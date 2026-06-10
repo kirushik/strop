@@ -20,14 +20,14 @@ unless they'd be expensive to reverse.
       history via per-transaction span snapshots, so undo/redo restore
       spans. Selection composites over content backgrounds (Kirill's
       visibility requirement) via alpha blending.
-- [ ] A3. **BlockMap**: per-block kinds (paragraph, heading 1–3, quote,
+- [x] A3. **BlockMap**: per-block kinds (paragraph, heading 1–3, quote,
       list item, divider, code block, footnote def) over the same text
       stream; block-aware rendering (sizes/leading on the 28px rhythm,
       quote inset, ⁂ divider, PT Mono code blocks); Enter/Backspace
       semantics at block edges; persistence as newline marks in Loro.
       Typography: research PT-family pairings for headings (PT Sans vs
       PT Serif display cuts vs Literata weights) — Kirill's explicit ask.
-- [ ] A4. Block commands: `#`–`###`-space at line start converts (same
+- [x] A4. Block commands (soft break U+2028 deferred to B-phase): `#`–`###`-space at line start converts (same
       single-undo contract as the typograph; NO inline `*`/`_` rules —
       decided against), ctrl-alt-1/2/3 headings, quote/list/divider
       toggles, shift-enter soft break (U+2028).

@@ -8,7 +8,7 @@ use gpui::{
     actions, prelude::*, px, size,
 };
 use strop_core::Store;
-use strop_core::document::SpanSet;
+use strop_core::document::{BlockMap, SpanSet};
 
 use editor::Editor;
 
@@ -22,6 +22,9 @@ const LITERATA_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Literata-It
 const LITERATA_BOLD: &[u8] = include_bytes!("../../../assets/fonts/Literata-Bold.ttf");
 const LITERATA_BOLD_ITALIC: &[u8] =
     include_bytes!("../../../assets/fonts/Literata-BoldItalic.ttf");
+const LITERATA_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Literata-SemiBold.ttf");
+const LITERATA_36PT_SEMIBOLD: &[u8] =
+    include_bytes!("../../../assets/fonts/Literata36pt-SemiBold.ttf");
 const PT_MONO: &[u8] = include_bytes!("../../../assets/fonts/PTMono-Regular.ttf");
 
 const SAMPLE: &str = "Strop is a writer’s editor with an editor inside — one that diagnoses, and never rewrites you into the average.\n\
@@ -56,6 +59,8 @@ fn main() {
                 LITERATA_ITALIC.into(),
                 LITERATA_BOLD.into(),
                 LITERATA_BOLD_ITALIC.into(),
+                LITERATA_SEMIBOLD.into(),
+                LITERATA_36PT_SEMIBOLD.into(),
                 PT_MONO.into(),
             ])
             .expect("failed to load bundled fonts");
@@ -80,15 +85,15 @@ fn main() {
                 }
             }
         };
-        let (initial_text, initial_spans) = match &store {
+        let (initial_text, initial_spans, initial_blocks) = match &store {
             Some((store, existing)) => match existing {
-                Some((text, spans)) => (text.clone(), spans.clone()),
+                Some((text, spans, blocks)) => (text.clone(), spans.clone(), blocks.clone()),
                 None => {
                     store.seed(SAMPLE);
-                    (SAMPLE.to_owned(), SpanSet::default())
+                    (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default())
                 }
             },
-            None => (SAMPLE.to_owned(), SpanSet::default()),
+            None => (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default()),
         };
 
         let bounds = Bounds::centered(None, size(px(960.), px(720.)), cx);
@@ -104,7 +109,7 @@ fn main() {
             },
             |window, cx| {
                 let editor = cx.new(|cx| {
-                    let mut editor = Editor::new(cx, &initial_text, initial_spans);
+                    let mut editor = Editor::new(cx, &initial_text, initial_spans, initial_blocks);
                     editor.start_blink(cx);
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);

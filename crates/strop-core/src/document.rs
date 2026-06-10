@@ -41,6 +41,10 @@ pub enum BlockKind {
         depth: u8,
     },
     Divider,
+    CodeBlock {
+        /// Markdown fence info string; stored for round-trip, never acted on.
+        info: String,
+    },
     Image {
         src: String,
         alt: String,
@@ -49,6 +53,75 @@ pub enum BlockKind {
     FootnoteDef {
         id: String,
     },
+}
+
+/// Block kinds aligned with the text's newline-separated blocks.
+/// Invariant: `kinds.len() == rope.len_lines()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockMap {
+    kinds: Vec<BlockKind>,
+}
+
+impl Default for BlockMap {
+    fn default() -> Self {
+        Self {
+            kinds: vec![BlockKind::default()],
+        }
+    }
+}
+
+impl BlockMap {
+    pub fn new(blocks: usize) -> Self {
+        Self {
+            kinds: vec![BlockKind::default(); blocks.max(1)],
+        }
+    }
+
+    pub fn from_kinds(kinds: Vec<BlockKind>) -> Self {
+        if kinds.is_empty() {
+            Self::default()
+        } else {
+            Self { kinds }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.kinds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false // invariant: at least one block
+    }
+
+    pub fn kinds(&self) -> &[BlockKind] {
+        &self.kinds
+    }
+
+    pub fn kind(&self, block: usize) -> &BlockKind {
+        self.kinds
+            .get(block)
+            .unwrap_or(&BlockKind::Paragraph)
+    }
+
+    pub fn set_kind(&mut self, block: usize, kind: BlockKind) {
+        if let Some(slot) = self.kinds.get_mut(block) {
+            *slot = kind;
+        }
+    }
+
+    /// Repair after a text edit. `block` is the block containing the edit
+    /// start (pre-edit), `merged` how many newlines the edit deleted,
+    /// `splits` how many it inserted. Merges keep the first block's kind;
+    /// splits inherit it (Enter-at-heading-end is special-cased upstream).
+    pub fn on_edit(&mut self, block: usize, merged: usize, splits: usize) {
+        let block = block.min(self.kinds.len().saturating_sub(1));
+        let drain_end = (block + 1 + merged).min(self.kinds.len());
+        self.kinds.drain(block + 1..drain_end);
+        let kind = self.kinds[block].clone();
+        for _ in 0..splits {
+            self.kinds.insert(block + 1, kind.clone());
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,23 +261,32 @@ impl SpanSet {
     }
 }
 
-/// Text + formatting with unified, transaction-aligned undo. The buffer
-/// owns text history; span states are snapshotted per transaction (span
-/// sets are small — snapshots beat op inversion on simplicity).
+/// Text + formatting + block structure with unified, transaction-aligned
+/// undo. The buffer owns text history; span/block states are snapshotted
+/// per transaction (they're small — snapshots beat op inversion).
 #[derive(Debug, Default)]
 pub struct Document {
     buffer: Buffer,
     spans: SpanSet,
-    span_undo: Vec<SpanSet>,
-    span_redo: Vec<SpanSet>,
+    blocks: BlockMap,
+    undo_states: Vec<(SpanSet, BlockMap)>,
+    redo_states: Vec<(SpanSet, BlockMap)>,
     pending_ops: Vec<TextOp>,
 }
 
 impl Document {
-    pub fn new(text: &str, spans: SpanSet) -> Self {
+    pub fn new(text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
+        let buffer = Buffer::new(text);
+        let mut blocks = blocks;
+        // Repair a stale/foreign block map against the actual text.
+        let lines = buffer.rope().len_lines();
+        if blocks.len() != lines {
+            blocks = BlockMap::new(lines);
+        }
         Self {
-            buffer: Buffer::new(text),
+            buffer,
             spans,
+            blocks,
             ..Default::default()
         }
     }
@@ -215,6 +297,15 @@ impl Document {
 
     pub fn spans(&self) -> &SpanSet {
         &self.spans
+    }
+
+    pub fn blocks(&self) -> &BlockMap {
+        &self.blocks
+    }
+
+    /// Block index containing a byte offset.
+    pub fn block_of_byte(&self, byte: usize) -> usize {
+        self.buffer.rope().byte_to_line(byte)
     }
 
     // Hot-path delegates, so the editor reads as `doc.rope()` etc.
@@ -259,35 +350,71 @@ impl Document {
         self.pending_ops.extend(ops);
     }
 
+    /// (block containing the edit start, newlines deleted) — computed
+    /// against the pre-edit rope.
+    fn pre_edit_info(&self, byte_range: &Range<usize>) -> (usize, usize) {
+        let rope = self.buffer.rope();
+        let start = rope.byte_to_char(byte_range.start);
+        let end = rope.byte_to_char(byte_range.end);
+        let block = rope.char_to_line(start);
+        let merged = rope.slice(start..end).chars().filter(|c| *c == '\n').count();
+        (block, merged)
+    }
+
+    fn snapshot(&self) -> (SpanSet, BlockMap) {
+        (self.spans.clone(), self.blocks.clone())
+    }
+
     pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
-        let snapshot = self.spans.clone();
+        let snapshot = self.snapshot();
+        let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes(byte_range, text) {
-            self.span_undo.push(snapshot);
-            self.span_redo.clear();
+            self.undo_states.push(snapshot);
+            self.redo_states.clear();
         }
+        self.blocks
+            .on_edit(block, merged, text.matches('\n').count());
         self.absorb_buffer_ops();
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
-        let snapshot = self.spans.clone();
+        let snapshot = self.snapshot();
+        let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes_coalescing(byte_range, text) {
-            self.span_undo.push(snapshot);
-            self.span_redo.clear();
+            self.undo_states.push(snapshot);
+            self.redo_states.clear();
         }
+        self.blocks
+            .on_edit(block, merged, text.matches('\n').count());
         self.absorb_buffer_ops();
     }
 
     /// Toggle `attr` over a char range as its own undoable transaction.
     pub fn toggle_format(&mut self, range: Range<usize>, attr: InlineAttr) {
-        let snapshot = self.spans.clone();
+        let snapshot = self.snapshot();
         self.buffer.push_empty_transaction();
-        self.span_undo.push(snapshot);
-        self.span_redo.clear();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
         if self.spans.covers(range.clone(), &attr) {
             self.spans.remove(range, &attr);
         } else {
             self.spans.add(range, attr);
         }
+    }
+
+    /// Set a block's kind as its own undoable transaction.
+    pub fn set_block_kind(&mut self, block: usize, kind: BlockKind) {
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        self.blocks.set_kind(block, kind);
+    }
+
+    /// Change a block's kind inside the current transaction (rides a text
+    /// edit, e.g. the `# `-shortcut or Enter-at-heading-end).
+    pub fn set_block_kind_in_current_tx(&mut self, block: usize, kind: BlockKind) {
+        self.blocks.set_kind(block, kind);
     }
 
     /// Apply/clear an attribute inside the *current* transaction (sticky
@@ -301,25 +428,29 @@ impl Document {
         }
     }
 
-    /// Undo one transaction (text and formatting together). Outer None =
-    /// nothing to undo; inner None = format-only (keep the cursor).
+    /// Undo one transaction (text, formatting, and block kinds together).
+    /// Outer None = nothing to undo; inner None = format-only (keep cursor).
     pub fn undo(&mut self) -> Option<Option<usize>> {
         let cursor = self.buffer.undo()?;
-        if let Some(snapshot) = self.span_undo.pop() {
-            self.span_redo
-                .push(std::mem::replace(&mut self.spans, snapshot));
+        if let Some((spans, blocks)) = self.undo_states.pop() {
+            self.redo_states.push((
+                std::mem::replace(&mut self.spans, spans),
+                std::mem::replace(&mut self.blocks, blocks),
+            ));
         }
         // Buffer inverse ops still mirror to the store, but must NOT be
-        // re-applied to spans (the snapshot already is the correct state).
+        // re-applied to spans/blocks (the snapshot is the correct state).
         self.pending_ops.extend(self.buffer.take_ops());
         Some(cursor)
     }
 
     pub fn redo(&mut self) -> Option<Option<usize>> {
         let cursor = self.buffer.redo()?;
-        if let Some(snapshot) = self.span_redo.pop() {
-            self.span_undo
-                .push(std::mem::replace(&mut self.spans, snapshot));
+        if let Some((spans, blocks)) = self.redo_states.pop() {
+            self.undo_states.push((
+                std::mem::replace(&mut self.spans, spans),
+                std::mem::replace(&mut self.blocks, blocks),
+            ));
         }
         self.pending_ops.extend(self.buffer.take_ops());
         Some(cursor)
@@ -451,7 +582,7 @@ mod tests {
 
     #[test]
     fn format_toggle_is_undoable() {
-        let mut doc = Document::new("hello world", SpanSet::default());
+        let mut doc = Document::new("hello world", SpanSet::default(), BlockMap::default());
         doc.toggle_format(0..5, InlineAttr::Strong);
         assert!(doc.spans().covers(0..5, &InlineAttr::Strong));
         // Format-only transaction: undo keeps the cursor (inner None).
@@ -463,7 +594,7 @@ mod tests {
 
     #[test]
     fn typing_with_sticky_attr_undoes_together() {
-        let mut doc = Document::new("", SpanSet::default());
+        let mut doc = Document::new("", SpanSet::default(), BlockMap::default());
         doc.edit_bytes_coalescing(0..0, "w");
         doc.format_in_current_tx(0..1, InlineAttr::Strong, true);
         doc.edit_bytes_coalescing(1..1, "o"); // same tx; expansion grows span
@@ -477,7 +608,7 @@ mod tests {
     fn undo_restores_formatting_deleted_with_text() {
         // The smoke-run bug: delete styled text, undo, the style returns
         // (and the neighbor no longer swallows the restored range).
-        let mut doc = Document::new("bold plain", SpanSet::default());
+        let mut doc = Document::new("bold plain", SpanSet::default(), BlockMap::default());
         doc.toggle_format(0..4, InlineAttr::Strong);
         doc.edit_bytes(2..8, "");
         assert_eq!(doc.text(), "boin");

@@ -19,7 +19,7 @@ use gpui::{
     UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*,
     px, relative, rgb, rgba, size,
 };
-use strop_core::document::{Document, InlineAttr, SpanSet};
+use strop_core::document::{BlockKind, BlockMap, Document, InlineAttr, SpanSet};
 use strop_core::{Store, typograph};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -43,7 +43,8 @@ actions!(
         End, SelectToHome, SelectToEnd, DocStart, DocEnd, SelectToDocStart, SelectToDocEnd,
         PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, Undo, Redo,
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
-        ToggleCode,
+        ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
+        ToggleBulletList, ToggleOrderedList,
     ]
 );
 
@@ -103,6 +104,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-x", ToggleStrikethrough, ctx),
         KeyBinding::new("ctrl-shift-h", ToggleHighlight, ctx),
         KeyBinding::new("ctrl-e", ToggleCode, ctx),
+        KeyBinding::new("ctrl-alt-1", Heading1, ctx),
+        KeyBinding::new("ctrl-alt-2", Heading2, ctx),
+        KeyBinding::new("ctrl-alt-3", Heading3, ctx),
+        KeyBinding::new("ctrl-alt-q", ToggleQuoteBlock, ctx),
+        KeyBinding::new("ctrl-alt-c", ToggleCodeBlock, ctx),
+        // Google Docs list conventions.
+        KeyBinding::new("ctrl-shift-8", ToggleBulletList, ctx),
+        KeyBinding::new("ctrl-shift-7", ToggleOrderedList, ctx),
     ]);
 }
 
@@ -173,6 +182,13 @@ struct ParagraphLayout {
     /// Y offset of the paragraph top, relative to `TextFrame::bounds` origin.
     top: Pixels,
     height: Pixels,
+    /// Per-block metrics (headings, code, quotes differ from body).
+    line_height: Pixels,
+    indent: Pixels,
+    /// Kind-derived decorations, resolved at prepaint.
+    bg: Option<gpui::Rgba>,
+    quote_rule: bool,
+    marker: Option<SharedString>,
 }
 
 impl ParagraphLayout {
@@ -200,10 +216,11 @@ impl ParagraphLayout {
             .partition_point(|&b| if affinity_down { b <= local } else { b < local })
     }
 
-    /// X position of a local index within its visual line.
+    /// X position of a local index within its visual line, in frame
+    /// coordinates (block indent included).
     fn x_for(&self, local: usize, line: usize) -> Pixels {
         let layout = &self.line.unwrapped_layout;
-        layout.x_for_index(local) - layout.x_for_index(self.line_start(line))
+        self.indent + layout.x_for_index(local) - layout.x_for_index(self.line_start(line))
     }
 
     fn position(&self, local: usize, affinity_down: bool) -> (usize, Pixels) {
@@ -211,14 +228,15 @@ impl ParagraphLayout {
         (line, self.x_for(local, line))
     }
 
-    /// Closest local index to `x` on visual line `line`, with the affinity
-    /// that renders the cursor on that same line.
-    fn index_at(&self, line: usize, x: Pixels, line_height: Pixels) -> (usize, bool) {
+    /// Closest local index to frame-x `x` on visual line `line`, with the
+    /// affinity that renders the cursor on that same line.
+    fn index_at(&self, line: usize, x: Pixels) -> (usize, bool) {
         let line = line.min(self.line_count() - 1);
-        let y = line_height * (line as f32) + line_height / 2.;
+        let y = self.line_height * (line as f32) + self.line_height / 2.;
+        let local_x = (x - self.indent).max(px(0.));
         let ix = self
             .line
-            .closest_index_for_position(point(x, y), line_height)
+            .closest_index_for_position(point(local_x, y), self.line_height)
             .unwrap_or_else(|ix| ix);
         (ix, line > 0 && ix == self.line_start(line))
     }
@@ -251,7 +269,7 @@ impl TextFrame {
     fn position_of(&self, offset: usize, affinity_down: bool) -> Option<Point<Pixels>> {
         let (par_ix, line, x) = self.cursor_position(offset, affinity_down)?;
         let par = &self.paragraphs[par_ix];
-        Some(point(x, par.top + self.line_height * (line as f32)))
+        Some(point(x, par.top + par.line_height * (line as f32)))
     }
 
     /// Byte offset (and cursor affinity) closest to a point relative to
@@ -271,12 +289,12 @@ impl TextFrame {
                 } else {
                     (par, 0)
                 };
-                let (ix, aff) = target.index_at(line, x, self.line_height);
+                let (ix, aff) = target.index_at(line, x);
                 return (target.range.start + ix, aff);
             }
             if p.y < par.top + par.height {
-                let line = ((p.y - par.top) / self.line_height) as usize;
-                let (ix, aff) = par.index_at(line, x, self.line_height);
+                let line = ((p.y - par.top) / par.line_height) as usize;
+                let (ix, aff) = par.index_at(line, x);
                 return (par.range.start + ix, aff);
             }
         }
@@ -285,10 +303,10 @@ impl TextFrame {
 }
 
 impl Editor {
-    pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet) -> Self {
+    pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            doc: Document::new(text, spans),
+            doc: Document::new(text, spans, blocks),
             caret_attrs: Vec::new(),
             selected_range: 0..0,
             selection_reversed: false,
@@ -350,7 +368,7 @@ impl Editor {
     pub fn save_now(&mut self) {
         self.sync_mutations();
         if let Some(store) = &self.store {
-            match store.save_with_marks(self.doc.spans()) {
+            match store.save_with_state(self.doc.spans(), self.doc.blocks()) {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
             }
@@ -668,7 +686,7 @@ impl Editor {
         let (offset, affinity) = match target {
             Some((p, l)) => {
                 let par = &frame.paragraphs[p];
-                let (ix, aff) = par.index_at(l, x, frame.line_height);
+                let (ix, aff) = par.index_at(l, x);
                 (par.range.start + ix, aff)
             }
             // First line up -> document start; last line down -> document end.
@@ -697,9 +715,8 @@ impl Editor {
         };
         let x = self.goal_x.unwrap_or(x);
         let page = (frame.bounds.size.height - frame.line_height).max(frame.line_height);
-        let y = frame.paragraphs[par_ix].top
-            + frame.line_height * (line_ix as f32)
-            + frame.line_height / 2.;
+        let par = &frame.paragraphs[par_ix];
+        let y = par.top + par.line_height * (line_ix as f32) + par.line_height / 2.;
         let target = point(x, y + page * (direction as f32));
         let (offset, affinity) = frame.index_for_point(target);
 
@@ -715,7 +732,21 @@ impl Editor {
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            let prev = self.previous_boundary(self.cursor_offset());
+            // At the start of a styled block, the first backspace strips
+            // the block kind instead of merging (Notion/Docs convention).
+            let cursor = self.cursor_offset();
+            let (par_start, _) = self.paragraph_bounds(cursor);
+            if cursor == par_start {
+                let block = self.doc.block_of_byte(cursor);
+                if *self.doc.blocks().kind(block) != BlockKind::Paragraph {
+                    self.doc.set_block_kind(block, BlockKind::Paragraph);
+                    self.store_dirty = true;
+                    self.bump_activity();
+                    cx.notify();
+                    return;
+                }
+            }
+            let prev = self.previous_boundary(cursor);
             self.select_to(prev, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
@@ -894,7 +925,75 @@ impl Editor {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter at the end of a heading/divider starts a paragraph, not
+        // another heading (the split otherwise inherits the block kind).
+        let cursor = self.cursor_offset();
+        let (_, par_end) = self.paragraph_bounds(cursor);
+        let block = self.doc.block_of_byte(cursor.min(self.doc.len_bytes()));
+        let demote = self.selected_range.is_empty()
+            && cursor == par_end
+            && matches!(
+                self.doc.blocks().kind(block),
+                BlockKind::Heading(_) | BlockKind::Divider
+            );
         self.replace_text_in_range(None, "\n", window, cx);
+        if demote {
+            let new_block = self.doc.block_of_byte(self.cursor_offset());
+            self.doc
+                .set_block_kind_in_current_tx(new_block, BlockKind::Paragraph);
+            cx.notify();
+        }
+    }
+
+    /// Toggle a block kind over the selected block range, one transaction.
+    fn toggle_block(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
+        let start_block = self.doc.block_of_byte(self.selected_range.start);
+        let end_block = self.doc.block_of_byte(self.selected_range.end);
+        let target = if *self.doc.blocks().kind(start_block) == kind {
+            BlockKind::Paragraph
+        } else {
+            kind
+        };
+        self.doc.set_block_kind(start_block, target.clone());
+        for block in start_block + 1..=end_block {
+            self.doc.set_block_kind_in_current_tx(block, target.clone());
+        }
+        self.store_dirty = true;
+        self.bump_activity();
+        cx.notify();
+    }
+
+    fn heading1(&mut self, _: &Heading1, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_block(BlockKind::Heading(1), cx);
+    }
+
+    fn heading2(&mut self, _: &Heading2, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_block(BlockKind::Heading(2), cx);
+    }
+
+    fn heading3(&mut self, _: &Heading3, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_block(BlockKind::Heading(3), cx);
+    }
+
+    fn toggle_quote_block(&mut self, _: &ToggleQuoteBlock, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_block(BlockKind::Blockquote, cx);
+    }
+
+    fn toggle_code_block(&mut self, _: &ToggleCodeBlock, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_block(BlockKind::CodeBlock { info: String::new() }, cx);
+    }
+
+    fn toggle_bullet_list(&mut self, _: &ToggleBulletList, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_block(BlockKind::ListItem { ordered: false, depth: 0 }, cx);
+    }
+
+    fn toggle_ordered_list(
+        &mut self,
+        _: &ToggleOrderedList,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_block(BlockKind::ListItem { ordered: true, depth: 0 }, cx);
     }
 
     fn toggle_strong(&mut self, _: &ToggleStrong, _: &mut Window, cx: &mut Context<Self>) {
@@ -1156,32 +1255,33 @@ impl Editor {
     /// wrapped-line index within the paragraph, and x position.
     pub fn debug_cursor(&self) -> String {
         let cursor = self.cursor_offset();
-        let Some(frame) = self.last_frame.as_ref() else {
-            return format!("off={cursor} (no frame)");
-        };
-        match frame.cursor_position(cursor, self.cursor_affinity_down) {
-            Some((par, line, x)) => {
-                let tail_start = self
-                    .doc
-                    .rope()
-                    .byte_to_char(cursor)
-                    .saturating_sub(12);
-                let tail: String = self
-                    .doc
-                    .rope()
-                    .chars_at(tail_start)
-                    .take(self.doc.rope().byte_to_char(cursor) - tail_start)
-                    .collect();
+        let tail_start = self.doc.rope().byte_to_char(cursor).saturating_sub(12);
+        let tail: String = self
+            .doc
+            .rope()
+            .chars_at(tail_start)
+            .take(self.doc.rope().byte_to_char(cursor) - tail_start)
+            .collect();
+        let doc_state = format!(
+            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}",
+            self.selected_range,
+            self.doc.blocks().kind(self.doc.block_of_byte(cursor)),
+            self.doc.spans().spans()
+        );
+        // Geometry may lag when the compositor throttles an occluded
+        // window; doc state above stays authoritative.
+        let geometry = self
+            .last_frame
+            .as_ref()
+            .and_then(|f| f.cursor_position(cursor, self.cursor_affinity_down))
+            .map(|(par, line, x)| {
                 format!(
-                    "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?} scroll={:?} tail={tail:?} spans={:?}",
-                    self.cursor_affinity_down as u8,
-                    self.selected_range,
-                    self.scroll_top,
-                    self.doc.spans().spans()
+                    "par={par} line={line} x={x:?} aff={} scroll={:?}",
+                    self.cursor_affinity_down as u8, self.scroll_top
                 )
-            }
-            None => format!("off={cursor} (no paragraph)"),
-        }
+            })
+            .unwrap_or_else(|| "geom=stale".into());
+        format!("{doc_state} {geometry}")
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
@@ -1208,8 +1308,27 @@ impl Editor {
 
         self.doc.edit_bytes_coalescing(range.clone(), new_text);
         let mut cursor = range.start + new_text.len();
+        let mut block_shortcut_fired = false;
 
-        if typograph {
+        // `# `..`### ` at block start converts to a heading; the hash
+        // prefix is removed in the same transaction, so one undo restores
+        // the literal hashes and the paragraph kind together.
+        if typograph && new_text == " " {
+            let (par_start, _) = self.paragraph_bounds(cursor);
+            let head = self.doc.slice_bytes(par_start..cursor);
+            let hashes = head.strip_suffix(' ').unwrap_or("");
+            if !hashes.is_empty() && hashes.len() <= 3 && hashes.bytes().all(|b| b == b'#') {
+                let level = hashes.len() as u8;
+                let block = self.doc.block_of_byte(par_start);
+                self.doc.edit_bytes(par_start..cursor, "");
+                self.doc
+                    .set_block_kind_in_current_tx(block, BlockKind::Heading(level));
+                cursor = par_start;
+                block_shortcut_fired = true;
+            }
+        }
+
+        if typograph && !block_shortcut_fired {
             let (par_start, _) = self.paragraph_bounds(cursor);
             let prefix = self.doc.slice_bytes(par_start..cursor);
             let lang = typograph::detect_lang(self.doc.rope().chars());
@@ -1381,6 +1500,81 @@ impl IntoElement for EditorElement {
     }
 }
 
+/// Per-kind block metrics and decorations, per the PT-pairings research:
+/// same-family Literata SemiBold headings (display optical for H1), all
+/// boxes on the 28px rhythm.
+struct BlockStyle {
+    size: Pixels,
+    line_height: Pixels,
+    indent: Pixels,
+    extra_top: Pixels,
+    family: Option<&'static str>,
+    weight: Option<FontWeight>,
+    muted: bool,
+    bg: Option<gpui::Rgba>,
+    quote_rule: bool,
+}
+
+impl Default for BlockStyle {
+    fn default() -> Self {
+        Self {
+            size: px(20.),
+            line_height: px(28.),
+            indent: px(0.),
+            extra_top: px(0.),
+            family: None,
+            weight: None,
+            muted: false,
+            bg: None,
+            quote_rule: false,
+        }
+    }
+}
+
+fn block_style(kind: &BlockKind) -> BlockStyle {
+    let semibold = Some(FontWeight::SEMIBOLD);
+    match kind {
+        BlockKind::Heading(1) => BlockStyle {
+            size: px(32.),
+            line_height: px(42.),
+            extra_top: px(14.),
+            family: Some("Literata 36pt"),
+            weight: semibold,
+            ..Default::default()
+        },
+        BlockKind::Heading(2) => BlockStyle {
+            size: px(24.),
+            weight: semibold,
+            ..Default::default()
+        },
+        BlockKind::Heading(_) => BlockStyle {
+            weight: semibold,
+            ..Default::default()
+        },
+        BlockKind::Blockquote => BlockStyle {
+            indent: px(28.),
+            quote_rule: true,
+            ..Default::default()
+        },
+        BlockKind::ListItem { depth, .. } => BlockStyle {
+            indent: px(28.) * (*depth as f32 + 1.),
+            ..Default::default()
+        },
+        BlockKind::Divider | BlockKind::FootnoteDef { .. } => BlockStyle {
+            muted: true,
+            ..Default::default()
+        },
+        BlockKind::CodeBlock { .. } => BlockStyle {
+            size: px(16.),
+            indent: px(12.),
+            family: Some(CODE_FONT),
+            bg: Some(rgba(CODE_BG_COLOR)),
+            ..Default::default()
+        },
+        _ => BlockStyle::default(),
+    }
+}
+
 /// Alpha source-over compositing, so selection never hides content
 /// backgrounds (highlight, code — and later annotation markings): partial
 /// overlaps already split into their own runs by the cut logic.
@@ -1538,7 +1732,6 @@ impl Element for EditorElement {
     ) -> Self::PrepaintState {
         let editor = self.editor.read(cx);
         let style = window.text_style();
-        let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
         let paragraph_gap = line_height; // vertical rhythm: one full line
         let wrap_width = bounds.size.width;
@@ -1578,10 +1771,47 @@ impl Element for EditorElement {
             strikethrough: None,
         };
 
+        let kinds: Vec<BlockKind> = editor.doc.blocks().kinds().to_vec();
+
         let mut paragraphs = Vec::new();
         let mut top = px(0.);
         let mut offset = 0;
-        for par_text in text.split('\n') {
+        let mut ordered_no = 0usize;
+        for (block_ix, par_text) in text.split('\n').enumerate() {
+            let kind = kinds.get(block_ix).cloned().unwrap_or_default();
+            let bstyle = block_style(&kind);
+            let marker = match &kind {
+                BlockKind::ListItem { ordered: false, .. } => {
+                    ordered_no = 0;
+                    Some(SharedString::from("•"))
+                }
+                BlockKind::ListItem { ordered: true, .. } => {
+                    ordered_no += 1;
+                    Some(SharedString::from(format!("{ordered_no}.")))
+                }
+                _ => {
+                    ordered_no = 0;
+                    None
+                }
+            };
+
+            let mut block_font = base_run.font.clone();
+            if let Some(family) = bstyle.family {
+                block_font.family = family.into();
+            }
+            if let Some(weight) = bstyle.weight {
+                block_font.weight = weight;
+            }
+            let block_base = TextRun {
+                font: block_font,
+                color: if bstyle.muted {
+                    rgb(MUTED_COLOR).into()
+                } else {
+                    base_run.color
+                },
+                ..base_run.clone()
+            };
+
             let range = offset..offset + par_text.len();
             let par_spans: Vec<(Range<usize>, InlineAttr)> = spans_bytes
                 .iter()
@@ -1589,14 +1819,14 @@ impl Element for EditorElement {
                 .cloned()
                 .collect();
             let runs =
-                runs_for_paragraph(&range, &selection, marked.as_ref(), &par_spans, &base_run);
+                runs_for_paragraph(&range, &selection, marked.as_ref(), &par_spans, &block_base);
             let line = window
                 .text_system()
                 .shape_text(
                     SharedString::from(par_text.to_owned()),
-                    font_size,
+                    bstyle.size,
                     &runs,
-                    Some(wrap_width),
+                    Some(wrap_width - bstyle.indent),
                     None,
                 )
                 .expect("shape_text failed")
@@ -1611,13 +1841,19 @@ impl Element for EditorElement {
                     run.glyphs[b.glyph_ix].index
                 })
                 .collect();
-            let height = line.size(line_height).height;
+            top += bstyle.extra_top;
+            let height = line.size(bstyle.line_height).height;
             paragraphs.push(ParagraphLayout {
                 line,
                 range: range.clone(),
                 boundaries,
                 top,
                 height,
+                line_height: bstyle.line_height,
+                indent: bstyle.indent,
+                bg: bstyle.bg,
+                quote_rule: bstyle.quote_rule,
+                marker,
             });
             top += height + paragraph_gap;
             offset = range.end + 1; // step over '\n'
@@ -1634,14 +1870,17 @@ impl Element for EditorElement {
             .find(|p| cursor_offset <= p.range.end)
             .map(|par| {
                 let (line, x) = par.position(cursor_offset - par.range.start, cursor_affinity);
-                point(x, par.top + line_height * (line as f32))
+                (
+                    point(x, par.top + par.line_height * (line as f32)),
+                    par.line_height,
+                )
             });
 
-        if autoscroll && let Some(pos) = cursor_pos {
+        if autoscroll && let Some((pos, cursor_lh)) = cursor_pos {
             if pos.y < scroll_top {
                 scroll_top = pos.y;
-            } else if pos.y + line_height > scroll_top + viewport {
-                scroll_top = pos.y + line_height - viewport;
+            } else if pos.y + cursor_lh > scroll_top + viewport {
+                scroll_top = pos.y + cursor_lh - viewport;
             }
         }
 
@@ -1652,16 +1891,13 @@ impl Element for EditorElement {
             editor.autoscroll_request = false;
         });
 
-        let cursor = cursor_pos.and_then(|pos| {
+        let cursor = cursor_pos.and_then(|(pos, cursor_lh)| {
             let y = pos.y - scroll_top;
-            if !cursor_blink_visible || y + line_height <= px(0.) || y >= viewport {
+            if !cursor_blink_visible || y + cursor_lh <= px(0.) || y >= viewport {
                 return None;
             }
             Some(fill(
-                Bounds::new(
-                    bounds.origin + point(pos.x, y),
-                    size(px(2.), line_height),
-                ),
+                Bounds::new(bounds.origin + point(pos.x, y), size(px(2.), cursor_lh)),
                 rgb(TEXT_COLOR),
             ))
         });
@@ -1700,12 +1936,53 @@ impl Element for EditorElement {
             if y + par.height <= px(0.) || y >= viewport {
                 continue; // outside the viewport
             }
-            let origin = bounds.origin + point(px(0.), y);
+            // Kind decorations: code-block panel, quote rule, list markers.
+            if let Some(bg) = par.bg {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(-8.), y - px(6.)),
+                        size(bounds.size.width + px(16.), par.height + px(12.)),
+                    ),
+                    bg,
+                ));
+            }
+            if par.quote_rule {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(10.), y),
+                        size(px(3.), par.height),
+                    ),
+                    rgb(RULE_COLOR),
+                ));
+            }
+            let origin = bounds.origin + point(par.indent, y);
+            if let Some(marker) = &par.marker {
+                let run = TextRun {
+                    len: marker.len(),
+                    font: gpui::font("Literata"),
+                    color: rgb(MUTED_COLOR).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped =
+                    window
+                        .text_system()
+                        .shape_line(marker.clone(), px(16.), &[run], None);
+                shaped
+                    .paint(
+                        bounds.origin + point(par.indent - px(24.), y + px(2.)),
+                        par.line_height,
+                        window,
+                        cx,
+                    )
+                    .ok();
+            }
             par.line
-                .paint_background(origin, line_height, TextAlign::Left, None, window, cx)
+                .paint_background(origin, par.line_height, TextAlign::Left, None, window, cx)
                 .expect("paint_background failed");
             par.line
-                .paint(origin, line_height, TextAlign::Left, None, window, cx)
+                .paint(origin, par.line_height, TextAlign::Left, None, window, cx)
                 .expect("paint failed");
         }
 
@@ -1896,6 +2173,13 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_strikethrough))
                     .on_action(cx.listener(Self::toggle_highlight))
                     .on_action(cx.listener(Self::toggle_code))
+                    .on_action(cx.listener(Self::heading1))
+                    .on_action(cx.listener(Self::heading2))
+                    .on_action(cx.listener(Self::heading3))
+                    .on_action(cx.listener(Self::toggle_quote_block))
+                    .on_action(cx.listener(Self::toggle_code_block))
+                    .on_action(cx.listener(Self::toggle_bullet_list))
+                    .on_action(cx.listener(Self::toggle_ordered_list))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

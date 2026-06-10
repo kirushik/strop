@@ -14,9 +14,56 @@ use std::path::{Path, PathBuf};
 use loro::{ExpandType, ExportMode, LoroDoc, LoroValue, StyleConfig, StyleConfigMap, TextDelta};
 
 use crate::buffer::TextOp;
-use crate::document::{InlineAttr, SpanSet};
+use crate::document::{BlockKind, BlockMap, InlineAttr, SpanSet};
 
 const TEXT_CONTAINER: &str = "content";
+const BLOCKS_CONTAINER: &str = "blocks";
+
+/// One token per block, newline-joined (block text never contains '\n').
+/// Wholesale-rebuilt at save, like marks.
+fn kind_token(kind: &BlockKind) -> String {
+    match kind {
+        BlockKind::Paragraph => "p".into(),
+        BlockKind::Heading(n) => format!("h{n}"),
+        BlockKind::Blockquote => "quote".into(),
+        BlockKind::ListItem { ordered, depth } => {
+            format!("li:{}:{depth}", if *ordered { "o" } else { "b" })
+        }
+        BlockKind::Divider => "div".into(),
+        BlockKind::CodeBlock { info } => format!("code:{info}"),
+        BlockKind::FootnoteDef { id } => format!("fn:{id}"),
+        // Image asset plumbing lands with B3; src survives the round trip.
+        BlockKind::Image { src, .. } => format!("img:{src}"),
+    }
+}
+
+fn kind_from_token(token: &str) -> BlockKind {
+    match token {
+        "p" => BlockKind::Paragraph,
+        "quote" => BlockKind::Blockquote,
+        "div" => BlockKind::Divider,
+        t if t.starts_with('h') => t[1..]
+            .parse::<u8>()
+            .map(BlockKind::Heading)
+            .unwrap_or_default(),
+        t if t.starts_with("li:") => {
+            let mut parts = t.splitn(3, ':').skip(1);
+            let ordered = parts.next() == Some("o");
+            let depth = parts.next().and_then(|d| d.parse().ok()).unwrap_or(0);
+            BlockKind::ListItem { ordered, depth }
+        }
+        t if t.starts_with("code:") => BlockKind::CodeBlock {
+            info: t[5..].into(),
+        },
+        t if t.starts_with("fn:") => BlockKind::FootnoteDef { id: t[3..].into() },
+        t if t.starts_with("img:") => BlockKind::Image {
+            src: t[4..].into(),
+            alt: String::new(),
+            caption: String::new(),
+        },
+        _ => BlockKind::Paragraph,
+    }
+}
 
 /// All style keys we ever write; unmarked wholesale before each rebuild.
 const STYLE_KEYS: [&str; 8] = [
@@ -93,8 +140,10 @@ pub struct Store {
 
 impl Store {
     /// Open a `.strop` file. Returns the store and, when the file already
-    /// existed, its current text and formatting (None = brand-new document).
-    pub fn open(path: impl Into<PathBuf>) -> io::Result<(Self, Option<(String, SpanSet)>)> {
+    /// existed, its text, formatting, and block kinds (None = brand-new).
+    pub fn open(
+        path: impl Into<PathBuf>,
+    ) -> io::Result<(Self, Option<(String, SpanSet, BlockMap)>)> {
         let path = path.into();
         let doc = LoroDoc::new();
         doc.config_text_style(style_config());
@@ -115,7 +164,16 @@ impl Store {
                         pos += len;
                     }
                 }
-                Some((text.to_string(), spans))
+                let blocks = match doc.get_map(BLOCKS_CONTAINER).get("kinds") {
+                    Some(v) => match v.into_value() {
+                        Ok(LoroValue::String(tokens)) => BlockMap::from_kinds(
+                            tokens.lines().map(kind_from_token).collect(),
+                        ),
+                        _ => BlockMap::default(),
+                    },
+                    None => BlockMap::default(),
+                };
+                Some((text.to_string(), spans, blocks))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
@@ -123,11 +181,20 @@ impl Store {
         Ok((Self { doc, path }, existing))
     }
 
-    /// Rebuild Peritext marks from the authoritative SpanSet, then snapshot.
-    /// Durability only matters at the disk boundary, so marks are not
-    /// mirrored per-edit — this avoids expand-rule drift entirely.
-    pub fn save_with_marks(&self, spans: &SpanSet) -> io::Result<()> {
+    /// Rebuild Peritext marks + block kinds from the authoritative state,
+    /// then snapshot. Durability only matters at the disk boundary, so
+    /// neither is mirrored per-edit — this avoids expand-rule drift.
+    pub fn save_with_state(&self, spans: &SpanSet, blocks: &BlockMap) -> io::Result<()> {
         self.rebuild_marks(spans);
+        let tokens: Vec<String> = blocks.kinds().iter().map(kind_token).collect();
+        if let Err(e) = self
+            .doc
+            .get_map(BLOCKS_CONTAINER)
+            .insert("kinds", tokens.join("\n"))
+        {
+            eprintln!("strop: persist blocks: {e}");
+        }
+        self.doc.commit();
         self.save()
     }
 
@@ -234,7 +301,7 @@ mod tests {
         store.save().unwrap();
         let (_store2, existing) = Store::open(&path).unwrap();
         assert_eq!(
-            existing.map(|(text, _)| text).as_deref(),
+            existing.map(|(text, _, _)| text).as_deref(),
             Some("привет, мир")
         );
 
@@ -252,10 +319,10 @@ mod tests {
         spans.add(0..6, InlineAttr::Strong);
         spans.add(9..12, InlineAttr::Code);
         spans.add(2..4, InlineAttr::Link("https://e.x".into()));
-        store.save_with_marks(&spans).unwrap();
+        store.save_with_state(&spans, &BlockMap::new(1)).unwrap();
 
         let (_s2, existing) = Store::open(&path).unwrap();
-        let (text, loaded) = existing.unwrap();
+        let (text, loaded, _blocks) = existing.unwrap();
         assert_eq!(text, "жирный и код");
         assert!(loaded.covers(0..6, &InlineAttr::Strong));
         assert!(loaded.covers(9..12, &InlineAttr::Code));
