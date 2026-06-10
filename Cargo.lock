@@ -5366,6 +5366,7 @@ dependencies = [
  "anyhow",
  "gpui",
  "strop-core",
+ "unicode-segmentation",
 ]
 
 [[package]]

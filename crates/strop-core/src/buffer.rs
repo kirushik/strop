@@ -34,6 +34,14 @@ impl Buffer {
         self.version += 1;
     }
 
+    /// Replace `byte_range` (UTF-8 offsets) with `text`. UI layers work in
+    /// byte offsets (text layout) and UTF-16 (IME); chars are internal.
+    pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
+        let start = self.rope.byte_to_char(byte_range.start);
+        let end = self.rope.byte_to_char(byte_range.end);
+        self.edit(start..end, text);
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             rope: self.rope.clone(),
@@ -41,8 +49,28 @@ impl Buffer {
         }
     }
 
+    pub fn rope(&self) -> &Rope {
+        &self.rope
+    }
+
     pub fn len_chars(&self) -> usize {
         self.rope.len_chars()
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.rope.len_bytes()
+    }
+
+    pub fn slice_bytes(&self, byte_range: Range<usize>) -> String {
+        self.rope.byte_slice(byte_range).to_string()
+    }
+
+    pub fn byte_to_utf16(&self, byte: usize) -> usize {
+        self.rope.char_to_utf16_cu(self.rope.byte_to_char(byte))
+    }
+
+    pub fn utf16_to_byte(&self, utf16: usize) -> usize {
+        self.rope.char_to_byte(self.rope.utf16_cu_to_char(utf16))
     }
 
     pub fn text(&self) -> String {
@@ -59,6 +87,23 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_and_utf16_conversions() {
+        // "д" is 2 bytes / 1 utf16 unit; "🙂" is 4 bytes / 2 utf16 units.
+        let buf = Buffer::new("aд🙂b");
+        assert_eq!(buf.len_bytes(), 8);
+        assert_eq!(buf.byte_to_utf16(3), 2); // after 'a' + 'д'
+        assert_eq!(buf.utf16_to_byte(4), 7); // after 'a' + 'д' + '🙂'
+        assert_eq!(buf.slice_bytes(1..3), "д");
+    }
+
+    #[test]
+    fn edit_bytes() {
+        let mut buf = Buffer::new("ёлки");
+        buf.edit_bytes(0..2, "П");
+        assert_eq!(buf.text(), "Плки");
+    }
 
     #[test]
     fn edit_and_snapshot_isolation() {

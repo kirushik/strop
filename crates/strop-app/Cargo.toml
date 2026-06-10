@@ -13,3 +13,4 @@ path = "src/main.rs"
 strop-core = { workspace = true }
 gpui = { workspace = true }
 anyhow = { workspace = true }
+unicode-segmentation = "1"
