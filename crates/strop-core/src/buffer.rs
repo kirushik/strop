@@ -100,30 +100,40 @@ impl Buffer {
     }
 
     /// Replace `char_range` with `text` as its own transaction.
-    pub fn edit(&mut self, char_range: Range<usize>, text: &str) {
-        self.apply_edit(char_range, text, false);
+    /// Returns true when this started a new transaction (vs coalescing).
+    pub fn edit(&mut self, char_range: Range<usize>, text: &str) -> bool {
+        self.apply_edit(char_range, text, false)
     }
 
     /// Replace `byte_range` (UTF-8 offsets) with `text`. UI layers work in
     /// byte offsets (text layout) and UTF-16 (IME); chars are internal.
-    pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
+    pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) -> bool {
         let range = self.byte_range_to_chars(byte_range);
-        self.apply_edit(range, text, false);
+        self.apply_edit(range, text, false)
     }
 
     /// Like `edit_bytes`, but coalesces with the previous edit when it
     /// continues the same typing/deleting run. Word-granularity: an inserted
     /// whitespace closes the group.
-    pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
+    pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) -> bool {
         let range = self.byte_range_to_chars(byte_range);
-        self.apply_edit(range, text, true);
+        self.apply_edit(range, text, true)
+    }
+
+    /// Push an empty transaction: an undoable step with no text change
+    /// (formatting toggles). The owner tracks the non-text state itself,
+    /// aligned with transaction boundaries.
+    pub fn push_empty_transaction(&mut self) {
+        self.group_open = false;
+        self.redo_stack.clear();
+        self.undo_stack.push(Transaction { edits: Vec::new() });
     }
 
     fn byte_range_to_chars(&self, byte_range: Range<usize>) -> Range<usize> {
         self.rope.byte_to_char(byte_range.start)..self.rope.byte_to_char(byte_range.end)
     }
 
-    fn apply_edit(&mut self, char_range: Range<usize>, text: &str, coalesce: bool) {
+    fn apply_edit(&mut self, char_range: Range<usize>, text: &str, coalesce: bool) -> bool {
         let edit = Edit {
             start: char_range.start,
             old: self.rope.slice(char_range.clone()).to_string(),
@@ -150,16 +160,19 @@ impl Buffer {
         self.group_open = coalesce && !edit.new.chars().any(char::is_whitespace);
         if extend {
             self.undo_stack.last_mut().unwrap().edits.push(edit);
+            false
         } else {
             self.undo_stack.push(Transaction { edits: vec![edit] });
+            true
         }
     }
 
-    /// Undo the last transaction. Returns a char offset for the cursor.
-    pub fn undo(&mut self) -> Option<usize> {
+    /// Undo the last transaction. Outer None = nothing to undo; inner None =
+    /// a format-only transaction (no text change, keep the cursor).
+    pub fn undo(&mut self) -> Option<Option<usize>> {
         self.group_open = false;
         let tx = self.undo_stack.pop()?;
-        let mut cursor = 0;
+        let mut cursor = None;
         for edit in tx.edits.iter().rev() {
             let end = edit.start + edit.new_chars();
             self.ops.push(TextOp {
@@ -169,18 +182,18 @@ impl Buffer {
             });
             self.rope.remove(edit.start..end);
             self.rope.insert(edit.start, &edit.old);
-            cursor = edit.start + edit.old_chars();
+            cursor = Some(edit.start + edit.old_chars());
         }
         self.version += 1;
         self.redo_stack.push(tx);
         Some(cursor)
     }
 
-    /// Redo the last undone transaction. Returns a char offset for the cursor.
-    pub fn redo(&mut self) -> Option<usize> {
+    /// Redo the last undone transaction. Same contract as `undo`.
+    pub fn redo(&mut self) -> Option<Option<usize>> {
         self.group_open = false;
         let tx = self.redo_stack.pop()?;
-        let mut cursor = 0;
+        let mut cursor = None;
         for edit in &tx.edits {
             let end = edit.start + edit.old_chars();
             self.ops.push(TextOp {
@@ -190,7 +203,7 @@ impl Buffer {
             });
             self.rope.remove(edit.start..end);
             self.rope.insert(edit.start, &edit.new);
-            cursor = edit.start + edit.new_chars();
+            cursor = Some(edit.start + edit.new_chars());
         }
         self.version += 1;
         self.undo_stack.push(tx);
@@ -287,7 +300,7 @@ mod tests {
         buf.edit(3..3, "def");
         buf.edit(0..1, "X");
         assert_eq!(buf.text(), "Xbcdef");
-        assert_eq!(buf.undo(), Some(1));
+        assert_eq!(buf.undo(), Some(Some(1)));
         assert_eq!(buf.text(), "abcdef");
         buf.undo();
         assert_eq!(buf.text(), "abc");

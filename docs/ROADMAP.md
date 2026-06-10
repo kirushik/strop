@@ -13,9 +13,13 @@ unless they'd be expensive to reverse.
 
 - [x] A1. Bold rendering (static Literata faces; variable axes unsupported
       by GPUI on Linux), highlight verified, run-construction tests.
-- [ ] A2. **Durable formatting**: mirror SpanSet into Loro Peritext marks
-      (expand-config parity, roundtrip tests), load marks on open;
-      formatting joins transaction history so undo restores spans.
+- [x] A2. **Durable formatting**: SpanSet persists as Loro Peritext marks
+      (rebuilt wholesale at save time — durability lives at the disk
+      boundary, which sidesteps expand-rule drift; live mirroring waits
+      for multiplayer), loaded on open; formatting joined transaction
+      history via per-transaction span snapshots, so undo/redo restore
+      spans. Selection composites over content backgrounds (Kirill's
+      visibility requirement) via alpha blending.
 - [ ] A3. **BlockMap**: per-block kinds (paragraph, heading 1–3, quote,
       list item, divider, code block, footnote def) over the same text
       stream; block-aware rendering (sizes/leading on the 28px rhythm,
@@ -51,9 +55,12 @@ unless they'd be expensive to reverse.
       (ctrl-m) anchored to ranges, rendered in the right margin, surviving
       edits (SpanSet math + Loro cursors), resolve/delete. Proves the
       margin interaction.
-- [ ] C2. **LLM plumbing**: BYO-key config (~/.config/strop/config.toml),
-      Anthropic API first (background thread + channel into GPUI's
-      executor; mind the smol-vs-tokio trap), non-streaming.
+- [ ] C2. **LLM plumbing**: BYO-key config (~/.config/strop/config.toml)
+      as an **OpenAI-compatible chat-completions client with configurable
+      base_url/key/model** — one client covers Poe (Kirill's subscription,
+      explicitly requested), OpenAI, OpenRouter, ollama/llama.cpp, and
+      Anthropic's compat endpoint. Background thread + channel into GPUI's
+      executor (mind the smol-vs-tokio trap), non-streaming first.
 - [ ] C3. **Diagnosis run**: document/selection scope -> diagnosis-first
       prompt (named problems as queries, zero rewrites, Gaiman guardrail;
       levels-of-edit as a mode switch: developmental/line/copy) ->

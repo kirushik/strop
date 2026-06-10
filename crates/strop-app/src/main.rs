@@ -8,6 +8,7 @@ use gpui::{
     actions, prelude::*, px, size,
 };
 use strop_core::Store;
+use strop_core::document::SpanSet;
 
 use editor::Editor;
 
@@ -79,15 +80,15 @@ fn main() {
                 }
             }
         };
-        let initial_text = match &store {
+        let (initial_text, initial_spans) = match &store {
             Some((store, existing)) => match existing {
-                Some(text) => text.clone(),
+                Some((text, spans)) => (text.clone(), spans.clone()),
                 None => {
                     store.seed(SAMPLE);
-                    SAMPLE.to_owned()
+                    (SAMPLE.to_owned(), SpanSet::default())
                 }
             },
-            None => SAMPLE.to_owned(),
+            None => (SAMPLE.to_owned(), SpanSet::default()),
         };
 
         let bounds = Bounds::centered(None, size(px(960.), px(720.)), cx);
@@ -103,7 +104,7 @@ fn main() {
             },
             |window, cx| {
                 let editor = cx.new(|cx| {
-                    let mut editor = Editor::new(cx, &initial_text);
+                    let mut editor = Editor::new(cx, &initial_text, initial_spans);
                     editor.start_blink(cx);
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);

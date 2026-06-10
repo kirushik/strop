@@ -19,8 +19,8 @@ use gpui::{
     UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*,
     px, relative, rgb, rgba, size,
 };
-use strop_core::document::{InlineAttr, SpanSet};
-use strop_core::{Buffer, Store, typograph};
+use strop_core::document::{Document, InlineAttr, SpanSet};
+use strop_core::{Store, typograph};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const BG_COLOR: u32 = 0xFBFAF8;
@@ -108,12 +108,9 @@ pub fn bind_keys(cx: &mut App) {
 
 pub struct Editor {
     focus_handle: FocusHandle,
-    buffer: Buffer,
-    /// Inline formatting (char-indexed); kept consistent with every edit via
-    /// the op fan-out in `sync_mutations`.
-    /// TODO(durable formatting): mirror into Loro Peritext marks and load on
-    /// open — formatting is session-only until then; text persists.
-    spans: SpanSet,
+    /// Text + formatting with unified transaction history. Marks persist
+    /// via Store::save_with_marks at save time.
+    doc: Document,
     /// Sticky caret formatting: toggles made with an empty selection apply
     /// to the next typed text. (attr, on) overrides what the position would
     /// inherit; cleared by any caret motion.
@@ -288,11 +285,10 @@ impl TextFrame {
 }
 
 impl Editor {
-    pub fn new(cx: &mut Context<Self>, text: &str) -> Self {
+    pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            buffer: Buffer::new(text),
-            spans: SpanSet::default(),
+            doc: Document::new(text, spans),
             caret_attrs: Vec::new(),
             selected_range: 0..0,
             selection_reversed: false,
@@ -341,12 +337,9 @@ impl Editor {
     /// Fan buffer changes out to every offset-tracking consumer (formatting
     /// spans, durable store). Must run after every mutation.
     fn sync_mutations(&mut self) {
-        let ops = self.buffer.take_ops();
+        let ops = self.doc.take_ops();
         if ops.is_empty() {
             return;
-        }
-        for op in &ops {
-            self.spans.apply_op(op);
         }
         if let Some(store) = &self.store {
             store.apply(&ops);
@@ -357,7 +350,7 @@ impl Editor {
     pub fn save_now(&mut self) {
         self.sync_mutations();
         if let Some(store) = &self.store {
-            match store.save() {
+            match store.save_with_marks(self.doc.spans()) {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
             }
@@ -369,10 +362,10 @@ impl Editor {
     /// span, or at the right edge of an expanding one.
     fn caret_inherits(&self, attr: &InlineAttr) -> bool {
         let pos = self
-            .buffer
+            .doc
             .rope()
             .byte_to_char(self.selected_range.start);
-        self.spans.spans().iter().any(|s| {
+        self.doc.spans().spans().iter().any(|s| {
             s.attr == *attr
                 && (s.range.start < pos && pos < s.range.end
                     || s.range.end == pos && s.attr.expands())
@@ -388,10 +381,10 @@ impl Editor {
             }
             self.caret_inherits(attr)
         } else {
-            let rope = self.buffer.rope();
+            let rope = self.doc.rope();
             let range = rope.byte_to_char(self.selected_range.start)
                 ..rope.byte_to_char(self.selected_range.end);
-            self.spans.covers(range, attr)
+            self.doc.spans().covers(range, attr)
         }
     }
 
@@ -406,14 +399,11 @@ impl Editor {
             cx.notify();
             return;
         }
-        let rope = self.buffer.rope();
+        let rope = self.doc.rope();
         let range =
             rope.byte_to_char(self.selected_range.start)..rope.byte_to_char(self.selected_range.end);
-        if self.spans.covers(range.clone(), &attr) {
-            self.spans.remove(range, &attr);
-        } else {
-            self.spans.add(range, attr);
-        }
+        self.doc.toggle_format(range, attr);
+        self.store_dirty = true;
         cx.notify();
     }
 
@@ -495,7 +485,7 @@ impl Editor {
     /// is published; middle-click pastes it. No-op on other platforms.
     fn publish_primary(&self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            let text = self.buffer.slice_bytes(self.selected_range.clone());
+            let text = self.doc.slice_bytes(self.selected_range.clone());
             cx.write_to_primary(ClipboardItem::new_string(text));
         }
     }
@@ -514,7 +504,7 @@ impl Editor {
 
     /// Start/end of the *paragraph* (rope line) containing `offset`.
     fn paragraph_bounds(&self, offset: usize) -> (usize, usize) {
-        let rope = self.buffer.rope();
+        let rope = self.doc.rope();
         let line_ix = rope.byte_to_line(offset);
         let start = rope.line_to_byte(line_ix);
         let end = if line_ix + 1 < rope.len_lines() {
@@ -550,14 +540,14 @@ impl Editor {
         if offset == start {
             return offset - 1; // step over the newline
         }
-        let line = self.buffer.slice_bytes(start..offset);
+        let line = self.doc.slice_bytes(start..offset);
         line.grapheme_indices(true)
             .next_back()
             .map_or(start, |(ix, _)| start + ix)
     }
 
     fn next_boundary(&self, offset: usize) -> usize {
-        let len = self.buffer.len_bytes();
+        let len = self.doc.len_bytes();
         if offset >= len {
             return len;
         }
@@ -565,7 +555,7 @@ impl Editor {
         if offset == end {
             return offset + 1; // step over the newline
         }
-        let line = self.buffer.slice_bytes(offset..end);
+        let line = self.doc.slice_bytes(offset..end);
         line.grapheme_indices(true)
             .nth(1)
             .map_or(end, |(ix, _)| offset + ix)
@@ -580,7 +570,7 @@ impl Editor {
             // Continue the search from the end of the previous paragraph.
             return self.previous_word_boundary(offset - 1).max(0);
         }
-        let line = self.buffer.slice_bytes(start..offset);
+        let line = self.doc.slice_bytes(start..offset);
         line.split_word_bound_indices()
             .rev()
             .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
@@ -588,7 +578,7 @@ impl Editor {
     }
 
     fn next_word_boundary(&self, offset: usize) -> usize {
-        let len = self.buffer.len_bytes();
+        let len = self.doc.len_bytes();
         if offset >= len {
             return len;
         }
@@ -596,7 +586,7 @@ impl Editor {
         if offset == end {
             return self.next_word_boundary(offset + 1).min(len);
         }
-        let line = self.buffer.slice_bytes(offset..end);
+        let line = self.doc.slice_bytes(offset..end);
         line.split_word_bound_indices()
             .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
             .map_or(end, |(ix, seg)| offset + ix + seg.len())
@@ -618,7 +608,7 @@ impl Editor {
     /// To end of current paragraph, or of the next one when already at an end.
     fn next_paragraph_boundary(&self, offset: usize) -> usize {
         let (_, end) = self.paragraph_bounds(offset);
-        let len = self.buffer.len_bytes();
+        let len = self.doc.len_bytes();
         if offset < end {
             end
         } else if end < len {
@@ -635,7 +625,7 @@ impl Editor {
             return start..end;
         }
         let local = (offset - start).min(end - start - 1);
-        let line = self.buffer.slice_bytes(start..end);
+        let line = self.doc.slice_bytes(start..end);
         for (ix, seg) in line.split_word_bound_indices() {
             if ix <= local && local < ix + seg.len() {
                 return start + ix..start + ix + seg.len();
@@ -839,7 +829,7 @@ impl Editor {
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
-        self.select_to(self.buffer.len_bytes(), cx);
+        self.select_to(self.doc.len_bytes(), cx);
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
@@ -871,7 +861,7 @@ impl Editor {
     }
 
     fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.buffer.len_bytes(), cx);
+        self.move_to(self.doc.len_bytes(), cx);
     }
 
     fn select_to_doc_start(
@@ -884,7 +874,7 @@ impl Editor {
     }
 
     fn select_to_doc_end(&mut self, _: &SelectToDocEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.buffer.len_bytes(), cx);
+        self.select_to(self.doc.len_bytes(), cx);
     }
 
     fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -938,14 +928,14 @@ impl Editor {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            let text = self.buffer.slice_bytes(self.selected_range.clone());
+            let text = self.doc.slice_bytes(self.selected_range.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            let text = self.buffer.slice_bytes(self.selected_range.clone());
+            let text = self.doc.slice_bytes(self.selected_range.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.replace_text_in_range(None, "", window, cx);
         }
@@ -959,9 +949,11 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(cursor_char) = self.buffer.undo() {
-            let cursor = self.buffer.char_to_byte(cursor_char);
-            self.selected_range = cursor..cursor;
+        if let Some(cursor_char) = self.doc.undo() {
+            if let Some(cursor_char) = cursor_char {
+                let cursor = self.doc.char_to_byte(cursor_char);
+                self.selected_range = cursor..cursor;
+            }
             self.selection_reversed = false;
             self.cursor_affinity_down = false;
             self.goal_x = None;
@@ -974,9 +966,11 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(cursor_char) = self.buffer.redo() {
-            let cursor = self.buffer.char_to_byte(cursor_char);
-            self.selected_range = cursor..cursor;
+        if let Some(cursor_char) = self.doc.redo() {
+            if let Some(cursor_char) = cursor_char {
+                let cursor = self.doc.char_to_byte(cursor_char);
+                self.selected_range = cursor..cursor;
+            }
             self.selection_reversed = false;
             self.cursor_affinity_down = false;
             self.goal_x = None;
@@ -1168,22 +1162,22 @@ impl Editor {
         match frame.cursor_position(cursor, self.cursor_affinity_down) {
             Some((par, line, x)) => {
                 let tail_start = self
-                    .buffer
+                    .doc
                     .rope()
                     .byte_to_char(cursor)
                     .saturating_sub(12);
                 let tail: String = self
-                    .buffer
+                    .doc
                     .rope()
                     .chars_at(tail_start)
-                    .take(self.buffer.rope().byte_to_char(cursor) - tail_start)
+                    .take(self.doc.rope().byte_to_char(cursor) - tail_start)
                     .collect();
                 format!(
                     "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?} scroll={:?} tail={tail:?} spans={:?}",
                     self.cursor_affinity_down as u8,
                     self.selected_range,
                     self.scroll_top,
-                    self.spans.spans()
+                    self.doc.spans().spans()
                 )
             }
             None => format!("off={cursor} (no paragraph)"),
@@ -1191,11 +1185,11 @@ impl Editor {
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.buffer.byte_to_utf16(range.start)..self.buffer.byte_to_utf16(range.end)
+        self.doc.byte_to_utf16(range.start)..self.doc.byte_to_utf16(range.end)
     }
 
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.buffer.utf16_to_byte(range.start)..self.buffer.utf16_to_byte(range.end)
+        self.doc.utf16_to_byte(range.start)..self.doc.utf16_to_byte(range.end)
     }
 
     /// Core text replacement; optionally runs the typograph on the result.
@@ -1212,20 +1206,20 @@ impl Editor {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.buffer.edit_bytes_coalescing(range.clone(), new_text);
+        self.doc.edit_bytes_coalescing(range.clone(), new_text);
         let mut cursor = range.start + new_text.len();
 
         if typograph {
             let (par_start, _) = self.paragraph_bounds(cursor);
-            let prefix = self.buffer.slice_bytes(par_start..cursor);
-            let lang = typograph::detect_lang(self.buffer.rope().chars());
+            let prefix = self.doc.slice_bytes(par_start..cursor);
+            let lang = typograph::detect_lang(self.doc.rope().chars());
             if let Some(sub) = typograph::process(&prefix, lang) {
                 // The substitution is its own transaction: one undo reverts
                 // it alone, restoring the literally-typed characters — and
                 // since rules fire only on the typed char, the restored text
                 // never re-fires (the Birman override contract).
                 let start = cursor - sub.span;
-                self.buffer.edit_bytes(start..cursor, &sub.text);
+                self.doc.edit_bytes(start..cursor, &sub.text);
                 cursor = start + sub.text.len();
             }
         }
@@ -1241,16 +1235,12 @@ impl Editor {
         // sync, so it layers over the spans' own expansion behavior).
         if !new_text.is_empty() && !self.caret_attrs.is_empty() {
             let char_range = {
-                let rope = self.buffer.rope();
+                let rope = self.doc.rope();
                 rope.byte_to_char(range.start)..rope.byte_to_char(cursor)
             };
             if char_range.start < char_range.end {
                 for (attr, on) in self.caret_attrs.clone() {
-                    if on {
-                        self.spans.add(char_range.clone(), attr);
-                    } else {
-                        self.spans.remove(char_range.clone(), &attr);
-                    }
+                    self.doc.format_in_current_tx(char_range.clone(), attr, on);
                 }
             }
         }
@@ -1270,7 +1260,7 @@ impl EntityInputHandler for Editor {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
-        Some(self.buffer.slice_bytes(range))
+        Some(self.doc.slice_bytes(range))
     }
 
     fn selected_text_range(
@@ -1320,7 +1310,7 @@ impl EntityInputHandler for Editor {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.buffer.edit_bytes(range.clone(), new_text);
+        self.doc.edit_bytes(range.clone(), new_text);
         self.marked_range = if new_text.is_empty() {
             None
         } else {
@@ -1365,7 +1355,7 @@ impl EntityInputHandler for Editor {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let (byte_ix, _) = self.index_for_mouse(point);
-        Some(self.buffer.byte_to_utf16(byte_ix))
+        Some(self.doc.byte_to_utf16(byte_ix))
     }
 }
 
@@ -1388,6 +1378,28 @@ impl IntoElement for EditorElement {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+/// Alpha source-over compositing, so selection never hides content
+/// backgrounds (highlight, code — and later annotation markings): partial
+/// overlaps already split into their own runs by the cut logic.
+fn blend_over(top: gpui::Rgba, bottom: gpui::Rgba) -> gpui::Rgba {
+    let a = top.a + bottom.a * (1. - top.a);
+    if a <= f32::EPSILON {
+        return gpui::Rgba {
+            r: 0.,
+            g: 0.,
+            b: 0.,
+            a: 0.,
+        };
+    }
+    let ch = |t: f32, b: f32| (t * top.a + b * bottom.a * (1. - top.a)) / a;
+    gpui::Rgba {
+        r: ch(top.r, bottom.r),
+        g: ch(top.g, bottom.g),
+        b: ch(top.b, bottom.b),
+        a,
     }
 }
 
@@ -1422,7 +1434,9 @@ fn runs_for_paragraph(
 
             let mut font = base.font.clone();
             let mut color = base.color;
-            let mut background = in_selection.then(|| rgba(SELECTION_COLOR).into());
+            // Content background (highlight/code); selection composites
+            // over it at the end instead of replacing it.
+            let mut content_bg: Option<gpui::Rgba> = None;
             let mut underline = in_marked.then(|| UnderlineStyle {
                 color: Some(base.color),
                 thickness: px(1.),
@@ -1451,15 +1465,11 @@ fn runs_for_paragraph(
                         });
                     }
                     InlineAttr::Highlight => {
-                        if background.is_none() {
-                            background = Some(rgba(HIGHLIGHT_COLOR).into());
-                        }
+                        content_bg.get_or_insert(rgba(HIGHLIGHT_COLOR));
                     }
                     InlineAttr::Code => {
                         font.family = CODE_FONT.into();
-                        if background.is_none() {
-                            background = Some(rgba(CODE_BG_COLOR).into());
-                        }
+                        content_bg.get_or_insert(rgba(CODE_BG_COLOR));
                     }
                     InlineAttr::Link(_) => {
                         color = rgb(LINK_COLOR).into();
@@ -1472,6 +1482,13 @@ fn runs_for_paragraph(
                     InlineAttr::FootnoteRef(_) => {}
                 }
             }
+
+            let background = match (in_selection, content_bg) {
+                (true, Some(bg)) => Some(blend_over(rgba(SELECTION_COLOR), bg).into()),
+                (true, None) => Some(rgba(SELECTION_COLOR).into()),
+                (false, Some(bg)) => Some(bg.into()),
+                (false, None) => None,
+            };
 
             TextRun {
                 len: w[1] - w[0],
@@ -1527,7 +1544,7 @@ impl Element for EditorElement {
         let wrap_width = bounds.size.width;
         let viewport = bounds.size.height;
 
-        let text = editor.buffer.text();
+        let text = editor.doc.text();
         let selection = editor.selected_range.clone();
         let marked = editor.marked_range.clone();
         let cursor_offset = editor.cursor_offset();
@@ -1537,9 +1554,10 @@ impl Element for EditorElement {
         let autoscroll = editor.autoscroll_request;
         // Formatting spans, converted to byte ranges for this frame.
         let spans_bytes: Vec<(Range<usize>, InlineAttr)> = {
-            let rope = editor.buffer.rope();
+            let rope = editor.doc.rope();
             editor
-                .spans
+                .doc
+                .spans()
                 .spans()
                 .iter()
                 .map(|s| {
@@ -1939,18 +1957,31 @@ mod tests {
     }
 
     #[test]
-    fn selection_masks_highlight_background() {
-        // Standard behavior: while selected, the selection color wins.
+    fn selection_composites_over_highlight() {
+        // Markings stay visible through selection: the selected-and-
+        // highlighted segment gets a blend distinct from both pure colors;
+        // partial overlap splits into its own runs.
         let par = 0..6;
         let spans = vec![(0..6, InlineAttr::Highlight)];
         let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &base());
-        let selected = &runs[1];
-        assert_eq!(
-            selected.background_color,
+        let blended = blend_over(rgba(SELECTION_COLOR), rgba(HIGHLIGHT_COLOR));
+        assert_eq!(runs[1].background_color, Some(blended.into()));
+        assert_ne!(
+            runs[1].background_color,
             Some(rgba(SELECTION_COLOR).into())
         );
-        // Outside the selection the highlight shows.
+        assert_ne!(
+            runs[1].background_color,
+            Some(rgba(HIGHLIGHT_COLOR).into())
+        );
+        // Outside the selection the pure highlight shows.
         assert_eq!(runs[0].background_color, Some(rgba(HIGHLIGHT_COLOR).into()));
+        // Selection over plain text stays the plain selection color.
+        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &base());
+        assert_eq!(
+            plain[1].background_color,
+            Some(rgba(SELECTION_COLOR).into())
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use crate::buffer::TextOp;
+use crate::buffer::{Buffer, TextOp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineAttr {
@@ -58,7 +58,7 @@ pub struct Span {
 }
 
 /// Inline formatting as an interval set, kept sorted by start.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SpanSet {
     spans: Vec<Span>,
 }
@@ -188,6 +188,144 @@ impl SpanSet {
     }
 }
 
+/// Text + formatting with unified, transaction-aligned undo. The buffer
+/// owns text history; span states are snapshotted per transaction (span
+/// sets are small — snapshots beat op inversion on simplicity).
+#[derive(Debug, Default)]
+pub struct Document {
+    buffer: Buffer,
+    spans: SpanSet,
+    span_undo: Vec<SpanSet>,
+    span_redo: Vec<SpanSet>,
+    pending_ops: Vec<TextOp>,
+}
+
+impl Document {
+    pub fn new(text: &str, spans: SpanSet) -> Self {
+        Self {
+            buffer: Buffer::new(text),
+            spans,
+            ..Default::default()
+        }
+    }
+
+    pub fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
+    pub fn spans(&self) -> &SpanSet {
+        &self.spans
+    }
+
+    // Hot-path delegates, so the editor reads as `doc.rope()` etc.
+    pub fn rope(&self) -> &ropey::Rope {
+        self.buffer.rope()
+    }
+
+    pub fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.buffer.len_bytes()
+    }
+
+    pub fn slice_bytes(&self, range: Range<usize>) -> String {
+        self.buffer.slice_bytes(range)
+    }
+
+    pub fn byte_to_utf16(&self, byte: usize) -> usize {
+        self.buffer.byte_to_utf16(byte)
+    }
+
+    pub fn utf16_to_byte(&self, utf16: usize) -> usize {
+        self.buffer.utf16_to_byte(utf16)
+    }
+
+    pub fn char_to_byte(&self, ch: usize) -> usize {
+        self.buffer.char_to_byte(ch)
+    }
+
+    /// Drain text ops for the durable-store mirror.
+    pub fn take_ops(&mut self) -> Vec<TextOp> {
+        std::mem::take(&mut self.pending_ops)
+    }
+
+    fn absorb_buffer_ops(&mut self) {
+        let ops = self.buffer.take_ops();
+        for op in &ops {
+            self.spans.apply_op(op);
+        }
+        self.pending_ops.extend(ops);
+    }
+
+    pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
+        let snapshot = self.spans.clone();
+        if self.buffer.edit_bytes(byte_range, text) {
+            self.span_undo.push(snapshot);
+            self.span_redo.clear();
+        }
+        self.absorb_buffer_ops();
+    }
+
+    pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
+        let snapshot = self.spans.clone();
+        if self.buffer.edit_bytes_coalescing(byte_range, text) {
+            self.span_undo.push(snapshot);
+            self.span_redo.clear();
+        }
+        self.absorb_buffer_ops();
+    }
+
+    /// Toggle `attr` over a char range as its own undoable transaction.
+    pub fn toggle_format(&mut self, range: Range<usize>, attr: InlineAttr) {
+        let snapshot = self.spans.clone();
+        self.buffer.push_empty_transaction();
+        self.span_undo.push(snapshot);
+        self.span_redo.clear();
+        if self.spans.covers(range.clone(), &attr) {
+            self.spans.remove(range, &attr);
+        } else {
+            self.spans.add(range, attr);
+        }
+    }
+
+    /// Apply/clear an attribute inside the *current* transaction (sticky
+    /// caret formatting riding a typing transaction) — undone together
+    /// with the typed text.
+    pub fn format_in_current_tx(&mut self, range: Range<usize>, attr: InlineAttr, on: bool) {
+        if on {
+            self.spans.add(range, attr);
+        } else {
+            self.spans.remove(range, &attr);
+        }
+    }
+
+    /// Undo one transaction (text and formatting together). Outer None =
+    /// nothing to undo; inner None = format-only (keep the cursor).
+    pub fn undo(&mut self) -> Option<Option<usize>> {
+        let cursor = self.buffer.undo()?;
+        if let Some(snapshot) = self.span_undo.pop() {
+            self.span_redo
+                .push(std::mem::replace(&mut self.spans, snapshot));
+        }
+        // Buffer inverse ops still mirror to the store, but must NOT be
+        // re-applied to spans (the snapshot already is the correct state).
+        self.pending_ops.extend(self.buffer.take_ops());
+        Some(cursor)
+    }
+
+    pub fn redo(&mut self) -> Option<Option<usize>> {
+        let cursor = self.buffer.redo()?;
+        if let Some(snapshot) = self.span_redo.pop() {
+            self.span_undo
+                .push(std::mem::replace(&mut self.spans, snapshot));
+        }
+        self.pending_ops.extend(self.buffer.take_ops());
+        Some(cursor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +447,44 @@ mod tests {
         set.add(0..4, InlineAttr::Code);
         set.add(4..8, InlineAttr::Code); // Code merges too via add
         assert!(set.covers(2..6, &InlineAttr::Code));
+    }
+
+    #[test]
+    fn format_toggle_is_undoable() {
+        let mut doc = Document::new("hello world", SpanSet::default());
+        doc.toggle_format(0..5, InlineAttr::Strong);
+        assert!(doc.spans().covers(0..5, &InlineAttr::Strong));
+        // Format-only transaction: undo keeps the cursor (inner None).
+        assert_eq!(doc.undo(), Some(None));
+        assert!(doc.spans().spans().is_empty());
+        doc.redo();
+        assert!(doc.spans().covers(0..5, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn typing_with_sticky_attr_undoes_together() {
+        let mut doc = Document::new("", SpanSet::default());
+        doc.edit_bytes_coalescing(0..0, "w");
+        doc.format_in_current_tx(0..1, InlineAttr::Strong, true);
+        doc.edit_bytes_coalescing(1..1, "o"); // same tx; expansion grows span
+        assert!(doc.spans().covers(0..2, &InlineAttr::Strong));
+        assert_eq!(doc.undo(), Some(Some(0)));
+        assert_eq!(doc.text(), "");
+        assert!(doc.spans().spans().is_empty());
+    }
+
+    #[test]
+    fn undo_restores_formatting_deleted_with_text() {
+        // The smoke-run bug: delete styled text, undo, the style returns
+        // (and the neighbor no longer swallows the restored range).
+        let mut doc = Document::new("bold plain", SpanSet::default());
+        doc.toggle_format(0..4, InlineAttr::Strong);
+        doc.edit_bytes(2..8, "");
+        assert_eq!(doc.text(), "boin");
+        doc.undo();
+        assert_eq!(doc.text(), "bold plain");
+        assert!(doc.spans().covers(0..4, &InlineAttr::Strong));
+        assert!(!doc.spans().covers(0..5, &InlineAttr::Strong));
     }
 
     #[test]
