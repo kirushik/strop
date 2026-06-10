@@ -46,8 +46,16 @@ unless they'd be expensive to reverse.
       rendering via gpui img.
 - [ ] B4. File UX: ctrl-o open (.strop/.md via xdg portal dialog), recent
       files on the bar?, save-as. Keep minimal.
-- [ ] B5. **Checkpoints** (rough): named checkpoint action, list, restore
-      — the durable layer's history made visible. Minimal UI.
+- [~] B5. **Checkpoints & persistent history** (plumbing done 2026-06-11,
+      pulled forward on Kirill's ask — "Google-Docs Rewind, local-first,
+      self-contained file" resonates with his interviewees):
+      cross-session undo/redo (transaction stacks + span/block snapshots
+      persisted atomically with the text; one lifecycle for typing AND
+      formatting — Kirill's unification principle), auto "Session start"
+      checkpoint on open, ctrl-alt-s named checkpoints, Frontiers-based
+      time-travel reads (state_at), restore-as-forward-edit semantics.
+      REMAINING: the rewind UI (checkpoint list, preview, restore button)
+      and an in-app naming input.
 
 ## Phase C — The thesis: diagnosis margin
 

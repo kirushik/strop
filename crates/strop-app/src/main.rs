@@ -85,15 +85,25 @@ fn main() {
                 }
             }
         };
-        let (initial_text, initial_spans, initial_blocks) = match &store {
+        let (initial_text, initial_spans, initial_blocks, initial_history) = match &store {
             Some((store, existing)) => match existing {
-                Some((text, spans, blocks)) => (text.clone(), spans.clone(), blocks.clone()),
+                Some(loaded) => {
+                    // "Undo everything since I sat down" is always one
+                    // visible restore away.
+                    store.add_checkpoint("Session start");
+                    (
+                        loaded.text.clone(),
+                        loaded.spans.clone(),
+                        loaded.blocks.clone(),
+                        loaded.history.clone(),
+                    )
+                }
                 None => {
                     store.seed(SAMPLE);
-                    (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default())
+                    (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default(), None)
                 }
             },
-            None => (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default()),
+            None => (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default(), None),
         };
 
         let bounds = Bounds::centered(None, size(px(960.), px(720.)), cx);
@@ -110,6 +120,9 @@ fn main() {
             |window, cx| {
                 let editor = cx.new(|cx| {
                     let mut editor = Editor::new(cx, &initial_text, initial_spans, initial_blocks);
+                    if let Some(history) = initial_history {
+                        editor.restore_history(history);
+                    }
                     editor.start_blink(cx);
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);

@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use ropey::Rope;
+use serde::{Deserialize, Serialize};
 
 /// The hot-path text buffer: a rope plus a transaction-grouped undo history.
 /// Anchors land here next, designed against `Snapshot` from day one so AI
@@ -37,14 +38,14 @@ pub struct Snapshot {
 
 /// One undoable user-visible step; may group several primitive edits
 /// (e.g. the keystrokes of a word).
-#[derive(Debug)]
-struct Transaction {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Transaction {
     edits: Vec<Edit>,
 }
 
 /// A primitive edit, recorded in the char coordinates that were valid at the
 /// moment it was applied (so a transaction undoes cleanly in reverse order).
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Edit {
     start: usize,
     old: String,
@@ -172,6 +173,11 @@ impl Buffer {
     pub fn undo(&mut self) -> Option<Option<usize>> {
         self.group_open = false;
         let tx = self.undo_stack.pop()?;
+        if !self.tx_in_bounds(&tx, false) {
+            // Corrupted persisted history: drop it rather than panic.
+            self.undo_stack.clear();
+            return None;
+        }
         let mut cursor = None;
         for edit in tx.edits.iter().rev() {
             let end = edit.start + edit.new_chars();
@@ -193,6 +199,10 @@ impl Buffer {
     pub fn redo(&mut self) -> Option<Option<usize>> {
         self.group_open = false;
         let tx = self.redo_stack.pop()?;
+        if !self.tx_in_bounds(&tx, true) {
+            self.redo_stack.clear();
+            return None;
+        }
         let mut cursor = None;
         for edit in &tx.edits {
             let end = edit.start + edit.old_chars();
@@ -213,6 +223,45 @@ impl Buffer {
     /// Drain the mirror log. Call after every mutation batch.
     pub fn take_ops(&mut self) -> Vec<TextOp> {
         std::mem::take(&mut self.ops)
+    }
+
+    /// Clone the undo/redo transaction stacks for persistence, keeping at
+    /// most `cap` most-recent entries of each.
+    pub(crate) fn export_history(&self, cap: usize) -> (Vec<Transaction>, Vec<Transaction>) {
+        let tail = |v: &Vec<Transaction>| {
+            v[v.len().saturating_sub(cap)..].to_vec()
+        };
+        (tail(&self.undo_stack), tail(&self.redo_stack))
+    }
+
+    pub(crate) fn import_history(&mut self, undo: Vec<Transaction>, redo: Vec<Transaction>) {
+        self.undo_stack = undo;
+        self.redo_stack = redo;
+        self.group_open = false;
+    }
+
+    /// A transaction's edits are valid only against the text state they
+    /// were recorded for. Persisted history is saved atomically with that
+    /// text, but guard against corrupted/foreign files anyway. Edits apply
+    /// sequentially, so validity is checked against the *evolving* length.
+    fn tx_in_bounds(&self, tx: &Transaction, forward: bool) -> bool {
+        let mut len = self.rope.len_chars();
+        if forward {
+            for e in &tx.edits {
+                if e.start + e.old_chars() > len {
+                    return false;
+                }
+                len = len - e.old_chars() + e.new_chars();
+            }
+        } else {
+            for e in tx.edits.iter().rev() {
+                if e.start + e.new_chars() > len {
+                    return false;
+                }
+                len = len - e.new_chars() + e.old_chars();
+            }
+        }
+        true
     }
 
     pub fn snapshot(&self) -> Snapshot {

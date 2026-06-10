@@ -44,7 +44,7 @@ actions!(
         PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, Undo, Redo,
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
-        ToggleBulletList, ToggleOrderedList,
+        ToggleBulletList, ToggleOrderedList, AddCheckpoint,
     ]
 );
 
@@ -112,6 +112,7 @@ pub fn bind_keys(cx: &mut App) {
         // Google Docs list conventions.
         KeyBinding::new("ctrl-shift-8", ToggleBulletList, ctx),
         KeyBinding::new("ctrl-shift-7", ToggleOrderedList, ctx),
+        KeyBinding::new("ctrl-alt-s", AddCheckpoint, ctx),
     ]);
 }
 
@@ -365,10 +366,31 @@ impl Editor {
         }
     }
 
+    /// Restore persisted cross-session undo/redo.
+    pub fn restore_history(&mut self, history: strop_core::document::History) {
+        self.doc.import_history(history);
+    }
+
+    /// Record a named version snapshot in the document file.
+    fn add_checkpoint(&mut self, _: &AddCheckpoint, _: &mut Window, cx: &mut Context<Self>) {
+        self.sync_mutations();
+        if let Some(store) = &self.store {
+            let name = format!("Checkpoint {}", store.checkpoints().len() + 1);
+            store.add_checkpoint(&name);
+            self.store_dirty = true;
+            eprintln!("strop: recorded \"{name}\"");
+        }
+        cx.notify();
+    }
+
     pub fn save_now(&mut self) {
         self.sync_mutations();
         if let Some(store) = &self.store {
-            match store.save_with_state(self.doc.spans(), self.doc.blocks()) {
+            match store.save_with_state(
+                self.doc.spans(),
+                self.doc.blocks(),
+                &self.doc.export_history(200),
+            ) {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
             }
@@ -2180,6 +2202,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_code_block))
                     .on_action(cx.listener(Self::toggle_bullet_list))
                     .on_action(cx.listener(Self::toggle_ordered_list))
+                    .on_action(cx.listener(Self::add_checkpoint))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

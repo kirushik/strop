@@ -12,6 +12,8 @@ strop-core = { path = "crates/strop-core" }
 ropey = "1.6"
 loro = "1"
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Pinned to the published crate for now; expect to migrate to a git pin on
 # zed-industries/zed once we need post-0.2.2 APIs (the gpui/gpui_platform split).

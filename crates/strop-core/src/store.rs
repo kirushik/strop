@@ -11,13 +11,36 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use loro::{ExpandType, ExportMode, LoroDoc, LoroValue, StyleConfig, StyleConfigMap, TextDelta};
+use loro::{
+    ExpandType, ExportMode, Frontiers, LoroDoc, LoroValue, StyleConfig, StyleConfigMap, TextDelta,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::buffer::TextOp;
-use crate::document::{BlockKind, BlockMap, InlineAttr, SpanSet};
+use crate::document::{BlockKind, BlockMap, History, InlineAttr, SpanSet};
 
 const TEXT_CONTAINER: &str = "content";
 const BLOCKS_CONTAINER: &str = "blocks";
+const SESSION_CONTAINER: &str = "session";
+const CHECKPOINTS_CONTAINER: &str = "checkpoints";
+
+/// Everything a reopened document restores.
+pub struct Loaded {
+    pub text: String,
+    pub spans: SpanSet,
+    pub blocks: BlockMap,
+    pub history: Option<History>,
+}
+
+/// A named version snapshot: a Loro frontier (version vector position) the
+/// document can be rewound to. Lives inside the .strop file — Google-Docs
+/// version history, local-first and self-contained.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub name: String,
+    pub created_unix: i64,
+    pub frontiers: Vec<u8>,
+}
 
 /// One token per block, newline-joined (block text never contains '\n').
 /// Wholesale-rebuilt at save, like marks.
@@ -141,50 +164,120 @@ pub struct Store {
 impl Store {
     /// Open a `.strop` file. Returns the store and, when the file already
     /// existed, its text, formatting, and block kinds (None = brand-new).
-    pub fn open(
-        path: impl Into<PathBuf>,
-    ) -> io::Result<(Self, Option<(String, SpanSet, BlockMap)>)> {
+    pub fn open(path: impl Into<PathBuf>) -> io::Result<(Self, Option<Loaded>)> {
         let path = path.into();
         let doc = LoroDoc::new();
         doc.config_text_style(style_config());
-        let existing = match fs::read(&path) {
+        match fs::read(&path) {
             Ok(bytes) => {
                 doc.import(&bytes).map_err(io::Error::other)?;
-                let text = doc.get_text(TEXT_CONTAINER);
-                let mut spans = SpanSet::default();
-                let mut pos = 0usize;
-                for delta in text.to_delta() {
-                    if let TextDelta::Insert { insert, attributes } = delta {
-                        let len = insert.chars().count();
-                        for (key, value) in attributes.iter().flatten() {
-                            if let Some(attr) = attr_from(key, value) {
-                                spans.add(pos..pos + len, attr);
-                            }
-                        }
-                        pos += len;
+                let store = Self { doc, path };
+                let (text, spans, blocks) = store.read_state();
+                let history = match store.doc.get_map(SESSION_CONTAINER).get("history") {
+                    Some(v) => match v.into_value() {
+                        Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                Ok((
+                    store,
+                    Some(Loaded {
+                        text,
+                        spans,
+                        blocks,
+                        history,
+                    }),
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Self { doc, path }, None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Text + formatting + block kinds at the doc's *current* version
+    /// (which `state_at` temporarily moves).
+    fn read_state(&self) -> (String, SpanSet, BlockMap) {
+        let text = self.doc.get_text(TEXT_CONTAINER);
+        let mut spans = SpanSet::default();
+        let mut pos = 0usize;
+        for delta in text.to_delta() {
+            if let TextDelta::Insert { insert, attributes } = delta {
+                let len = insert.chars().count();
+                for (key, value) in attributes.iter().flatten() {
+                    if let Some(attr) = attr_from(key, value) {
+                        spans.add(pos..pos + len, attr);
                     }
                 }
-                let blocks = match doc.get_map(BLOCKS_CONTAINER).get("kinds") {
-                    Some(v) => match v.into_value() {
-                        Ok(LoroValue::String(tokens)) => BlockMap::from_kinds(
-                            tokens.lines().map(kind_from_token).collect(),
-                        ),
-                        _ => BlockMap::default(),
-                    },
-                    None => BlockMap::default(),
-                };
-                Some((text.to_string(), spans, blocks))
+                pos += len;
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
+        }
+        let blocks = match self.doc.get_map(BLOCKS_CONTAINER).get("kinds") {
+            Some(v) => match v.into_value() {
+                Ok(LoroValue::String(tokens)) => {
+                    BlockMap::from_kinds(tokens.lines().map(kind_from_token).collect())
+                }
+                _ => BlockMap::default(),
+            },
+            None => BlockMap::default(),
         };
-        Ok((Self { doc, path }, existing))
+        (text.to_string(), spans, blocks)
+    }
+
+    /// Record a named checkpoint at the current version.
+    pub fn add_checkpoint(&self, name: &str) {
+        self.doc.commit();
+        let checkpoint = Checkpoint {
+            name: name.to_owned(),
+            created_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            frontiers: self.doc.oplog_frontiers().encode(),
+        };
+        match serde_json::to_string(&checkpoint) {
+            Ok(json) => {
+                let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
+                if let Err(e) = list.push(json) {
+                    eprintln!("strop: record checkpoint: {e}");
+                }
+                self.doc.commit();
+            }
+            Err(e) => eprintln!("strop: encode checkpoint: {e}"),
+        }
+    }
+
+    pub fn checkpoints(&self) -> Vec<Checkpoint> {
+        let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
+        (0..list.len())
+            .filter_map(|i| list.get(i))
+            .filter_map(|v| match v.into_value() {
+                Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Document state as of a checkpoint: time-travel there, read, return
+    /// to the present. Restoring is the caller's ordinary (undoable) edit —
+    /// history is append-only, never rewritten.
+    pub fn state_at(&self, frontiers: &[u8]) -> Option<(String, SpanSet, BlockMap)> {
+        let frontiers = Frontiers::decode(frontiers).ok()?;
+        self.doc.checkout(&frontiers).ok()?;
+        let state = self.read_state();
+        self.doc.checkout_to_latest();
+        Some(state)
     }
 
     /// Rebuild Peritext marks + block kinds from the authoritative state,
     /// then snapshot. Durability only matters at the disk boundary, so
     /// neither is mirrored per-edit — this avoids expand-rule drift.
-    pub fn save_with_state(&self, spans: &SpanSet, blocks: &BlockMap) -> io::Result<()> {
+    pub fn save_with_state(
+        &self,
+        spans: &SpanSet,
+        blocks: &BlockMap,
+        history: &History,
+    ) -> io::Result<()> {
         self.rebuild_marks(spans);
         let tokens: Vec<String> = blocks.kinds().iter().map(kind_token).collect();
         if let Err(e) = self
@@ -193,6 +286,14 @@ impl Store {
             .insert("kinds", tokens.join("\n"))
         {
             eprintln!("strop: persist blocks: {e}");
+        }
+        match serde_json::to_string(history) {
+            Ok(json) => {
+                if let Err(e) = self.doc.get_map(SESSION_CONTAINER).insert("history", json) {
+                    eprintln!("strop: persist history: {e}");
+                }
+            }
+            Err(e) => eprintln!("strop: encode history: {e}"),
         }
         self.doc.commit();
         self.save()
@@ -301,7 +402,7 @@ mod tests {
         store.save().unwrap();
         let (_store2, existing) = Store::open(&path).unwrap();
         assert_eq!(
-            existing.map(|(text, _, _)| text).as_deref(),
+            existing.map(|l| l.text).as_deref(),
             Some("привет, мир")
         );
 
@@ -326,7 +427,7 @@ mod tests {
 
         // Second session: history is present, and grows further.
         let (store2, existing) = Store::open(&path).unwrap();
-        assert_eq!(existing.as_ref().unwrap().0, "abc");
+        assert_eq!(existing.as_ref().unwrap().text, "abc");
         let ops_after_first = store2.doc.len_ops();
         assert!(ops_after_first >= 2, "history lost on reopen");
         store2.apply(&[TextOp {
@@ -338,7 +439,7 @@ mod tests {
 
         // Third session: both sessions' ops are in the file.
         let (store3, existing) = Store::open(&path).unwrap();
-        assert_eq!(existing.unwrap().0, "abcd");
+        assert_eq!(existing.unwrap().text, "abcd");
         assert!(store3.doc.len_ops() > ops_after_first);
 
         let _ = fs::remove_file(&path);
@@ -355,15 +456,63 @@ mod tests {
         spans.add(0..6, InlineAttr::Strong);
         spans.add(9..12, InlineAttr::Code);
         spans.add(2..4, InlineAttr::Link("https://e.x".into()));
-        store.save_with_state(&spans, &BlockMap::new(1)).unwrap();
+        store.save_with_state(&spans, &BlockMap::new(1), &History::default()).unwrap();
 
         let (_s2, existing) = Store::open(&path).unwrap();
-        let (text, loaded, _blocks) = existing.unwrap();
-        assert_eq!(text, "жирный и код");
-        assert!(loaded.covers(0..6, &InlineAttr::Strong));
-        assert!(loaded.covers(9..12, &InlineAttr::Code));
-        assert!(loaded.covers(2..4, &InlineAttr::Link("https://e.x".into())));
-        assert!(!loaded.covers(6..9, &InlineAttr::Strong));
+        let loaded = existing.unwrap();
+        assert_eq!(loaded.text, "жирный и код");
+        assert!(loaded.spans.covers(0..6, &InlineAttr::Strong));
+        assert!(loaded.spans.covers(9..12, &InlineAttr::Code));
+        assert!(
+            loaded
+                .spans
+                .covers(2..4, &InlineAttr::Link("https://e.x".into()))
+        );
+        assert!(!loaded.spans.covers(6..9, &InlineAttr::Strong));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn undo_history_and_checkpoints_roundtrip() {
+        use crate::document::Document;
+        let path = temp_path("undo-roundtrip");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+
+        // Session 1: type, format, checkpoint, type more, save.
+        let mut doc = Document::new("", SpanSet::default(), BlockMap::default());
+        doc.edit_bytes_coalescing(0..0, "v1");
+        store.apply(&doc.take_ops());
+        store.add_checkpoint("first draft");
+        doc.edit_bytes(2..2, " v2");
+        doc.toggle_format(0..2, InlineAttr::Strong);
+        store.apply(&doc.take_ops());
+        store
+            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200))
+            .unwrap();
+
+        // Session 2: undo works across the restart, typing AND formatting.
+        let (store2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.text, "v1 v2");
+        let mut doc2 = Document::new(&loaded.text, loaded.spans, loaded.blocks);
+        doc2.import_history(loaded.history.unwrap());
+        assert_eq!(doc2.undo(), Some(None)); // the format toggle
+        assert!(doc2.spans().spans().is_empty());
+        doc2.undo().unwrap(); // " v2"
+        assert_eq!(doc2.text(), "v1");
+        doc2.redo().unwrap();
+        assert_eq!(doc2.text(), "v1 v2");
+
+        // Checkpoint rewind: state as of "first draft".
+        let cps = store2.checkpoints();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].name, "first draft");
+        let (text_then, _, _) = store2.state_at(&cps[0].frontiers).unwrap();
+        assert_eq!(text_then, "v1");
+        // And the present is untouched after time travel.
+        assert_eq!(store2.text(), "v1 v2");
 
         let _ = fs::remove_file(&path);
     }

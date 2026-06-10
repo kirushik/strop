@@ -7,9 +7,11 @@
 
 use std::ops::Range;
 
-use crate::buffer::{Buffer, TextOp};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use crate::buffer::{Buffer, TextOp, Transaction};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InlineAttr {
     Emphasis,
     Strong,
@@ -30,7 +32,7 @@ impl InlineAttr {
 }
 
 /// Per-block kind; lives beside the text, keyed by block index.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum BlockKind {
     #[default]
     Paragraph,
@@ -57,7 +59,7 @@ pub enum BlockKind {
 
 /// Block kinds aligned with the text's newline-separated blocks.
 /// Invariant: `kinds.len() == rope.len_lines()`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMap {
     kinds: Vec<BlockKind>,
 }
@@ -124,14 +126,14 @@ impl BlockMap {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     pub range: Range<usize>,
     pub attr: InlineAttr,
 }
 
 /// Inline formatting as an interval set, kept sorted by start.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SpanSet {
     spans: Vec<Span>,
 }
@@ -455,6 +457,44 @@ impl Document {
         self.pending_ops.extend(self.buffer.take_ops());
         Some(cursor)
     }
+
+    /// Export undo/redo state for persistence (most-recent `cap` entries).
+    /// Saved atomically with the text it refers to, so it restores exactly.
+    pub fn export_history(&self, cap: usize) -> History {
+        let (undo, redo) = self.buffer.export_history(cap);
+        let tail =
+            |v: &Vec<(SpanSet, BlockMap)>| v[v.len().saturating_sub(cap)..].to_vec();
+        History {
+            undo,
+            redo,
+            undo_states: tail(&self.undo_states),
+            redo_states: tail(&self.redo_states),
+        }
+    }
+
+    /// Restore persisted undo/redo state. Misaligned data (foreign or
+    /// corrupted file) is dropped — never trusted into a panic.
+    pub fn import_history(&mut self, history: History) {
+        if history.undo.len() != history.undo_states.len()
+            || history.redo.len() != history.redo_states.len()
+        {
+            return;
+        }
+        self.buffer.import_history(history.undo, history.redo);
+        self.undo_states = history.undo_states;
+        self.redo_states = history.redo_states;
+    }
+}
+
+/// Persisted cross-session undo/redo: the transaction stacks plus their
+/// aligned span/block snapshots (one lifecycle for typing and formatting —
+/// ctrl-z after reopen behaves exactly like before close).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct History {
+    undo: Vec<Transaction>,
+    redo: Vec<Transaction>,
+    undo_states: Vec<(SpanSet, BlockMap)>,
+    redo_states: Vec<(SpanSet, BlockMap)>,
 }
 
 #[cfg(test)]
