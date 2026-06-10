@@ -9,13 +9,14 @@
 //! Not yet: scrolling, drag-extends-by-word after double-click, cursor blink.
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
-    actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    ScrollWheelEvent, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
+    Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::Buffer;
 use unicode_segmentation::UnicodeSegmentation;
@@ -31,7 +32,7 @@ actions!(
         WordRight, ParagraphUp, ParagraphDown, SelectLeft, SelectRight, SelectUp, SelectDown,
         SelectWordLeft, SelectWordRight, SelectParagraphUp, SelectParagraphDown, SelectAll, Home,
         End, SelectToHome, SelectToEnd, DocStart, DocEnd, SelectToDocStart, SelectToDocEnd,
-        Newline, Copy, Cut, Paste, Undo, Redo,
+        PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, Undo, Redo,
     ]
 );
 
@@ -69,6 +70,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-end", DocEnd, ctx),
         KeyBinding::new("ctrl-shift-home", SelectToDocStart, ctx),
         KeyBinding::new("ctrl-shift-end", SelectToDocEnd, ctx),
+        KeyBinding::new("pageup", PageUp, ctx),
+        KeyBinding::new("pagedown", PageDown, ctx),
+        KeyBinding::new("shift-pageup", SelectPageUp, ctx),
+        KeyBinding::new("shift-pagedown", SelectPageDown, ctx),
         KeyBinding::new("enter", Newline, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
         KeyBinding::new("ctrl-c", Copy, ctx),
@@ -102,6 +107,17 @@ pub struct Editor {
     /// The unit selected by the initiating double/triple click; drag unions
     /// the unit under the pointer with this.
     selection_origin: Option<Range<usize>>,
+    /// Document-space offset of the viewport top. Clamped at prepaint.
+    scroll_top: Pixels,
+    /// When set, the next prepaint scrolls the cursor into view. Set by any
+    /// cursor-moving input; never by wheel scrolling (scroll never steals
+    /// the caret, the caret never blocks scrolling).
+    autoscroll_request: bool,
+    /// Last pointer position during a drag, for edge autoscrolling.
+    drag_point: Option<Point<Pixels>>,
+    autoscroll_active: bool,
+    cursor_visible: bool,
+    last_input: Instant,
     last_frame: Option<TextFrame>,
 }
 
@@ -117,6 +133,8 @@ enum SelectGranularity {
 struct TextFrame {
     bounds: Bounds<Pixels>,
     line_height: Pixels,
+    scroll_top: Pixels,
+    content_height: Pixels,
     paragraphs: Vec<ParagraphLayout>,
 }
 
@@ -185,6 +203,16 @@ impl TextFrame {
         self.paragraphs.last().map_or(0, |p| p.range.end)
     }
 
+    /// Maximum scroll offset: one blank line of breathing room past the end.
+    fn max_scroll(&self) -> Pixels {
+        (self.content_height + self.line_height - self.bounds.size.height).max(px(0.))
+    }
+
+    /// Window point -> document-space point.
+    fn doc_point(&self, window_point: Point<Pixels>) -> Point<Pixels> {
+        window_point - self.bounds.origin + point(px(0.), self.scroll_top)
+    }
+
     /// (paragraph index, visual line, x) of a byte offset.
     fn cursor_position(&self, offset: usize, affinity_down: bool) -> Option<(usize, usize, Pixels)> {
         let par_ix = self.paragraphs.iter().position(|p| offset <= p.range.end)?;
@@ -243,8 +271,51 @@ impl Editor {
             is_selecting: false,
             select_granularity: SelectGranularity::Char,
             selection_origin: None,
+            scroll_top: px(0.),
+            autoscroll_request: false,
+            drag_point: None,
+            autoscroll_active: false,
+            cursor_visible: true,
+            last_input: Instant::now(),
             last_frame: None,
         }
+    }
+
+    /// Start the cursor-blink heartbeat. GNOME-style: solid while typing,
+    /// blinking when idle, solid again (and quiet — no repaints) after 10s.
+    pub fn start_blink(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(530))
+                    .await;
+                let alive = this.update(cx, |editor: &mut Editor, cx| {
+                    let idle = editor.last_input.elapsed();
+                    let visible = if idle < Duration::from_millis(530)
+                        || idle > Duration::from_secs(10)
+                    {
+                        true
+                    } else {
+                        !editor.cursor_visible
+                    };
+                    if visible != editor.cursor_visible {
+                        editor.cursor_visible = visible;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Any cursor-affecting input: reset blink and schedule scroll-to-cursor.
+    fn bump_activity(&mut self) {
+        self.last_input = Instant::now();
+        self.cursor_visible = true;
+        self.autoscroll_request = true;
     }
 
     fn cursor_offset(&self) -> usize {
@@ -261,6 +332,7 @@ impl Editor {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         self.cursor_affinity_down = affinity_down;
+        self.bump_activity();
         cx.notify();
     }
 
@@ -276,6 +348,7 @@ impl Editor {
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
         self.cursor_affinity_down = affinity_down;
+        self.bump_activity();
         self.publish_primary(cx);
         cx.notify();
     }
@@ -483,6 +556,33 @@ impl Editor {
         }
     }
 
+    /// GTK/Windows page motion: move the caret by a viewport (minus one line
+    /// of overlap), preserving goal-x.
+    fn page_by(&mut self, direction: i64, select: bool, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let cursor = self.cursor_offset();
+        let Some((par_ix, line_ix, x)) = frame.cursor_position(cursor, self.cursor_affinity_down)
+        else {
+            return;
+        };
+        let x = self.goal_x.unwrap_or(x);
+        let page = (frame.bounds.size.height - frame.line_height).max(frame.line_height);
+        let y = frame.paragraphs[par_ix].top
+            + frame.line_height * (line_ix as f32)
+            + frame.line_height / 2.;
+        let target = point(x, y + page * (direction as f32));
+        let (offset, affinity) = frame.index_for_point(target);
+
+        self.goal_x = Some(x);
+        if select {
+            self.extend_cursor(offset, affinity, cx);
+        } else {
+            self.set_cursor(offset, affinity, cx);
+        }
+    }
+
     // -- Actions -------------------------------------------------------------
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -649,6 +749,22 @@ impl Editor {
         self.select_to(self.buffer.len_bytes(), cx);
     }
 
+    fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.page_by(-1, false, cx);
+    }
+
+    fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.page_by(1, false, cx);
+    }
+
+    fn select_page_up(&mut self, _: &SelectPageUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.page_by(-1, true, cx);
+    }
+
+    fn select_page_down(&mut self, _: &SelectPageDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.page_by(1, true, cx);
+    }
+
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         self.replace_text_in_range(None, "\n", window, cx);
     }
@@ -682,6 +798,7 @@ impl Editor {
             self.cursor_affinity_down = false;
             self.goal_x = None;
             self.marked_range = None;
+            self.bump_activity();
             cx.notify();
         }
     }
@@ -694,8 +811,48 @@ impl Editor {
             self.cursor_affinity_down = false;
             self.goal_x = None;
             self.marked_range = None;
+            self.bump_activity();
             cx.notify();
         }
+    }
+
+    // -- Scrolling ------------------------------------------------------------
+
+    fn on_scroll_wheel(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let delta = ev.delta.pixel_delta(frame.line_height);
+        let target = (self.scroll_top - delta.y).clamp(px(0.), frame.max_scroll());
+        if target != self.scroll_top {
+            self.scroll_top = target;
+            cx.notify();
+        }
+    }
+
+    /// One tick of drag-edge autoscroll: while the pointer is held beyond
+    /// the viewport edge, keep scrolling (speed ∝ overshoot) and extending.
+    fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.is_selecting {
+            self.autoscroll_active = false;
+            return false;
+        }
+        let (Some(frame), Some(pos)) = (self.last_frame.as_ref(), self.drag_point) else {
+            return true;
+        };
+        let bounds = frame.bounds;
+        let overshoot = if pos.y < bounds.top() {
+            pos.y - bounds.top()
+        } else if pos.y > bounds.bottom() {
+            pos.y - bounds.bottom()
+        } else {
+            return true;
+        };
+        let step = f32::from(overshoot).clamp(-48., 48.) * 0.4;
+        self.scroll_top = (self.scroll_top + px(step)).clamp(px(0.), frame.max_scroll());
+        self.drag_extend_to(pos, cx);
+        cx.notify();
+        true
     }
 
     // -- Mouse ----------------------------------------------------------------
@@ -704,7 +861,30 @@ impl Editor {
         let Some(frame) = self.last_frame.as_ref() else {
             return (0, false);
         };
-        frame.index_for_point(position - frame.bounds.origin)
+        frame.index_for_point(frame.doc_point(position))
+    }
+
+    /// Extend the drag selection toward a window point, clamped to the
+    /// viewport so dragging past an edge selects to the edge (the autoscroll
+    /// tick brings the rest into reach).
+    fn drag_extend_to(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let bounds = frame.bounds;
+        let clamped = point(
+            pos.x,
+            pos.y.clamp(bounds.top(), bounds.bottom() - px(1.)),
+        );
+        // Use the *current* scroll offset, which the autoscroll tick may have
+        // moved past the painted frame's.
+        let doc =
+            clamped - bounds.origin + point(px(0.), self.scroll_top);
+        let (ix, affinity) = frame.index_for_point(doc);
+        match self.select_granularity {
+            SelectGranularity::Char => self.extend_cursor(ix, affinity, cx),
+            _ => self.extend_by_unit(ix, cx),
+        }
     }
 
     /// The selection unit at `offset` for the current drag granularity.
@@ -729,6 +909,7 @@ impl Editor {
         self.selection_reversed = unit.start < origin.start;
         self.selected_range = origin.start.min(unit.start)..origin.end.max(unit.end);
         self.cursor_affinity_down = false;
+        self.bump_activity();
         self.publish_primary(cx);
         cx.notify();
     }
@@ -736,6 +917,24 @@ impl Editor {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
         self.is_selecting = true;
+        self.drag_point = Some(ev.position);
+        if !self.autoscroll_active {
+            self.autoscroll_active = true;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    let go_on = this
+                        .update(cx, |editor: &mut Editor, cx| editor.autoscroll_tick(cx))
+                        .unwrap_or(false);
+                    if !go_on {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         let (ix, affinity) = self.index_for_mouse(ev.position);
         match ev.click_count {
             1 => {
@@ -776,17 +975,15 @@ impl Editor {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
+        self.drag_point = None;
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.is_selecting {
             return;
         }
-        let (ix, affinity) = self.index_for_mouse(ev.position);
-        match self.select_granularity {
-            SelectGranularity::Char => self.extend_cursor(ix, affinity, cx),
-            _ => self.extend_by_unit(ix, cx),
-        }
+        self.drag_point = Some(ev.position);
+        self.drag_extend_to(ev.position, cx);
     }
 
     /// Cursor geometry for the smoke harness: byte offset, paragraph index,
@@ -798,8 +995,8 @@ impl Editor {
         };
         match frame.cursor_position(cursor, self.cursor_affinity_down) {
             Some((par, line, x)) => format!(
-                "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?}",
-                self.cursor_affinity_down as u8, self.selected_range
+                "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?} scroll={:?}",
+                self.cursor_affinity_down as u8, self.selected_range, self.scroll_top
             ),
             None => format!("off={cursor} (no paragraph)"),
         }
@@ -867,6 +1064,7 @@ impl EntityInputHandler for Editor {
         self.cursor_affinity_down = false;
         self.goal_x = None;
         self.marked_range = None;
+        self.bump_activity();
         cx.notify();
     }
 
@@ -901,6 +1099,7 @@ impl EntityInputHandler for Editor {
         self.selection_reversed = false;
         self.cursor_affinity_down = false;
         self.goal_x = None;
+        self.bump_activity();
         cx.notify();
     }
 
@@ -915,7 +1114,7 @@ impl EntityInputHandler for Editor {
         let range = self.range_from_utf16(&range_utf16);
         let pos = frame.position_of(range.start, self.cursor_affinity_down)?;
         Some(Bounds::new(
-            frame.bounds.origin + pos,
+            frame.bounds.origin + pos - point(px(0.), frame.scroll_top),
             size(px(2.), frame.line_height),
         ))
     }
@@ -941,6 +1140,8 @@ struct PrepaintState {
     paragraphs: Vec<ParagraphLayout>,
     cursor: Option<PaintQuad>,
     line_height: Pixels,
+    scroll_top: Pixels,
+    content_height: Pixels,
 }
 
 impl IntoElement for EditorElement {
@@ -1029,12 +1230,16 @@ impl Element for EditorElement {
         let line_height = window.line_height();
         let paragraph_gap = line_height; // vertical rhythm: one full line
         let wrap_width = bounds.size.width;
+        let viewport = bounds.size.height;
 
         let text = editor.buffer.text();
         let selection = editor.selected_range.clone();
         let marked = editor.marked_range.clone();
         let cursor_offset = editor.cursor_offset();
         let cursor_affinity = editor.cursor_affinity_down;
+        let cursor_blink_visible = editor.cursor_visible;
+        let mut scroll_top = editor.scroll_top;
+        let autoscroll = editor.autoscroll_request;
 
         let base_run = TextRun {
             len: 0,
@@ -1084,25 +1289,55 @@ impl Element for EditorElement {
             offset = range.end + 1; // step over '\n'
         }
 
-        let cursor = paragraphs
+        // `top` has accumulated one trailing gap past the last paragraph.
+        let content_height = top - paragraph_gap;
+        let max_scroll = (content_height + line_height - viewport).max(px(0.));
+        scroll_top = scroll_top.clamp(px(0.), max_scroll);
+
+        // Cursor position in document space (needed for autoscroll + quad).
+        let cursor_pos = paragraphs
             .iter()
             .find(|p| cursor_offset <= p.range.end)
             .map(|par| {
                 let (line, x) = par.position(cursor_offset - par.range.start, cursor_affinity);
-                fill(
-                    Bounds::new(
-                        bounds.origin
-                            + point(x, par.top + line_height * (line as f32)),
-                        size(px(2.), line_height),
-                    ),
-                    rgb(TEXT_COLOR),
-                )
+                point(x, par.top + line_height * (line as f32))
             });
+
+        if autoscroll && let Some(pos) = cursor_pos {
+            if pos.y < scroll_top {
+                scroll_top = pos.y;
+            } else if pos.y + line_height > scroll_top + viewport {
+                scroll_top = pos.y + line_height - viewport;
+            }
+        }
+
+        // Write the clamped/adjusted scroll back; no notify needed, we're
+        // mid-frame and painting with this exact value.
+        self.editor.update(cx, |editor, _| {
+            editor.scroll_top = scroll_top;
+            editor.autoscroll_request = false;
+        });
+
+        let cursor = cursor_pos.and_then(|pos| {
+            let y = pos.y - scroll_top;
+            if !cursor_blink_visible || y + line_height <= px(0.) || y >= viewport {
+                return None;
+            }
+            Some(fill(
+                Bounds::new(
+                    bounds.origin + point(pos.x, y),
+                    size(px(2.), line_height),
+                ),
+                rgb(TEXT_COLOR),
+            ))
+        });
 
         PrepaintState {
             paragraphs,
             cursor,
             line_height,
+            scroll_top,
+            content_height,
         }
     }
 
@@ -1124,8 +1359,14 @@ impl Element for EditorElement {
         );
 
         let line_height = prepaint.line_height;
+        let scroll_top = prepaint.scroll_top;
+        let viewport = bounds.size.height;
         for par in &prepaint.paragraphs {
-            let origin = bounds.origin + point(px(0.), par.top);
+            let y = par.top - scroll_top;
+            if y + par.height <= px(0.) || y >= viewport {
+                continue; // outside the viewport
+            }
+            let origin = bounds.origin + point(px(0.), y);
             par.line
                 .paint_background(origin, line_height, TextAlign::Left, None, window, cx)
                 .expect("paint_background failed");
@@ -1141,10 +1382,13 @@ impl Element for EditorElement {
         }
 
         let paragraphs = std::mem::take(&mut prepaint.paragraphs);
+        let content_height = prepaint.content_height;
         self.editor.update(cx, |editor, _| {
             editor.last_frame = Some(TextFrame {
                 bounds,
                 line_height,
+                scroll_top,
+                content_height,
                 paragraphs,
             });
         });
@@ -1193,6 +1437,10 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::doc_end))
                     .on_action(cx.listener(Self::select_to_doc_start))
                     .on_action(cx.listener(Self::select_to_doc_end))
+                    .on_action(cx.listener(Self::page_up))
+                    .on_action(cx.listener(Self::page_down))
+                    .on_action(cx.listener(Self::select_page_up))
+                    .on_action(cx.listener(Self::select_page_down))
                     .on_action(cx.listener(Self::newline))
                     .on_action(cx.listener(Self::copy))
                     .on_action(cx.listener(Self::cut))
@@ -1204,10 +1452,12 @@ impl Render for Editor {
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                     .w_full()
                     .max_w(px(660.))
                     .h_full()
                     .pt(px(84.))
+                    .pb(px(28.))
                     .px(px(28.))
                     .font_family("Literata")
                     .text_size(px(20.))
