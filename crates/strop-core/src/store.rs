@@ -309,6 +309,42 @@ mod tests {
     }
 
     #[test]
+    fn edit_history_survives_reopen() {
+        // The CRDT contract: ExportMode::Snapshot carries the full op log,
+        // so keystroke-level history accumulates across sessions.
+        let path = temp_path("history");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("ab");
+        store.apply(&[TextOp {
+            pos: 2,
+            delete: 0,
+            insert: "c".into(),
+        }]);
+        store.save().unwrap();
+
+        // Second session: history is present, and grows further.
+        let (store2, existing) = Store::open(&path).unwrap();
+        assert_eq!(existing.as_ref().unwrap().0, "abc");
+        let ops_after_first = store2.doc.len_ops();
+        assert!(ops_after_first >= 2, "history lost on reopen");
+        store2.apply(&[TextOp {
+            pos: 3,
+            delete: 0,
+            insert: "d".into(),
+        }]);
+        store2.save().unwrap();
+
+        // Third session: both sessions' ops are in the file.
+        let (store3, existing) = Store::open(&path).unwrap();
+        assert_eq!(existing.unwrap().0, "abcd");
+        assert!(store3.doc.len_ops() > ops_after_first);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn marks_roundtrip() {
         let path = temp_path("marks");
         let _ = fs::remove_file(&path);
