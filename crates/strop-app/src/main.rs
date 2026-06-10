@@ -13,9 +13,14 @@ use editor::Editor;
 
 actions!(strop, [Quit]);
 
-const LITERATA: &[u8] = include_bytes!("../../../assets/fonts/Literata[opsz,wght].ttf");
-const LITERATA_ITALIC: &[u8] =
-    include_bytes!("../../../assets/fonts/Literata-Italic[opsz,wght].ttf");
+// Static instances, not the variable font: GPUI's Linux text stack does not
+// instantiate variable axes, so a lone variable file makes bold render as
+// regular. Revisit when GPUI grows variation support (we lose opsz for now).
+const LITERATA: &[u8] = include_bytes!("../../../assets/fonts/Literata-Regular.ttf");
+const LITERATA_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Literata-Italic.ttf");
+const LITERATA_BOLD: &[u8] = include_bytes!("../../../assets/fonts/Literata-Bold.ttf");
+const LITERATA_BOLD_ITALIC: &[u8] =
+    include_bytes!("../../../assets/fonts/Literata-BoldItalic.ttf");
 const PT_MONO: &[u8] = include_bytes!("../../../assets/fonts/PTMono-Regular.ttf");
 
 const SAMPLE: &str = "Strop is a writer’s editor with an editor inside — one that diagnoses, and never rewrites you into the average.\n\
@@ -45,7 +50,13 @@ fn data_file() -> PathBuf {
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.text_system()
-            .add_fonts(vec![LITERATA.into(), LITERATA_ITALIC.into(), PT_MONO.into()])
+            .add_fonts(vec![
+                LITERATA.into(),
+                LITERATA_ITALIC.into(),
+                LITERATA_BOLD.into(),
+                LITERATA_BOLD_ITALIC.into(),
+                PT_MONO.into(),
+            ])
             .expect("failed to load bundled fonts");
 
         editor::bind_keys(cx);

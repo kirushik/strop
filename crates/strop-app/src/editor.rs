@@ -1905,3 +1905,60 @@ impl Focusable for Editor {
         self.focus_handle.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> TextRun {
+        TextRun {
+            len: 0,
+            font: gpui::font("Literata"),
+            color: rgb(TEXT_COLOR).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
+    }
+
+    #[test]
+    fn bold_and_highlight_runs() {
+        let par = 0..10;
+        let spans = vec![
+            (2..5, InlineAttr::Strong),
+            (5..8, InlineAttr::Highlight),
+        ];
+        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &base());
+        // Segments: [0,2) plain, [2,5) bold, [5,8) highlight, [8,10) plain.
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs[1].font.weight, FontWeight::BOLD);
+        assert!(runs[1].background_color.is_none());
+        assert_eq!(runs[2].font.weight, FontWeight::default());
+        assert!(runs[2].background_color.is_some());
+        assert!(runs[0].background_color.is_none());
+    }
+
+    #[test]
+    fn selection_masks_highlight_background() {
+        // Standard behavior: while selected, the selection color wins.
+        let par = 0..6;
+        let spans = vec![(0..6, InlineAttr::Highlight)];
+        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &base());
+        let selected = &runs[1];
+        assert_eq!(
+            selected.background_color,
+            Some(rgba(SELECTION_COLOR).into())
+        );
+        // Outside the selection the highlight shows.
+        assert_eq!(runs[0].background_color, Some(rgba(HIGHLIGHT_COLOR).into()));
+    }
+
+    #[test]
+    fn code_run_switches_family_and_marked_text_underlines() {
+        let par = 0..8;
+        let spans = vec![(0..4, InlineAttr::Code)];
+        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &base());
+        assert_eq!(runs[0].font.family.as_ref(), CODE_FONT);
+        assert!(runs[1].underline.is_some());
+    }
+}
