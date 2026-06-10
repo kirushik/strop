@@ -34,10 +34,12 @@ unless they'd be expensive to reverse.
 
 ## Phase B — Documents & interchange
 
-- [ ] B1. **Markdown export/import** (pulldown-cmark in, serializer out)
-      per the document-model mapping table; ctrl-shift-e export, opening
-      a `.md` imports. Underline as `<u>`, footnotes `[^id]`, soft break
-      as trailing backslash.
+- [~] B1. **Markdown export/import**: EXPORT DONE (serializer over the
+      full schema — heading/quote/list/code-fence merging/divider/footnote
+      defs/images, inline nesting with reopen-on-overlap, escaping,
+      `<u>` passthrough, soft-break backslash; ctrl-shift-e writes
+      doc.md next to doc.strop). IMPORT remaining: pulldown-cmark walker
+      (strikethrough+footnote extensions), .md open detection.
 - [ ] B2. **Footnotes**: insert/ref/def plumbing + the viewport bottom
       zone (global numbering, overlay inset, ~1/3 height cap, read-only
       projection, click-to-jump).

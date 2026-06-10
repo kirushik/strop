@@ -44,7 +44,7 @@ actions!(
         PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, Undo, Redo,
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
-        ToggleBulletList, ToggleOrderedList, AddCheckpoint,
+        ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown,
     ]
 );
 
@@ -113,6 +113,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-8", ToggleBulletList, ctx),
         KeyBinding::new("ctrl-shift-7", ToggleOrderedList, ctx),
         KeyBinding::new("ctrl-alt-s", AddCheckpoint, ctx),
+        KeyBinding::new("ctrl-shift-e", ExportMarkdown, ctx),
     ]);
 }
 
@@ -403,6 +404,25 @@ impl Editor {
         self.caret_attrs.clear();
         self.sync_mutations();
         self.bump_activity();
+        cx.notify();
+    }
+
+    /// Export next to the .strop file (doc.strop -> doc.md).
+    fn export_markdown(&mut self, _: &ExportMarkdown, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else {
+            eprintln!("strop: no document file to export next to");
+            return;
+        };
+        let md = strop_core::markdown::to_markdown(
+            &self.doc.text(),
+            self.doc.spans(),
+            self.doc.blocks(),
+        );
+        let path = store.path().with_extension("md");
+        match std::fs::write(&path, md) {
+            Ok(()) => eprintln!("strop: exported {}", path.display()),
+            Err(e) => eprintln!("strop: export failed: {e}"),
+        }
         cx.notify();
     }
 
@@ -2337,6 +2357,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_bullet_list))
                     .on_action(cx.listener(Self::toggle_ordered_list))
                     .on_action(cx.listener(Self::add_checkpoint))
+                    .on_action(cx.listener(Self::export_markdown))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

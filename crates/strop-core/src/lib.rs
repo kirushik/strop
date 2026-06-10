@@ -6,6 +6,7 @@
 
 pub mod buffer;
 pub mod document;
+pub mod markdown;
 pub mod store;
 pub mod typograph;
 
