@@ -13,17 +13,22 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ScrollWheelEvent, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
-    Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextAlign, TextRun,
+    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*,
+    px, relative, rgb, rgba, size,
 };
+use strop_core::document::{InlineAttr, SpanSet};
 use strop_core::{Buffer, Store, typograph};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const BG_COLOR: u32 = 0xFBFAF8;
 pub const TEXT_COLOR: u32 = 0x1A1A18;
 const SELECTION_COLOR: u32 = 0xB4D5FE88;
+const HIGHLIGHT_COLOR: u32 = 0xF9E29CAA;
+const CODE_BG_COLOR: u32 = 0x1A1A1814;
+const LINK_COLOR: u32 = 0x1A56A0;
 
 actions!(
     editor,
@@ -33,6 +38,8 @@ actions!(
         SelectWordLeft, SelectWordRight, SelectParagraphUp, SelectParagraphDown, SelectAll, Home,
         End, SelectToHome, SelectToEnd, DocStart, DocEnd, SelectToDocStart, SelectToDocEnd,
         PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, Undo, Redo,
+        ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
+        ToggleCode,
     ]
 );
 
@@ -86,12 +93,23 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, ctx),
         KeyBinding::new("ctrl-shift-z", Redo, ctx),
         KeyBinding::new("ctrl-y", Redo, ctx),
+        KeyBinding::new("ctrl-b", ToggleStrong, ctx),
+        KeyBinding::new("ctrl-i", ToggleEmphasis, ctx),
+        KeyBinding::new("ctrl-u", ToggleUnderline, ctx),
+        KeyBinding::new("ctrl-shift-x", ToggleStrikethrough, ctx),
+        KeyBinding::new("ctrl-shift-h", ToggleHighlight, ctx),
+        KeyBinding::new("ctrl-e", ToggleCode, ctx),
     ]);
 }
 
 pub struct Editor {
     focus_handle: FocusHandle,
     buffer: Buffer,
+    /// Inline formatting (char-indexed); kept consistent with every edit via
+    /// the op fan-out in `sync_mutations`.
+    /// TODO(durable formatting): mirror into Loro Peritext marks and load on
+    /// open — formatting is session-only until then; text persists.
+    spans: SpanSet,
     /// Selection in UTF-8 byte offsets; the cursor is `end` unless reversed.
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -266,6 +284,7 @@ impl Editor {
         Self {
             focus_handle: cx.focus_handle(),
             buffer: Buffer::new(text),
+            spans: SpanSet::default(),
             selected_range: 0..0,
             selection_reversed: false,
             cursor_affinity_down: false,
@@ -310,11 +329,15 @@ impl Editor {
         .detach();
     }
 
-    /// Mirror buffer changes into the store. Must run after every mutation.
-    fn sync_store(&mut self) {
+    /// Fan buffer changes out to every offset-tracking consumer (formatting
+    /// spans, durable store). Must run after every mutation.
+    fn sync_mutations(&mut self) {
         let ops = self.buffer.take_ops();
         if ops.is_empty() {
             return;
+        }
+        for op in &ops {
+            self.spans.apply_op(op);
         }
         if let Some(store) = &self.store {
             store.apply(&ops);
@@ -323,13 +346,31 @@ impl Editor {
     }
 
     pub fn save_now(&mut self) {
-        self.sync_store();
+        self.sync_mutations();
         if let Some(store) = &self.store {
             match store.save() {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
             }
         }
+    }
+
+    /// Toggle an inline attribute over the selection: fully covered ->
+    /// remove, anything less -> apply (the universal toggle convention).
+    /// TODO: with an empty selection this should set a sticky caret attr.
+    fn toggle_span(&mut self, attr: InlineAttr, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            return;
+        }
+        let rope = self.buffer.rope();
+        let range =
+            rope.byte_to_char(self.selected_range.start)..rope.byte_to_char(self.selected_range.end);
+        if self.spans.covers(range.clone(), &attr) {
+            self.spans.remove(range, &attr);
+        } else {
+            self.spans.add(range, attr);
+        }
+        cx.notify();
     }
 
     /// Start the cursor-blink heartbeat. GNOME-style: solid while typing,
@@ -820,6 +861,35 @@ impl Editor {
         self.replace_text_in_range(None, "\n", window, cx);
     }
 
+    fn toggle_strong(&mut self, _: &ToggleStrong, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_span(InlineAttr::Strong, cx);
+    }
+
+    fn toggle_emphasis(&mut self, _: &ToggleEmphasis, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_span(InlineAttr::Emphasis, cx);
+    }
+
+    fn toggle_underline(&mut self, _: &ToggleUnderline, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_span(InlineAttr::Underline, cx);
+    }
+
+    fn toggle_strikethrough(
+        &mut self,
+        _: &ToggleStrikethrough,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_span(InlineAttr::Strikethrough, cx);
+    }
+
+    fn toggle_highlight(&mut self, _: &ToggleHighlight, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_span(InlineAttr::Highlight, cx);
+    }
+
+    fn toggle_code(&mut self, _: &ToggleCode, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_span(InlineAttr::Code, cx);
+    }
+
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             let text = self.buffer.slice_bytes(self.selected_range.clone());
@@ -850,7 +920,7 @@ impl Editor {
             self.cursor_affinity_down = false;
             self.goal_x = None;
             self.marked_range = None;
-            self.sync_store();
+            self.sync_mutations();
             self.bump_activity();
             cx.notify();
         }
@@ -864,7 +934,7 @@ impl Editor {
             self.cursor_affinity_down = false;
             self.goal_x = None;
             self.marked_range = None;
-            self.sync_store();
+            self.sync_mutations();
             self.bump_activity();
             cx.notify();
         }
@@ -1061,8 +1131,11 @@ impl Editor {
                     .take(self.buffer.rope().byte_to_char(cursor) - tail_start)
                     .collect();
                 format!(
-                    "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?} scroll={:?} tail={tail:?}",
-                    self.cursor_affinity_down as u8, self.selected_range, self.scroll_top
+                    "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?} scroll={:?} tail={tail:?} spans={:?}",
+                    self.cursor_affinity_down as u8,
+                    self.selected_range,
+                    self.scroll_top,
+                    self.spans.spans()
                 )
             }
             None => format!("off={cursor} (no paragraph)"),
@@ -1114,7 +1187,7 @@ impl Editor {
         self.cursor_affinity_down = false;
         self.goal_x = None;
         self.marked_range = None;
-        self.sync_store();
+        self.sync_mutations();
         self.bump_activity();
         cx.notify();
     }
@@ -1197,7 +1270,7 @@ impl EntityInputHandler for Editor {
         self.selection_reversed = false;
         self.cursor_affinity_down = false;
         self.goal_x = None;
-        self.sync_store();
+        self.sync_mutations();
         self.bump_activity();
         cx.notify();
     }
@@ -1251,17 +1324,23 @@ impl IntoElement for EditorElement {
     }
 }
 
-/// Split a paragraph into runs cut at selection/marked boundaries, so
-/// selection paints via `WrappedLine::paint_background` and IME composition
-/// gets an underline.
+/// Split a paragraph into runs cut at selection/marked/formatting
+/// boundaries. Selection and highlight paint via
+/// `WrappedLine::paint_background`; IME composition gets an underline;
+/// formatting maps to font weight/style and decorations.
 fn runs_for_paragraph(
     par_range: &Range<usize>,
     selection: &Range<usize>,
     marked: Option<&Range<usize>>,
+    spans: &[(Range<usize>, InlineAttr)],
     base: &TextRun,
 ) -> Vec<TextRun> {
     let mut cuts = vec![par_range.start, par_range.end];
     for r in [Some(selection), marked].into_iter().flatten() {
+        cuts.push(r.start.clamp(par_range.start, par_range.end));
+        cuts.push(r.end.clamp(par_range.start, par_range.end));
+    }
+    for (r, _) in spans {
         cuts.push(r.start.clamp(par_range.start, par_range.end));
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
@@ -1273,17 +1352,67 @@ fn runs_for_paragraph(
         .map(|w| {
             let in_selection = w[0] >= selection.start && w[1] <= selection.end;
             let in_marked = marked.is_some_and(|m| w[0] >= m.start && w[1] <= m.end);
+
+            let mut font = base.font.clone();
+            let mut color = base.color;
+            let mut background = in_selection.then(|| rgba(SELECTION_COLOR).into());
+            let mut underline = in_marked.then(|| UnderlineStyle {
+                color: Some(base.color),
+                thickness: px(1.),
+                wavy: false,
+            });
+            let mut strikethrough = None;
+
+            for (range, attr) in spans {
+                if !(range.start <= w[0] && w[1] <= range.end) {
+                    continue;
+                }
+                match attr {
+                    InlineAttr::Strong => font.weight = FontWeight::BOLD,
+                    InlineAttr::Emphasis => font.style = FontStyle::Italic,
+                    InlineAttr::Underline => {
+                        underline.get_or_insert(UnderlineStyle {
+                            color: Some(color),
+                            thickness: px(1.),
+                            wavy: false,
+                        });
+                    }
+                    InlineAttr::Strikethrough => {
+                        strikethrough = Some(StrikethroughStyle {
+                            color: Some(color),
+                            thickness: px(1.),
+                        });
+                    }
+                    InlineAttr::Highlight => {
+                        if background.is_none() {
+                            background = Some(rgba(HIGHLIGHT_COLOR).into());
+                        }
+                    }
+                    InlineAttr::Code => {
+                        font.family = "monospace".into();
+                        if background.is_none() {
+                            background = Some(rgba(CODE_BG_COLOR).into());
+                        }
+                    }
+                    InlineAttr::Link(_) => {
+                        color = rgb(LINK_COLOR).into();
+                        underline.get_or_insert(UnderlineStyle {
+                            color: Some(rgb(LINK_COLOR).into()),
+                            thickness: px(1.),
+                            wavy: false,
+                        });
+                    }
+                    InlineAttr::FootnoteRef(_) => {}
+                }
+            }
+
             TextRun {
                 len: w[1] - w[0],
-                font: base.font.clone(),
-                color: base.color,
-                background_color: in_selection.then(|| rgba(SELECTION_COLOR).into()),
-                underline: in_marked.then(|| UnderlineStyle {
-                    color: Some(base.color),
-                    thickness: px(1.),
-                    wavy: false,
-                }),
-                strikethrough: None,
+                font,
+                color,
+                background_color: background,
+                underline,
+                strikethrough,
             }
         })
         .collect()
@@ -1339,6 +1468,21 @@ impl Element for EditorElement {
         let cursor_blink_visible = editor.cursor_visible;
         let mut scroll_top = editor.scroll_top;
         let autoscroll = editor.autoscroll_request;
+        // Formatting spans, converted to byte ranges for this frame.
+        let spans_bytes: Vec<(Range<usize>, InlineAttr)> = {
+            let rope = editor.buffer.rope();
+            editor
+                .spans
+                .spans()
+                .iter()
+                .map(|s| {
+                    (
+                        rope.char_to_byte(s.range.start)..rope.char_to_byte(s.range.end),
+                        s.attr.clone(),
+                    )
+                })
+                .collect()
+        };
 
         let base_run = TextRun {
             len: 0,
@@ -1354,7 +1498,13 @@ impl Element for EditorElement {
         let mut offset = 0;
         for par_text in text.split('\n') {
             let range = offset..offset + par_text.len();
-            let runs = runs_for_paragraph(&range, &selection, marked.as_ref(), &base_run);
+            let par_spans: Vec<(Range<usize>, InlineAttr)> = spans_bytes
+                .iter()
+                .filter(|(r, _)| r.start < range.end && range.start < r.end)
+                .cloned()
+                .collect();
+            let runs =
+                runs_for_paragraph(&range, &selection, marked.as_ref(), &par_spans, &base_run);
             let line = window
                 .text_system()
                 .shape_text(
@@ -1546,6 +1696,12 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::paste))
                     .on_action(cx.listener(Self::undo))
                     .on_action(cx.listener(Self::redo))
+                    .on_action(cx.listener(Self::toggle_strong))
+                    .on_action(cx.listener(Self::toggle_emphasis))
+                    .on_action(cx.listener(Self::toggle_underline))
+                    .on_action(cx.listener(Self::toggle_strikethrough))
+                    .on_action(cx.listener(Self::toggle_highlight))
+                    .on_action(cx.listener(Self::toggle_code))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

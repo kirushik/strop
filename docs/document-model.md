@@ -19,6 +19,11 @@ now and expensive to change later.
 | Link `{href}` | `[…](url)` | does **not** expand |
 | Footnote ref `{id}` | `[^id]` | zero-width atom |
 
+Decisions 2026-06-10: **highlight is in**. **No autolinking** — links are
+created explicitly (TLD heuristics are exactly the kind of guessing the
+typograph forswears); margin comments may adopt different conventions when
+they exist.
+
 \* *Expansion* = typing at the span's right edge continues the style
 (Peritext semantics). Styles expand; code and links don't — typing after a
 link must not grow the link. This matches Loro's mark expand configuration,
@@ -43,8 +48,9 @@ Markdown's trailing-backslash break.
 | Blockquote | `>` | essential for op-ed/criticism; one nesting level |
 | List item {bullet/ordered, depth 0–1} | `-` / `1.` | prose lists are flat; two levels max, deliberately |
 | Divider / scene break | `***` | first-class for fiction (⁂-class rendering later), not just a rule |
-| Image {src, alt, caption} | `![alt](src)` | standalone block only; assets stored in-file (§4); PNG/JPEG/WebP, size-capped |
-| Footnote definition {id} | `[^id]: …` | lives in the text stream as a block; UI may render as popover/margin later |
+| Image {src, alt, caption} | `![alt](src)` | standalone block only; assets stored in-file (§5b) |
+| Code block {info} | ``` fenced ``` | monospace, **no syntax highlighting** — by design; doubles as the ASCII-pseudotable escape hatch. The fence info string (` ```rust `) is stored for round-trip fidelity, never acted on |
+| Footnote definition {id} | `[^id]: …` | lives in the text stream as a block; rendered in the viewport footnote zone (§4c) |
 
 ## 3. Explicitly rejected (the "what else" answer, negative half)
 
@@ -73,6 +79,50 @@ though v1 ships none of it:
   even time travel), mirrored on the hot path by the same span-adjustment
   math as formatting (`SpanSet::apply_op`).
 
+## 4a. Multiplayer-proofing the annotation overlay
+
+Verified against the "human editor leaves Google-Docs-style margin
+comments" future:
+
+- **Convergence**: annotations live in Loro containers; concurrent edits
+  from multiple replicas converge by CRDT construction, no extra design.
+- **Anchors**: Loro `Cursor` binds to character *identity* (OpID), not
+  offset — it survives concurrent edits, resolves identically on every
+  replica after sync, and degrades to the nearest surviving position when
+  the anchored text is deleted. This is precisely the primitive built for
+  this use case.
+- **Schema reserved now** (cheap to declare, shapes thinking): annotation =
+  { id, anchor, kind, **author {id, name}**, **parent_id** (threads/replies),
+  **created/modified**, status {open, resolved}, body }. **Body is a
+  LoroText**, not a string — editors write formatted comments with links.
+- **Suggested edits** (Docs' "suggesting" mode) fit as kind `suggestion`
+  with payload {anchored range, proposed text}; accepting one is an
+  ordinary transaction. No schema break.
+
+Out of scope until needed: identity/auth, permissions, transport — all
+orthogonal to the document model.
+
+## 4c. Footnote presentation (sketch, UX postponed)
+
+Adopted direction (Kirill): footnotes render *as footnotes* — a zone at
+the viewport bottom showing the definitions whose anchors are currently
+visible. Footnotes are part of the text (bottom zone); margin space stays
+reserved for annotations (not part of the text). The semantics align.
+
+Design constraints that make it workable:
+
+- **Numbering is global by document order**, displayed as-is in the zone —
+  nothing renumbers on scroll; you simply see "7, 8" when those anchors
+  are in view.
+- **The zone is an overlay inset, not a layout resize** — text scrolls
+  behind it; `max_scroll` and cursor-into-view account for the inset.
+  Otherwise scrolling reflows the page, which is disqualifying.
+- **Height cap ~⅓ of viewport**, internal scroll past that; long notes
+  clamp with expansion. Too-many-footnotes can crowd the zone, never the
+  text.
+- v1 of the zone: read-only projection of the def blocks, click-to-jump;
+  editing in place in the zone is a later, separate decision.
+
 ## 4b. Document metadata
 
 `LoroMap("meta")`: `lang` (explicit typograph-language override; absent =
@@ -95,8 +145,27 @@ Durable layer (Loro):
 - Block attrs = marks on the block's trailing `\n` (the Quill/Loro
   rich-text convention).
 - `LoroMap("assets")` — image bytes keyed by content hash; image blocks
-  reference the hash. Caps enforced at insertion (type allowlist, size cap,
-  configurable, default ~8 MB).
+  reference the hash. **In-file always** (decided: portability beats file
+  size; sidecar directories are how exports break).
+
+### 5b. Image import policy (deterministic, decided 2026-06-10)
+
+- **Stored natively**: PNG, JPEG, WebP — kept byte-identical when within
+  caps (recompressing a JPEG is generation loss; PNGs are screenshots
+  where lossless text matters).
+- **Converted on import**: GIF/BMP/TIFF → PNG if the image has an alpha
+  channel, else JPEG q88. (Alpha test is deterministic; "looks
+  photographic" is not.) Animated GIF: first frame, with a notice.
+- **SVG: refused in v1** — arbitrary SVG is a rendering and security
+  surface, not a photo. Revisit if real demand appears.
+- **Downscale only when oversized**: long edge > 2400 px → scale to
+  2400 px (2× the 660 px column at 2× DPI, with headroom for zoom and
+  export). Below that, never touched.
+- **EXIF stripped** (GPS in photos is a privacy leak), orientation baked
+  into pixels first.
+- **Hard caps**: > 8 MB after the pipeline, or > 12000 px either edge
+  pre-decode (decompression-bomb guard) → **refused with a message**,
+  never silently degraded.
 - `LoroList("annotations")` — the overlay, with Loro Cursors as anchors.
 
 Mirroring stays op-based as today; formatting changes add mark/unmark ops
@@ -118,12 +187,11 @@ Current `.strop` files are plain LoroText — already forward-compatible:
 the new model reads them as all-paragraph documents with empty SpanSet.
 No format break.
 
-## Open questions for Kirill
+## Resolved questions (2026-06-10)
 
-1. Highlight (`==…==`): in or out?
-2. Links: autolink pasted URLs, or only explicit link creation?
-3. Image size cap and whether assets belong in-file (single portable
-   `.strop`) vs sidecar directory (smaller files, fragile moves). I lean
-   **in-file** — portability is worth megabytes, and Loro handles binary.
-4. Footnote UX direction (inline defs at doc end vs margin popovers) —
-   affects nothing in the schema, everything in the editor; can wait.
+1. Highlight: **in**.
+2. Links: **explicit creation only**, no autolink.
+3. Images: **in-file**, policy in §5b.
+4. Footnotes: **viewport footnote zone**, sketch in §4c; UX details later.
+5. Code blocks: **in** — monospace, no highlighting, info string stored
+   for round-trip only.

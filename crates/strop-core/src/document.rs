@@ -75,6 +75,28 @@ impl SpanSet {
             .map(|s| &s.attr)
     }
 
+    /// Is every position in `range` covered by spans with this attribute?
+    /// (Same-attr spans may be adjacent after edits; chains count.)
+    pub fn covers(&self, range: Range<usize>, attr: &InlineAttr) -> bool {
+        if range.start >= range.end {
+            return false;
+        }
+        let mut covered_to = range.start;
+        for s in &self.spans {
+            if s.attr != *attr || s.range.end <= covered_to {
+                continue;
+            }
+            if s.range.start > covered_to {
+                return false; // spans are sorted: this is a gap
+            }
+            covered_to = s.range.end;
+            if covered_to >= range.end {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Apply an attribute over a range, merging with touching/overlapping
     /// spans of the same attribute.
     pub fn add(&mut self, range: Range<usize>, attr: InlineAttr) {
@@ -272,6 +294,21 @@ mod tests {
         set.add(0..10, InlineAttr::Strong);
         set.remove(3..6, &InlineAttr::Emphasis);
         assert_eq!(set.spans(), &[strong(0..10)]);
+    }
+
+    #[test]
+    fn covers_handles_chains_and_gaps() {
+        let mut set = SpanSet::default();
+        set.add(0..4, InlineAttr::Strong);
+        set.add(6..9, InlineAttr::Strong);
+        assert!(set.covers(1..3, &InlineAttr::Strong));
+        assert!(!set.covers(1..7, &InlineAttr::Strong)); // gap at 4..6
+        assert!(!set.covers(1..3, &InlineAttr::Emphasis));
+        // Adjacent spans (possible after edits) chain.
+        let mut set = SpanSet::default();
+        set.add(0..4, InlineAttr::Code);
+        set.add(4..8, InlineAttr::Code); // Code merges too via add
+        assert!(set.covers(2..6, &InlineAttr::Code));
     }
 
     #[test]
