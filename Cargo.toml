@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/strop-core", "crates/strop-app"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+strop-core = { path = "crates/strop-core" }
+ropey = "1.6"
+loro = "1"
+anyhow = "1"
+
+# Pinned to the published crate for now; expect to migrate to a git pin on
+# zed-industries/zed once we need post-0.2.2 APIs (the gpui/gpui_platform split).
+# X11 backend off: dev machine lacks libxkbcommon-x11 dev files and runs
+# Wayland; re-enable "x11" when packaging for distribution.
+gpui = { version = "0.2", default-features = false, features = ["font-kit", "wayland"] }
+
+[profile.dev]
+# gpui is a huge dep tree; keep its codegen optimized even in dev builds
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

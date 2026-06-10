@@ -1,0 +1,15 @@
+[package]
+name = "strop-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Strop desktop shell (GPUI)"
+
+[[bin]]
+name = "strop"
+path = "src/main.rs"
+
+[dependencies]
+strop-core = { workspace = true }
+gpui = { workspace = true }
+anyhow = { workspace = true }
