@@ -18,7 +18,7 @@ use gpui::{
     ScrollWheelEvent, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
     Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
-use strop_core::{Buffer, typograph};
+use strop_core::{Buffer, Store, typograph};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const BG_COLOR: u32 = 0xFBFAF8;
@@ -118,6 +118,9 @@ pub struct Editor {
     autoscroll_active: bool,
     cursor_visible: bool,
     last_input: Instant,
+    /// Durable layer; edits mirror into it, a background task saves when idle.
+    store: Option<Store>,
+    store_dirty: bool,
     last_frame: Option<TextFrame>,
 }
 
@@ -277,7 +280,55 @@ impl Editor {
             autoscroll_active: false,
             cursor_visible: true,
             last_input: Instant::now(),
+            store: None,
+            store_dirty: false,
             last_frame: None,
+        }
+    }
+
+    /// Attach the durable store and start the idle-save heartbeat: edits
+    /// mirror into Loro immediately, the snapshot hits disk once typing
+    /// pauses for a second (and on quit, via `save_now`).
+    pub fn attach_store(&mut self, store: Store, cx: &mut Context<Self>) {
+        self.store = Some(store);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1000))
+                    .await;
+                let alive = this.update(cx, |editor: &mut Editor, _| {
+                    if editor.store_dirty && editor.last_input.elapsed() >= Duration::from_secs(1)
+                    {
+                        editor.save_now();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Mirror buffer changes into the store. Must run after every mutation.
+    fn sync_store(&mut self) {
+        let ops = self.buffer.take_ops();
+        if ops.is_empty() {
+            return;
+        }
+        if let Some(store) = &self.store {
+            store.apply(&ops);
+            self.store_dirty = true;
+        }
+    }
+
+    pub fn save_now(&mut self) {
+        self.sync_store();
+        if let Some(store) = &self.store {
+            match store.save() {
+                Ok(()) => self.store_dirty = false,
+                Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
+            }
         }
     }
 
@@ -799,6 +850,7 @@ impl Editor {
             self.cursor_affinity_down = false;
             self.goal_x = None;
             self.marked_range = None;
+            self.sync_store();
             self.bump_activity();
             cx.notify();
         }
@@ -812,6 +864,7 @@ impl Editor {
             self.cursor_affinity_down = false;
             self.goal_x = None;
             self.marked_range = None;
+            self.sync_store();
             self.bump_activity();
             cx.notify();
         }
@@ -1061,6 +1114,7 @@ impl Editor {
         self.cursor_affinity_down = false;
         self.goal_x = None;
         self.marked_range = None;
+        self.sync_store();
         self.bump_activity();
         cx.notify();
     }
@@ -1143,6 +1197,7 @@ impl EntityInputHandler for Editor {
         self.selection_reversed = false;
         self.cursor_affinity_down = false;
         self.goal_x = None;
+        self.sync_store();
         self.bump_activity();
         cx.notify();
     }

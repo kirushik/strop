@@ -5,6 +5,8 @@
 //! shell talks to this crate through snapshots and transactions only.
 
 pub mod buffer;
+pub mod store;
 pub mod typograph;
 
 pub use buffer::Buffer;
+pub use store::Store;

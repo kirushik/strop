@@ -13,6 +13,19 @@ pub struct Buffer {
     redo_stack: Vec<Transaction>,
     /// Whether the top of `undo_stack` may still absorb coalesced edits.
     group_open: bool,
+    /// Log of applied text changes (including undo/redo), in application
+    /// order, for mirroring into the durable store. Drained by `take_ops` —
+    /// the owner must drain after every mutation.
+    ops: Vec<TextOp>,
+}
+
+/// A text change in char coordinates: delete `delete` chars at `pos`, then
+/// insert `insert` there. Matches Loro's unicode-indexed text operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextOp {
+    pub pos: usize,
+    pub delete: usize,
+    pub insert: String,
 }
 
 /// An immutable, O(1)-cloned view of the buffer at a point in time.
@@ -116,6 +129,11 @@ impl Buffer {
             old: self.rope.slice(char_range.clone()).to_string(),
             new: text.to_owned(),
         };
+        self.ops.push(TextOp {
+            pos: char_range.start,
+            delete: char_range.end - char_range.start,
+            insert: text.to_owned(),
+        });
         self.rope.remove(char_range.clone());
         self.rope.insert(char_range.start, text);
         self.version += 1;
@@ -144,6 +162,11 @@ impl Buffer {
         let mut cursor = 0;
         for edit in tx.edits.iter().rev() {
             let end = edit.start + edit.new_chars();
+            self.ops.push(TextOp {
+                pos: edit.start,
+                delete: edit.new_chars(),
+                insert: edit.old.clone(),
+            });
             self.rope.remove(edit.start..end);
             self.rope.insert(edit.start, &edit.old);
             cursor = edit.start + edit.old_chars();
@@ -160,6 +183,11 @@ impl Buffer {
         let mut cursor = 0;
         for edit in &tx.edits {
             let end = edit.start + edit.old_chars();
+            self.ops.push(TextOp {
+                pos: edit.start,
+                delete: edit.old_chars(),
+                insert: edit.new.clone(),
+            });
             self.rope.remove(edit.start..end);
             self.rope.insert(edit.start, &edit.new);
             cursor = edit.start + edit.new_chars();
@@ -167,6 +195,11 @@ impl Buffer {
         self.version += 1;
         self.undo_stack.push(tx);
         Some(cursor)
+    }
+
+    /// Drain the mirror log. Call after every mutation batch.
+    pub fn take_ops(&mut self) -> Vec<TextOp> {
+        std::mem::take(&mut self.ops)
     }
 
     pub fn snapshot(&self) -> Snapshot {
