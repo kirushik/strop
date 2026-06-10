@@ -16,6 +16,7 @@ actions!(strop, [Quit]);
 const LITERATA: &[u8] = include_bytes!("../../../assets/fonts/Literata[opsz,wght].ttf");
 const LITERATA_ITALIC: &[u8] =
     include_bytes!("../../../assets/fonts/Literata-Italic[opsz,wght].ttf");
+const PT_MONO: &[u8] = include_bytes!("../../../assets/fonts/PTMono-Regular.ttf");
 
 const SAMPLE: &str = "Strop is a writer’s editor with an editor inside — one that diagnoses, and never rewrites you into the average.\n\
 Хороший редактор называет проблему — «здесь зарыта мысль», «начало хоронит главное» — и оставляет решение автору. Тире, кавычки-ёлочки и неразрывные пробелы должны просто работать: 1941—1945, «так», “so”.\n\
@@ -44,8 +45,8 @@ fn data_file() -> PathBuf {
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.text_system()
-            .add_fonts(vec![LITERATA.into(), LITERATA_ITALIC.into()])
-            .expect("failed to load bundled Literata");
+            .add_fonts(vec![LITERATA.into(), LITERATA_ITALIC.into(), PT_MONO.into()])
+            .expect("failed to load bundled fonts");
 
         editor::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);

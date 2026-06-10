@@ -29,6 +29,10 @@ const SELECTION_COLOR: u32 = 0xB4D5FE88;
 const HIGHLIGHT_COLOR: u32 = 0xF9E29CAA;
 const CODE_BG_COLOR: u32 = 0x1A1A1814;
 const LINK_COLOR: u32 = 0x1A56A0;
+const CODE_FONT: &str = "PT Mono";
+const BAR_HEIGHT: f32 = 36.;
+const MUTED_COLOR: u32 = 0x8A8678;
+const RULE_COLOR: u32 = 0xE8E4DC;
 
 actions!(
     editor,
@@ -110,6 +114,10 @@ pub struct Editor {
     /// TODO(durable formatting): mirror into Loro Peritext marks and load on
     /// open — formatting is session-only until then; text persists.
     spans: SpanSet,
+    /// Sticky caret formatting: toggles made with an empty selection apply
+    /// to the next typed text. (attr, on) overrides what the position would
+    /// inherit; cleared by any caret motion.
+    caret_attrs: Vec<(InlineAttr, bool)>,
     /// Selection in UTF-8 byte offsets; the cursor is `end` unless reversed.
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -285,6 +293,7 @@ impl Editor {
             focus_handle: cx.focus_handle(),
             buffer: Buffer::new(text),
             spans: SpanSet::default(),
+            caret_attrs: Vec::new(),
             selected_range: 0..0,
             selection_reversed: false,
             cursor_affinity_down: false,
@@ -355,11 +364,46 @@ impl Editor {
         }
     }
 
-    /// Toggle an inline attribute over the selection: fully covered ->
-    /// remove, anything less -> apply (the universal toggle convention).
-    /// TODO: with an empty selection this should set a sticky caret attr.
+    /// Would text typed at the caret inherit `attr` from the existing spans?
+    /// Mirrors `SpanSet::apply_op` insertion rules: strictly inside any
+    /// span, or at the right edge of an expanding one.
+    fn caret_inherits(&self, attr: &InlineAttr) -> bool {
+        let pos = self
+            .buffer
+            .rope()
+            .byte_to_char(self.selected_range.start);
+        self.spans.spans().iter().any(|s| {
+            s.attr == *attr
+                && (s.range.start < pos && pos < s.range.end
+                    || s.range.end == pos && s.attr.expands())
+        })
+    }
+
+    /// Is `attr` active at the current selection/caret (for toggle logic
+    /// and toolbar state)?
+    fn attr_active(&self, attr: &InlineAttr) -> bool {
+        if self.selected_range.is_empty() {
+            if let Some((_, on)) = self.caret_attrs.iter().find(|(a, _)| a == attr) {
+                return *on;
+            }
+            self.caret_inherits(attr)
+        } else {
+            let rope = self.buffer.rope();
+            let range = rope.byte_to_char(self.selected_range.start)
+                ..rope.byte_to_char(self.selected_range.end);
+            self.spans.covers(range, attr)
+        }
+    }
+
+    /// Toggle an inline attribute: over a selection, fully-covered removes
+    /// and anything less applies; at a bare caret, sets a sticky attr for
+    /// the next typed text (the universal rich-editor convention).
     fn toggle_span(&mut self, attr: InlineAttr, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            let target = !self.attr_active(&attr);
+            self.caret_attrs.retain(|(a, _)| a != &attr);
+            self.caret_attrs.push((attr, target));
+            cx.notify();
             return;
         }
         let rope = self.buffer.rope();
@@ -424,6 +468,7 @@ impl Editor {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         self.cursor_affinity_down = affinity_down;
+        self.caret_attrs.clear();
         self.bump_activity();
         cx.notify();
     }
@@ -440,6 +485,7 @@ impl Editor {
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
         self.cursor_affinity_down = affinity_down;
+        self.caret_attrs.clear();
         self.bump_activity();
         self.publish_primary(cx);
         cx.notify();
@@ -920,6 +966,7 @@ impl Editor {
             self.cursor_affinity_down = false;
             self.goal_x = None;
             self.marked_range = None;
+            self.caret_attrs.clear();
             self.sync_mutations();
             self.bump_activity();
             cx.notify();
@@ -934,6 +981,7 @@ impl Editor {
             self.cursor_affinity_down = false;
             self.goal_x = None;
             self.marked_range = None;
+            self.caret_attrs.clear();
             self.sync_mutations();
             self.bump_activity();
             cx.notify();
@@ -1188,6 +1236,25 @@ impl Editor {
         self.goal_x = None;
         self.marked_range = None;
         self.sync_mutations();
+
+        // Sticky caret formatting applies to what was just inserted (after
+        // sync, so it layers over the spans' own expansion behavior).
+        if !new_text.is_empty() && !self.caret_attrs.is_empty() {
+            let char_range = {
+                let rope = self.buffer.rope();
+                rope.byte_to_char(range.start)..rope.byte_to_char(cursor)
+            };
+            if char_range.start < char_range.end {
+                for (attr, on) in self.caret_attrs.clone() {
+                    if on {
+                        self.spans.add(char_range.clone(), attr);
+                    } else {
+                        self.spans.remove(char_range.clone(), &attr);
+                    }
+                }
+            }
+        }
+
         self.bump_activity();
         cx.notify();
     }
@@ -1389,7 +1456,7 @@ fn runs_for_paragraph(
                         }
                     }
                     InlineAttr::Code => {
-                        font.family = "monospace".into();
+                        font.family = CODE_FONT.into();
                         if background.is_none() {
                             background = Some(rgba(CODE_BG_COLOR).into());
                         }
@@ -1644,17 +1711,126 @@ impl Element for EditorElement {
     }
 }
 
+impl Editor {
+    fn format_button(
+        &self,
+        label: &'static str,
+        attr: InlineAttr,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.attr_active(&attr);
+        div()
+            .id(label)
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(5.))
+            .cursor(CursorStyle::PointingHand)
+            .text_color(if active {
+                rgb(TEXT_COLOR)
+            } else {
+                rgb(MUTED_COLOR)
+            })
+            .when(active, |d| d.bg(rgba(0x1A1A1812u32)))
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.toggle_span(attr.clone(), cx);
+                }),
+            )
+            .child(label)
+    }
+
+    fn window_button(
+        &self,
+        label: &'static str,
+        action: fn(&mut Window, &mut App),
+    ) -> impl IntoElement {
+        div()
+            .id(label)
+            .w(px(34.))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(MUTED_COLOR))
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)).text_color(rgb(TEXT_COLOR)))
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                action(window, cx);
+            })
+            .child(label)
+    }
+
+    /// The one piece of chrome: a unified bar — drag region, formatting
+    /// toggles with live state, window controls. Deliberately quiet.
+    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let drag =
+            |_: &MouseDownEvent, window: &mut Window, _: &mut App| window.start_window_move();
+        div()
+            .h(px(BAR_HEIGHT))
+            .w_full()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(rgb(RULE_COLOR))
+            .font_family("Literata")
+            .text_size(px(13.))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .pl(px(14.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .on_mouse_down(MouseButton::Left, drag)
+                    .child("Strop"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .child(self.format_button("B", InlineAttr::Strong, cx))
+                    .child(self.format_button("I", InlineAttr::Emphasis, cx))
+                    .child(self.format_button("U", InlineAttr::Underline, cx))
+                    .child(self.format_button("S", InlineAttr::Strikethrough, cx))
+                    .child(self.format_button("H", InlineAttr::Highlight, cx))
+                    .child(self.format_button("{}", InlineAttr::Code, cx)),
+            )
+            .child(
+                div()
+                    .w(px(28.))
+                    .h_full()
+                    .on_mouse_down(MouseButton::Left, drag),
+            )
+            .child(self.window_button("–", |window, _| window.minimize_window()))
+            .child(self.window_button("□", |window, _| window.zoom_window()))
+            .child(self.window_button("✕", |_, cx| cx.quit()))
+    }
+}
+
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .bg(rgb(BG_COLOR))
             .flex()
-            .justify_center()
-            .overflow_hidden()
+            .flex_col()
+            .child(self.render_titlebar(cx))
             .child(
                 div()
-                    .key_context("Editor")
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .key_context("Editor")
                     .track_focus(&self.focus_handle)
                     .cursor(CursorStyle::IBeam)
                     .on_action(cx.listener(Self::backspace))
@@ -1708,17 +1884,18 @@ impl Render for Editor {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-                    .w_full()
-                    .max_w(px(660.))
-                    .h_full()
-                    .pt(px(84.))
-                    .pb(px(28.))
-                    .px(px(28.))
-                    .font_family("Literata")
-                    .text_size(px(20.))
-                    .line_height(px(28.))
-                    .text_color(rgb(TEXT_COLOR))
-                    .child(EditorElement { editor: cx.entity() }),
+                            .w_full()
+                            .max_w(px(660.))
+                            .h_full()
+                            .pt(px(56.))
+                            .pb(px(28.))
+                            .px(px(28.))
+                            .font_family("Literata")
+                            .text_size(px(20.))
+                            .line_height(px(28.))
+                            .text_color(rgb(TEXT_COLOR))
+                            .child(EditorElement { editor: cx.entity() }),
+                    ),
             )
     }
 }
