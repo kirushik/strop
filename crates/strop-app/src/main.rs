@@ -1,4 +1,5 @@
 mod editor;
+mod smoke;
 
 use gpui::{
     App, Application, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
@@ -28,7 +29,7 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
 
         let bounds = Bounds::centered(None, size(px(960.), px(720.)), cx);
-        cx.open_window(
+        let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -44,6 +45,7 @@ fn main() {
             },
         )
         .expect("failed to open window");
+        smoke::maybe_run(window, cx);
         cx.activate(true);
     });
 }

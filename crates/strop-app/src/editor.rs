@@ -1,9 +1,12 @@
 //! The prose canvas: a multi-paragraph editable text element built directly
 //! on GPUI's IME-capable input plumbing (`EntityInputHandler`).
 //!
-//! v0 scope: plain text, cursor/selection/mouse, word movement, clipboard.
-//! Not yet: scrolling, undo (waits for strop-core transactions), inline
-//! styles, the typograph input engine, cursor blink.
+//! Cursor positions at soft-wrap boundaries are ambiguous (end of the upper
+//! visual line vs start of the lower); we resolve them with an explicit
+//! affinity bit, set by the motion that produced the position.
+//!
+//! v0 scope: plain text, cursor/selection/mouse, word ops, clipboard, undo.
+//! Not yet: scrolling, drag-extends-by-word after double-click, cursor blink.
 
 use std::ops::Range;
 
@@ -24,8 +27,10 @@ const SELECTION_COLOR: u32 = 0xB4D5FE88;
 actions!(
     editor,
     [
-        Backspace, Delete, Left, Right, Up, Down, WordLeft, WordRight, SelectLeft, SelectRight,
-        SelectUp, SelectDown, SelectAll, Home, End, Newline, Copy, Cut, Paste, Undo, Redo,
+        Backspace, Delete, DeleteWordLeft, DeleteWordRight, Left, Right, Up, Down, WordLeft,
+        WordRight, SelectLeft, SelectRight, SelectUp, SelectDown, SelectWordLeft, SelectWordRight,
+        SelectAll, Home, End, SelectToHome, SelectToEnd, DocStart, DocEnd, SelectToDocStart,
+        SelectToDocEnd, Newline, Copy, Cut, Paste, Undo, Redo,
     ]
 );
 
@@ -34,6 +39,8 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
+        KeyBinding::new("ctrl-backspace", DeleteWordLeft, ctx),
+        KeyBinding::new("ctrl-delete", DeleteWordRight, ctx),
         KeyBinding::new("left", Left, ctx),
         KeyBinding::new("right", Right, ctx),
         KeyBinding::new("up", Up, ctx),
@@ -44,14 +51,26 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-right", SelectRight, ctx),
         KeyBinding::new("shift-up", SelectUp, ctx),
         KeyBinding::new("shift-down", SelectDown, ctx),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
         KeyBinding::new("ctrl-a", SelectAll, ctx),
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
+        KeyBinding::new("shift-home", SelectToHome, ctx),
+        KeyBinding::new("shift-end", SelectToEnd, ctx),
+        KeyBinding::new("ctrl-home", DocStart, ctx),
+        KeyBinding::new("ctrl-end", DocEnd, ctx),
+        KeyBinding::new("ctrl-shift-home", SelectToDocStart, ctx),
+        KeyBinding::new("ctrl-shift-end", SelectToDocEnd, ctx),
         KeyBinding::new("enter", Newline, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
         KeyBinding::new("ctrl-c", Copy, ctx),
         KeyBinding::new("ctrl-x", Cut, ctx),
         KeyBinding::new("ctrl-v", Paste, ctx),
+        // CUA legacy, still alive in every Linux toolkit.
+        KeyBinding::new("ctrl-insert", Copy, ctx),
+        KeyBinding::new("shift-delete", Cut, ctx),
+        KeyBinding::new("shift-insert", Paste, ctx),
         KeyBinding::new("ctrl-z", Undo, ctx),
         KeyBinding::new("ctrl-shift-z", Redo, ctx),
         KeyBinding::new("ctrl-y", Redo, ctx),
@@ -64,6 +83,11 @@ pub struct Editor {
     /// Selection in UTF-8 byte offsets; the cursor is `end` unless reversed.
     selected_range: Range<usize>,
     selection_reversed: bool,
+    /// When the cursor offset sits exactly on a soft-wrap boundary: false =
+    /// end of the upper visual line, true = start of the lower one.
+    cursor_affinity_down: bool,
+    /// Preferred x for consecutive vertical moves. Cleared by any other motion.
+    goal_x: Option<Pixels>,
     marked_range: Option<Range<usize>>,
     is_selecting: bool,
     last_frame: Option<TextFrame>,
@@ -81,9 +105,60 @@ struct ParagraphLayout {
     line: WrappedLine,
     /// Byte range in the document, excluding the trailing newline.
     range: Range<usize>,
+    /// Paragraph-local byte indices where soft-wrapped visual lines start.
+    boundaries: Vec<usize>,
     /// Y offset of the paragraph top, relative to `TextFrame::bounds` origin.
     top: Pixels,
     height: Pixels,
+}
+
+impl ParagraphLayout {
+    fn len(&self) -> usize {
+        self.range.end - self.range.start
+    }
+
+    fn line_count(&self) -> usize {
+        self.boundaries.len() + 1
+    }
+
+    /// Paragraph-local byte index where visual line `line` starts.
+    fn line_start(&self, line: usize) -> usize {
+        if line == 0 { 0 } else { self.boundaries[line - 1] }
+    }
+
+    /// Paragraph-local byte index where visual line `line` ends.
+    fn line_end(&self, line: usize) -> usize {
+        self.boundaries.get(line).copied().unwrap_or(self.len())
+    }
+
+    /// Which visual line a paragraph-local index sits on, given affinity.
+    fn line_of(&self, local: usize, affinity_down: bool) -> usize {
+        self.boundaries
+            .partition_point(|&b| if affinity_down { b <= local } else { b < local })
+    }
+
+    /// X position of a local index within its visual line.
+    fn x_for(&self, local: usize, line: usize) -> Pixels {
+        let layout = &self.line.unwrapped_layout;
+        layout.x_for_index(local) - layout.x_for_index(self.line_start(line))
+    }
+
+    fn position(&self, local: usize, affinity_down: bool) -> (usize, Pixels) {
+        let line = self.line_of(local, affinity_down);
+        (line, self.x_for(local, line))
+    }
+
+    /// Closest local index to `x` on visual line `line`, with the affinity
+    /// that renders the cursor on that same line.
+    fn index_at(&self, line: usize, x: Pixels, line_height: Pixels) -> (usize, bool) {
+        let line = line.min(self.line_count() - 1);
+        let y = line_height * (line as f32) + line_height / 2.;
+        let ix = self
+            .line
+            .closest_index_for_position(point(x, y), line_height)
+            .unwrap_or_else(|ix| ix);
+        (ix, line > 0 && ix == self.line_start(line))
+    }
 }
 
 impl TextFrame {
@@ -91,39 +166,48 @@ impl TextFrame {
         self.paragraphs.last().map_or(0, |p| p.range.end)
     }
 
-    fn paragraph_containing(&self, offset: usize) -> Option<&ParagraphLayout> {
-        self.paragraphs.iter().find(|p| offset <= p.range.end)
+    /// (paragraph index, visual line, x) of a byte offset.
+    fn cursor_position(&self, offset: usize, affinity_down: bool) -> Option<(usize, usize, Pixels)> {
+        let par_ix = self.paragraphs.iter().position(|p| offset <= p.range.end)?;
+        let par = &self.paragraphs[par_ix];
+        let (line, x) = par.position(offset - par.range.start, affinity_down);
+        Some((par_ix, line, x))
     }
 
     /// Position of a byte offset, relative to `bounds` origin.
-    fn position_of(&self, offset: usize) -> Option<Point<Pixels>> {
-        let par = self.paragraph_containing(offset)?;
-        let local = par
-            .line
-            .position_for_index(offset - par.range.start, self.line_height)?;
-        Some(point(local.x, par.top + local.y))
+    fn position_of(&self, offset: usize, affinity_down: bool) -> Option<Point<Pixels>> {
+        let (par_ix, line, x) = self.cursor_position(offset, affinity_down)?;
+        let par = &self.paragraphs[par_ix];
+        Some(point(x, par.top + self.line_height * (line as f32)))
     }
 
-    /// Byte offset closest to a point given relative to `bounds` origin.
-    /// Points in inter-paragraph gaps snap to the following paragraph.
-    fn index_for_point(&self, p: Point<Pixels>) -> usize {
+    /// Byte offset (and cursor affinity) closest to a point relative to
+    /// `bounds` origin. Points in inter-paragraph gaps snap to the nearest
+    /// paragraph edge.
+    fn index_for_point(&self, p: Point<Pixels>) -> (usize, bool) {
         if p.y < px(0.) {
-            return 0;
+            return (0, false);
         }
-        for par in &self.paragraphs {
+        let x = p.x.max(px(0.));
+        for (i, par) in self.paragraphs.iter().enumerate() {
+            if p.y < par.top && i > 0 {
+                let prev = &self.paragraphs[i - 1];
+                let prev_bottom = prev.top + prev.height;
+                let (target, line) = if p.y - prev_bottom <= par.top - p.y {
+                    (prev, prev.line_count() - 1)
+                } else {
+                    (par, 0)
+                };
+                let (ix, aff) = target.index_at(line, x, self.line_height);
+                return (target.range.start + ix, aff);
+            }
             if p.y < par.top + par.height {
-                let local = point(
-                    p.x.max(px(0.)),
-                    (p.y - par.top).clamp(px(0.), par.height - px(1.)),
-                );
-                let ix = par
-                    .line
-                    .closest_index_for_position(local, self.line_height)
-                    .unwrap_or_else(|ix| ix);
-                return par.range.start + ix;
+                let line = ((p.y - par.top) / self.line_height) as usize;
+                let (ix, aff) = par.index_at(line, x, self.line_height);
+                return (par.range.start + ix, aff);
             }
         }
-        self.doc_len()
+        (self.doc_len(), false)
     }
 }
 
@@ -134,6 +218,8 @@ impl Editor {
             buffer: Buffer::new(text),
             selected_range: 0..0,
             selection_reversed: false,
+            cursor_affinity_down: false,
+            goal_x: None,
             marked_range: None,
             is_selecting: false,
             last_frame: None,
@@ -148,13 +234,17 @@ impl Editor {
         }
     }
 
-    fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+    /// Collapse the selection to `offset`. Keeps `goal_x`; non-vertical
+    /// callers go through `move_to`, which clears it.
+    fn set_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.cursor_affinity_down = affinity_down;
         cx.notify();
     }
 
-    fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+    /// Extend the selection's moving end to `offset`. Keeps `goal_x`.
+    fn extend_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -164,12 +254,24 @@ impl Editor {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.cursor_affinity_down = affinity_down;
         cx.notify();
+    }
+
+    fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        self.set_cursor(offset, false, cx);
+    }
+
+    fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        self.extend_cursor(offset, false, cx);
     }
 
     // -- Boundary helpers (byte offsets) ------------------------------------
 
-    fn line_bounds(&self, offset: usize) -> (usize, usize) {
+    /// Start/end of the *paragraph* (rope line) containing `offset`.
+    fn paragraph_bounds(&self, offset: usize) -> (usize, usize) {
         let rope = self.buffer.rope();
         let line_ix = rope.byte_to_line(offset);
         let start = rope.line_to_byte(line_ix);
@@ -181,11 +283,28 @@ impl Editor {
         (start, end)
     }
 
+    /// Start/end of the *visual* line under the cursor, with the affinity
+    /// that keeps the cursor on it. Falls back to paragraph bounds when no
+    /// frame exists yet.
+    fn visual_line_bounds(&self, offset: usize) -> ((usize, bool), (usize, bool)) {
+        if let Some(frame) = self.last_frame.as_ref()
+            && let Some((par_ix, line, _)) =
+                frame.cursor_position(offset, self.cursor_affinity_down)
+        {
+            let par = &frame.paragraphs[par_ix];
+            let start = par.range.start + par.line_start(line);
+            let end = par.range.start + par.line_end(line);
+            return ((start, line > 0), (end, false));
+        }
+        let (start, end) = self.paragraph_bounds(offset);
+        ((start, false), (end, false))
+    }
+
     fn previous_boundary(&self, offset: usize) -> usize {
         if offset == 0 {
             return 0;
         }
-        let (start, _) = self.line_bounds(offset);
+        let (start, _) = self.paragraph_bounds(offset);
         if offset == start {
             return offset - 1; // step over the newline
         }
@@ -200,7 +319,7 @@ impl Editor {
         if offset >= len {
             return len;
         }
-        let (_, end) = self.line_bounds(offset);
+        let (_, end) = self.paragraph_bounds(offset);
         if offset == end {
             return offset + 1; // step over the newline
         }
@@ -214,9 +333,10 @@ impl Editor {
         if offset == 0 {
             return 0;
         }
-        let (start, _) = self.line_bounds(offset);
+        let (start, _) = self.paragraph_bounds(offset);
         if offset == start {
-            return offset - 1;
+            // Continue the search from the end of the previous paragraph.
+            return self.previous_word_boundary(offset - 1).max(0);
         }
         let line = self.buffer.slice_bytes(start..offset);
         line.split_word_bound_indices()
@@ -230,25 +350,80 @@ impl Editor {
         if offset >= len {
             return len;
         }
-        let (_, end) = self.line_bounds(offset);
+        let (_, end) = self.paragraph_bounds(offset);
         if offset == end {
-            return offset + 1;
+            return self.next_word_boundary(offset + 1).min(len);
         }
         let line = self.buffer.slice_bytes(offset..end);
         line.split_word_bound_indices()
-            .find(|(ix, seg)| {
-                ix + seg.len() > 0 && seg.chars().next().is_some_and(char::is_alphanumeric)
-            })
+            .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
             .map_or(end, |(ix, seg)| offset + ix + seg.len())
     }
 
-    fn vertical_index(&self, direction: f32) -> Option<usize> {
-        let frame = self.last_frame.as_ref()?;
-        let pos = frame.position_of(self.cursor_offset())?;
-        // Land mid-line above/below; index_for_point handles doc edges.
-        // TODO: persist goal-x across consecutive vertical moves.
-        let target = point(pos.x, pos.y + direction * frame.line_height + frame.line_height / 2.);
-        Some(frame.index_for_point(target))
+    /// Word-bound segment containing `offset` (for double-click selection).
+    fn word_range_at(&self, offset: usize) -> Range<usize> {
+        let (start, end) = self.paragraph_bounds(offset);
+        if start == end {
+            return start..end;
+        }
+        let local = (offset - start).min(end - start - 1);
+        let line = self.buffer.slice_bytes(start..end);
+        for (ix, seg) in line.split_word_bound_indices() {
+            if ix <= local && local < ix + seg.len() {
+                return start + ix..start + ix + seg.len();
+            }
+        }
+        start..end
+    }
+
+    // -- Vertical movement ----------------------------------------------------
+
+    fn vertical_by(&mut self, direction: i64, select: bool, cx: &mut Context<Self>) {
+        let cursor = self.cursor_offset();
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let Some((par_ix, line_ix, x)) = frame.cursor_position(cursor, self.cursor_affinity_down)
+        else {
+            return;
+        };
+        let x = self.goal_x.unwrap_or(x);
+
+        let par = &frame.paragraphs[par_ix];
+        let target = if direction > 0 {
+            if line_ix + 1 < par.line_count() {
+                Some((par_ix, line_ix + 1))
+            } else if par_ix + 1 < frame.paragraphs.len() {
+                Some((par_ix + 1, 0))
+            } else {
+                None
+            }
+        } else if line_ix > 0 {
+            Some((par_ix, line_ix - 1))
+        } else if par_ix > 0 {
+            let prev = &frame.paragraphs[par_ix - 1];
+            Some((par_ix - 1, prev.line_count() - 1))
+        } else {
+            None
+        };
+
+        let (offset, affinity) = match target {
+            Some((p, l)) => {
+                let par = &frame.paragraphs[p];
+                let (ix, aff) = par.index_at(l, x, frame.line_height);
+                (par.range.start + ix, aff)
+            }
+            // First line up -> document start; last line down -> document end.
+            None if direction > 0 => (frame.doc_len(), false),
+            None => (0, false),
+        };
+
+        self.goal_x = Some(x);
+        if select {
+            self.extend_cursor(offset, affinity, cx);
+        } else {
+            self.set_cursor(offset, affinity, cx);
+        }
     }
 
     // -- Actions -------------------------------------------------------------
@@ -264,6 +439,27 @@ impl Editor {
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
+            self.select_to(next, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let prev = self.previous_word_boundary(self.cursor_offset());
+            self.select_to(prev, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            let next = self.next_word_boundary(self.cursor_offset());
             self.select_to(next, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
@@ -286,15 +482,11 @@ impl Editor {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.vertical_index(-1.) {
-            self.move_to(ix, cx);
-        }
+        self.vertical_by(-1, false, cx);
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.vertical_index(1.) {
-            self.move_to(ix, cx);
-        }
+        self.vertical_by(1, false, cx);
     }
 
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -314,15 +506,19 @@ impl Editor {
     }
 
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.vertical_index(-1.) {
-            self.select_to(ix, cx);
-        }
+        self.vertical_by(-1, true, cx);
     }
 
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.vertical_index(1.) {
-            self.select_to(ix, cx);
-        }
+        self.vertical_by(1, true, cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.previous_word_boundary(self.cursor_offset()), cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.next_word_boundary(self.cursor_offset()), cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -331,13 +527,48 @@ impl Editor {
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        let (start, _) = self.line_bounds(self.cursor_offset());
-        self.move_to(start, cx);
+        let ((start, affinity), _) = self.visual_line_bounds(self.cursor_offset());
+        self.goal_x = None;
+        self.set_cursor(start, affinity, cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        let (_, end) = self.line_bounds(self.cursor_offset());
-        self.move_to(end, cx);
+        let (_, (end, affinity)) = self.visual_line_bounds(self.cursor_offset());
+        self.goal_x = None;
+        self.set_cursor(end, affinity, cx);
+    }
+
+    fn select_to_home(&mut self, _: &SelectToHome, _: &mut Window, cx: &mut Context<Self>) {
+        let ((start, affinity), _) = self.visual_line_bounds(self.cursor_offset());
+        self.goal_x = None;
+        self.extend_cursor(start, affinity, cx);
+    }
+
+    fn select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let (_, (end, affinity)) = self.visual_line_bounds(self.cursor_offset());
+        self.goal_x = None;
+        self.extend_cursor(end, affinity, cx);
+    }
+
+    fn doc_start(&mut self, _: &DocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.buffer.len_bytes(), cx);
+    }
+
+    fn select_to_doc_start(
+        &mut self,
+        _: &SelectToDocStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(0, cx);
+    }
+
+    fn select_to_doc_end(&mut self, _: &SelectToDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.buffer.len_bytes(), cx);
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
@@ -370,6 +601,8 @@ impl Editor {
             let cursor = self.buffer.char_to_byte(cursor_char);
             self.selected_range = cursor..cursor;
             self.selection_reversed = false;
+            self.cursor_affinity_down = false;
+            self.goal_x = None;
             self.marked_range = None;
             cx.notify();
         }
@@ -380,6 +613,8 @@ impl Editor {
             let cursor = self.buffer.char_to_byte(cursor_char);
             self.selected_range = cursor..cursor;
             self.selection_reversed = false;
+            self.cursor_affinity_down = false;
+            self.goal_x = None;
             self.marked_range = None;
             cx.notify();
         }
@@ -387,20 +622,39 @@ impl Editor {
 
     // -- Mouse ----------------------------------------------------------------
 
-    fn index_for_mouse(&self, position: Point<Pixels>) -> usize {
+    fn index_for_mouse(&self, position: Point<Pixels>) -> (usize, bool) {
         let Some(frame) = self.last_frame.as_ref() else {
-            return 0;
+            return (0, false);
         };
         frame.index_for_point(position - frame.bounds.origin)
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.is_selecting = true;
-        let ix = self.index_for_mouse(ev.position);
-        if ev.modifiers.shift {
-            self.select_to(ix, cx);
-        } else {
-            self.move_to(ix, cx);
+        self.goal_x = None;
+        let (ix, affinity) = self.index_for_mouse(ev.position);
+        match ev.click_count {
+            1 => {
+                self.is_selecting = true;
+                if ev.modifiers.shift {
+                    self.extend_cursor(ix, affinity, cx);
+                } else {
+                    self.set_cursor(ix, affinity, cx);
+                }
+            }
+            2 => {
+                // TODO: drag after double/triple click should extend by
+                // word/paragraph granularity.
+                let range = self.word_range_at(ix);
+                self.selected_range = range;
+                self.selection_reversed = false;
+                cx.notify();
+            }
+            _ => {
+                let (start, end) = self.paragraph_bounds(ix);
+                self.selected_range = start..end;
+                self.selection_reversed = false;
+                cx.notify();
+            }
         }
     }
 
@@ -410,8 +664,24 @@ impl Editor {
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
-            let ix = self.index_for_mouse(ev.position);
-            self.select_to(ix, cx);
+            let (ix, affinity) = self.index_for_mouse(ev.position);
+            self.extend_cursor(ix, affinity, cx);
+        }
+    }
+
+    /// Cursor geometry for the smoke harness: byte offset, paragraph index,
+    /// wrapped-line index within the paragraph, and x position.
+    pub fn debug_cursor(&self) -> String {
+        let cursor = self.cursor_offset();
+        let Some(frame) = self.last_frame.as_ref() else {
+            return format!("off={cursor} (no frame)");
+        };
+        match frame.cursor_position(cursor, self.cursor_affinity_down) {
+            Some((par, line, x)) => format!(
+                "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?}",
+                self.cursor_affinity_down as u8, self.selected_range
+            ),
+            None => format!("off={cursor} (no paragraph)"),
         }
     }
 
@@ -474,6 +744,8 @@ impl EntityInputHandler for Editor {
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
+        self.cursor_affinity_down = false;
+        self.goal_x = None;
         self.marked_range = None;
         cx.notify();
     }
@@ -507,6 +779,8 @@ impl EntityInputHandler for Editor {
                 cursor..cursor
             });
         self.selection_reversed = false;
+        self.cursor_affinity_down = false;
+        self.goal_x = None;
         cx.notify();
     }
 
@@ -519,7 +793,7 @@ impl EntityInputHandler for Editor {
     ) -> Option<Bounds<Pixels>> {
         let frame = self.last_frame.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        let pos = frame.position_of(range.start)?;
+        let pos = frame.position_of(range.start, self.cursor_affinity_down)?;
         Some(Bounds::new(
             frame.bounds.origin + pos,
             size(px(2.), frame.line_height),
@@ -532,7 +806,7 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let byte_ix = self.index_for_mouse(point);
+        let (byte_ix, _) = self.index_for_mouse(point);
         Some(self.buffer.byte_to_utf16(byte_ix))
     }
 }
@@ -557,7 +831,7 @@ impl IntoElement for EditorElement {
     }
 }
 
-/// Split `(start, end)` into runs cut at selection/marked boundaries, so
+/// Split a paragraph into runs cut at selection/marked boundaries, so
 /// selection paints via `WrappedLine::paint_background` and IME composition
 /// gets an underline.
 fn runs_for_paragraph(
@@ -640,6 +914,7 @@ impl Element for EditorElement {
         let selection = editor.selected_range.clone();
         let marked = editor.marked_range.clone();
         let cursor_offset = editor.cursor_offset();
+        let cursor_affinity = editor.cursor_affinity_down;
 
         let base_run = TextRun {
             len: 0,
@@ -669,10 +944,19 @@ impl Element for EditorElement {
                 .into_iter()
                 .next()
                 .expect("shape_text returned no lines");
+            let boundaries: Vec<usize> = line
+                .wrap_boundaries()
+                .iter()
+                .map(|b| {
+                    let run = &line.unwrapped_layout.runs[b.run_ix];
+                    run.glyphs[b.glyph_ix].index
+                })
+                .collect();
             let height = line.size(line_height).height;
             paragraphs.push(ParagraphLayout {
                 line,
                 range: range.clone(),
+                boundaries,
                 top,
                 height,
             });
@@ -683,17 +967,16 @@ impl Element for EditorElement {
         let cursor = paragraphs
             .iter()
             .find(|p| cursor_offset <= p.range.end)
-            .and_then(|par| {
-                let local = par
-                    .line
-                    .position_for_index(cursor_offset - par.range.start, line_height)?;
-                Some(fill(
+            .map(|par| {
+                let (line, x) = par.position(cursor_offset - par.range.start, cursor_affinity);
+                fill(
                     Bounds::new(
-                        bounds.origin + point(local.x, par.top + local.y),
+                        bounds.origin
+                            + point(x, par.top + line_height * (line as f32)),
                         size(px(2.), line_height),
                     ),
                     rgb(TEXT_COLOR),
-                ))
+                )
             });
 
         PrepaintState {
@@ -763,6 +1046,8 @@ impl Render for Editor {
                     .cursor(CursorStyle::IBeam)
                     .on_action(cx.listener(Self::backspace))
                     .on_action(cx.listener(Self::delete))
+                    .on_action(cx.listener(Self::delete_word_left))
+                    .on_action(cx.listener(Self::delete_word_right))
                     .on_action(cx.listener(Self::left))
                     .on_action(cx.listener(Self::right))
                     .on_action(cx.listener(Self::up))
@@ -773,9 +1058,17 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::select_right))
                     .on_action(cx.listener(Self::select_up))
                     .on_action(cx.listener(Self::select_down))
+                    .on_action(cx.listener(Self::select_word_left))
+                    .on_action(cx.listener(Self::select_word_right))
                     .on_action(cx.listener(Self::select_all))
                     .on_action(cx.listener(Self::home))
                     .on_action(cx.listener(Self::end))
+                    .on_action(cx.listener(Self::select_to_home))
+                    .on_action(cx.listener(Self::select_to_end))
+                    .on_action(cx.listener(Self::doc_start))
+                    .on_action(cx.listener(Self::doc_end))
+                    .on_action(cx.listener(Self::select_to_doc_start))
+                    .on_action(cx.listener(Self::select_to_doc_end))
                     .on_action(cx.listener(Self::newline))
                     .on_action(cx.listener(Self::copy))
                     .on_action(cx.listener(Self::cut))
