@@ -154,6 +154,8 @@ pub struct Editor {
     /// Durable layer; edits mirror into it, a background task saves when idle.
     store: Option<Store>,
     store_dirty: bool,
+    /// Rough rewind panel (B5); proper history visualization is backlogged.
+    show_history: bool,
     last_frame: Option<TextFrame>,
 }
 
@@ -325,6 +327,7 @@ impl Editor {
             last_input: Instant::now(),
             store: None,
             store_dirty: false,
+            show_history: false,
             last_frame: None,
         }
     }
@@ -380,6 +383,26 @@ impl Editor {
             self.store_dirty = true;
             eprintln!("strop: recorded \"{name}\"");
         }
+        cx.notify();
+    }
+
+    fn restore_checkpoint(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else { return };
+        let checkpoints = store.checkpoints();
+        let Some(cp) = checkpoints.get(ix) else { return };
+        let Some((text, spans, blocks)) = store.state_at(&cp.frontiers) else {
+            eprintln!("strop: cannot read checkpoint state");
+            return;
+        };
+        self.doc.restore_state(&text, spans, blocks);
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+        self.cursor_affinity_down = false;
+        self.goal_x = None;
+        self.marked_range = None;
+        self.caret_attrs.clear();
+        self.sync_mutations();
+        self.bump_activity();
         cx.notify();
     }
 
@@ -2119,6 +2142,31 @@ impl Editor {
             )
             .child(
                 div()
+                    .id("history-toggle")
+                    .px(px(8.))
+                    .py(px(2.))
+                    .ml(px(8.))
+                    .rounded(px(5.))
+                    .cursor(CursorStyle::PointingHand)
+                    .text_color(if self.show_history {
+                        rgb(TEXT_COLOR)
+                    } else {
+                        rgb(MUTED_COLOR)
+                    })
+                    .when(self.show_history, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.show_history = !editor.show_history;
+                            cx.notify();
+                        }),
+                    )
+                    .child("↺"),
+            )
+            .child(
+                div()
                     .w(px(28.))
                     .h_full()
                     .on_mouse_down(MouseButton::Left, drag),
@@ -2129,14 +2177,100 @@ impl Editor {
     }
 }
 
+
+/// Days-from-epoch to civil date (Howard Hinnant's algorithm); good enough
+/// for checkpoint labels (UTC — rough UI, backlogged with the rest).
+fn format_unix(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+}
+
+impl Editor {
+    fn render_history_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let checkpoints = self
+            .store
+            .as_ref()
+            .map(|s| s.checkpoints())
+            .unwrap_or_default();
+        div()
+            .id("history-panel")
+            .absolute()
+            .top(px(BAR_HEIGHT + 8.))
+            .right(px(8.))
+            .w(px(280.))
+            .max_h(px(440.))
+            .overflow_y_scroll()
+            .bg(rgb(0xF4F1EA))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(8.))
+            .p(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .font_family("Literata")
+            .text_size(px(13.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(4.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child(if checkpoints.is_empty() {
+                        "No checkpoints yet — ctrl-alt-s records one."
+                    } else {
+                        "Click a version to restore it (undoable)."
+                    }),
+            )
+            .children(checkpoints.into_iter().enumerate().rev().map(|(ix, cp)| {
+                div()
+                    .id(ix)
+                    .px(px(8.))
+                    .py(px(5.))
+                    .rounded(px(5.))
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.restore_checkpoint(ix, cx);
+                        }),
+                    )
+                    .child(div().text_color(rgb(TEXT_COLOR)).child(cp.name.clone()))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(format_unix(cp.created_unix)),
+                    )
+            }))
+    }
+}
+
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .relative()
             .bg(rgb(BG_COLOR))
             .flex()
             .flex_col()
             .child(self.render_titlebar(cx))
+            .when(self.show_history, |d| {
+                d.child(self.render_history_panel(cx))
+            })
             .child(
                 div()
                     .w_full()

@@ -46,7 +46,7 @@ unless they'd be expensive to reverse.
       rendering via gpui img.
 - [ ] B4. File UX: ctrl-o open (.strop/.md via xdg portal dialog), recent
       files on the bar?, save-as. Keep minimal.
-- [~] B5. **Checkpoints & persistent history** (plumbing done 2026-06-11,
+- [x] B5. **Checkpoints & persistent history** (plumbing done 2026-06-11,
       pulled forward on Kirill's ask — "Google-Docs Rewind, local-first,
       self-contained file" resonates with his interviewees):
       cross-session undo/redo (transaction stacks + span/block snapshots
@@ -54,8 +54,9 @@ unless they'd be expensive to reverse.
       formatting — Kirill's unification principle), auto "Session start"
       checkpoint on open, ctrl-alt-s named checkpoints, Frontiers-based
       time-travel reads (state_at), restore-as-forward-edit semantics.
-      REMAINING: the rewind UI (checkpoint list, preview, restore button)
-      and an in-app naming input.
+      Rough rewind UI shipped: titlebar toggle, checkpoint list with
+      dates, click-to-restore (one undoable forward edit). Naming input
+      still pending (auto names for now).
 
 ## Phase C — The thesis: diagnosis margin
 
@@ -87,6 +88,17 @@ unless they'd be expensive to reverse.
       save failed. Title shows document name.
 - [ ] D4. Docs sweep: README quickstart, DECISIONS/document-model updated
       to match reality.
+
+## Backlog (researched properly, not squeezed in)
+
+- **History & versions visualization** (Kirill, 2026-06-11): the rewind
+  panel is deliberately rough. Research the design space before building
+  the real one — VCS visualizations (gitk/Sublime Merge graphs, GitHub
+  blame/history), Apple Time Machine's spatial metaphor, Google Docs
+  version list with diff preview, Obsidian's sync history, local-first
+  apps' timeline scrubbers. Open questions: timeline vs list vs graph
+  (undo creates branches!), diff rendering between versions, checkpoint
+  naming/renaming UX, auto-checkpoint cadence beyond session-start.
 
 ## Explicitly post-MVP
 

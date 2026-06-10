@@ -458,6 +458,28 @@ impl Document {
         Some(cursor)
     }
 
+    /// Replace the whole document state as ONE undoable transaction —
+    /// checkpoint restore semantics: rewinding is a forward edit, history
+    /// stays append-only, and ctrl-z takes you back to the present.
+    pub fn restore_state(&mut self, text: &str, spans: SpanSet, blocks: BlockMap) {
+        let snapshot = self.snapshot();
+        let len = self.buffer.len_bytes();
+        if self.buffer.edit_bytes(0..len, text) {
+            self.undo_states.push(snapshot);
+            self.redo_states.clear();
+        }
+        self.absorb_buffer_ops();
+        // The wholesale text op mangled span/block adjustment; the restored
+        // state is authoritative.
+        self.spans = spans;
+        let lines = self.buffer.rope().len_lines();
+        self.blocks = if blocks.len() == lines {
+            blocks
+        } else {
+            BlockMap::new(lines)
+        };
+    }
+
     /// Export undo/redo state for persistence (most-recent `cap` entries).
     /// Saved atomically with the text it refers to, so it restores exactly.
     pub fn export_history(&self, cap: usize) -> History {
@@ -656,6 +678,20 @@ mod tests {
         assert_eq!(doc.text(), "bold plain");
         assert!(doc.spans().covers(0..4, &InlineAttr::Strong));
         assert!(!doc.spans().covers(0..5, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn restore_state_is_one_undoable_transaction() {
+        let mut doc = Document::new("новый текст", SpanSet::default(), BlockMap::default());
+        doc.toggle_format(0..5, InlineAttr::Strong);
+        doc.edit_bytes(0..0, "ещё ");
+        doc.restore_state("старый", SpanSet::default(), BlockMap::new(1));
+        assert_eq!(doc.text(), "старый");
+        assert!(doc.spans().spans().is_empty());
+        // One undo returns to the pre-restore present, formatting included.
+        doc.undo();
+        assert_eq!(doc.text(), "ещё новый текст");
+        assert!(doc.spans().covers(4..9, &InlineAttr::Strong));
     }
 
     #[test]
