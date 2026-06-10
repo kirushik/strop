@@ -25,7 +25,7 @@ actions!(
     editor,
     [
         Backspace, Delete, Left, Right, Up, Down, WordLeft, WordRight, SelectLeft, SelectRight,
-        SelectUp, SelectDown, SelectAll, Home, End, Newline, Copy, Cut, Paste,
+        SelectUp, SelectDown, SelectAll, Home, End, Newline, Copy, Cut, Paste, Undo, Redo,
     ]
 );
 
@@ -52,6 +52,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", Copy, ctx),
         KeyBinding::new("ctrl-x", Cut, ctx),
         KeyBinding::new("ctrl-v", Paste, ctx),
+        KeyBinding::new("ctrl-z", Undo, ctx),
+        KeyBinding::new("ctrl-shift-z", Redo, ctx),
+        KeyBinding::new("ctrl-y", Redo, ctx),
     ]);
 }
 
@@ -362,6 +365,26 @@ impl Editor {
         }
     }
 
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(cursor_char) = self.buffer.undo() {
+            let cursor = self.buffer.char_to_byte(cursor_char);
+            self.selected_range = cursor..cursor;
+            self.selection_reversed = false;
+            self.marked_range = None;
+            cx.notify();
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(cursor_char) = self.buffer.redo() {
+            let cursor = self.buffer.char_to_byte(cursor_char);
+            self.selected_range = cursor..cursor;
+            self.selection_reversed = false;
+            self.marked_range = None;
+            cx.notify();
+        }
+    }
+
     // -- Mouse ----------------------------------------------------------------
 
     fn index_for_mouse(&self, position: Point<Pixels>) -> usize {
@@ -447,7 +470,7 @@ impl EntityInputHandler for Editor {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.buffer.edit_bytes(range.clone(), new_text);
+        self.buffer.edit_bytes_coalescing(range.clone(), new_text);
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
@@ -757,6 +780,8 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::copy))
                     .on_action(cx.listener(Self::cut))
                     .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::undo))
+                    .on_action(cx.listener(Self::redo))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
