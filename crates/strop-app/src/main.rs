@@ -35,6 +35,9 @@ fn main() {
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
+        // Smoke runs must not steal the user's OS focus — keystroke dispatch
+        // uses GPUI's internal focus, which we set explicitly below.
+        let smoke = std::env::var("STROP_SMOKE").is_ok();
         let bounds = Bounds::centered(None, size(px(960.), px(720.)), cx);
         let window = cx.open_window(
             WindowOptions {
@@ -43,6 +46,7 @@ fn main() {
                     title: Some("Strop".into()),
                     ..Default::default()
                 }),
+                focus: !smoke,
                 ..Default::default()
             },
             |window, cx| {
@@ -57,6 +61,8 @@ fn main() {
         )
         .expect("failed to open window");
         smoke::maybe_run(window, cx);
-        cx.activate(true);
+        if !smoke {
+            cx.activate(true);
+        }
     });
 }

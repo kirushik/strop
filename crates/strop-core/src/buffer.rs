@@ -298,6 +298,23 @@ mod tests {
     }
 
     #[test]
+    fn typograph_substitution_undoes_separately() {
+        // The Birman undo contract, end to end: typing coalesces, but a
+        // substitution applied via `edit_bytes` is its own transaction, so
+        // one undo restores exactly the typed characters.
+        let mut buf = Buffer::new("");
+        for (i, ch) in "so...".chars().enumerate() {
+            buf.edit_bytes_coalescing(i..i, &ch.to_string());
+        }
+        buf.edit_bytes(2..5, "…");
+        assert_eq!(buf.text(), "so…");
+        buf.undo();
+        assert_eq!(buf.text(), "so...");
+        buf.undo();
+        assert_eq!(buf.text(), "");
+    }
+
+    #[test]
     fn new_edit_clears_redo() {
         let mut buf = Buffer::new("a");
         buf.edit(1..1, "b");

@@ -18,7 +18,7 @@ use gpui::{
     ScrollWheelEvent, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
     Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
-use strop_core::Buffer;
+use strop_core::{Buffer, typograph};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const BG_COLOR: u32 = 0xFBFAF8;
@@ -784,9 +784,10 @@ impl Editor {
         }
     }
 
-    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace("\r\n", "\n"), window, cx);
+            // Pasted text is never typographed — it is already authored.
+            self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
         }
     }
 
@@ -961,7 +962,7 @@ impl Editor {
         }
     }
 
-    fn on_middle_click(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_middle_click(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         // freedesktop PRIMARY contract: middle button pastes the primary
         // selection (never the clipboard) at the click position.
         let Some(text) = cx.read_from_primary().and_then(|item| item.text()) else {
@@ -970,7 +971,7 @@ impl Editor {
         let (ix, _) = self.index_for_mouse(ev.position);
         self.selected_range = ix..ix;
         self.selection_reversed = false;
-        self.replace_text_in_range(None, &text.replace("\r\n", "\n"), window, cx);
+        self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -994,10 +995,23 @@ impl Editor {
             return format!("off={cursor} (no frame)");
         };
         match frame.cursor_position(cursor, self.cursor_affinity_down) {
-            Some((par, line, x)) => format!(
-                "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?} scroll={:?}",
-                self.cursor_affinity_down as u8, self.selected_range, self.scroll_top
-            ),
+            Some((par, line, x)) => {
+                let tail_start = self
+                    .buffer
+                    .rope()
+                    .byte_to_char(cursor)
+                    .saturating_sub(12);
+                let tail: String = self
+                    .buffer
+                    .rope()
+                    .chars_at(tail_start)
+                    .take(self.buffer.rope().byte_to_char(cursor) - tail_start)
+                    .collect();
+                format!(
+                    "off={cursor} par={par} line={line} x={x:?} aff={} sel={:?} scroll={:?} tail={tail:?}",
+                    self.cursor_affinity_down as u8, self.selected_range, self.scroll_top
+                )
+            }
             None => format!("off={cursor} (no paragraph)"),
         }
     }
@@ -1008,6 +1022,47 @@ impl Editor {
 
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.buffer.utf16_to_byte(range.start)..self.buffer.utf16_to_byte(range.end)
+    }
+
+    /// Core text replacement; optionally runs the typograph on the result.
+    fn apply_replace(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        typograph: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+
+        self.buffer.edit_bytes_coalescing(range.clone(), new_text);
+        let mut cursor = range.start + new_text.len();
+
+        if typograph {
+            let (par_start, _) = self.paragraph_bounds(cursor);
+            let prefix = self.buffer.slice_bytes(par_start..cursor);
+            let lang = typograph::detect_lang(self.buffer.rope().chars());
+            if let Some(sub) = typograph::process(&prefix, lang) {
+                // The substitution is its own transaction: one undo reverts
+                // it alone, restoring the literally-typed characters — and
+                // since rules fire only on the typed char, the restored text
+                // never re-fires (the Birman override contract).
+                let start = cursor - sub.span;
+                self.buffer.edit_bytes(start..cursor, &sub.text);
+                cursor = start + sub.text.len();
+            }
+        }
+
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.cursor_affinity_down = false;
+        self.goal_x = None;
+        self.marked_range = None;
+        self.bump_activity();
+        cx.notify();
     }
 }
 
@@ -1051,21 +1106,10 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|r| self.range_from_utf16(r))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
-
-        self.buffer.edit_bytes_coalescing(range.clone(), new_text);
-        let cursor = range.start + new_text.len();
-        self.selected_range = cursor..cursor;
-        self.selection_reversed = false;
-        self.cursor_affinity_down = false;
-        self.goal_x = None;
-        self.marked_range = None;
-        self.bump_activity();
-        cx.notify();
+        // Typograph only single typed characters — multi-char inserts are
+        // IME commits or programmatic and arrive already authored.
+        let typograph = new_text.chars().count() == 1;
+        self.apply_replace(range_utf16, new_text, typograph, cx);
     }
 
     fn replace_and_mark_text_in_range(
