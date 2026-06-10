@@ -28,9 +28,10 @@ actions!(
     editor,
     [
         Backspace, Delete, DeleteWordLeft, DeleteWordRight, Left, Right, Up, Down, WordLeft,
-        WordRight, SelectLeft, SelectRight, SelectUp, SelectDown, SelectWordLeft, SelectWordRight,
-        SelectAll, Home, End, SelectToHome, SelectToEnd, DocStart, DocEnd, SelectToDocStart,
-        SelectToDocEnd, Newline, Copy, Cut, Paste, Undo, Redo,
+        WordRight, ParagraphUp, ParagraphDown, SelectLeft, SelectRight, SelectUp, SelectDown,
+        SelectWordLeft, SelectWordRight, SelectParagraphUp, SelectParagraphDown, SelectAll, Home,
+        End, SelectToHome, SelectToEnd, DocStart, DocEnd, SelectToDocStart, SelectToDocEnd,
+        Newline, Copy, Cut, Paste, Undo, Redo,
     ]
 );
 
@@ -38,6 +39,8 @@ pub fn bind_keys(cx: &mut App) {
     let ctx = Some("Editor");
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, ctx),
+        // GTK binds this too, "to help with mis-typing" during shift-selection.
+        KeyBinding::new("shift-backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
         KeyBinding::new("ctrl-backspace", DeleteWordLeft, ctx),
         KeyBinding::new("ctrl-delete", DeleteWordRight, ctx),
@@ -47,6 +50,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", Down, ctx),
         KeyBinding::new("ctrl-left", WordLeft, ctx),
         KeyBinding::new("ctrl-right", WordRight, ctx),
+        KeyBinding::new("ctrl-up", ParagraphUp, ctx),
+        KeyBinding::new("ctrl-down", ParagraphDown, ctx),
+        KeyBinding::new("ctrl-shift-up", SelectParagraphUp, ctx),
+        KeyBinding::new("ctrl-shift-down", SelectParagraphDown, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
         KeyBinding::new("shift-up", SelectUp, ctx),
@@ -90,7 +97,19 @@ pub struct Editor {
     goal_x: Option<Pixels>,
     marked_range: Option<Range<usize>>,
     is_selecting: bool,
+    /// Drag-selection granularity, set by click count (GTK SELECT_* modes).
+    select_granularity: SelectGranularity,
+    /// The unit selected by the initiating double/triple click; drag unions
+    /// the unit under the pointer with this.
+    selection_origin: Option<Range<usize>>,
     last_frame: Option<TextFrame>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SelectGranularity {
+    Char,
+    Word,
+    Paragraph,
 }
 
 /// Geometry of the last painted frame, for mouse, IME, and vertical-motion
@@ -222,6 +241,8 @@ impl Editor {
             goal_x: None,
             marked_range: None,
             is_selecting: false,
+            select_granularity: SelectGranularity::Char,
+            selection_origin: None,
             last_frame: None,
         }
     }
@@ -255,7 +276,17 @@ impl Editor {
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
         self.cursor_affinity_down = affinity_down;
+        self.publish_primary(cx);
         cx.notify();
+    }
+
+    /// Linux PRIMARY-selection contract: any selection (mouse or keyboard)
+    /// is published; middle-click pastes it. No-op on other platforms.
+    fn publish_primary(&self, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            let text = self.buffer.slice_bytes(self.selected_range.clone());
+            cx.write_to_primary(ClipboardItem::new_string(text));
+        }
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -358,6 +389,32 @@ impl Editor {
         line.split_word_bound_indices()
             .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
             .map_or(end, |(ix, seg)| offset + ix + seg.len())
+    }
+
+    /// GTK/Windows paragraph motion: to start of current paragraph, or of
+    /// the previous one when already at a start.
+    fn previous_paragraph_boundary(&self, offset: usize) -> usize {
+        let (start, _) = self.paragraph_bounds(offset);
+        if offset > start {
+            start
+        } else if start > 0 {
+            self.paragraph_bounds(start - 1).0
+        } else {
+            0
+        }
+    }
+
+    /// To end of current paragraph, or of the next one when already at an end.
+    fn next_paragraph_boundary(&self, offset: usize) -> usize {
+        let (_, end) = self.paragraph_bounds(offset);
+        let len = self.buffer.len_bytes();
+        if offset < end {
+            end
+        } else if end < len {
+            self.paragraph_bounds(end + 1).1
+        } else {
+            len
+        }
     }
 
     /// Word-bound segment containing `offset` (for double-click selection).
@@ -497,6 +554,27 @@ impl Editor {
         self.move_to(self.next_word_boundary(self.cursor_offset()), cx);
     }
 
+    fn paragraph_up(&mut self, _: &ParagraphUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.previous_paragraph_boundary(self.cursor_offset()), cx);
+    }
+
+    fn paragraph_down(&mut self, _: &ParagraphDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.next_paragraph_boundary(self.cursor_offset()), cx);
+    }
+
+    fn select_paragraph_up(&mut self, _: &SelectParagraphUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.previous_paragraph_boundary(self.cursor_offset()), cx);
+    }
+
+    fn select_paragraph_down(
+        &mut self,
+        _: &SelectParagraphDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(self.next_paragraph_boundary(self.cursor_offset()), cx);
+    }
+
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.previous_boundary(self.cursor_offset()), cx);
     }
@@ -629,33 +707,71 @@ impl Editor {
         frame.index_for_point(position - frame.bounds.origin)
     }
 
+    /// The selection unit at `offset` for the current drag granularity.
+    fn unit_at(&self, offset: usize) -> Range<usize> {
+        match self.select_granularity {
+            SelectGranularity::Char => offset..offset,
+            SelectGranularity::Word => self.word_range_at(offset),
+            SelectGranularity::Paragraph => {
+                let (start, end) = self.paragraph_bounds(offset);
+                start..end
+            }
+        }
+    }
+
+    /// Union the unit under the pointer with the origin unit (GTK/Word
+    /// drag-by-word/paragraph behavior).
+    fn extend_by_unit(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let Some(origin) = self.selection_origin.clone() else {
+            return;
+        };
+        let unit = self.unit_at(offset);
+        self.selection_reversed = unit.start < origin.start;
+        self.selected_range = origin.start.min(unit.start)..origin.end.max(unit.end);
+        self.cursor_affinity_down = false;
+        self.publish_primary(cx);
+        cx.notify();
+    }
+
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
+        self.is_selecting = true;
         let (ix, affinity) = self.index_for_mouse(ev.position);
         match ev.click_count {
             1 => {
-                self.is_selecting = true;
+                self.select_granularity = SelectGranularity::Char;
                 if ev.modifiers.shift {
+                    self.selection_origin = None;
                     self.extend_cursor(ix, affinity, cx);
                 } else {
+                    self.selection_origin = Some(ix..ix);
                     self.set_cursor(ix, affinity, cx);
                 }
             }
             2 => {
-                // TODO: drag after double/triple click should extend by
-                // word/paragraph granularity.
-                let range = self.word_range_at(ix);
-                self.selected_range = range;
-                self.selection_reversed = false;
-                cx.notify();
+                self.select_granularity = SelectGranularity::Word;
+                self.selection_origin = Some(self.word_range_at(ix));
+                self.extend_by_unit(ix, cx);
             }
             _ => {
+                self.select_granularity = SelectGranularity::Paragraph;
                 let (start, end) = self.paragraph_bounds(ix);
-                self.selected_range = start..end;
-                self.selection_reversed = false;
-                cx.notify();
+                self.selection_origin = Some(start..end);
+                self.extend_by_unit(ix, cx);
             }
         }
+    }
+
+    fn on_middle_click(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // freedesktop PRIMARY contract: middle button pastes the primary
+        // selection (never the clipboard) at the click position.
+        let Some(text) = cx.read_from_primary().and_then(|item| item.text()) else {
+            return;
+        };
+        let (ix, _) = self.index_for_mouse(ev.position);
+        self.selected_range = ix..ix;
+        self.selection_reversed = false;
+        self.replace_text_in_range(None, &text.replace("\r\n", "\n"), window, cx);
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -663,9 +779,13 @@ impl Editor {
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            let (ix, affinity) = self.index_for_mouse(ev.position);
-            self.extend_cursor(ix, affinity, cx);
+        if !self.is_selecting {
+            return;
+        }
+        let (ix, affinity) = self.index_for_mouse(ev.position);
+        match self.select_granularity {
+            SelectGranularity::Char => self.extend_cursor(ix, affinity, cx),
+            _ => self.extend_by_unit(ix, cx),
         }
     }
 
@@ -1054,6 +1174,10 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::down))
                     .on_action(cx.listener(Self::word_left))
                     .on_action(cx.listener(Self::word_right))
+                    .on_action(cx.listener(Self::paragraph_up))
+                    .on_action(cx.listener(Self::paragraph_down))
+                    .on_action(cx.listener(Self::select_paragraph_up))
+                    .on_action(cx.listener(Self::select_paragraph_down))
                     .on_action(cx.listener(Self::select_left))
                     .on_action(cx.listener(Self::select_right))
                     .on_action(cx.listener(Self::select_up))
@@ -1076,6 +1200,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::undo))
                     .on_action(cx.listener(Self::redo))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
