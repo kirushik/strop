@@ -24,7 +24,7 @@ use gpui::{
     px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
-    Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteStatus, SpanSet,
+    Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus, SpanSet,
 };
 use strop_core::{Store, typograph};
 
@@ -57,7 +57,7 @@ actions!(
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
-        OpenFile, SaveCopyAs, AddNote,
+        OpenFile, SaveCopyAs, AddNote, RunDiagnosis,
     ]
 );
 
@@ -129,6 +129,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-e", ExportMarkdown, ctx),
         KeyBinding::new("ctrl-alt-f", InsertFootnote, ctx),
         KeyBinding::new("ctrl-m", AddNote, ctx),
+        KeyBinding::new("ctrl-shift-d", RunDiagnosis, ctx),
         KeyBinding::new("enter", NoteCommit, Some("NoteInput")),
         KeyBinding::new("escape", NoteCancel, Some("NoteInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
@@ -184,6 +185,8 @@ pub struct Editor {
     pub config: Config,
     /// Active (snapped/highlighted) margin note, if any.
     active_note: Option<u64>,
+    diagnosis_running: bool,
+    last_ai_error: Option<String>,
     /// In-card composer for the active note's body.
     note_input: Option<Entity<NoteInput>>,
     last_frame: Option<TextFrame>,
@@ -614,6 +617,8 @@ impl Editor {
             image_assets: HashMap::new(),
             config: Config::default(),
             active_note: None,
+            diagnosis_running: false,
+            last_ai_error: None,
             note_input: None,
             last_frame: None,
         }
@@ -943,6 +948,79 @@ impl Editor {
         self.store_dirty = true;
         self.bump_activity();
         cx.notify();
+    }
+
+    /// The thesis, running: an editorial pass that names problems as
+    /// queries in the margin and never rewrites a word.
+    fn run_diagnosis(&mut self, _: &RunDiagnosis, _: &mut Window, cx: &mut Context<Self>) {
+        if self.diagnosis_running {
+            return;
+        }
+        let ai = self.config.ai.clone();
+        if ai.base_url.is_empty() || ai.model.is_empty() {
+            self.last_ai_error =
+                Some("configure [ai] base_url/api_key/model in config.toml".into());
+            cx.notify();
+            return;
+        }
+        // Scope: the selection if there is one, else the whole document
+        // (capped — a 24k-char window is plenty for an editorial pass).
+        let scope = if self.selected_range.is_empty() {
+            self.doc.text()
+        } else {
+            self.doc.slice_bytes(self.selected_range.clone())
+        };
+        let scope: String = scope.chars().take(24_000).collect();
+        let mode = "line".to_owned(); // levels-of-edit switch: config later
+        self.diagnosis_running = true;
+        self.last_ai_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let client =
+                        strop_core::llm::LlmClient::new(&ai.base_url, &ai.api_key, &ai.model);
+                    let system = strop_core::diagnose::system_prompt(&mode);
+                    let user = strop_core::diagnose::user_prompt(&scope);
+                    client
+                        .chat(&system, &user, 2048)
+                        .map_err(|e| e.to_string())
+                        .and_then(|response| strop_core::diagnose::parse(&response))
+                })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor.diagnosis_running = false;
+                match result {
+                    Ok(diagnoses) => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let count = diagnoses.len();
+                        // Anchor against the text as it is NOW — quotes
+                        // that no longer match are dropped.
+                        let annotations = strop_core::diagnose::to_annotations(
+                            &editor.doc.text(),
+                            diagnoses,
+                            editor.doc.notes(),
+                            now,
+                        );
+                        let kept = annotations.len();
+                        editor.doc.add_diagnoses(annotations);
+                        editor.store_dirty = true;
+                        eprintln!("strop: diagnosis pass: {kept} of {count} anchored");
+                    }
+                    Err(e) => {
+                        editor.last_ai_error = Some(e);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn save_now(&mut self) {
@@ -2290,7 +2368,7 @@ fn runs_for_paragraph(
     selection: &Range<usize>,
     marked: Option<&Range<usize>>,
     spans: &[(Range<usize>, InlineAttr)],
-    notes: &[(Range<usize>, bool)],
+    notes: &[(Range<usize>, bool, bool)],
     base: &TextRun,
 ) -> Vec<TextRun> {
     let mut cuts = vec![par_range.start, par_range.end];
@@ -2302,7 +2380,7 @@ fn runs_for_paragraph(
         cuts.push(r.start.clamp(par_range.start, par_range.end));
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
-    for (r, _) in notes {
+    for (r, _, _) in notes {
         cuts.push(r.start.clamp(par_range.start, par_range.end));
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
@@ -2366,10 +2444,19 @@ fn runs_for_paragraph(
                 }
             }
 
-            // Note anchor tint composites over highlight/code backgrounds;
-            // selection composites over everything (Kirill's visibility rule).
-            for (r, active) in notes {
+            // Note anchors tint (wheat); diagnosis anchors underline
+            // quietly in muted ink — never red, never wavy — promoting to
+            // a tint when active. Selection composites over everything.
+            for (r, active, is_diagnosis) in notes {
                 if r.start <= w[0] && w[1] <= r.end {
+                    if *is_diagnosis && !active {
+                        underline.get_or_insert(UnderlineStyle {
+                            color: Some(rgb(MUTED_COLOR).into()),
+                            thickness: px(1.),
+                            wavy: false,
+                        });
+                        continue;
+                    }
                     let tint = if *active {
                         rgba(NOTE_TINT_ACTIVE)
                     } else {
@@ -2516,8 +2603,9 @@ impl Element for EditorElement {
 
         let font_scale = editor.config.font_size.map_or(1., |s| (s / 20.).clamp(0.6, 2.));
         let kinds: Vec<BlockKind> = editor.doc.blocks().kinds().to_vec();
-        // Open-note anchors in byte ranges, with active flag, for tinting.
-        let note_ranges: Vec<(Range<usize>, bool)> = {
+        // Open-annotation anchors (byte ranges, active, is_diagnosis):
+        // notes tint; diagnoses underline quietly until activated.
+        let note_ranges: Vec<(Range<usize>, bool, bool)> = {
             let rope = editor.doc.rope();
             editor
                 .doc
@@ -2527,6 +2615,7 @@ impl Element for EditorElement {
                     (
                         rope.char_to_byte(n.range.start)..rope.char_to_byte(n.range.end),
                         editor.active_note == Some(n.id),
+                        n.kind == NoteKind::Diagnosis,
                     )
                 })
                 .collect()
@@ -2585,9 +2674,9 @@ impl Element for EditorElement {
                 .filter(|(r, _)| r.start < range.end && range.start < r.end)
                 .cloned()
                 .collect();
-            let par_notes: Vec<(Range<usize>, bool)> = note_ranges
+            let par_notes: Vec<(Range<usize>, bool, bool)> = note_ranges
                 .iter()
-                .filter(|(r, _)| r.start < range.end && range.start < r.end)
+                .filter(|(r, _, _)| r.start < range.end && range.start < r.end)
                 .cloned()
                 .collect();
             let runs = runs_for_paragraph(
@@ -2887,7 +2976,18 @@ impl Editor {
                     .pl(px(14.))
                     .text_color(rgb(MUTED_COLOR))
                     .on_mouse_down(MouseButton::Left, drag)
-                    .child("Strop"),
+                    .child("Strop")
+                    .when(self.diagnosis_running, |d| {
+                        d.child(div().ml(px(10.)).child("· диагноз…"))
+                    })
+                    .when_some(self.last_ai_error.clone(), |d, err| {
+                        d.child(
+                            div()
+                                .ml(px(10.))
+                                .text_color(rgb(0xA04A3A))
+                                .child(format!("AI: {err}")),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -3079,17 +3179,28 @@ impl Editor {
     }
 }
 
+struct MarginCard {
+    id: u64,
+    top: f32,
+    height: f32,
+    body: String,
+    active: bool,
+    kind: NoteKind,
+    title: String,
+    level: String,
+}
+
 impl Editor {
     /// The Docs-style margin solver (via Liveblocks' AnchoredThreads):
     /// downward sweep normally; with an active card, it snaps to its anchor,
     /// later cards push down, earlier cards push up from it in reverse.
-    fn margin_cards(&self) -> Vec<(u64, f32, f32, String, bool)> {
+    fn margin_cards(&self) -> Vec<MarginCard> {
         let Some(frame) = self.last_frame.as_ref() else {
             return Vec::new();
         };
         let rope = self.doc.rope();
         let len = self.doc.len_bytes();
-        let mut cards: Vec<(u64, f32, f32, String, bool)> = Vec::new();
+        let mut cards: Vec<MarginCard> = Vec::new();
         for n in self.doc.notes().open() {
             let byte = rope.char_to_byte(n.range.start.min(rope.len_chars())).min(len);
             let Some(pos) = frame.position_of(byte, false) else {
@@ -3097,33 +3208,43 @@ impl Editor {
             };
             let desired =
                 f32::from(frame.bounds.origin.y) + f32::from(pos.y) - f32::from(frame.scroll_top);
-            let lines = (n.body.chars().count() / 30 + 1).clamp(1, 3) as f32;
+            let text_len = n.title.chars().count() + n.body.chars().count();
+            let lines = (text_len / 30 + 1).clamp(1, 4) as f32;
             let height = 30. + 18. * lines + 22.;
-            cards.push((n.id, desired, height, n.body.clone(), self.active_note == Some(n.id)));
+            cards.push(MarginCard {
+                id: n.id,
+                top: desired,
+                height,
+                body: n.body.clone(),
+                active: self.active_note == Some(n.id),
+                kind: n.kind,
+                title: n.title.clone(),
+                level: n.level.clone(),
+            });
         }
         // cards are in document order (notes are kept sorted by anchor).
-        let active_ix = cards.iter().position(|(_, _, _, _, a)| *a);
+        let active_ix = cards.iter().position(|c| c.active);
         match active_ix {
             None => {
                 let mut bottom = f32::MIN;
                 for card in cards.iter_mut() {
-                    card.1 = card.1.max(bottom);
-                    bottom = card.1 + card.2 + MARGIN_GAP;
+                    card.top = card.top.max(bottom);
+                    bottom = card.top + card.height + MARGIN_GAP;
                 }
             }
             Some(a) => {
                 // Ascending from the active card (which gets its anchor y).
                 let mut bottom = f32::MIN;
                 for card in cards[a..].iter_mut() {
-                    card.1 = card.1.max(bottom);
-                    bottom = card.1 + card.2 + MARGIN_GAP;
+                    card.top = card.top.max(bottom);
+                    bottom = card.top + card.height + MARGIN_GAP;
                 }
                 // Descending above it, nearest first: push up out of the way.
-                let mut top_limit = cards[a].1;
+                let mut top_limit = cards[a].top;
                 for card in cards[..a].iter_mut().rev() {
-                    let max_top = top_limit - card.2 - MARGIN_GAP;
-                    card.1 = card.1.min(max_top);
-                    top_limit = card.1;
+                    let max_top = top_limit - card.height - MARGIN_GAP;
+                    card.top = card.top.min(max_top);
+                    top_limit = card.top;
                 }
             }
         }
@@ -3182,8 +3303,19 @@ impl Editor {
                 .bottom_0()
                 .left(px(lane_left))
                 .w(px(MARGIN_WIDTH))
-                .children(cards.into_iter().map(|(id, top, _h, body, active)| {
+                .children(cards.into_iter().map(|card| {
+                    let MarginCard {
+                        id,
+                        top,
+                        body,
+                        active,
+                        kind,
+                        title,
+                        level,
+                        ..
+                    } = card;
                     let composer = if active { self.note_input.clone() } else { None };
+                    let is_diagnosis = kind == NoteKind::Diagnosis;
                     div()
                         .id(("note-card", id as usize))
                         .absolute()
@@ -3208,13 +3340,16 @@ impl Editor {
                             cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
                                 if editor.active_note != Some(id) {
-                                    let body = editor
-                                        .doc
-                                        .notes()
-                                        .get(id)
-                                        .map(|n| n.body.clone())
-                                        .unwrap_or_default();
-                                    editor.open_composer(id, body, window, cx);
+                                    let note = editor.doc.notes().get(id);
+                                    let is_note =
+                                        note.is_some_and(|n| n.kind == NoteKind::Note);
+                                    let body =
+                                        note.map(|n| n.body.clone()).unwrap_or_default();
+                                    if is_note {
+                                        editor.open_composer(id, body, window, cx);
+                                    } else {
+                                        editor.active_note = Some(id);
+                                    }
                                     cx.notify();
                                 }
                             }),
@@ -3225,7 +3360,15 @@ impl Editor {
                                 .justify_between()
                                 .text_size(px(11.))
                                 .text_color(rgb(MUTED_COLOR))
-                                .child("Note")
+                                .child(if is_diagnosis {
+                                    if level.is_empty() {
+                                        "Diagnosis".to_owned()
+                                    } else {
+                                        level.clone()
+                                    }
+                                } else {
+                                    "Note".to_owned()
+                                })
                                 .child(
                                     div()
                                         .flex()
@@ -3278,12 +3421,15 @@ impl Editor {
                                         ),
                                 ),
                         )
+                        .when(is_diagnosis && !title.is_empty(), |d| {
+                            d.child(div().font_weight(FontWeight::SEMIBOLD).child(title.clone()))
+                        })
                         .when_some(composer, |d, input| d.child(input))
-                        .when(!active, |d| {
-                            d.child(if body.is_empty() {
+                        .when(!active || is_diagnosis, |d| {
+                            d.child(if body.is_empty() && !is_diagnosis {
                                 div().text_color(rgb(MUTED_COLOR)).child("(empty note)")
                             } else {
-                                div().child(body)
+                                div().child(body.clone())
                             })
                         })
                 })),
@@ -3392,6 +3538,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::export_markdown))
                     .on_action(cx.listener(Self::insert_footnote))
                     .on_action(cx.listener(Self::add_note))
+                    .on_action(cx.listener(Self::run_diagnosis))
                     .on_action(cx.listener(Self::open_file))
                     .on_action(cx.listener(Self::save_copy_as))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))

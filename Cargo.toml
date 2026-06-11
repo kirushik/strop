@@ -18,6 +18,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "rayon"] }
 blake3 = "1.8"
 toml = "0.8"
+ureq = { version = "3", features = ["json"] }
 
 # Pinned to the published crate for now; expect to migrate to a git pin on
 # zed-industries/zed once we need post-0.2.2 APIs (the gpui/gpui_platform split).

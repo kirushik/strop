@@ -13,3 +13,4 @@ serde_json = { workspace = true }
 pulldown-cmark = { workspace = true }
 image = { workspace = true }
 blake3 = { workspace = true }
+ureq = { workspace = true }

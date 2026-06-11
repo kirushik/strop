@@ -92,17 +92,27 @@ unless they'd be expensive to reverse.
       (card click <-> anchor click), Done/Dismiss terminal states leave
       the margin but persist. Old persisted-undo JSON drops once
       (state-snapshot format grew a field).
-- [ ] C2. **LLM plumbing**: BYO-key config (~/.config/strop/config.toml)
-      as an **OpenAI-compatible chat-completions client with configurable
-      base_url/key/model** — one client covers Poe (Kirill's subscription,
-      explicitly requested), OpenAI, OpenRouter, ollama/llama.cpp, and
-      Anthropic's compat endpoint. Background thread + channel into GPUI's
-      executor (mind the smol-vs-tokio trap), non-streaming first.
-- [ ] C3. **Diagnosis run**: document/selection scope -> diagnosis-first
-      prompt (named problems as queries, zero rewrites, Gaiman guardrail;
-      levels-of-edit as a mode switch: developmental/line/copy) ->
-      anchored margin annotations with dismiss/done. The handoff doc's
-      §2 conclusions become running code here.
+- [x] C2. **LLM plumbing** (research: provider wire-matrix verified):
+      ureq-3 blocking client on the background executor (gpui's bundled
+      http_client is trait-only — NullHttpClient by default). Bearer auth
+      everywhere; max_completion_tokens except ollama-ish base URLs; NO
+      response_format (Poe + Anthropic-compat ignore it) — structured
+      output is prompt-and-parse with a lenient fence-stripping array
+      extractor; OpenRouter errors-inside-200 handled; error matrix
+      (Auth/RateLimited/Provider-verbatim/Shape) unit-tested.
+- [x] C3. **Diagnosis run** (ctrl-shift-d): selection-or-document scope
+      (24k-char cap) -> diagnosis-first prompt (named problems as queries
+      to the author, zero rewrites, Gaiman guardrail, voice-is-never-a-
+      defect clause, manuscript language matched, empty array honorable,
+      <=7 items; levels developmental/line/copy with line default — config
+      mode switch still to wire) -> quotes anchored sequentially against
+      the CURRENT text (hallucinated quotes dropped, count reported),
+      dismissed diagnoses never re-raised on the same span (tested), the
+      whole pass is ONE undoable transaction. Margin: diagnosis cards are
+      the quiet species (level chip, named problem semibold, query body;
+      no composer), anchors are muted underlines promoting to tint when
+      active — never red, never wavy. Titlebar shows running/error state.
+      NEEDS a live key test (Poe) — all layers below HTTP are unit-tested.
 - [x] C4. Settings file (~/.config/strop/config.toml, malformed = warn +
       defaults): [ai] base_url/api_key/model, language = auto|ru|en
       typograph override, auto_copy_selection (Kirill's habit — selection

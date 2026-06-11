@@ -272,8 +272,18 @@ pub enum NoteStatus {
     Dismissed,
 }
 
+/// Annotation species: human ink vs machine query — visually and
+/// behaviorally distinct in the margin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NoteKind {
+    #[default]
+    Note,
+    Diagnosis,
+}
+
 /// An overlay annotation anchored to a char range — never part of the text
-/// stream. Author notes now; AI diagnoses add their fields in C3.
+/// stream. `title`/`level` are diagnosis fields (named problem;
+/// developmental|line|copy); serde defaults keep older files loading.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Annotation {
     pub id: u64,
@@ -281,6 +291,12 @@ pub struct Annotation {
     pub body: String,
     pub status: NoteStatus,
     pub created_unix: i64,
+    #[serde(default)]
+    pub kind: NoteKind,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub level: String,
 }
 
 /// The annotation overlay. Anchors adjust like non-expanding spans
@@ -302,6 +318,9 @@ impl Annotations {
             body,
             status: NoteStatus::Open,
             created_unix,
+            kind: NoteKind::Note,
+            title: String::new(),
+            level: String::new(),
         });
         self.notes.sort_by_key(|n| n.range.start);
         id
@@ -332,6 +351,26 @@ impl Annotations {
         self.notes
             .iter()
             .filter(|n| n.status == NoteStatus::Open)
+    }
+
+    pub fn push(&mut self, mut annotation: Annotation) -> u64 {
+        self.next_id += 1;
+        annotation.id = self.next_id;
+        let id = annotation.id;
+        self.notes.push(annotation);
+        self.notes.sort_by_key(|n| n.range.start);
+        id
+    }
+
+    /// Has a *dismissed* diagnosis with this title already covered this
+    /// range? The engine must not re-raise what the author waved off.
+    pub fn is_dismissed(&self, range: &Range<usize>, title: &str) -> bool {
+        self.notes.iter().any(|n| {
+            n.status == NoteStatus::Dismissed
+                && n.title == title
+                && n.range.start < range.end
+                && range.start < n.range.end
+        })
     }
 
     pub fn apply_op(&mut self, op: &TextOp) {
@@ -502,6 +541,21 @@ impl Document {
         self.undo_states.push(snapshot);
         self.redo_states.clear();
         self.notes.set_body(id, body);
+    }
+
+    /// Add a batch of diagnoses as ONE undoable transaction (one ctrl-z
+    /// clears a whole pass).
+    pub fn add_diagnoses(&mut self, diagnoses: Vec<Annotation>) {
+        if diagnoses.is_empty() {
+            return;
+        }
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        for d in diagnoses {
+            self.notes.push(d);
+        }
     }
 
     pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
