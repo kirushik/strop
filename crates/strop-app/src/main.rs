@@ -77,7 +77,15 @@ fn main() {
         let store = if smoke && std::env::args().nth(1).is_none() {
             None
         } else {
-            match Store::open(data_file()) {
+            let store_path = {
+                let p = data_file();
+                if p.extension().is_some_and(|e| e == "md") {
+                    p.with_extension("strop")
+                } else {
+                    p
+                }
+            };
+            match Store::open(store_path) {
                 Ok(opened) => Some(opened),
                 Err(e) => {
                     eprintln!("strop: cannot open {}: {e}", data_file().display());
@@ -85,6 +93,21 @@ fn main() {
                 }
             }
         };
+        // Opening a .md imports it into a sibling .strop (existing .strop
+        // wins — the durable file is the source of truth once it exists).
+        let md_import: Option<(String, SpanSet, BlockMap)> = {
+            let arg = data_file();
+            if arg.extension().is_some_and(|e| e == "md") && !arg.with_extension("strop").exists()
+            {
+                std::fs::read_to_string(&arg).ok().map(|md| {
+                    let (text, spans, blocks) = strop_core::markdown::from_markdown(&md);
+                    (text, spans, blocks)
+                })
+            } else {
+                None
+            }
+        };
+
         let (initial_text, initial_spans, initial_blocks, initial_history) = match &store {
             Some((store, existing)) => match existing {
                 Some(loaded) => {
@@ -98,10 +121,16 @@ fn main() {
                         loaded.history.clone(),
                     )
                 }
-                None => {
-                    store.seed(SAMPLE);
-                    (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default(), None)
-                }
+                None => match &md_import {
+                    Some((text, spans, blocks)) => {
+                        store.seed(text);
+                        (text.clone(), spans.clone(), blocks.clone(), None)
+                    }
+                    None => {
+                        store.seed(SAMPLE);
+                        (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default(), None)
+                    }
+                },
             },
             None => (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default(), None),
         };

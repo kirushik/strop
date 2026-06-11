@@ -158,6 +158,204 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
     format!("{trimmed}\n")
 }
 
+/// Markdown -> document state. Lossy where the schema is deliberately
+/// smaller than Markdown (tables, raw HTML beyond `<u>` import as visible
+/// literal text — never silently dropped). Footnote *references* import as
+/// literal `[^id]` until B2 gives them an atom representation.
+pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
+    use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+    let mut text = String::new();
+    let mut chars = 0usize; // char length of `text`
+    let mut spans = SpanSet::default();
+    let mut kinds: Vec<BlockKind> = Vec::new();
+
+    let mut quote = 0usize;
+    let mut lists: Vec<bool> = Vec::new(); // ordered?
+    let mut item_fresh = false; // suppress begin_block for the item's first para
+    let mut code_info: Option<String> = None;
+    let mut footnote_def: Option<String> = None;
+    let mut image_alt: Option<String> = None; // capturing alt text
+    let mut inline_starts: Vec<(usize, InlineAttr)> = Vec::new();
+    let mut underline_start: Option<usize> = None;
+
+    macro_rules! push_str {
+        ($s:expr) => {{
+            let s: &str = $s;
+            text.push_str(s);
+            chars += s.chars().count();
+        }};
+    }
+
+    let begin_block = |text: &mut String,
+                           chars: &mut usize,
+                           kinds: &mut Vec<BlockKind>,
+                           kind: BlockKind| {
+        if !kinds.is_empty() {
+            text.push('\n');
+            *chars += 1;
+        }
+        kinds.push(kind);
+    };
+
+    let current_kind = |quote: usize,
+                        lists: &[bool],
+                        footnote_def: &Option<String>|
+     -> BlockKind {
+        if let Some(id) = footnote_def {
+            BlockKind::FootnoteDef { id: id.clone() }
+        } else if let Some(&ordered) = lists.last() {
+            BlockKind::ListItem {
+                ordered,
+                depth: (lists.len() - 1).min(1) as u8,
+            }
+        } else if quote > 0 {
+            BlockKind::Blockquote
+        } else {
+            BlockKind::Paragraph
+        }
+    };
+
+    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES;
+    for event in Parser::new_ext(md, options) {
+        match event {
+            Event::Start(Tag::Paragraph) => {
+                if item_fresh {
+                    item_fresh = false;
+                } else {
+                    begin_block(
+                        &mut text,
+                        &mut chars,
+                        &mut kinds,
+                        current_kind(quote, &lists, &footnote_def),
+                    );
+                }
+            }
+            Event::Start(Tag::Heading { level, .. }) => {
+                let n = match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                };
+                begin_block(&mut text, &mut chars, &mut kinds, BlockKind::Heading(n));
+            }
+            Event::Start(Tag::BlockQuote(_)) => quote += 1,
+            Event::End(TagEnd::BlockQuote(_)) => quote = quote.saturating_sub(1),
+            Event::Start(Tag::List(start)) => lists.push(start.is_some()),
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                begin_block(
+                    &mut text,
+                    &mut chars,
+                    &mut kinds,
+                    current_kind(quote, &lists, &footnote_def),
+                );
+                item_fresh = true;
+            }
+            Event::End(TagEnd::Item) => item_fresh = false,
+            Event::Start(Tag::CodeBlock(kind)) => {
+                code_info = Some(match kind {
+                    CodeBlockKind::Fenced(info) => info.to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                });
+            }
+            Event::End(TagEnd::CodeBlock) => code_info = None,
+            Event::Start(Tag::FootnoteDefinition(id)) => {
+                footnote_def = Some(id.to_string());
+            }
+            Event::End(TagEnd::FootnoteDefinition) => footnote_def = None,
+            Event::Rule => {
+                begin_block(&mut text, &mut chars, &mut kinds, BlockKind::Divider);
+            }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                image_alt = Some(String::new());
+                begin_block(
+                    &mut text,
+                    &mut chars,
+                    &mut kinds,
+                    BlockKind::Image {
+                        src: dest_url.to_string(),
+                        alt: String::new(),
+                        caption: String::new(),
+                    },
+                );
+            }
+            Event::End(TagEnd::Image) => {
+                let alt = image_alt.take().unwrap_or_default();
+                if let Some(BlockKind::Image { alt: slot, .. }) = kinds.last_mut() {
+                    *slot = alt;
+                }
+            }
+            Event::Start(Tag::Emphasis) => inline_starts.push((chars, InlineAttr::Emphasis)),
+            Event::Start(Tag::Strong) => inline_starts.push((chars, InlineAttr::Strong)),
+            Event::Start(Tag::Strikethrough) => {
+                inline_starts.push((chars, InlineAttr::Strikethrough))
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                inline_starts.push((chars, InlineAttr::Link(dest_url.to_string())))
+            }
+            Event::End(TagEnd::Emphasis)
+            | Event::End(TagEnd::Strong)
+            | Event::End(TagEnd::Strikethrough)
+            | Event::End(TagEnd::Link) => {
+                if let Some((start, attr)) = inline_starts.pop() {
+                    spans.add(start..chars, attr);
+                }
+            }
+            Event::Code(code) => {
+                let start = chars;
+                push_str!(code.as_ref());
+                spans.add(start..chars, InlineAttr::Code);
+            }
+            Event::Text(t) => {
+                if let Some(alt) = image_alt.as_mut() {
+                    alt.push_str(&t);
+                } else if let Some(info) = &code_info {
+                    // Each code line is its own CodeBlock block.
+                    let body = t.strip_suffix('\n').unwrap_or(&t);
+                    for (i, line) in body.split('\n').enumerate() {
+                        if i > 0 || kinds.last().map(|k| !matches!(k, BlockKind::CodeBlock { .. }))
+                            != Some(false)
+                        {
+                            begin_block(
+                                &mut text,
+                                &mut chars,
+                                &mut kinds,
+                                BlockKind::CodeBlock { info: info.clone() },
+                            );
+                        }
+                        push_str!(line);
+                    }
+                } else {
+                    push_str!(t.as_ref());
+                }
+            }
+            Event::Html(h) | Event::InlineHtml(h) => match h.as_ref().trim() {
+                "<u>" => underline_start = Some(chars),
+                "</u>" => {
+                    if let Some(start) = underline_start.take() {
+                        spans.add(start..chars, InlineAttr::Underline);
+                    }
+                }
+                other => push_str!(other),
+            },
+            Event::FootnoteReference(id) => {
+                push_str!(&format!("[^{id}]"));
+            }
+            Event::SoftBreak => push_str!(" "),
+            Event::HardBreak => push_str!("\u{2028}"),
+            _ => {}
+        }
+    }
+
+    (text, spans, BlockMap::from_kinds(kinds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +392,51 @@ mod tests {
             "## Заголовок\n\n**Жирный** *курсив* и `код`.\n\n> цитата\n\n\
              1. первый\n2. второй\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n"
         );
+    }
+
+    #[test]
+    fn import_roundtrips_through_export() {
+        let md = "## Заголовок\n\n**Жирный** *курсив* и `код`.\n\n> цитата\n\n\
+                  1. первый\n2. второй\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n\n\
+                  ***\n\nСсылка на [сайт](https://e.x) и <u>подчёркнутое</u>.\n";
+        let (text, spans, blocks) = from_markdown(md);
+        assert_eq!(
+            blocks.kinds(),
+            &[
+                BlockKind::Heading(2),
+                BlockKind::Paragraph,
+                BlockKind::Blockquote,
+                BlockKind::ListItem {
+                    ordered: true,
+                    depth: 0
+                },
+                BlockKind::ListItem {
+                    ordered: true,
+                    depth: 0
+                },
+                BlockKind::CodeBlock {
+                    info: "rust".into()
+                },
+                BlockKind::CodeBlock {
+                    info: "rust".into()
+                },
+                BlockKind::Divider,
+                BlockKind::Paragraph,
+            ]
+        );
+        assert!(text.contains("Жирный курсив и код."));
+        assert!(spans.covers(10..16, &InlineAttr::Strong));
+        assert!(spans.covers(17..23, &InlineAttr::Emphasis));
+        // Full circle: export of the import matches the original.
+        assert_eq!(to_markdown(&text, &spans, &blocks), md.replace("                  ", ""));
+    }
+
+    #[test]
+    fn import_handles_soft_and_hard_breaks() {
+        let (text, _, blocks) = from_markdown("строка раз\nстрока два\\\nстрока три\n");
+        // Soft wrap joins with a space; hard break becomes U+2028.
+        assert_eq!(text, "строка раз строка два\u{2028}строка три");
+        assert_eq!(blocks.len(), 1);
     }
 
     #[test]
