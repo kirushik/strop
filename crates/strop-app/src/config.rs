@@ -45,6 +45,56 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Default levels-of-edit depth: "developmental" | "line" | "copy".
+    pub mode: String,
+}
+
+impl AiConfig {
+    pub fn configured(&self) -> bool {
+        !self.base_url.is_empty() && !self.model.is_empty()
+    }
+
+    /// STROP_API_KEY wins over the file (the plaintext-averse path).
+    pub fn resolved_api_key(&self) -> String {
+        std::env::var("STROP_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| self.api_key.clone())
+    }
+}
+
+/// Commented starter config; written once, then the user's file is never
+/// touched again (comments survive because Strop only ever reads it).
+const TEMPLATE: &str = r#"# Strop configuration. Edit and save — Strop re-reads this file before
+# every AI pass, so no restart is needed.
+
+[ai]
+# Any OpenAI-compatible chat-completions endpoint works. Examples:
+#   Poe:        base_url = "https://api.poe.com/v1"        model = "Claude-Sonnet-4.5"
+#   OpenRouter: base_url = "https://openrouter.ai/api/v1"  model = "anthropic/claude-sonnet-4.5"
+#   Ollama:     base_url = "http://localhost:11434/v1"     model = "llama3.3"
+base_url = ""
+# The key sits in plain text here — chmod 600 this file, or leave it empty
+# and export STROP_API_KEY instead (the environment variable wins).
+api_key = ""
+model = ""
+# Default depth of the editorial pass: "developmental" | "line" | "copy".
+mode = "line"
+
+# [voice]
+# corpus = ["~/essays/*.md"]   # your own texts; >= 3 enable drift flags
+"#;
+
+/// Ensure a starter config exists; returns its path either way.
+pub fn write_template_if_missing() -> PathBuf {
+    let path = config_path();
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, TEMPLATE);
+    }
+    path
 }
 
 pub fn config_path() -> PathBuf {
@@ -87,5 +137,17 @@ mod tests {
         // Empty/missing input is fine too.
         let default: Config = toml::from_str("").unwrap();
         assert!(!default.auto_copy_selection);
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn template_parses_as_valid_config() {
+        let config: Config = toml::from_str(TEMPLATE).expect("template must stay valid TOML");
+        assert!(!config.ai.configured(), "template starts unconfigured");
+        assert_eq!(config.ai.mode, "line");
     }
 }

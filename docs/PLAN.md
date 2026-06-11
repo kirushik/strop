@@ -98,11 +98,26 @@ here. Sequenced so dogfooding unblocks as early as possible.
   revisit after dogfood), recently-used.xbel deferred, single-instance
   raise-if-open deferred. New documents seed empty; the first-ever
   document keeps the demo text until E4's tutorial replaces it.
-- [ ] **E3. AI surface**: in-app settings panel (provider/key/model,
-  test-call validation), margin teaching card when unconfigured, run
-  indicator + cancel, error cards that name the cause (401/429/network/
-  parse), **levels-of-edit mode picker** (the thesis switch), privacy
-  line at the point of action. Details pending E3-research.
+- [x] **E3. AI surface** (shipped 2026-06-12, per E3-research): guided
+  config-file flow, no settings panel — "Set Up AI Provider…" writes a
+  commented template (Poe/OpenRouter/Ollama examples, STROP_API_KEY env
+  precedence documented and implemented) and opens it via xdg-open;
+  every pass re-reads config.toml, so edit→save→retry needs no restart.
+  AiStatus state machine rendered where results land (margin lane top,
+  floating card on narrow windows): NeedsSetup teaching card with the
+  privacy line + Open config + Test connection; Running card with
+  UI-level Cancel (generation counter drops stale responses); success
+  Note that names kept/dropped counts (0-anchored is said out loud) and
+  fades; Error cards with named causes (key rejected / rate limited /
+  unreachable / unusable reply / not-diagnosis-format) + Open config /
+  Retry (repeats the same pass kind) / Dismiss. "Test AI Connection" =
+  1-token chat that moves 401s to setup time; on provider errors it
+  GETs /models and lists the first 8 ids — that IS the model picker.
+  **Levels-of-edit mode switch shipped** (the thesis surface, handoff
+  §2.2): Diagnosis Mode Developmental/Line/Copy palette commands +
+  [ai].mode config default + idle margin hint showing the current mode;
+  debug_cursor reports ai=/mode= for smoke. Deferred: ticking elapsed
+  display, margin-header mode chips (post-dogfood).
 - [ ] **E4. First-run tutorial document + shortcuts overlay**: tutorial
   .strop seeded on first launch (teaches marks, checkpoint, rewind; a
   pre-seeded diagnosis so the margin is never empty on first sight),

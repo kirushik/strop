@@ -8,11 +8,13 @@
 use gpui::Action;
 
 use crate::editor::{
-    AddCheckpoint, AddNote, CopyDocumentPath, ExportMarkdown, Find, Heading1, Heading2, Heading3,
-    InsertFootnote, NewDocument, OpenFile, Redo, RenameDocument, Replace, RevealInFiles,
-    RunBelieving, RunDiagnosis, SaveCopyAs, ToggleBulletList, ToggleCode, ToggleCodeBlock,
-    ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList, TogglePalette,
-    ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
+    AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
+    DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1, Heading2,
+    Heading3, InsertFootnote, NewDocument, OpenAiConfig, OpenFile, Redo, RenameDocument, Replace,
+    RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs, TestAiConnection, ToggleBulletList,
+    ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory,
+    ToggleOrderedList, TogglePalette, ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong,
+    ToggleUnderline, Undo,
 };
 
 pub struct Command {
@@ -176,6 +178,48 @@ pub fn all() -> &'static [Command] {
             Some("ctrl-m"),
             AddNote,
             ["comment", "заметка на полях"]
+        ),
+        cmd!(
+            "Diagnosis Mode: Developmental",
+            "Margin & AI",
+            None,
+            DiagnosisModeDevelopmental,
+            ["structure", "argument", "структура"]
+        ),
+        cmd!(
+            "Diagnosis Mode: Line",
+            "Margin & AI",
+            None,
+            DiagnosisModeLine,
+            ["style", "clarity", "стиль"]
+        ),
+        cmd!(
+            "Diagnosis Mode: Copy",
+            "Margin & AI",
+            None,
+            DiagnosisModeCopy,
+            ["mechanics", "usage", "вычитка", "корректура"]
+        ),
+        cmd!(
+            "Set Up AI Provider…",
+            "Margin & AI",
+            None,
+            OpenAiConfig,
+            ["api key", "config", "settings", "настроить ии", "ключ"]
+        ),
+        cmd!(
+            "Test AI Connection",
+            "Margin & AI",
+            None,
+            TestAiConnection,
+            ["verify", "ping", "проверить подключение"]
+        ),
+        cmd!(
+            "Cancel AI Run",
+            "Margin & AI",
+            None,
+            CancelAiRun,
+            ["stop", "отменить"]
         ),
         cmd!(
             "Toggle History & Rewind",

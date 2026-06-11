@@ -105,6 +105,33 @@ impl LlmClient {
             .map_err(|e| LlmError::Network(e.to_string()))?;
         parse_chat_response(status, &text)
     }
+
+    /// GET {base}/models — the answer to "model not found": list what the
+    /// provider actually serves (this IS the model picker; no dropdown).
+    pub fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let mut response = self
+            .agent
+            .get(format!("{}/models", self.base_url))
+            .header("Authorization", &format!("Bearer {}", self.api_key))
+            .call()
+            .map_err(|e| LlmError::Network(e.to_string()))?;
+        let text = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| LlmError::Network(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Models {
+            #[serde(default)]
+            data: Vec<ModelEntry>,
+        }
+        #[derive(Deserialize)]
+        struct ModelEntry {
+            id: String,
+        }
+        let parsed: Models = serde_json::from_str(&text)
+            .map_err(|e| LlmError::Shape(format!("models list: {e}")))?;
+        Ok(parsed.data.into_iter().map(|m| m.id).collect())
+    }
 }
 
 #[derive(Deserialize)]

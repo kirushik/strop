@@ -59,7 +59,8 @@ actions!(
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
         OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
         ToggleHistory, TogglePalette, PaletteUp, PaletteDown, NewDocument, RenameDocument,
-        RevealInFiles, CopyDocumentPath,
+        RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection, CancelAiRun,
+        DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
     ]
 );
 
@@ -196,8 +197,17 @@ pub struct Editor {
     pub config: Config,
     /// Active (snapped/highlighted) margin note, if any.
     active_note: Option<u64>,
-    diagnosis_running: bool,
-    last_ai_error: Option<String>,
+    /// AI pass lifecycle, rendered as the margin's first card (PLAN.md
+    /// E3): teaches setup, shows progress, names failures actionably.
+    ai_status: Option<AiStatus>,
+    /// Bumped on every run and on cancel: an in-flight response from an
+    /// older generation is silently dropped.
+    ai_generation: u64,
+    /// Session override of the levels-of-edit depth; None = config's
+    /// [ai].mode (the thesis switch, handoff §2.2).
+    diagnosis_mode: Option<String>,
+    /// What the last pass was, so an error card's Retry can repeat it.
+    last_pass_believing: bool,
     /// Find bar (ctrl-f): live-highlighting query input; Enter advances.
     find_input: Option<Entity<NoteInput>>,
     /// The command palette (PLAN.md E1): the menu, summoned not mounted.
@@ -658,8 +668,10 @@ impl Editor {
             image_assets: HashMap::new(),
             config: Config::default(),
             active_note: None,
-            diagnosis_running: false,
-            last_ai_error: None,
+            ai_status: None,
+            ai_generation: 0,
+            diagnosis_mode: None,
+            last_pass_believing: false,
             find_input: None,
             palette_input: None,
             palette_selected: 0,
@@ -1354,17 +1366,33 @@ impl Editor {
         self.run_pass(true, cx);
     }
 
+    /// The effective levels-of-edit depth: session override, else config,
+    /// else "line" (Perkins' default register).
+    fn effective_mode(&self) -> String {
+        let mode = self
+            .diagnosis_mode
+            .clone()
+            .unwrap_or_else(|| self.config.ai.mode.clone());
+        match mode.as_str() {
+            "developmental" | "copy" => mode,
+            _ => "line".to_owned(),
+        }
+    }
+
     fn run_pass(&mut self, believing: bool, cx: &mut Context<Self>) {
-        if self.diagnosis_running {
+        if matches!(self.ai_status, Some(AiStatus::Running { .. })) {
             return;
         }
+        // Re-read the config: edit → save → retry must work without a
+        // restart (the guided config-file flow's contract).
+        self.config = crate::config::load();
         let ai = self.config.ai.clone();
-        if ai.base_url.is_empty() || ai.model.is_empty() {
-            self.last_ai_error =
-                Some("configure [ai] base_url/api_key/model in config.toml".into());
+        if !ai.configured() {
+            self.ai_status = Some(AiStatus::NeedsSetup);
             cx.notify();
             return;
         }
+        self.last_pass_believing = believing;
         // Scope: the selection if there is one, else the whole document
         // (capped — a 24k-char window is plenty for an editorial pass).
         let scope = if self.selected_range.is_empty() {
@@ -1373,17 +1401,30 @@ impl Editor {
             self.doc.slice_bytes(self.selected_range.clone())
         };
         let scope: String = scope.chars().take(24_000).collect();
-        let mode = "line".to_owned(); // levels-of-edit switch: config later
-        self.diagnosis_running = true;
-        self.last_ai_error = None;
+        let mode = self.effective_mode();
+        self.ai_generation += 1;
+        let generation = self.ai_generation;
+        self.ai_status = Some(AiStatus::Running {
+            label: format!(
+                "{} · {}",
+                if believing {
+                    "believing pass".to_owned()
+                } else {
+                    format!("{mode} diagnosis")
+                },
+                ai.model
+            ),
+        });
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            let api_key = ai.resolved_api_key();
+            let base_url = ai.base_url.clone();
+            let model = ai.model.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let client =
-                        strop_core::llm::LlmClient::new(&ai.base_url, &ai.api_key, &ai.model);
+                    let client = strop_core::llm::LlmClient::new(&base_url, &api_key, &model);
                     let system = if believing {
                         strop_core::diagnose::believing_system_prompt()
                     } else {
@@ -1392,12 +1433,16 @@ impl Editor {
                     let user = strop_core::diagnose::user_prompt(&scope);
                     client
                         .chat(&system, &user, 2048)
-                        .map_err(|e| e.to_string())
-                        .and_then(|response| strop_core::diagnose::parse(&response))
+                        .map_err(AiFailure::Llm)
+                        .and_then(|response| {
+                            strop_core::diagnose::parse(&response).map_err(AiFailure::Parse)
+                        })
                 })
                 .await;
             this.update(cx, |editor: &mut Editor, cx| {
-                editor.diagnosis_running = false;
+                if editor.ai_generation != generation {
+                    return; // cancelled or superseded — drop silently
+                }
                 match result {
                     Ok(diagnoses) => {
                         let now = std::time::SystemTime::now()
@@ -1416,10 +1461,27 @@ impl Editor {
                         let kept = annotations.len();
                         editor.doc.add_diagnoses(annotations);
                         editor.store_dirty = true;
-                        eprintln!("strop: diagnosis pass: {kept} of {count} anchored");
+                        // Silent success is the second invisibility bug:
+                        // 0 anchored must be said out loud.
+                        editor.ai_status = Some(AiStatus::Note {
+                            title: match kept {
+                                0 if count == 0 => {
+                                    "Pass complete — the editor found nothing to flag".to_owned()
+                                }
+                                0 => "Pass complete — no quote matched the current text".to_owned(),
+                                n => format!("{n} margin quer{} anchored", if n == 1 { "y" } else { "ies" }),
+                            },
+                            detail: if count > kept && kept > 0 {
+                                format!("{} dropped (stale quotes)", count - kept)
+                            } else {
+                                String::new()
+                            },
+                        });
+                        editor.schedule_status_fade(generation, cx);
                     }
-                    Err(e) => {
-                        editor.last_ai_error = Some(e);
+                    Err(failure) => {
+                        editor.ai_status =
+                            Some(failure.into_status(&editor.config.ai.base_url, &editor.config.ai.model));
                     }
                 }
                 cx.notify();
@@ -1427,6 +1489,157 @@ impl Editor {
             .ok();
         })
         .detach();
+    }
+
+    /// Success notes fade; errors and setup cards stay until acted on.
+    fn schedule_status_fade(&mut self, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(6))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.ai_generation == generation
+                    && matches!(editor.ai_status, Some(AiStatus::Note { .. }))
+                {
+                    editor.ai_status = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn cancel_ai_run(&mut self, _: &CancelAiRun, _: &mut Window, cx: &mut Context<Self>) {
+        // UI-level cancel: the response of the abandoned generation is
+        // ignored when it lands (no need to abort the request itself).
+        self.ai_generation += 1;
+        self.ai_status = None;
+        cx.notify();
+    }
+
+    /// Guided config-file flow: ensure the commented template exists,
+    /// open it in the system editor, and say what happens next.
+    fn open_ai_config(&mut self, _: &OpenAiConfig, _: &mut Window, cx: &mut Context<Self>) {
+        let path = crate::config::write_template_if_missing();
+        let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+        self.ai_generation += 1;
+        let generation = self.ai_generation;
+        self.ai_status = Some(AiStatus::Note {
+            title: "Opened config.toml in your editor".to_owned(),
+            detail: "Fill [ai] base_url / api_key / model, save, and run the pass again — \
+                     Strop re-reads the file every time."
+                .to_owned(),
+        });
+        self.schedule_status_fade(generation, cx);
+        cx.notify();
+    }
+
+    /// A 1-token chat call: moves 401s from run-time to setup-time. On a
+    /// provider error it also fetches /models — that list IS the picker.
+    fn test_ai_connection(&mut self, _: &TestAiConnection, _: &mut Window, cx: &mut Context<Self>) {
+        self.config = crate::config::load();
+        let ai = self.config.ai.clone();
+        if !ai.configured() {
+            self.ai_status = Some(AiStatus::NeedsSetup);
+            cx.notify();
+            return;
+        }
+        self.ai_generation += 1;
+        let generation = self.ai_generation;
+        self.ai_status = Some(AiStatus::Running {
+            label: format!("testing {} · {}", host_of(&ai.base_url), ai.model),
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let api_key = ai.resolved_api_key();
+            let base_url = ai.base_url.clone();
+            let model = ai.model.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = strop_core::llm::LlmClient::new(&base_url, &api_key, &model);
+                    let started = std::time::Instant::now();
+                    match client.chat("Reply with exactly: ok", "ok?", 16) {
+                        Ok(_) => Ok(started.elapsed().as_millis() as u64),
+                        Err(e) => {
+                            let models = match &e {
+                                strop_core::llm::LlmError::Provider(_) => {
+                                    client.list_models().ok()
+                                }
+                                _ => None,
+                            };
+                            Err((e, models))
+                        }
+                    }
+                })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.ai_generation != generation {
+                    return;
+                }
+                editor.ai_status = Some(match result {
+                    Ok(ms) => {
+                        editor.schedule_status_fade(generation, cx);
+                        AiStatus::Note {
+                            title: format!(
+                                "OK — {} via {} · {ms}ms",
+                                ai.model,
+                                host_of(&ai.base_url)
+                            ),
+                            detail: String::new(),
+                        }
+                    }
+                    Err((e, models)) => {
+                        let mut status = AiFailure::Llm(e).into_status(&ai.base_url, &ai.model);
+                        if let (AiStatus::Error { detail, .. }, Some(list)) = (&mut status, models)
+                            && !list.is_empty()
+                        {
+                            let shown: Vec<String> = list.into_iter().take(8).collect();
+                            detail.push_str(&format!("\nAvailable models: {}", shown.join(", ")));
+                        }
+                        status
+                    }
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_diagnosis_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.diagnosis_mode = Some(mode.to_owned());
+        self.ai_generation += 1;
+        let generation = self.ai_generation;
+        self.ai_status = Some(AiStatus::Note {
+            title: format!("Diagnosis mode: {mode}"),
+            detail: match mode {
+                "developmental" => "Structure and argument — what the piece wants to be.",
+                "copy" => "Consistency, usage, mechanics — nothing stylistic.",
+                _ => "Clarity, momentum, dead weight — the default register.",
+            }
+            .to_owned(),
+        });
+        self.schedule_status_fade(generation, cx);
+        cx.notify();
+    }
+
+    fn mode_developmental(
+        &mut self,
+        _: &DiagnosisModeDevelopmental,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_diagnosis_mode("developmental", cx);
+    }
+
+    fn mode_line(&mut self, _: &DiagnosisModeLine, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_diagnosis_mode("line", cx);
+    }
+
+    fn mode_copy(&mut self, _: &DiagnosisModeCopy, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_diagnosis_mode("copy", cx);
     }
 
     fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
@@ -3056,11 +3269,19 @@ impl Editor {
             }
             None => String::new(),
         };
+        let ai = match &self.ai_status {
+            None => "",
+            Some(AiStatus::NeedsSetup) => " ai=needs-setup",
+            Some(AiStatus::Running { .. }) => " ai=running",
+            Some(AiStatus::Note { .. }) => " ai=note",
+            Some(AiStatus::Error { .. }) => " ai=error",
+        };
         let doc_state = format!(
-            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}",
+            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai} mode={}",
             self.selected_range,
             self.doc.blocks().kind(self.doc.block_of_byte(cursor)),
-            self.doc.spans().spans()
+            self.doc.spans().spans(),
+            self.effective_mode(),
         );
         // Geometry may lag when the compositor throttles an occluded
         // window; doc state above stays authoritative.
@@ -4161,17 +4382,6 @@ impl Editor {
                         }
                         (None, None) => div().child("Strop").into_any_element(),
                     })
-                    .when(self.diagnosis_running, |d| {
-                        d.child(div().ml(px(10.)).child("· диагноз…"))
-                    })
-                    .when_some(self.last_ai_error.clone(), |d, err| {
-                        d.child(
-                            div()
-                                .ml(px(10.))
-                                .text_color(rgb(0xA04A3A))
-                                .child(format!("AI: {err}")),
-                        )
-                    }),
             )
             .child(
                 div()
@@ -4699,6 +4909,64 @@ enum PaletteRow {
     Recent(std::path::PathBuf),
 }
 
+/// The AI surface's state machine (PLAN.md E3). Status lives where the
+/// results will land — the margin — not in a toast or a titlebar whisper.
+enum AiStatus {
+    /// No provider configured: the empty state teaches setup.
+    NeedsSetup,
+    Running {
+        label: String,
+    },
+    /// Success/info; fades after a few seconds.
+    Note {
+        title: String,
+        detail: String,
+    },
+    /// Persistent until dismissed, retried, or superseded.
+    Error {
+        title: String,
+        detail: String,
+    },
+}
+
+/// App-side failure classes; the card copy names what failed and the
+/// next action, never a bare status code.
+enum AiFailure {
+    Llm(strop_core::llm::LlmError),
+    Parse(String),
+}
+
+fn host_of(base_url: &str) -> String {
+    base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(base_url)
+        .to_owned()
+}
+
+impl AiFailure {
+    fn into_status(self, base_url: &str, model: &str) -> AiStatus {
+        use strop_core::llm::LlmError as E;
+        let host = host_of(base_url);
+        let (title, detail) = match self {
+            Self::Llm(E::Auth(m)) => (format!("{host} rejected the API key"), m),
+            Self::Llm(E::RateLimited(m)) => {
+                (format!("Rate limited by {host} — try again in a moment"), m)
+            }
+            Self::Llm(E::Provider(m)) => (format!("{host} returned an error"), m),
+            Self::Llm(E::Network(m)) => (format!("Couldn't reach {host}"), m),
+            Self::Llm(E::Shape(m)) => (format!("Unusable reply from {model}"), m),
+            Self::Parse(m) => (
+                format!("{model} replied, but not in diagnosis format — usually a too-small model"),
+                m,
+            ),
+        };
+        AiStatus::Error { title, detail }
+    }
+}
+
 /// The materialized preview: merged diff text + styled ranges (bytes).
 /// Formatting is projected from both diff sides — kept/inserted content
 /// carries the newer version's spans and block kinds, deleted content the
@@ -4816,6 +5084,157 @@ impl Editor {
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Note:"))
                 .child(div().flex_1().child(input)),
         )
+    }
+
+    /// The AI surface (PLAN.md E3), pinned where results land: top of the
+    /// margin lane when it fits, a floating top-right card otherwise.
+    /// With no status and an empty margin, a one-line hint teaches the
+    /// chord — the AI must be visible before the chord is known.
+    fn render_ai_status(&self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let fits = self.margin_fits(window);
+        let (left, width) = if fits {
+            let frame = self.last_frame.as_ref()?;
+            let col_right =
+                f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+            (col_right + MARGIN_GAP + 8., MARGIN_WIDTH - 8.)
+        } else {
+            let vw = f32::from(window.viewport_size().width);
+            ((vw - 308.).max(8.), 300.)
+        };
+        let card = |bg: u32| {
+            div()
+                .absolute()
+                .top(px(BAR_HEIGHT + 8.))
+                .left(px(left))
+                .w(px(width))
+                .p(px(10.))
+                .rounded(px(6.))
+                .bg(rgb(bg))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .font_family("PT Serif")
+                .text_size(px(12.))
+                .text_color(rgb(TEXT_COLOR))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+        };
+        let action_button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .cursor(CursorStyle::PointingHand)
+                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                .text_size(px(11.))
+                .child(label)
+        };
+        let mode = self.effective_mode();
+        Some(match self.ai_status.as_ref() {
+            None => {
+                // Idle hint, only in the wide margin and only when the
+                // margin is otherwise empty.
+                if !fits || !self.margin_cards().is_empty() || self.doc.len_bytes() == 0 {
+                    return None;
+                }
+                div()
+                    .absolute()
+                    .top(px(BAR_HEIGHT + 12.))
+                    .left(px(left))
+                    .w(px(width))
+                    .font_family("PT Serif")
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child(format!("Поля редактора: ctrl-shift-d — {mode} diagnosis"))
+                    .into_any_element()
+            }
+            Some(AiStatus::NeedsSetup) => card(0xFFFDF6)
+                .child(div().font_weight(FontWeight::BOLD).child("Diagnosis needs a model"))
+                .child(div().text_color(rgb(MUTED_COLOR)).child(
+                    "Strop sends your text directly to the OpenAI-compatible endpoint you \
+                     configure — only when you run a pass, never while you type.",
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .child(action_button("ai-setup", "Open config").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.open_ai_config(&OpenAiConfig, window, cx);
+                            }),
+                        ))
+                        .child(action_button("ai-test", "Test connection").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.test_ai_connection(&TestAiConnection, window, cx);
+                            }),
+                        )),
+                )
+                .into_any_element(),
+            Some(AiStatus::Running { label }) => card(0xFFFDF6)
+                .child(div().text_color(rgb(MUTED_COLOR)).child(format!("Running: {label}…")))
+                .child(
+                    div().flex().child(action_button("ai-cancel", "Cancel").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.cancel_ai_run(&CancelAiRun, window, cx);
+                        }),
+                    )),
+                )
+                .into_any_element(),
+            Some(AiStatus::Note { title, detail }) => card(0xF2F4EC)
+                .child(div().child(title.clone()))
+                .when(!detail.is_empty(), |d| {
+                    d.child(div().text_color(rgb(MUTED_COLOR)).child(detail.clone()))
+                })
+                .into_any_element(),
+            Some(AiStatus::Error { title, detail }) => card(0xFAF0EC)
+                .child(div().font_weight(FontWeight::BOLD).child(title.clone()))
+                .when(!detail.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_color(rgb(MUTED_COLOR))
+                            .text_size(px(11.))
+                            .child(detail.clone()),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .child(action_button("ai-err-config", "Open config").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.open_ai_config(&OpenAiConfig, window, cx);
+                            }),
+                        ))
+                        .child(action_button("ai-err-retry", "Retry").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                editor.ai_status = None;
+                                let believing = editor.last_pass_believing;
+                                editor.run_pass(believing, cx);
+                            }),
+                        ))
+                        .child(action_button("ai-err-dismiss", "Dismiss").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.cancel_ai_run(&CancelAiRun, window, cx);
+                            }),
+                        )),
+                )
+                .into_any_element(),
+        })
     }
 
     fn render_margin(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -5068,6 +5487,12 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::rename_document))
                     .on_action(cx.listener(Self::reveal_in_files))
                     .on_action(cx.listener(Self::copy_document_path))
+                    .on_action(cx.listener(Self::open_ai_config))
+                    .on_action(cx.listener(Self::test_ai_connection))
+                    .on_action(cx.listener(Self::cancel_ai_run))
+                    .on_action(cx.listener(Self::mode_developmental))
+                    .on_action(cx.listener(Self::mode_line))
+                    .on_action(cx.listener(Self::mode_copy))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -5107,6 +5532,10 @@ impl Render for Editor {
             })
             .map(|d| match self.render_margin(window, cx) {
                 Some(margin) => d.child(margin),
+                None => d,
+            })
+            .map(|d| match self.render_ai_status(window, cx) {
+                Some(status) => d.child(status),
                 None => d,
             })
             .map(|d| {
