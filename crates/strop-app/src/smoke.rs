@@ -40,8 +40,14 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 .unwrap_or_default();
             eprintln!("SMOKE {key}: {state}");
         }
-        // AsyncApp::update is now infallible (returns R, not Result).
-        cx.update(|cx| cx.quit());
+        // STROP_SMOKE_HOLD keeps the window alive after the script — the
+        // visual rig screenshots it from outside, then kills the process.
+        if std::env::var("STROP_SMOKE_HOLD").is_err() {
+            // AsyncApp::update is now infallible (returns R, not Result).
+            cx.update(|cx| cx.quit());
+        } else {
+            eprintln!("SMOKE HOLD");
+        }
     })
     .detach();
 }

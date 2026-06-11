@@ -31,8 +31,8 @@ glob = "0.3"
 # `gpui_platform::application()`.
 # X11 backend off: Wayland-only dev machine; re-enable "x11" (on
 # gpui_platform) when packaging for distribution.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "350f33871e84d5ed83a403523e9490b9bf014a94", default-features = false, features = ["font-kit", "wayland"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "350f33871e84d5ed83a403523e9490b9bf014a94", default-features = false, features = ["wayland"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "350f33871e84d5ed83a403523e9490b9bf014a94", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "350f33871e84d5ed83a403523e9490b9bf014a94", default-features = false, features = ["wayland", "x11"] }
 
 [profile.dev]
 # gpui is a huge dep tree; keep its codegen optimized even in dev builds
