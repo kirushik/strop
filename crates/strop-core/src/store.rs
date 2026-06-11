@@ -43,6 +43,9 @@ pub struct Checkpoint {
     pub name: String,
     pub created_unix: i64,
     pub frontiers: Vec<u8>,
+    /// Named-by-the-author (vs automatic session markers).
+    #[serde(default)]
+    pub manual: bool,
 }
 
 /// One token per block, newline-joined (block text never contains '\n').
@@ -260,7 +263,7 @@ impl Store {
     }
 
     /// Record a named checkpoint at the current version.
-    pub fn add_checkpoint(&self, name: &str) {
+    pub fn add_checkpoint(&self, name: &str, manual: bool) {
         self.doc.commit();
         let checkpoint = Checkpoint {
             name: name.to_owned(),
@@ -269,6 +272,7 @@ impl Store {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             frontiers: self.doc.oplog_frontiers().encode(),
+            manual,
         };
         match serde_json::to_string(&checkpoint) {
             Ok(json) => {
@@ -623,7 +627,7 @@ mod tests {
         doc.edit_bytes_coalescing(0..0, "v1");
         doc.add_note(0..2, "заметка".into(), 7);
         store.apply(&doc.take_ops());
-        store.add_checkpoint("first draft");
+        store.add_checkpoint("first draft", true);
         doc.edit_bytes(2..2, " v2");
         doc.toggle_format(0..2, InlineAttr::Strong);
         store.apply(&doc.take_ops());

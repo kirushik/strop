@@ -139,7 +139,7 @@ fn main() {
                 Some(loaded) => {
                     // "Undo everything since I sat down" is always one
                     // visible restore away.
-                    store.add_checkpoint("Session start");
+                    store.add_checkpoint("Session start", false);
                     (
                         loaded.text.clone(),
                         loaded.spans.clone(),

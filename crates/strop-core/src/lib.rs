@@ -6,6 +6,7 @@
 
 pub mod buffer;
 pub mod diagnose;
+pub mod diff;
 pub mod document;
 pub mod images;
 pub mod llm;

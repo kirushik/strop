@@ -57,7 +57,7 @@ actions!(
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
-        OpenFile, SaveCopyAs, AddNote, RunDiagnosis, Find,
+        OpenFile, SaveCopyAs, AddNote, RunDiagnosis, Find, EscapeMode, ToggleHistory,
     ]
 );
 
@@ -131,6 +131,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-m", AddNote, ctx),
         KeyBinding::new("ctrl-shift-d", RunDiagnosis, ctx),
         KeyBinding::new("ctrl-f", Find, ctx),
+        KeyBinding::new("escape", EscapeMode, ctx),
+        KeyBinding::new("ctrl-alt-h", ToggleHistory, ctx),
         KeyBinding::new("enter", NoteCommit, Some("NoteInput")),
         KeyBinding::new("escape", NoteCancel, Some("NoteInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
@@ -177,8 +179,11 @@ pub struct Editor {
     /// Durable layer; edits mirror into it, a background task saves when idle.
     store: Option<Store>,
     store_dirty: bool,
-    /// Rough rewind panel (B5); proper history visualization is backlogged.
-    show_history: bool,
+    /// History mode (rewind v2): list + read-only diff preview.
+    history_view: Option<HistoryView>,
+    history_preview: Option<PreviewDoc>,
+    /// Edits since the last checkpoint — idle-gap session sealing.
+    dirty_since_checkpoint: bool,
     /// Encoded image assets by id; Arc<gpui::Image> handles feed GPUI's
     /// decode-once cache via use_render_image.
     image_assets: HashMap<String, Arc<gpui::Image>>,
@@ -617,7 +622,9 @@ impl Editor {
             last_input: Instant::now(),
             store: None,
             store_dirty: false,
-            show_history: false,
+            history_view: None,
+            history_preview: None,
+            dirty_since_checkpoint: false,
             image_assets: HashMap::new(),
             config: Config::default(),
             active_note: None,
@@ -645,6 +652,16 @@ impl Editor {
                     {
                         editor.save_now();
                     }
+                    // Idle gap seals a writing session — checkpoints are
+                    // navigation markers for "a sitting", not safety.
+                    if editor.dirty_since_checkpoint
+                        && editor.last_input.elapsed() >= Duration::from_secs(900)
+                    {
+                        if let Some(store) = &editor.store {
+                            store.add_checkpoint("Session", false);
+                            editor.dirty_since_checkpoint = false;
+                        }
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -664,6 +681,7 @@ impl Editor {
         if let Some(store) = &self.store {
             store.apply(&ops);
             self.store_dirty = true;
+            self.dirty_since_checkpoint = true;
         }
     }
 
@@ -681,18 +699,114 @@ impl Editor {
         self.sync_mutations();
         if let Some(store) = &self.store {
             let name = format!("Checkpoint {}", store.checkpoints().len() + 1);
-            store.add_checkpoint(&name);
+            store.add_checkpoint(&name, true);
+            self.dirty_since_checkpoint = false;
             self.store_dirty = true;
             eprintln!("strop: recorded \"{name}\"");
         }
         cx.notify();
     }
 
-    fn restore_checkpoint(&mut self, ix: usize, cx: &mut Context<Self>) {
+    /// Build the rewind list: materialize every checkpoint once, compute
+    /// word deltas between consecutive states.
+    fn enter_history(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let mut entries: Vec<HistoryEntry> = Vec::new();
+        let mut prev_text = String::new();
+        for cp in store.checkpoints() {
+            let Some((text, _, _)) = store.state_at(&cp.frontiers) else {
+                continue;
+            };
+            let delta = strop_core::diff::word_delta(&strop_core::diff::prose_diff(
+                &prev_text, &text,
+            ));
+            prev_text = text.clone();
+            entries.push(HistoryEntry {
+                name: cp.name.clone(),
+                created_unix: cp.created_unix,
+                manual: cp.manual,
+                frontiers: cp.frontiers.clone(),
+                text,
+                delta,
+            });
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let selected = entries.len() - 1;
+        self.history_view = Some(HistoryView {
+            entries,
+            selected,
+            named_only: false,
+            compare_current: false,
+        });
+        self.rebuild_preview();
+        cx.notify();
+    }
+
+    fn exit_history(&mut self, cx: &mut Context<Self>) {
+        self.history_view = None;
+        self.history_preview = None;
+        cx.notify();
+    }
+
+    fn rebuild_preview(&mut self) {
+        let Some(hv) = &self.history_view else {
+            self.history_preview = None;
+            return;
+        };
+        let entry = &hv.entries[hv.selected];
+        let (old, new) = if hv.compare_current {
+            (entry.text.as_str(), self.doc.text())
+        } else {
+            let prev = hv
+                .selected
+                .checked_sub(1)
+                .map(|i| hv.entries[i].text.as_str())
+                .unwrap_or("");
+            (prev, entry.text.clone())
+        };
+        let segs = strop_core::diff::prose_diff(old, &new);
+        let mut text = String::new();
+        let mut inserts = Vec::new();
+        let mut deletes = Vec::new();
+        for seg in segs {
+            let start = text.len();
+            text.push_str(&seg.text);
+            match seg.op {
+                strop_core::diff::DiffOp::Insert => inserts.push(start..text.len()),
+                strop_core::diff::DiffOp::Delete => deletes.push(start..text.len()),
+                strop_core::diff::DiffOp::Same => {}
+            }
+        }
+        self.history_preview = Some(PreviewDoc {
+            text,
+            inserts,
+            deletes,
+        });
+    }
+
+    fn history_select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(hv) = &mut self.history_view {
+            hv.selected = ix.min(hv.entries.len() - 1);
+            self.rebuild_preview();
+            self.scroll_top = px(0.);
+            cx.notify();
+        }
+    }
+
+    /// Restore the selected checkpoint: auto-checkpoint the present first
+    /// (the rail narrates what happened), restore as an undoable forward
+    /// edit, exit history.
+    fn restore_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(hv) = &self.history_view else { return };
+        let entry = &hv.entries[hv.selected];
+        let (name, frontiers) = (entry.name.clone(), entry.frontiers.clone());
         let Some(store) = &self.store else { return };
-        let checkpoints = store.checkpoints();
-        let Some(cp) = checkpoints.get(ix) else { return };
-        let Some((text, spans, blocks)) = store.state_at(&cp.frontiers) else {
+        store.add_checkpoint(&format!("Before restoring “{name}”"), false);
+        let Some((text, spans, blocks)) = store.state_at(&frontiers) else {
             eprintln!("strop: cannot read checkpoint state");
             return;
         };
@@ -703,7 +817,9 @@ impl Editor {
         self.goal_x = None;
         self.marked_range = None;
         self.caret_attrs.clear();
+        self.exit_history(cx);
         self.sync_mutations();
+        self.store_dirty = true;
         self.bump_activity();
         cx.notify();
     }
@@ -1223,6 +1339,9 @@ impl Editor {
     /// and anything less applies; at a bare caret, sets a sticky attr for
     /// the next typed text (the universal rich-editor convention).
     fn toggle_span(&mut self, attr: InlineAttr, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            return;
+        }
         if self.selected_range.is_empty() {
             let target = !self.attr_active(&attr);
             self.caret_attrs.retain(|(a, _)| a != &attr);
@@ -1615,11 +1734,35 @@ impl Editor {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(hv) = &self.history_view {
+            let ix = hv.selected.saturating_sub(1);
+            self.history_select(ix, cx);
+            return;
+        }
         self.vertical_by(-1, false, cx);
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(hv) = &self.history_view {
+            let ix = hv.selected + 1;
+            self.history_select(ix, cx);
+            return;
+        }
         self.vertical_by(1, false, cx);
+    }
+
+    fn toggle_history(&mut self, _: &ToggleHistory, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            self.exit_history(cx);
+        } else {
+            self.enter_history(cx);
+        }
+    }
+
+    fn escape_mode(&mut self, _: &EscapeMode, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            self.exit_history(cx);
+        }
     }
 
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -1742,6 +1885,10 @@ impl Editor {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            self.restore_selected(cx);
+            return;
+        }
         // Enter at the end of a heading/divider starts a paragraph, not
         // another heading (the split otherwise inherits the block kind).
         let cursor = self.cursor_offset();
@@ -1764,6 +1911,9 @@ impl Editor {
 
     /// Toggle a block kind over the selected block range, one transaction.
     fn toggle_block(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            return;
+        }
         let start_block = self.doc.block_of_byte(self.selected_range.start);
         let end_block = self.doc.block_of_byte(self.selected_range.end);
         let target = if *self.doc.blocks().kind(start_block) == kind {
@@ -1934,6 +2084,9 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            return;
+        }
         if let Some(cursor_char) = self.doc.undo() {
             if let Some(cursor_char) = cursor_char {
                 let cursor = self.doc.char_to_byte(cursor_char);
@@ -1951,6 +2104,9 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            return;
+        }
         if let Some(cursor_char) = self.doc.redo() {
             if let Some(cursor_char) = cursor_char {
                 let cursor = self.doc.char_to_byte(cursor_char);
@@ -2159,8 +2315,17 @@ impl Editor {
             .chars_at(tail_start)
             .take(self.doc.rope().byte_to_char(cursor) - tail_start)
             .collect();
+        let hist = match &self.history_view {
+            Some(hv) => format!(
+                " hist={}/{} preview={}b",
+                hv.selected + 1,
+                hv.entries.len(),
+                self.history_preview.as_ref().map_or(0, |p| p.text.len())
+            ),
+            None => String::new(),
+        };
         let doc_state = format!(
-            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}",
+            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}",
             self.selected_range,
             self.doc.blocks().kind(self.doc.block_of_byte(cursor)),
             self.doc.spans().spans()
@@ -2197,6 +2362,9 @@ impl Editor {
         typograph: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.history_view.is_some() {
+            return; // history preview is read-only
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -2520,6 +2688,7 @@ fn runs_for_paragraph(
     spans: &[(Range<usize>, InlineAttr)],
     notes: &[(Range<usize>, bool, bool)],
     matches: &[Range<usize>],
+    dels: &[Range<usize>],
     base: &TextRun,
 ) -> Vec<TextRun> {
     let mut cuts = vec![par_range.start, par_range.end];
@@ -2535,7 +2704,7 @@ fn runs_for_paragraph(
         cuts.push(r.start.clamp(par_range.start, par_range.end));
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
-    for r in matches {
+    for r in matches.iter().chain(dels.iter()) {
         cuts.push(r.start.clamp(par_range.start, par_range.end));
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
@@ -2629,6 +2798,16 @@ fn runs_for_paragraph(
                     content_bg = Some(match content_bg {
                         Some(bg) => blend_over(rgba(0x7FB8A455), bg),
                         None => rgba(0x7FB8A455), // sage — distinct from wheat
+                    });
+                }
+            }
+            // Diff deletions: strikethrough, dimmed — Track Changes idiom.
+            for r in dels {
+                if r.start <= w[0] && w[1] <= r.end {
+                    color = rgb(MUTED_COLOR).into();
+                    strikethrough = Some(StrikethroughStyle {
+                        color: Some(rgb(MUTED_COLOR).into()),
+                        thickness: px(1.),
                     });
                 }
             }
@@ -2732,16 +2911,34 @@ impl Element for EditorElement {
         let wrap_width = bounds.size.width;
         let viewport = bounds.size.height;
 
-        let text = editor.doc.text();
-        let selection = editor.selected_range.clone();
-        let marked = editor.marked_range.clone();
+        let preview = editor
+            .history_preview
+            .as_ref()
+            .map(|p| (p.text.clone(), p.inserts.clone(), p.deletes.clone()));
+        let in_history = preview.is_some();
+        let (text, diff_inserts, diff_deletes) = match preview {
+            Some((t, i, d)) => (t, i, d),
+            None => (editor.doc.text(), Vec::new(), Vec::new()),
+        };
+        let selection = if in_history {
+            0..0
+        } else {
+            editor.selected_range.clone()
+        };
+        let marked = if in_history {
+            None
+        } else {
+            editor.marked_range.clone()
+        };
         let cursor_offset = editor.cursor_offset();
         let cursor_affinity = editor.cursor_affinity_down;
-        let cursor_blink_visible = editor.cursor_visible;
+        let cursor_blink_visible = editor.cursor_visible && !in_history;
         let mut scroll_top = editor.scroll_top;
         let autoscroll = editor.autoscroll_request;
         // Formatting spans, converted to byte ranges for this frame.
-        let spans_bytes: Vec<(Range<usize>, InlineAttr)> = {
+        let spans_bytes: Vec<(Range<usize>, InlineAttr)> = if in_history {
+            Vec::new()
+        } else {
             let rope = editor.doc.rope();
             editor
                 .doc
@@ -2767,15 +2964,25 @@ impl Element for EditorElement {
         };
 
         let font_scale = editor.config.font_size.map_or(1., |s| (s / 20.).clamp(0.6, 2.));
-        let kinds: Vec<BlockKind> = editor.doc.blocks().kinds().to_vec();
-        let find_matches: Vec<Range<usize>> = editor
-            .find_input
-            .as_ref()
-            .map(|i| editor.find_matches(&i.read(cx).content))
-            .unwrap_or_default();
+        let kinds: Vec<BlockKind> = if in_history {
+            vec![BlockKind::Paragraph; text.split('\n').count()]
+        } else {
+            editor.doc.blocks().kinds().to_vec()
+        };
+        let find_matches: Vec<Range<usize>> = if in_history {
+            diff_inserts.clone() // inserts reuse the sage tint
+        } else {
+            editor
+                .find_input
+                .as_ref()
+                .map(|i| editor.find_matches(&i.read(cx).content))
+                .unwrap_or_default()
+        };
         // Open-annotation anchors (byte ranges, active, is_diagnosis):
         // notes tint; diagnoses underline quietly until activated.
-        let note_ranges: Vec<(Range<usize>, bool, bool)> = {
+        let note_ranges: Vec<(Range<usize>, bool, bool)> = if in_history {
+            Vec::new()
+        } else {
             let rope = editor.doc.rope();
             editor
                 .doc
@@ -2854,6 +3061,11 @@ impl Element for EditorElement {
                 .filter(|r| r.start < range.end && range.start < r.end)
                 .cloned()
                 .collect();
+            let par_dels: Vec<Range<usize>> = diff_deletes
+                .iter()
+                .filter(|r| r.start < range.end && range.start < r.end)
+                .cloned()
+                .collect();
             let runs = runs_for_paragraph(
                 &range,
                 &selection,
@@ -2861,6 +3073,7 @@ impl Element for EditorElement {
                 &par_spans,
                 &par_notes,
                 &par_matches,
+                &par_dels,
                 &block_base,
             );
             let line = window
@@ -3193,19 +3406,22 @@ impl Editor {
                     .ml(px(8.))
                     .rounded(px(5.))
                     .cursor(CursorStyle::PointingHand)
-                    .text_color(if self.show_history {
+                    .text_color(if self.history_view.is_some() {
                         rgb(TEXT_COLOR)
                     } else {
                         rgb(MUTED_COLOR)
                     })
-                    .when(self.show_history, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .when(self.history_view.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            editor.show_history = !editor.show_history;
-                            cx.notify();
+                            if editor.history_view.is_some() {
+                                editor.exit_history(cx);
+                            } else {
+                                editor.enter_history(cx);
+                            }
                         }),
                     )
                     .child("↺"),
@@ -3243,18 +3459,102 @@ fn format_unix(secs: i64) -> String {
 
 impl Editor {
     fn render_history_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let checkpoints = self
-            .store
-            .as_ref()
-            .map(|s| s.checkpoints())
-            .unwrap_or_default();
+        let hv = self.history_view.as_ref();
+        let (entries, selected, named_only, compare_current) = match hv {
+            Some(hv) => (
+                hv.entries.as_slice(),
+                hv.selected,
+                hv.named_only,
+                hv.compare_current,
+            ),
+            None => (&[][..], 0, false, false),
+        };
+        let toggle = |label: &'static str, on: bool| {
+            div()
+                .id(label)
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(4.))
+                .cursor(CursorStyle::PointingHand)
+                .text_color(if on { rgb(TEXT_COLOR) } else { rgb(MUTED_COLOR) })
+                .when(on, |d| d.bg(rgba(0x1A1A1812u32)))
+                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                .child(label)
+        };
+        let mut last_day = String::new();
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for (ix, e) in entries.iter().enumerate() {
+            if named_only && !e.manual {
+                continue;
+            }
+            let stamp = format_unix(e.created_unix);
+            let (day, time) = stamp.split_once(' ').unwrap_or((stamp.as_str(), ""));
+            if day != last_day {
+                last_day = day.to_owned();
+                rows.push(
+                    div()
+                        .px(px(8.))
+                        .pt(px(8.))
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child(day.to_owned())
+                        .into_any_element(),
+                );
+            }
+            let (ins, del) = e.delta;
+            let delta = if ins == 0 && del == 0 {
+                String::new()
+            } else {
+                format!("+{ins} −{del}")
+            };
+            let active = ix == selected;
+            rows.push(
+                div()
+                    .id(("hist-row", ix))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(5.))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(active, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.history_select(ix, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_color(rgb(TEXT_COLOR))
+                                    .when(e.manual, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                    .child(format!(
+                                        "{}{}",
+                                        if e.manual { "● " } else { "○ " },
+                                        e.name.clone()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child(format!("{time}  {delta}")),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
         div()
             .id("history-panel")
             .absolute()
             .top(px(BAR_HEIGHT + 8.))
             .right(px(8.))
-            .w(px(280.))
-            .max_h(px(440.))
+            .w(px(300.))
+            .max_h(px(520.))
             .overflow_y_scroll()
             .bg(rgb(0xF4F1EA))
             .border_1()
@@ -3271,43 +3571,72 @@ impl Editor {
                 div()
                     .px(px(8.))
                     .py(px(4.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .child(if checkpoints.is_empty() {
-                        "No checkpoints yet — ctrl-alt-s records one."
-                    } else {
-                        "Click a version to restore it (undoable)."
-                    }),
-            )
-            .children(checkpoints.into_iter().enumerate().rev().map(|(ix, cp)| {
-                div()
-                    .id(ix)
-                    .px(px(8.))
-                    .py(px(5.))
-                    .rounded(px(5.))
-                    .cursor(CursorStyle::PointingHand)
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            editor.restore_checkpoint(ix, cx);
-                        }),
-                    )
-                    .child(div().text_color(rgb(TEXT_COLOR)).child(cp.name.clone()))
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_color(rgb(MUTED_COLOR)).child("History"))
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED_COLOR))
-                            .child(format_unix(cp.created_unix)),
-                    )
-            }))
+                            .flex()
+                            .gap(px(4.))
+                            .child(
+                                toggle("named", named_only).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(hv) = &mut editor.history_view {
+                                            hv.named_only = !hv.named_only;
+                                            cx.notify();
+                                        }
+                                    }),
+                                ),
+                            )
+                            .child(
+                                toggle("vs draft", compare_current).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(hv) = &mut editor.history_view {
+                                            hv.compare_current = !hv.compare_current;
+                                            editor.rebuild_preview();
+                                            cx.notify();
+                                        }
+                                    }),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .id("restore-btn")
+                                    .px(px(8.))
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .bg(rgb(0xE8DFC8))
+                                    .text_color(rgb(TEXT_COLOR))
+                                    .hover(|d| d.bg(rgb(0xDFD3B0)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            |editor, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                editor.restore_selected(cx);
+                                            },
+                                        ),
+                                    )
+                                    .child("Restore"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(8.))
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child("↑/↓ step versions · Esc exits · restoring is undoable"),
+            )
+            .children(rows)
     }
-}
 
-impl Editor {
-    /// The viewport footnote zone (document-model §4c): definitions whose
-    /// refs are on screen, pinned to the window bottom as an overlay inset.
-    /// Read-only projection; click jumps to the def block.
     fn render_footnote_zone(
         &self,
         footnotes: Vec<(String, String, usize)>,
@@ -3361,6 +3690,34 @@ impl Editor {
                     )),
             )
     }
+}
+
+/// One rewind-list entry, materialized on entering history mode.
+struct HistoryEntry {
+    name: String,
+    created_unix: i64,
+    manual: bool,
+    frontiers: Vec<u8>,
+    text: String,
+    /// (+words, -words) vs the previous checkpoint.
+    delta: (usize, usize),
+}
+
+/// History mode: Docs-style list + read-only inline-diff preview.
+struct HistoryView {
+    entries: Vec<HistoryEntry>,
+    selected: usize,
+    named_only: bool,
+    /// false: diff vs previous checkpoint ("work of that session");
+    /// true: diff vs the current draft ("what restoring would change").
+    compare_current: bool,
+}
+
+/// The materialized preview: merged diff text + styled ranges (bytes).
+struct PreviewDoc {
+    text: String,
+    inserts: Vec<Range<usize>>,
+    deletes: Vec<Range<usize>>,
 }
 
 struct MarginCard {
@@ -3630,7 +3987,7 @@ impl Render for Editor {
             .flex()
             .flex_col()
             .child(self.render_titlebar(cx))
-            .when(self.show_history, |d| {
+            .when(self.history_view.is_some(), |d| {
                 d.child(self.render_history_panel(cx))
             })
             .map(|d| {
@@ -3728,6 +4085,8 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::add_note))
                     .on_action(cx.listener(Self::run_diagnosis))
                     .on_action(cx.listener(Self::find))
+                    .on_action(cx.listener(Self::escape_mode))
+                    .on_action(cx.listener(Self::toggle_history))
                     .on_action(cx.listener(Self::open_file))
                     .on_action(cx.listener(Self::save_copy_as))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -3786,7 +4145,7 @@ mod tests {
             (2..5, InlineAttr::Strong),
             (5..8, InlineAttr::Highlight),
         ];
-        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &[], &base());
+        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &[], &[], &base());
         // Segments: [0,2) plain, [2,5) bold, [5,8) highlight, [8,10) plain.
         assert_eq!(runs.len(), 4);
         assert_eq!(runs[1].font.weight, FontWeight::BOLD);
@@ -3803,7 +4162,7 @@ mod tests {
         // partial overlap splits into its own runs.
         let par = 0..6;
         let spans = vec![(0..6, InlineAttr::Highlight)];
-        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &[], &[], &base());
+        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &[], &[], &[], &base());
         let blended = blend_over(rgba(SELECTION_COLOR), rgba(HIGHLIGHT_COLOR));
         assert_eq!(runs[1].background_color, Some(blended.into()));
         assert_ne!(
@@ -3817,7 +4176,7 @@ mod tests {
         // Outside the selection the pure highlight shows.
         assert_eq!(runs[0].background_color, Some(rgba(HIGHLIGHT_COLOR).into()));
         // Selection over plain text stays the plain selection color.
-        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &[], &[], &base());
+        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &[], &[], &[], &base());
         assert_eq!(
             plain[1].background_color,
             Some(rgba(SELECTION_COLOR).into())
@@ -3828,7 +4187,7 @@ mod tests {
     fn code_run_switches_family_and_marked_text_underlines() {
         let par = 0..8;
         let spans = vec![(0..4, InlineAttr::Code)];
-        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &[], &[], &base());
+        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &[], &[], &[], &base());
         assert_eq!(runs[0].font.family.as_ref(), CODE_FONT);
         assert!(runs[1].underline.is_some());
     }

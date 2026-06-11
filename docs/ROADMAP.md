@@ -159,14 +159,21 @@ unless they'd be expensive to reverse.
   named problem + query phrasing) when C3 lands, CriticMarkup export of
   notes.
 
-- **History & versions visualization** (Kirill, 2026-06-11): the rewind
-  panel is deliberately rough. Research the design space before building
-  the real one — VCS visualizations (gitk/Sublime Merge graphs, GitHub
-  blame/history), Apple Time Machine's spatial metaphor, Google Docs
-  version list with diff preview, Obsidian's sync history, local-first
-  apps' timeline scrubbers. Open questions: timeline vs list vs graph
-  (undo creates branches!), diff rendering between versions, checkpoint
-  naming/renaming UX, auto-checkpoint cadence beyond session-start.
+- [x] **History & versions visualization** (researched + rebuilt
+  2026-06-11): the research verdict — list beats scrubber (Etherpad's
+  own maintainers call theirs broken), never show writers a DAG, inline
+  diff in reading order, restore-as-forward-edit validated. Shipped:
+  history mode (↺ or ctrl-alt-h) takes the editor read-only with an
+  inline word-level diff (similar crate, paragraph->word cascade,
+  whole-paragraph fallback below 0.4 word-ratio; sage inserts,
+  struck-dimmed deletes); Docs-style panel with day groups, word deltas,
+  named-only and vs-prev/vs-draft toggles; arrow-key version stepping
+  with live preview; Enter or Restore button restores (auto "Before
+  restoring" checkpoint, still undoable); idle-gap (15min) session
+  sealing replaces interval checkpoints. Deliberately skipped per
+  research: scrubber, tree view, side-by-side, selective restore,
+  per-author colors. REMAINING (needs hands-on feedback first):
+  rename-in-place, "since last session" affordance, snap animation.
 
 ## Explicitly post-MVP
 
