@@ -22,11 +22,12 @@ ureq = { version = "3", features = ["json"] }
 similar = { version = "2", features = ["unicode", "inline"] }
 glob = "0.3"
 
-# Pinned to the published crate for now; expect to migrate to a git pin on
-# zed-industries/zed once we need post-0.2.2 APIs (the gpui/gpui_platform split).
+# Vendored 0.2.2 (crates.io's last-ever gpui release) with upstream text
+# fixes backported — see vendor/gpui/STROP-PATCHES.md. The long-term path is
+# still a git pin on zed-industries/zed (post gpui/gpui_platform split).
 # X11 backend off: dev machine lacks libxkbcommon-x11 dev files and runs
 # Wayland; re-enable "x11" when packaging for distribution.
-gpui = { version = "0.2", default-features = false, features = ["font-kit", "wayland"] }
+gpui = { path = "vendor/gpui", default-features = false, features = ["font-kit", "wayland"] }
 
 [profile.dev]
 # gpui is a huge dep tree; keep its codegen optimized even in dev builds

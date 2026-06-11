@@ -224,3 +224,35 @@ per-paragraph AI rewrites (thesis says diagnosis only).
   audit tool). Literata's three-family static set was the prime suspect;
   PT faces are independently drawn. **If corruption recurs under PT, it's
   GPUI's shaping/atlas — file upstream with the dump as evidence.**
+
+## Text-pipeline surgery (2026-06-11, после PT-swap screenshots)
+
+Corruption SURVIVED the font swap -> the bug was GPUI's text pipeline,
+proven and patched:
+
+- [x] **shape_audit harness** (`strop-app --example shape_audit`):
+  headless-ish window shapes the exact corrupted lines + decoy battery in
+  two process orders, compares every glyph id against the font's own cmap
+  (ttf-parser over the same embedded bytes). Verdict: isolated shaping was
+  deterministic and cmap-exact -> bug above/below shaping, not in it.
+- [x] **Vendored gpui 0.2.2** (last crates.io release ever; zed stopped
+  publishing) into `vendor/gpui` + backported upstream fixes — see
+  vendor/gpui/STROP-PATCHES.md: PR #41224 (TextLayout re-measure mangles
+  truncated runs -> the history-panel jitter/garble), PR #43856
+  (layout_line drops font changes between runs when decorations match),
+  PR #48504 adapted (cosmic-text 0.14->0.17.2: style-mismatched fallback
+  picked wrong fonts; ASCII fast path emitted wrong glyphs for words with
+  incompatible spans -> the canvas corruption class).
+- [x] **De-fallback the chrome**: PT has no ○●↑↓↺□✕✓→; those were forcing
+  mid-session system-font loads (the trigger surface). History markers,
+  zoom button, history toggle are now drawn divs; ✕->×, →->›, ↑/↓->words.
+  Voice strings keep σ (no honest replacement; fallback now safe-ish).
+- [ ] **Visual confirmation needed (Kirill)**: rebuild, look at the same
+  two paragraphs + history panel. If small-caps-style corruption persists,
+  next suspects in order: raster path (backport #45423+#46857), AMD/radv
+  (test `ZED_PATH_SAMPLE_COUNT=0`), then a zed git pin.
+- [ ] Autonomous screenshots remain blocked: GNOME portal denies headless
+  capture; `sudo apt install sway grim` would let me run Strop in a nested
+  headless compositor and look at pixels myself.
+- [ ] Exit strategy: git pin on zed-industries/zed (post gpui/gpui_platform
+  split) to retire the vendor patches; #54878 fallback wiring comes free.

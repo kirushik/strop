@@ -1559,7 +1559,7 @@ impl Editor {
                 .child(div().flex_1().child(input))
                 .child(div().text_color(rgb(MUTED_COLOR)).child(label))
                 .when_some(self.replace_input.clone(), |d, rep| {
-                    d.child(div().text_color(rgb(MUTED_COLOR)).child("→"))
+                    d.child(div().text_color(rgb(MUTED_COLOR)).child("›"))
                         .child(div().flex_1().child(rep))
                         .child(
                             div()
@@ -3651,6 +3651,10 @@ impl Editor {
             .child(label)
     }
 
+    // UI chrome avoids glyphs outside the bundled PT fonts (arrows, circles,
+    // checks): every such character forces a mid-session system-font fallback
+    // load, the exact path behind the garbled-glyph bugs. Indicators that
+    // have no PT-covered character are drawn as divs instead.
     fn window_button(
         &self,
         label: &'static str,
@@ -3746,7 +3750,28 @@ impl Editor {
                             }
                         }),
                     )
-                    .child("↺"),
+                    .child(
+                        // History: drawn clock-face stand-in (↺ isn't in PT).
+                        div()
+                            .size(px(11.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if self.history_view.is_some() {
+                                rgb(TEXT_COLOR)
+                            } else {
+                                rgb(MUTED_COLOR)
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().size(px(3.)).rounded_full().bg(
+                                if self.history_view.is_some() {
+                                    rgb(TEXT_COLOR)
+                                } else {
+                                    rgb(MUTED_COLOR)
+                                },
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -3755,8 +3780,29 @@ impl Editor {
                     .on_mouse_down(MouseButton::Left, drag),
             )
             .child(self.window_button("–", |window, _| window.minimize_window()))
-            .child(self.window_button("□", |window, _| window.zoom_window()))
-            .child(self.window_button("✕", |_, cx| cx.quit()))
+            .child(
+                // Zoom: drawn square (U+25A1 isn't in PT).
+                div()
+                    .id("win-zoom")
+                    .w(px(34.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        cx.stop_propagation();
+                        window.zoom_window();
+                    })
+                    .child(
+                        div()
+                            .size(px(9.))
+                            .border_1()
+                            .border_color(rgb(MUTED_COLOR))
+                            .rounded(px(1.)),
+                    ),
+            )
+            .child(self.window_button("×", |_, cx| cx.quit()))
     }
 }
 
@@ -3866,16 +3912,34 @@ impl Editor {
                                     None => div()
                                         .flex_1()
                                         .min_w(px(0.))
-                                        .truncate()
-                                        .text_color(rgb(TEXT_COLOR))
-                                        .when(e.manual, |d| {
-                                            d.font_weight(FontWeight::BOLD)
-                                        })
-                                        .child(format!(
-                                            "{}{}",
-                                            if e.manual { "● " } else { "○ " },
-                                            e.name.clone()
-                                        )),
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(
+                                            // Drawn marker: ●/○ aren't in PT.
+                                            div()
+                                                .flex_shrink_0()
+                                                .size(px(7.))
+                                                .rounded_full()
+                                                .when(e.manual, |d| {
+                                                    d.bg(rgb(TEXT_COLOR))
+                                                })
+                                                .when(!e.manual, |d| {
+                                                    d.border_1().border_color(
+                                                        rgb(MUTED_COLOR),
+                                                    )
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_color(rgb(TEXT_COLOR))
+                                                .when(e.manual, |d| {
+                                                    d.font_weight(FontWeight::BOLD)
+                                                })
+                                                .child(e.name.clone()),
+                                        ),
                                 },
                             )
                             .child(
@@ -3974,7 +4038,7 @@ impl Editor {
                     .px(px(8.))
                     .text_size(px(11.))
                     .text_color(rgb(MUTED_COLOR))
-                    .child("↑/↓ step versions · Esc exits · restoring is undoable"),
+                    .child("Up/Down step versions · Esc exits · restoring is undoable"),
             )
             .when_some(self.voice_baseline.as_ref(), |d, baseline| {
                 let lang = match self.config.language {
@@ -4355,7 +4419,7 @@ impl Editor {
                                                         },
                                                     ),
                                                 )
-                                                .child("✓ done"),
+                                                .child("done"),
                                         )
                                         .child(
                                             div()
@@ -4378,7 +4442,7 @@ impl Editor {
                                                         },
                                                     ),
                                                 )
-                                                .child("✕"),
+                                                .child("×"),
                                         ),
                                 ),
                         )
