@@ -241,6 +241,20 @@ pub struct Editor {
     /// The command palette (PLAN.md E1): the menu, summoned not mounted.
     palette_input: Option<Entity<NoteInput>>,
     palette_selected: usize,
+    /// Mirror of the palette query (debug_cursor has no `cx` to read the
+    /// input entity); maintained by the palette's observe hook.
+    palette_query: String,
+    /// Per-command execution counts (DESIGN §3.3, hit-frequency
+    /// ordering): loaded from disk at palette open, written through on
+    /// every palette execution — the palette becomes *your* instrument.
+    palette_freq: HashMap<String, u32>,
+    /// The chord whisper (DESIGN §3.5, VimGolf's engine): after a palette
+    /// execution of a chorded command, one muted bottom-right one-liner
+    /// names the chord, then fades. Bederson's flow rules cap it at once
+    /// per session (the bool); the generation guards the fade timer.
+    chord_whisper: Option<String>,
+    chord_whisper_shown: bool,
+    chord_whisper_generation: u64,
     /// In-titlebar document rename (PLAN.md E2).
     doc_rename_input: Option<Entity<NoteInput>>,
     /// The keyboard-map overlay (PLAN.md E4, ctrl-?).
@@ -834,6 +848,11 @@ impl Editor {
             find_input: None,
             palette_input: None,
             palette_selected: 0,
+            palette_query: String::new(),
+            palette_freq: HashMap::new(),
+            chord_whisper: None,
+            chord_whisper_shown: false,
+            chord_whisper_generation: 0,
             doc_rename_input: None,
             shortcuts_open: false,
             ai_settings: None,
@@ -2313,8 +2332,9 @@ impl Editor {
             return;
         }
         let input = cx.new(NoteInput::for_palette);
-        cx.observe(&input, |editor, _, cx| {
+        cx.observe(&input, |editor, input, cx| {
             editor.palette_selected = 0; // query changed: selection restarts
+            editor.palette_query = input.read(cx).content.clone();
             cx.notify();
         })
         .detach();
@@ -2334,6 +2354,10 @@ impl Editor {
         window.focus(&input_focus, cx);
         self.palette_input = Some(input);
         self.palette_selected = 0;
+        self.palette_query.clear();
+        // Read once per open, not per keystroke; executions write through
+        // to disk AND to this copy, so the session stays self-consistent.
+        self.palette_freq = crate::files::load_palette_freq();
         cx.notify();
     }
 
@@ -2422,12 +2446,23 @@ impl Editor {
     }
 
     /// Commands first (ranked), then recent documents that match — the
-    /// palette is both the menu and the door to the other essays.
+    /// palette is both the menu and the door to the other essays. The
+    /// empty state opens with a Frequent section (DESIGN §3.3): the five
+    /// most-executed commands, which repeat in their home sections below.
     fn palette_rows(&self, query: &str) -> Vec<PaletteRow> {
-        let mut rows: Vec<PaletteRow> = crate::commands::ranked(query)
-            .into_iter()
-            .map(PaletteRow::Cmd)
-            .collect();
+        let mut rows: Vec<PaletteRow> = Vec::new();
+        if query.trim().is_empty() {
+            rows.extend(
+                crate::commands::frequent(&self.palette_freq)
+                    .into_iter()
+                    .map(PaletteRow::Frequent),
+            );
+        }
+        rows.extend(
+            crate::commands::ranked_with_freq(query, &self.palette_freq)
+                .into_iter()
+                .map(PaletteRow::Cmd),
+        );
         let current = self.store.as_ref().map(|s| s.path().to_owned());
         for p in crate::files::recents() {
             if Some(&p) == current.as_ref() {
@@ -2455,8 +2490,14 @@ impl Editor {
             return;
         };
         match row {
-            PaletteRow::Cmd(cmd) => {
+            PaletteRow::Cmd(cmd) | PaletteRow::Frequent(cmd) => {
+                let cmd = *cmd;
                 let action = (cmd.make)();
+                // Frequency writes through on every execution (DESIGN
+                // §3.3) — disk and the session's in-memory copy together.
+                let count = crate::files::bump_palette_freq(cmd.label);
+                self.palette_freq.insert(cmd.label.to_owned(), count);
+                self.maybe_whisper_chord(cmd, cx);
                 // Close first: focus returns to the document, so the action
                 // lands exactly as if its chord had been pressed there.
                 self.close_palette(window, cx);
@@ -2468,6 +2509,37 @@ impl Editor {
                 crate::files::open_in_new_window(&path);
             }
         }
+    }
+
+    /// The solution reveal, post-hoc and opt-out-by-ignoring (DESIGN
+    /// §3.5): a palette execution of a chorded command earns one muted
+    /// "that chord exists" whisper — at most once per app session
+    /// (VimGolf's engine; Bederson's flow rules forbid more), fading on
+    /// the same timer pattern as AI status notes. Chord-less commands
+    /// never whisper: there is nothing faster to reveal.
+    fn maybe_whisper_chord(&mut self, cmd: &crate::commands::Command, cx: &mut Context<Self>) {
+        let Some(keys) = cmd.keys else { return };
+        if self.chord_whisper_shown {
+            return;
+        }
+        self.chord_whisper_shown = true;
+        self.chord_whisper = Some(format!("Chord: {keys} does this directly"));
+        self.chord_whisper_generation += 1;
+        let generation = self.chord_whisper_generation;
+        cx.spawn(async move |this, cx| {
+            // Same fade window as schedule_status_fade's success notes.
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(6))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.chord_whisper_generation == generation {
+                    editor.chord_whisper = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn palette_up(&mut self, _: &PaletteUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -2504,6 +2576,7 @@ impl Editor {
         for (ix, row) in rows.iter().enumerate() {
             let section = match row {
                 PaletteRow::Cmd(cmd) => cmd.section,
+                PaletteRow::Frequent(_) => "Frequent",
                 PaletteRow::Recent(_) => "Recent Documents",
             };
             if grouped && section != last_section {
@@ -2519,7 +2592,7 @@ impl Editor {
                 );
             }
             let (label, right): (String, Option<String>) = match row {
-                PaletteRow::Cmd(cmd) => {
+                PaletteRow::Cmd(cmd) | PaletteRow::Frequent(cmd) => {
                     (cmd.label.to_owned(), cmd.keys.map(|k| k.to_owned()))
                 }
                 PaletteRow::Recent(p) => {
@@ -4626,6 +4699,23 @@ impl Editor {
         }
         if self.session_had_edits {
             session += " edits=1";
+        }
+        // F6 explorability tags: the palette's first row for the live
+        // query (Frequent/ prefix marks the frequency section) and the
+        // chord whisper's visibility window.
+        if self.palette_input.is_some() {
+            let top = match self.palette_rows(&self.palette_query).into_iter().next() {
+                Some(PaletteRow::Frequent(cmd)) => Some(format!("Frequent/{}", cmd.label)),
+                Some(PaletteRow::Cmd(cmd)) => Some(cmd.label.to_owned()),
+                Some(PaletteRow::Recent(p)) => Some(format!("Recent/{}", p.display())),
+                None => None,
+            };
+            session += &format!(" palette_top={:?}", top.unwrap_or_default());
+        }
+        if self.chord_whisper.is_some() {
+            // The generation stays at 1 for the whole session if the
+            // once-per-session rule holds.
+            session += &format!(" whisper=chord/{}", self.chord_whisper_generation);
         }
         let doc_state = format!(
             "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai}{panel}{session} mode={}",
@@ -7016,9 +7106,12 @@ fn auto_group_start(entries: &[HistoryEntry], ix: usize) -> usize {
     start
 }
 
-/// One palette row: a command from the registry, or a recent document.
+/// One palette row: a command from the registry, the same command worn
+/// as a "Frequent" badge (the empty state's top section, DESIGN §3.3),
+/// or a recent document.
 enum PaletteRow {
     Cmd(&'static crate::commands::Command),
+    Frequent(&'static crate::commands::Command),
     Recent(std::path::PathBuf),
 }
 
@@ -7235,6 +7328,32 @@ impl Editor {
                 .text_size(px(13.))
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Note:"))
                 .child(div().flex_1().child(input)),
+        )
+    }
+
+    /// The chord whisper (DESIGN §3.5): a muted one-liner in the bottom
+    /// right corner — its own tiny surface, deliberately NOT ai_status
+    /// (no card, no title) and never over prose; it fades on its timer
+    /// or dies with the next repaint after it.
+    fn render_chord_whisper(&self) -> Option<impl IntoElement> {
+        let text = self.chord_whisper.clone()?;
+        Some(
+            div()
+                .absolute()
+                .bottom(px(8.))
+                .right(px(12.))
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(4.))
+                // Translucent paper: in wide windows the corner is margin
+                // lane (prose-free); in narrow ones it can graze the
+                // viewport's last clipped line, and the translucency
+                // keeps even that readable for the 6s the whisper lives.
+                .bg(rgba(0xFBFAF8D9u32))
+                .font_family("PT Sans")
+                .text_size(px(11.))
+                .text_color(rgb(MUTED_COLOR))
+                .child(text),
         )
     }
 
@@ -7855,6 +7974,10 @@ impl Render for Editor {
             })
             .map(|d| match self.render_goal_strip() {
                 Some(strip) => d.child(strip),
+                None => d,
+            })
+            .map(|d| match self.render_chord_whisper() {
+                Some(whisper) => d.child(whisper),
                 None => d,
             })
             .map(|d| match self.render_selection_popover(window, cx) {

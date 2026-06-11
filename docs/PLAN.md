@@ -332,6 +332,33 @@ section. Ordering: root-fix verification first, then highest-leverage.
   first-edit auto-clear), pixel pass on rail/titlebar/banner. Rig note:
   click:X,Y smoke needs the X11 env (env -u WAYLAND_DISPLAY DISPLAY=:0)
   — occluded Wayland windows hit-test against a stale frame.
-- [ ] **F6. Explorability passes** (DESIGN §3): tutorial invites
-  breaking things; solution-reveal whispers (1/session); palette
-  hit-frequency ordering.
+- [x] **F6. Explorability passes** (shipped 2026-06-12, DESIGN §3):
+  three small features closing the explorability layer. **Tutorial
+  invites breaking things** (§3.4, the Papert microworld): the Rewind
+  section now dares the reader — "delete this whole paragraph —
+  really, all of it" — then names both ways home (ctrl-alt-h,
+  ctrl-z); Marks teaches the promoted ctrl-1..3 chords plus the F5
+  outline rail (ctrl-shift-o); a closing "When you're done today"
+  section hands off to End Session… and the next-session note. All
+  three demo-card anchors intact (unit test). **Palette hit-frequency
+  ordering** (§3.3, "your instrument"): per-label execution counts in
+  ~/.local/state/strop/palette_freq.json, written through on every
+  palette execution; the empty-query state opens with a "Frequent"
+  section — top 5 by count, min count 2, rows repeating in their home
+  sections (the Obsidian pattern); typed queries get +min(count,20) —
+  enough to break ties between equal matches, never enough to beat a
+  plainly better one. **Chord whisper** (§3.5, VimGolf's engine):
+  executing a *chorded* command from the palette earns one muted
+  bottom-right one-liner — "Chord: ctrl-shift-o does this directly" —
+  at most once per app session (Bederson's flow rules), fading on the
+  6s status-note timer; translucent paper, never a card, chord-less
+  commands never whisper. Verified: freq round-trip at injected path +
+  ranked-boost/cap + frequent-section unit tests; X11 smoke
+  (palette_top=/whisper=chord/N debug tags: execute twice → restart →
+  empty palette leads with Frequent/…; chordless execution whispers
+  nothing; the once-per-session generation stays 1); pixel pass on all
+  three (FREQUENT header, corner whisper, tutorial Rewind + closing).
+
+**Phase F complete** (2026-06-12): the designed shell is built — F0
+keystone through F6 explorability. Every DESIGN §1–§4 surface that
+PLAN promised now exists in the running editor.

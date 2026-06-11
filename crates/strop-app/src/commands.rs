@@ -346,18 +346,49 @@ fn score_one(query: &str, target: &str) -> Option<i32> {
 }
 
 /// Commands ranked for a query: table order when empty, score order
-/// otherwise (stable across equal scores, so sections stay grouped).
-pub fn ranked(query: &str) -> Vec<&'static Command> {
+/// otherwise (stable across equal scores, so sections stay grouped) —
+/// plus hit-frequency (DESIGN §3.3): a typed query gets a small boost
+/// per past execution, capped so frequency can tilt ties but never
+/// outshout a plainly better match. The empty state stays table order —
+/// the Frequent section (see `frequent`) carries frequency there.
+pub fn ranked_with_freq(
+    query: &str,
+    freq: &std::collections::HashMap<String, u32>,
+) -> Vec<&'static Command> {
     let all = all();
     if query.trim().is_empty() {
         return all.iter().collect();
     }
     let mut scored: Vec<(i32, &Command)> = all
         .iter()
-        .filter_map(|c| score(query.trim(), c).map(|s| (s, c)))
+        .filter_map(|c| {
+            score(query.trim(), c).map(|s| {
+                let boost = freq.get(c.label).map_or(0, |&n| (n as i32).min(20));
+                (s + boost, c)
+            })
+        })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
     scored.into_iter().map(|(_, c)| c).collect()
+}
+
+/// The empty-query palette's "Frequent" section (DESIGN §3.3): the top 5
+/// commands by execution count, counts below 2 don't qualify (a single
+/// use is noise, not habit), ties broken by table order. The rows repeat
+/// in their home sections below — Obsidian does the same.
+pub fn frequent(freq: &std::collections::HashMap<String, u32>) -> Vec<&'static Command> {
+    let mut hits: Vec<(u32, &Command)> = all()
+        .iter()
+        .filter_map(|c| {
+            freq.get(c.label)
+                .copied()
+                .filter(|&n| n >= 2)
+                .map(|n| (n, c))
+        })
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0)); // stable: table order breaks ties
+    hits.truncate(5);
+    hits.into_iter().map(|(_, c)| c).collect()
 }
 
 #[cfg(test)]
@@ -365,12 +396,13 @@ mod tests {
     use super::*;
 
     fn labels(query: &str) -> Vec<&'static str> {
-        ranked(query).iter().map(|c| c.label).collect()
+        let no_freq = std::collections::HashMap::new();
+        ranked_with_freq(query, &no_freq).iter().map(|c| c.label).collect()
     }
 
     #[test]
     fn empty_query_lists_everything_in_table_order() {
-        assert_eq!(ranked("").len(), all().len());
+        assert_eq!(labels("").len(), all().len());
         assert_eq!(labels("")[0], "New Document");
     }
 
@@ -391,6 +423,60 @@ mod tests {
     fn scattered_subsequence_still_matches() {
         assert!(labels("tgbld").contains(&"Toggle Bold"));
         assert!(labels("xyzzy").is_empty());
+    }
+
+    #[test]
+    fn frequency_boost_tilts_ranking_but_is_capped() {
+        // "toggle" matches many commands equally (word-start substring);
+        // frequency breaks the tie toward the habitual one.
+        let mut freq = std::collections::HashMap::new();
+        freq.insert("Toggle Highlight".to_owned(), 3u32);
+        let boosted = ranked_with_freq("toggle", &freq);
+        assert_eq!(boosted[0].label, "Toggle Highlight");
+        // Without history, table order holds.
+        assert_eq!(labels("toggle")[0], "Toggle Bold");
+        // The boost is capped at 20: "do" hits "New Document" at a word
+        // start (~1096) and "Undo" mid-word (~998); a thousand Undo
+        // executions close the tie-breaking gap, never the quality gap.
+        let mut freq = std::collections::HashMap::new();
+        freq.insert("Undo".to_owned(), 1000u32);
+        let l: Vec<_> = ranked_with_freq("do", &freq).iter().map(|c| c.label).collect();
+        assert_eq!(l[0], "New Document", "capped boost can't beat a better match");
+        assert!(
+            l.iter().position(|&c| c == "Undo").unwrap()
+                < l.iter().position(|&c| c == "Redo").unwrap(),
+            "but it does break the Undo/Redo tie"
+        );
+        // Empty query ignores frequency entirely (the Frequent section
+        // carries it there); table order is untouched.
+        assert_eq!(ranked_with_freq("", &freq)[0].label, "New Document");
+    }
+
+    #[test]
+    fn frequent_needs_two_uses_and_caps_at_five() {
+        let mut freq = std::collections::HashMap::new();
+        assert!(frequent(&freq).is_empty());
+        freq.insert("Undo".to_owned(), 1u32);
+        assert!(frequent(&freq).is_empty(), "a single use is noise");
+        freq.insert("Undo".to_owned(), 2);
+        freq.insert("Toggle Bold".to_owned(), 9);
+        assert_eq!(
+            frequent(&freq)
+                .iter()
+                .map(|c| c.label)
+                .collect::<Vec<_>>(),
+            vec!["Toggle Bold", "Undo"],
+            "count order, most-used first"
+        );
+        for c in ["Find in Document", "Heading 1", "Heading 2", "Heading 3"] {
+            freq.insert(c.to_owned(), 5);
+        }
+        let top = frequent(&freq);
+        assert_eq!(top.len(), 5, "capped at five");
+        assert_eq!(top[0].label, "Toggle Bold");
+        // Stale labels (renamed/removed commands) are simply skipped.
+        freq.insert("Gone Command".to_owned(), 50);
+        assert_eq!(frequent(&freq).len(), 5);
     }
 
     #[test]

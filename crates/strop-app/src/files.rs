@@ -133,6 +133,47 @@ pub fn replace_recent(old: &Path, new: &Path) {
     push_recent(new);
 }
 
+/// ~/.local/state/strop/palette_freq.json (DESIGN §3.3, hit-frequency
+/// ordering): label → execution count, written through on every palette
+/// execution so the palette slowly becomes *your* instrument.
+fn palette_freq_file() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".local/state"))
+        .join("strop/palette_freq.json")
+}
+
+pub fn load_palette_freq() -> std::collections::HashMap<String, u32> {
+    load_palette_freq_at(&palette_freq_file())
+}
+
+fn load_palette_freq_at(file: &Path) -> std::collections::HashMap<String, u32> {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+/// Count one execution; returns the new count (the caller keeps its
+/// in-memory copy in step without re-reading the file).
+pub fn bump_palette_freq(label: &str) -> u32 {
+    bump_palette_freq_at(&palette_freq_file(), label)
+}
+
+fn bump_palette_freq_at(file: &Path, label: &str) -> u32 {
+    let mut map = load_palette_freq_at(file);
+    let count = map.entry(label.to_owned()).or_insert(0);
+    *count += 1;
+    let count = *count;
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(file, json);
+    }
+    count
+}
+
 /// One entry of ~/.local/state/strop/intents.json (DESIGN §4.1, the
 /// close-time if-then ritual): the "Next session I will ___" sentence
 /// recorded by End Session, plus the caret offset at quit so the writer
@@ -409,6 +450,33 @@ mod tests {
         assert!(load_intent_at(&file, &doc_a).is_none());
         set_intent_at(&file, &doc_a, "re-seeded", 1);
         assert!(load_intent_at(&file, &doc_a).is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// palette_freq.json round-trip against an injected path (same env
+    /// discipline as `intents_round_trip_at_injected_path`).
+    #[test]
+    fn palette_freq_round_trip_at_injected_path() {
+        let tmp = std::env::temp_dir().join(format!("strop-freq-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("state/strop/palette_freq.json");
+
+        assert!(load_palette_freq_at(&file).is_empty(), "empty start");
+
+        // Each bump writes through and returns the running count.
+        assert_eq!(bump_palette_freq_at(&file, "Toggle Bold"), 1);
+        assert_eq!(bump_palette_freq_at(&file, "Toggle Bold"), 2);
+        assert_eq!(bump_palette_freq_at(&file, "Find in Document"), 1);
+        let map = load_palette_freq_at(&file);
+        assert_eq!(map.get("Toggle Bold"), Some(&2));
+        assert_eq!(map.get("Find in Document"), Some(&1));
+
+        // A garbage file degrades to empty, never panics.
+        std::fs::write(&file, b"not json").unwrap();
+        assert!(load_palette_freq_at(&file).is_empty());
+        assert_eq!(bump_palette_freq_at(&file, "Undo"), 1, "re-seeded");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

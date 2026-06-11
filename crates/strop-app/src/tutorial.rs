@@ -18,7 +18,7 @@ This document is alive — edit anything. It is a real file in your documents fo
 
 ## Marks
 
-Select a word and try `ctrl-b` bold, `ctrl-i` italic, `ctrl-shift-h` highlight. Headings are `ctrl-alt-1`–`3`. The typograph quietly sets quotes, dashes and spaces as you type — «так», “so”, 1941—1945 — and a single undo always returns exactly what you typed.
+Select a word and try `ctrl-b` bold, `ctrl-i` italic, `ctrl-shift-h` highlight. Headings are `ctrl-1`–`3`, and `ctrl-shift-o` opens an outline of them on the left — click one to jump. The typograph quietly sets quotes, dashes and spaces as you type — «так», “so”, 1941—1945 — and a single undo always returns exactly what you typed.
 
 ## The margin
 
@@ -28,11 +28,15 @@ The cards on the right are the point of this editor. Each one names a problem an
 
 ## Rewind
 
-Every keystroke is kept, across sessions — `ctrl-z` works after a restart. `ctrl-alt-h` opens history: step through versions with the arrow keys, restore anything (restoring is itself undoable). `ctrl-alt-s` names a checkpoint; this document already has one — open history and look.
+Every keystroke is kept, across sessions — `ctrl-z` works after a restart. Try it: delete this whole paragraph — really, all of it — then press `ctrl-alt-h` and step back through versions to bring it home, or just `ctrl-z`. Nothing in Strop can be lost. Restoring is itself undoable, and `ctrl-alt-s` names a checkpoint; this document already has one — open history and look.
 
 ## Files
 
 Documents are real files in ~/Documents/Strop — `ctrl-n` new, `ctrl-o` open, `ctrl-shift-e` exports Markdown next to the file. Work saves continuously; there is no Save.
+
+## When you're done today
+
+Run “End Session…” from the palette and answer one question — *next session I will ___*. Strop quits, and the next open lands on that note with your cursor exactly where you left it. Quitting any other way is fine too; nothing is ever asked.
 
 *The fix is yours. Always.*"#;
 
