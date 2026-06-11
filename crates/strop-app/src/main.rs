@@ -38,6 +38,31 @@ The voice-distance metric is the regression test for the whole thesis: an edit t
 Перо знает о бумаге больше, чем писатель о читателе; редактор — тот, кто читал за обоих.\n\
 And somewhere past the tenth paragraph, the window must scroll — which is, frankly, the only reason this sentence exists.";
 
+/// Remembered window bounds, in ~/.local/state (or XDG_STATE_HOME).
+fn state_file() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME not set")).join(".local/state")
+        })
+        .join("strop/window.json")
+}
+
+fn load_bounds() -> Option<(f32, f32, f32, f32)> {
+    let json = std::fs::read_to_string(state_file()).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+fn save_bounds(b: (f32, f32, f32, f32)) {
+    let path = state_file();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(&b) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 /// `strop [file.strop]`; default document lives in the XDG data dir.
 fn data_file() -> PathBuf {
     if let Some(arg) = std::env::args().nth(1) {
@@ -135,18 +160,34 @@ fn main() {
             None => (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default(), None),
         };
 
-        let bounds = Bounds::centered(None, size(px(960.), px(720.)), cx);
+        let bounds = match load_bounds() {
+            Some((x, y, w, h)) => Bounds {
+                origin: gpui::point(px(x), px(y)),
+                size: size(px(w.max(400.)), px(h.max(300.))),
+            },
+            None => Bounds::centered(None, size(px(960.), px(720.)), cx),
+        };
+        let title = {
+            let p = data_file();
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Scratch")
+                .to_owned();
+            format!("{stem} — Strop")
+        };
         let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Strop".into()),
+                    title: Some(title.clone().into()),
                     ..Default::default()
                 }),
                 focus: !smoke,
                 ..Default::default()
             },
             |window, cx| {
+                window.set_window_title(&title);
                 let editor = cx.new(|cx| {
                     let mut editor = Editor::new(cx, &initial_text, initial_spans, initial_blocks);
                     if let Some(history) = initial_history {
@@ -168,8 +209,18 @@ fn main() {
         let editor = window
             .update(cx, |_, _, cx| cx.entity())
             .expect("window just opened");
+        let window_for_quit = window;
         cx.on_app_quit(move |cx| {
             editor.update(cx, |editor, _| editor.save_now());
+            let _ = window_for_quit.update(cx, |_, window, _| {
+                let b = window.bounds();
+                save_bounds((
+                    f32::from(b.origin.x),
+                    f32::from(b.origin.y),
+                    f32::from(b.size.width),
+                    f32::from(b.size.height),
+                ));
+            });
             async {}
         })
         .detach();

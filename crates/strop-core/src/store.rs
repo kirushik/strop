@@ -393,6 +393,19 @@ impl Store {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Write a snapshot copy (full history) to another path; the open
+    /// document keeps saving to its own.
+    pub fn save_copy_to(&self, path: &Path) -> io::Result<()> {
+        let bytes = self
+            .doc
+            .export(ExportMode::Snapshot)
+            .map_err(io::Error::other)?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(path, bytes)
+    }
 }
 
 #[cfg(test)]

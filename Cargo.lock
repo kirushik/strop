@@ -5405,6 +5405,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "gpui",
+ "serde_json",
  "strop-core",
  "unicode-segmentation",
 ]

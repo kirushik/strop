@@ -49,6 +49,7 @@ actions!(
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
+        OpenFile, SaveCopyAs,
     ]
 );
 
@@ -119,6 +120,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-s", AddCheckpoint, ctx),
         KeyBinding::new("ctrl-shift-e", ExportMarkdown, ctx),
         KeyBinding::new("ctrl-alt-f", InsertFootnote, ctx),
+        KeyBinding::new("ctrl-o", OpenFile, ctx),
+        KeyBinding::new("ctrl-shift-s", SaveCopyAs, ctx),
     ]);
 }
 
@@ -532,6 +535,72 @@ impl Editor {
             out.push((id.clone(), def, start));
         }
         out
+    }
+
+    /// One document, one window, one process: opening spawns a sibling
+    /// instance (in-place document switching is backlogged).
+    fn open_file(&mut self, _: &OpenFile, _: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn(async move |_, _| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                let Some(path) = paths.first() else { return };
+                let Ok(exe) = std::env::current_exe() else { return };
+                if let Err(e) = std::process::Command::new(exe).arg(path).spawn() {
+                    eprintln!("strop: open in new window: {e}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Save a copy: .md exports markdown, anything else a full .strop
+    /// snapshot (history included). The open document keeps its own path —
+    /// continuous save never re-targets.
+    fn save_copy_as(&mut self, _: &SaveCopyAs, _: &mut Window, cx: &mut Context<Self>) {
+        self.save_now();
+        let Some(store) = &self.store else {
+            eprintln!("strop: no document to copy");
+            return;
+        };
+        let dir = store
+            .path()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let suggested = format!(
+            "{} copy.strop",
+            store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
+        );
+        let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
+        let md = strop_core::markdown::to_markdown(
+            &self.doc.text(),
+            self.doc.spans(),
+            self.doc.blocks(),
+        );
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                if path.extension().is_some_and(|e| e == "md") {
+                    if let Err(e) = std::fs::write(&path, md) {
+                        eprintln!("strop: save copy: {e}");
+                    }
+                } else {
+                    this.update(cx, |editor: &mut Editor, _| {
+                        if let Some(store) = &editor.store {
+                            if let Err(e) = store.save_copy_to(&path) {
+                                eprintln!("strop: save copy: {e}");
+                            }
+                        }
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn save_now(&mut self) {
@@ -2677,6 +2746,8 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::add_checkpoint))
                     .on_action(cx.listener(Self::export_markdown))
                     .on_action(cx.listener(Self::insert_footnote))
+                    .on_action(cx.listener(Self::open_file))
+                    .on_action(cx.listener(Self::save_copy_as))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

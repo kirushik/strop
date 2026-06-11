@@ -59,8 +59,12 @@ unless they'd be expensive to reverse.
       (ExternalPaths) insert Image blocks; rendering via Arc<gpui::Image>
       -> use_render_image decode-once cache -> Window::paint_image,
       DPI-crisp and column-capped.
-- [ ] B4. File UX: ctrl-o open (.strop/.md via xdg portal dialog), recent
-      files on the bar?, save-as. Keep minimal.
+- [x] B4. File UX: ctrl-o open dialog -> new window (one document, one
+      process — in-place switching backlogged), ctrl-shift-s "save a copy"
+      (.md exports markdown, else full-history .strop snapshot; continuous
+      save never re-targets), window title from file stem, window bounds
+      remembered across launches (XDG state file). Recent-files dropped
+      from scope (the OS file manager + dialog recents cover it).
 - [x] B5. **Checkpoints & persistent history** (plumbing done 2026-06-11,
       pulled forward on Kirill's ask — "Google-Docs Rewind, local-first,
       self-contained file" resonates with his interviewees):
@@ -99,8 +103,9 @@ unless they'd be expensive to reverse.
 - [ ] D2. Latency sanity pass: profile full-document reshape-per-frame,
       fix the obvious (cache shaped paragraphs across frames keyed by
       content+width), verify with Typometer if feasible.
-- [ ] D3. Window niceties: remember size/position, confirm-quit only if
-      save failed. Title shows document name.
+- [~] D3. Window niceties: size/position remembered and title shows the
+      document name (landed with B4). Remaining: confirm-quit if save
+      failed.
 - [ ] D4. Docs sweep: README quickstart, DECISIONS/document-model updated
       to match reality.
 
@@ -117,6 +122,8 @@ unless they'd be expensive to reverse.
 - **Image UX**: selection/deletion affordances on image blocks, alt/caption
   editing, GNOME screenshot-portal paste quirks. Wayland clipboard image
   WRITE is unimplemented in GPUI (copying an image out won't work).
+- **In-place document switching** (vs one-window-per-document) + recent
+  files, if multi-doc workflows materialize.
 
 - **History & versions visualization** (Kirill, 2026-06-11): the rewind
   panel is deliberately rough. Research the design space before building
