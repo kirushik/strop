@@ -57,7 +57,7 @@ actions!(
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
-        OpenFile, SaveCopyAs, AddNote, RunDiagnosis,
+        OpenFile, SaveCopyAs, AddNote, RunDiagnosis, Find,
     ]
 );
 
@@ -130,6 +130,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-f", InsertFootnote, ctx),
         KeyBinding::new("ctrl-m", AddNote, ctx),
         KeyBinding::new("ctrl-shift-d", RunDiagnosis, ctx),
+        KeyBinding::new("ctrl-f", Find, ctx),
         KeyBinding::new("enter", NoteCommit, Some("NoteInput")),
         KeyBinding::new("escape", NoteCancel, Some("NoteInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
@@ -187,6 +188,9 @@ pub struct Editor {
     active_note: Option<u64>,
     diagnosis_running: bool,
     last_ai_error: Option<String>,
+    /// Find bar (ctrl-f): live-highlighting query input; Enter advances.
+    find_input: Option<Entity<NoteInput>>,
+    find_current: usize,
     /// In-card composer for the active note's body.
     note_input: Option<Entity<NoteInput>>,
     last_frame: Option<TextFrame>,
@@ -619,6 +623,8 @@ impl Editor {
             active_note: None,
             diagnosis_running: false,
             last_ai_error: None,
+            find_input: None,
+            find_current: 0,
             note_input: None,
             last_frame: None,
         }
@@ -1021,6 +1027,98 @@ impl Editor {
             .ok();
         })
         .detach();
+    }
+
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        let seed = if self.selected_range.is_empty() {
+            String::new()
+        } else {
+            self.doc.slice_bytes(self.selected_range.clone())
+        };
+        let input = cx.new(|cx| NoteInput::new(cx, seed));
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, input, event: &NoteInputEvent, window, cx| match event {
+                NoteInputEvent::Commit(_) => {
+                    // Enter: jump to the next match, keep the bar open.
+                    let query = input.read(cx).content.clone();
+                    let matches = editor.find_matches(&query);
+                    if matches.is_empty() {
+                        return;
+                    }
+                    editor.find_current = (editor.find_current + 1) % matches.len();
+                    let m = matches[editor.find_current].clone();
+                    editor.selected_range = m;
+                    editor.selection_reversed = false;
+                    editor.bump_activity();
+                    cx.notify();
+                    let _ = window; // focus stays on the bar
+                }
+                NoteInputEvent::Cancel => {
+                    editor.find_input = None;
+                    window.focus(&editor.focus_handle);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        window.focus(&input.read(cx).focus_handle);
+        self.find_input = Some(input);
+        self.find_current = 0;
+        cx.notify();
+    }
+
+    fn find_matches(&self, query: &str) -> Vec<Range<usize>> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let text = self.doc.text();
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(found) = text[from..].find(query) {
+            let start = from + found;
+            out.push(start..start + query.len());
+            from = start + query.len().max(1);
+            if out.len() >= 500 {
+                break; // enough; this is a prose editor, not grep
+            }
+        }
+        out
+    }
+
+    fn render_find_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let input = self.find_input.clone()?;
+        let query = input.read(cx).content.clone();
+        let count = self.find_matches(&query).len();
+        let label = if query.is_empty() {
+            String::new()
+        } else if count == 0 {
+            "нет совпадений".into()
+        } else {
+            format!("{}/{count}", (self.find_current % count.max(1)) + 1)
+        };
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .bg(rgb(0xF4F1EA))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .px(px(28.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .font_family("Literata")
+                .text_size(px(13.))
+                .child(div().text_color(rgb(MUTED_COLOR)).child("Find:"))
+                .child(div().flex_1().child(input))
+                .child(div().text_color(rgb(MUTED_COLOR)).child(label)),
+        )
     }
 
     pub fn save_now(&mut self) {
@@ -2369,6 +2467,7 @@ fn runs_for_paragraph(
     marked: Option<&Range<usize>>,
     spans: &[(Range<usize>, InlineAttr)],
     notes: &[(Range<usize>, bool, bool)],
+    matches: &[Range<usize>],
     base: &TextRun,
 ) -> Vec<TextRun> {
     let mut cuts = vec![par_range.start, par_range.end];
@@ -2381,6 +2480,10 @@ fn runs_for_paragraph(
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
     for (r, _, _) in notes {
+        cuts.push(r.start.clamp(par_range.start, par_range.end));
+        cuts.push(r.end.clamp(par_range.start, par_range.end));
+    }
+    for r in matches {
         cuts.push(r.start.clamp(par_range.start, par_range.end));
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
@@ -2469,6 +2572,15 @@ fn runs_for_paragraph(
                 }
             }
 
+            for r in matches {
+                if r.start <= w[0] && w[1] <= r.end {
+                    content_bg = Some(match content_bg {
+                        Some(bg) => blend_over(rgba(0x7FB8A455), bg),
+                        None => rgba(0x7FB8A455), // sage — distinct from wheat
+                    });
+                }
+            }
+
             let background = match (in_selection, content_bg) {
                 (true, Some(bg)) => Some(blend_over(rgba(SELECTION_COLOR), bg).into()),
                 (true, None) => Some(rgba(SELECTION_COLOR).into()),
@@ -2522,6 +2634,7 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let perf_start = std::env::var_os("STROP_PERF").map(|_| Instant::now());
         // Ensure encoded-image handles exist for every Image block (the
         // actual decode is async inside GPUI's asset cache).
         let needed: Vec<String> = {
@@ -2603,6 +2716,11 @@ impl Element for EditorElement {
 
         let font_scale = editor.config.font_size.map_or(1., |s| (s / 20.).clamp(0.6, 2.));
         let kinds: Vec<BlockKind> = editor.doc.blocks().kinds().to_vec();
+        let find_matches: Vec<Range<usize>> = editor
+            .find_input
+            .as_ref()
+            .map(|i| editor.find_matches(&i.read(cx).content))
+            .unwrap_or_default();
         // Open-annotation anchors (byte ranges, active, is_diagnosis):
         // notes tint; diagnoses underline quietly until activated.
         let note_ranges: Vec<(Range<usize>, bool, bool)> = {
@@ -2679,12 +2797,18 @@ impl Element for EditorElement {
                 .filter(|(r, _, _)| r.start < range.end && range.start < r.end)
                 .cloned()
                 .collect();
+            let par_matches: Vec<Range<usize>> = find_matches
+                .iter()
+                .filter(|r| r.start < range.end && range.start < r.end)
+                .cloned()
+                .collect();
             let runs = runs_for_paragraph(
                 &range,
                 &selection,
                 marked.as_ref(),
                 &par_spans,
                 &par_notes,
+                &par_matches,
                 &block_base,
             );
             let line = window
@@ -2785,6 +2909,14 @@ impl Element for EditorElement {
                 rgb(TEXT_COLOR),
             ))
         });
+
+        if let Some(start) = perf_start {
+            eprintln!(
+                "strop-perf: prepaint {:?} ({} blocks)",
+                start.elapsed(),
+                paragraphs.len()
+            );
+        }
 
         PrepaintState {
             paragraphs,
@@ -3469,6 +3601,10 @@ impl Render for Editor {
                     d
                 }
             })
+            .map(|d| match self.render_find_strip(cx) {
+                Some(strip) => d.child(strip),
+                None => d,
+            })
             .child(
                 div()
                     .w_full()
@@ -3539,6 +3675,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::insert_footnote))
                     .on_action(cx.listener(Self::add_note))
                     .on_action(cx.listener(Self::run_diagnosis))
+                    .on_action(cx.listener(Self::find))
                     .on_action(cx.listener(Self::open_file))
                     .on_action(cx.listener(Self::save_copy_as))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -3597,7 +3734,7 @@ mod tests {
             (2..5, InlineAttr::Strong),
             (5..8, InlineAttr::Highlight),
         ];
-        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &base());
+        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &[], &base());
         // Segments: [0,2) plain, [2,5) bold, [5,8) highlight, [8,10) plain.
         assert_eq!(runs.len(), 4);
         assert_eq!(runs[1].font.weight, FontWeight::BOLD);
@@ -3614,7 +3751,7 @@ mod tests {
         // partial overlap splits into its own runs.
         let par = 0..6;
         let spans = vec![(0..6, InlineAttr::Highlight)];
-        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &[], &base());
+        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &[], &[], &base());
         let blended = blend_over(rgba(SELECTION_COLOR), rgba(HIGHLIGHT_COLOR));
         assert_eq!(runs[1].background_color, Some(blended.into()));
         assert_ne!(
@@ -3628,7 +3765,7 @@ mod tests {
         // Outside the selection the pure highlight shows.
         assert_eq!(runs[0].background_color, Some(rgba(HIGHLIGHT_COLOR).into()));
         // Selection over plain text stays the plain selection color.
-        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &[], &base());
+        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &[], &[], &base());
         assert_eq!(
             plain[1].background_color,
             Some(rgba(SELECTION_COLOR).into())
@@ -3639,7 +3776,7 @@ mod tests {
     fn code_run_switches_family_and_marked_text_underlines() {
         let par = 0..8;
         let spans = vec![(0..4, InlineAttr::Code)];
-        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &[], &base());
+        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &[], &[], &base());
         assert_eq!(runs[0].font.family.as_ref(), CODE_FONT);
         assert!(runs[1].underline.is_some());
     }

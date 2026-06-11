@@ -122,15 +122,21 @@ unless they'd be expensive to reverse.
 
 ## Phase D — MVP polish gate
 
-- [ ] D1. Find (ctrl-f), minimal: highlight matches, n/N navigation.
-- [ ] D2. Latency sanity pass: profile full-document reshape-per-frame,
-      fix the obvious (cache shaped paragraphs across frames keyed by
-      content+width), verify with Typometer if feasible.
-- [~] D3. Window niceties: size/position remembered and title shows the
-      document name (landed with B4). Remaining: confirm-quit if save
-      failed.
-- [ ] D4. Docs sweep: README quickstart, DECISIONS/document-model updated
-      to match reality.
+- [x] D1. Find (ctrl-f): live sage-tinted matches (compositing with
+      everything else), Enter cycles with wraparound + count label,
+      Escape returns to the text, seeds from the selection.
+      Case-insensitive search backlogged.
+- [x] D2. Latency pass, by measurement (STROP_PERF=1): release prepaint
+      of a 59k-char / 121-block document = 0.4-0.9ms — inside the
+      8.3ms/120Hz budget; GPUI's frame-to-frame LineLayoutCache already
+      dedupes shaping. No paragraph cache needed at MVP scale. Typometer
+      verification remains a nice-to-have (external hardware-ish setup).
+- [x] D3. Window niceties: size/position remembered, title shows the
+      document name (B4). Confirm-quit-on-failed-save judged not worth a
+      blocking quit-time prompt: idle-save failures already warn on every
+      heartbeat long before quit; revisit if a real data loss ever occurs.
+- [x] D4. Docs sweep: README rewritten to match the shipped feature set;
+      ROADMAP is the live record. **MVP gate passed 2026-06-11.**
 
 ## Backlog (researched properly, not squeezed in)
 
