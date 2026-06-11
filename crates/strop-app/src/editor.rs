@@ -207,6 +207,8 @@ pub struct Editor {
     rename_input: Option<(usize, Entity<NoteInput>)>,
     /// Alt-text composer for an image block: (block index, composer).
     alt_input: Option<(usize, Entity<NoteInput>)>,
+    /// Self-baseline from the [voice] corpus (None until >=3 docs load).
+    pub voice_baseline: Option<strop_core::voice::Baseline>,
     /// In-card composer for the active note's body.
     note_input: Option<Entity<NoteInput>>,
     last_frame: Option<TextFrame>,
@@ -646,6 +648,7 @@ impl Editor {
             replace_input: None,
             rename_input: None,
             alt_input: None,
+            voice_baseline: None,
             note_input: None,
             last_frame: None,
         }
@@ -696,6 +699,57 @@ impl Editor {
             store.apply(&ops);
             self.store_dirty = true;
             self.dirty_since_checkpoint = true;
+        }
+    }
+
+    /// Load the [voice] corpus and build the self-baseline. Synchronous —
+    /// essays are small; runs once at startup.
+    pub fn load_voice_corpus(&mut self) {
+        if self.config.voice.corpus.is_empty() {
+            return;
+        }
+        let mut texts: Vec<String> = Vec::new();
+        for pattern in &self.config.voice.corpus {
+            let expanded = if let Some(rest) = pattern.strip_prefix("~/") {
+                format!(
+                    "{}/{rest}",
+                    std::env::var("HOME").unwrap_or_default()
+                )
+            } else {
+                pattern.clone()
+            };
+            let Ok(paths) = glob::glob(&expanded) else {
+                eprintln!("strop: bad corpus glob: {pattern}");
+                continue;
+            };
+            for path in paths.flatten() {
+                let text = match path.extension().and_then(|e| e.to_str()) {
+                    Some("md") => std::fs::read_to_string(&path)
+                        .ok()
+                        .map(|md| strop_core::markdown::from_markdown(&md).0),
+                    Some("strop") => Store::open(&path)
+                        .ok()
+                        .and_then(|(_, loaded)| loaded.map(|l| l.text)),
+                    _ => std::fs::read_to_string(&path).ok(),
+                };
+                if let Some(text) = text {
+                    if text.split_whitespace().count() >= 200 {
+                        texts.push(text);
+                    }
+                }
+            }
+        }
+        let lang = match self.config.language {
+            Language::Ru => typograph::Lang::Ru,
+            Language::En => typograph::Lang::En,
+            Language::Auto => typograph::detect_lang(texts.join(" ").chars().take(4000)),
+        };
+        let n = texts.len();
+        self.voice_baseline = strop_core::voice::baseline(&texts, lang);
+        if self.voice_baseline.is_some() {
+            eprintln!("strop: voice baseline from {n} corpus texts");
+        } else if n > 0 {
+            eprintln!("strop: voice corpus has {n} usable texts; need 3+");
         }
     }
 
@@ -3895,6 +3949,48 @@ impl Editor {
                     .text_color(rgb(MUTED_COLOR))
                     .child("↑/↓ step versions · Esc exits · restoring is undoable"),
             )
+            .when_some(self.voice_baseline.as_ref(), |d, baseline| {
+                let lang = match self.config.language {
+                    Language::Ru => typograph::Lang::Ru,
+                    Language::En => typograph::Lang::En,
+                    Language::Auto => typograph::detect_lang(self.doc.rope().chars()),
+                };
+                let report =
+                    baseline.assess(&strop_core::voice::signature(&self.doc.text(), lang));
+                let ru = lang == typograph::Lang::Ru;
+                let headline = if report.overall_sigma > 2. {
+                    if ru {
+                        format!(
+                            "Голос: {:.1}σ за пределами вашей нормы ({} текстов)",
+                            report.overall_sigma, baseline.docs
+                        )
+                    } else {
+                        format!(
+                            "Voice: {:.1}σ outside your normal range ({} texts)",
+                            report.overall_sigma, baseline.docs
+                        )
+                    }
+                } else if ru {
+                    format!("Голос: в пределах вашей нормы ({} текстов)", baseline.docs)
+                } else {
+                    format!("Voice: within your normal range ({} texts)", baseline.docs)
+                };
+                d.child(
+                    div()
+                        .px(px(8.))
+                        .pt(px(4.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .text_size(px(11.))
+                        .text_color(if report.overall_sigma > 2. {
+                            rgb(0xA04A3A)
+                        } else {
+                            rgb(MUTED_COLOR)
+                        })
+                        .children(std::iter::once(headline).chain(report.flags)),
+                )
+            })
             .when(compare_current, |d| {
                 // Voice drift v0: descriptive stylometry between the
                 // selected version and the draft (rhythm first — research:

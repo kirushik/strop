@@ -5481,6 +5481,7 @@ name = "strop-app"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "glob",
  "gpui",
  "serde",
  "serde_json",

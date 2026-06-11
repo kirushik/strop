@@ -17,6 +17,15 @@ pub struct Config {
     /// Body text size in px (line height scales at 1.4, rhythm-rounded).
     pub font_size: Option<f32>,
     pub ai: AiConfig,
+    pub voice: VoiceConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// Globs of the writer's own past texts (.md/.txt/.strop) — the
+    /// self-baseline corpus for voice-drift flagging (needs >= 3 files).
+    pub corpus: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -71,6 +80,7 @@ mod tests {
         )
         .unwrap();
         assert!(config.auto_copy_selection);
+        assert!(config.voice.corpus.is_empty());
         assert_eq!(config.language, Language::Ru);
         assert_eq!(config.ai.base_url, "https://api.poe.com/v1");
         assert!(config.ai.api_key.is_empty());

@@ -239,6 +239,179 @@ pub fn describe_drift(from: &Signature, to: &Signature, lang: Lang) -> Vec<Strin
     out
 }
 
+/// Flatten a signature into one feature vector. Layout: function words,
+/// then [cv, burstiness, mean sentence length], punct rates, [mattr,
+/// mean word length].
+fn flatten(s: &Signature) -> Vec<f32> {
+    let mut v = s.function_words.clone();
+    v.extend([s.sentence_cv, s.burstiness, s.sentence_mean]);
+    v.extend(s.punct);
+    v.extend([s.mattr, s.mean_word_len]);
+    v
+}
+
+fn feature_name(ix: usize, lang: Lang) -> String {
+    let fw = match lang {
+        Lang::Ru => RU_FUNCTION_WORDS,
+        Lang::En => EN_FUNCTION_WORDS,
+    };
+    let n = fw.len();
+    let ru = lang == Lang::Ru;
+    match ix {
+        i if i < n => {
+            if ru {
+                format!("частота «{}»", fw[i])
+            } else {
+                format!("frequency of \"{}\"", fw[i])
+            }
+        }
+        i if i == n => if ru { "разброс длины фраз".into() } else { "sentence-length variance".into() },
+        i if i == n + 1 => if ru { "ритмическая неровность".into() } else { "rhythm burstiness".into() },
+        i if i == n + 2 => if ru { "средняя длина фразы".into() } else { "mean sentence length".into() },
+        i if i < n + 10 => {
+            let names_en = ["em-dash", "semicolon", "colon", "parens", "!", "?", "comma"];
+            let names_ru = ["тире", "точка с запятой", "двоеточие", "скобки", "!", "?", "запятая"];
+            let p = ix - n - 3;
+            if ru {
+                format!("частота: {}", names_ru[p])
+            } else {
+                format!("{} rate", names_en[p])
+            }
+        }
+        i if i == n + 10 => if ru { "лексическое разнообразие".into() } else { "lexical diversity".into() },
+        _ => if ru { "длина слов".into() } else { "word length".into() },
+    }
+}
+
+/// Self-baseline over the writer's own corpus (>=3 documents), with
+/// leave-one-out calibration of normal self-variation — the research
+/// recipe. Flags are nameable per-feature observations, never identity
+/// verdicts (Eder's floor).
+pub struct Baseline {
+    pub docs: usize,
+    mean: Vec<f32>,
+    sd: Vec<f32>,
+    delta_mean: f32,
+    delta_sd: f32,
+    lang: Lang,
+}
+
+const SIGMA_FLOOR: f32 = 1e-4;
+
+fn mean_sd(rows: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
+    let n = rows.len() as f32;
+    let dims = rows[0].len();
+    let mut mean = vec![0f32; dims];
+    for r in rows {
+        for (m, v) in mean.iter_mut().zip(r) {
+            *m += v / n;
+        }
+    }
+    let mut sd = vec![0f32; dims];
+    for r in rows {
+        for ((s, v), m) in sd.iter_mut().zip(r).zip(&mean) {
+            *s += (v - m).powi(2) / n;
+        }
+    }
+    for s in &mut sd {
+        *s = s.sqrt().max(SIGMA_FLOOR);
+    }
+    (mean, sd)
+}
+
+/// Mean |z| over the function-word block — the Burrows-Delta-style
+/// distance against a baseline.
+fn fw_delta(v: &[f32], mean: &[f32], sd: &[f32], fw_len: usize) -> f32 {
+    (0..fw_len)
+        .map(|i| ((v[i] - mean[i]) / sd[i]).abs())
+        .sum::<f32>()
+        / fw_len as f32
+}
+
+pub fn baseline(texts: &[String], lang: Lang) -> Option<Baseline> {
+    if texts.len() < 3 {
+        return None;
+    }
+    let rows: Vec<Vec<f32>> = texts
+        .iter()
+        .map(|t| flatten(&signature(t, lang)))
+        .collect();
+    let fw_len = match lang {
+        Lang::Ru => RU_FUNCTION_WORDS.len(),
+        Lang::En => EN_FUNCTION_WORDS.len(),
+    };
+    let (mean, sd) = mean_sd(&rows);
+    // Leave-one-out: each doc's distance to the baseline of the others.
+    let mut deltas = Vec::new();
+    for i in 0..rows.len() {
+        let others: Vec<Vec<f32>> = rows
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, r)| r.clone())
+            .collect();
+        let (m, s) = mean_sd(&others);
+        deltas.push(fw_delta(&rows[i], &m, &s, fw_len));
+    }
+    let dn = deltas.len() as f32;
+    let delta_mean = deltas.iter().sum::<f32>() / dn;
+    let delta_sd = (deltas
+        .iter()
+        .map(|d| (d - delta_mean).powi(2))
+        .sum::<f32>()
+        / dn)
+        .sqrt()
+        .max(SIGMA_FLOOR);
+    Some(Baseline {
+        docs: texts.len(),
+        mean,
+        sd,
+        delta_mean,
+        delta_sd,
+        lang,
+    })
+}
+
+pub struct VoiceReport {
+    /// How far outside normal self-variation the draft sits, in LOO sigmas.
+    pub overall_sigma: f32,
+    /// Per-feature |z|>2 observations, loudest first, max 5.
+    pub flags: Vec<String>,
+}
+
+impl Baseline {
+    pub fn assess(&self, draft: &Signature) -> VoiceReport {
+        let v = flatten(draft);
+        let fw_len = match self.lang {
+            Lang::Ru => RU_FUNCTION_WORDS.len(),
+            Lang::En => EN_FUNCTION_WORDS.len(),
+        };
+        let delta = fw_delta(&v, &self.mean, &self.sd, fw_len);
+        let overall_sigma = (delta - self.delta_mean) / self.delta_sd;
+        let ru = self.lang == Lang::Ru;
+        let mut scored: Vec<(f32, String)> = Vec::new();
+        for i in 0..v.len() {
+            let z = (v[i] - self.mean[i]) / self.sd[i];
+            if z.abs() > 2. {
+                let name = feature_name(i, self.lang);
+                scored.push((
+                    z.abs(),
+                    if ru {
+                        format!("{name}: {:+.1}σ от вашей нормы", z)
+                    } else {
+                        format!("{name}: {:+.1}σ from your baseline", z)
+                    },
+                ));
+            }
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        VoiceReport {
+            overall_sigma,
+            flags: scored.into_iter().take(5).map(|(_, f)| f).collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +435,34 @@ mod tests {
         let drift = describe_drift(&a, &b, Lang::Ru);
         assert!(!drift.is_empty());
         assert!(drift[0].contains("ритм"), "rhythm leads: {drift:?}");
+    }
+
+    #[test]
+    fn baseline_needs_three_docs_and_calibrates() {
+        let style_a = |n: usize| {
+            (0..n)
+                .map(|i| format!("Я думаю, что это решает дело номер {i}. Коротко. А потом — длинная фраза, которая петляет и не спешит к точке, потому что так дышит автор."))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let corpus: Vec<String> = (3..7).map(|k| style_a(k * 4)).collect();
+        assert!(baseline(&corpus[..2], Lang::Ru).is_none());
+        let b = baseline(&corpus, Lang::Ru).unwrap();
+        // A corpus member sits within normal self-variation.
+        let member = signature(&corpus[0], Lang::Ru);
+        let r = b.assess(&member);
+        assert!(r.overall_sigma < 2., "member flagged: {}", r.overall_sigma);
+        // A metronome draft with alien punctuation drifts measurably.
+        let alien = "Это предложение средней длины без украшений; точно так же; и снова так; всегда одинаково; без вариаций; механически; ровно; гладко; одинаково; совсем одинаково."
+            .repeat(8);
+        let r2 = b.assess(&signature(&alien, Lang::Ru));
+        assert!(
+            r2.overall_sigma > r.overall_sigma,
+            "alien {} <= member {}",
+            r2.overall_sigma,
+            r.overall_sigma
+        );
+        assert!(!r2.flags.is_empty(), "no flags for alien draft");
     }
 
     #[test]

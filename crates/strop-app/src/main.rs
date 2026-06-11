@@ -192,6 +192,7 @@ fn main() {
                 let editor = cx.new(|cx| {
                     let mut editor = Editor::new(cx, &initial_text, initial_spans, initial_blocks);
                     editor.config = config::load();
+                    editor.load_voice_corpus();
                     if let Some(history) = initial_history {
                         editor.restore_history(history);
                     }

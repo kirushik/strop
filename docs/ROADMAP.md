@@ -181,16 +181,15 @@ unless they'd be expensive to reverse.
   per-author colors. REMAINING (needs hands-on feedback first):
   rename-in-place, "since last session" affordance, snap animation.
 
-## Next loop stage (queued 2026-06-11)
+## Done in the final loop round (2026-06-11)
 
-- **Voice baseline corpus**: config `[voice] corpus = ["~/essays/*.md"]`
-  -> parse each file (markdown import for .md, store read for .strop),
-  compute per-feature mu/sigma across >=3 docs, leave-one-out calibration
-  of normal self-variation (research recipe), then flag draft drift at
-  >2sigma per feature ("semicolon rate 3.1sigma above your baseline" — a
-  nameable problem in the product's idiom) in the history panel and/or a
-  voice readout. With <3 corpus docs, stay descriptive (current v0
-  behavior).
+- [x] **Voice baseline corpus**: `[voice] corpus = ["~/essays/*.md"]`
+  globs (.md via import, .strop via store read, .txt raw; >=200 words
+  each, >=3 files) -> per-feature mu/sigma + leave-one-out calibration of
+  normal self-variation; the history panel shows "Voice: within / Nsigma
+  outside your normal range (M texts)" plus up to 5 nameable per-feature
+  flags ("частота тире: +3.1sigma от вашей нормы"). Below 3 docs the v0
+  descriptive mode stands. Verified live with a generated corpus.
 
 ## Explicitly post-MVP
 
