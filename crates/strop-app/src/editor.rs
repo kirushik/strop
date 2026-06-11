@@ -11,7 +11,7 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
@@ -41,6 +41,10 @@ const NOTE_TINT: u32 = 0xE3B84926; // wheat/amber ~15% — Docs-trained intuitio
 const NOTE_TINT_ACTIVE: u32 = 0xE3B8494D; // ~30% when active
 const MARGIN_WIDTH: f32 = 248.;
 const MARGIN_GAP: f32 = 16.;
+/// History side panel (DESIGN §2-history): push, not overlay. The panel
+/// shrinks before the document does — prose keeps DOC_MIN_WIDTH.
+const HISTORY_PANEL_WIDTH: f32 = 320.;
+const DOC_MIN_WIDTH: f32 = 400.;
 const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
 const MUTED_COLOR: u32 = 0x8A8678;
@@ -872,7 +876,8 @@ impl Editor {
     }
 
     /// Build the rewind list: materialize every checkpoint once, compute
-    /// word deltas between consecutive states.
+    /// word deltas between consecutive states and (when a self-baseline
+    /// exists) per-checkpoint voice drift.
     fn enter_history(&mut self, cx: &mut Context<Self>) {
         let Some(store) = &self.store else {
             return;
@@ -886,6 +891,18 @@ impl Editor {
             let delta = strop_core::diff::word_delta(&strop_core::diff::prose_diff(
                 &prev_text, &text,
             ));
+            // Flag-only scalar: shown when assess() puts the checkpoint
+            // outside the writer's normal range. Gated on the corpus floor
+            // (200 words) — shorter states are statistical noise. The
+            // signature must use the BASELINE's language (the vectors are
+            // per-language and differently sized).
+            let drift_sigma = self.voice_baseline.as_ref().and_then(|b| {
+                if text.split_whitespace().count() < 200 {
+                    return None;
+                }
+                let report = b.assess(&strop_core::voice::signature(&text, b.lang()));
+                (report.overall_sigma > 2.).then_some(report.overall_sigma)
+            });
             prev_text = text.clone();
             entries.push(HistoryEntry {
                 name: cp.name.clone(),
@@ -896,17 +913,25 @@ impl Editor {
                 spans,
                 blocks,
                 delta,
+                drift_sigma,
             });
         }
         if entries.is_empty() {
             return;
         }
         let selected = entries.len() - 1;
+        // You land on the newest checkpoint: if it's automatic, its run
+        // starts unfolded so the selected row is visible.
+        let mut expanded = HashSet::new();
+        if !entries[selected].manual {
+            expanded.insert(auto_group_start(&entries, selected));
+        }
         self.history_view = Some(HistoryView {
             entries,
             selected,
             named_only: false,
             compare_current: false,
+            expanded,
         });
         self.rebuild_preview();
         cx.notify();
@@ -1112,6 +1137,13 @@ impl Editor {
     fn history_select(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(hv) = &mut self.history_view {
             hv.selected = ix.min(hv.entries.len() - 1);
+            // Arrow-stepping into a collapsed auto run unfolds it: the
+            // selected row must be visible (no hidden modes, no hidden
+            // selection).
+            if !hv.entries[hv.selected].manual {
+                hv.expanded
+                    .insert(auto_group_start(&hv.entries, hv.selected));
+            }
             self.rebuild_preview();
             self.scroll_top = px(0.);
             cx.notify();
@@ -4860,16 +4892,100 @@ fn format_unix(secs: i64) -> String {
 }
 
 impl Editor {
-    fn render_history_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Width of the history side panel for this window, 0 when closed.
+    /// Push, not overlay (DESIGN §2-history): the document column reflows.
+    /// In narrow windows the panel shrinks first; prose keeps ~DOC_MIN_WIDTH.
+    fn history_panel_width(&self, window: &Window) -> f32 {
+        if self.history_view.is_none() {
+            return 0.;
+        }
+        let vw = f32::from(window.viewport_size().width);
+        (vw - DOC_MIN_WIDTH).clamp(180., HISTORY_PANEL_WIDTH)
+    }
+
+    /// The mode banner (DESIGN §2-history, principle 5 — no hidden modes):
+    /// a slim strip across the top of the document area naming what you're
+    /// viewing, with the one verb (Restore) and the exit. It lives in the
+    /// column's top padding — never over prose.
+    fn render_history_banner(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let (name, stamp) = self
+            .history_view
+            .as_ref()
+            .map(|hv| {
+                let e = &hv.entries[hv.selected];
+                (e.name.clone(), format_unix(e.created_unix))
+            })
+            .unwrap_or_default();
+        div()
+            .absolute()
+            .top(px(BAR_HEIGHT))
+            .left_0()
+            .right(px(panel_w))
+            .h(px(30.))
+            .bg(rgb(0xF4F1EA))
+            .border_b_1()
+            .border_color(rgb(RULE_COLOR))
+            .px(px(16.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .font_family("PT Serif")
+            .text_size(px(12.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Viewing:"))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(rgb(TEXT_COLOR))
+                    .child(format!("{name} · {stamp}")),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("restore-btn")
+                    .flex_shrink_0()
+                    .px(px(8.))
+                    .py(px(1.))
+                    .rounded(px(4.))
+                    .cursor(CursorStyle::PointingHand)
+                    .bg(rgb(0xE8DFC8))
+                    .text_color(rgb(TEXT_COLOR))
+                    .hover(|d| d.bg(rgb(0xDFD3B0)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.restore_selected(cx);
+                        }),
+                    )
+                    .child("Restore"),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(MUTED_COLOR))
+                    .child("Esc exits"),
+            )
+    }
+
+    /// The history side panel (DESIGN §2-history): full-height, right,
+    /// displaces the margin while open. Two-tier list — named checkpoints
+    /// are first-class rows; runs of automatic ones collapse into
+    /// expandable "N auto-checkpoints" rows (Figma's answer to autosave
+    /// noise). vs-prev/vs-draft rides the bottom as a segmented control.
+    fn render_history_panel(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let empty_expanded = HashSet::new();
         let hv = self.history_view.as_ref();
-        let (entries, selected, named_only, compare_current) = match hv {
+        let (entries, selected, named_only, compare_current, expanded) = match hv {
             Some(hv) => (
                 hv.entries.as_slice(),
                 hv.selected,
                 hv.named_only,
                 hv.compare_current,
+                &hv.expanded,
             ),
-            None => (&[][..], 0, false, false),
+            None => (&[][..], 0, false, false, &empty_expanded),
         };
         let toggle = |label: &'static str, on: bool| {
             div()
@@ -4883,247 +4999,323 @@ impl Editor {
                 .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                 .child(label)
         };
-        let mut last_day = String::new();
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for (ix, e) in entries.iter().enumerate() {
-            if named_only && !e.manual {
-                continue;
-            }
+        // One checkpoint row: dot marker (drawn: ●/○ aren't in PT), name,
+        // time, word delta, drift scalar when flagged. Double-click renames
+        // in place. Expanded auto rows indent under their group row.
+        let entry_row = |ix: usize, e: &HistoryEntry, indent: bool| {
             let stamp = format_unix(e.created_unix);
-            let (day, time) = stamp.split_once(' ').unwrap_or((stamp.as_str(), ""));
-            if day != last_day {
-                last_day = day.to_owned();
-                rows.push(
-                    div()
-                        .px(px(8.))
-                        .pt(px(8.))
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED_COLOR))
-                        .child(day.to_owned())
-                        .into_any_element(),
-                );
-            }
+            let (_, time) = stamp.split_once(' ').unwrap_or((stamp.as_str(), ""));
+            let time = time.to_owned();
             let (ins, del) = e.delta;
             let delta = if ins == 0 && del == 0 {
                 String::new()
             } else {
                 format!("+{ins} −{del}")
             };
-            let active = ix == selected;
+            div()
+                .id(("hist-row", ix))
+                .px(px(8.))
+                .py(px(4.))
+                .when(indent, |d| d.pl(px(20.)))
+                .rounded(px(5.))
+                .cursor(CursorStyle::PointingHand)
+                .when(ix == selected, |d| d.bg(rgba(0x1A1A1812u32)))
+                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |editor, ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        if ev.click_count >= 2 {
+                            editor.start_rename(ix, window, cx);
+                        } else {
+                            editor.history_select(ix, cx);
+                        }
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .child(
+                            match self
+                                .rename_input
+                                .as_ref()
+                                .filter(|(rix, _)| *rix == ix)
+                            {
+                                Some((_, input)) => {
+                                    div().flex_1().child(input.clone())
+                                }
+                                None => div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .size(px(7.))
+                                            .rounded_full()
+                                            .when(e.manual, |d| {
+                                                d.bg(rgb(TEXT_COLOR))
+                                            })
+                                            .when(!e.manual, |d| {
+                                                d.border_1().border_color(
+                                                    rgb(MUTED_COLOR),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_color(rgb(TEXT_COLOR))
+                                            .when(e.manual, |d| {
+                                                d.font_weight(FontWeight::BOLD)
+                                            })
+                                            .child(e.name.clone()),
+                                    ),
+                            },
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .ml(px(6.))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(11.))
+                                .child(
+                                    div()
+                                        .text_color(rgb(MUTED_COLOR))
+                                        .child(format!("{time}  {delta}")),
+                                )
+                                .when_some(e.drift_sigma, |d, s| {
+                                    // Scalar caps at >10σ: beyond that the
+                                    // number is noise, not information.
+                                    d.child(div().text_color(rgb(0x8A6A3A)).child(
+                                        if s >= 10. {
+                                            ">10σ".to_owned()
+                                        } else {
+                                            format!("{s:+.1}σ")
+                                        },
+                                    ))
+                                }),
+                        ),
+                )
+                .into_any_element()
+        };
+        let day_header = |day: &str| {
+            div()
+                .px(px(8.))
+                .pt(px(8.))
+                .text_size(px(11.))
+                .text_color(rgb(MUTED_COLOR))
+                .child(day.to_owned())
+                .into_any_element()
+        };
+        let mut last_day = String::new();
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        let mut ix = 0usize;
+        while ix < entries.len() {
+            let stamp = format_unix(entries[ix].created_unix);
+            let (day, _) = stamp.split_once(' ').unwrap_or((stamp.as_str(), ""));
+            if entries[ix].manual {
+                if day != last_day {
+                    last_day = day.to_owned();
+                    rows.push(day_header(day));
+                }
+                rows.push(entry_row(ix, &entries[ix], false));
+                ix += 1;
+                continue;
+            }
+            // A run of automatic checkpoints: one collapsed row between
+            // named neighbours; click (or arrow-stepping into it) unfolds.
+            let end = entries[ix..]
+                .iter()
+                .position(|e| e.manual)
+                .map_or(entries.len(), |p| ix + p);
+            if named_only {
+                ix = end;
+                continue;
+            }
+            if day != last_day {
+                last_day = day.to_owned();
+                rows.push(day_header(day));
+            }
+            let n = end - ix;
+            let is_open = expanded.contains(&ix);
+            let holds_selection = (ix..end).contains(&selected);
+            let gix = ix;
             rows.push(
                 div()
-                    .id(("hist-row", ix))
+                    .id(("hist-group", gix))
                     .px(px(8.))
                     .py(px(4.))
                     .rounded(px(5.))
                     .cursor(CursorStyle::PointingHand)
-                    .when(active, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .when(!is_open && holds_selection, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |editor, ev: &MouseDownEvent, window, cx| {
+                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            if ev.click_count >= 2 {
-                                editor.start_rename(ix, window, cx);
-                            } else {
-                                editor.history_select(ix, cx);
+                            if let Some(hv) = &mut editor.history_view {
+                                if !hv.expanded.remove(&gix) {
+                                    hv.expanded.insert(gix);
+                                }
+                                cx.notify();
                             }
                         }),
                     )
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
                     .child(
                         div()
-                            .flex()
-                            .justify_between()
-                            .child(
-                                match self
-                                    .rename_input
-                                    .as_ref()
-                                    .filter(|(rix, _)| *rix == ix)
-                                {
-                                    Some((_, input)) => {
-                                        div().flex_1().child(input.clone())
-                                    }
-                                    None => div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.))
-                                        .child(
-                                            // Drawn marker: ●/○ aren't in PT.
-                                            div()
-                                                .flex_shrink_0()
-                                                .size(px(7.))
-                                                .rounded_full()
-                                                .when(e.manual, |d| {
-                                                    d.bg(rgb(TEXT_COLOR))
-                                                })
-                                                .when(!e.manual, |d| {
-                                                    d.border_1().border_color(
-                                                        rgb(MUTED_COLOR),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w(px(0.))
-                                                .truncate()
-                                                .text_color(rgb(TEXT_COLOR))
-                                                .when(e.manual, |d| {
-                                                    d.font_weight(FontWeight::BOLD)
-                                                })
-                                                .child(e.name.clone()),
-                                        ),
-                                },
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .ml(px(6.))
-                                    .text_size(px(11.))
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child(format!("{time}  {delta}")),
-                            ),
+                            .flex_shrink_0()
+                            .size(px(7.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgb(MUTED_COLOR)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(format!(
+                                "{n} auto-checkpoint{}",
+                                if n == 1 { "" } else { "s" }
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(if is_open { "hide" } else { "show" }),
                     )
                     .into_any_element(),
             );
+            if is_open {
+                for k in ix..end {
+                    rows.push(entry_row(k, &entries[k], true));
+                }
+            }
+            ix = end;
         }
         div()
             .id("history-panel")
             .absolute()
-            .top(px(BAR_HEIGHT + 8.))
-            .right(px(8.))
-            .w(px(300.))
-            .max_h(px(520.))
-            .overflow_y_scroll()
+            .top(px(BAR_HEIGHT))
+            .right_0()
+            .bottom_0()
+            .w(px(panel_w))
             .bg(rgb(0xF4F1EA))
-            .border_1()
+            .border_l_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(8.))
-            .p(px(6.))
             .flex()
             .flex_col()
-            .gap(px(2.))
             .font_family("PT Serif")
             .text_size(px(13.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
-                    .px(px(8.))
-                    .py(px(4.))
+                    .px(px(14.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(rgb(RULE_COLOR))
                     .flex()
                     .justify_between()
                     .items_center()
                     .child(div().text_color(rgb(MUTED_COLOR)).child("History"))
                     .child(
-                        div()
-                            .flex()
-                            .gap(px(4.))
-                            .child(
-                                toggle("named", named_only).on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        if let Some(hv) = &mut editor.history_view {
-                                            hv.named_only = !hv.named_only;
-                                            cx.notify();
-                                        }
-                                    }),
-                                ),
-                            )
-                            .child(
-                                toggle("vs draft", compare_current).on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        if let Some(hv) = &mut editor.history_view {
-                                            hv.compare_current = !hv.compare_current;
-                                            editor.rebuild_preview();
-                                            cx.notify();
-                                        }
-                                    }),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .id("restore-btn")
-                                    .px(px(8.))
-                                    .py(px(1.))
-                                    .rounded(px(4.))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .bg(rgb(0xE8DFC8))
-                                    .text_color(rgb(TEXT_COLOR))
-                                    .hover(|d| d.bg(rgb(0xDFD3B0)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(
-                                            |editor, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation();
-                                                editor.restore_selected(cx);
-                                            },
-                                        ),
-                                    )
-                                    .child("Restore"),
-                            ),
+                        toggle("named", named_only).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(hv) = &mut editor.history_view {
+                                    hv.named_only = !hv.named_only;
+                                    cx.notify();
+                                }
+                            }),
+                        ),
                     ),
             )
             .child(
                 div()
-                    .px(px(8.))
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .child("Up/Down step versions · Esc exits · restoring is undoable"),
+                    .id("history-list")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .p(px(6.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(rows),
             )
-            .when_some(self.voice_baseline.as_ref(), |d, baseline| {
+            .when(compare_current, |d| {
+                // vs-draft: how the draft sits against the self-baseline,
+                // plus descriptive stylometry between the selected version
+                // and the draft (rhythm first — research: flattening
+                // variance is the LLM-characteristic signal).
                 let lang = match self.config.language {
                     Language::Ru => typograph::Lang::Ru,
                     Language::En => typograph::Lang::En,
                     Language::Auto => typograph::detect_lang(self.doc.rope().chars()),
                 };
-                let report =
-                    baseline.assess(&strop_core::voice::signature(&self.doc.text(), lang));
-                let ru = lang == typograph::Lang::Ru;
-                let headline = if report.overall_sigma > 2. {
-                    if ru {
-                        format!(
-                            "Голос: {:.1}σ за пределами вашей нормы ({} текстов)",
-                            report.overall_sigma, baseline.docs
-                        )
-                    } else {
-                        format!(
-                            "Voice: {:.1}σ outside your normal range ({} texts)",
-                            report.overall_sigma, baseline.docs
+                let d = match self.voice_baseline.as_ref() {
+                    Some(baseline) => {
+                        // assess() requires the baseline's own language —
+                        // the function-word vectors are per-language and
+                        // differently sized.
+                        let report = baseline.assess(&strop_core::voice::signature(
+                            &self.doc.text(),
+                            baseline.lang(),
+                        ));
+                        let ru = baseline.lang() == typograph::Lang::Ru;
+                        let headline = if report.overall_sigma > 2. {
+                            if ru {
+                                format!(
+                                    "Голос: {:.1}σ за пределами вашей нормы ({} текстов)",
+                                    report.overall_sigma, baseline.docs
+                                )
+                            } else {
+                                format!(
+                                    "Voice: {:.1}σ outside your normal range ({} texts)",
+                                    report.overall_sigma, baseline.docs
+                                )
+                            }
+                        } else if ru {
+                            format!(
+                                "Голос: в пределах вашей нормы ({} текстов)",
+                                baseline.docs
+                            )
+                        } else {
+                            format!(
+                                "Voice: within your normal range ({} texts)",
+                                baseline.docs
+                            )
+                        };
+                        d.child(
+                            div()
+                                .px(px(14.))
+                                .pt(px(6.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.))
+                                .text_size(px(11.))
+                                .text_color(if report.overall_sigma > 2. {
+                                    rgb(0xA04A3A)
+                                } else {
+                                    rgb(MUTED_COLOR)
+                                })
+                                .children(std::iter::once(headline).chain(report.flags)),
                         )
                     }
-                } else if ru {
-                    format!("Голос: в пределах вашей нормы ({} текстов)", baseline.docs)
-                } else {
-                    format!("Voice: within your normal range ({} texts)", baseline.docs)
-                };
-                d.child(
-                    div()
-                        .px(px(8.))
-                        .pt(px(4.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.))
-                        .text_size(px(11.))
-                        .text_color(if report.overall_sigma > 2. {
-                            rgb(0xA04A3A)
-                        } else {
-                            rgb(MUTED_COLOR)
-                        })
-                        .children(std::iter::once(headline).chain(report.flags)),
-                )
-            })
-            .when(compare_current, |d| {
-                // Voice drift v0: descriptive stylometry between the
-                // selected version and the draft (rhythm first — research:
-                // flattening variance is the LLM-characteristic signal).
-                let lang = match self.config.language {
-                    Language::Ru => typograph::Lang::Ru,
-                    Language::En => typograph::Lang::En,
-                    Language::Auto => typograph::detect_lang(self.doc.rope().chars()),
+                    None => d,
                 };
                 let drift = self
                     .history_view
@@ -5138,8 +5330,8 @@ impl Editor {
                 d.when(!drift.is_empty(), |d| {
                     d.child(
                         div()
-                            .px(px(8.))
-                            .pt(px(4.))
+                            .px(px(14.))
+                            .pt(px(6.))
                             .flex()
                             .flex_col()
                             .gap(px(1.))
@@ -5152,7 +5344,69 @@ impl Editor {
                     )
                 })
             })
-            .children(rows)
+            .child(
+                // Pinned at the panel bottom (the Docs "Show changes"
+                // position): what the canvas diff compares against.
+                div()
+                    .border_t_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .p(px(8.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .px(px(2.))
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child("Up/Down step versions · double-click renames · restoring is undoable"),
+                    )
+                    .child(
+                        div().flex().text_size(px(12.)).children(
+                            [("vs previous", false), ("vs draft", true)].map(
+                                |(label, value)| {
+                                    let on = compare_current == value;
+                                    div()
+                                        .id(label)
+                                        .flex_1()
+                                        .py(px(3.))
+                                        .flex()
+                                        .justify_center()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .border_1()
+                                        .border_color(rgb(RULE_COLOR))
+                                        .when(!value, |d| d.rounded_l(px(5.)))
+                                        .when(value, |d| d.rounded_r(px(5.)).border_l_0())
+                                        .when(on, |d| {
+                                            d.bg(rgb(0xE8DFC8)).text_color(rgb(TEXT_COLOR))
+                                        })
+                                        .when(!on, |d| {
+                                            d.text_color(rgb(MUTED_COLOR))
+                                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |editor, _: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some(hv) =
+                                                        &mut editor.history_view
+                                                    {
+                                                        if hv.compare_current != value {
+                                                            hv.compare_current = value;
+                                                            editor.rebuild_preview();
+                                                            cx.notify();
+                                                        }
+                                                    }
+                                                },
+                                            ),
+                                        )
+                                        .child(label)
+                                },
+                            ),
+                        ),
+                    ),
+            )
     }
 
     fn render_footnote_zone(
@@ -5223,9 +5477,14 @@ struct HistoryEntry {
     blocks: BlockMap,
     /// (+words, -words) vs the previous checkpoint.
     delta: (usize, usize),
+    /// Voice drift vs the writer's self-baseline, in LOO sigmas — set only
+    /// when the baseline exists AND the checkpoint sits outside the normal
+    /// range (>2σ). Scalars in the list; prose diff on the canvas.
+    drift_sigma: Option<f32>,
 }
 
-/// History mode: Docs-style list + read-only inline-diff preview.
+/// History mode (DESIGN §2-history, the Docs/Figma hybrid): right side
+/// panel with a two-tier list + the document as read-only diff canvas.
 struct HistoryView {
     entries: Vec<HistoryEntry>,
     selected: usize,
@@ -5233,6 +5492,20 @@ struct HistoryView {
     /// false: diff vs previous checkpoint ("work of that session");
     /// true: diff vs the current draft ("what restoring would change").
     compare_current: bool,
+    /// Expanded auto-checkpoint runs, keyed by the run's first entry index.
+    /// Runs are collapsed by default (Figma's answer to autosave noise);
+    /// arrow-stepping into one unfolds it.
+    expanded: HashSet<usize>,
+}
+
+/// First index of the run of consecutive auto checkpoints containing `ix`
+/// (caller guarantees `entries[ix]` is automatic).
+fn auto_group_start(entries: &[HistoryEntry], ix: usize) -> usize {
+    let mut start = ix;
+    while start > 0 && !entries[start - 1].manual {
+        start -= 1;
+    }
+    start
 }
 
 /// One palette row: a command from the registry, or a recent document.
@@ -5736,6 +6009,10 @@ impl Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // History mode pushes the document aside (DESIGN §2-history: push,
+        // not overlay — single-document app, reflow is cheap). The column
+        // re-centers and re-wraps in the remaining width.
+        let hist_panel_w = self.history_panel_width(window);
         div()
             .size_full()
             .relative()
@@ -5755,6 +6032,7 @@ impl Render for Editor {
                     .flex()
                     .justify_center()
                     .overflow_hidden()
+                    .when(hist_panel_w > 0., |d| d.pr(px(hist_panel_w)))
                     .child(
                         div()
                             .key_context("Editor")
@@ -5870,21 +6148,35 @@ impl Render for Editor {
             // order, so anything mounted before it ends up UNDER the text
             // (the bug Kirill caught from the first screenshot).
             .when(self.history_view.is_some(), |d| {
-                d.child(self.render_history_panel(cx))
+                d.child(self.render_history_banner(hist_panel_w, cx))
+                    .child(self.render_history_panel(hist_panel_w, cx))
             })
             .map(|d| {
-                let footnotes = self.visible_footnotes();
+                // The footnote zone keys off live-doc offsets; in history
+                // the canvas shows the merged diff, so it stands down.
+                let footnotes = if self.history_view.is_some() {
+                    Vec::new()
+                } else {
+                    self.visible_footnotes()
+                };
                 d.when(!footnotes.is_empty(), |d| {
                     d.child(self.render_footnote_zone(footnotes, cx))
                 })
             })
-            .map(|d| match self.render_margin(window, cx) {
-                Some(margin) => d.child(margin),
-                None => d,
-            })
-            .map(|d| match self.render_ai_status(window, cx) {
-                Some(status) => d.child(status),
-                None => d,
+            .map(|d| {
+                // The panel displaces the margin lane while open (DESIGN
+                // §2-history) — and the AI status card that rides it.
+                if self.history_view.is_some() {
+                    return d;
+                }
+                let d = match self.render_margin(window, cx) {
+                    Some(margin) => d.child(margin),
+                    None => d,
+                };
+                match self.render_ai_status(window, cx) {
+                    Some(status) => d.child(status),
+                    None => d,
+                }
             })
             .map(|d| {
                 if !self.margin_fits(window) {
@@ -5981,6 +6273,29 @@ mod tests {
             plain[1].background_color,
             Some(rgba(SELECTION_COLOR).into())
         );
+    }
+
+    #[test]
+    fn auto_runs_group_from_their_first_entry() {
+        let e = |manual: bool| HistoryEntry {
+            name: String::new(),
+            created_unix: 0,
+            manual,
+            frontiers: Vec::new(),
+            text: String::new(),
+            spans: SpanSet::default(),
+            blocks: BlockMap::default(),
+            delta: (0, 0),
+            drift_sigma: None,
+        };
+        // [named, auto, auto, named, auto]
+        let entries = vec![e(true), e(false), e(false), e(true), e(false)];
+        assert_eq!(auto_group_start(&entries, 1), 1);
+        assert_eq!(auto_group_start(&entries, 2), 1);
+        assert_eq!(auto_group_start(&entries, 4), 4);
+        // A leading auto run starts at index 0.
+        let entries = vec![e(false), e(false), e(true)];
+        assert_eq!(auto_group_start(&entries, 1), 0);
     }
 
     #[test]

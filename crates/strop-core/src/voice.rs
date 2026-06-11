@@ -380,6 +380,13 @@ pub struct VoiceReport {
 }
 
 impl Baseline {
+    /// The corpus language. Signatures fed to `assess` MUST be built with
+    /// it: the function-word vectors are per-language and differently
+    /// sized — mixing languages would index out of bounds.
+    pub fn lang(&self) -> Lang {
+        self.lang
+    }
+
     pub fn assess(&self, draft: &Signature) -> VoiceReport {
         let v = flatten(draft);
         let fw_len = match self.lang {

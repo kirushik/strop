@@ -235,9 +235,25 @@ section. Ordering: root-fix verification first, then highest-leverage.
   silent literal aliases in bind_keys. Rig note: shot.sh now captures
   twice — unfocused XWayland surfaces present stale frames on the first
   grab.
-- [ ] **F2. History side panel** (DESIGN §2-history): push panel, mode
-  banner, two-tier list (autos collapsed between named), drift glyph +
-  word delta per row, segmented vs-toggle, dropdown retired.
+- [x] **F2. History side panel** (shipped 2026-06-12, DESIGN §2-history):
+  the dropdown is dead. Full-height right panel, PUSH not overlay — the
+  center row gets pr(panel_w) so the column re-centers and re-wraps; the
+  panel shrinks before the document does (180..320px, prose keeps
+  ~400px), margin lane + AI card + footnote zone stand down while open.
+  Slim mode banner in the column's 56px top padding (never over prose):
+  "Viewing: name · date · [Restore] · Esc exits" — Restore lives there
+  now, once. Two-tier list: named checkpoints first-class (bold, filled
+  dot), runs of autos collapse into "N auto-checkpoints show/hide" rows;
+  arrow-stepping into a collapsed run unfolds it (selection is never
+  hidden); day headers, rename-in-place, word deltas, named-only filter
+  all kept. Per-row voice-drift scalar ("+2.1σ", capped at ">10σ") when
+  a baseline exists and assess() flags, gated on the 200-word corpus
+  floor. vs-prev/vs-draft is a segmented control pinned at the panel
+  bottom (Docs' "Show changes" position); the vs-draft voice block sits
+  above it. Bug fixed en route: Baseline::assess with a doc-detected
+  language different from the corpus language indexed out of bounds
+  (per-language function-word vectors differ in size) — Baseline now
+  exposes lang() and all assess() signatures use it.
 - [ ] **F3. Footnote completion** (DESIGN §2-footnotes): painted
   superior marks, bidirectional jumps, zone-as-editor, stacking policy.
 - [ ] **F4. AI settings panel** (DESIGN §2-ai): form + test-call +
