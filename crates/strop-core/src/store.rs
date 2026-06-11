@@ -311,6 +311,20 @@ impl Store {
         }
     }
 
+    /// Add a checkpoint only if the document state actually differs from
+    /// the most recent checkpoint — empty sessions never clutter the rail
+    /// (the research's top Docs complaint).
+    pub fn add_checkpoint_if_changed(&self, name: &str, manual: bool) {
+        if let Some(last) = self.checkpoints().last() {
+            if let Some((text, _, _)) = self.state_at(&last.frontiers) {
+                if text == self.text() {
+                    return;
+                }
+            }
+        }
+        self.add_checkpoint(name, manual);
+    }
+
     pub fn checkpoints(&self) -> Vec<Checkpoint> {
         let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
         (0..list.len())

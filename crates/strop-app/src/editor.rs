@@ -675,7 +675,7 @@ impl Editor {
                         && editor.last_input.elapsed() >= Duration::from_secs(900)
                     {
                         if let Some(store) = &editor.store {
-                            store.add_checkpoint("Session", false);
+                            store.add_checkpoint_if_changed("Session", false);
                             editor.dirty_since_checkpoint = false;
                         }
                     }
@@ -3376,6 +3376,24 @@ impl Element for EditorElement {
                 &par_dels,
                 &block_base,
             );
+            // Shaping feeds runs as byte windows: a run boundary off a char
+            // boundary or a length mismatch silently corrupts glyphs.
+            {
+                let mut at = 0usize;
+                let mut valid = true;
+                for run in &runs {
+                    if !par_text.is_char_boundary(at) {
+                        valid = false;
+                    }
+                    at += run.len;
+                }
+                if at != par_text.len() || !valid {
+                    eprintln!(
+                        "strop-bug: run misalignment in block {block_ix}: runs sum {at} vs len {}, boundary-ok {valid}",
+                        par_text.len()
+                    );
+                }
+            }
             let line = window
                 .text_system()
                 .shape_text(
@@ -3842,6 +3860,9 @@ impl Editor {
                                         div().flex_1().child(input.clone())
                                     }
                                     None => div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
                                         .text_color(rgb(TEXT_COLOR))
                                         .when(e.manual, |d| {
                                             d.font_weight(FontWeight::SEMIBOLD)
@@ -3855,6 +3876,8 @@ impl Editor {
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
+                                    .ml(px(6.))
                                     .text_size(px(11.))
                                     .text_color(rgb(MUTED_COLOR))
                                     .child(format!("{time}  {delta}")),
