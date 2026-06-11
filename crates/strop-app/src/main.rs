@@ -3,6 +3,7 @@ mod config;
 mod editor;
 mod files;
 mod smoke;
+mod tutorial;
 
 use std::path::PathBuf;
 
@@ -70,23 +71,25 @@ fn save_bounds(b: (f32, f32, f32, f32)) {
     }
 }
 
-/// `strop [file.strop|file.md|--new]`. With no argument: migrate the
-/// legacy hidden scratch if present, else reopen the most recent
-/// document, else start a fresh visible Untitled (PLAN.md E2 — documents
-/// are never created in hidden locations).
-fn data_file() -> PathBuf {
+/// `strop [file.strop|file.md|--new|--welcome]`. With no argument:
+/// migrate the legacy hidden scratch if present, else reopen the most
+/// recent document, else the first run ever gets the tutorial (PLAN.md
+/// E2/E4 — documents are never created in hidden locations). The bool
+/// marks "seed this as the welcome tutorial".
+fn data_file() -> (PathBuf, bool) {
     match std::env::args().nth(1).as_deref() {
-        Some("--new") => return files::untitled_path(),
-        Some(arg) => return arg.into(),
+        Some("--new") => return (files::untitled_path(), false),
+        Some("--welcome") => return (files::welcome_path(), true),
+        Some(arg) => return (arg.into(), false),
         None => {}
     }
     if let Some(migrated) = files::migrate_scratch() {
-        return migrated;
+        return (migrated, false);
     }
     if let Some(recent) = files::recents().into_iter().next() {
-        return recent;
+        return (recent, false);
     }
-    files::untitled_path()
+    (files::welcome_path(), true)
 }
 
 fn main() {
@@ -116,11 +119,13 @@ fn main() {
         let smoke = std::env::var("STROP_SMOKE").is_ok();
         // Resolve the document path exactly once: data_file() has side
         // effects (scratch migration) that smoke runs must never trigger.
-        let doc_path: Option<PathBuf> = if smoke && std::env::args().nth(1).is_none() {
-            None
-        } else {
-            Some(data_file())
-        };
+        let (doc_path, welcome): (Option<PathBuf>, bool) =
+            if smoke && std::env::args().nth(1).is_none() {
+                (None, false)
+            } else {
+                let (p, welcome) = data_file();
+                (Some(p), welcome)
+            };
         let store = match &doc_path {
             None => None,
             Some(p) => {
@@ -157,6 +162,7 @@ fn main() {
             }
         });
 
+        let mut tutorial_notes = None;
         let (initial_text, initial_spans, initial_blocks, initial_history) = match &store {
             Some((store, existing)) => match existing {
                 Some(loaded) => {
@@ -175,14 +181,18 @@ fn main() {
                         store.seed(text);
                         (text.clone(), spans.clone(), blocks.clone(), None)
                     }
+                    None if welcome => {
+                        // First run ever (or "Open Welcome Guide"): the
+                        // tutorial document, margin demo cards included.
+                        let (text, spans, blocks, notes) = tutorial::document();
+                        store.seed(&text);
+                        store.add_checkpoint("Fresh tutorial", true);
+                        tutorial_notes = Some(notes);
+                        (text, spans, blocks, None)
+                    }
                     None => {
-                        // The very first document a user ever sees carries
-                        // the demo text (E4 upgrades it to a real tutorial);
-                        // every later New Document starts clean.
-                        let first_run = files::recents().len() <= 1;
-                        let seed = if first_run { SAMPLE } else { "" };
-                        store.seed(seed);
-                        (seed.to_owned(), SpanSet::default(), BlockMap::default(), None)
+                        store.seed("");
+                        (String::new(), SpanSet::default(), BlockMap::default(), None)
                     }
                 },
             },
@@ -226,6 +236,9 @@ fn main() {
                     }
                     if let Some((_, Some(loaded))) = &store {
                         editor.restore_annotations(loaded.annotations.clone());
+                    }
+                    if let Some(notes) = tutorial_notes {
+                        editor.restore_annotations(notes);
                     }
                     editor.start_blink(cx);
                     if let Some((store, _)) = store {

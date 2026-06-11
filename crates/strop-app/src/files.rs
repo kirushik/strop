@@ -178,6 +178,27 @@ pub fn new_window_blank() {
     }
 }
 
+/// First free "Welcome to Strop[ N].strop" — the tutorial document's home.
+pub fn welcome_path() -> PathBuf {
+    let dir = documents_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let first = dir.join("Welcome to Strop.strop");
+    if !first.exists() {
+        return first;
+    }
+    (2..)
+        .map(|n| dir.join(format!("Welcome to Strop {n}.strop")))
+        .find(|p| !p.exists())
+        .expect("unbounded range")
+}
+
+/// A fresh tutorial in its own window (reopenable from the palette).
+pub fn open_welcome_window() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).arg("--welcome").spawn();
+    }
+}
+
 /// Sanitize a typed title into a file stem (keeps Unicode letters, trims
 /// path separators and leading dots).
 pub fn stem_from_title(title: &str) -> Option<String> {

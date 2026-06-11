@@ -118,11 +118,17 @@ here. Sequenced so dogfooding unblocks as early as possible.
   [ai].mode config default + idle margin hint showing the current mode;
   debug_cursor reports ai=/mode= for smoke. Deferred: ticking elapsed
   display, margin-header mode chips (post-dogfood).
-- [ ] **E4. First-run tutorial document + shortcuts overlay**: tutorial
-  .strop seeded on first launch (teaches marks, checkpoint, rewind; a
-  pre-seeded diagnosis so the margin is never empty on first sight),
-  shortcuts window (ctrl-?, GNOME convention). Details pending
-  E1-research (overlay conventions).
+- [x] **E4. First-run tutorial + keyboard map** (shipped 2026-06-12):
+  first launch (and palette "Open Welcome Guide" / `--welcome`) seeds
+  "Welcome to Strop.strop" — built at runtime from markdown, real
+  formatting, literal chords inline, three pre-seeded margin cards (two
+  diagnoses on planted flaws incl. an agreement slip the copy mode would
+  catch, one author note) and a "Fresh tutorial" checkpoint so rewind has
+  something to show; the demo SAMPLE text is retired. ctrl-? (GNOME
+  convention) opens the keyboard map: every registry command grouped by
+  section plus the text-editing baseline, esc/click-out closes —
+  rendered from the same table as the palette and keymap, so it can
+  never lie.
 - [ ] **E5. Dogfood gate**: Kirill writes something real; every friction
   point becomes a tracked item; first live-key diagnosis run on real
   prose. Exit criterion: he reaches for Strop instead of his current

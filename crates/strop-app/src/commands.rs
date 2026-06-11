@@ -10,11 +10,11 @@ use gpui::Action;
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
     DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1, Heading2,
-    Heading3, InsertFootnote, NewDocument, OpenAiConfig, OpenFile, Redo, RenameDocument, Replace,
-    RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs, TestAiConnection, ToggleBulletList,
-    ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory,
-    ToggleOrderedList, TogglePalette, ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong,
-    ToggleUnderline, Undo,
+    Heading3, InsertFootnote, NewDocument, OpenAiConfig, OpenFile, OpenWelcome, Redo,
+    RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
+    ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode, ToggleCodeBlock,
+    ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList, TogglePalette,
+    ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
 };
 
 pub struct Command {
@@ -241,6 +241,20 @@ pub fn all() -> &'static [Command] {
             Some("ctrl-shift-p"),
             TogglePalette,
             ["commands", "menu", "палитра команд", "меню"]
+        ),
+        cmd!(
+            "Keyboard Map",
+            "Help",
+            Some("ctrl-?"),
+            ShowShortcuts,
+            ["shortcuts", "cheatsheet", "горячие клавиши"]
+        ),
+        cmd!(
+            "Open Welcome Guide",
+            "Help",
+            None,
+            OpenWelcome,
+            ["tutorial", "help", "учебник", "справка"]
         ),
     ];
     COMMANDS

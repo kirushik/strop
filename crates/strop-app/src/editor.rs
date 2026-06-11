@@ -60,7 +60,8 @@ actions!(
         OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
         ToggleHistory, TogglePalette, PaletteUp, PaletteDown, NewDocument, RenameDocument,
         RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection, CancelAiRun,
-        DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
+        DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy, ShowShortcuts,
+        OpenWelcome,
     ]
 );
 
@@ -215,6 +216,8 @@ pub struct Editor {
     palette_selected: usize,
     /// In-titlebar document rename (PLAN.md E2).
     doc_rename_input: Option<Entity<NoteInput>>,
+    /// The keyboard-map overlay (PLAN.md E4, ctrl-?).
+    shortcuts_open: bool,
     find_current: usize,
     /// Replace field (ctrl-h adds it beside find): Enter on it replaces
     /// the current match; the All button replaces every match (one undo).
@@ -676,6 +679,7 @@ impl Editor {
             palette_input: None,
             palette_selected: 0,
             doc_rename_input: None,
+            shortcuts_open: false,
             find_current: 0,
             replace_input: None,
             rename_input: None,
@@ -2687,9 +2691,130 @@ impl Editor {
     }
 
     fn escape_mode(&mut self, _: &EscapeMode, _: &mut Window, cx: &mut Context<Self>) {
+        if self.shortcuts_open {
+            self.shortcuts_open = false;
+            cx.notify();
+            return;
+        }
         if self.history_view.is_some() {
             self.exit_history(cx);
         }
+    }
+
+    fn show_shortcuts(&mut self, _: &ShowShortcuts, _: &mut Window, cx: &mut Context<Self>) {
+        self.shortcuts_open = !self.shortcuts_open;
+        cx.notify();
+    }
+
+    fn open_welcome(&mut self, _: &OpenWelcome, _: &mut Window, _: &mut Context<Self>) {
+        crate::files::open_welcome_window();
+    }
+
+    /// The keyboard map (GNOME's ctrl-? convention): every command from
+    /// the registry plus the text-editing baseline, at a glance. The
+    /// palette is for doing; this is for learning.
+    fn render_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut sections: Vec<(&'static str, Vec<(String, String)>)> = Vec::new();
+        for cmd in crate::commands::all() {
+            let keys = cmd.keys.map_or_else(|| "palette".to_owned(), |k| k.to_owned());
+            match sections.iter_mut().find(|(s, _)| *s == cmd.section) {
+                Some((_, rows)) => rows.push((cmd.label.to_owned(), keys)),
+                None => sections.push((cmd.section, vec![(cmd.label.to_owned(), keys)])),
+            }
+        }
+        sections.push((
+            "Text editing",
+            [
+                ("Move by word / paragraph", "ctrl-arrows"),
+                ("Select by word / paragraph", "ctrl-shift-arrows"),
+                ("Document start / end", "ctrl-home / ctrl-end"),
+                ("Select all", "ctrl-a"),
+                ("Copy / Cut / Paste", "ctrl-c / x / v"),
+                ("Markdown headings", "# ## ### + space"),
+                ("Escape any mode", "escape"),
+            ]
+            .into_iter()
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            .collect(),
+        ));
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x1A1A1830u32))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.shortcuts_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("shortcuts-panel")
+                    .w(px(700.))
+                    .max_h(px(560.))
+                    .overflow_y_scroll()
+                    .bg(rgb(0xFCFAF4))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .rounded(px(8.))
+                    .shadow_lg()
+                    .p(px(18.))
+                    .font_family("PT Serif")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .pb(px(10.))
+                            .flex()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_COLOR))
+                                    .child("Keyboard map"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child("esc closes · ctrl-shift-p runs any of these by name"),
+                            ),
+                    )
+                    .child(div().flex().flex_wrap().gap(px(16.)).children(
+                        sections.into_iter().map(|(section, rows)| {
+                            div()
+                                .w(px(320.))
+                                .child(
+                                    div()
+                                        .pt(px(6.))
+                                        .pb(px(3.))
+                                        .text_size(px(10.))
+                                        .text_color(rgb(MUTED_COLOR))
+                                        .child(section.to_uppercase()),
+                                )
+                                .children(rows.into_iter().map(|(label, keys)| {
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .gap(px(10.))
+                                        .py(px(1.))
+                                        .text_size(px(12.))
+                                        .child(div().text_color(rgb(TEXT_COLOR)).child(label))
+                                        .child(
+                                            div()
+                                                .text_color(rgb(MUTED_COLOR))
+                                                .text_size(px(11.))
+                                                .child(keys),
+                                        )
+                                }))
+                        }),
+                    )),
+            )
     }
 
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -5493,6 +5618,8 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::mode_developmental))
                     .on_action(cx.listener(Self::mode_line))
                     .on_action(cx.listener(Self::mode_copy))
+                    .on_action(cx.listener(Self::show_shortcuts))
+                    .on_action(cx.listener(Self::open_welcome))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -5556,10 +5683,12 @@ impl Render for Editor {
                 Some(strip) => d.child(strip),
                 None => d,
             })
-            // Last child = topmost: the palette covers everything below.
+            // Last children = topmost: the palette and the keyboard map
+            // cover everything below.
             .when(self.palette_input.is_some(), |d| {
                 d.child(self.render_palette(cx))
             })
+            .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
     }
 }
 
