@@ -254,8 +254,28 @@ section. Ordering: root-fix verification first, then highest-leverage.
   language different from the corpus language indexed out of bounds
   (per-language function-word vectors differ in size) — Baseline now
   exposes lang() and all assess() signatures use it.
-- [ ] **F3. Footnote completion** (DESIGN §2-footnotes): painted
-  superior marks, bidirectional jumps, zone-as-editor, stacking policy.
+- [x] **F3. Footnote completion** (shipped 2026-06-12, DESIGN
+  §2-footnotes): the in-text ref is a painted superior figure — the
+  carrier digit keeps its advance (caret, hit-testing, selection) but
+  inks transparent; paint() draws the number at 65% of the block size,
+  baseline raised 35% of the font size, accent ink, pill dropped (size
+  signals "footnote", color "interactive"; PT ships no sups, so we
+  paint our own with the list-marker machinery). Painted numbers
+  derive from ref order in the text — stored ids stay stable internal
+  labels (the Pandoc architecture); orphan defs take the following
+  numbers; insert mints max(label)+1 so a label is never reused after
+  a deletion. Bidirectional jumps: click a ref → caret at its def's
+  text start; click the def's "N." gutter or a zone row's marker →
+  caret just after the ref (geometry hit-test on the span's glyph band
+  — a caret placed *beside* the ref must not teleport). The zone is an
+  edit surface now: clicking row text lands the caret at the matching
+  offset in the def line (Word notes-pane niche; row bounds captured
+  by a canvas child, click x re-shaped against the row's own text).
+  Stacking policy: >3 visible refs → the 3 nearest the viewport center
+  + a muted "+N more" row. Rig: the smoke harness gained `click:X,Y`
+  (synthetic clicks through the full GPUI dispatch path, div listeners
+  included) and `fn-geo` (window-space click targets for refs, def
+  gutters, zone rows).
 - [ ] **F4. AI settings panel** (DESIGN §2-ai): form + test-call +
   /models picker; toml_edit writes; config file stays authoritative.
 - [ ] **F5. Structure & finishing layer** (DESIGN §1.6, §4): the beat

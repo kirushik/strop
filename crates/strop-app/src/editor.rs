@@ -20,8 +20,8 @@ use gpui::{
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextAlign, TextRun,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*,
-    px, relative, rgb, rgba, size,
+    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, canvas, div, fill, point,
+    prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
     Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus, SpanSet,
@@ -247,6 +247,11 @@ pub struct Editor {
     selection_popover: bool,
     /// Titlebar word count, recomputed on mutation — never per frame.
     word_count: usize,
+    /// Painted bounds of each footnote-zone row's text area (captured by a
+    /// canvas child at paint time), so a click on the mirror maps to the
+    /// same offset in the def line (DESIGN §2-footnotes, the Word
+    /// notes-pane behavior).
+    zone_row_bounds: HashMap<usize, Bounds<Pixels>>,
     last_frame: Option<TextFrame>,
 }
 
@@ -571,6 +576,11 @@ struct ParagraphLayout {
     bg: Option<gpui::Rgba>,
     quote_rule: bool,
     marker: Option<SharedString>,
+    /// Painted superior footnote figures (DESIGN §2-footnotes):
+    /// (paragraph-local byte offset of the invisible carrier, label).
+    fn_marks: Vec<(usize, SharedString)>,
+    /// The block's font size — superior figures scale from it.
+    font_size: Pixels,
     /// Decoded image for Image blocks, with its display size.
     image: Option<(Arc<RenderImage>, gpui::Size<Pixels>)>,
 }
@@ -749,6 +759,7 @@ impl Editor {
             voice_baseline: None,
             note_input: None,
             selection_popover: false,
+            zone_row_bounds: HashMap::new(),
             last_frame: None,
         }
     }
@@ -1228,13 +1239,24 @@ impl Editor {
     /// Insert a footnote: a ref atom at the cursor, a def block at the end,
     /// cursor lands in the def. (Two transactions; two undos remove it.)
     fn insert_footnote(&mut self, _: &InsertFootnote, _: &mut Window, cx: &mut Context<Self>) {
+        // Fresh internal label, Pandoc-style: never reused (counting defs
+        // collides after a deletion). The PAINTED number derives from ref
+        // order at paint time; the stored id is identity only.
         let n = self
             .doc
             .blocks()
             .kinds()
             .iter()
-            .filter(|k| matches!(k, BlockKind::FootnoteDef { .. }))
-            .count()
+            .filter_map(|k| match k {
+                BlockKind::FootnoteDef { id } => id.parse::<u64>().ok(),
+                _ => None,
+            })
+            .chain(self.doc.spans().spans().iter().filter_map(|s| match &s.attr {
+                InlineAttr::FootnoteRef(id) => id.parse::<u64>().ok(),
+                _ => None,
+            }))
+            .max()
+            .unwrap_or(0)
             + 1;
         let id = n.to_string();
         let sel = self.selected_range.clone();
@@ -1262,11 +1284,13 @@ impl Editor {
         cx.notify();
     }
 
-    /// Footnotes whose refs are visible in the viewport: (id, def text,
-    /// def byte offset). Derived from the last painted frame.
-    fn visible_footnotes(&self) -> Vec<(String, String, usize)> {
+    /// Footnotes whose refs are visible in the viewport, as zone rows,
+    /// plus the count of rows collapsed by the stacking policy (DESIGN
+    /// §2-footnotes: all up to 3, then the 3 nearest the viewport center
+    /// and a "+N more" row). Derived from the last painted frame.
+    fn visible_footnotes(&self) -> (Vec<ZoneNote>, usize) {
         let Some(frame) = self.last_frame.as_ref() else {
-            return Vec::new();
+            return (Vec::new(), 0);
         };
         let top = frame.scroll_top;
         let bottom = top + frame.bounds.size.height;
@@ -1283,11 +1307,25 @@ impl Editor {
         let len = self.doc.len_bytes();
         let (lo, hi) = (lo.min(len), hi.min(len));
         if lo >= hi {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let rope = self.doc.rope();
         let (clo, chi) = (rope.byte_to_char(lo), rope.byte_to_char(hi));
-        let mut out: Vec<(String, String, usize)> = Vec::new();
+        let numbers = {
+            let refs: Vec<(usize, &str)> = self
+                .doc
+                .spans()
+                .spans()
+                .iter()
+                .filter_map(|s| match &s.attr {
+                    InlineAttr::FootnoteRef(id) => Some((s.range.start, id.as_str())),
+                    _ => None,
+                })
+                .collect();
+            footnote_numbers(&refs, self.doc.blocks().kinds())
+        };
+        // (row, byte offset of the ref's start — for ordering/stacking)
+        let mut out: Vec<(ZoneNote, usize)> = Vec::new();
         for span in self.doc.spans().spans() {
             let InlineAttr::FootnoteRef(id) = &span.attr else {
                 continue;
@@ -1295,7 +1333,11 @@ impl Editor {
             if span.range.start >= chi || span.range.end <= clo {
                 continue;
             }
-            if out.iter().any(|(seen, _, _)| seen == id) {
+            let no = match numbers.get(id) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if out.iter().any(|(seen, _)| seen.no == no) {
                 continue;
             }
             let Some(block) = self
@@ -1313,13 +1355,50 @@ impl Editor {
             } else {
                 rope.len_bytes()
             };
-            let mut def = self.doc.slice_bytes(start..end);
-            if def.chars().count() > 110 {
-                def = def.chars().take(110).collect::<String>() + "…";
-            }
-            out.push((id.clone(), def, start));
+            let full = self.doc.slice_bytes(start..end);
+            let (def, def_len) = if full.chars().count() > 110 {
+                let cut: String = full.chars().take(110).collect();
+                let cut_len = cut.len();
+                (cut + "…", cut_len)
+            } else {
+                let full_len = full.len();
+                (full, full_len)
+            };
+            out.push((
+                ZoneNote {
+                    no,
+                    def,
+                    def_start: start,
+                    def_len,
+                    ref_byte: rope.char_to_byte(span.range.end),
+                },
+                rope.char_to_byte(span.range.start),
+            ));
         }
-        out
+        // Reading order, whatever order the span set stores.
+        out.sort_by_key(|(_, ref_start)| *ref_start);
+        let total = out.len();
+        if total > 3 {
+            // Keep the 3 nearest the viewport center; reading order stays.
+            let center = f32::from(top + frame.bounds.size.height / 2.);
+            let mut by_dist: Vec<usize> = (0..total).collect();
+            by_dist.sort_by(|&a, &b| {
+                let d = |i: usize| {
+                    frame
+                        .position_of(out[i].1, false)
+                        .map_or(f32::MAX, |p| (f32::from(p.y) - center).abs())
+                };
+                d(a).total_cmp(&d(b))
+            });
+            let keep: HashSet<usize> = by_dist.into_iter().take(3).collect();
+            out = out
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| keep.contains(i))
+                .map(|(_, n)| n)
+                .collect();
+        }
+        (out.into_iter().map(|(n, _)| n).collect(), total.saturating_sub(3))
     }
 
     /// One document, one window, one process: opening spawns a sibling
@@ -3342,6 +3421,74 @@ impl Editor {
         (ix.min(self.doc.len_bytes()), aff)
     }
 
+    /// Footnote click routing (DESIGN §2-footnotes): a point on an in-text
+    /// ref resolves to the start of its def's text; a point in a footnote
+    /// def's marker gutter (the painted "N.") resolves to just after the
+    /// in-text ref. None = not a footnote target, place the caret normally.
+    fn footnote_jump_target(&self, position: Point<Pixels>) -> Option<usize> {
+        let frame = self.last_frame.as_ref()?;
+        let p = frame.doc_point(position);
+        let par_ix = frame
+            .paragraphs
+            .iter()
+            .position(|par| p.y >= par.top && p.y < par.top + par.height)?;
+        let par = &frame.paragraphs[par_ix];
+        // Stale-frame guard (compositor throttling): offsets beyond the
+        // live rope never leave this function.
+        if par.range.end > self.doc.len_bytes() {
+            return None;
+        }
+        let rope = self.doc.rope();
+        if p.x < par.indent {
+            // The def's marker gutter: jump back to the in-text ref.
+            if let Some(BlockKind::FootnoteDef { id }) = self.doc.blocks().kinds().get(par_ix) {
+                let span = self
+                    .doc
+                    .spans()
+                    .spans()
+                    .iter()
+                    .filter(|s| matches!(&s.attr, InlineAttr::FootnoteRef(d) if d == id))
+                    .min_by_key(|s| s.range.start)?;
+                return Some(rope.char_to_byte(span.range.end));
+            }
+            return None;
+        }
+        // A ref's carrier: jump forward to the def. Hit-test the span's
+        // glyph band — a caret landing *next to* the ref must not teleport.
+        let line_ix = (((p.y - par.top) / par.line_height) as usize).min(par.line_count() - 1);
+        for s in self.doc.spans().spans() {
+            let InlineAttr::FootnoteRef(id) = &s.attr else {
+                continue;
+            };
+            let (bs, be) = (
+                rope.char_to_byte(s.range.start),
+                rope.char_to_byte(s.range.end),
+            );
+            if bs < par.range.start || be > par.range.end {
+                continue;
+            }
+            let line = par.line_of(bs - par.range.start, true);
+            if line != line_ix {
+                continue;
+            }
+            let x0 = par.x_for(bs - par.range.start, line);
+            let x1 = par.x_for(be - par.range.start, line);
+            if p.x < x0 || p.x >= x1 {
+                continue;
+            }
+            let def = self
+                .doc
+                .blocks()
+                .kinds()
+                .iter()
+                .position(|k| matches!(k, BlockKind::FootnoteDef { id: d } if d == id))?;
+            // The def line's start — the painted "N." lives in the gutter,
+            // so this IS "after the marker".
+            return Some(rope.line_to_byte(def));
+        }
+        None
+    }
+
     /// Extend the drag selection toward a window point, clamped to the
     /// viewport so dragging past an edge selects to the edge (the autoscroll
     /// tick brings the rest into reach).
@@ -3393,6 +3540,19 @@ impl Editor {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Footnote jumps (DESIGN §2-footnotes): a plain click on a ref's
+        // mark goes to its def; a click on a def's "N." gutter goes back
+        // to the ref. Never starts a drag selection.
+        if ev.click_count == 1
+            && !ev.modifiers.shift
+            && self.history_view.is_none()
+            && let Some(target) = self.footnote_jump_target(ev.position)
+        {
+            self.goal_x = None;
+            self.selection_popover = false;
+            self.set_cursor(target, false, cx);
+            return;
+        }
         self.goal_x = None;
         self.is_selecting = true;
         self.selection_popover = false;
@@ -3484,6 +3644,69 @@ impl Editor {
         }
         self.drag_point = Some(ev.position);
         self.drag_extend_to(ev.position, cx);
+    }
+
+    /// Footnote click targets for the smoke harness, in window coordinates:
+    /// every in-text ref mark, every def-marker gutter, every zone row's
+    /// text origin (marker sits 24px left of it).
+    pub fn debug_footnotes(&self) -> String {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return "no-frame".into();
+        };
+        let rope = self.doc.rope();
+        let origin = frame.bounds.origin;
+        let mut out = String::new();
+        for s in self.doc.spans().spans() {
+            let InlineAttr::FootnoteRef(id) = &s.attr else {
+                continue;
+            };
+            let (bs, be) = (
+                rope.char_to_byte(s.range.start),
+                rope.char_to_byte(s.range.end),
+            );
+            let Some(par) = frame
+                .paragraphs
+                .iter()
+                .find(|p| p.range.start <= bs && be <= p.range.end)
+            else {
+                continue;
+            };
+            let line = par.line_of(bs - par.range.start, true);
+            let x0 = par.x_for(bs - par.range.start, line);
+            let x1 = par.x_for(be - par.range.start, line);
+            let y = par.top + par.line_height * (line as f32) + par.line_height / 2.
+                - frame.scroll_top;
+            out += &format!(
+                "ref {id} @{:.0},{:.0}\n",
+                f32::from(origin.x + (x0 + x1) / 2.),
+                f32::from(origin.y + y)
+            );
+        }
+        for (ix, kind) in self.doc.blocks().kinds().iter().enumerate() {
+            let BlockKind::FootnoteDef { id } = kind else {
+                continue;
+            };
+            let Some(par) = frame.paragraphs.get(ix) else {
+                continue;
+            };
+            let y = par.top + par.line_height / 2. - frame.scroll_top;
+            out += &format!(
+                "def {id} @{:.0},{:.0}\n",
+                f32::from(origin.x + par.indent / 2.),
+                f32::from(origin.y + y)
+            );
+        }
+        let mut rows: Vec<_> = self.zone_row_bounds.iter().collect();
+        rows.sort_by_key(|(ix, _)| **ix);
+        for (ix, b) in rows {
+            out += &format!(
+                "zone {ix} @{:.0},{:.0} w={:.0}\n",
+                f32::from(b.origin.x),
+                f32::from(b.center().y),
+                f32::from(b.size.width)
+            );
+        }
+        out
     }
 
     /// Cursor geometry for the smoke harness: byte offset, paragraph index,
@@ -3868,6 +4091,28 @@ fn block_style(kind: &BlockKind) -> BlockStyle {
     }
 }
 
+/// Painted footnote numbers (DESIGN §2-footnotes): the Nth distinct ref in
+/// text order paints as N — numbering derives from ref order while stored
+/// ids stay stable internal labels, the universal Word/Pandoc architecture.
+/// Defs whose ref is gone get the following numbers in block order, so an
+/// orphaned def keeps a painted identity instead of going blank.
+fn footnote_numbers(refs: &[(usize, &str)], kinds: &[BlockKind]) -> HashMap<String, usize> {
+    let mut ordered: Vec<(usize, &str)> = refs.to_vec();
+    ordered.sort_unstable();
+    let mut map = HashMap::new();
+    for (_, id) in ordered {
+        let next = map.len() + 1;
+        map.entry(id.to_owned()).or_insert(next);
+    }
+    for kind in kinds {
+        if let BlockKind::FootnoteDef { id } = kind {
+            let next = map.len() + 1;
+            map.entry(id.clone()).or_insert(next);
+        }
+    }
+    map
+}
+
 /// Alpha source-over compositing, so selection never hides content
 /// backgrounds (highlight, code — and later annotation markings): partial
 /// overlaps already split into their own runs by the cut logic.
@@ -3978,11 +4223,12 @@ fn runs_for_paragraph(
                         });
                     }
                     InlineAttr::FootnoteRef(_) => {
-                        // Findable, not invisible: accent ink + a quiet
-                        // pill. (True superscript needs per-run font sizes;
-                        // queued for the design pass.)
-                        color = rgb(LINK_COLOR).into();
-                        content_bg.get_or_insert(rgba(CODE_BG_COLOR));
+                        // The carrier digits keep their advance (caret,
+                        // hit-testing) but paint transparent; paint() draws
+                        // a superior figure over them (DESIGN §2-footnotes
+                        // — PT ships no superscripts, so we paint our own,
+                        // same machinery as list markers).
+                        color = gpui::transparent_black();
                     }
                 }
             }
@@ -4187,6 +4433,18 @@ impl Element for EditorElement {
         } else {
             editor.doc.blocks().kinds().to_vec()
         };
+        // Painted footnote numbers, derived from ref order in this frame's
+        // text (preview or live) — stored ids stay internal labels.
+        let fn_numbers = {
+            let refs: Vec<(usize, &str)> = spans_bytes
+                .iter()
+                .filter_map(|(r, attr)| match attr {
+                    InlineAttr::FootnoteRef(id) => Some((r.start, id.as_str())),
+                    _ => None,
+                })
+                .collect();
+            footnote_numbers(&refs, &kinds)
+        };
         let find_matches: Vec<Range<usize>> = if in_history {
             diff_inserts.clone() // inserts reuse the sage tint
         } else {
@@ -4242,10 +4500,15 @@ impl Element for EditorElement {
                 }
                 // The footnote's own number, visible while editing the
                 // definition (the bottom zone only shows when the REF is
-                // on-screen — the def line must carry its identity).
+                // on-screen — the def line must carry its identity). The
+                // painted number follows ref order, not the stored id.
                 BlockKind::FootnoteDef { id } => {
                     ordered_no = 0;
-                    Some(SharedString::from(format!("{id}.")))
+                    let label = fn_numbers
+                        .get(id)
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| id.clone());
+                    Some(SharedString::from(format!("{label}.")))
                 }
                 _ => {
                     ordered_no = 0;
@@ -4290,6 +4553,29 @@ impl Element for EditorElement {
                 .iter()
                 .filter(|r| r.start < range.end && range.start < r.end)
                 .cloned()
+                .collect();
+            // Superior figures to paint over the invisible carriers —
+            // skipped for refs inside history-diff deletions, where the
+            // carrier re-inks (muted, struck) and a painted number on top
+            // would double up.
+            let fn_marks: Vec<(usize, SharedString)> = par_spans
+                .iter()
+                .filter_map(|(r, attr)| {
+                    let InlineAttr::FootnoteRef(id) = attr else {
+                        return None;
+                    };
+                    if r.start < range.start || r.end > range.end {
+                        return None;
+                    }
+                    if par_dels.iter().any(|d| d.start < r.end && r.start < d.end) {
+                        return None;
+                    }
+                    let label = fn_numbers
+                        .get(id)
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| id.clone());
+                    Some((r.start - range.start, SharedString::from(label)))
+                })
                 .collect();
             let runs = runs_for_paragraph(
                 &range,
@@ -4369,6 +4655,8 @@ impl Element for EditorElement {
                 bg: bstyle.bg,
                 quote_rule: bstyle.quote_rule,
                 marker,
+                fn_marks,
+                font_size: bstyle.size,
                 image,
             });
             top += height + paragraph_gap;
@@ -4521,6 +4809,48 @@ impl Element for EditorElement {
             par.line
                 .paint(origin, par.line_height, TextAlign::Left, None, window, cx)
                 .expect("paint failed");
+            // Footnote refs as painted superior figures (DESIGN
+            // §2-footnotes): ~65% of the block size, baseline raised ~35%
+            // of the font size so the top lands near cap height, accent
+            // ink — size signals "footnote", color "interactive". The
+            // transparent carrier under it keeps the advance.
+            for (local, label) in &par.fn_marks {
+                let line_ix = par.line_of(*local, true);
+                let x = par.x_for(*local, line_ix);
+                let mark_size = par.font_size * 0.65;
+                let run = TextRun {
+                    len: label.len(),
+                    font: gpui::font("PT Serif"),
+                    color: rgb(LINK_COLOR).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped =
+                    window
+                        .text_system()
+                        .shape_line(label.clone(), mark_size, &[run], None);
+                // paint() centers ascent+descent inside line_height;
+                // cancel that and put the small baseline 35% of the font
+                // size above the body baseline.
+                let body = &par.line.unwrapped_layout;
+                let body_baseline =
+                    (par.line_height - body.ascent - body.descent) / 2. + body.ascent;
+                let small_baseline =
+                    (par.line_height - shaped.ascent - shaped.descent) / 2. + shaped.ascent;
+                let dy = body_baseline - small_baseline - par.font_size * 0.35;
+                let line_y = y + par.line_height * (line_ix as f32);
+                shaped
+                    .paint(
+                        bounds.origin + point(x, line_y + dy),
+                        par.line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .ok();
+            }
         }
 
         if focus_handle.is_focused(window) {
@@ -5409,11 +5739,47 @@ impl Editor {
             )
     }
 
+    /// Map a window-space x on a zone row's text to a byte offset within
+    /// the def mirror, by re-shaping the row's exact text at its rendered
+    /// font (PT Serif 14px) against the bounds captured at paint time.
+    fn zone_def_offset(
+        &self,
+        row: usize,
+        text: &str,
+        def_len: usize,
+        x: Pixels,
+        window: &mut Window,
+    ) -> Option<usize> {
+        let bounds = self.zone_row_bounds.get(&row)?;
+        let run = TextRun {
+            len: text.len(),
+            font: gpui::font("PT Serif"),
+            color: rgb(MUTED_COLOR).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window.text_system().shape_line(
+            SharedString::from(text.to_owned()),
+            px(14.),
+            &[run],
+            None,
+        );
+        // Clamp into the real def: the trailing "…" is not document text.
+        Some(shaped.closest_index_for_x(x - bounds.origin.x).min(def_len))
+    }
+
+    /// The bottom zone (DESIGN §2-footnotes): a read-only mirror of the
+    /// defs whose refs are on-screen. Click the row's text = caret lands
+    /// at that offset in the def line (the Word notes-pane niche); click
+    /// the row's "N." = jump back to the in-text ref.
     fn render_footnote_zone(
         &self,
-        footnotes: Vec<(String, String, usize)>,
+        footnotes: Vec<ZoneNote>,
+        hidden: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let handle = cx.entity();
         div()
             .id("footnote-zone")
             .absolute()
@@ -5441,27 +5807,110 @@ impl Editor {
                     .font_family("PT Serif")
                     .text_size(px(14.))
                     .text_color(rgb(MUTED_COLOR))
-                    .children(footnotes.into_iter().enumerate().map(
-                        |(ix, (id, def, target))| {
+                    .children(footnotes.into_iter().enumerate().map(|(ix, note)| {
+                        let handle = handle.clone();
+                        let ZoneNote {
+                            no,
+                            def,
+                            def_start,
+                            def_len,
+                            ref_byte,
+                        } = note;
+                        let def_text = def.clone();
+                        div()
+                            .id(ix)
+                            .px(px(4.))
+                            .rounded(px(4.))
+                            .flex()
+                            .items_start()
+                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                            .child(
+                                // The marker mirrors the def line's painted
+                                // "N." — clicking it jumps back to the ref.
+                                div()
+                                    .w(px(24.))
+                                    .flex_shrink_0()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |editor, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                editor.goal_x = None;
+                                                editor.set_cursor(ref_byte, false, cx);
+                                            },
+                                        ),
+                                    )
+                                    .child(format!("{no}.")),
+                            )
+                            .child(
+                                // The text is the edit surface: the click
+                                // lands the caret at the matching offset in
+                                // the def line, which this row mirrors.
+                                div()
+                                    .flex_1()
+                                    .relative()
+                                    .cursor(CursorStyle::IBeam)
+                                    .child(
+                                        canvas(
+                                            move |bounds, _, cx| {
+                                                handle.update(cx, |editor, _| {
+                                                    editor.zone_row_bounds.insert(ix, bounds);
+                                                });
+                                            },
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .size_full(),
+                                    )
+                                    .child(def)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |editor, ev: &MouseDownEvent, window, cx| {
+                                                cx.stop_propagation();
+                                                let off = editor
+                                                    .zone_def_offset(
+                                                        ix,
+                                                        &def_text,
+                                                        def_len,
+                                                        ev.position.x,
+                                                        window,
+                                                    )
+                                                    .unwrap_or(0);
+                                                editor.goal_x = None;
+                                                editor.set_cursor(def_start + off, false, cx);
+                                            },
+                                        ),
+                                    ),
+                            )
+                    }))
+                    .when(hidden > 0, |d| {
+                        // Stacking policy: the rest collapse to a count.
+                        d.child(
                             div()
-                                .id(ix)
                                 .px(px(4.))
-                                .rounded(px(4.))
-                                .cursor(CursorStyle::PointingHand)
-                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        editor.goal_x = None;
-                                        editor.set_cursor(target, false, cx);
-                                    }),
-                                )
-                                .child(format!("{id}. {def}"))
-                        },
-                    )),
+                                .opacity(0.7)
+                                .child(format!("+{hidden} more")),
+                        )
+                    }),
             )
     }
+}
+
+/// One bottom-zone row (DESIGN §2-footnotes): painted number, the def's
+/// text mirror, and the offsets its two click targets resolve to.
+struct ZoneNote {
+    /// Painted number (ref order), not the stored id.
+    no: usize,
+    /// Mirrored def text, truncated for the row.
+    def: String,
+    /// Byte offset of the def text's start — the edit-surface target.
+    def_start: usize,
+    /// Byte length of the def prefix the mirror shows (truncation-aware).
+    def_len: usize,
+    /// Just after the in-text ref — the marker's jump-back target.
+    ref_byte: usize,
 }
 
 /// One rewind-list entry, materialized on entering history mode.
@@ -6154,13 +6603,13 @@ impl Render for Editor {
             .map(|d| {
                 // The footnote zone keys off live-doc offsets; in history
                 // the canvas shows the merged diff, so it stands down.
-                let footnotes = if self.history_view.is_some() {
-                    Vec::new()
+                let (footnotes, hidden) = if self.history_view.is_some() {
+                    (Vec::new(), 0)
                 } else {
                     self.visible_footnotes()
                 };
                 d.when(!footnotes.is_empty(), |d| {
-                    d.child(self.render_footnote_zone(footnotes, cx))
+                    d.child(self.render_footnote_zone(footnotes, hidden, cx))
                 })
             })
             .map(|d| {
@@ -6296,6 +6745,38 @@ mod tests {
         // A leading auto run starts at index 0.
         let entries = vec![e(false), e(false), e(true)];
         assert_eq!(auto_group_start(&entries, 1), 0);
+    }
+
+    #[test]
+    fn footnote_numbers_follow_ref_order_not_stored_ids() {
+        // Stored ids "2" and "1" appear in reverse order in the text; the
+        // painted numbers follow text order (DESIGN §2-footnotes). The
+        // orphan def "9" (its ref deleted) gets the next number.
+        let refs = vec![(40usize, "1"), (10usize, "2")];
+        let kinds = vec![
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "1".into() },
+            BlockKind::FootnoteDef { id: "2".into() },
+            BlockKind::FootnoteDef { id: "9".into() },
+        ];
+        let map = footnote_numbers(&refs, &kinds);
+        assert_eq!(map.get("2"), Some(&1));
+        assert_eq!(map.get("1"), Some(&2));
+        assert_eq!(map.get("9"), Some(&3));
+    }
+
+    #[test]
+    fn footnote_ref_carrier_paints_transparent_without_pill() {
+        // The carrier digit keeps its advance but must not ink: the
+        // superior figure is painted over it in the paint phase.
+        let par = 0..5;
+        let spans = vec![(2..3, InlineAttr::FootnoteRef("1".into()))];
+        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &[], &[], &base());
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].color.a, 0.);
+        assert!(runs[1].background_color.is_none());
+        // Neighbors stay inked.
+        assert_ne!(runs[0].color.a, 0.);
     }
 
     #[test]

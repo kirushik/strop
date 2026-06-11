@@ -5,7 +5,10 @@
 
 use std::time::Duration;
 
-use gpui::{AnyWindowHandle, App, AppContext as _, Keystroke, WindowHandle};
+use gpui::{
+    AnyWindowHandle, App, AppContext as _, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseUpEvent, PlatformInput, WindowHandle, point, px,
+};
 
 use crate::editor::Editor;
 
@@ -26,6 +29,53 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
         eprintln!("SMOKE start: {state}");
 
         for key in script.split_whitespace() {
+            // `fn-geo` prints footnote click targets; `click:X,Y` synthesizes
+            // a full left click (window coords) through GPUI dispatch — the
+            // same path real mouse input takes, div listeners included.
+            if key == "fn-geo" {
+                let geo = window
+                    .update(cx, |editor, _, _| editor.debug_footnotes())
+                    .unwrap_or_default();
+                eprintln!("SMOKE fn-geo:\n{geo}");
+                continue;
+            }
+            if let Some(pos) = key.strip_prefix("click:") {
+                let (x, y) = pos.split_once(',').expect("bad click in STROP_SMOKE");
+                let position = point(
+                    px(x.parse::<f32>().expect("bad click x")),
+                    px(y.parse::<f32>().expect("bad click y")),
+                );
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }),
+                        cx,
+                    );
+                    window.dispatch_event(
+                        PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                let state = window
+                    .update(cx, |editor, _, _| editor.debug_cursor())
+                    .unwrap_or_default();
+                eprintln!("SMOKE {key}: {state}");
+                continue;
+            }
             let keystroke = Keystroke::parse(key).expect("bad keystroke in STROP_SMOKE");
             cx.update_window(any, |_, window, cx| {
                 window.dispatch_keystroke(keystroke, cx);
