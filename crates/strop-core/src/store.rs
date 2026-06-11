@@ -339,8 +339,40 @@ impl Store {
             }
             Err(e) => eprintln!("strop: encode history: {e}"),
         }
+        self.collect_unreachable_assets(blocks, history);
         self.doc.commit();
         self.save()
+    }
+
+    /// Save-time asset GC: an asset survives if the current document, any
+    /// persisted undo/redo state, or any checkpoint's document still
+    /// references it. (Deleting an image block orphans its bytes only once
+    /// every survivor path has rotated away.)
+    fn collect_unreachable_assets(&self, blocks: &BlockMap, history: &History) {
+        let assets = self.doc.get_map(ASSETS_CONTAINER);
+        if assets.is_empty() {
+            return;
+        }
+        let mut reachable: std::collections::HashSet<String> = blocks
+            .asset_refs()
+            .chain(history.asset_refs())
+            .map(str::to_owned)
+            .collect();
+        for cp in self.checkpoints() {
+            if let Some((_, _, cp_blocks)) = self.state_at(&cp.frontiers) {
+                reachable.extend(cp_blocks.asset_refs().map(str::to_owned));
+            }
+        }
+        let stored: Vec<String> = assets.keys().map(|k| k.to_string()).collect();
+        for id in stored {
+            if !reachable.contains(&id) {
+                if let Err(e) = assets.delete(&id) {
+                    eprintln!("strop: gc asset {id}: {e}");
+                } else {
+                    eprintln!("strop: gc'd unreferenced asset {id}");
+                }
+            }
+        }
     }
 
     fn rebuild_marks(&self, spans: &SpanSet) {
@@ -516,6 +548,36 @@ mod tests {
         let (store2, _) = Store::open(&path).unwrap();
         assert_eq!(store2.get_asset(&id), Some(bytes));
         assert_eq!(store2.get_asset("asset:missing"), None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn asset_gc_keeps_reachable_drops_orphans() {
+        use crate::document::BlockKind;
+        let path = temp_path("gc");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("картинка\n");
+        let kept_id = store.put_asset(vec![1, 2, 3], "png");
+        let orphan_id = store.put_asset(vec![9, 9, 9], "png");
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Image {
+                src: kept_id.clone(),
+                alt: String::new(),
+                caption: String::new(),
+            },
+            BlockKind::Paragraph,
+        ]);
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &blocks,
+                &History::default(),
+                &Annotations::default(),
+            )
+            .unwrap();
+        assert!(store.get_asset(&kept_id).is_some(), "referenced asset kept");
+        assert!(store.get_asset(&orphan_id).is_none(), "orphan collected");
         let _ = fs::remove_file(&path);
     }
 

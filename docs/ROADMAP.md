@@ -125,7 +125,8 @@ unless they'd be expensive to reverse.
 - [x] D1. Find (ctrl-f): live sage-tinted matches (compositing with
       everything else), Enter cycles with wraparound + count label,
       Escape returns to the text, seeds from the selection.
-      Case-insensitive search backlogged.
+      Case-insensitive matching added in the backlog round (char-fold,
+      exact for RU/EN).
 - [x] D2. Latency pass, by measurement (STROP_PERF=1): release prepaint
       of a 59k-char / 121-block document = 0.4-0.9ms — inside the
       8.3ms/120Hz budget; GPUI's frame-to-frame LineLayoutCache already
@@ -140,12 +141,11 @@ unless they'd be expensive to reverse.
 
 ## Backlog (researched properly, not squeezed in)
 
-- **Asset GC**: deleting an image block orphans its asset in the file
-  (undo/history keep it reachable); needs a reachability sweep at save
-  or checkpoint-compaction time.
-- **Markdown export of assets**: image blocks export as
-  `![alt](asset:...)` ids; a real export should write `doc.assets/` files
-  with relative links (document-model §6).
+- [x] **Asset GC** (2026-06-11): save-time reachability sweep — an asset
+  survives if the current blocks, any persisted undo/redo state, or any
+  checkpoint still references it; otherwise deleted (tested).
+- [x] **Markdown export of assets** (2026-06-11): ctrl-shift-e writes
+  `<stem>.assets/<hash>.<ext>` files and rewrites links relative.
 - **fast_image_resize**: adopt (SIMD, 10-30x) if import latency on large
   photos annoys; image-crate resampler is scalar.
 - **Image UX**: selection/deletion affordances on image blocks, alt/caption

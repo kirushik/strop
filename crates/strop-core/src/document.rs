@@ -111,6 +111,14 @@ impl BlockMap {
         }
     }
 
+    /// Asset ids referenced by Image blocks (for the save-time GC sweep).
+    pub fn asset_refs<'a>(&'a self) -> impl Iterator<Item = &'a str> + 'a {
+        self.kinds.iter().filter_map(|k| match k {
+            BlockKind::Image { src, .. } => Some(src.as_str()),
+            _ => None,
+        })
+    }
+
     /// Repair after a text edit. `block` is the block containing the edit
     /// start (pre-edit), `merged` how many newlines the edit deleted,
     /// `splits` how many it inserted. Merges keep the first block's kind;
@@ -711,6 +719,16 @@ pub struct History {
     redo: Vec<Transaction>,
     undo_states: Vec<(SpanSet, BlockMap, Annotations)>,
     redo_states: Vec<(SpanSet, BlockMap, Annotations)>,
+}
+
+impl History {
+    /// Asset ids any undo/redo state could resurrect (GC must keep them).
+    pub fn asset_refs(&self) -> impl Iterator<Item = &str> {
+        self.undo_states
+            .iter()
+            .chain(self.redo_states.iter())
+            .flat_map(|(_, blocks, _)| blocks.asset_refs())
+    }
 }
 
 #[cfg(test)]

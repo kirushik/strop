@@ -714,12 +714,41 @@ impl Editor {
             eprintln!("strop: no document file to export next to");
             return;
         };
-        let md = strop_core::markdown::to_markdown(
+        let mut md = strop_core::markdown::to_markdown(
             &self.doc.text(),
             self.doc.spans(),
             self.doc.blocks(),
         );
         let path = store.path().with_extension("md");
+        // Materialize in-file assets as a sidecar dir with relative links
+        // (document-model §6).
+        let asset_ids: Vec<String> = self
+            .doc
+            .blocks()
+            .asset_refs()
+            .map(str::to_owned)
+            .collect();
+        if !asset_ids.is_empty() {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("doc")
+                .to_owned();
+            let dir = path.with_file_name(format!("{stem}.assets"));
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("strop: export assets dir: {e}");
+            } else {
+                for id in asset_ids {
+                    let Some(bytes) = store.get_asset(&id) else { continue };
+                    let file = id.trim_start_matches("asset:").to_owned();
+                    let rel = format!("{stem}.assets/{file}");
+                    if let Err(e) = std::fs::write(dir.join(&file), bytes) {
+                        eprintln!("strop: export asset {file}: {e}");
+                    }
+                    md = md.replace(&format!("]({id})"), &format!("]({rel})"));
+                }
+            }
+        }
         match std::fs::write(&path, md) {
             Ok(()) => eprintln!("strop: exported {}", path.display()),
             Err(e) => eprintln!("strop: export failed: {e}"),
@@ -1070,19 +1099,42 @@ impl Editor {
         cx.notify();
     }
 
+    /// Case-insensitive (first-lowercase-char folding — exact for RU/EN,
+    /// approximate for ß-class expansions) match positions in byte ranges.
     fn find_matches(&self, query: &str) -> Vec<Range<usize>> {
         if query.is_empty() {
             return Vec::new();
         }
         let text = self.doc.text();
+        let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+        let needle: Vec<char> = query.chars().map(fold).collect();
+        let hay: Vec<(usize, char)> = text
+            .char_indices()
+            .map(|(b, c)| (b, fold(c)))
+            .collect();
         let mut out = Vec::new();
-        let mut from = 0;
-        while let Some(found) = text[from..].find(query) {
-            let start = from + found;
-            out.push(start..start + query.len());
-            from = start + query.len().max(1);
-            if out.len() >= 500 {
-                break; // enough; this is a prose editor, not grep
+        if needle.len() > hay.len() {
+            return out;
+        }
+        let mut i = 0;
+        while i + needle.len() <= hay.len() {
+            if hay[i..i + needle.len()]
+                .iter()
+                .map(|(_, c)| *c)
+                .eq(needle.iter().copied())
+            {
+                let start = hay[i].0;
+                let end = hay
+                    .get(i + needle.len())
+                    .map(|(b, _)| *b)
+                    .unwrap_or(text.len());
+                out.push(start..end);
+                i += needle.len();
+                if out.len() >= 500 {
+                    break;
+                }
+            } else {
+                i += 1;
             }
         }
         out
