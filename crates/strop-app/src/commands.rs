@@ -14,7 +14,7 @@ use crate::editor::{
     RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode, ToggleCodeBlock,
     ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList, TogglePalette,
-    ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
+    TogglePopover, ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
 };
 
 pub struct Command {
@@ -120,9 +120,18 @@ pub fn all() -> &'static [Command] {
             ["marker", "выделить маркером"]
         ),
         cmd!("Toggle Inline Code", "Format", Some("ctrl-e"), ToggleCode, ["mono", "код"]),
-        cmd!("Heading 1", "Structure", Some("ctrl-alt-1"), Heading1, ["title", "заголовок"]),
-        cmd!("Heading 2", "Structure", Some("ctrl-alt-2"), Heading2, ["заголовок"]),
-        cmd!("Heading 3", "Structure", Some("ctrl-alt-3"), Heading3, ["заголовок"]),
+        cmd!(
+            "Format Selection…",
+            "Format",
+            Some("ctrl-."),
+            TogglePopover,
+            ["popover", "toolbar", "формат"]
+        ),
+        // ctrl-1..3 is the promoted chord (iA/Bear/Typora convention);
+        // ctrl-alt-1..3 stay bound as silent aliases in bind_keys.
+        cmd!("Heading 1", "Structure", Some("ctrl-1"), Heading1, ["title", "заголовок"]),
+        cmd!("Heading 2", "Structure", Some("ctrl-2"), Heading2, ["заголовок"]),
+        cmd!("Heading 3", "Structure", Some("ctrl-3"), Heading3, ["заголовок"]),
         cmd!(
             "Toggle Blockquote",
             "Structure",

@@ -219,10 +219,22 @@ section. Ordering: root-fix verification first, then highest-leverage.
   warm-up once; ExternalPaths clipboard paste deliberately ignored.
   REMAINING VERIFICATION: Kirill's eyes on the corrupted screens
   (footnote line, headings) — raster output can't be asserted headless.
-- [ ] **F1. Titlebar diet + selection popover** (DESIGN §2-toolbar):
-  strip B I U S H {} from chrome; word count joins the titlebar;
-  selection popover (in-surface overlay, mouse-up, keyboard-summonable)
-  with B I S {} H1/H2; ctrl-1..3 promoted, ctrl-alt-1..3 silent.
+- [x] **F1. Titlebar diet + selection popover** (shipped 2026-06-11,
+  DESIGN §2-toolbar): persistent B I U S H {} stripped from the titlebar
+  (zero category precedent across the seven surveyed minimal editors);
+  final bar = title · live word count (cached usize, recomputed in
+  sync_mutations — never per frame) · history ring · hamburger · window
+  controls. Selection popover: in-surface GPUI overlay (never an
+  xdg_popup), B I S {} + H1 H2, shown on mouse-up over a non-empty
+  selection, summonable via ctrl-. ("Format Selection…" in the registry,
+  the ARIA-toolbar keyboard path), anchored above the selection start
+  (below when the titlebar is in the way; clamped to window edges),
+  dismissed by mousedown/typing/scroll/escape, mounted after the canvas
+  and before the palette in the overlay chain. ctrl-1..3 promoted in the
+  registry (palette + keyboard map show them); ctrl-alt-1..3 stay as
+  silent literal aliases in bind_keys. Rig note: shot.sh now captures
+  twice — unfocused XWayland surfaces present stale frames on the first
+  grab.
 - [ ] **F2. History side panel** (DESIGN §2-history): push panel, mode
   banner, two-tier list (autos collapsed between named), drift glyph +
   word delta per row, segmented vs-toggle, dropdown retired.

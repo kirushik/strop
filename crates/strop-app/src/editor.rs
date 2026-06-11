@@ -58,10 +58,10 @@ actions!(
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
         OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
-        ToggleHistory, TogglePalette, PaletteUp, PaletteDown, NewDocument, RenameDocument,
-        RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection, CancelAiRun,
-        DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy, ShowShortcuts,
-        OpenWelcome,
+        ToggleHistory, TogglePalette, TogglePopover, PaletteUp, PaletteDown, NewDocument,
+        RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
+        CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
+        ShowShortcuts, OpenWelcome,
     ]
 );
 
@@ -132,6 +132,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-insert", Paste, ctx),
         // Redo's CUA alias; the primary chord comes from the registry.
         KeyBinding::new("ctrl-y", Redo, ctx),
+        // Silent legacy heading aliases (DESIGN §2-toolbar): ctrl-1..3 is
+        // the promoted chord; these keep working but the UI never shows them.
+        KeyBinding::new("ctrl-alt-1", Heading1, ctx),
+        KeyBinding::new("ctrl-alt-2", Heading2, ctx),
+        KeyBinding::new("ctrl-alt-3", Heading3, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
         // GNOME's menu key opens the palette — it IS the menu.
         KeyBinding::new("f10", TogglePalette, ctx),
@@ -232,6 +237,12 @@ pub struct Editor {
     pub voice_baseline: Option<strop_core::voice::Baseline>,
     /// In-card composer for the active note's body.
     note_input: Option<Entity<NoteInput>>,
+    /// Selection popover (DESIGN §2-toolbar): formatting rides the
+    /// selection. Shown on mouse-up over a selection or via ctrl-.;
+    /// dismissed by mousedown, typing, scrolling, or escape.
+    selection_popover: bool,
+    /// Titlebar word count, recomputed on mutation — never per frame.
+    word_count: usize,
     last_frame: Option<TextFrame>,
 }
 
@@ -671,10 +682,29 @@ impl TextFrame {
     }
 }
 
+/// Whitespace-delimited word count over text chunks (rope chunks may split
+/// mid-word, so track the in-word state across them).
+fn count_words<'a>(chunks: impl Iterator<Item = &'a str>) -> usize {
+    let mut words = 0;
+    let mut in_word = false;
+    for chunk in chunks {
+        for c in chunk.chars() {
+            if c.is_whitespace() {
+                in_word = false;
+            } else if !in_word {
+                in_word = true;
+                words += 1;
+            }
+        }
+    }
+    words
+}
+
 impl Editor {
     pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            word_count: count_words([text].into_iter()),
             doc: Document::new(text, spans, blocks),
             caret_attrs: Vec::new(),
             selected_range: 0..0,
@@ -714,6 +744,7 @@ impl Editor {
             alt_input: None,
             voice_baseline: None,
             note_input: None,
+            selection_popover: false,
             last_frame: None,
         }
     }
@@ -759,6 +790,7 @@ impl Editor {
         if ops.is_empty() {
             return;
         }
+        self.word_count = count_words(self.doc.rope().chunks());
         if let Some(store) = &self.store {
             store.apply(&ops);
             self.store_dirty = true;
@@ -2732,9 +2764,21 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.selection_popover {
+            self.selection_popover = false;
+            cx.notify();
+            return;
+        }
         if self.history_view.is_some() {
             self.exit_history(cx);
         }
+    }
+
+    /// ctrl-.: summon the selection popover by keyboard (the ARIA-toolbar
+    /// requirement — no capability reachable by only one modality).
+    fn toggle_popover(&mut self, _: &TogglePopover, _: &mut Window, cx: &mut Context<Self>) {
+        self.selection_popover = !self.selection_popover && !self.selected_range.is_empty();
+        cx.notify();
     }
 
     fn show_shortcuts(&mut self, _: &ShowShortcuts, _: &mut Window, cx: &mut Context<Self>) {
@@ -3224,6 +3268,8 @@ impl Editor {
         let target = (self.scroll_top - delta.y).clamp(px(0.), frame.max_scroll());
         if target != self.scroll_top {
             self.scroll_top = target;
+            // Anchored to stale geometry once the text moves — dismiss.
+            self.selection_popover = false;
             cx.notify();
         }
     }
@@ -3317,6 +3363,7 @@ impl Editor {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
         self.is_selecting = true;
+        self.selection_popover = false;
         self.drag_point = Some(ev.position);
         if !self.autoscroll_active {
             self.autoscroll_active = true;
@@ -3388,7 +3435,13 @@ impl Editor {
         self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Medium lineage: the popover appears when the button releases over
+        // a live selection — never mid-drag.
+        if self.is_selecting && !self.selected_range.is_empty() {
+            self.selection_popover = true;
+            cx.notify();
+        }
         self.is_selecting = false;
         self.drag_point = None;
     }
@@ -3482,6 +3535,7 @@ impl Editor {
         if self.history_view.is_some() {
             return; // history preview is read-only
         }
+        self.selection_popover = false;
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -4488,6 +4542,105 @@ impl Editor {
             .child(label)
     }
 
+    fn heading_button(
+        &self,
+        label: &'static str,
+        level: u8,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let kind = self.doc.blocks().kind(self.doc.block_of_byte(self.selected_range.start));
+        let active = matches!(kind, BlockKind::Heading(l) if *l == level);
+        div()
+            .id(label)
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(5.))
+            .cursor(CursorStyle::PointingHand)
+            .text_color(if active {
+                rgb(TEXT_COLOR)
+            } else {
+                rgb(MUTED_COLOR)
+            })
+            .when(active, |d| d.bg(rgba(0x1A1A1812u32)))
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.toggle_block(BlockKind::Heading(level), cx);
+                }),
+            )
+            .child(label)
+    }
+
+    /// The selection popover (DESIGN §2-toolbar, Medium lineage): formatting
+    /// rides the selection. An in-surface GPUI overlay — never a Wayland
+    /// xdg_popup (Zed's documented popup fragility under wlroots).
+    fn render_selection_popover(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        const POPOVER_W: f32 = 196.;
+        const POPOVER_H: f32 = 30.;
+        if !self.selection_popover
+            || self.selected_range.is_empty()
+            || self.is_selecting
+            || self.history_view.is_some()
+        {
+            return None;
+        }
+        let frame = self.last_frame.as_ref()?;
+        let (par_ix, line, x) =
+            frame.cursor_position(self.selected_range.start.min(frame.doc_len()), false)?;
+        let par = &frame.paragraphs[par_ix];
+        // Window-space top of the selection's first visual line.
+        let line_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
+            + f32::from(par.line_height) * line as f32
+            - f32::from(frame.scroll_top);
+        let viewport = window.viewport_size();
+        let left = (f32::from(frame.bounds.origin.x) + f32::from(x) - POPOVER_W / 2.)
+            .clamp(8., (f32::from(viewport.width) - POPOVER_W - 8.).max(8.));
+        // Above the selection start; below its line when the titlebar is in
+        // the way; clamped on-screen either way.
+        let above = line_top - POPOVER_H - 8.;
+        let top = if above >= BAR_HEIGHT + 4. {
+            above
+        } else {
+            line_top + f32::from(par.line_height) + 8.
+        }
+        .clamp(BAR_HEIGHT + 4., f32::from(viewport.height) - POPOVER_H - 8.);
+        Some(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(POPOVER_W))
+                .bg(rgb(0xFCFAF4))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .rounded(px(6.))
+                .shadow_md()
+                .px(px(4.))
+                .py(px(3.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(2.))
+                .font_family("PT Serif")
+                .text_size(px(13.))
+                // Clicks on the popover chrome must not reach the canvas —
+                // they would collapse the very selection being formatted.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(self.format_button("B", InlineAttr::Strong, cx))
+                .child(self.format_button("I", InlineAttr::Emphasis, cx))
+                .child(self.format_button("S", InlineAttr::Strikethrough, cx))
+                .child(self.format_button("{}", InlineAttr::Code, cx))
+                .child(self.heading_button("H1", 1, cx))
+                .child(self.heading_button("H2", 2, cx)),
+        )
+    }
+
     // UI chrome avoids glyphs outside the bundled PT fonts (arrows, circles,
     // checks): every such character forces a mid-session system-font fallback
     // load, the exact path behind the garbled-glyph bugs. Indicators that
@@ -4513,8 +4666,9 @@ impl Editor {
             .child(label)
     }
 
-    /// The one piece of chrome: a unified bar — drag region, formatting
-    /// toggles with live state, window controls. Deliberately quiet.
+    /// The one piece of chrome: title, word count, history, menu, window
+    /// controls. Formatting lives in the selection popover (DESIGN
+    /// §2-toolbar: zero category precedent for persistent format buttons).
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let drag =
             |_: &MouseDownEvent, window: &mut Window, _: &mut App| window.start_window_move();
@@ -4570,15 +4724,8 @@ impl Editor {
             )
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .child(self.format_button("B", InlineAttr::Strong, cx))
-                    .child(self.format_button("I", InlineAttr::Emphasis, cx))
-                    .child(self.format_button("U", InlineAttr::Underline, cx))
-                    .child(self.format_button("S", InlineAttr::Strikethrough, cx))
-                    .child(self.format_button("H", InlineAttr::Highlight, cx))
-                    .child(self.format_button("{}", InlineAttr::Code, cx)),
+                    .text_color(rgb(MUTED_COLOR))
+                    .child(format!("{} words", self.word_count)),
             )
             .child(
                 div()
@@ -5679,6 +5826,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::open_file))
                     .on_action(cx.listener(Self::save_copy_as))
                     .on_action(cx.listener(Self::toggle_palette))
+                    .on_action(cx.listener(Self::toggle_popover))
                     .on_action(cx.listener(Self::palette_up))
                     .on_action(cx.listener(Self::palette_down))
                     .on_action(cx.listener(Self::new_document))
@@ -5754,6 +5902,10 @@ impl Render for Editor {
             })
             .map(|d| match self.render_alt_strip() {
                 Some(strip) => d.child(strip),
+                None => d,
+            })
+            .map(|d| match self.render_selection_popover(window, cx) {
+                Some(popover) => d.child(popover),
                 None => d,
             })
             // Last children = topmost: the palette and the keyboard map

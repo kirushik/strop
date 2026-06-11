@@ -25,6 +25,10 @@ sleep 1
 WIN=$(env -u WAYLAND_DISPLAY DISPLAY=:0 xwininfo -root -tree 2>/dev/null \
     | grep -m1 'Strop' | awk '{print $1}')
 if [ -n "$WIN" ]; then
+    # Unfocused XWayland surfaces present frames lazily; the first capture
+    # drains the stale queue, the second one sees the current state.
+    env -u WAYLAND_DISPLAY DISPLAY=:0 import -window "$WIN" "$OUT"
+    sleep 2
     env -u WAYLAND_DISPLAY DISPLAY=:0 import -window "$WIN" "$OUT"
 else
     env -u WAYLAND_DISPLAY DISPLAY=:0 import -window root "$OUT"
