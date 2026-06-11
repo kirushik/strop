@@ -4407,37 +4407,6 @@ impl Render for Editor {
             // inputs bubble here.
             .on_action(cx.listener(Self::note_tab))
             .child(self.render_titlebar(cx))
-            .when(self.history_view.is_some(), |d| {
-                d.child(self.render_history_panel(cx))
-            })
-            .map(|d| {
-                let footnotes = self.visible_footnotes();
-                d.when(!footnotes.is_empty(), |d| {
-                    d.child(self.render_footnote_zone(footnotes, cx))
-                })
-            })
-            .map(|d| match self.render_margin(window, cx) {
-                Some(margin) => d.child(margin),
-                None => d,
-            })
-            .map(|d| {
-                if !self.margin_fits(window) {
-                    match self.render_composer_strip() {
-                        Some(strip) => d.child(strip),
-                        None => d,
-                    }
-                } else {
-                    d
-                }
-            })
-            .map(|d| match self.render_find_strip(cx) {
-                Some(strip) => d.child(strip),
-                None => d,
-            })
-            .map(|d| match self.render_alt_strip() {
-                Some(strip) => d.child(strip),
-                None => d,
-            })
             .child(
                 div()
                     .w_full()
@@ -4541,6 +4510,40 @@ impl Render for Editor {
                             .child(EditorElement { editor: cx.entity() }),
                     ),
             )
+            // Overlays AFTER the canvas: GPUI paints siblings in tree
+            // order, so anything mounted before it ends up UNDER the text
+            // (the bug Kirill caught from the first screenshot).
+            .when(self.history_view.is_some(), |d| {
+                d.child(self.render_history_panel(cx))
+            })
+            .map(|d| {
+                let footnotes = self.visible_footnotes();
+                d.when(!footnotes.is_empty(), |d| {
+                    d.child(self.render_footnote_zone(footnotes, cx))
+                })
+            })
+            .map(|d| match self.render_margin(window, cx) {
+                Some(margin) => d.child(margin),
+                None => d,
+            })
+            .map(|d| {
+                if !self.margin_fits(window) {
+                    match self.render_composer_strip() {
+                        Some(strip) => d.child(strip),
+                        None => d,
+                    }
+                } else {
+                    d
+                }
+            })
+            .map(|d| match self.render_find_strip(cx) {
+                Some(strip) => d.child(strip),
+                None => d,
+            })
+            .map(|d| match self.render_alt_strip() {
+                Some(strip) => d.child(strip),
+                None => d,
+            })
     }
 }
 
