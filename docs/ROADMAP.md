@@ -103,8 +103,12 @@ unless they'd be expensive to reverse.
       levels-of-edit as a mode switch: developmental/line/copy) ->
       anchored margin annotations with dismiss/done. The handoff doc's
       §2 conclusions become running code here.
-- [ ] C4. Settings file: provider/model/key, document language override,
-      auto-copy-selection-to-clipboard (Kirill's habit), font size.
+- [x] C4. Settings file (~/.config/strop/config.toml, malformed = warn +
+      defaults): [ai] base_url/api_key/model, language = auto|ru|en
+      typograph override, auto_copy_selection (Kirill's habit — selection
+      also hits the clipboard), font_size (body, headings scale
+      proportionally on a 2px-rounded rhythm). Pulled ahead of C2/C3
+      since the client consumes it.
 
 ## Phase D — MVP polish gate
 

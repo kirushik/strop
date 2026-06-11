@@ -15,3 +15,5 @@ gpui = { workspace = true }
 anyhow = { workspace = true }
 unicode-segmentation = "1"
 serde_json = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

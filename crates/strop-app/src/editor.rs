@@ -27,6 +27,8 @@ use strop_core::document::{
     Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteStatus, SpanSet,
 };
 use strop_core::{Store, typograph};
+
+use crate::config::{Config, Language};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const BG_COLOR: u32 = 0xFBFAF8;
@@ -178,6 +180,8 @@ pub struct Editor {
     /// Encoded image assets by id; Arc<gpui::Image> handles feed GPUI's
     /// decode-once cache via use_render_image.
     image_assets: HashMap<String, Arc<gpui::Image>>,
+    /// User settings (config.toml), loaded at startup.
+    pub config: Config,
     /// Active (snapped/highlighted) margin note, if any.
     active_note: Option<u64>,
     /// In-card composer for the active note's body.
@@ -608,6 +612,7 @@ impl Editor {
             store_dirty: false,
             show_history: false,
             image_assets: HashMap::new(),
+            config: Config::default(),
             active_note: None,
             note_input: None,
             last_frame: None,
@@ -1080,10 +1085,14 @@ impl Editor {
     }
 
     /// Linux PRIMARY-selection contract: any selection (mouse or keyboard)
-    /// is published; middle-click pastes it. No-op on other platforms.
+    /// is published; middle-click pastes it. With auto_copy_selection
+    /// (config), the regular clipboard gets it too — Kirill's habit.
     fn publish_primary(&self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             let text = self.doc.slice_bytes(self.selected_range.clone());
+            if self.config.auto_copy_selection {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            }
             cx.write_to_primary(ClipboardItem::new_string(text));
         }
     }
@@ -1991,7 +2000,11 @@ impl Editor {
         if typograph && !block_shortcut_fired {
             let (par_start, _) = self.paragraph_bounds(cursor);
             let prefix = self.doc.slice_bytes(par_start..cursor);
-            let lang = typograph::detect_lang(self.doc.rope().chars());
+            let lang = match self.config.language {
+                Language::Ru => typograph::Lang::Ru,
+                Language::En => typograph::Lang::En,
+                Language::Auto => typograph::detect_lang(self.doc.rope().chars()),
+            };
             if let Some(sub) = typograph::process(&prefix, lang) {
                 // The substitution is its own transaction: one undo reverts
                 // it alone, restoring the literally-typed characters — and
@@ -2189,6 +2202,17 @@ impl Default for BlockStyle {
             quote_rule: false,
         }
     }
+}
+
+fn block_style_scaled(kind: &BlockKind, scale: f32) -> BlockStyle {
+    let mut style = block_style(kind);
+    if (scale - 1.).abs() > f32::EPSILON {
+        // Keep the rhythm: line heights round to 2px so boxes stay tidy.
+        style.size = px((f32::from(style.size) * scale).round());
+        style.line_height = px((f32::from(style.line_height) * scale / 2.).round() * 2.);
+        style.extra_top = px((f32::from(style.extra_top) * scale / 2.).round() * 2.);
+    }
+    style
 }
 
 fn block_style(kind: &BlockKind) -> BlockStyle {
@@ -2490,6 +2514,7 @@ impl Element for EditorElement {
             strikethrough: None,
         };
 
+        let font_scale = editor.config.font_size.map_or(1., |s| (s / 20.).clamp(0.6, 2.));
         let kinds: Vec<BlockKind> = editor.doc.blocks().kinds().to_vec();
         // Open-note anchors in byte ranges, with active flag, for tinting.
         let note_ranges: Vec<(Range<usize>, bool)> = {
@@ -2521,7 +2546,7 @@ impl Element for EditorElement {
         let mut ordered_no = 0usize;
         for (block_ix, par_text) in text.split('\n').enumerate() {
             let kind = kinds.get(block_ix).cloned().unwrap_or_default();
-            let bstyle = block_style(&kind);
+            let bstyle = block_style_scaled(&kind, font_scale);
             let marker = match &kind {
                 BlockKind::ListItem { ordered: false, .. } => {
                     ordered_no = 0;
@@ -3383,8 +3408,13 @@ impl Render for Editor {
                             .pb(px(28.))
                             .px(px(28.))
                             .font_family("Literata")
-                            .text_size(px(20.))
-                            .line_height(px(28.))
+                            .text_size(px(
+                                self.config.font_size.unwrap_or(20.).clamp(12., 40.)
+                            ))
+                            .line_height(px({
+                                let fs = self.config.font_size.unwrap_or(20.).clamp(12., 40.);
+                                ((fs * 1.4) / 2.).round() * 2.
+                            }))
                             .text_color(rgb(TEXT_COLOR))
                             .child(EditorElement { editor: cx.entity() }),
                     ),

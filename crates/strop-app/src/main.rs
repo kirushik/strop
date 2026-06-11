@@ -1,3 +1,4 @@
+mod config;
 mod editor;
 mod smoke;
 
@@ -190,6 +191,7 @@ fn main() {
                 window.set_window_title(&title);
                 let editor = cx.new(|cx| {
                     let mut editor = Editor::new(cx, &initial_text, initial_spans, initial_blocks);
+                    editor.config = config::load();
                     if let Some(history) = initial_history {
                         editor.restore_history(history);
                     }
