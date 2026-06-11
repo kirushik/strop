@@ -58,12 +58,30 @@ actions!(
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
         OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
-        ToggleHistory,
+        ToggleHistory, TogglePalette, PaletteUp, PaletteDown,
     ]
 );
 
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some("Editor");
+    // Commands (anything a menu would list) bind from the registry, so the
+    // palette and the keymap can never disagree about a chord.
+    let editor_ctx: std::rc::Rc<gpui::KeyBindingContextPredicate> =
+        gpui::KeyBindingContextPredicate::parse("Editor").unwrap().into();
+    cx.bind_keys(crate::commands::all().iter().filter_map(|cmd| {
+        let keys = cmd.keys?;
+        Some(
+            KeyBinding::load(
+                keys,
+                (cmd.make)(),
+                Some(editor_ctx.clone()),
+                false,
+                None,
+                &gpui::DummyKeyboardMapper,
+            )
+            .expect("bad chord in command registry"),
+        )
+    }));
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, ctx),
         // GTK binds this too, "to help with mis-typing" during shift-selection.
@@ -109,39 +127,21 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-insert", Copy, ctx),
         KeyBinding::new("shift-delete", Cut, ctx),
         KeyBinding::new("shift-insert", Paste, ctx),
-        KeyBinding::new("ctrl-z", Undo, ctx),
-        KeyBinding::new("ctrl-shift-z", Redo, ctx),
+        // Redo's CUA alias; the primary chord comes from the registry.
         KeyBinding::new("ctrl-y", Redo, ctx),
-        KeyBinding::new("ctrl-b", ToggleStrong, ctx),
-        KeyBinding::new("ctrl-i", ToggleEmphasis, ctx),
-        KeyBinding::new("ctrl-u", ToggleUnderline, ctx),
-        KeyBinding::new("ctrl-shift-x", ToggleStrikethrough, ctx),
-        KeyBinding::new("ctrl-shift-h", ToggleHighlight, ctx),
-        KeyBinding::new("ctrl-e", ToggleCode, ctx),
-        KeyBinding::new("ctrl-alt-1", Heading1, ctx),
-        KeyBinding::new("ctrl-alt-2", Heading2, ctx),
-        KeyBinding::new("ctrl-alt-3", Heading3, ctx),
-        KeyBinding::new("ctrl-alt-q", ToggleQuoteBlock, ctx),
-        KeyBinding::new("ctrl-alt-c", ToggleCodeBlock, ctx),
-        // Google Docs list conventions.
-        KeyBinding::new("ctrl-shift-8", ToggleBulletList, ctx),
-        KeyBinding::new("ctrl-shift-7", ToggleOrderedList, ctx),
-        KeyBinding::new("ctrl-alt-s", AddCheckpoint, ctx),
-        KeyBinding::new("ctrl-shift-e", ExportMarkdown, ctx),
-        KeyBinding::new("ctrl-alt-f", InsertFootnote, ctx),
-        KeyBinding::new("ctrl-m", AddNote, ctx),
-        KeyBinding::new("ctrl-shift-d", RunDiagnosis, ctx),
-        KeyBinding::new("ctrl-shift-b", RunBelieving, ctx),
-        KeyBinding::new("ctrl-f", Find, ctx),
-        KeyBinding::new("ctrl-h", Replace, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
-        KeyBinding::new("ctrl-alt-h", ToggleHistory, ctx),
+        // GNOME's menu key opens the palette — it IS the menu.
+        KeyBinding::new("f10", TogglePalette, ctx),
         KeyBinding::new("enter", NoteCommit, Some("NoteInput")),
         KeyBinding::new("escape", NoteCancel, Some("NoteInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
         KeyBinding::new("tab", NoteTab, Some("NoteInput")),
-        KeyBinding::new("ctrl-o", OpenFile, ctx),
-        KeyBinding::new("ctrl-shift-s", SaveCopyAs, ctx),
+        // The palette's query field: same editing actions, plus row motion.
+        KeyBinding::new("enter", NoteCommit, Some("PaletteInput")),
+        KeyBinding::new("escape", NoteCancel, Some("PaletteInput")),
+        KeyBinding::new("backspace", NoteBackspace, Some("PaletteInput")),
+        KeyBinding::new("up", PaletteUp, Some("PaletteInput")),
+        KeyBinding::new("down", PaletteDown, Some("PaletteInput")),
     ]);
 }
 
@@ -199,6 +199,9 @@ pub struct Editor {
     last_ai_error: Option<String>,
     /// Find bar (ctrl-f): live-highlighting query input; Enter advances.
     find_input: Option<Entity<NoteInput>>,
+    /// The command palette (PLAN.md E1): the menu, summoned not mounted.
+    palette_input: Option<Entity<NoteInput>>,
+    palette_selected: usize,
     find_current: usize,
     /// Replace field (ctrl-h adds it beside find): Enter on it replaces
     /// the current match; the All button replaces every match (one undo).
@@ -228,6 +231,9 @@ pub struct NoteInput {
     focus_handle: FocusHandle,
     content: String,
     marked: Option<Range<usize>>,
+    /// Keymap context: "NoteInput" everywhere except the palette, whose
+    /// query field needs its own bindings (up/down move the selection).
+    key_context: &'static str,
 }
 
 pub enum NoteInputEvent {
@@ -243,6 +249,14 @@ impl NoteInput {
             focus_handle: cx.focus_handle(),
             content,
             marked: None,
+            key_context: "NoteInput",
+        }
+    }
+
+    fn for_palette(cx: &mut Context<Self>) -> Self {
+        Self {
+            key_context: "PaletteInput",
+            ..Self::new(cx, String::new())
         }
     }
 
@@ -349,7 +363,7 @@ impl EntityInputHandler for NoteInput {
 impl Render for NoteInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .key_context("NoteInput")
+            .key_context(self.key_context)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::cancel))
@@ -644,6 +658,8 @@ impl Editor {
             diagnosis_running: false,
             last_ai_error: None,
             find_input: None,
+            palette_input: None,
+            palette_selected: 0,
             find_current: 0,
             replace_input: None,
             rename_input: None,
@@ -1466,6 +1482,182 @@ impl Editor {
             window.focus(&find.read(cx).focus_handle);
         }
         cx.notify();
+    }
+
+    /// ctrl-shift-p / F10 / the titlebar menu button: the command palette.
+    /// Every command the app has, searchable, with its chord on the row —
+    /// this is the menu bar of a chrome-minimal editor (PLAN.md E1).
+    fn toggle_palette(&mut self, _: &TogglePalette, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_input.is_some() {
+            self.close_palette(window, cx);
+            return;
+        }
+        let input = cx.new(NoteInput::for_palette);
+        cx.observe(&input, |editor, _, cx| {
+            editor.palette_selected = 0; // query changed: selection restarts
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, input, event: &NoteInputEvent, window, cx| match event {
+                NoteInputEvent::Commit(_) => {
+                    let query = input.read(cx).content.clone();
+                    editor.execute_palette_entry(&query, editor.palette_selected, window, cx);
+                }
+                NoteInputEvent::Cancel => editor.close_palette(window, cx),
+            },
+        )
+        .detach();
+        window.focus(&input.read(cx).focus_handle);
+        self.palette_input = Some(input);
+        self.palette_selected = 0;
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_input = None;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn execute_palette_entry(
+        &mut self,
+        query: &str,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cmd) = crate::commands::ranked(query).get(ix).copied() else {
+            return;
+        };
+        let action = (cmd.make)();
+        // Close first: focus returns to the document, so the action lands
+        // exactly as if its chord had been pressed there.
+        self.close_palette(window, cx);
+        window.dispatch_action(action, cx);
+    }
+
+    fn palette_up(&mut self, _: &PaletteUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.palette_selected = self.palette_selected.saturating_sub(1);
+        cx.notify();
+    }
+
+    fn palette_down(&mut self, _: &PaletteDown, _: &mut Window, cx: &mut Context<Self>) {
+        let len = self
+            .palette_input
+            .as_ref()
+            .map_or(0, |i| crate::commands::ranked(&i.read(cx).content).len());
+        if len > 0 {
+            self.palette_selected = (self.palette_selected + 1).min(len - 1);
+        }
+        cx.notify();
+    }
+
+    fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
+        let input = self.palette_input.clone().expect("palette open");
+        let query = input.read(cx).content.clone();
+        let ranked = crate::commands::ranked(&query);
+        let selected = self.palette_selected.min(ranked.len().saturating_sub(1));
+        let grouped = query.trim().is_empty();
+        let mut list = div()
+            .id("palette-list")
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .pb(px(6.));
+        let mut last_section = "";
+        for (ix, cmd) in ranked.iter().enumerate() {
+            if grouped && cmd.section != last_section {
+                last_section = cmd.section;
+                list = list.child(
+                    div()
+                        .px(px(12.))
+                        .pt(px(10.))
+                        .pb(px(2.))
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child(cmd.section.to_uppercase()),
+                );
+            }
+            list = list.child(
+                div()
+                    .id(("palette-row", ix))
+                    .px(px(12.))
+                    .py(px(4.))
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .cursor(CursorStyle::PointingHand)
+                    .when(ix == selected, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            let q = editor
+                                .palette_input
+                                .as_ref()
+                                .map(|i| i.read(cx).content.clone())
+                                .unwrap_or_default();
+                            editor.execute_palette_entry(&q, ix, window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(TEXT_COLOR))
+                            .child(cmd.label),
+                    )
+                    .when_some(cmd.keys, |d, keys| {
+                        d.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED_COLOR))
+                                .child(keys),
+                        )
+                    }),
+            );
+        }
+        if ranked.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .text_size(px(13.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child("No matching command"),
+            );
+        }
+        div()
+            .absolute()
+            .top(px(BAR_HEIGHT + 6.))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(460.))
+                    .bg(rgb(0xFCFAF4))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .rounded(px(8.))
+                    .shadow_lg()
+                    .font_family("PT Serif")
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .p(px(8.))
+                            .border_b_1()
+                            .border_color(rgb(RULE_COLOR))
+                            .child(input.clone()),
+                    )
+                    .child(list),
+            )
     }
 
     /// ctrl-h: ensure the find bar exists, add the replace field.
@@ -3875,6 +4067,37 @@ impl Editor {
                     ),
             )
             .child(
+                // The day-zero affordance: a user who knows nothing clicks
+                // the only unexplained button and lands in a searchable
+                // list of every capability (GNOME primary-menu position).
+                div()
+                    .id("palette-toggle")
+                    .px(px(8.))
+                    .py(px(2.))
+                    .ml(px(4.))
+                    .rounded(px(5.))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(self.palette_input.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.toggle_palette(&TogglePalette, window, cx);
+                        }),
+                    )
+                    .child(
+                        // Drawn hamburger (no PT-covered menu glyph).
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .children((0..3).map(|_| {
+                                div().w(px(11.)).h(px(1.5)).bg(rgb(MUTED_COLOR))
+                            })),
+                    ),
+            )
+            .child(
                 div()
                     .w(px(28.))
                     .h_full()
@@ -4664,6 +4887,9 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_history))
                     .on_action(cx.listener(Self::open_file))
                     .on_action(cx.listener(Self::save_copy_as))
+                    .on_action(cx.listener(Self::toggle_palette))
+                    .on_action(cx.listener(Self::palette_up))
+                    .on_action(cx.listener(Self::palette_down))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -4722,6 +4948,10 @@ impl Render for Editor {
             .map(|d| match self.render_alt_strip() {
                 Some(strip) => d.child(strip),
                 None => d,
+            })
+            // Last child = topmost: the palette covers everything below.
+            .when(self.palette_input.is_some(), |d| {
+                d.child(self.render_palette(cx))
             })
     }
 }
