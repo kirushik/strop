@@ -181,6 +181,17 @@ unless they'd be expensive to reverse.
   per-author colors. REMAINING (needs hands-on feedback first):
   rename-in-place, "since last session" affordance, snap animation.
 
+## Next loop stage (queued 2026-06-11)
+
+- **Voice baseline corpus**: config `[voice] corpus = ["~/essays/*.md"]`
+  -> parse each file (markdown import for .md, store read for .strop),
+  compute per-feature mu/sigma across >=3 docs, leave-one-out calibration
+  of normal self-variation (research recipe), then flag draft drift at
+  >2sigma per feature ("semicolon rate 3.1sigma above your baseline" — a
+  nameable problem in the product's idiom) in the history panel and/or a
+  voice readout. With <3 corpus docs, stay descriptive (current v0
+  behavior).
+
 ## Explicitly post-MVP
 
 Voice-distance metric — v0 stylometric proxy DONE 2026-06-11
