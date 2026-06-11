@@ -210,9 +210,15 @@ too small [Retry]; raw error as expandable detail, never alone.
 Execution of the design architecture; each stage cites its DESIGN.md
 section. Ordering: root-fix verification first, then highest-leverage.
 
-- [ ] **F0. gpui migration lands** (root fix for the glyph-corruption
-  class; agent branch in progress) — merge, re-run shape_audit + full
-  smoke, Kirill eyeballs the footnote/heading screens.
+- [x] **F0. gpui migration landed** (2026-06-13): pinned to zed tag
+  v0.233.10 (gpui facade + gpui_platform; wgpu renderer, current
+  cosmic-text, per-span fallback wiring — every fix class the vendored
+  0.2.2 hotpatched around). 22 mechanical API changes; smoke output was
+  byte-identical to the old binary down to glyph x-positions; shape
+  audit clean; vendor/gpui deleted. First launch pays ~20s wgpu shader
+  warm-up once; ExternalPaths clipboard paste deliberately ignored.
+  REMAINING VERIFICATION: Kirill's eyes on the corrupted screens
+  (footnote line, headings) — raster output can't be asserted headless.
 - [ ] **F1. Titlebar diet + selection popover** (DESIGN §2-toolbar):
   strip B I U S H {} from chrome; word count joins the titlebar;
   selection popover (in-surface overlay, mouse-up, keyboard-summonable)
