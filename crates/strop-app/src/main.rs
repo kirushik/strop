@@ -193,6 +193,9 @@ fn main() {
                     if let Some(history) = initial_history {
                         editor.restore_history(history);
                     }
+                    if let Some((_, Some(loaded))) = &store {
+                        editor.restore_annotations(loaded.annotations.clone());
+                    }
                     editor.start_blink(cx);
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);

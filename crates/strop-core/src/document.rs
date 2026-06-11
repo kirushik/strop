@@ -263,6 +263,108 @@ impl SpanSet {
     }
 }
 
+/// Margin annotation status; Done/Dismissed leave the margin but persist
+/// (the engine must not re-raise a dismissed diagnosis on the same span).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteStatus {
+    Open,
+    Done,
+    Dismissed,
+}
+
+/// An overlay annotation anchored to a char range — never part of the text
+/// stream. Author notes now; AI diagnoses add their fields in C3.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Annotation {
+    pub id: u64,
+    pub range: Range<usize>,
+    pub body: String,
+    pub status: NoteStatus,
+    pub created_unix: i64,
+}
+
+/// The annotation overlay. Anchors adjust like non-expanding spans
+/// (insertions at the edges stay outside; a fully deleted anchor collapses
+/// to a point and survives as an orphan, Hypothesis-style).
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Annotations {
+    notes: Vec<Annotation>,
+    next_id: u64,
+}
+
+impl Annotations {
+    pub fn add(&mut self, range: Range<usize>, body: String, created_unix: i64) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.notes.push(Annotation {
+            id,
+            range,
+            body,
+            status: NoteStatus::Open,
+            created_unix,
+        });
+        self.notes.sort_by_key(|n| n.range.start);
+        id
+    }
+
+    pub fn notes(&self) -> &[Annotation] {
+        &self.notes
+    }
+
+    pub fn get(&self, id: u64) -> Option<&Annotation> {
+        self.notes.iter().find(|n| n.id == id)
+    }
+
+    pub fn set_status(&mut self, id: u64, status: NoteStatus) {
+        if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
+            n.status = status;
+        }
+    }
+
+    pub fn set_body(&mut self, id: u64, body: String) {
+        if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
+            n.body = body;
+        }
+    }
+
+    /// Open notes in document order.
+    pub fn open(&self) -> impl Iterator<Item = &Annotation> {
+        self.notes
+            .iter()
+            .filter(|n| n.status == NoteStatus::Open)
+    }
+
+    pub fn apply_op(&mut self, op: &TextOp) {
+        let del_end = op.pos + op.delete;
+        let ins = op.insert.chars().count();
+        let clamp = |x: usize| {
+            if x >= del_end {
+                x - op.delete
+            } else if x > op.pos {
+                op.pos
+            } else {
+                x
+            }
+        };
+        for n in &mut self.notes {
+            if op.delete > 0 {
+                n.range.start = clamp(n.range.start);
+                n.range.end = clamp(n.range.end);
+            }
+            if ins > 0 {
+                // Non-expanding (ExpandType::None semantics).
+                if n.range.start >= op.pos {
+                    n.range.start += ins;
+                }
+                if n.range.end > op.pos {
+                    n.range.end += ins;
+                }
+            }
+        }
+        self.notes.sort_by_key(|n| n.range.start);
+    }
+}
+
 /// Text + formatting + block structure with unified, transaction-aligned
 /// undo. The buffer owns text history; span/block states are snapshotted
 /// per transaction (they're small — snapshots beat op inversion).
@@ -271,8 +373,9 @@ pub struct Document {
     buffer: Buffer,
     spans: SpanSet,
     blocks: BlockMap,
-    undo_states: Vec<(SpanSet, BlockMap)>,
-    redo_states: Vec<(SpanSet, BlockMap)>,
+    notes: Annotations,
+    undo_states: Vec<(SpanSet, BlockMap, Annotations)>,
+    redo_states: Vec<(SpanSet, BlockMap, Annotations)>,
     pending_ops: Vec<TextOp>,
 }
 
@@ -348,6 +451,7 @@ impl Document {
         let ops = self.buffer.take_ops();
         for op in &ops {
             self.spans.apply_op(op);
+            self.notes.apply_op(op);
         }
         self.pending_ops.extend(ops);
     }
@@ -363,8 +467,41 @@ impl Document {
         (block, merged)
     }
 
-    fn snapshot(&self) -> (SpanSet, BlockMap) {
-        (self.spans.clone(), self.blocks.clone())
+    fn snapshot(&self) -> (SpanSet, BlockMap, Annotations) {
+        (self.spans.clone(), self.blocks.clone(), self.notes.clone())
+    }
+
+    pub fn notes(&self) -> &Annotations {
+        &self.notes
+    }
+
+    pub fn set_notes(&mut self, notes: Annotations) {
+        self.notes = notes;
+    }
+
+    /// Add an author note as its own undoable transaction.
+    pub fn add_note(&mut self, range: Range<usize>, body: String, created_unix: i64) -> u64 {
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        self.notes.add(range, body, created_unix)
+    }
+
+    pub fn set_note_status(&mut self, id: u64, status: NoteStatus) {
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        self.notes.set_status(id, status);
+    }
+
+    pub fn set_note_body(&mut self, id: u64, body: String) {
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        self.notes.set_body(id, body);
     }
 
     pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
@@ -434,10 +571,11 @@ impl Document {
     /// Outer None = nothing to undo; inner None = format-only (keep cursor).
     pub fn undo(&mut self) -> Option<Option<usize>> {
         let cursor = self.buffer.undo()?;
-        if let Some((spans, blocks)) = self.undo_states.pop() {
+        if let Some((spans, blocks, notes)) = self.undo_states.pop() {
             self.redo_states.push((
                 std::mem::replace(&mut self.spans, spans),
                 std::mem::replace(&mut self.blocks, blocks),
+                std::mem::replace(&mut self.notes, notes),
             ));
         }
         // Buffer inverse ops still mirror to the store, but must NOT be
@@ -448,10 +586,11 @@ impl Document {
 
     pub fn redo(&mut self) -> Option<Option<usize>> {
         let cursor = self.buffer.redo()?;
-        if let Some((spans, blocks)) = self.redo_states.pop() {
+        if let Some((spans, blocks, notes)) = self.redo_states.pop() {
             self.undo_states.push((
                 std::mem::replace(&mut self.spans, spans),
                 std::mem::replace(&mut self.blocks, blocks),
+                std::mem::replace(&mut self.notes, notes),
             ));
         }
         self.pending_ops.extend(self.buffer.take_ops());
@@ -484,8 +623,9 @@ impl Document {
     /// Saved atomically with the text it refers to, so it restores exactly.
     pub fn export_history(&self, cap: usize) -> History {
         let (undo, redo) = self.buffer.export_history(cap);
-        let tail =
-            |v: &Vec<(SpanSet, BlockMap)>| v[v.len().saturating_sub(cap)..].to_vec();
+        let tail = |v: &Vec<(SpanSet, BlockMap, Annotations)>| {
+            v[v.len().saturating_sub(cap)..].to_vec()
+        };
         History {
             undo,
             redo,
@@ -515,8 +655,8 @@ impl Document {
 pub struct History {
     undo: Vec<Transaction>,
     redo: Vec<Transaction>,
-    undo_states: Vec<(SpanSet, BlockMap)>,
-    redo_states: Vec<(SpanSet, BlockMap)>,
+    undo_states: Vec<(SpanSet, BlockMap, Annotations)>,
+    redo_states: Vec<(SpanSet, BlockMap, Annotations)>,
 }
 
 #[cfg(test)]
@@ -692,6 +832,27 @@ mod tests {
         doc.undo();
         assert_eq!(doc.text(), "ещё новый текст");
         assert!(doc.spans().covers(4..9, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn notes_anchor_adjust_and_undo() {
+        let mut doc = Document::new("первый абзац", SpanSet::default(), BlockMap::default());
+        let id = doc.add_note(0..6, "лид?".into(), 0);
+        assert_eq!(doc.notes().open().count(), 1);
+        // Typing before the anchor shifts it; the note follows its text.
+        doc.edit_bytes(0..0, "ещё ");
+        let n = doc.notes().get(id).unwrap();
+        assert_eq!(n.range, 4..10);
+        // Status change is its own undoable step.
+        doc.set_note_status(id, NoteStatus::Done);
+        assert_eq!(doc.notes().open().count(), 0);
+        doc.undo();
+        assert_eq!(doc.notes().open().count(), 1);
+        // Undo the typing, then the note creation: overlay restores fully.
+        doc.undo();
+        assert_eq!(doc.notes().get(id).unwrap().range, 0..6);
+        doc.undo();
+        assert!(doc.notes().notes().is_empty());
     }
 
     #[test]

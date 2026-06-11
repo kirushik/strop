@@ -79,10 +79,19 @@ unless they'd be expensive to reverse.
 
 ## Phase C — The thesis: diagnosis margin
 
-- [ ] C1. **Annotation overlay UI first, no AI**: author notes-to-self
-      (ctrl-m) anchored to ranges, rendered in the right margin, surviving
-      edits (SpanSet math + Loro cursors), resolve/delete. Proves the
-      margin interaction.
+- [x] C1. **Annotation overlay UI, no AI** (research: Liveblocks/Docs
+      two-pass solver brief in repo history): Annotations in core —
+      non-expanding anchors (orphan-on-delete, Hypothesis-style), unified
+      undo (own transactions; snapshots now triple spans/blocks/notes),
+      persisted with save + loaded. ctrl-m notes selection (or word at
+      caret) and opens a composer (minimal IME-capable NoteInput entity;
+      in-card when the margin fits, bottom strip when narrow). Margin lane
+      at >= column+264px: Docs-style solver (downward sweep; active card
+      snaps to anchor, earlier cards push up in reverse), wheat anchor
+      tints compositing under selection, bidirectional activation
+      (card click <-> anchor click), Done/Dismiss terminal states leave
+      the margin but persist. Old persisted-undo JSON drops once
+      (state-snapshot format grew a field).
 - [ ] C2. **LLM plumbing**: BYO-key config (~/.config/strop/config.toml)
       as an **OpenAI-compatible chat-completions client with configurable
       base_url/key/model** — one client covers Poe (Kirill's subscription,
@@ -124,6 +133,11 @@ unless they'd be expensive to reverse.
   WRITE is unimplemented in GPUI (copying an image out won't work).
 - **In-place document switching** (vs one-window-per-document) + recent
   files, if multi-doc workflows materialize.
+- **Margin v2** (from the C1 research): floating card near anchor on
+  narrow windows, gutter dots / clean-mode, collapsed icon rail, snap
+  animation (~180ms ease on card top), diagnosis-card anatomy (mode chip +
+  named problem + query phrasing) when C3 lands, CriticMarkup export of
+  notes.
 
 - **History & versions visualization** (Kirill, 2026-06-11): the rewind
   panel is deliberately rough. Research the design space before building

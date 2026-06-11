@@ -23,7 +23,9 @@ use gpui::{
     UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*,
     px, relative, rgb, rgba, size,
 };
-use strop_core::document::{BlockKind, BlockMap, Document, InlineAttr, SpanSet};
+use strop_core::document::{
+    Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteStatus, SpanSet,
+};
 use strop_core::{Store, typograph};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -33,6 +35,10 @@ const SELECTION_COLOR: u32 = 0xB4D5FE88;
 const HIGHLIGHT_COLOR: u32 = 0xF9E29CAA;
 const CODE_BG_COLOR: u32 = 0x1A1A1814;
 const LINK_COLOR: u32 = 0x1A56A0;
+const NOTE_TINT: u32 = 0xE3B84926; // wheat/amber ~15% — Docs-trained intuition
+const NOTE_TINT_ACTIVE: u32 = 0xE3B8494D; // ~30% when active
+const MARGIN_WIDTH: f32 = 248.;
+const MARGIN_GAP: f32 = 16.;
 const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
 const MUTED_COLOR: u32 = 0x8A8678;
@@ -49,7 +55,7 @@ actions!(
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
-        OpenFile, SaveCopyAs,
+        OpenFile, SaveCopyAs, AddNote,
     ]
 );
 
@@ -120,6 +126,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-s", AddCheckpoint, ctx),
         KeyBinding::new("ctrl-shift-e", ExportMarkdown, ctx),
         KeyBinding::new("ctrl-alt-f", InsertFootnote, ctx),
+        KeyBinding::new("ctrl-m", AddNote, ctx),
+        KeyBinding::new("enter", NoteCommit, Some("NoteInput")),
+        KeyBinding::new("escape", NoteCancel, Some("NoteInput")),
+        KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
         KeyBinding::new("ctrl-o", OpenFile, ctx),
         KeyBinding::new("ctrl-shift-s", SaveCopyAs, ctx),
     ]);
@@ -168,6 +178,10 @@ pub struct Editor {
     /// Encoded image assets by id; Arc<gpui::Image> handles feed GPUI's
     /// decode-once cache via use_render_image.
     image_assets: HashMap<String, Arc<gpui::Image>>,
+    /// Active (snapped/highlighted) margin note, if any.
+    active_note: Option<u64>,
+    /// In-card composer for the active note's body.
+    note_input: Option<Entity<NoteInput>>,
     last_frame: Option<TextFrame>,
 }
 
@@ -176,6 +190,257 @@ enum SelectGranularity {
     Char,
     Word,
     Paragraph,
+}
+
+/// Minimal single-line composer for note bodies: typing + backspace + IME;
+/// Enter commits, Escape cancels. Deliberately tiny — the main editor's
+/// machinery stays the only real text surface.
+pub struct NoteInput {
+    focus_handle: FocusHandle,
+    content: String,
+    marked: Option<Range<usize>>,
+}
+
+pub enum NoteInputEvent {
+    Commit(String),
+    Cancel,
+}
+
+impl gpui::EventEmitter<NoteInputEvent> for NoteInput {}
+
+impl NoteInput {
+    fn new(cx: &mut Context<Self>, content: String) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+            content,
+            marked: None,
+        }
+    }
+
+    fn commit(&mut self, _: &NoteCommit, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(NoteInputEvent::Commit(self.content.clone()));
+    }
+
+    fn cancel(&mut self, _: &NoteCancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(NoteInputEvent::Cancel);
+    }
+
+    fn backspace(&mut self, _: &NoteBackspace, _: &mut Window, cx: &mut Context<Self>) {
+        self.content.pop();
+        cx.notify();
+    }
+}
+
+actions!(note_input, [NoteCommit, NoteCancel, NoteBackspace]);
+
+impl EntityInputHandler for NoteInput {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        Some(self.content.clone())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self.content.chars().map(|c| c.len_utf16()).sum();
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked.clone()
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.marked = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(m) = self.marked.take() {
+            let byte_start = self.content.len().saturating_sub(m.end - m.start);
+            self.content.truncate(byte_start);
+        }
+        self.content.push_str(text);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(m) = self.marked.take() {
+            let byte_start = self.content.len().saturating_sub(m.end - m.start);
+            self.content.truncate(byte_start);
+        }
+        self.marked = Some(0..text.len());
+        self.content.push_str(text);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl Render for NoteInput {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context("NoteInput")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::commit))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::backspace))
+            .w_full()
+            .min_h(px(22.))
+            .px(px(6.))
+            .py(px(2.))
+            .rounded(px(4.))
+            .bg(rgb(0xFFFFFF))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .text_size(px(13.))
+            .text_color(rgb(TEXT_COLOR))
+            .child(NoteInputElement { input: cx.entity() })
+    }
+}
+
+impl Focusable for NoteInput {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+/// Paints the composer text and registers the IME handler.
+struct NoteInputElement {
+    input: Entity<NoteInput>,
+}
+
+impl IntoElement for NoteInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for NoteInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<gpui::ShapedLine>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let content = self.input.read(cx).content.clone();
+        let style = window.text_style();
+        let run = TextRun {
+            len: content.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        Some(window.text_system().shape_line(
+            SharedString::from(content),
+            style.font_size.to_pixels(window.rem_size()),
+            &[run],
+            None,
+        ))
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        line: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.input.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
+        if let Some(line) = line.take() {
+            let cursor_x = line.width;
+            line.paint(bounds.origin, window.line_height(), window, cx)
+                .ok();
+            if focus_handle.is_focused(window) {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(cursor_x, px(2.)),
+                        size(px(1.5), window.line_height() - px(4.)),
+                    ),
+                    rgb(TEXT_COLOR),
+                ));
+            }
+        }
+    }
 }
 
 /// Geometry of the last painted frame, for mouse, IME, and vertical-motion
@@ -343,6 +608,8 @@ impl Editor {
             store_dirty: false,
             show_history: false,
             image_assets: HashMap::new(),
+            active_note: None,
+            note_input: None,
             last_frame: None,
         }
     }
@@ -387,6 +654,10 @@ impl Editor {
     /// Restore persisted cross-session undo/redo.
     pub fn restore_history(&mut self, history: strop_core::document::History) {
         self.doc.import_history(history);
+    }
+
+    pub fn restore_annotations(&mut self, annotations: Annotations) {
+        self.doc.set_notes(annotations);
     }
 
     /// Record a named version snapshot in the document file.
@@ -603,6 +874,72 @@ impl Editor {
         .detach();
     }
 
+    /// ctrl-m: note on the selection (or the word at the caret), then
+    /// open the composer for its body.
+    fn add_note(&mut self, _: &AddNote, window: &mut Window, cx: &mut Context<Self>) {
+        let range = if self.selected_range.is_empty() {
+            self.word_range_at(self.cursor_offset())
+        } else {
+            self.selected_range.clone()
+        };
+        if range.is_empty() {
+            return;
+        }
+        let rope = self.doc.rope();
+        let char_range = rope.byte_to_char(range.start)..rope.byte_to_char(range.end);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let id = self.doc.add_note(char_range, String::new(), now);
+        self.store_dirty = true;
+        self.open_composer(id, String::new(), window, cx);
+        self.bump_activity();
+        cx.notify();
+    }
+
+    fn open_composer(
+        &mut self,
+        id: u64,
+        body: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_note = Some(id);
+        let input = cx.new(|cx| NoteInput::new(cx, body));
+        cx.subscribe_in(
+            &input,
+            window,
+            move |editor, _, event: &NoteInputEvent, window, cx| {
+                match event {
+                    NoteInputEvent::Commit(body) => {
+                        editor.doc.set_note_body(id, body.clone());
+                        editor.store_dirty = true;
+                    }
+                    NoteInputEvent::Cancel => {}
+                }
+                editor.note_input = None;
+                // Focus returns to the text — the composer's handle is gone.
+                window.focus(&editor.focus_handle);
+                cx.notify();
+            },
+        )
+        .detach();
+        window.focus(&input.read(cx).focus_handle);
+        self.note_input = Some(input);
+    }
+
+    fn set_note_status(&mut self, id: u64, status: NoteStatus, cx: &mut Context<Self>) {
+        self.doc.set_note_status(id, status);
+        if self.active_note == Some(id) {
+            self.active_note = None;
+            self.note_input = None;
+        }
+        self.store_dirty = true;
+        self.bump_activity();
+        cx.notify();
+    }
+
     pub fn save_now(&mut self) {
         self.sync_mutations();
         if let Some(store) = &self.store {
@@ -610,6 +947,7 @@ impl Editor {
                 self.doc.spans(),
                 self.doc.blocks(),
                 &self.doc.export_history(200),
+                self.doc.notes(),
             ) {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
@@ -1524,6 +1862,15 @@ impl Editor {
                     self.selection_origin = Some(ix..ix);
                     self.set_cursor(ix, affinity, cx);
                 }
+                // Bidirectional activation: clicking inside an anchor
+                // activates its margin card.
+                let c = self.doc.rope().byte_to_char(ix.min(self.doc.len_bytes()));
+                self.active_note = self
+                    .doc
+                    .notes()
+                    .open()
+                    .find(|n| n.range.start <= c && c < n.range.end)
+                    .map(|n| n.id);
             }
             2 => {
                 self.select_granularity = SelectGranularity::Word;
@@ -1919,6 +2266,7 @@ fn runs_for_paragraph(
     selection: &Range<usize>,
     marked: Option<&Range<usize>>,
     spans: &[(Range<usize>, InlineAttr)],
+    notes: &[(Range<usize>, bool)],
     base: &TextRun,
 ) -> Vec<TextRun> {
     let mut cuts = vec![par_range.start, par_range.end];
@@ -1927,6 +2275,10 @@ fn runs_for_paragraph(
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
     for (r, _) in spans {
+        cuts.push(r.start.clamp(par_range.start, par_range.end));
+        cuts.push(r.end.clamp(par_range.start, par_range.end));
+    }
+    for (r, _) in notes {
         cuts.push(r.start.clamp(par_range.start, par_range.end));
         cuts.push(r.end.clamp(par_range.start, par_range.end));
     }
@@ -1987,6 +2339,22 @@ fn runs_for_paragraph(
                         });
                     }
                     InlineAttr::FootnoteRef(_) => {}
+                }
+            }
+
+            // Note anchor tint composites over highlight/code backgrounds;
+            // selection composites over everything (Kirill's visibility rule).
+            for (r, active) in notes {
+                if r.start <= w[0] && w[1] <= r.end {
+                    let tint = if *active {
+                        rgba(NOTE_TINT_ACTIVE)
+                    } else {
+                        rgba(NOTE_TINT)
+                    };
+                    content_bg = Some(match content_bg {
+                        Some(bg) => blend_over(tint, bg),
+                        None => tint,
+                    });
                 }
             }
 
@@ -2123,6 +2491,21 @@ impl Element for EditorElement {
         };
 
         let kinds: Vec<BlockKind> = editor.doc.blocks().kinds().to_vec();
+        // Open-note anchors in byte ranges, with active flag, for tinting.
+        let note_ranges: Vec<(Range<usize>, bool)> = {
+            let rope = editor.doc.rope();
+            editor
+                .doc
+                .notes()
+                .open()
+                .map(|n| {
+                    (
+                        rope.char_to_byte(n.range.start)..rope.char_to_byte(n.range.end),
+                        editor.active_note == Some(n.id),
+                    )
+                })
+                .collect()
+        };
         let image_handles: Vec<Option<Arc<gpui::Image>>> = kinds
             .iter()
             .map(|k| match k {
@@ -2177,8 +2560,19 @@ impl Element for EditorElement {
                 .filter(|(r, _)| r.start < range.end && range.start < r.end)
                 .cloned()
                 .collect();
-            let runs =
-                runs_for_paragraph(&range, &selection, marked.as_ref(), &par_spans, &block_base);
+            let par_notes: Vec<(Range<usize>, bool)> = note_ranges
+                .iter()
+                .filter(|(r, _)| r.start < range.end && range.start < r.end)
+                .cloned()
+                .collect();
+            let runs = runs_for_paragraph(
+                &range,
+                &selection,
+                marked.as_ref(),
+                &par_spans,
+                &par_notes,
+                &block_base,
+            );
             let line = window
                 .text_system()
                 .shape_text(
@@ -2660,8 +3054,220 @@ impl Editor {
     }
 }
 
+impl Editor {
+    /// The Docs-style margin solver (via Liveblocks' AnchoredThreads):
+    /// downward sweep normally; with an active card, it snaps to its anchor,
+    /// later cards push down, earlier cards push up from it in reverse.
+    fn margin_cards(&self) -> Vec<(u64, f32, f32, String, bool)> {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return Vec::new();
+        };
+        let rope = self.doc.rope();
+        let len = self.doc.len_bytes();
+        let mut cards: Vec<(u64, f32, f32, String, bool)> = Vec::new();
+        for n in self.doc.notes().open() {
+            let byte = rope.char_to_byte(n.range.start.min(rope.len_chars())).min(len);
+            let Some(pos) = frame.position_of(byte, false) else {
+                continue;
+            };
+            let desired =
+                f32::from(frame.bounds.origin.y) + f32::from(pos.y) - f32::from(frame.scroll_top);
+            let lines = (n.body.chars().count() / 30 + 1).clamp(1, 3) as f32;
+            let height = 30. + 18. * lines + 22.;
+            cards.push((n.id, desired, height, n.body.clone(), self.active_note == Some(n.id)));
+        }
+        // cards are in document order (notes are kept sorted by anchor).
+        let active_ix = cards.iter().position(|(_, _, _, _, a)| *a);
+        match active_ix {
+            None => {
+                let mut bottom = f32::MIN;
+                for card in cards.iter_mut() {
+                    card.1 = card.1.max(bottom);
+                    bottom = card.1 + card.2 + MARGIN_GAP;
+                }
+            }
+            Some(a) => {
+                // Ascending from the active card (which gets its anchor y).
+                let mut bottom = f32::MIN;
+                for card in cards[a..].iter_mut() {
+                    card.1 = card.1.max(bottom);
+                    bottom = card.1 + card.2 + MARGIN_GAP;
+                }
+                // Descending above it, nearest first: push up out of the way.
+                let mut top_limit = cards[a].1;
+                for card in cards[..a].iter_mut().rev() {
+                    let max_top = top_limit - card.2 - MARGIN_GAP;
+                    card.1 = card.1.min(max_top);
+                    top_limit = card.1;
+                }
+            }
+        }
+        cards
+    }
+
+    fn margin_fits(&self, window: &Window) -> bool {
+        let vw = f32::from(window.viewport_size().width);
+        let Some(frame) = self.last_frame.as_ref() else {
+            return false;
+        };
+        let col_right = f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+        vw >= col_right + MARGIN_GAP + MARGIN_WIDTH + 8.
+    }
+
+    /// Narrow-window composer: the margin (and its in-card composer) is
+    /// hidden, so the note body is edited in a bottom strip instead.
+    fn render_composer_strip(&self) -> Option<impl IntoElement> {
+        let input = self.note_input.clone()?;
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .bg(rgb(0xF4F1EA))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .px(px(28.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .font_family("Literata")
+                .text_size(px(13.))
+                .child(div().text_color(rgb(MUTED_COLOR)).child("Note:"))
+                .child(div().flex_1().child(input)),
+        )
+    }
+
+    fn render_margin(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.margin_fits(window) {
+            return None;
+        }
+        let frame = self.last_frame.as_ref()?;
+        let col_right = f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+        let cards = self.margin_cards();
+        if cards.is_empty() {
+            return None;
+        }
+        let lane_left = col_right + MARGIN_GAP;
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(lane_left))
+                .w(px(MARGIN_WIDTH))
+                .children(cards.into_iter().map(|(id, top, _h, body, active)| {
+                    let composer = if active { self.note_input.clone() } else { None };
+                    div()
+                        .id(("note-card", id as usize))
+                        .absolute()
+                        .top(px(top.max(4.)))
+                        .left(px(if active { 0. } else { 8. }))
+                        .w(px(MARGIN_WIDTH - 8.))
+                        .p(px(8.))
+                        .rounded(px(6.))
+                        .bg(rgb(0xFFFDF6))
+                        .border_1()
+                        .border_color(if active {
+                            rgb(0xC8A951)
+                        } else {
+                            rgb(RULE_COLOR)
+                        })
+                        .cursor(CursorStyle::PointingHand)
+                        .font_family("Literata")
+                        .text_size(px(13.))
+                        .text_color(rgb(TEXT_COLOR))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                if editor.active_note != Some(id) {
+                                    let body = editor
+                                        .doc
+                                        .notes()
+                                        .get(id)
+                                        .map(|n| n.body.clone())
+                                        .unwrap_or_default();
+                                    editor.open_composer(id, body, window, cx);
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED_COLOR))
+                                .child("Note")
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(6.))
+                                        .child(
+                                            div()
+                                                .id(("note-done", id as usize))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        move |editor,
+                                                              _: &MouseDownEvent,
+                                                              _,
+                                                              cx| {
+                                                            cx.stop_propagation();
+                                                            editor.set_note_status(
+                                                                id,
+                                                                NoteStatus::Done,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ),
+                                                )
+                                                .child("✓ done"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("note-dismiss", id as usize))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        move |editor,
+                                                              _: &MouseDownEvent,
+                                                              _,
+                                                              cx| {
+                                                            cx.stop_propagation();
+                                                            editor.set_note_status(
+                                                                id,
+                                                                NoteStatus::Dismissed,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ),
+                                                )
+                                                .child("✕"),
+                                        ),
+                                ),
+                        )
+                        .when_some(composer, |d, input| d.child(input))
+                        .when(!active, |d| {
+                            d.child(if body.is_empty() {
+                                div().text_color(rgb(MUTED_COLOR)).child("(empty note)")
+                            } else {
+                                div().child(body)
+                            })
+                        })
+                })),
+        )
+    }
+}
+
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .relative()
@@ -2677,6 +3283,20 @@ impl Render for Editor {
                 d.when(!footnotes.is_empty(), |d| {
                     d.child(self.render_footnote_zone(footnotes, cx))
                 })
+            })
+            .map(|d| match self.render_margin(window, cx) {
+                Some(margin) => d.child(margin),
+                None => d,
+            })
+            .map(|d| {
+                if !self.margin_fits(window) {
+                    match self.render_composer_strip() {
+                        Some(strip) => d.child(strip),
+                        None => d,
+                    }
+                } else {
+                    d
+                }
             })
             .child(
                 div()
@@ -2746,6 +3366,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::add_checkpoint))
                     .on_action(cx.listener(Self::export_markdown))
                     .on_action(cx.listener(Self::insert_footnote))
+                    .on_action(cx.listener(Self::add_note))
                     .on_action(cx.listener(Self::open_file))
                     .on_action(cx.listener(Self::save_copy_as))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -2799,7 +3420,7 @@ mod tests {
             (2..5, InlineAttr::Strong),
             (5..8, InlineAttr::Highlight),
         ];
-        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &base());
+        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &base());
         // Segments: [0,2) plain, [2,5) bold, [5,8) highlight, [8,10) plain.
         assert_eq!(runs.len(), 4);
         assert_eq!(runs[1].font.weight, FontWeight::BOLD);
@@ -2816,7 +3437,7 @@ mod tests {
         // partial overlap splits into its own runs.
         let par = 0..6;
         let spans = vec![(0..6, InlineAttr::Highlight)];
-        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &base());
+        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &[], &base());
         let blended = blend_over(rgba(SELECTION_COLOR), rgba(HIGHLIGHT_COLOR));
         assert_eq!(runs[1].background_color, Some(blended.into()));
         assert_ne!(
@@ -2830,7 +3451,7 @@ mod tests {
         // Outside the selection the pure highlight shows.
         assert_eq!(runs[0].background_color, Some(rgba(HIGHLIGHT_COLOR).into()));
         // Selection over plain text stays the plain selection color.
-        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &base());
+        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &[], &base());
         assert_eq!(
             plain[1].background_color,
             Some(rgba(SELECTION_COLOR).into())
@@ -2841,7 +3462,7 @@ mod tests {
     fn code_run_switches_family_and_marked_text_underlines() {
         let par = 0..8;
         let spans = vec![(0..4, InlineAttr::Code)];
-        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &base());
+        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &[], &base());
         assert_eq!(runs[0].font.family.as_ref(), CODE_FONT);
         assert!(runs[1].underline.is_some());
     }

@@ -17,11 +17,12 @@ use loro::{
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::TextOp;
-use crate::document::{BlockKind, BlockMap, History, InlineAttr, SpanSet};
+use crate::document::{Annotations, BlockKind, BlockMap, History, InlineAttr, SpanSet};
 
 const TEXT_CONTAINER: &str = "content";
 const BLOCKS_CONTAINER: &str = "blocks";
 const SESSION_CONTAINER: &str = "session";
+const ANNOTATIONS_CONTAINER: &str = "annotations";
 const CHECKPOINTS_CONTAINER: &str = "checkpoints";
 const ASSETS_CONTAINER: &str = "assets";
 
@@ -31,6 +32,7 @@ pub struct Loaded {
     pub spans: SpanSet,
     pub blocks: BlockMap,
     pub history: Option<History>,
+    pub annotations: Annotations,
 }
 
 /// A named version snapshot: a Loro frontier (version vector position) the
@@ -181,6 +183,15 @@ impl Store {
                     },
                     None => None,
                 };
+                let annotations = match store.doc.get_map(ANNOTATIONS_CONTAINER).get("list") {
+                    Some(v) => match v.into_value() {
+                        Ok(LoroValue::String(json)) => {
+                            serde_json::from_str(&json).unwrap_or_default()
+                        }
+                        _ => Annotations::default(),
+                    },
+                    None => Annotations::default(),
+                };
                 Ok((
                     store,
                     Some(Loaded {
@@ -188,6 +199,7 @@ impl Store {
                         spans,
                         blocks,
                         history,
+                        annotations,
                     }),
                 ))
             }
@@ -300,7 +312,16 @@ impl Store {
         spans: &SpanSet,
         blocks: &BlockMap,
         history: &History,
+        annotations: &Annotations,
     ) -> io::Result<()> {
+        match serde_json::to_string(annotations) {
+            Ok(json) => {
+                if let Err(e) = self.doc.get_map(ANNOTATIONS_CONTAINER).insert("list", json) {
+                    eprintln!("strop: persist annotations: {e}");
+                }
+            }
+            Err(e) => eprintln!("strop: encode annotations: {e}"),
+        }
         self.rebuild_marks(spans);
         let tokens: Vec<String> = blocks.kinds().iter().map(kind_token).collect();
         if let Err(e) = self
@@ -509,7 +530,9 @@ mod tests {
         spans.add(0..6, InlineAttr::Strong);
         spans.add(9..12, InlineAttr::Code);
         spans.add(2..4, InlineAttr::Link("https://e.x".into()));
-        store.save_with_state(&spans, &BlockMap::new(1), &History::default()).unwrap();
+        store
+            .save_with_state(&spans, &BlockMap::new(1), &History::default(), &Annotations::default())
+            .unwrap();
 
         let (_s2, existing) = Store::open(&path).unwrap();
         let loaded = existing.unwrap();
@@ -533,23 +556,32 @@ mod tests {
         let _ = fs::remove_file(&path);
         let (store, _) = Store::open(&path).unwrap();
 
-        // Session 1: type, format, checkpoint, type more, save.
+        // Session 1: type, format, checkpoint, note, type more, save.
         let mut doc = Document::new("", SpanSet::default(), BlockMap::default());
         doc.edit_bytes_coalescing(0..0, "v1");
+        doc.add_note(0..2, "заметка".into(), 7);
         store.apply(&doc.take_ops());
         store.add_checkpoint("first draft");
         doc.edit_bytes(2..2, " v2");
         doc.toggle_format(0..2, InlineAttr::Strong);
         store.apply(&doc.take_ops());
         store
-            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200))
+            .save_with_state(
+                doc.spans(),
+                doc.blocks(),
+                &doc.export_history(200),
+                doc.notes(),
+            )
             .unwrap();
 
         // Session 2: undo works across the restart, typing AND formatting.
         let (store2, loaded) = Store::open(&path).unwrap();
         let loaded = loaded.unwrap();
         assert_eq!(loaded.text, "v1 v2");
+        assert_eq!(loaded.annotations.notes().len(), 1);
+        assert_eq!(loaded.annotations.notes()[0].body, "заметка");
         let mut doc2 = Document::new(&loaded.text, loaded.spans, loaded.blocks);
+        doc2.set_notes(loaded.annotations.clone());
         doc2.import_history(loaded.history.unwrap());
         assert_eq!(doc2.undo(), Some(None)); // the format toggle
         assert!(doc2.spans().spans().is_empty());
