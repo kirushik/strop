@@ -256,3 +256,20 @@ proven and patched:
   headless compositor and look at pixels myself.
 - [ ] Exit strategy: git pin on zed-industries/zed (post gpui/gpui_platform
   split) to retire the vendor patches; #54878 fallback wiring comes free.
+
+## History preview formatting (2026-06-11, Kirill's report)
+
+- [x] **Styling no longer disappears in history mode**: checkpoints carry
+  their SpanSet+BlockMap (state_at already computed them; they were being
+  discarded), and rebuild_preview projects BOTH diff sides' formatting onto
+  the merged view — kept/inserted text gets the newer version's spans and
+  block kinds, deleted text the older version's. Built on new
+  diff::prose_diff_blocks (per-block provenance: which old/new paragraph a
+  merged line renders; segments reconstruct each source byte-exact — the
+  flat prose_diff's separator newlines are synthetic, so the flat form
+  can't be cursor-walked). Smoke: pspans/pkinds in debug_cursor prove a
+  bold span + H3 survive into the preview of a real store's checkpoint.
+- [ ] Formatting-only sessions never seal a checkpoint
+  (add_checkpoint_if_changed compares text only) — bold/heading work
+  without text edits is unreachable by rewind. Compare (text, spans,
+  blocks) instead?

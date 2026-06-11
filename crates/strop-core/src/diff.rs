@@ -68,45 +68,75 @@ fn word_diff(out: &mut Vec<DiffSeg>, old: &str, new: &str) {
     }
 }
 
-/// Two-pass prose diff. Input texts use '\n' as the block separator
-/// (Strop's document model); output segments concatenate to the merged
-/// old+new reading view.
-pub fn prose_diff(old: &str, new: &str) -> Vec<DiffSeg> {
+/// One block (paragraph) of the merged diff view, with provenance: which
+/// paragraph of each source text it renders. Within a block, the Delete
+/// segments concatenate to the old paragraph's tail and Same+Insert to the
+/// new one's — byte-exact, so formatting can be projected through.
+#[derive(Debug, PartialEq)]
+pub struct BlockDiff {
+    /// Index into `old.split('\n')`, if this block existed in the old text.
+    pub old_par: Option<usize>,
+    /// Index into `new.split('\n')`, if it exists in the new text.
+    pub new_par: Option<usize>,
+    pub segs: Vec<DiffSeg>,
+}
+
+fn block(old_par: Option<usize>, new_par: Option<usize>, segs: Vec<DiffSeg>) -> BlockDiff {
+    BlockDiff {
+        old_par,
+        new_par,
+        segs,
+    }
+}
+
+/// Two-pass prose diff with block provenance. Input texts use '\n' as the
+/// block separator (Strop's document model); one BlockDiff per line of the
+/// merged reading view.
+pub fn prose_diff_blocks(old: &str, new: &str) -> Vec<BlockDiff> {
     let old_pars: Vec<&str> = old.split('\n').collect();
     let new_pars: Vec<&str> = new.split('\n').collect();
     let diff = TextDiff::from_slices(&old_pars, &new_pars);
     let mut out = Vec::new();
-    let mut first = true;
-    let mut sep = |out: &mut Vec<DiffSeg>| {
-        if !first {
-            push(out, DiffOp::Same, "\n");
-        }
-        first = false;
+    let seg = |op: DiffOp, text: &str| {
+        let mut v = Vec::new();
+        push(&mut v, op, text);
+        v
     };
     for op in diff.ops() {
         match *op {
             similar::DiffOp::Equal {
-                old_index, len, ..
+                old_index,
+                new_index,
+                len,
             } => {
-                for par in &old_pars[old_index..old_index + len] {
-                    sep(&mut out);
-                    push(&mut out, DiffOp::Same, par);
+                for i in 0..len {
+                    out.push(block(
+                        Some(old_index + i),
+                        Some(new_index + i),
+                        seg(DiffOp::Same, old_pars[old_index + i]),
+                    ));
                 }
             }
             similar::DiffOp::Delete {
                 old_index, old_len, ..
             } => {
-                for par in &old_pars[old_index..old_index + old_len] {
-                    sep(&mut out);
-                    push(&mut out, DiffOp::Delete, par);
+                for i in 0..old_len {
+                    out.push(block(
+                        Some(old_index + i),
+                        None,
+                        seg(DiffOp::Delete, old_pars[old_index + i]),
+                    ));
                 }
             }
             similar::DiffOp::Insert {
                 new_index, new_len, ..
             } => {
-                for par in &new_pars[new_index..new_index + new_len] {
-                    sep(&mut out);
-                    push(&mut out, DiffOp::Insert, par);
+                for i in 0..new_len {
+                    out.push(block(
+                        None,
+                        Some(new_index + i),
+                        seg(DiffOp::Insert, new_pars[new_index + i]),
+                    ));
                 }
             }
             similar::DiffOp::Replace {
@@ -117,18 +147,41 @@ pub fn prose_diff(old: &str, new: &str) -> Vec<DiffSeg> {
             } => {
                 let pairs = old_len.min(new_len);
                 for i in 0..pairs {
-                    sep(&mut out);
-                    word_diff(&mut out, old_pars[old_index + i], new_pars[new_index + i]);
+                    let mut segs = Vec::new();
+                    word_diff(&mut segs, old_pars[old_index + i], new_pars[new_index + i]);
+                    out.push(block(Some(old_index + i), Some(new_index + i), segs));
                 }
-                for par in &old_pars[old_index + pairs..old_index + old_len] {
-                    sep(&mut out);
-                    push(&mut out, DiffOp::Delete, par);
+                for i in pairs..old_len {
+                    out.push(block(
+                        Some(old_index + i),
+                        None,
+                        seg(DiffOp::Delete, old_pars[old_index + i]),
+                    ));
                 }
-                for par in &new_pars[new_index + pairs..new_index + new_len] {
-                    sep(&mut out);
-                    push(&mut out, DiffOp::Insert, par);
+                for i in pairs..new_len {
+                    out.push(block(
+                        None,
+                        Some(new_index + i),
+                        seg(DiffOp::Insert, new_pars[new_index + i]),
+                    ));
                 }
             }
+        }
+    }
+    out
+}
+
+/// Flat segment view: blocks joined by Same '\n' separators (the merged
+/// reading view's own newlines — NOT faithful to either source's bytes;
+/// use `prose_diff_blocks` when projecting positions back to a source).
+pub fn prose_diff(old: &str, new: &str) -> Vec<DiffSeg> {
+    let mut out = Vec::new();
+    for (i, b) in prose_diff_blocks(old, new).into_iter().enumerate() {
+        if i > 0 {
+            push(&mut out, DiffOp::Same, "\n");
+        }
+        for s in b.segs {
+            push(&mut out, s.op, &s.text);
         }
     }
     out
@@ -181,5 +234,42 @@ mod tests {
         let (ins, del) = word_delta(&segs);
         assert_eq!((ins, del), (1, 0));
         assert!(merged(&segs).contains("два"));
+    }
+
+    #[test]
+    fn blocks_carry_provenance() {
+        let blocks = prose_diff_blocks("один\nтри", "один\nдва\nтри");
+        let pars: Vec<(Option<usize>, Option<usize>)> =
+            blocks.iter().map(|b| (b.old_par, b.new_par)).collect();
+        assert_eq!(pars, vec![(Some(0), Some(0)), (None, Some(1)), (Some(1), Some(2))]);
+    }
+
+    #[test]
+    fn block_segments_reconstruct_both_sources_byte_exact() {
+        let old = "общий хвост остаётся\nудалённый абзац\nправка внутри строки тут";
+        let new = "общий хвост остаётся\nправка прямо в строке тут\nвставленный абзац";
+        let blocks = prose_diff_blocks(old, new);
+        let old_pars: Vec<&str> = old.split('\n').collect();
+        let new_pars: Vec<&str> = new.split('\n').collect();
+        for b in &blocks {
+            let from_old: String = b
+                .segs
+                .iter()
+                .filter(|s| s.op != DiffOp::Insert)
+                .map(|s| s.text.as_str())
+                .collect();
+            let from_new: String = b
+                .segs
+                .iter()
+                .filter(|s| s.op != DiffOp::Delete)
+                .map(|s| s.text.as_str())
+                .collect();
+            if let Some(p) = b.old_par {
+                assert_eq!(from_old, old_pars[p]);
+            }
+            if let Some(p) = b.new_par {
+                assert_eq!(from_new, new_pars[p]);
+            }
+        }
     }
 }

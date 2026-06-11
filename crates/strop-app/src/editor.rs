@@ -784,7 +784,7 @@ impl Editor {
         let mut entries: Vec<HistoryEntry> = Vec::new();
         let mut prev_text = String::new();
         for cp in store.checkpoints() {
-            let Some((text, _, _)) = store.state_at(&cp.frontiers) else {
+            let Some((text, spans, blocks)) = store.state_at(&cp.frontiers) else {
                 continue;
             };
             let delta = strop_core::diff::word_delta(&strop_core::diff::prose_diff(
@@ -797,6 +797,8 @@ impl Editor {
                 manual: cp.manual,
                 frontiers: cp.frontiers.clone(),
                 text,
+                spans,
+                blocks,
                 delta,
             });
         }
@@ -821,38 +823,126 @@ impl Editor {
     }
 
     fn rebuild_preview(&mut self) {
+        use strop_core::diff::DiffOp;
         let Some(hv) = &self.history_view else {
             self.history_preview = None;
             return;
         };
         let entry = &hv.entries[hv.selected];
-        let (old, new) = if hv.compare_current {
-            (entry.text.as_str(), self.doc.text())
+        let empty_spans = SpanSet::default();
+        let empty_blocks = BlockMap::default();
+        let current_text;
+        let (old, old_spans, old_blocks, new, new_spans, new_blocks) = if hv.compare_current {
+            current_text = self.doc.text();
+            (
+                entry.text.as_str(),
+                &entry.spans,
+                &entry.blocks,
+                current_text.as_str(),
+                self.doc.spans(),
+                self.doc.blocks(),
+            )
         } else {
-            let prev = hv
-                .selected
-                .checked_sub(1)
-                .map(|i| hv.entries[i].text.as_str())
-                .unwrap_or("");
-            (prev, entry.text.clone())
+            let (old, old_spans, old_blocks) = match hv.selected.checked_sub(1) {
+                Some(i) => {
+                    let prev = &hv.entries[i];
+                    (prev.text.as_str(), &prev.spans, &prev.blocks)
+                }
+                None => ("", &empty_spans, &empty_blocks),
+            };
+            (
+                old,
+                old_spans,
+                old_blocks,
+                entry.text.as_str(),
+                &entry.spans,
+                &entry.blocks,
+            )
         };
-        let segs = strop_core::diff::prose_diff(old, &new);
+
+        // Byte offsets of each '\n'-separated paragraph, plus char->byte
+        // span conversion for each source (live spans are char-indexed).
+        let par_offsets = |text: &str| {
+            let mut offs = vec![0usize];
+            offs.extend(text.match_indices('\n').map(|(b, _)| b + 1));
+            offs
+        };
+        let spans_to_bytes = |text: &str, spans: &SpanSet| {
+            let mut idx: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+            idx.push(text.len());
+            let b = |ci: usize| idx.get(ci).copied().unwrap_or(text.len());
+            spans
+                .spans()
+                .iter()
+                .map(|s| (b(s.range.start)..b(s.range.end), s.attr.clone()))
+                .collect::<Vec<_>>()
+        };
+        let old_offs = par_offsets(old);
+        let new_offs = par_offsets(new);
+        let old_spans_b = spans_to_bytes(old, old_spans);
+        let new_spans_b = spans_to_bytes(new, new_spans);
+
         let mut text = String::new();
         let mut inserts = Vec::new();
         let mut deletes = Vec::new();
-        for seg in segs {
-            let start = text.len();
-            text.push_str(&seg.text);
-            match seg.op {
-                strop_core::diff::DiffOp::Insert => inserts.push(start..text.len()),
-                strop_core::diff::DiffOp::Delete => deletes.push(start..text.len()),
-                strop_core::diff::DiffOp::Same => {}
+        let mut spans_bytes: Vec<(Range<usize>, InlineAttr)> = Vec::new();
+        let mut kinds: Vec<BlockKind> = Vec::new();
+        for (i, b) in strop_core::diff::prose_diff_blocks(old, new).iter().enumerate() {
+            if i > 0 {
+                text.push('\n');
+            }
+            // Block style follows the newer side when it exists there.
+            kinds.push(
+                b.new_par
+                    .and_then(|p| new_blocks.kinds().get(p))
+                    .or_else(|| b.old_par.and_then(|p| old_blocks.kinds().get(p)))
+                    .cloned()
+                    .unwrap_or(BlockKind::Paragraph),
+            );
+            // Within the block, Delete segments concatenate to the old
+            // paragraph and Same+Insert to the new one (byte-exact, by
+            // prose_diff_blocks' contract) — walk both cursors and project
+            // each source's spans onto the merged text.
+            let mut old_b = b.old_par.map_or(0, |p| old_offs[p]);
+            let mut new_b = b.new_par.map_or(0, |p| new_offs[p]);
+            for seg in &b.segs {
+                let start = text.len();
+                let len = seg.text.len();
+                let (src_spans, src_start) = match seg.op {
+                    DiffOp::Delete => (&old_spans_b, old_b),
+                    _ => (&new_spans_b, new_b),
+                };
+                for (r, attr) in src_spans {
+                    let s = r.start.max(src_start);
+                    let e = r.end.min(src_start + len);
+                    if s < e {
+                        spans_bytes
+                            .push((start + (s - src_start)..start + (e - src_start), attr.clone()));
+                    }
+                }
+                text.push_str(&seg.text);
+                match seg.op {
+                    DiffOp::Insert => {
+                        inserts.push(start..text.len());
+                        new_b += len;
+                    }
+                    DiffOp::Delete => {
+                        deletes.push(start..text.len());
+                        old_b += len;
+                    }
+                    DiffOp::Same => {
+                        old_b += len;
+                        new_b += len;
+                    }
+                }
             }
         }
         self.history_preview = Some(PreviewDoc {
             text,
             inserts,
             deletes,
+            spans_bytes,
+            kinds,
         });
     }
 
@@ -2616,12 +2706,24 @@ impl Editor {
             .take(self.doc.rope().byte_to_char(cursor) - tail_start)
             .collect();
         let hist = match &self.history_view {
-            Some(hv) => format!(
-                " hist={}/{} preview={}b",
-                hv.selected + 1,
-                hv.entries.len(),
-                self.history_preview.as_ref().map_or(0, |p| p.text.len())
-            ),
+            Some(hv) => {
+                let (bytes, pspans, styled_kinds) =
+                    self.history_preview.as_ref().map_or((0, 0, 0), |p| {
+                        (
+                            p.text.len(),
+                            p.spans_bytes.len(),
+                            p.kinds
+                                .iter()
+                                .filter(|k| !matches!(k, BlockKind::Paragraph))
+                                .count(),
+                        )
+                    });
+                format!(
+                    " hist={}/{} preview={bytes}b pspans={pspans} pkinds={styled_kinds}",
+                    hv.selected + 1,
+                    hv.entries.len(),
+                )
+            }
             None => String::new(),
         };
         let doc_state = format!(
@@ -3215,14 +3317,11 @@ impl Element for EditorElement {
         let wrap_width = bounds.size.width;
         let viewport = bounds.size.height;
 
-        let preview = editor
-            .history_preview
-            .as_ref()
-            .map(|p| (p.text.clone(), p.inserts.clone(), p.deletes.clone()));
+        let preview = editor.history_preview.clone();
         let in_history = preview.is_some();
-        let (text, diff_inserts, diff_deletes) = match preview {
-            Some((t, i, d)) => (t, i, d),
-            None => (editor.doc.text(), Vec::new(), Vec::new()),
+        let (text, diff_inserts, diff_deletes, preview_spans, preview_kinds) = match preview {
+            Some(p) => (p.text, p.inserts, p.deletes, Some(p.spans_bytes), Some(p.kinds)),
+            None => (editor.doc.text(), Vec::new(), Vec::new(), None, None),
         };
         let selection = if in_history {
             0..0
@@ -3239,9 +3338,11 @@ impl Element for EditorElement {
         let cursor_blink_visible = editor.cursor_visible && !in_history;
         let mut scroll_top = editor.scroll_top;
         let autoscroll = editor.autoscroll_request;
-        // Formatting spans, converted to byte ranges for this frame.
-        let spans_bytes: Vec<(Range<usize>, InlineAttr)> = if in_history {
-            Vec::new()
+        // Formatting spans, converted to byte ranges for this frame. In
+        // history mode the preview carries its own, already projected
+        // through the diff onto the merged text.
+        let spans_bytes: Vec<(Range<usize>, InlineAttr)> = if let Some(spans) = preview_spans {
+            spans
         } else {
             let rope = editor.doc.rope();
             editor
@@ -3268,8 +3369,8 @@ impl Element for EditorElement {
         };
 
         let font_scale = editor.config.font_size.map_or(1., |s| (s / 20.).clamp(0.6, 2.));
-        let kinds: Vec<BlockKind> = if in_history {
-            vec![BlockKind::Paragraph; text.split('\n').count()]
+        let kinds: Vec<BlockKind> = if let Some(kinds) = preview_kinds {
+            kinds
         } else {
             editor.doc.blocks().kinds().to_vec()
         };
@@ -4183,6 +4284,10 @@ struct HistoryEntry {
     manual: bool,
     frontiers: Vec<u8>,
     text: String,
+    /// Formatting at this checkpoint — projected into the preview so the
+    /// document doesn't strip to plain text while time-travelling.
+    spans: SpanSet,
+    blocks: BlockMap,
     /// (+words, -words) vs the previous checkpoint.
     delta: (usize, usize),
 }
@@ -4198,10 +4303,16 @@ struct HistoryView {
 }
 
 /// The materialized preview: merged diff text + styled ranges (bytes).
+/// Formatting is projected from both diff sides — kept/inserted content
+/// carries the newer version's spans and block kinds, deleted content the
+/// older version's — so history reads as the document, not as plain text.
+#[derive(Clone)]
 struct PreviewDoc {
     text: String,
     inserts: Vec<Range<usize>>,
     deletes: Vec<Range<usize>>,
+    spans_bytes: Vec<(Range<usize>, InlineAttr)>,
+    kinds: Vec<BlockKind>,
 }
 
 struct MarginCard {
