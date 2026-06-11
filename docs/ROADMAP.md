@@ -155,9 +155,15 @@ unless they'd be expensive to reverse.
   files, if multi-doc workflows materialize.
 - **Margin v2** (from the C1 research): floating card near anchor on
   narrow windows, gutter dots / clean-mode, collapsed icon rail, snap
-  animation (~180ms ease on card top), diagnosis-card anatomy (mode chip +
-  named problem + query phrasing) when C3 lands, CriticMarkup export of
-  notes.
+  animation (~180ms ease on card top), CriticMarkup export of notes.
+  (Diagnosis-card anatomy landed with C3; checkpoint rename-in-place and
+  image alt editing landed 2026-06-11.)
+- **Visual self-verification** (blocked on a one-time user action): the
+  agent cannot screenshot GNOME Wayland headlessly — portal screenshot is
+  permission-gated (a dialog may be pending; approving it once grants it),
+  or `sudo apt install sway grim` enables a nested headless compositor the
+  agent fully controls. Either unblocks autonomous visual audit/polish of
+  all UI built to date.
 
 - [x] **History & versions visualization** (researched + rebuilt
   2026-06-11): the research verdict — list beats scrubber (Etherpad's

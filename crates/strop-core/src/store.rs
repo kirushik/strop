@@ -286,6 +286,31 @@ impl Store {
         }
     }
 
+    /// Rename a checkpoint; renaming an automatic entry makes it named
+    /// (manual), per the rewind research.
+    pub fn rename_checkpoint(&self, ix: usize, name: &str) {
+        let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
+        let Some(v) = list.get(ix) else { return };
+        let Ok(LoroValue::String(json)) = v.into_value() else {
+            return;
+        };
+        let Ok(mut cp) = serde_json::from_str::<Checkpoint>(&json) else {
+            return;
+        };
+        cp.name = name.to_owned();
+        cp.manual = true;
+        match serde_json::to_string(&cp) {
+            Ok(json) => {
+                let _ = list.delete(ix, 1);
+                if let Err(e) = list.insert(ix, json) {
+                    eprintln!("strop: rename checkpoint: {e}");
+                }
+                self.doc.commit();
+            }
+            Err(e) => eprintln!("strop: encode checkpoint: {e}"),
+        }
+    }
+
     pub fn checkpoints(&self) -> Vec<Checkpoint> {
         let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
         (0..list.len())

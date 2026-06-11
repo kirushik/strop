@@ -203,6 +203,10 @@ pub struct Editor {
     /// Replace field (ctrl-h adds it beside find): Enter on it replaces
     /// the current match; the All button replaces every match (one undo).
     replace_input: Option<Entity<NoteInput>>,
+    /// Rename-in-place for a history row: (entry index, composer).
+    rename_input: Option<(usize, Entity<NoteInput>)>,
+    /// Alt-text composer for an image block: (block index, composer).
+    alt_input: Option<(usize, Entity<NoteInput>)>,
     /// In-card composer for the active note's body.
     note_input: Option<Entity<NoteInput>>,
     last_frame: Option<TextFrame>,
@@ -640,6 +644,8 @@ impl Editor {
             find_input: None,
             find_current: 0,
             replace_input: None,
+            rename_input: None,
+            alt_input: None,
             note_input: None,
             last_frame: None,
         }
@@ -794,6 +800,71 @@ impl Editor {
             inserts,
             deletes,
         });
+    }
+
+    fn edit_image_alt(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let BlockKind::Image { src, alt, caption } = self.doc.blocks().kind(block).clone()
+        else {
+            return;
+        };
+        let input = cx.new(|cx| NoteInput::new(cx, alt));
+        cx.subscribe_in(
+            &input,
+            window,
+            move |editor, _, event: &NoteInputEvent, window, cx| {
+                if let NoteInputEvent::Commit(new_alt) = event {
+                    editor.doc.set_block_kind(
+                        block,
+                        BlockKind::Image {
+                            src: src.clone(),
+                            alt: new_alt.clone(),
+                            caption: caption.clone(),
+                        },
+                    );
+                    editor.store_dirty = true;
+                }
+                editor.alt_input = None;
+                window.focus(&editor.focus_handle);
+                cx.notify();
+            },
+        )
+        .detach();
+        window.focus(&input.read(cx).focus_handle);
+        self.alt_input = Some((block, input));
+        cx.notify();
+    }
+
+    fn start_rename(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hv) = &self.history_view else { return };
+        let seed = hv.entries[ix].name.clone();
+        let input = cx.new(|cx| NoteInput::new(cx, seed));
+        cx.subscribe_in(
+            &input,
+            window,
+            move |editor, _, event: &NoteInputEvent, window, cx| {
+                if let NoteInputEvent::Commit(name) = event {
+                    if !name.trim().is_empty() {
+                        if let Some(store) = &editor.store {
+                            store.rename_checkpoint(ix, name.trim());
+                            editor.store_dirty = true;
+                        }
+                        if let Some(hv) = &mut editor.history_view {
+                            if let Some(e) = hv.entries.get_mut(ix) {
+                                e.name = name.trim().to_owned();
+                                e.manual = true;
+                            }
+                        }
+                    }
+                }
+                editor.rename_input = None;
+                window.focus(&editor.focus_handle);
+                cx.notify();
+            },
+        )
+        .detach();
+        window.focus(&input.read(cx).focus_handle);
+        self.rename_input = Some((ix, input));
+        cx.notify();
     }
 
     fn history_select(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -1378,6 +1449,29 @@ impl Editor {
             }
         }
         out
+    }
+
+    fn render_alt_strip(&self) -> Option<impl IntoElement> {
+        let (_, input) = self.alt_input.clone()?;
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .bg(rgb(0xF4F1EA))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .px(px(28.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .font_family("Literata")
+                .text_size(px(13.))
+                .child(div().text_color(rgb(MUTED_COLOR)).child("Alt text:"))
+                .child(div().flex_1().child(input)),
+        )
     }
 
     fn render_find_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -2369,7 +2463,7 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_mouse_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
         self.is_selecting = true;
         self.drag_point = Some(ev.position);
@@ -2412,6 +2506,12 @@ impl Editor {
                     .map(|n| n.id);
             }
             2 => {
+                // Double-click on an image block edits its alt text.
+                let block = self.doc.block_of_byte(ix.min(self.doc.len_bytes()));
+                if matches!(self.doc.blocks().kind(block), BlockKind::Image { .. }) {
+                    self.edit_image_alt(block, window, cx);
+                    return;
+                }
                 self.select_granularity = SelectGranularity::Word;
                 self.selection_origin = Some(self.word_range_at(ix));
                 self.extend_by_unit(ix, cx);
@@ -3665,9 +3765,13 @@ impl Editor {
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                        cx.listener(move |editor, ev: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            editor.history_select(ix, cx);
+                            if ev.click_count >= 2 {
+                                editor.start_rename(ix, window, cx);
+                            } else {
+                                editor.history_select(ix, cx);
+                            }
                         }),
                     )
                     .child(
@@ -3675,14 +3779,25 @@ impl Editor {
                             .flex()
                             .justify_between()
                             .child(
-                                div()
-                                    .text_color(rgb(TEXT_COLOR))
-                                    .when(e.manual, |d| d.font_weight(FontWeight::SEMIBOLD))
-                                    .child(format!(
-                                        "{}{}",
-                                        if e.manual { "● " } else { "○ " },
-                                        e.name.clone()
-                                    )),
+                                match self
+                                    .rename_input
+                                    .as_ref()
+                                    .filter(|(rix, _)| *rix == ix)
+                                {
+                                    Some((_, input)) => {
+                                        div().flex_1().child(input.clone())
+                                    }
+                                    None => div()
+                                        .text_color(rgb(TEXT_COLOR))
+                                        .when(e.manual, |d| {
+                                            d.font_weight(FontWeight::SEMIBOLD)
+                                        })
+                                        .child(format!(
+                                            "{}{}",
+                                            if e.manual { "● " } else { "○ " },
+                                            e.name.clone()
+                                        )),
+                                },
                             )
                             .child(
                                 div()
@@ -4197,6 +4312,10 @@ impl Render for Editor {
                 }
             })
             .map(|d| match self.render_find_strip(cx) {
+                Some(strip) => d.child(strip),
+                None => d,
+            })
+            .map(|d| match self.render_alt_strip() {
                 Some(strip) => d.child(strip),
                 None => d,
             })
