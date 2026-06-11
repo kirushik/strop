@@ -57,7 +57,7 @@ actions!(
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
-        OpenFile, SaveCopyAs, AddNote, RunDiagnosis, Find, EscapeMode, ToggleHistory,
+        OpenFile, SaveCopyAs, AddNote, RunDiagnosis, Find, Replace, EscapeMode, ToggleHistory,
     ]
 );
 
@@ -131,11 +131,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-m", AddNote, ctx),
         KeyBinding::new("ctrl-shift-d", RunDiagnosis, ctx),
         KeyBinding::new("ctrl-f", Find, ctx),
+        KeyBinding::new("ctrl-h", Replace, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
         KeyBinding::new("ctrl-alt-h", ToggleHistory, ctx),
         KeyBinding::new("enter", NoteCommit, Some("NoteInput")),
         KeyBinding::new("escape", NoteCancel, Some("NoteInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
+        KeyBinding::new("tab", NoteTab, Some("NoteInput")),
         KeyBinding::new("ctrl-o", OpenFile, ctx),
         KeyBinding::new("ctrl-shift-s", SaveCopyAs, ctx),
     ]);
@@ -196,6 +198,9 @@ pub struct Editor {
     /// Find bar (ctrl-f): live-highlighting query input; Enter advances.
     find_input: Option<Entity<NoteInput>>,
     find_current: usize,
+    /// Replace field (ctrl-h adds it beside find): Enter on it replaces
+    /// the current match; the All button replaces every match (one undo).
+    replace_input: Option<Entity<NoteInput>>,
     /// In-card composer for the active note's body.
     note_input: Option<Entity<NoteInput>>,
     last_frame: Option<TextFrame>,
@@ -247,7 +252,7 @@ impl NoteInput {
     }
 }
 
-actions!(note_input, [NoteCommit, NoteCancel, NoteBackspace]);
+actions!(note_input, [NoteCommit, NoteCancel, NoteBackspace, NoteTab]);
 
 impl EntityInputHandler for NoteInput {
     fn text_for_range(
@@ -632,6 +637,7 @@ impl Editor {
             last_ai_error: None,
             find_input: None,
             find_current: 0,
+            replace_input: None,
             note_input: None,
             last_frame: None,
         }
@@ -1203,6 +1209,7 @@ impl Editor {
                 }
                 NoteInputEvent::Cancel => {
                     editor.find_input = None;
+                    editor.replace_input = None;
                     window.focus(&editor.focus_handle);
                     cx.notify();
                 }
@@ -1217,6 +1224,109 @@ impl Editor {
 
     /// Case-insensitive (first-lowercase-char folding — exact for RU/EN,
     /// approximate for ß-class expansions) match positions in byte ranges.
+    /// Tab in the find/replace bar hops between the two fields (the
+    /// action bubbles up from the NoteInput context to the editor).
+    fn note_tab(&mut self, _: &NoteTab, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(find), Some(rep)) = (self.find_input.clone(), self.replace_input.clone())
+        else {
+            return;
+        };
+        if find.read(cx).focus_handle.is_focused(window) {
+            window.focus(&rep.read(cx).focus_handle);
+        } else {
+            window.focus(&find.read(cx).focus_handle);
+        }
+        cx.notify();
+    }
+
+    /// ctrl-h: ensure the find bar exists, add the replace field.
+    fn replace(&mut self, _: &Replace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_input.is_none() {
+            self.find(&Find, window, cx);
+        }
+        if self.replace_input.is_some() {
+            return;
+        }
+        let input = cx.new(|cx| NoteInput::new(cx, String::new()));
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, _, event: &NoteInputEvent, window, cx| match event {
+                NoteInputEvent::Commit(replacement) => {
+                    editor.replace_current(replacement.clone(), cx);
+                }
+                NoteInputEvent::Cancel => {
+                    editor.find_input = None;
+                    editor.replace_input = None;
+                    window.focus(&editor.focus_handle);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        self.replace_input = Some(input);
+        cx.notify();
+    }
+
+    /// Replace the current match and advance to the next.
+    fn replace_current(&mut self, replacement: String, cx: &mut Context<Self>) {
+        let Some(find) = self.find_input.clone() else {
+            return;
+        };
+        let query = find.read(cx).content.clone();
+        let matches = self.find_matches(&query);
+        if matches.is_empty() {
+            return;
+        }
+        let ix = self.find_current % matches.len();
+        let target = matches[ix].clone();
+        self.doc.edit_bytes(target.clone(), &replacement);
+        let cursor = target.start + replacement.len();
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.sync_mutations();
+        self.store_dirty = true;
+        // Land on what is now the match at the same index.
+        let matches = self.find_matches(&query);
+        if !matches.is_empty() {
+            self.find_current = ix % matches.len();
+            self.selected_range = matches[self.find_current].clone();
+        }
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// Replace every match in one undoable step (reverse order keeps
+    /// earlier offsets valid; the buffer coalesces nothing here — each
+    /// edit is its own transaction, so group manually via restore… no:
+    /// edits run back-to-front so a single undo per edit would be tedious —
+    /// instead snapshot once by funnelling through one transaction).
+    fn replace_all(&mut self, cx: &mut Context<Self>) {
+        let (Some(find), Some(rep)) = (self.find_input.clone(), self.replace_input.clone())
+        else {
+            return;
+        };
+        let query = find.read(cx).content.clone();
+        let replacement = rep.read(cx).content.clone();
+        let matches = self.find_matches(&query);
+        if matches.is_empty() {
+            return;
+        }
+        for m in matches.iter().rev() {
+            self.doc.edit_bytes(m.clone(), &replacement);
+        }
+        let count = matches.len();
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+        self.sync_mutations();
+        self.store_dirty = true;
+        self.find_current = 0;
+        eprintln!("strop: replaced {count} matches");
+        self.bump_activity();
+        cx.notify();
+    }
+
     fn find_matches(&self, query: &str) -> Vec<Range<usize>> {
         if query.is_empty() {
             return Vec::new();
@@ -1285,7 +1395,29 @@ impl Editor {
                 .text_size(px(13.))
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Find:"))
                 .child(div().flex_1().child(input))
-                .child(div().text_color(rgb(MUTED_COLOR)).child(label)),
+                .child(div().text_color(rgb(MUTED_COLOR)).child(label))
+                .when_some(self.replace_input.clone(), |d, rep| {
+                    d.child(div().text_color(rgb(MUTED_COLOR)).child("→"))
+                        .child(div().flex_1().child(rep))
+                        .child(
+                            div()
+                                .id("replace-all")
+                                .px(px(8.))
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .cursor(CursorStyle::PointingHand)
+                                .bg(rgb(0xE8DFC8))
+                                .hover(|d| d.bg(rgb(0xDFD3B0)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        editor.replace_all(cx);
+                                    }),
+                                )
+                                .child("All"),
+                        )
+                }),
         )
     }
 
@@ -3986,6 +4118,10 @@ impl Render for Editor {
             .bg(rgb(BG_COLOR))
             .flex()
             .flex_col()
+            // Bottom strips (find/replace, composer) mount on this root,
+            // outside the column's listener stack — actions from their
+            // inputs bubble here.
+            .on_action(cx.listener(Self::note_tab))
             .child(self.render_titlebar(cx))
             .when(self.history_view.is_some(), |d| {
                 d.child(self.render_history_panel(cx))
@@ -4085,6 +4221,8 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::add_note))
                     .on_action(cx.listener(Self::run_diagnosis))
                     .on_action(cx.listener(Self::find))
+                    .on_action(cx.listener(Self::replace))
+                    .on_action(cx.listener(Self::note_tab))
                     .on_action(cx.listener(Self::escape_mode))
                     .on_action(cx.listener(Self::toggle_history))
                     .on_action(cx.listener(Self::open_file))

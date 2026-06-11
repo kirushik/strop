@@ -177,6 +177,9 @@ unless they'd be expensive to reverse.
 
 ## Explicitly post-MVP
 
-Voice-distance metric (the generation-gate experiment), any text
-generation, believing-mode, sync/multiplayer, mac/Windows, find-replace,
-tables (never?), per-paragraph AI rewrites (thesis says diagnosis only).
+Voice-distance metric (v0 stylometric proxy IN PROGRESS — surprisal-based
+real metric still post-MVP), any text generation, believing-mode (IN
+PROGRESS), sync/multiplayer, mac/Windows, ~~find-replace~~ (done
+2026-06-11: ctrl-h adds a replace field to the find bar, Tab hops fields,
+Enter replaces-and-advances, All replaces every match), tables (never?),
+per-paragraph AI rewrites (thesis says diagnosis only).
