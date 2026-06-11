@@ -316,8 +316,11 @@ impl Store {
     /// (the research's top Docs complaint).
     pub fn add_checkpoint_if_changed(&self, name: &str, manual: bool) {
         if let Some(last) = self.checkpoints().last() {
-            if let Some((text, _, _)) = self.state_at(&last.frontiers) {
-                if text == self.text() {
+            if let Some(at_last) = self.state_at(&last.frontiers) {
+                // Full (text, spans, blocks) comparison: a session that only
+                // bolded or restructured headings still deserves a rewind
+                // point — text-only comparison made such work unreachable.
+                if at_last == self.read_state() {
                     return;
                 }
             }
@@ -537,6 +540,44 @@ mod tests {
             existing.map(|l| l.text).as_deref(),
             Some("привет, мир")
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn formatting_only_change_still_seals_a_checkpoint() {
+        let path = temp_path("fmt-checkpoint");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("слово и слово");
+        store.add_checkpoint("base", false);
+
+        // Identical call with nothing changed: skipped.
+        store.add_checkpoint_if_changed("noop", false);
+        assert_eq!(store.checkpoints().len(), 1);
+
+        // Bold a word without touching the text.
+        let mut spans = SpanSet::default();
+        spans.add(0..5, crate::document::InlineAttr::Strong);
+        store
+            .save_with_state(
+                &spans,
+                &BlockMap::from_kinds(vec![crate::document::BlockKind::Paragraph]),
+                &History::default(),
+                &Annotations::default(),
+            )
+            .unwrap();
+        store.add_checkpoint_if_changed("bolded", false);
+        assert_eq!(
+            store.checkpoints().len(),
+            2,
+            "formatting-only work must be reachable by rewind"
+        );
+
+        // And again with no further change: skipped.
+        store.add_checkpoint_if_changed("noop2", false);
+        assert_eq!(store.checkpoints().len(), 2);
 
         let _ = fs::remove_file(&path);
     }

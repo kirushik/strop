@@ -141,7 +141,7 @@ pub struct Span {
 }
 
 /// Inline formatting as an interval set, kept sorted by start.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpanSet {
     spans: Vec<Span>,
 }
