@@ -11,8 +11,12 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle, Element, ElementId,
+    ElementInputHandler, ExternalPaths, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextAlign, TextRun,
@@ -158,6 +162,9 @@ pub struct Editor {
     store_dirty: bool,
     /// Rough rewind panel (B5); proper history visualization is backlogged.
     show_history: bool,
+    /// Encoded image assets by id; Arc<gpui::Image> handles feed GPUI's
+    /// decode-once cache via use_render_image.
+    image_assets: HashMap<String, Arc<gpui::Image>>,
     last_frame: Option<TextFrame>,
 }
 
@@ -194,6 +201,8 @@ struct ParagraphLayout {
     bg: Option<gpui::Rgba>,
     quote_rule: bool,
     marker: Option<SharedString>,
+    /// Decoded image for Image blocks, with its display size.
+    image: Option<(Arc<RenderImage>, gpui::Size<Pixels>)>,
 }
 
 impl ParagraphLayout {
@@ -330,6 +339,7 @@ impl Editor {
             store: None,
             store_dirty: false,
             show_history: false,
+            image_assets: HashMap::new(),
             last_frame: None,
         }
     }
@@ -1204,9 +1214,78 @@ impl Editor {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            // Pasted text is never typographed — it is already authored.
-            self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        for entry in item.into_entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    self.import_image_bytes(image.bytes, cx);
+                    return;
+                }
+                ClipboardEntry::String(text) => {
+                    // Pasted text is never typographed — already authored.
+                    let text = text.text().replace("\r\n", "\n");
+                    self.apply_replace(None, &text, false, cx);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Run the §5b import pipeline off the UI thread, then insert a block.
+    fn import_image_bytes(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { strop_core::images::import_image(bytes) })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| match result {
+                Ok(imported) => editor.insert_image_block(imported, cx),
+                Err(e) => eprintln!("strop: {e}"),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn insert_image_block(
+        &mut self,
+        imported: strop_core::images::Imported,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = &self.store else {
+            eprintln!("strop: image pasted, but no document store to keep it in");
+            return;
+        };
+        let src = store.put_asset(imported.bytes, imported.ext);
+        self.store_dirty = true;
+        let cursor = self.cursor_offset().min(self.doc.len_bytes());
+        let (_, par_end) = self.paragraph_bounds(cursor);
+        self.doc.edit_bytes(par_end..par_end, "\n");
+        let block = self.doc.block_of_byte((par_end + 1).min(self.doc.len_bytes()));
+        self.doc.set_block_kind_in_current_tx(
+            block,
+            BlockKind::Image {
+                src,
+                alt: String::new(),
+                caption: String::new(),
+            },
+        );
+        let cursor = par_end + 1;
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.sync_mutations();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    fn on_file_drop(&mut self, paths: &ExternalPaths, _: &mut Window, cx: &mut Context<Self>) {
+        for path in paths.paths() {
+            match std::fs::read(path) {
+                Ok(bytes) => self.import_image_bytes(bytes, cx),
+                Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
+            }
         }
     }
 
@@ -1895,6 +1974,44 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        // Ensure encoded-image handles exist for every Image block (the
+        // actual decode is async inside GPUI's asset cache).
+        let needed: Vec<String> = {
+            let editor = self.editor.read(cx);
+            editor
+                .doc
+                .blocks()
+                .kinds()
+                .iter()
+                .filter_map(|k| match k {
+                    BlockKind::Image { src, .. }
+                        if !editor.image_assets.contains_key(src) =>
+                    {
+                        Some(src.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        if !needed.is_empty() {
+            self.editor.update(cx, |editor, _| {
+                for id in needed {
+                    let Some(store) = &editor.store else { continue };
+                    let Some(bytes) = store.get_asset(&id) else { continue };
+                    let format = if id.ends_with(".png") {
+                        gpui::ImageFormat::Png
+                    } else if id.ends_with(".webp") {
+                        gpui::ImageFormat::Webp
+                    } else {
+                        gpui::ImageFormat::Jpeg
+                    };
+                    editor
+                        .image_assets
+                        .insert(id, Arc::new(gpui::Image::from_bytes(format, bytes)));
+                }
+            });
+        }
+
         let editor = self.editor.read(cx);
         let style = window.text_style();
         let line_height = window.line_height();
@@ -1937,6 +2054,14 @@ impl Element for EditorElement {
         };
 
         let kinds: Vec<BlockKind> = editor.doc.blocks().kinds().to_vec();
+        let image_handles: Vec<Option<Arc<gpui::Image>>> = kinds
+            .iter()
+            .map(|k| match k {
+                BlockKind::Image { src, .. } => editor.image_assets.get(src).cloned(),
+                _ => None,
+            })
+            .collect();
+        let scale = window.scale_factor();
 
         let mut paragraphs = Vec::new();
         let mut top = px(0.);
@@ -2007,7 +2132,23 @@ impl Element for EditorElement {
                 })
                 .collect();
             top += bstyle.extra_top;
-            let height = line.size(bstyle.line_height).height;
+            let mut height = line.size(bstyle.line_height).height;
+            let image = image_handles[block_ix].clone().and_then(|handle| {
+                let render = handle.use_render_image(window, cx)?;
+                let dev = render.size(0);
+                // Crisp at this DPI, capped to the column width.
+                let natural_w = dev.width.0 as f32 / scale;
+                let natural_h = dev.height.0 as f32 / scale;
+                let w = natural_w.min(f32::from(wrap_width));
+                let h = natural_h * (w / natural_w);
+                Some((render, gpui::size(px(w), px(h))))
+            });
+            if matches!(kind, BlockKind::Image { .. }) {
+                height = image
+                    .as_ref()
+                    .map(|(_, sz)| sz.height)
+                    .unwrap_or(px(56.)); // decoding placeholder
+            }
             paragraphs.push(ParagraphLayout {
                 line,
                 range: range.clone(),
@@ -2019,6 +2160,7 @@ impl Element for EditorElement {
                 bg: bstyle.bg,
                 quote_rule: bstyle.quote_rule,
                 marker,
+                image,
             });
             top += height + paragraph_gap;
             offset = range.end + 1; // step over '\n'
@@ -2121,6 +2263,17 @@ impl Element for EditorElement {
                 ));
             }
             let origin = bounds.origin + point(par.indent, y);
+            if let Some((render, sz)) = &par.image {
+                if let Err(e) = window.paint_image(
+                    Bounds::new(origin, *sz),
+                    Corners::default(),
+                    render.clone(),
+                    0,
+                    false,
+                ) {
+                    eprintln!("strop: paint image: {e}");
+                }
+            }
             if let Some(marker) = &par.marker {
                 let run = TextRun {
                     len: marker.len(),
@@ -2530,6 +2683,7 @@ impl Render for Editor {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                    .on_drop(cx.listener(Self::on_file_drop))
                             .w_full()
                             .max_w(px(660.))
                             .h_full()

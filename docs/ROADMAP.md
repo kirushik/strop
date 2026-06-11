@@ -49,9 +49,16 @@ unless they'd be expensive to reverse.
       zone shows defs whose refs are on screen (overlay inset, height
       cap + internal scroll, click jumps to def). Stale-frame offset
       clamps added across frame-data consumers (fixed a delete-all panic).
-- [ ] B3. **Images**: paste/drop import pipeline per §5b policy (types,
-      2400px downscale, EXIF strip, 8MB refusal), assets in Loro, block
-      rendering via gpui img.
+- [x] B3. **Images**: §5b pipeline in core (header-only bomb check,
+      PNG/WebP byte-identical passthrough, JPEG passthrough only when
+      EXIF-free — privacy beats fidelity, decided 2026-06-11; alpha-rule
+      conversion, CatmullRom downscale, in-crate orientation baking;
+      runs on the background executor — 0.3-0.8s for 12MP). blake3
+      content-addressed assets in-file with dedupe. Paste (Wayland
+      clipboard images verified readable per GPUI source) and file drop
+      (ExternalPaths) insert Image blocks; rendering via Arc<gpui::Image>
+      -> use_render_image decode-once cache -> Window::paint_image,
+      DPI-crisp and column-capped.
 - [ ] B4. File UX: ctrl-o open (.strop/.md via xdg portal dialog), recent
       files on the bar?, save-as. Keep minimal.
 - [x] B5. **Checkpoints & persistent history** (plumbing done 2026-06-11,
@@ -98,6 +105,18 @@ unless they'd be expensive to reverse.
       to match reality.
 
 ## Backlog (researched properly, not squeezed in)
+
+- **Asset GC**: deleting an image block orphans its asset in the file
+  (undo/history keep it reachable); needs a reachability sweep at save
+  or checkpoint-compaction time.
+- **Markdown export of assets**: image blocks export as
+  `![alt](asset:...)` ids; a real export should write `doc.assets/` files
+  with relative links (document-model §6).
+- **fast_image_resize**: adopt (SIMD, 10-30x) if import latency on large
+  photos annoys; image-crate resampler is scalar.
+- **Image UX**: selection/deletion affordances on image blocks, alt/caption
+  editing, GNOME screenshot-portal paste quirks. Wayland clipboard image
+  WRITE is unimplemented in GPUI (copying an image out won't work).
 
 - **History & versions visualization** (Kirill, 2026-06-11): the rewind
   panel is deliberately rough. Research the design space before building

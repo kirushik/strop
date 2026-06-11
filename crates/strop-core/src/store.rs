@@ -23,6 +23,7 @@ const TEXT_CONTAINER: &str = "content";
 const BLOCKS_CONTAINER: &str = "blocks";
 const SESSION_CONTAINER: &str = "session";
 const CHECKPOINTS_CONTAINER: &str = "checkpoints";
+const ASSETS_CONTAINER: &str = "assets";
 
 /// Everything a reopened document restores.
 pub struct Loaded {
@@ -222,6 +223,28 @@ impl Store {
             None => BlockMap::default(),
         };
         (text.to_string(), spans, blocks)
+    }
+
+    /// Store an image asset in-file; returns its id for Image{src}.
+    /// Content-addressed (blake3) — identical pastes dedupe; the document
+    /// stays a single portable file.
+    pub fn put_asset(&self, bytes: Vec<u8>, ext: &str) -> String {
+        let id = format!("asset:{}.{ext}", blake3::hash(&bytes).to_hex());
+        let assets = self.doc.get_map(ASSETS_CONTAINER);
+        if assets.get(&id).is_none() {
+            if let Err(e) = assets.insert(&id, bytes) {
+                eprintln!("strop: store asset: {e}");
+            }
+            self.doc.commit();
+        }
+        id
+    }
+
+    pub fn get_asset(&self, id: &str) -> Option<Vec<u8>> {
+        match self.doc.get_map(ASSETS_CONTAINER).get(id)?.into_value() {
+            Ok(LoroValue::Binary(b)) => Some(b.to_vec()),
+            _ => None,
+        }
     }
 
     /// Record a named checkpoint at the current version.
@@ -442,6 +465,23 @@ mod tests {
         assert_eq!(existing.unwrap().text, "abcd");
         assert!(store3.doc.len_ops() > ops_after_first);
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn assets_roundtrip_and_dedupe() {
+        let path = temp_path("assets");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        let bytes = vec![1u8, 2, 3, 4, 5];
+        let id = store.put_asset(bytes.clone(), "png");
+        let id2 = store.put_asset(bytes.clone(), "png");
+        assert_eq!(id, id2); // dedupe by content
+        assert!(id.ends_with(".png"));
+        store.save().unwrap();
+        let (store2, _) = Store::open(&path).unwrap();
+        assert_eq!(store2.get_asset(&id), Some(bytes));
+        assert_eq!(store2.get_asset("asset:missing"), None);
         let _ = fs::remove_file(&path);
     }
 
