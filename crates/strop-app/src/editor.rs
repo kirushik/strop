@@ -138,11 +138,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", NoteCommit, Some("NoteInput")),
         KeyBinding::new("escape", NoteCancel, Some("NoteInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
+        KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("NoteInput")),
         KeyBinding::new("tab", NoteTab, Some("NoteInput")),
         // The palette's query field: same editing actions, plus row motion.
         KeyBinding::new("enter", NoteCommit, Some("PaletteInput")),
         KeyBinding::new("escape", NoteCancel, Some("PaletteInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("PaletteInput")),
+        KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("PaletteInput")),
         KeyBinding::new("up", PaletteUp, Some("PaletteInput")),
         KeyBinding::new("down", PaletteDown, Some("PaletteInput")),
     ]);
@@ -288,9 +290,27 @@ impl NoteInput {
         self.content.pop();
         cx.notify();
     }
+
+    /// ctrl-backspace: muscle memory holds in every field (Kirill's rule —
+    /// universal gestures stay universal). Append-only model, so "word
+    /// left of the caret" means the trailing word.
+    fn backspace_word(&mut self, _: &NoteBackspaceWord, _: &mut Window, cx: &mut Context<Self>) {
+        let trimmed = self.content.trim_end();
+        let cut = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        self.content.truncate(cut);
+        cx.notify();
+    }
 }
 
-actions!(note_input, [NoteCommit, NoteCancel, NoteBackspace, NoteTab]);
+actions!(
+    note_input,
+    [NoteCommit, NoteCancel, NoteBackspace, NoteBackspaceWord, NoteTab]
+);
 
 impl EntityInputHandler for NoteInput {
     fn text_for_range(
@@ -384,6 +404,7 @@ impl Render for NoteInput {
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::backspace_word))
             .w_full()
             .min_h(px(22.))
             .px(px(6.))
@@ -3722,8 +3743,14 @@ fn block_style(kind: &BlockKind) -> BlockStyle {
             indent: px(28.) * (*depth as f32 + 1.),
             ..Default::default()
         },
-        BlockKind::Divider | BlockKind::FootnoteDef { .. } => BlockStyle {
+        BlockKind::Divider => BlockStyle {
             muted: true,
+            ..Default::default()
+        },
+        BlockKind::FootnoteDef { .. } => BlockStyle {
+            muted: true,
+            // Room for the painted "N." marker, list-style.
+            indent: px(28.),
             ..Default::default()
         },
         BlockKind::CodeBlock { .. } => BlockStyle {
@@ -3846,7 +3873,13 @@ fn runs_for_paragraph(
                             wavy: false,
                         });
                     }
-                    InlineAttr::FootnoteRef(_) => {}
+                    InlineAttr::FootnoteRef(_) => {
+                        // Findable, not invisible: accent ink + a quiet
+                        // pill. (True superscript needs per-run font sizes;
+                        // queued for the design pass.)
+                        color = rgb(LINK_COLOR).into();
+                        content_bg.get_or_insert(rgba(CODE_BG_COLOR));
+                    }
                 }
             }
 
@@ -4102,6 +4135,13 @@ impl Element for EditorElement {
                 BlockKind::ListItem { ordered: true, .. } => {
                     ordered_no += 1;
                     Some(SharedString::from(format!("{ordered_no}.")))
+                }
+                // The footnote's own number, visible while editing the
+                // definition (the bottom zone only shows when the REF is
+                // on-screen — the def line must carry its identity).
+                BlockKind::FootnoteDef { id } => {
+                    ordered_no = 0;
+                    Some(SharedString::from(format!("{id}.")))
                 }
                 _ => {
                     ordered_no = 0;
@@ -5223,26 +5263,32 @@ impl Editor {
                 f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
             (col_right + MARGIN_GAP + 8., MARGIN_WIDTH - 8.)
         } else {
-            let vw = f32::from(window.viewport_size().width);
-            ((vw - 308.).max(8.), 300.)
+            (0., 0.) // narrow: bottom strip, never floating over prose
         };
-        let card = |bg: u32| {
-            div()
-                .absolute()
-                .top(px(BAR_HEIGHT + 8.))
-                .left(px(left))
-                .w(px(width))
-                .p(px(10.))
-                .rounded(px(6.))
-                .bg(rgb(bg))
-                .border_1()
-                .border_color(rgb(RULE_COLOR))
-                .font_family("PT Serif")
-                .text_size(px(12.))
-                .text_color(rgb(TEXT_COLOR))
-                .flex()
-                .flex_col()
-                .gap(px(6.))
+        let card = move |bg: u32| {
+            // Wide window: a card at the top of the margin lane. Narrow:
+            // a full-width strip at the bottom — status must never sit on
+            // top of the user's text (Kirill's "insult to injury").
+            if fits {
+                div()
+                    .absolute()
+                    .top(px(BAR_HEIGHT + 8.))
+                    .left(px(left))
+                    .w(px(width))
+                    .rounded(px(6.))
+                    .flex_col()
+            } else {
+                div().absolute().bottom_0().left_0().right_0().border_t_1().flex_row().items_center()
+            }
+            .p(px(10.))
+            .bg(rgb(bg))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .font_family("PT Serif")
+            .text_size(px(12.))
+            .text_color(rgb(TEXT_COLOR))
+            .flex()
+            .gap(px(6.))
         };
         let action_button = |id: &'static str, label: &'static str| {
             div()
@@ -5298,6 +5344,13 @@ impl Editor {
                             cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
                                 editor.test_ai_connection(&TestAiConnection, window, cx);
+                            }),
+                        ))
+                        .child(action_button("ai-setup-dismiss", "Dismiss").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.cancel_ai_run(&CancelAiRun, window, cx);
                             }),
                         )),
                 )
