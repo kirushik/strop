@@ -10,8 +10,8 @@ use gpui::Action;
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
     DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1, Heading2,
-    Heading3, InsertFootnote, NewDocument, OpenAiConfig, OpenFile, OpenWelcome, Redo,
-    RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
+    Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
+    OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode, ToggleCodeBlock,
     ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList, TogglePalette,
     TogglePopover, ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
@@ -213,7 +213,7 @@ pub fn all() -> &'static [Command] {
             "Set Up AI Provider…",
             "Margin & AI",
             None,
-            OpenAiConfig,
+            OpenAiSettings,
             ["api key", "config", "settings", "настроить ии", "ключ"]
         ),
         cmd!(

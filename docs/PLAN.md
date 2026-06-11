@@ -276,8 +276,29 @@ section. Ordering: root-fix verification first, then highest-leverage.
   (synthetic clicks through the full GPUI dispatch path, div listeners
   included) and `fn-geo` (window-space click targets for refs, def
   gutters, zone rows).
-- [ ] **F4. AI settings panel** (DESIGN §2-ai): form + test-call +
-  /models picker; toml_edit writes; config file stays authoritative.
+- [x] **F4. AI settings panel** (shipped 2026-06-12, DESIGN §2-ai —
+  Kirill's mandate: provider setup is the core onboarding task): a
+  centered in-surface overlay (keyboard-map pattern: backdrop, 520px
+  panel, esc/click-out closes, mounted last) on OpenAiSettings — the
+  registry's "Set Up AI Provider…" and every AI-card "Open config"
+  button now point here; "Edit config file…" inside the panel keeps the
+  old xdg-open flow. Three NoteInput fields under a "SettingsInput" key
+  context (tab cycles via note_tab, enter commits, ctrl-enter saves,
+  escape closes): Base URL with the three example endpoints as helper
+  text, API key MASKED (dots except last 4 — display only, paste/IME
+  untouched), Model as free text that live-filters the picker. [Test] =
+  the 1-token chat against the *typed* values, inline on the panel
+  ("testing…" → "OK · Nms" green / warm-red error), auto-fetching
+  /models on success; [List models] → background list_models() →
+  scrollable list, up/down+enter or click picks. Save writes through
+  toml_edit (workspace dep): [ai] values set in place, comments and
+  unknown keys survive (unit-tested against an injected temp path —
+  env vars are process-global and lifecycle_in_isolated_home already
+  owns them), config reloaded, fading "AI configured: model via host"
+  note; with STROP_API_KEY set the key field says it's ignored and is
+  never written. Verified live against a local python stub (/models +
+  /chat/completions) and the connection-refused error path;
+  debug_cursor gained ai_panel=/ai_models= tags.
 - [ ] **F5. Structure & finishing layer** (DESIGN §1.6, §4): the beat
   strip (outline at point of performance) + close-time "Next session I
   will ___" ritual + session word-progress. The research's verdict:

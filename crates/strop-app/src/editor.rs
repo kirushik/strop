@@ -65,7 +65,7 @@ actions!(
         ToggleHistory, TogglePalette, TogglePopover, PaletteUp, PaletteDown, NewDocument,
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
-        ShowShortcuts, OpenWelcome,
+        ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
     ]
 );
 
@@ -156,6 +156,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("PaletteInput")),
         KeyBinding::new("up", PaletteUp, Some("PaletteInput")),
         KeyBinding::new("down", PaletteDown, Some("PaletteInput")),
+        // The AI settings panel's fields (F4): tab cycles, enter commits
+        // (test, or pick from the model list), up/down walk the list,
+        // ctrl-enter saves, escape closes.
+        KeyBinding::new("enter", NoteCommit, Some("SettingsInput")),
+        KeyBinding::new("escape", NoteCancel, Some("SettingsInput")),
+        KeyBinding::new("backspace", NoteBackspace, Some("SettingsInput")),
+        KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("SettingsInput")),
+        KeyBinding::new("tab", NoteTab, Some("SettingsInput")),
+        KeyBinding::new("up", SettingsUp, Some("SettingsInput")),
+        KeyBinding::new("down", SettingsDown, Some("SettingsInput")),
+        KeyBinding::new("ctrl-enter", SaveAiSettings, Some("SettingsInput")),
     ]);
 }
 
@@ -229,6 +240,12 @@ pub struct Editor {
     doc_rename_input: Option<Entity<NoteInput>>,
     /// The keyboard-map overlay (PLAN.md E4, ctrl-?).
     shortcuts_open: bool,
+    /// The AI settings panel (DESIGN §2-ai, F4): form + async test +
+    /// /models picker; saves write through toml_edit.
+    ai_settings: Option<AiSettings>,
+    /// Bumped on every panel-spawned request and on close, so a stale
+    /// test/list response from a closed panel is dropped silently.
+    ai_settings_generation: u64,
     find_current: usize,
     /// Replace field (ctrl-h adds it beside find): Enter on it replaces
     /// the current match; the All button replaces every match (one undo).
@@ -269,9 +286,13 @@ pub struct NoteInput {
     focus_handle: FocusHandle,
     content: String,
     marked: Option<Range<usize>>,
-    /// Keymap context: "NoteInput" everywhere except the palette, whose
-    /// query field needs its own bindings (up/down move the selection).
+    /// Keymap context: "NoteInput" everywhere except the palette ("up"/
+    /// "down" move its selection) and the AI settings panel (tab cycles
+    /// fields, ctrl-enter saves) — each gets its own binding set.
     key_context: &'static str,
+    /// Secret-field display: dots except the last 4 chars (the API key).
+    /// The real content is untouched — typing and paste work normally.
+    masked: bool,
 }
 
 pub enum NoteInputEvent {
@@ -288,6 +309,7 @@ impl NoteInput {
             content,
             marked: None,
             key_context: "NoteInput",
+            masked: false,
         }
     }
 
@@ -295,6 +317,16 @@ impl NoteInput {
         Self {
             key_context: "PaletteInput",
             ..Self::new(cx, String::new())
+        }
+    }
+
+    /// A field of the AI settings panel (F4): its own context so tab/
+    /// up/down/ctrl-enter can mean panel things; `masked` for the key.
+    fn for_settings(cx: &mut Context<Self>, content: String, masked: bool) -> Self {
+        Self {
+            key_context: "SettingsInput",
+            masked,
+            ..Self::new(cx, content)
         }
     }
 
@@ -492,7 +524,20 @@ impl Element for NoteInputElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let content = self.input.read(cx).content.clone();
+        let input = self.input.read(cx);
+        let content = if input.masked {
+            // Dots except the last 4 chars — enough to recognize which key
+            // this is without ever showing it whole (DESIGN §2-ai).
+            let chars: Vec<char> = input.content.chars().collect();
+            let visible_from = chars.len().saturating_sub(4);
+            chars
+                .iter()
+                .enumerate()
+                .map(|(i, c)| if i < visible_from { '•' } else { *c })
+                .collect()
+        } else {
+            input.content.clone()
+        };
         let style = window.text_style();
         let run = TextRun {
             len: content.len(),
@@ -752,6 +797,8 @@ impl Editor {
             palette_selected: 0,
             doc_rename_input: None,
             shortcuts_open: false,
+            ai_settings: None,
+            ai_settings_generation: 0,
             find_current: 0,
             replace_input: None,
             rename_input: None,
@@ -1786,6 +1833,287 @@ impl Editor {
         .detach();
     }
 
+    /// The AI settings panel (F4): the in-app surface for the core
+    /// onboarding task. Prefilled from config.toml; Save writes back
+    /// through toml_edit, so the file stays the storage and hand edits
+    /// stay respected (DESIGN §0 directive 3).
+    fn open_ai_settings(&mut self, _: &OpenAiSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai_settings.is_some() {
+            return;
+        }
+        let cfg = crate::config::load();
+        let base_url = cx.new(|cx| NoteInput::for_settings(cx, cfg.ai.base_url.clone(), false));
+        let api_key = cx.new(|cx| NoteInput::for_settings(cx, cfg.ai.api_key.clone(), true));
+        let model = cx.new(|cx| NoteInput::for_settings(cx, cfg.ai.model.clone(), false));
+        for input in [&base_url, &api_key, &model] {
+            cx.subscribe_in(
+                input,
+                window,
+                |editor, _, event: &NoteInputEvent, window, cx| match event {
+                    NoteInputEvent::Commit(_) => editor.ai_settings_commit(cx),
+                    NoteInputEvent::Cancel => editor.close_ai_settings(window, cx),
+                },
+            )
+            .detach();
+        }
+        // Typing in the model field re-filters the list live.
+        cx.observe(&model, |editor, _, cx| {
+            if let Some(panel) = &mut editor.ai_settings {
+                panel.selected = 0;
+            }
+            cx.notify();
+        })
+        .detach();
+        cx.observe(&base_url, |_, _, cx| cx.notify()).detach();
+        cx.observe(&api_key, |_, _, cx| cx.notify()).detach();
+        let focus = base_url.read(cx).focus_handle.clone();
+        window.focus(&focus, cx);
+        self.ai_settings = Some(AiSettings {
+            base_url,
+            api_key,
+            model,
+            test: AiSettingsTest::Idle,
+            models: Vec::new(),
+            selected: 0,
+            models_note: None,
+        });
+        cx.notify();
+    }
+
+    fn close_ai_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ai_settings = None;
+        self.ai_settings_generation += 1; // drop in-flight test/list replies
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// (base_url, api_key, model) as currently typed, trimmed.
+    fn ai_settings_values(&self, cx: &Context<Self>) -> Option<(String, String, String)> {
+        let panel = self.ai_settings.as_ref()?;
+        Some((
+            panel.base_url.read(cx).content.trim().to_owned(),
+            panel.api_key.read(cx).content.trim().to_owned(),
+            panel.model.read(cx).content.trim().to_owned(),
+        ))
+    }
+
+    /// Models matching the model field (case-insensitive substring);
+    /// empty field = the whole list.
+    fn ai_settings_filtered(&self, cx: &Context<Self>) -> Vec<String> {
+        let Some(panel) = self.ai_settings.as_ref() else {
+            return Vec::new();
+        };
+        let query = panel.model.read(cx).content.trim().to_lowercase();
+        panel
+            .models
+            .iter()
+            .filter(|m| query.is_empty() || m.to_lowercase().contains(&query))
+            .cloned()
+            .collect()
+    }
+
+    /// Enter in any panel field: pick from the visible model list if it
+    /// still offers something new; otherwise run the test call.
+    fn ai_settings_commit(&mut self, cx: &mut Context<Self>) {
+        let filtered = self.ai_settings_filtered(cx);
+        let Some(panel) = &mut self.ai_settings else {
+            return;
+        };
+        if let Some(pick) = filtered.get(panel.selected.min(filtered.len().saturating_sub(1))) {
+            let already = panel.model.read(cx).content.trim() == pick.as_str();
+            if !already {
+                let pick = pick.clone();
+                panel.model.update(cx, |input, cx| {
+                    input.content = pick;
+                    cx.notify();
+                });
+                cx.notify();
+                return;
+            }
+        }
+        self.ai_settings_test(cx);
+    }
+
+    fn settings_up(&mut self, _: &SettingsUp, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = &mut self.ai_settings {
+            panel.selected = panel.selected.saturating_sub(1);
+            cx.notify();
+        }
+    }
+
+    fn settings_down(&mut self, _: &SettingsDown, _: &mut Window, cx: &mut Context<Self>) {
+        let len = self.ai_settings_filtered(cx).len();
+        if let Some(panel) = &mut self.ai_settings
+            && len > 0
+        {
+            panel.selected = (panel.selected + 1).min(len - 1);
+            cx.notify();
+        }
+    }
+
+    /// [Test]: the same 1-token chat as Test AI Connection, but against
+    /// the values typed in the form (not yet saved), reported inline.
+    fn ai_settings_test(&mut self, cx: &mut Context<Self>) {
+        let Some((base_url, key, model)) = self.ai_settings_values(cx) else {
+            return;
+        };
+        let Some(panel) = &mut self.ai_settings else {
+            return;
+        };
+        if base_url.is_empty() || model.is_empty() {
+            panel.test = AiSettingsTest::Failed {
+                message: "base URL and model are both needed for a test call".into(),
+            };
+            cx.notify();
+            return;
+        }
+        panel.test = AiSettingsTest::Running;
+        self.ai_settings_generation += 1;
+        let generation = self.ai_settings_generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let api_key = resolved_key(&key);
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = strop_core::llm::LlmClient::new(&base_url, &api_key, &model);
+                    let started = std::time::Instant::now();
+                    client
+                        .chat("Reply with exactly: ok", "ok?", 16)
+                        .map(|_| started.elapsed().as_millis() as u64)
+                })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.ai_settings_generation != generation {
+                    return;
+                }
+                let (base_url, model) = match editor.ai_settings_values(cx) {
+                    Some((b, _, m)) => (b, m),
+                    None => return,
+                };
+                match result {
+                    Ok(ms) => {
+                        if let Some(panel) = &mut editor.ai_settings {
+                            panel.test = AiSettingsTest::Ok { ms };
+                        }
+                        // A provider that just answered can also tell us
+                        // what it serves: refresh the picker for free.
+                        editor.ai_settings_list_models(cx);
+                    }
+                    Err(e) => {
+                        let AiStatus::Error { title, detail } =
+                            AiFailure::Llm(e).into_status(&base_url, &model)
+                        else {
+                            unreachable!("into_status always errors")
+                        };
+                        if let Some(panel) = &mut editor.ai_settings {
+                            panel.test = AiSettingsTest::Failed {
+                                message: if detail.is_empty() {
+                                    title
+                                } else {
+                                    format!("{title} — {detail}")
+                                },
+                            };
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// [List models]: GET {base}/models on the background executor; the
+    /// result is the pickable, filterable list (Open WebUI's flow).
+    fn ai_settings_list_models(&mut self, cx: &mut Context<Self>) {
+        let Some((base_url, key, _)) = self.ai_settings_values(cx) else {
+            return;
+        };
+        let Some(panel) = &mut self.ai_settings else {
+            return;
+        };
+        if base_url.is_empty() {
+            panel.models_note = Some("base URL is needed to list models".into());
+            cx.notify();
+            return;
+        }
+        panel.models_note = Some("fetching model list…".into());
+        self.ai_settings_generation += 1;
+        let generation = self.ai_settings_generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let api_key = resolved_key(&key);
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = strop_core::llm::LlmClient::new(&base_url, &api_key, "");
+                    client.list_models()
+                })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.ai_settings_generation != generation {
+                    return;
+                }
+                let Some(panel) = &mut editor.ai_settings else {
+                    return;
+                };
+                match result {
+                    Ok(models) if models.is_empty() => {
+                        panel.models = Vec::new();
+                        panel.models_note = Some("the provider returned an empty list".into());
+                    }
+                    Ok(models) => {
+                        panel.models = models;
+                        panel.selected = 0;
+                        panel.models_note = None;
+                    }
+                    Err(e) => {
+                        panel.models_note = Some(format!("couldn't list models: {e}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// [Save] / ctrl-enter: write through toml_edit (comments and unknown
+    /// keys survive), reload the live config, close, confirm in the margin.
+    fn save_ai_settings(&mut self, _: &SaveAiSettings, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((base_url, key, model)) = self.ai_settings_values(cx) else {
+            return;
+        };
+        // STROP_API_KEY wins over the file; never write a key the
+        // environment is already supplying (the panel says so too).
+        let key_from_env = env_key_set();
+        let api_key = (!key_from_env).then_some(key.as_str());
+        match crate::config::save_ai(&base_url, api_key, &model) {
+            Ok(_) => {
+                self.config = crate::config::load();
+                self.close_ai_settings(window, cx);
+                self.ai_generation += 1;
+                let generation = self.ai_generation;
+                self.ai_status = Some(AiStatus::Note {
+                    title: if self.config.ai.configured() {
+                        format!("AI configured: {model} via {}", host_of(&base_url))
+                    } else {
+                        "AI settings saved (provider still incomplete)".to_owned()
+                    },
+                    detail: String::new(),
+                });
+                self.schedule_status_fade(generation, cx);
+            }
+            Err(e) => {
+                if let Some(panel) = &mut self.ai_settings {
+                    panel.test = AiSettingsTest::Failed { message: e };
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn set_diagnosis_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         self.diagnosis_mode = Some(mode.to_owned());
         self.ai_generation += 1;
@@ -1868,6 +2196,18 @@ impl Editor {
     /// Tab in the find/replace bar hops between the two fields (the
     /// action bubbles up from the NoteInput context to the editor).
     fn note_tab(&mut self, _: &NoteTab, window: &mut Window, cx: &mut Context<Self>) {
+        // AI settings panel: tab cycles base URL → key → model → base URL.
+        if let Some(panel) = &self.ai_settings {
+            let fields = [&panel.base_url, &panel.api_key, &panel.model];
+            let focused = fields
+                .iter()
+                .position(|f| f.read(cx).focus_handle.is_focused(window))
+                .unwrap_or(2);
+            let next = fields[(focused + 1) % fields.len()].read(cx).focus_handle.clone();
+            window.focus(&next, cx);
+            cx.notify();
+            return;
+        }
         let (Some(find), Some(rep)) = (self.find_input.clone(), self.replace_input.clone())
         else {
             return;
@@ -2869,7 +3209,11 @@ impl Editor {
         }
     }
 
-    fn escape_mode(&mut self, _: &EscapeMode, _: &mut Window, cx: &mut Context<Self>) {
+    fn escape_mode(&mut self, _: &EscapeMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai_settings.is_some() {
+            self.close_ai_settings(window, cx);
+            return;
+        }
         if self.shortcuts_open {
             self.shortcuts_open = false;
             cx.notify();
@@ -3005,6 +3349,290 @@ impl Editor {
                                 }))
                         }),
                     )),
+            )
+    }
+
+    /// The AI settings panel (DESIGN §2-ai, F4): centered in-surface
+    /// overlay like the keyboard map — backdrop, esc/click-out closes.
+    /// Form + async test with inline states + pickable /models list; the
+    /// config file stays the storage (Save writes through toml_edit).
+    fn render_ai_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = self.ai_settings.as_ref().expect("ai settings open");
+        let key_from_env = env_key_set();
+        let filtered = self.ai_settings_filtered(cx);
+        let selected = panel.selected.min(filtered.len().saturating_sub(1));
+        let has_models = !panel.models.is_empty();
+        let models_note = panel.models_note.clone();
+
+        let label = |text: &'static str| {
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(MUTED_COLOR))
+                .child(text.to_uppercase())
+        };
+        let helper = |text: String| {
+            div()
+                .text_size(px(10.5))
+                .text_color(rgb(MUTED_COLOR))
+                .child(text)
+        };
+        let button = |id: &'static str, text: &'static str| {
+            div()
+                .id(id)
+                .px(px(10.))
+                .py(px(3.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .cursor(CursorStyle::PointingHand)
+                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                .text_size(px(12.))
+                .child(text)
+        };
+        // Inline feedback, never a margin card while the panel is open.
+        let status_line = match &panel.test {
+            AiSettingsTest::Idle => None,
+            AiSettingsTest::Running => Some(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child("testing…"),
+            ),
+            AiSettingsTest::Ok { ms } => Some(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0x4F7A4A))
+                    .child(format!("OK · {ms}ms")),
+            ),
+            AiSettingsTest::Failed { message } => Some(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0xA3492F))
+                    .child(message.clone()),
+            ),
+        };
+        let mut model_list = div()
+            .id("ai-models-list")
+            .max_h(px(170.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(4.));
+        for (ix, m) in filtered.iter().enumerate() {
+            let model_id = m.clone();
+            model_list = model_list.child(
+                div()
+                    .id(("ai-model-row", ix))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .text_size(px(12.))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(ix == selected, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(panel) = &editor.ai_settings {
+                                let m = model_id.clone();
+                                panel.model.update(cx, |input, cx| {
+                                    input.content = m;
+                                    cx.notify();
+                                });
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(m.clone()),
+            );
+        }
+        let focus_field = |which: usize| {
+            cx.listener(move |editor: &mut Editor, _: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                if let Some(panel) = &editor.ai_settings {
+                    let field = [&panel.base_url, &panel.api_key, &panel.model][which];
+                    let handle = field.read(cx).focus_handle.clone();
+                    window.focus(&handle, cx);
+                }
+            })
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x1A1A1830u32))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_action(cx.listener(Self::settings_up))
+            .on_action(cx.listener(Self::settings_down))
+            .on_action(cx.listener(Self::save_ai_settings))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    editor.close_ai_settings(window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .id("ai-settings-panel")
+                    .w(px(520.))
+                    .max_h(px(600.))
+                    .bg(rgb(0xFCFAF4))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .rounded(px(8.))
+                    .shadow_lg()
+                    .p(px(18.))
+                    .font_family("PT Serif")
+                    .text_color(rgb(TEXT_COLOR))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("AI provider"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child("esc closes · tab moves between fields"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .on_mouse_down(MouseButton::Left, focus_field(0))
+                            .child(label("Base URL"))
+                            .child(panel.base_url.clone())
+                            .child(helper(
+                                "Poe https://api.poe.com/v1 · OpenRouter \
+                                 https://openrouter.ai/api/v1 · Ollama \
+                                 http://localhost:11434/v1"
+                                    .into(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .on_mouse_down(MouseButton::Left, focus_field(1))
+                            .child(label("API key"))
+                            .child(panel.api_key.clone())
+                            .child(helper(if key_from_env {
+                                "key comes from STROP_API_KEY; this field is ignored \
+                                 and never written"
+                                    .into()
+                            } else {
+                                "stored as plain text in config.toml — or export \
+                                 STROP_API_KEY and leave this empty"
+                                    .into()
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .on_mouse_down(MouseButton::Left, focus_field(2))
+                            .child(label("Model"))
+                            .child(panel.model.clone())
+                            .child(helper(
+                                "free text — typing filters the provider's list below".into(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(button("ai-settings-test", "Test").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    editor.ai_settings_test(cx);
+                                }),
+                            ))
+                            .child(button("ai-settings-models", "List models").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    editor.ai_settings_list_models(cx);
+                                }),
+                            ))
+                            .child(button("ai-settings-save", "Save").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.save_ai_settings(&SaveAiSettings, window, cx);
+                                }),
+                            )),
+                    )
+                    .when_some(status_line, |d, status| d.child(status))
+                    .when_some(models_note, |d, note| {
+                        d.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED_COLOR))
+                                .child(note),
+                        )
+                    })
+                    .when(has_models, |d| {
+                        if filtered.is_empty() {
+                            d.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child("no models match the filter"),
+                            )
+                        } else {
+                            d.child(model_list)
+                        }
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .pt(px(2.))
+                            .child(
+                                div()
+                                    .id("ai-settings-edit-file")
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            editor.close_ai_settings(window, cx);
+                                            editor.open_ai_config(&OpenAiConfig, window, cx);
+                                        }),
+                                    )
+                                    .child("Edit config file…"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child("enter tests · ctrl-enter saves"),
+                            ),
+                    ),
             )
     }
 
@@ -3748,8 +4376,21 @@ impl Editor {
             Some(AiStatus::Note { .. }) => " ai=note",
             Some(AiStatus::Error { .. }) => " ai=error",
         };
+        let panel = match &self.ai_settings {
+            None => String::new(),
+            Some(p) => format!(
+                " ai_panel={} ai_models={}",
+                match &p.test {
+                    AiSettingsTest::Idle => "open",
+                    AiSettingsTest::Running => "testing",
+                    AiSettingsTest::Ok { .. } => "ok",
+                    AiSettingsTest::Failed { .. } => "err",
+                },
+                p.models.len()
+            ),
+        };
         let doc_state = format!(
-            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai} mode={}",
+            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai}{panel} mode={}",
             self.selected_range,
             self.doc.blocks().kind(self.doc.block_of_byte(cursor)),
             self.doc.spans().spans(),
@@ -5990,6 +6631,32 @@ enum AiFailure {
     Parse(String),
 }
 
+/// The AI settings panel (DESIGN §2-ai, Kirill's mandate: provider setup
+/// is the core onboarding task). The form holds live values; the config
+/// file stays authoritative — Save writes through toml_edit so comments
+/// and hand edits survive, and hand editing keeps working forever.
+struct AiSettings {
+    base_url: Entity<NoteInput>,
+    api_key: Entity<NoteInput>,
+    model: Entity<NoteInput>,
+    /// Inline test/save feedback ON the panel — never a margin card while
+    /// the panel is open (the margin is covered by the backdrop anyway).
+    test: AiSettingsTest,
+    /// GET /models result; the model field filters it, click/enter picks.
+    models: Vec<String>,
+    /// Selection inside the *filtered* list (up/down/enter).
+    selected: usize,
+    /// List-area message: "fetching…", "no models", or the fetch error.
+    models_note: Option<String>,
+}
+
+enum AiSettingsTest {
+    Idle,
+    Running,
+    Ok { ms: u64 },
+    Failed { message: String },
+}
+
 fn host_of(base_url: &str) -> String {
     base_url
         .trim_start_matches("https://")
@@ -5998,6 +6665,19 @@ fn host_of(base_url: &str) -> String {
         .next()
         .unwrap_or(base_url)
         .to_owned()
+}
+
+fn env_key_set() -> bool {
+    std::env::var("STROP_API_KEY").is_ok_and(|k| !k.is_empty())
+}
+
+/// STROP_API_KEY wins over whatever the form holds — the same precedence
+/// `AiConfig::resolved_api_key` applies to the file.
+fn resolved_key(field: &str) -> String {
+    std::env::var("STROP_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| field.to_owned())
 }
 
 impl AiFailure {
@@ -6221,11 +6901,11 @@ impl Editor {
                     div()
                         .flex()
                         .gap(px(6.))
-                        .child(action_button("ai-setup", "Open config").on_mouse_down(
+                        .child(action_button("ai-setup", "Set up…").on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
-                                editor.open_ai_config(&OpenAiConfig, window, cx);
+                                editor.open_ai_settings(&OpenAiSettings, window, cx);
                             }),
                         ))
                         .child(action_button("ai-test", "Test connection").on_mouse_down(
@@ -6276,11 +6956,11 @@ impl Editor {
                     div()
                         .flex()
                         .gap(px(6.))
-                        .child(action_button("ai-err-config", "Open config").on_mouse_down(
+                        .child(action_button("ai-err-config", "Set up…").on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
-                                editor.open_ai_config(&OpenAiConfig, window, cx);
+                                editor.open_ai_settings(&OpenAiSettings, window, cx);
                             }),
                         ))
                         .child(action_button("ai-err-retry", "Retry").on_mouse_down(
@@ -6561,6 +7241,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::reveal_in_files))
                     .on_action(cx.listener(Self::copy_document_path))
                     .on_action(cx.listener(Self::open_ai_config))
+                    .on_action(cx.listener(Self::open_ai_settings))
                     .on_action(cx.listener(Self::test_ai_connection))
                     .on_action(cx.listener(Self::cancel_ai_run))
                     .on_action(cx.listener(Self::mode_developmental))
@@ -6649,12 +7330,15 @@ impl Render for Editor {
                 Some(popover) => d.child(popover),
                 None => d,
             })
-            // Last children = topmost: the palette and the keyboard map
-            // cover everything below.
+            // Last children = topmost: the palette, the keyboard map and
+            // the AI settings panel cover everything below.
             .when(self.palette_input.is_some(), |d| {
                 d.child(self.render_palette(cx))
             })
             .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
+            .when(self.ai_settings.is_some(), |d| {
+                d.child(self.render_ai_settings(cx))
+            })
     }
 }
 
