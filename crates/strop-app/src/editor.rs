@@ -44,7 +44,7 @@ actions!(
         PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, Undo, Redo,
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
-        ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown,
+        ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
     ]
 );
 
@@ -114,6 +114,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-7", ToggleOrderedList, ctx),
         KeyBinding::new("ctrl-alt-s", AddCheckpoint, ctx),
         KeyBinding::new("ctrl-shift-e", ExportMarkdown, ctx),
+        KeyBinding::new("ctrl-alt-f", InsertFootnote, ctx),
     ]);
 }
 
@@ -424,6 +425,103 @@ impl Editor {
             Err(e) => eprintln!("strop: export failed: {e}"),
         }
         cx.notify();
+    }
+
+    /// Insert a footnote: a ref atom at the cursor, a def block at the end,
+    /// cursor lands in the def. (Two transactions; two undos remove it.)
+    fn insert_footnote(&mut self, _: &InsertFootnote, _: &mut Window, cx: &mut Context<Self>) {
+        let n = self
+            .doc
+            .blocks()
+            .kinds()
+            .iter()
+            .filter(|k| matches!(k, BlockKind::FootnoteDef { .. }))
+            .count()
+            + 1;
+        let id = n.to_string();
+        let sel = self.selected_range.clone();
+        self.doc.edit_bytes(sel.start..sel.end, &id);
+        let char_range = {
+            let rope = self.doc.rope();
+            rope.byte_to_char(sel.start)..rope.byte_to_char(sel.start + id.len())
+        };
+        self.doc
+            .format_in_current_tx(char_range, InlineAttr::FootnoteRef(id.clone()), true);
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(len..len, "\n");
+        let def_block = self.doc.block_of_byte(self.doc.len_bytes());
+        self.doc
+            .set_block_kind_in_current_tx(def_block, BlockKind::FootnoteDef { id });
+        let end = self.doc.len_bytes();
+        self.selected_range = end..end;
+        self.selection_reversed = false;
+        self.cursor_affinity_down = false;
+        self.goal_x = None;
+        self.caret_attrs.clear();
+        self.sync_mutations();
+        self.store_dirty = true;
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// Footnotes whose refs are visible in the viewport: (id, def text,
+    /// def byte offset). Derived from the last painted frame.
+    fn visible_footnotes(&self) -> Vec<(String, String, usize)> {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return Vec::new();
+        };
+        let top = frame.scroll_top;
+        let bottom = top + frame.bounds.size.height;
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for par in &frame.paragraphs {
+            if par.top + par.height > top && par.top < bottom {
+                lo = lo.min(par.range.start);
+                hi = hi.max(par.range.end);
+            }
+        }
+        // The frame may be one paint behind the document (compositor
+        // throttling, big edits): clamp its byte ranges to the live rope.
+        let len = self.doc.len_bytes();
+        let (lo, hi) = (lo.min(len), hi.min(len));
+        if lo >= hi {
+            return Vec::new();
+        }
+        let rope = self.doc.rope();
+        let (clo, chi) = (rope.byte_to_char(lo), rope.byte_to_char(hi));
+        let mut out: Vec<(String, String, usize)> = Vec::new();
+        for span in self.doc.spans().spans() {
+            let InlineAttr::FootnoteRef(id) = &span.attr else {
+                continue;
+            };
+            if span.range.start >= chi || span.range.end <= clo {
+                continue;
+            }
+            if out.iter().any(|(seen, _, _)| seen == id) {
+                continue;
+            }
+            let Some(block) = self
+                .doc
+                .blocks()
+                .kinds()
+                .iter()
+                .position(|k| matches!(k, BlockKind::FootnoteDef { id: d } if d == id))
+            else {
+                continue;
+            };
+            let start = rope.line_to_byte(block);
+            let end = if block + 1 < rope.len_lines() {
+                rope.line_to_byte(block + 1).saturating_sub(1)
+            } else {
+                rope.len_bytes()
+            };
+            let mut def = self.doc.slice_bytes(start..end);
+            if def.chars().count() > 110 {
+                def = def.chars().take(110).collect::<String>() + "…";
+            }
+            out.push((id.clone(), def, start));
+        }
+        out
     }
 
     pub fn save_now(&mut self) {
@@ -1191,7 +1289,9 @@ impl Editor {
         let Some(frame) = self.last_frame.as_ref() else {
             return (0, false);
         };
-        frame.index_for_point(frame.doc_point(position))
+        let (ix, aff) = frame.index_for_point(frame.doc_point(position));
+        // Stale-frame guard: never hand out offsets beyond the live rope.
+        (ix.min(self.doc.len_bytes()), aff)
     }
 
     /// Extend the drag selection toward a window point, clamped to the
@@ -2279,6 +2379,65 @@ impl Editor {
     }
 }
 
+impl Editor {
+    /// The viewport footnote zone (document-model §4c): definitions whose
+    /// refs are on screen, pinned to the window bottom as an overlay inset.
+    /// Read-only projection; click jumps to the def block.
+    fn render_footnote_zone(
+        &self,
+        footnotes: Vec<(String, String, usize)>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("footnote-zone")
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .max_h(px(168.)) // 6 rows; ~1/3 of a short window
+            .overflow_y_scroll()
+            .bg(rgb(BG_COLOR))
+            .border_t_1()
+            .border_color(rgb(RULE_COLOR))
+            .flex()
+            .flex_col()
+            .items_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(660.))
+                    .px(px(28.))
+                    .py(px(6.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .font_family("Literata")
+                    .text_size(px(14.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .children(footnotes.into_iter().enumerate().map(
+                        |(ix, (id, def, target))| {
+                            div()
+                                .id(ix)
+                                .px(px(4.))
+                                .rounded(px(4.))
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        editor.goal_x = None;
+                                        editor.set_cursor(target, false, cx);
+                                    }),
+                                )
+                                .child(format!("{id}. {def}"))
+                        },
+                    )),
+            )
+    }
+}
+
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -2290,6 +2449,12 @@ impl Render for Editor {
             .child(self.render_titlebar(cx))
             .when(self.show_history, |d| {
                 d.child(self.render_history_panel(cx))
+            })
+            .map(|d| {
+                let footnotes = self.visible_footnotes();
+                d.when(!footnotes.is_empty(), |d| {
+                    d.child(self.render_footnote_zone(footnotes, cx))
+                })
             })
             .child(
                 div()
@@ -2358,6 +2523,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_ordered_list))
                     .on_action(cx.listener(Self::add_checkpoint))
                     .on_action(cx.listener(Self::export_markdown))
+                    .on_action(cx.listener(Self::insert_footnote))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

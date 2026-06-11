@@ -69,7 +69,13 @@ fn inline_md(line: &str, base: usize, spans: &SpanSet) -> String {
             }
         }
         if let Some(c) = chars.get(i) {
-            escape_into(*c, &mut out);
+            // A footnote ref's marker replaces its carrier text entirely.
+            if !here
+                .iter()
+                .any(|a| matches!(a, InlineAttr::FootnoteRef(_)))
+            {
+                escape_into(*c, &mut out);
+            }
         }
     }
     out
@@ -160,8 +166,7 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
 
 /// Markdown -> document state. Lossy where the schema is deliberately
 /// smaller than Markdown (tables, raw HTML beyond `<u>` import as visible
-/// literal text — never silently dropped). Footnote *references* import as
-/// literal `[^id]` until B2 gives them an atom representation.
+/// literal text — never silently dropped).
 pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
     use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -345,7 +350,10 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                 other => push_str!(other),
             },
             Event::FootnoteReference(id) => {
-                push_str!(&format!("[^{id}]"));
+                // The ref is a span over its carrier digits (the id text).
+                let start = chars;
+                push_str!(id.as_ref());
+                spans.add(start..chars, InlineAttr::FootnoteRef(id.to_string()));
             }
             Event::SoftBreak => push_str!(" "),
             Event::HardBreak => push_str!("\u{2028}"),
@@ -437,6 +445,19 @@ mod tests {
         // Soft wrap joins with a space; hard break becomes U+2028.
         assert_eq!(text, "строка раз строка два\u{2028}строка три");
         assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn footnotes_roundtrip() {
+        let md = "Текст[^1] продолжается.\n\n[^1]: Сама сноска.\n";
+        let (text, spans, blocks) = from_markdown(md);
+        assert_eq!(text, "Текст1 продолжается.\nСама сноска.");
+        assert!(spans.covers(5..6, &InlineAttr::FootnoteRef("1".into())));
+        assert_eq!(
+            blocks.kinds()[1],
+            BlockKind::FootnoteDef { id: "1".into() }
+        );
+        assert_eq!(to_markdown(&text, &spans, &blocks), md);
     }
 
     #[test]

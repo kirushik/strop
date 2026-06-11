@@ -43,9 +43,12 @@ unless they'd be expensive to reverse.
       line-splitting, image hoisting, <u> html, soft/hard breaks),
       byte-exact roundtrip test; opening a .md imports into a sibling
       .strop (existing .strop wins).
-- [ ] B2. **Footnotes**: insert/ref/def plumbing + the viewport bottom
-      zone (global numbering, overlay inset, ~1/3 height cap, read-only
-      projection, click-to-jump).
+- [x] B2. **Footnotes**: refs are FootnoteRef spans over carrier digits
+      (markdown roundtrip: marker replaces carrier), ctrl-alt-f inserts
+      ref + def block and lands the cursor in the def; viewport bottom
+      zone shows defs whose refs are on screen (overlay inset, height
+      cap + internal scroll, click jumps to def). Stale-frame offset
+      clamps added across frame-data consumers (fixed a delete-all panic).
 - [ ] B3. **Images**: paste/drop import pipeline per §5b policy (types,
       2400px downscale, EXIF strip, 8MB refusal), assets in Loro, block
       rendering via gpui img.
