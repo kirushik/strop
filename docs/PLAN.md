@@ -204,3 +204,30 @@ is the second invisibility bug). **Error taxonomy** on the same card:
 401→key rejected [Open config]; 404→model not found [List models];
 429→rate limited [Retry]; network→can't reach host [Retry]; parse→model
 too small [Retry]; raw error as expandable detail, never alone.
+
+## Phase F — the designed shell (from docs/DESIGN.md, 2026-06-13)
+
+Execution of the design architecture; each stage cites its DESIGN.md
+section. Ordering: root-fix verification first, then highest-leverage.
+
+- [ ] **F0. gpui migration lands** (root fix for the glyph-corruption
+  class; agent branch in progress) — merge, re-run shape_audit + full
+  smoke, Kirill eyeballs the footnote/heading screens.
+- [ ] **F1. Titlebar diet + selection popover** (DESIGN §2-toolbar):
+  strip B I U S H {} from chrome; word count joins the titlebar;
+  selection popover (in-surface overlay, mouse-up, keyboard-summonable)
+  with B I S {} H1/H2; ctrl-1..3 promoted, ctrl-alt-1..3 silent.
+- [ ] **F2. History side panel** (DESIGN §2-history): push panel, mode
+  banner, two-tier list (autos collapsed between named), drift glyph +
+  word delta per row, segmented vs-toggle, dropdown retired.
+- [ ] **F3. Footnote completion** (DESIGN §2-footnotes): painted
+  superior marks, bidirectional jumps, zone-as-editor, stacking policy.
+- [ ] **F4. AI settings panel** (DESIGN §2-ai): form + test-call +
+  /models picker; toml_edit writes; config file stays authoritative.
+- [ ] **F5. Structure & finishing layer** (DESIGN §1.6, §4): the beat
+  strip (outline at point of performance) + close-time "Next session I
+  will ___" ritual + session word-progress. The research's verdict:
+  this, not chrome, is what stands between the writer and "The End".
+- [ ] **F6. Explorability passes** (DESIGN §3): tutorial invites
+  breaking things; solution-reveal whispers (1/session); palette
+  hit-frequency ordering.

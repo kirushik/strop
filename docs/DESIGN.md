@@ -95,14 +95,52 @@ ring, hamburger, window controls), command palette, keyboard map,
 margin (notes/diagnoses/AI status), footnote zone, find/replace strip,
 history dropdown + inline diff, bottom strips (narrow-window variants).
 
-_To resolve against research:_
-- Toolbar: what earns persistent chrome; selection-popover question;
-  heading access; undo/redo buttons.
-- History: dropdown → side panel? Anatomy, mode entry/exit, where
-  voice-drift lives.
-- Footnotes: complete the bottom-zone model (mark rendering, hover,
-  bidirectional jumps, edit-in-zone).
-- AI settings panel: form anatomy, /models picker, validation states.
+Resolved against the surfaces research (2026-06-13):
+
+**Toolbar.** None of the seven surveyed minimal editors keeps persistent
+formatting buttons (even Bear collapses; iA/Typora/ghostwriter have
+none; persistent chrome budget goes to panel toggles, export, stats,
+modes). DECIDED: strip the titlebar to title/rename · word count ·
+history button · hamburger · window controls. Formatting moves to a
+**selection popover** (Medium lineage: B I S {} + two-level heading
+control; link when it exists), shown on mouse-up only, keyboard-
+summonable (ARIA toolbar rule), rendered as an in-surface GPUI overlay
+— NEVER a Wayland xdg_popup (Zed's documented popup fragility under
+wlroots compositors). Headings: ctrl-1..3 becomes the promoted chord
+(the iA/Bear/Typora convention), `# ` autoformat stays, ctrl-alt-1..3
+remain as silent aliases. No undo/redo buttons — zero category
+precedent; the history surface is the discoverable safety net.
+
+**History.** The Docs/Figma hybrid, not panel-vs-mode: right side panel
+(PUSH, not overlay — single-document app, reflow is cheap), document
+stays the diff canvas (our existing strength), slim mode banner on top
+("Viewing checkpoint X · Restore · Esc"), read-only takeover,
+restore-as-forward-edit (validated verbatim by Figma's semantics).
+List: two-tier — named checkpoints first-class, auto-checkpoints
+collapsed between them (Figma's exact answer to autosave noise),
+named-only filter, each row = name · time · word delta · voice-drift
+glyph (scalars in the list; prose diff on the canvas). vs-prev/vs-draft
+stays (exceeds mainstream precedent) as a segmented control at panel
+bottom. The current dropdown dies; at most a "edited Nm ago" teaser.
+
+**Footnotes.** The bottom zone is Strop's most defensible original move
+(print-faithful; satisfies Gwern's zero-effort criterion better than
+popovers) — keep it, complete it: marks become painted superior
+figures (~65% size, raised, accent ink — size signals "footnote",
+color signals "interactive"; PT lacks sups/⁴⁺ glyphs so we paint our
+own, same machinery as list markers), click ref → jump to def, click
+def/zone marker → jump back, the zone becomes the primary edit surface
+(scroll-synced Word-Notes-pane niche, essentially unoccupied), no hover
+popovers (the zone already beats them), stacking policy: show all up to
+3, then collapse with count. Numbering stays painted-by-order over
+stable labels (the universal Word/Pandoc architecture — already ours).
+
+**AI settings panel** (Kirill's mandate + partial research): dedicated
+in-app panel; form = base_url · key (masked, paste-friendly) · model;
+async test-call validation with inline states; fetch /models into a
+pickable, filterable list (Open WebUI is the closest flow model);
+writes config.toml through toml_edit so comments and hand edits
+survive; config file remains the storage and stays hand-editable.
 
 ## 3. The explorability layer (the Bryce verdict, suit on)
 
