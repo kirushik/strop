@@ -209,3 +209,18 @@ this). Any text generation, sync/multiplayer, mac/Windows,
 2026-06-11: ctrl-h adds a replace field to the find bar, Tab hops fields,
 Enter replaces-and-advances, All replaces every match), tables (never?),
 per-paragraph AI rewrites (thesis says diagnosis only).
+
+## Screenshot-driven fixes round 2 (2026-06-11)
+
+- [x] **Overlay z-order**: history panel (and every other overlay) painted
+  UNDER the document text — GPUI paints siblings in tree order; overlays
+  now mount after the canvas child. Caught by Kirill from a screenshot;
+  invisible to the state-reading smoke harness by construction.
+- [x] **Font stack → PT superfamily** (PT Serif body / PT Sans Bold
+  headings / PT Mono code), replacing Literata. Motive: migrating glyph
+  corruption (small-cap-looking forms whose location shifted when style
+  runs changed). Document file audited clean first — one span, exactly
+  "Lish", char-indexed end to end (`strop-core --example dump` is the new
+  audit tool). Literata's three-family static set was the prime suspect;
+  PT faces are independently drawn. **If corruption recurs under PT, it's
+  GPUI's shaping/atlas — file upstream with the dump as evidence.**

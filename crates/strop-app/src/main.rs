@@ -15,17 +15,21 @@ use editor::Editor;
 
 actions!(strop, [Quit]);
 
-// Static instances, not the variable font: GPUI's Linux text stack does not
-// instantiate variable axes, so a lone variable file makes bold render as
-// regular. Revisit when GPUI grows variation support (we lose opsz for now).
-const LITERATA: &[u8] = include_bytes!("../../../assets/fonts/Literata-Regular.ttf");
-const LITERATA_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Literata-Italic.ttf");
-const LITERATA_BOLD: &[u8] = include_bytes!("../../../assets/fonts/Literata-Bold.ttf");
-const LITERATA_BOLD_ITALIC: &[u8] =
-    include_bytes!("../../../assets/fonts/Literata-BoldItalic.ttf");
-const LITERATA_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Literata-SemiBold.ttf");
-const LITERATA_36PT_SEMIBOLD: &[u8] =
-    include_bytes!("../../../assets/fonts/Literata36pt-SemiBold.ttf");
+// The PT superfamily (ParaType, OFL): serif body, sans headings, mono code —
+// drawn as independent fonts with the four canonical styles per family, and
+// metrically harmonized with full Cyrillic. Replaced Literata after its
+// variable-font-derived statics ("Literata" / "Literata SemiBold" /
+// "Literata 36pt") showed migrating glyph corruption in GPUI's shaping/atlas
+// path; the document bytes were proven clean, so the fonts were the variable
+// under test.
+const PT_SERIF: &[u8] = include_bytes!("../../../assets/fonts/PTSerif-Regular.ttf");
+const PT_SERIF_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/PTSerif-Italic.ttf");
+const PT_SERIF_BOLD: &[u8] = include_bytes!("../../../assets/fonts/PTSerif-Bold.ttf");
+const PT_SERIF_BOLD_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/PTSerif-BoldItalic.ttf");
+const PT_SANS: &[u8] = include_bytes!("../../../assets/fonts/PTSans-Regular.ttf");
+const PT_SANS_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/PTSans-Italic.ttf");
+const PT_SANS_BOLD: &[u8] = include_bytes!("../../../assets/fonts/PTSans-Bold.ttf");
+const PT_SANS_BOLD_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/PTSans-BoldItalic.ttf");
 const PT_MONO: &[u8] = include_bytes!("../../../assets/fonts/PTMono-Regular.ttf");
 
 const SAMPLE: &str = "Strop is a writer’s editor with an editor inside — one that diagnoses, and never rewrites you into the average.\n\
@@ -81,12 +85,14 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.text_system()
             .add_fonts(vec![
-                LITERATA.into(),
-                LITERATA_ITALIC.into(),
-                LITERATA_BOLD.into(),
-                LITERATA_BOLD_ITALIC.into(),
-                LITERATA_SEMIBOLD.into(),
-                LITERATA_36PT_SEMIBOLD.into(),
+                PT_SERIF.into(),
+                PT_SERIF_ITALIC.into(),
+                PT_SERIF_BOLD.into(),
+                PT_SERIF_BOLD_ITALIC.into(),
+                PT_SANS.into(),
+                PT_SANS_ITALIC.into(),
+                PT_SANS_BOLD.into(),
+                PT_SANS_BOLD_ITALIC.into(),
                 PT_MONO.into(),
             ])
             .expect("failed to load bundled fonts");

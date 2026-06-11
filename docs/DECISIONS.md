@@ -87,13 +87,23 @@ on hanging punctuation in body text: «выпендрёж». The bar IS:
   reversible with a single undo that reverts just the substitution.
 - **Vertical rhythm over font choice.** All vertical gaps in multiples of the
   line height.
-- **v1 metrics: 20px/28px Literata, ~64ch measure (~660px), ragged right,
+- **v1 metrics: 20px/28px body, ~64ch measure (~660px), ragged right,
   no justification, no hyphenation.** (Birman's own blog runs 20/28; iA's
   default measure is 64ch; Bringhurst's band is 45–75.)
-- **Font: Literata variable** (OFL, expert Cyrillic per type.today, opsz
-  axis), vendored in `assets/fonts`. Alt: PT Serif. Do NOT ship iA's fonts
-  as defaults (license-legal but reputationally radioactive in this exact
-  product category).
+- **Font: the PT superfamily** (ParaType via Google Fonts, OFL), vendored in
+  `assets/fonts`: PT Serif body (4 canonical styles), PT Sans Bold headings
+  (the families are metrically harmonized for pairing; PT ships no SemiBold,
+  so the sans face carries heading contrast), PT Mono code. *Supersedes
+  Literata* (2026-06-11): Literata's variable-font-derived statics spanned
+  three family names ("Literata"/"Literata SemiBold"/"Literata 36pt") and
+  showed migrating glyph corruption in GPUI's shaping/atlas path on lines
+  and windows mixing faces — wrong glyphs (small-cap forms) whose location
+  shifted when style runs changed. Document bytes were verified clean, so
+  the font stack was the experiment variable; PT faces are independently
+  drawn, not instanced. If corruption recurs under PT, the bug is GPUI's
+  text system itself → file upstream. Do NOT ship iA's fonts as defaults
+  (license-legal but reputationally radioactive in this exact product
+  category).
 
 ## D6. Text-engine commitments
 

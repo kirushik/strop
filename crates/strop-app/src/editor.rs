@@ -1521,7 +1521,7 @@ impl Editor {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .font_family("Literata")
+                .font_family("PT Serif")
                 .text_size(px(13.))
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Alt text:"))
                 .child(div().flex_1().child(input)),
@@ -1553,7 +1553,7 @@ impl Editor {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .font_family("Literata")
+                .font_family("PT Serif")
                 .text_size(px(13.))
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Find:"))
                 .child(div().flex_1().child(input))
@@ -2870,8 +2870,9 @@ impl IntoElement for EditorElement {
 }
 
 /// Per-kind block metrics and decorations, per the PT-pairings research:
-/// same-family Literata SemiBold headings (display optical for H1), all
-/// boxes on the 28px rhythm.
+/// PT Sans Bold headings over the PT Serif body (the superfamily is
+/// metrically harmonized for exactly this), all boxes on the 28px rhythm.
+/// PT ships no SemiBold, so the sans face alone carries the H3 contrast.
 struct BlockStyle {
     size: Pixels,
     line_height: Pixels,
@@ -2912,23 +2913,26 @@ fn block_style_scaled(kind: &BlockKind, scale: f32) -> BlockStyle {
 }
 
 fn block_style(kind: &BlockKind) -> BlockStyle {
-    let semibold = Some(FontWeight::SEMIBOLD);
+    let heading = Some("PT Sans");
+    let bold = Some(FontWeight::BOLD);
     match kind {
         BlockKind::Heading(1) => BlockStyle {
             size: px(32.),
             line_height: px(42.),
             extra_top: px(14.),
-            family: Some("Literata 36pt"),
-            weight: semibold,
+            family: heading,
+            weight: bold,
             ..Default::default()
         },
         BlockKind::Heading(2) => BlockStyle {
             size: px(24.),
-            weight: semibold,
+            family: heading,
+            weight: bold,
             ..Default::default()
         },
         BlockKind::Heading(_) => BlockStyle {
-            weight: semibold,
+            family: heading,
+            weight: bold,
             ..Default::default()
         },
         BlockKind::Blockquote => BlockStyle {
@@ -3569,7 +3573,7 @@ impl Element for EditorElement {
             if let Some(marker) = &par.marker {
                 let run = TextRun {
                     len: marker.len(),
-                    font: gpui::font("Literata"),
+                    font: gpui::font("PT Serif"),
                     color: rgb(MUTED_COLOR).into(),
                     background_color: None,
                     underline: None,
@@ -3680,7 +3684,7 @@ impl Editor {
             .items_center()
             .border_b_1()
             .border_color(rgb(RULE_COLOR))
-            .font_family("Literata")
+            .font_family("PT Serif")
             .text_size(px(13.))
             .child(
                 div()
@@ -3865,7 +3869,7 @@ impl Editor {
                                         .truncate()
                                         .text_color(rgb(TEXT_COLOR))
                                         .when(e.manual, |d| {
-                                            d.font_weight(FontWeight::SEMIBOLD)
+                                            d.font_weight(FontWeight::BOLD)
                                         })
                                         .child(format!(
                                             "{}{}",
@@ -3902,7 +3906,7 @@ impl Editor {
             .flex()
             .flex_col()
             .gap(px(2.))
-            .font_family("Literata")
+            .font_family("PT Serif")
             .text_size(px(13.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
@@ -4082,7 +4086,7 @@ impl Editor {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .font_family("Literata")
+                    .font_family("PT Serif")
                     .text_size(px(14.))
                     .text_color(rgb(MUTED_COLOR))
                     .children(footnotes.into_iter().enumerate().map(
@@ -4235,7 +4239,7 @@ impl Editor {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .font_family("Literata")
+                .font_family("PT Serif")
                 .text_size(px(13.))
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Note:"))
                 .child(div().flex_1().child(input)),
@@ -4289,7 +4293,7 @@ impl Editor {
                             rgb(RULE_COLOR)
                         })
                         .cursor(CursorStyle::PointingHand)
-                        .font_family("Literata")
+                        .font_family("PT Serif")
                         .text_size(px(13.))
                         .text_color(rgb(TEXT_COLOR))
                         .on_mouse_down(
@@ -4379,7 +4383,7 @@ impl Editor {
                                 ),
                         )
                         .when(is_diagnosis && !title.is_empty(), |d| {
-                            d.child(div().font_weight(FontWeight::SEMIBOLD).child(title.clone()))
+                            d.child(div().font_weight(FontWeight::BOLD).child(title.clone()))
                         })
                         .when_some(composer, |d, input| d.child(input))
                         .when(!active || is_diagnosis, |d| {
@@ -4498,7 +4502,7 @@ impl Render for Editor {
                             .pt(px(56.))
                             .pb(px(28.))
                             .px(px(28.))
-                            .font_family("Literata")
+                            .font_family("PT Serif")
                             .text_size(px(
                                 self.config.font_size.unwrap_or(20.).clamp(12., 40.)
                             ))
@@ -4560,7 +4564,7 @@ mod tests {
     fn base() -> TextRun {
         TextRun {
             len: 0,
-            font: gpui::font("Literata"),
+            font: gpui::font("PT Serif"),
             color: rgb(TEXT_COLOR).into(),
             background_color: None,
             underline: None,
