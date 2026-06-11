@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod editor;
+mod files;
 mod smoke;
 
 use std::path::PathBuf;
@@ -69,17 +70,23 @@ fn save_bounds(b: (f32, f32, f32, f32)) {
     }
 }
 
-/// `strop [file.strop]`; default document lives in the XDG data dir.
+/// `strop [file.strop|file.md|--new]`. With no argument: migrate the
+/// legacy hidden scratch if present, else reopen the most recent
+/// document, else start a fresh visible Untitled (PLAN.md E2 — documents
+/// are never created in hidden locations).
 fn data_file() -> PathBuf {
-    if let Some(arg) = std::env::args().nth(1) {
-        return arg.into();
+    match std::env::args().nth(1).as_deref() {
+        Some("--new") => return files::untitled_path(),
+        Some(arg) => return arg.into(),
+        None => {}
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME not set")).join(".local/share")
-        });
-    base.join("strop/scratch.strop")
+    if let Some(migrated) = files::migrate_scratch() {
+        return migrated;
+    }
+    if let Some(recent) = files::recents().into_iter().next() {
+        return recent;
+    }
+    files::untitled_path()
 }
 
 fn main() {
@@ -107,39 +114,48 @@ fn main() {
         // also never touch the user's real document: no store unless a file
         // was passed explicitly (which lets smoke scripts test persistence).
         let smoke = std::env::var("STROP_SMOKE").is_ok();
-        let store = if smoke && std::env::args().nth(1).is_none() {
+        // Resolve the document path exactly once: data_file() has side
+        // effects (scratch migration) that smoke runs must never trigger.
+        let doc_path: Option<PathBuf> = if smoke && std::env::args().nth(1).is_none() {
             None
         } else {
-            let store_path = {
-                let p = data_file();
-                if p.extension().is_some_and(|e| e == "md") {
+            Some(data_file())
+        };
+        let store = match &doc_path {
+            None => None,
+            Some(p) => {
+                let store_path = if p.extension().is_some_and(|e| e == "md") {
                     p.with_extension("strop")
                 } else {
-                    p
-                }
-            };
-            match Store::open(store_path) {
-                Ok(opened) => Some(opened),
-                Err(e) => {
-                    eprintln!("strop: cannot open {}: {e}", data_file().display());
-                    None
+                    p.clone()
+                };
+                match Store::open(store_path) {
+                    Ok(opened) => {
+                        if !smoke {
+                            files::push_recent(opened.0.path());
+                        }
+                        Some(opened)
+                    }
+                    Err(e) => {
+                        eprintln!("strop: cannot open {}: {e}", p.display());
+                        None
+                    }
                 }
             }
         };
         // Opening a .md imports it into a sibling .strop (existing .strop
         // wins — the durable file is the source of truth once it exists).
-        let md_import: Option<(String, SpanSet, BlockMap)> = {
-            let arg = data_file();
+        let md_import: Option<(String, SpanSet, BlockMap)> = doc_path.as_ref().and_then(|arg| {
             if arg.extension().is_some_and(|e| e == "md") && !arg.with_extension("strop").exists()
             {
-                std::fs::read_to_string(&arg).ok().map(|md| {
+                std::fs::read_to_string(arg).ok().map(|md| {
                     let (text, spans, blocks) = strop_core::markdown::from_markdown(&md);
                     (text, spans, blocks)
                 })
             } else {
                 None
             }
-        };
+        });
 
         let (initial_text, initial_spans, initial_blocks, initial_history) = match &store {
             Some((store, existing)) => match existing {
@@ -160,8 +176,13 @@ fn main() {
                         (text.clone(), spans.clone(), blocks.clone(), None)
                     }
                     None => {
-                        store.seed(SAMPLE);
-                        (SAMPLE.to_owned(), SpanSet::default(), BlockMap::default(), None)
+                        // The very first document a user ever sees carries
+                        // the demo text (E4 upgrades it to a real tutorial);
+                        // every later New Document starts clean.
+                        let first_run = files::recents().len() <= 1;
+                        let seed = if first_run { SAMPLE } else { "" };
+                        store.seed(seed);
+                        (seed.to_owned(), SpanSet::default(), BlockMap::default(), None)
                     }
                 },
             },
@@ -176,11 +197,11 @@ fn main() {
             None => Bounds::centered(None, size(px(960.), px(720.)), cx),
         };
         let title = {
-            let p = data_file();
-            let stem = p
-                .file_stem()
+            let stem = doc_path
+                .as_ref()
+                .and_then(|p| p.file_stem())
                 .and_then(|s| s.to_str())
-                .unwrap_or("Scratch")
+                .unwrap_or("Smoke")
                 .to_owned();
             format!("{stem} — Strop")
         };

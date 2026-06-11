@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Strop
+Comment=A writer's editor with an editor inside
+Exec=@BIN@ %f
+MimeType=application/x-strop;
+Categories=Office;WordProcessor;
+Terminal=false

@@ -8,10 +8,11 @@
 use gpui::Action;
 
 use crate::editor::{
-    AddCheckpoint, AddNote, ExportMarkdown, Find, Heading1, Heading2, Heading3, InsertFootnote,
-    OpenFile, Redo, Replace, RunBelieving, RunDiagnosis, SaveCopyAs, ToggleBulletList, ToggleCode,
-    ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList,
-    TogglePalette, ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
+    AddCheckpoint, AddNote, CopyDocumentPath, ExportMarkdown, Find, Heading1, Heading2, Heading3,
+    InsertFootnote, NewDocument, OpenFile, Redo, RenameDocument, Replace, RevealInFiles,
+    RunBelieving, RunDiagnosis, SaveCopyAs, ToggleBulletList, ToggleCode, ToggleCodeBlock,
+    ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList, TogglePalette,
+    ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
 };
 
 pub struct Command {
@@ -40,7 +41,29 @@ macro_rules! cmd {
 /// Table order is presentation order (palette empty state, cheatsheet).
 pub fn all() -> &'static [Command] {
     static COMMANDS: &[Command] = &[
+        cmd!("New Document", "File", Some("ctrl-n"), NewDocument, ["create", "новый документ"]),
         cmd!("Open Document…", "File", Some("ctrl-o"), OpenFile, ["file", "открыть"]),
+        cmd!(
+            "Rename Document…",
+            "File",
+            Some("f2"),
+            RenameDocument,
+            ["title", "переименовать"]
+        ),
+        cmd!(
+            "Reveal in Files",
+            "File",
+            None,
+            RevealInFiles,
+            ["show in file manager", "folder", "где файл", "папка"]
+        ),
+        cmd!(
+            "Copy Document Path",
+            "File",
+            None,
+            CopyDocumentPath,
+            ["location", "путь к файлу"]
+        ),
         cmd!(
             "Save a Copy As…",
             "File",
@@ -190,6 +213,12 @@ pub fn score(query: &str, command: &Command) -> Option<i32> {
         .max()
 }
 
+/// Score arbitrary text (recents rows etc.) with the same rules commands
+/// use; query is lowercased here, like in `score`.
+pub fn score_text(query: &str, target: &str) -> Option<i32> {
+    score_one(&query.to_lowercase(), &target.to_lowercase())
+}
+
 fn score_one(query: &str, target: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
@@ -248,7 +277,7 @@ mod tests {
     #[test]
     fn empty_query_lists_everything_in_table_order() {
         assert_eq!(ranked("").len(), all().len());
-        assert_eq!(labels("")[0], "Open Document…");
+        assert_eq!(labels("")[0], "New Document");
     }
 
     #[test]

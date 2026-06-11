@@ -58,7 +58,8 @@ actions!(
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
         OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
-        ToggleHistory, TogglePalette, PaletteUp, PaletteDown,
+        ToggleHistory, TogglePalette, PaletteUp, PaletteDown, NewDocument, RenameDocument,
+        RevealInFiles, CopyDocumentPath,
     ]
 );
 
@@ -202,6 +203,8 @@ pub struct Editor {
     /// The command palette (PLAN.md E1): the menu, summoned not mounted.
     palette_input: Option<Entity<NoteInput>>,
     palette_selected: usize,
+    /// In-titlebar document rename (PLAN.md E2).
+    doc_rename_input: Option<Entity<NoteInput>>,
     find_current: usize,
     /// Replace field (ctrl-h adds it beside find): Enter on it replaces
     /// the current match; the All button replaces every match (one undo).
@@ -660,6 +663,7 @@ impl Editor {
             find_input: None,
             palette_input: None,
             palette_selected: 0,
+            doc_rename_input: None,
             find_current: 0,
             replace_input: None,
             rename_input: None,
@@ -1522,6 +1526,105 @@ impl Editor {
         cx.notify();
     }
 
+    /// One window per document, one process per window: simple, and two
+    /// windows can never fight over the same CRDT file.
+    fn new_document(&mut self, _: &NewDocument, _: &mut Window, _: &mut Context<Self>) {
+        crate::files::new_window_blank();
+    }
+
+    fn reveal_in_files(&mut self, _: &RevealInFiles, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(store) = &self.store {
+            crate::files::reveal(store.path());
+        }
+    }
+
+    fn copy_document_path(&mut self, _: &CopyDocumentPath, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(store) = &self.store {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                store.path().display().to_string(),
+            ));
+        }
+    }
+
+    /// F2 or clicking the titlebar name: rename the document in place —
+    /// the file on disk is renamed too (visible-from-birth contract).
+    fn rename_document(&mut self, _: &RenameDocument, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else { return };
+        if self.doc_rename_input.is_some() {
+            return;
+        }
+        let stem = store
+            .path()
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled")
+            .to_owned();
+        let input = cx.new(|cx| NoteInput::new(cx, stem));
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, _, event: &NoteInputEvent, window, cx| match event {
+                NoteInputEvent::Commit(title) => editor.finish_rename(title.clone(), window, cx),
+                NoteInputEvent::Cancel => {
+                    editor.doc_rename_input = None;
+                    window.focus(&editor.focus_handle);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        window.focus(&input.read(cx).focus_handle);
+        self.doc_rename_input = Some(input);
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.doc_rename_input = None;
+        window.focus(&self.focus_handle);
+        let Some(stem) = crate::files::stem_from_title(&title) else {
+            cx.notify();
+            return;
+        };
+        if let Some(store) = &mut self.store {
+            let old = store.path().to_owned();
+            let new_path = old
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(format!("{stem}.strop"));
+            match store.rename_file(new_path) {
+                Ok(()) => {
+                    crate::files::replace_recent(&old, store.path());
+                    window.set_window_title(&format!("{stem} — Strop"));
+                }
+                Err(e) => eprintln!("strop: rename: {e}"),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Commands first (ranked), then recent documents that match — the
+    /// palette is both the menu and the door to the other essays.
+    fn palette_rows(&self, query: &str) -> Vec<PaletteRow> {
+        let mut rows: Vec<PaletteRow> = crate::commands::ranked(query)
+            .into_iter()
+            .map(PaletteRow::Cmd)
+            .collect();
+        let current = self.store.as_ref().map(|s| s.path().to_owned());
+        for p in crate::files::recents() {
+            if Some(&p) == current.as_ref() {
+                continue;
+            }
+            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if query.trim().is_empty()
+                || crate::commands::score_text(query.trim(), name).is_some()
+            {
+                rows.push(PaletteRow::Recent(p));
+            }
+        }
+        rows
+    }
+
     fn execute_palette_entry(
         &mut self,
         query: &str,
@@ -1529,14 +1632,24 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(cmd) = crate::commands::ranked(query).get(ix).copied() else {
+        let rows = self.palette_rows(query);
+        let Some(row) = rows.get(ix) else {
             return;
         };
-        let action = (cmd.make)();
-        // Close first: focus returns to the document, so the action lands
-        // exactly as if its chord had been pressed there.
-        self.close_palette(window, cx);
-        window.dispatch_action(action, cx);
+        match row {
+            PaletteRow::Cmd(cmd) => {
+                let action = (cmd.make)();
+                // Close first: focus returns to the document, so the action
+                // lands exactly as if its chord had been pressed there.
+                self.close_palette(window, cx);
+                window.dispatch_action(action, cx);
+            }
+            PaletteRow::Recent(path) => {
+                let path = path.clone();
+                self.close_palette(window, cx);
+                crate::files::open_in_new_window(&path);
+            }
+        }
     }
 
     fn palette_up(&mut self, _: &PaletteUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -1548,7 +1661,7 @@ impl Editor {
         let len = self
             .palette_input
             .as_ref()
-            .map_or(0, |i| crate::commands::ranked(&i.read(cx).content).len());
+            .map_or(0, |i| self.palette_rows(&i.read(cx).content).len());
         if len > 0 {
             self.palette_selected = (self.palette_selected + 1).min(len - 1);
         }
@@ -1558,9 +1671,10 @@ impl Editor {
     fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
         let input = self.palette_input.clone().expect("palette open");
         let query = input.read(cx).content.clone();
-        let ranked = crate::commands::ranked(&query);
-        let selected = self.palette_selected.min(ranked.len().saturating_sub(1));
+        let rows = self.palette_rows(&query);
+        let selected = self.palette_selected.min(rows.len().saturating_sub(1));
         let grouped = query.trim().is_empty();
+        let home = std::env::var("HOME").unwrap_or_default();
         let mut list = div()
             .id("palette-list")
             .max_h(px(420.))
@@ -1569,9 +1683,13 @@ impl Editor {
             .flex_col()
             .pb(px(6.));
         let mut last_section = "";
-        for (ix, cmd) in ranked.iter().enumerate() {
-            if grouped && cmd.section != last_section {
-                last_section = cmd.section;
+        for (ix, row) in rows.iter().enumerate() {
+            let section = match row {
+                PaletteRow::Cmd(cmd) => cmd.section,
+                PaletteRow::Recent(_) => "Recent Documents",
+            };
+            if grouped && section != last_section {
+                last_section = section;
                 list = list.child(
                     div()
                         .px(px(12.))
@@ -1579,9 +1697,26 @@ impl Editor {
                         .pb(px(2.))
                         .text_size(px(10.))
                         .text_color(rgb(MUTED_COLOR))
-                        .child(cmd.section.to_uppercase()),
+                        .child(section.to_uppercase()),
                 );
             }
+            let (label, right): (String, Option<String>) = match row {
+                PaletteRow::Cmd(cmd) => {
+                    (cmd.label.to_owned(), cmd.keys.map(|k| k.to_owned()))
+                }
+                PaletteRow::Recent(p) => {
+                    let stem = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_owned();
+                    let dir = p
+                        .parent()
+                        .map(|d| d.display().to_string().replace(&home, "~"))
+                        .unwrap_or_default();
+                    (stem, Some(dir))
+                }
+            };
             list = list.child(
                 div()
                     .id(("palette-row", ix))
@@ -1590,6 +1725,7 @@ impl Editor {
                     .flex()
                     .justify_between()
                     .items_center()
+                    .gap(px(12.))
                     .cursor(CursorStyle::PointingHand)
                     .when(ix == selected, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
@@ -1609,19 +1745,21 @@ impl Editor {
                         div()
                             .text_size(px(13.))
                             .text_color(rgb(TEXT_COLOR))
-                            .child(cmd.label),
+                            .child(label),
                     )
-                    .when_some(cmd.keys, |d, keys| {
+                    .when_some(right, |d, right| {
                         d.child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(MUTED_COLOR))
-                                .child(keys),
+                                .min_w(px(0.))
+                                .truncate()
+                                .child(right),
                         )
                     }),
             );
         }
-        if ranked.is_empty() {
+        if rows.is_empty() {
             list = list.child(
                 div()
                     .px(px(12.))
@@ -3992,7 +4130,37 @@ impl Editor {
                     .pl(px(14.))
                     .text_color(rgb(MUTED_COLOR))
                     .on_mouse_down(MouseButton::Left, drag)
-                    .child("Strop")
+                    .child(match (&self.doc_rename_input, &self.store) {
+                        // F2 / click: rename the document right here.
+                        (Some(input), _) => div()
+                            .w(px(220.))
+                            .child(input.clone())
+                            .into_any_element(),
+                        (None, Some(store)) => {
+                            let stem = store
+                                .path()
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Untitled")
+                                .to_owned();
+                            div()
+                                .id("doc-title")
+                                .px(px(4.))
+                                .rounded(px(4.))
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.rename_document(&RenameDocument, window, cx);
+                                    }),
+                                )
+                                .child(stem)
+                                .into_any_element()
+                        }
+                        (None, None) => div().child("Strop").into_any_element(),
+                    })
                     .when(self.diagnosis_running, |d| {
                         d.child(div().ml(px(10.)).child("· диагноз…"))
                     })
@@ -4525,6 +4693,12 @@ struct HistoryView {
     compare_current: bool,
 }
 
+/// One palette row: a command from the registry, or a recent document.
+enum PaletteRow {
+    Cmd(&'static crate::commands::Command),
+    Recent(std::path::PathBuf),
+}
+
 /// The materialized preview: merged diff text + styled ranges (bytes).
 /// Formatting is projected from both diff sides — kept/inserted content
 /// carries the newer version's spans and block kinds, deleted content the
@@ -4890,6 +5064,10 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_palette))
                     .on_action(cx.listener(Self::palette_up))
                     .on_action(cx.listener(Self::palette_down))
+                    .on_action(cx.listener(Self::new_document))
+                    .on_action(cx.listener(Self::rename_document))
+                    .on_action(cx.listener(Self::reveal_in_files))
+                    .on_action(cx.listener(Self::copy_document_path))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

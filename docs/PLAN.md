@@ -81,14 +81,23 @@ here. Sequenced so dogfooding unblocks as early as possible.
   real action with focus returned to the document first; up/down navigate
   via a PaletteInput key context. Polish later: scroll-selected-into-view,
   recents-on-top.
-- [ ] **E2. Document lifecycle** (per E2-research, landed — see below):
-  visible-from-birth files — Untitled.strop created immediately in
-  `$XDG_DOCUMENTS_DIR/Strop/` (xdg user-dirs aware), kill the silent
-  scratch (migrate it there visibly), titlebar filename + popover (path,
-  copy, Reveal in Files via FileManager1 D-Bus, rename-in-place), New
-  Document + Open + app-private recents (~/.local/state/strop/
-  recents.json) in the palette, one window per document, .desktop + MIME
-  registration script.
+- [x] **E2. Document lifecycle** (shipped 2026-06-12): visible-from-birth
+  files — bare launch reopens the most recent document, first launch ever
+  migrates the old hidden scratch into `$XDG_DOCUMENTS_DIR/Strop/` (xdg
+  user-dirs parsed, localized) or starts Untitled.strop there; `--new` /
+  ctrl-n / palette "New Document" opens a fresh Untitled in its own
+  window (one window per document, one process per window); titlebar
+  shows the document name — click or F2 renames in place and renames the
+  file on disk (collision-refusing); Reveal in Files (FileManager1 D-Bus,
+  xdg-open fallback) and Copy Document Path in the palette; app-private
+  recents (~/.local/state/strop/recents.json, deduped, existing-only)
+  appear as palette rows that open in new windows;
+  scripts/install-desktop.sh registers application/x-strop + .desktop so
+  double-click works. Deviations from research, deliberate: no start
+  screen (recents-in-palette + reopen-last covers it with zero new UI;
+  revisit after dogfood), recently-used.xbel deferred, single-instance
+  raise-if-open deferred. New documents seed empty; the first-ever
+  document keeps the demo text until E4's tutorial replaces it.
 - [ ] **E3. AI surface**: in-app settings panel (provider/key/model,
   test-call validation), margin teaching card when unconfigured, run
   indicator + cancel, error cards that name the cause (401/429/network/

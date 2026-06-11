@@ -168,6 +168,33 @@ pub struct Store {
 }
 
 impl Store {
+    /// Rename/move the on-disk file; subsequent saves follow. Refuses to
+    /// overwrite — renaming is never allowed to destroy another document.
+    pub fn rename_file(&mut self, new_path: impl Into<PathBuf>) -> io::Result<()> {
+        let new_path = new_path.into();
+        if new_path == self.path {
+            return Ok(());
+        }
+        if new_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", new_path.display()),
+            ));
+        }
+        if let Some(dir) = new_path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        // The file may not exist yet (brand-new doc before first save) —
+        // that's fine, the path is still just where saves will land.
+        match fs::rename(&self.path, &new_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        self.path = new_path;
+        Ok(())
+    }
+
     /// Open a `.strop` file. Returns the store and, when the file already
     /// existed, its text, formatting, and block kinds (None = brand-new).
     pub fn open(path: impl Into<PathBuf>) -> io::Result<(Self, Option<Loaded>)> {
