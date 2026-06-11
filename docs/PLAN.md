@@ -299,10 +299,39 @@ section. Ordering: root-fix verification first, then highest-leverage.
   never written. Verified live against a local python stub (/models +
   /chat/completions) and the connection-refused error path;
   debug_cursor gained ai_panel=/ai_models= tags.
-- [ ] **F5. Structure & finishing layer** (DESIGN §1.6, §4): the beat
-  strip (outline at point of performance) + close-time "Next session I
-  will ___" ritual + session word-progress. The research's verdict:
-  this, not chrome, is what stands between the writer and "The End".
+- [x] **F5. Structure & finishing layer** (shipped 2026-06-12, DESIGN
+  §1.6 + §4): three pieces, all honoring the invariant "opening Strop
+  lands you in the document, caret restored, zero questions asked".
+  **Outline rail** (§1.6): toggleable left rail (~200px, PUSH like the
+  history panel pushes right; hidden by default; session-only, no
+  config) listing BlockKind::Heading lines, level shown by indent (PT
+  Sans 12px), current section highlighted from the cursor's block,
+  click = caret to heading start + autoscroll; empty state teaches
+  ctrl-1..3; ToggleOutline on ctrl-shift-o (registry section "View") +
+  a drawn three-decreasing-bars titlebar button left of the history
+  ring; stands down while history is open (the canvas shows a merged
+  diff there). **Close-time if-then ritual** (§4.1, d=0.65): "End
+  Session…" palette action opens a bottom strip "Next session I will
+  ___" — enter saves to ~/.local/state/strop/intents.json (keyed by
+  canonical doc path: intent/set_unix/caret) and quits (it IS
+  end-session); escape stays. ctrl-q/window close never blocks and
+  never writes an intent (§4b tension 6) — quit only records the caret
+  offset, which restore_session clamps and re-seats on open (caret was
+  never persisted before; resume-mid-sentence now works). On open the
+  intent shows as a dismissible "Next: …" card at the margin-lane top
+  (bottom strip in narrow windows — status never covers prose), its own
+  field, NOT ai_status; auto-clears from screen and disk on first edit
+  or dismiss; the idle margin hint stands down while it shows. **Session
+  word goal** (§4.2): "Set Session Goal…" strip takes a number (invalid
+  ignored, 0 clears); titlebar becomes "1,234 words · +56/200" (delta vs
+  count-at-set); at the goal the separator dot quietly fills in sage
+  #7D8C66 — no celebration (§4b tension 3); session-only. Verified:
+  intents.json round-trip unit test (injected path, no env races), X11
+  smoke (outline click-jump to all 5 headings, goal=/intent=/outline=
+  debug tags, EndSession write→quit→reopen-banner→dismiss-by-click and
+  first-edit auto-clear), pixel pass on rail/titlebar/banner. Rig note:
+  click:X,Y smoke needs the X11 env (env -u WAYLAND_DISPLAY DISPLAY=:0)
+  — occluded Wayland windows hit-test against a stale frame.
 - [ ] **F6. Explorability passes** (DESIGN §3): tutorial invites
   breaking things; solution-reveal whispers (1/session); palette
   hit-frequency ordering.

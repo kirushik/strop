@@ -9,12 +9,13 @@ use gpui::Action;
 
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
-    DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1, Heading2,
-    Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
+    DiagnosisModeDevelopmental, DiagnosisModeLine, EndSession, ExportMarkdown, Find, Heading1,
+    Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
-    ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode, ToggleCodeBlock,
-    ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList, TogglePalette,
-    TogglePopover, ToggleQuoteBlock, ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
+    SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode,
+    ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList,
+    ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleStrikethrough,
+    ToggleStrong, ToggleUnderline, Undo,
 };
 
 pub struct Command {
@@ -167,6 +168,15 @@ pub fn all() -> &'static [Command] {
             InsertFootnote,
             ["сноска"]
         ),
+        // The outline rail (DESIGN §1.6): externalized structure at the
+        // point of performance — the biggest structural gap, per research.
+        cmd!(
+            "Toggle Outline",
+            "View",
+            Some("ctrl-shift-o"),
+            ToggleOutline,
+            ["headings", "beats", "оглавление", "план", "структура"]
+        ),
         cmd!(
             "Run Editorial Diagnosis",
             "Margin & AI",
@@ -243,6 +253,23 @@ pub fn all() -> &'static [Command] {
             Some("ctrl-alt-s"),
             AddCheckpoint,
             ["snapshot", "version", "чекпоинт"]
+        ),
+        // The finish-your-story layer (DESIGN §4): per-session progress
+        // and the close-time if-then ritual. Scaffolds prompt at CLOSE,
+        // never at open (§4b tension 6) — both are pull-only.
+        cmd!(
+            "Set Session Goal…",
+            "Session",
+            None,
+            SetSessionGoal,
+            ["words", "target", "progress", "цель", "норма слов"]
+        ),
+        cmd!(
+            "End Session…",
+            "Session",
+            None,
+            EndSession,
+            ["quit", "next session", "intent", "закончить сессию", "намерение"]
         ),
         cmd!(
             "Open Command Palette",

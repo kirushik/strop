@@ -242,6 +242,14 @@ fn main() {
                     if let Some(notes) = tutorial_notes {
                         editor.restore_annotations(notes);
                     }
+                    // The if-then ritual's open half (DESIGN §4.1): caret
+                    // restored, last close's intent surfaced — and nothing
+                    // is ever asked at open (the §4 invariant).
+                    if let Some((store, _)) = &store {
+                        if let Some(entry) = files::load_intent(store.path()) {
+                            editor.restore_session(entry);
+                        }
+                    }
                     editor.start_blink(cx);
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);
@@ -260,7 +268,12 @@ fn main() {
             .expect("window just opened");
         let window_for_quit = window;
         cx.on_app_quit(move |cx| {
-            editor.update(cx, |editor, _| editor.save_now());
+            editor.update(cx, |editor, _| {
+                editor.save_now();
+                // Caret remembered for next open (resume mid-sentence);
+                // never a question, never a dialog (DESIGN §4b tension 6).
+                editor.record_exit_state();
+            });
             let _ = window_for_quit.update(cx, |_, window, _| {
                 let b = window.bounds();
                 save_bounds((

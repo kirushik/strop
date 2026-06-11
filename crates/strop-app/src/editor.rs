@@ -44,7 +44,11 @@ const MARGIN_GAP: f32 = 16.;
 /// History side panel (DESIGN §2-history): push, not overlay. The panel
 /// shrinks before the document does — prose keeps DOC_MIN_WIDTH.
 const HISTORY_PANEL_WIDTH: f32 = 320.;
+/// Outline rail (DESIGN §1.6): left, push — mirrors the history panel.
+const OUTLINE_PANEL_WIDTH: f32 = 200.;
 const DOC_MIN_WIDTH: f32 = 400.;
+/// Sage for the reached-goal dot (DESIGN §4.2): subtle, no celebration.
+const SAGE_COLOR: u32 = 0x7D8C66;
 const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
 const MUTED_COLOR: u32 = 0x8A8678;
@@ -66,6 +70,7 @@ actions!(
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
+        ToggleOutline, EndSession, SetSessionGoal,
     ]
 );
 
@@ -264,6 +269,27 @@ pub struct Editor {
     selection_popover: bool,
     /// Titlebar word count, recomputed on mutation — never per frame.
     word_count: usize,
+    /// Outline rail (DESIGN §1.6): toggleable left rail of headings,
+    /// session-only — externalized structure at the point of performance.
+    outline_open: bool,
+    /// "Next session I will ___" recorded at the previous close (DESIGN
+    /// §4.1), shown as a dismissible banner; auto-clears on first edit.
+    /// Deliberately NOT ai_status — the AI never speaks first.
+    next_intent: Option<String>,
+    /// End Session recorded an intent this run; quit then skips the
+    /// caret-only rewrite (the entry is already complete).
+    intent_recorded: bool,
+    /// store_dirty was set at least once this session. The close-time
+    /// decision it feeds (DESIGN §4b tension 6): edits + no intent =
+    /// still NOTHING at quit — no dialog, ever. The ritual is pull-only.
+    session_had_edits: bool,
+    /// The "End Session…" composer (bottom strip, like find).
+    end_session_input: Option<Entity<NoteInput>>,
+    /// Session word goal (DESIGN §4.2): (target, word_count at set time).
+    /// Session-only — per-session progress, never lifetime totals.
+    session_goal: Option<(usize, usize)>,
+    /// The "Set Session Goal…" composer (bottom strip).
+    goal_input: Option<Entity<NoteInput>>,
     /// Painted bounds of each footnote-zone row's text area (captured by a
     /// canvas child at paint time), so a click on the mirror maps to the
     /// same offset in the def line (DESIGN §2-footnotes, the Word
@@ -741,6 +767,19 @@ impl TextFrame {
     }
 }
 
+/// 1234 -> "1,234" for the titlebar count.
+fn format_thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Whitespace-delimited word count over text chunks (rope chunks may split
 /// mid-word, so track the in-word state across them).
 fn count_words<'a>(chunks: impl Iterator<Item = &'a str>) -> usize {
@@ -806,6 +845,13 @@ impl Editor {
             voice_baseline: None,
             note_input: None,
             selection_popover: false,
+            outline_open: false,
+            next_intent: None,
+            intent_recorded: false,
+            session_had_edits: false,
+            end_session_input: None,
+            session_goal: None,
+            goal_input: None,
             zone_row_bounds: HashMap::new(),
             last_frame: None,
         }
@@ -857,7 +903,43 @@ impl Editor {
             store.apply(&ops);
             self.store_dirty = true;
             self.dirty_since_checkpoint = true;
+            self.session_had_edits = true;
+            // The first edit honors the open-time intent: the banner has
+            // done its job and clears itself (DESIGN §4.1).
+            if self.next_intent.take().is_some() {
+                crate::files::clear_intent(store.path());
+            }
         }
+    }
+
+    /// Re-enter the document where the last session left it (DESIGN §4
+    /// invariant: caret restored, zero questions asked, within a second)
+    /// and surface the recorded next-session intent as a banner.
+    pub fn restore_session(&mut self, entry: crate::files::IntentEntry) {
+        if let Some(caret) = entry.caret {
+            // Clamp to the document and snap to a char boundary (the doc
+            // may have changed under us since the caret was recorded).
+            let byte = self
+                .doc
+                .char_to_byte(self.doc.rope().byte_to_char(caret.min(self.doc.len_bytes())));
+            self.selected_range = byte..byte;
+            self.autoscroll_request = true;
+        }
+        if let Some(intent) = entry.intent.filter(|i| !i.trim().is_empty()) {
+            self.next_intent = Some(intent);
+        }
+    }
+
+    /// Quit-time bookkeeping: remember the caret so the next open resumes
+    /// mid-sentence. The intent itself is only ever written by End
+    /// Session — a quit with edits and no intent stays a plain quit
+    /// (DESIGN §4b tension 6: prompts at close are offered, never owed).
+    pub fn record_exit_state(&self) {
+        let Some(store) = &self.store else { return };
+        if self.intent_recorded {
+            return; // End Session already wrote the full entry.
+        }
+        crate::files::record_caret(store.path(), self.cursor_offset());
     }
 
     /// Load the [voice] corpus and build the self-baseline. Synchronous —
@@ -3209,6 +3291,148 @@ impl Editor {
         }
     }
 
+    /// The outline rail (DESIGN §1.6): session-only, no config.
+    fn toggle_outline(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
+        self.outline_open = !self.outline_open;
+        cx.notify();
+    }
+
+    /// "End Session…" (DESIGN §4.1 — the strongest evidence card, d=0.65):
+    /// one line, "Next session I will ___", saved per-document; enter
+    /// saves AND quits (it IS end-session), escape stays. The ritual
+    /// lives at close and only on request — ctrl-q never blocks.
+    fn end_session(&mut self, _: &EndSession, window: &mut Window, cx: &mut Context<Self>) {
+        if self.end_session_input.is_some() {
+            return;
+        }
+        let input = cx.new(|cx| NoteInput::new(cx, String::new()));
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, _, event: &NoteInputEvent, window, cx| match event {
+                NoteInputEvent::Commit(text) => {
+                    let text = text.trim().to_owned();
+                    if let Some(store) = &editor.store
+                        && !text.is_empty()
+                    {
+                        crate::files::set_intent(store.path(), &text, editor.cursor_offset());
+                        editor.intent_recorded = true;
+                    }
+                    editor.save_now();
+                    cx.quit();
+                }
+                NoteInputEvent::Cancel => {
+                    editor.end_session_input = None;
+                    window.focus(&editor.focus_handle, cx);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
+        self.end_session_input = Some(input);
+        cx.notify();
+    }
+
+    /// "Set Session Goal…" (DESIGN §4.2): a number, a live delta in the
+    /// titlebar, a quiet sage dot at the finish line. Session-only.
+    fn set_session_goal(&mut self, _: &SetSessionGoal, window: &mut Window, cx: &mut Context<Self>) {
+        if self.goal_input.is_some() {
+            return;
+        }
+        let input = cx.new(|cx| NoteInput::new(cx, String::new()));
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, _, event: &NoteInputEvent, window, cx| {
+                match event {
+                    NoteInputEvent::Commit(text) => {
+                        // A number sets, 0 clears, anything else is
+                        // ignored gracefully — the strip just closes.
+                        match text.trim().replace([',', ' '], "").parse::<usize>() {
+                            Ok(0) => editor.session_goal = None,
+                            Ok(goal) => {
+                                editor.session_goal = Some((goal, editor.word_count));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    NoteInputEvent::Cancel => {}
+                }
+                editor.goal_input = None;
+                window.focus(&editor.focus_handle, cx);
+                cx.notify();
+            },
+        )
+        .detach();
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
+        self.goal_input = Some(input);
+        cx.notify();
+    }
+
+    /// "Next session I will" — the bottom strip, find-bar pattern.
+    fn render_end_session_strip(&self) -> Option<impl IntoElement> {
+        let input = self.end_session_input.clone()?;
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .bg(rgb(0xF4F1EA))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .px(px(28.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .font_family("PT Serif")
+                .text_size(px(13.))
+                .child(div().text_color(rgb(MUTED_COLOR)).child("Next session I will"))
+                .child(div().flex_1().child(input))
+                .child(
+                    div()
+                        .text_color(rgb(MUTED_COLOR))
+                        .text_size(px(11.))
+                        .child("enter saves & quits · esc stays"),
+                ),
+        )
+    }
+
+    fn render_goal_strip(&self) -> Option<impl IntoElement> {
+        let input = self.goal_input.clone()?;
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .bg(rgb(0xF4F1EA))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .px(px(28.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .font_family("PT Serif")
+                .text_size(px(13.))
+                .child(div().text_color(rgb(MUTED_COLOR)).child("Session goal, words:"))
+                .child(div().flex_1().child(input))
+                .child(
+                    div()
+                        .text_color(rgb(MUTED_COLOR))
+                        .text_size(px(11.))
+                        .child("enter sets · 0 clears · esc cancels"),
+                ),
+        )
+    }
+
     fn escape_mode(&mut self, _: &EscapeMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.ai_settings.is_some() {
             self.close_ai_settings(window, cx);
@@ -4389,8 +4613,22 @@ impl Editor {
                 p.models.len()
             ),
         };
+        // F5 session tags: outline rail, word goal, open-time intent.
+        let mut session = String::new();
+        if self.outline_open {
+            session += " outline=open";
+        }
+        if let Some((goal, start)) = self.session_goal {
+            session += &format!(" goal={:+}/{goal}", self.word_count as i64 - start as i64);
+        }
+        if self.next_intent.is_some() {
+            session += " intent=banner";
+        }
+        if self.session_had_edits {
+            session += " edits=1";
+        }
         let doc_state = format!(
-            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai}{panel} mode={}",
+            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai}{panel}{session} mode={}",
             self.selected_range,
             self.doc.blocks().kind(self.doc.block_of_byte(cursor)),
             self.doc.spans().spans(),
@@ -5725,10 +5963,76 @@ impl Editor {
                         (None, None) => div().child("Strop").into_any_element(),
                     })
             )
+            .child({
+                // Word count, plus the session goal's live delta (DESIGN
+                // §4.2): reward arrives during the session or not at all.
+                let count = format_thousands(self.word_count);
+                match self.session_goal {
+                    None => div()
+                        .text_color(rgb(MUTED_COLOR))
+                        .child(format!("{count} words"))
+                        .into_any_element(),
+                    Some((goal, start)) => {
+                        let delta = self.word_count as i64 - start as i64;
+                        let reached = delta >= goal as i64;
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(format!("{count} words"))
+                            .child(if reached {
+                                // Goal met: the separator quietly fills in
+                                // sage. No banner, no chime (§4b tension 3).
+                                div()
+                                    .size(px(5.))
+                                    .rounded_full()
+                                    .bg(rgb(SAGE_COLOR))
+                                    .into_any_element()
+                            } else {
+                                div().child("·").into_any_element()
+                            })
+                            .child(format!("{delta:+}/{goal}"))
+                            .into_any_element()
+                    }
+                }
+            })
             .child(
+                // Outline rail toggle (DESIGN §1.6): three stacked bars of
+                // decreasing width — drawn, like every titlebar glyph.
                 div()
-                    .text_color(rgb(MUTED_COLOR))
-                    .child(format!("{} words", self.word_count)),
+                    .id("outline-toggle")
+                    .px(px(8.))
+                    .py(px(2.))
+                    .ml(px(8.))
+                    .rounded(px(5.))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(self.outline_open, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.toggle_outline(&ToggleOutline, window, cx);
+                        }),
+                    )
+                    .child({
+                        let bar_color = if self.outline_open {
+                            rgb(TEXT_COLOR)
+                        } else {
+                            rgb(MUTED_COLOR)
+                        };
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap(px(2.))
+                            .children(
+                                [11., 8., 5.]
+                                    .into_iter()
+                                    .map(|w| div().w(px(w)).h(px(1.5)).bg(bar_color)),
+                            )
+                    }),
             )
             .child(
                 div()
@@ -5872,6 +6176,120 @@ impl Editor {
         }
         let vw = f32::from(window.viewport_size().width);
         (vw - DOC_MIN_WIDTH).clamp(180., HISTORY_PANEL_WIDTH)
+    }
+
+    /// Width of the outline rail, 0 when closed. Push, not overlay, like
+    /// the history panel; it stands down while history is open (the canvas
+    /// shows a merged diff there — live-doc offsets wouldn't match) and in
+    /// windows too narrow to keep the prose at DOC_MIN_WIDTH.
+    fn outline_width(&self, window: &Window) -> f32 {
+        if !self.outline_open || self.history_view.is_some() {
+            return 0.;
+        }
+        let vw = f32::from(window.viewport_size().width);
+        let free = vw - DOC_MIN_WIDTH;
+        if free < 120. { 0. } else { free.min(OUTLINE_PANEL_WIDTH) }
+    }
+
+    /// The document's headings: (block index, level, text, byte offset of
+    /// the heading's start).
+    fn outline_items(&self) -> Vec<(usize, u8, String, usize)> {
+        let kinds = self.doc.blocks().kinds();
+        let mut items = Vec::new();
+        let mut byte = 0usize;
+        for (ix, line) in self.doc.rope().lines().enumerate() {
+            if let Some(BlockKind::Heading(level)) = kinds.get(ix) {
+                let text: String = line.chars().take(120).collect();
+                items.push((ix, *level, text.trim().to_owned(), byte));
+            }
+            byte += line.len_bytes();
+        }
+        items
+    }
+
+    /// The outline rail (DESIGN §1.6 — externalize what working memory
+    /// can't hold): a glanceable left rail of headings, level shown by
+    /// indent, current section highlighted, click to jump.
+    fn render_outline(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let items = self.outline_items();
+        let cursor_block = self.doc.block_of_byte(self.cursor_offset());
+        // The section the caret is in: the nearest heading above it.
+        let current = items.iter().rposition(|(ix, ..)| *ix <= cursor_block);
+        let mut list = div()
+            .id("outline-list")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .px(px(8.))
+            .py(px(6.));
+        if items.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(8.))
+                    .py(px(4.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child("No headings yet — ctrl-1..3 structure the story"),
+            );
+        }
+        for (i, (_, level, text, byte_start)) in items.iter().enumerate() {
+            let jump = *byte_start;
+            list = list.child(
+                div()
+                    .id(("outline-row", i))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .pl(px(8. + 12. * (level.saturating_sub(1)) as f32))
+                    .rounded(px(4.))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(Some(i) == current, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            // Jump: caret to the heading's start + autoscroll
+                            // (move_to requests scroll-to-cursor).
+                            editor.move_to(jump, cx);
+                            window.focus(&editor.focus_handle, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(TEXT_COLOR))
+                            .when(*level == 1, |d| d.font_weight(FontWeight::BOLD))
+                            .child(text.clone()),
+                    ),
+            );
+        }
+        div()
+            .id("outline-panel")
+            .absolute()
+            .top(px(BAR_HEIGHT))
+            .left_0()
+            .bottom_0()
+            .w(px(panel_w))
+            .bg(rgb(0xF4F1EA))
+            .border_r_1()
+            .border_color(rgb(RULE_COLOR))
+            .flex()
+            .flex_col()
+            .font_family("PT Sans")
+            .text_size(px(12.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(14.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child("Outline"),
+            )
+            .child(list)
     }
 
     /// The mode banner (DESIGN §2-history, principle 5 — no hidden modes):
@@ -6820,12 +7238,101 @@ impl Editor {
         )
     }
 
+    /// Estimated height of the intent banner at the margin-lane top, so
+    /// the AI status card mounts below it instead of on top of it.
+    fn intent_banner_height(&self) -> f32 {
+        match &self.next_intent {
+            None => 0.,
+            Some(intent) => {
+                let lines = (intent.chars().count() / 28 + 1).clamp(1, 4) as f32;
+                16. + 17. * lines + 8.
+            }
+        }
+    }
+
+    /// "Next: <intent>" (DESIGN §4.1, the open half of the ritual): the
+    /// sentence recorded at close, shown at the top of the margin lane
+    /// (a bottom strip in narrow windows — status never covers prose),
+    /// dismissible, auto-cleared by the first edit. Its own field, not
+    /// ai_status — this is the writer's voice, not the model's.
+    fn render_intent_banner(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let intent = self.next_intent.clone()?;
+        let fits = self.margin_fits(window);
+        let dismiss = div()
+            .id("intent-dismiss")
+            .flex_shrink_0()
+            .cursor(CursorStyle::PointingHand)
+            .text_color(rgb(MUTED_COLOR))
+            .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.next_intent = None;
+                    if let Some(store) = &editor.store {
+                        crate::files::clear_intent(store.path());
+                    }
+                    cx.notify();
+                }),
+            )
+            .child("×");
+        let body = |d: gpui::Div| {
+            d.font_family("PT Serif")
+                .text_size(px(12.))
+                .text_color(rgb(TEXT_COLOR))
+                .flex()
+                .items_start()
+                .gap(px(6.))
+                .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Next:"))
+                .child(div().flex_1().min_w(px(0.)).child(intent))
+                .child(dismiss)
+        };
+        Some(if fits {
+            let frame = self.last_frame.as_ref()?;
+            let col_right =
+                f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+            body(
+                div()
+                    .absolute()
+                    .top(px(BAR_HEIGHT + 8.))
+                    .left(px(col_right + MARGIN_GAP + 8.))
+                    .w(px(MARGIN_WIDTH - 8.))
+                    .p(px(8.))
+                    .rounded(px(6.))
+                    .bg(rgb(0xF2F4EC))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR)),
+            )
+            .into_any_element()
+        } else {
+            body(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .bg(rgb(0xF2F4EC))
+                    .border_t_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .px(px(28.))
+                    .py(px(8.)),
+            )
+            .into_any_element()
+        })
+    }
+
     /// The AI surface (PLAN.md E3), pinned where results land: top of the
     /// margin lane when it fits, a floating top-right card otherwise.
     /// With no status and an empty margin, a one-line hint teaches the
     /// chord — the AI must be visible before the chord is known.
     fn render_ai_status(&self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let fits = self.margin_fits(window);
+        // The intent banner holds the lane's top slot while it lives.
+        let banner_h = self.intent_banner_height();
         let (left, width) = if fits {
             let frame = self.last_frame.as_ref()?;
             let col_right =
@@ -6841,7 +7348,7 @@ impl Editor {
             if fits {
                 div()
                     .absolute()
-                    .top(px(BAR_HEIGHT + 8.))
+                    .top(px(BAR_HEIGHT + 8. + banner_h))
                     .left(px(left))
                     .w(px(width))
                     .rounded(px(6.))
@@ -6876,8 +7383,13 @@ impl Editor {
         Some(match self.ai_status.as_ref() {
             None => {
                 // Idle hint, only in the wide margin and only when the
-                // margin is otherwise empty.
-                if !fits || !self.margin_cards().is_empty() || self.doc.len_bytes() == 0 {
+                // margin is otherwise empty (the intent banner counts —
+                // that one sentence should open the session alone).
+                if !fits
+                    || !self.margin_cards().is_empty()
+                    || self.doc.len_bytes() == 0
+                    || self.next_intent.is_some()
+                {
                     return None;
                 }
                 div()
@@ -7142,6 +7654,8 @@ impl Render for Editor {
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
         let hist_panel_w = self.history_panel_width(window);
+        // The outline rail pushes from the left the same way (DESIGN §1.6).
+        let outline_w = self.outline_width(window);
         div()
             .size_full()
             .relative()
@@ -7162,6 +7676,7 @@ impl Render for Editor {
                     .justify_center()
                     .overflow_hidden()
                     .when(hist_panel_w > 0., |d| d.pr(px(hist_panel_w)))
+                    .when(outline_w > 0., |d| d.pl(px(outline_w)))
                     .child(
                         div()
                             .key_context("Editor")
@@ -7249,6 +7764,9 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::mode_copy))
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::open_welcome))
+                    .on_action(cx.listener(Self::toggle_outline))
+                    .on_action(cx.listener(Self::end_session))
+                    .on_action(cx.listener(Self::set_session_goal))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -7281,6 +7799,7 @@ impl Render for Editor {
                 d.child(self.render_history_banner(hist_panel_w, cx))
                     .child(self.render_history_panel(hist_panel_w, cx))
             })
+            .when(outline_w > 0., |d| d.child(self.render_outline(outline_w, cx)))
             .map(|d| {
                 // The footnote zone keys off live-doc offsets; in history
                 // the canvas shows the merged diff, so it stands down.
@@ -7303,8 +7822,12 @@ impl Render for Editor {
                     Some(margin) => d.child(margin),
                     None => d,
                 };
-                match self.render_ai_status(window, cx) {
+                let d = match self.render_ai_status(window, cx) {
                     Some(status) => d.child(status),
+                    None => d,
+                };
+                match self.render_intent_banner(window, cx) {
+                    Some(banner) => d.child(banner),
                     None => d,
                 }
             })
@@ -7323,6 +7846,14 @@ impl Render for Editor {
                 None => d,
             })
             .map(|d| match self.render_alt_strip() {
+                Some(strip) => d.child(strip),
+                None => d,
+            })
+            .map(|d| match self.render_end_session_strip() {
+                Some(strip) => d.child(strip),
+                None => d,
+            })
+            .map(|d| match self.render_goal_strip() {
                 Some(strip) => d.child(strip),
                 None => d,
             })
@@ -7351,6 +7882,15 @@ impl Focusable for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thousands_separator() {
+        assert_eq!(format_thousands(0), "0");
+        assert_eq!(format_thousands(56), "56");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(1234), "1,234");
+        assert_eq!(format_thousands(1234567), "1,234,567");
+    }
 
     fn base() -> TextRun {
         TextRun {
