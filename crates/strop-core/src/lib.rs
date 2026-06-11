@@ -13,6 +13,7 @@ pub mod llm;
 pub mod markdown;
 pub mod store;
 pub mod typograph;
+pub mod voice;
 
 pub use buffer::Buffer;
 pub use store::Store;

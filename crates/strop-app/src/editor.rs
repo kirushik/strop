@@ -57,7 +57,8 @@ actions!(
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
-        OpenFile, SaveCopyAs, AddNote, RunDiagnosis, Find, Replace, EscapeMode, ToggleHistory,
+        OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
+        ToggleHistory,
     ]
 );
 
@@ -130,6 +131,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-f", InsertFootnote, ctx),
         KeyBinding::new("ctrl-m", AddNote, ctx),
         KeyBinding::new("ctrl-shift-d", RunDiagnosis, ctx),
+        KeyBinding::new("ctrl-shift-b", RunBelieving, ctx),
         KeyBinding::new("ctrl-f", Find, ctx),
         KeyBinding::new("ctrl-h", Replace, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
@@ -1110,6 +1112,14 @@ impl Editor {
     /// The thesis, running: an editorial pass that names problems as
     /// queries in the margin and never rewrites a word.
     fn run_diagnosis(&mut self, _: &RunDiagnosis, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_pass(false, cx);
+    }
+
+    fn run_believing(&mut self, _: &RunBelieving, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_pass(true, cx);
+    }
+
+    fn run_pass(&mut self, believing: bool, cx: &mut Context<Self>) {
         if self.diagnosis_running {
             return;
         }
@@ -1139,7 +1149,11 @@ impl Editor {
                 .spawn(async move {
                     let client =
                         strop_core::llm::LlmClient::new(&ai.base_url, &ai.api_key, &ai.model);
-                    let system = strop_core::diagnose::system_prompt(&mode);
+                    let system = if believing {
+                        strop_core::diagnose::believing_system_prompt()
+                    } else {
+                        strop_core::diagnose::system_prompt(&mode)
+                    };
                     let user = strop_core::diagnose::user_prompt(&scope);
                     client
                         .chat(&system, &user, 2048)
@@ -3766,6 +3780,42 @@ impl Editor {
                     .text_color(rgb(MUTED_COLOR))
                     .child("↑/↓ step versions · Esc exits · restoring is undoable"),
             )
+            .when(compare_current, |d| {
+                // Voice drift v0: descriptive stylometry between the
+                // selected version and the draft (rhythm first — research:
+                // flattening variance is the LLM-characteristic signal).
+                let lang = match self.config.language {
+                    Language::Ru => typograph::Lang::Ru,
+                    Language::En => typograph::Lang::En,
+                    Language::Auto => typograph::detect_lang(self.doc.rope().chars()),
+                };
+                let drift = self
+                    .history_view
+                    .as_ref()
+                    .map(|hv| {
+                        let from =
+                            strop_core::voice::signature(&hv.entries[hv.selected].text, lang);
+                        let to = strop_core::voice::signature(&self.doc.text(), lang);
+                        strop_core::voice::describe_drift(&from, &to, lang)
+                    })
+                    .unwrap_or_default();
+                d.when(!drift.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .px(px(8.))
+                            .pt(px(4.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .text_size(px(11.))
+                            .text_color(rgb(0x8A6A3A))
+                            .children(
+                                std::iter::once("Voice drift (v0, descriptive):".to_owned())
+                                    .chain(drift),
+                            ),
+                    )
+                })
+            })
             .children(rows)
     }
 
@@ -4220,6 +4270,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::insert_footnote))
                     .on_action(cx.listener(Self::add_note))
                     .on_action(cx.listener(Self::run_diagnosis))
+                    .on_action(cx.listener(Self::run_believing))
                     .on_action(cx.listener(Self::find))
                     .on_action(cx.listener(Self::replace))
                     .on_action(cx.listener(Self::note_tab))

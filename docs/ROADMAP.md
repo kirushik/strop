@@ -177,9 +177,19 @@ unless they'd be expensive to reverse.
 
 ## Explicitly post-MVP
 
-Voice-distance metric (v0 stylometric proxy IN PROGRESS — surprisal-based
-real metric still post-MVP), any text generation, believing-mode (IN
-PROGRESS), sync/multiplayer, mac/Windows, ~~find-replace~~ (done
+Voice-distance metric — v0 stylometric proxy DONE 2026-06-11
+(strop-core::voice: fixed RU/EN function-word frequencies, sentence-rhythm
+CV + Goh-Barabasi burstiness with top billing per research, punctuation
+per-1000w rates, MATTR-100; descriptive drift between any checkpoint and
+the draft shown in the history panel's vs-draft mode; honest Eder caveat —
+drift indicators, never identity; surprisal-based real metric still
+post-MVP, baseline-corpus z-flagging awaits multiple documents).
+Believing-mode DONE 2026-06-11 (ctrl-shift-b: Elbow's believing game as a
+pass — 2-3 named working moves with mechanisms, center of gravity, the
+comes-alive sentence, almost-said; quotes mandatory, praise-adjectives and
+advice verbs banned, scarcity rule; per research NO shipping tool does
+this). Any text generation, sync/multiplayer, mac/Windows,
+~~find-replace~~ (done
 2026-06-11: ctrl-h adds a replace field to the find bar, Tab hops fields,
 Enter replaces-and-advances, All replaces every match), tables (never?),
 per-paragraph AI rewrites (thesis says diagnosis only).

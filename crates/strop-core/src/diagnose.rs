@@ -41,6 +41,39 @@ honorable answer. Write problem and query in the language of the manuscript."
     )
 }
 
+/// Elbow's believing game as a pass (research 2026-06-11): named, quoted
+/// strengths with mechanisms — a discipline, not a mood. No shipping tool
+/// does this; Strop's margin idiom (observations as queries) is exactly
+/// Elbow's "Sharing and Responding" register.
+pub fn believing_system_prompt() -> String {
+    "You are playing Peter Elbow's believing game. Your only job is to find \
+what is true, alive, and working in this draft, and to name it precisely \
+enough that the writer can do it again on purpose. You are diagnosing \
+strengths, not judging quality. Report reader experience (\"I leaned in \
+at...\", \"the energy pools around...\"), never verdicts.\n\
+Respond with ONLY a JSON array, no prose, no markdown fences:\n\
+[{\"quote\": \"exact verbatim excerpt, under 120 characters\", \"problem\": \
+\"the named observation kind + the move's name\", \"query\": \"one sentence: \
+the MECHANISM (what it does to the reader and why), then optionally one \
+extension question pointing where else the move might serve\", \"level\": \
+\"move|center|alive|almost\"}]\n\
+Exactly these kinds: 2-3 items of level \"move\" (a working craft move, \
+named with a craft term); exactly 1 of level \"center\" (Elbow's center of \
+gravity — the source of energy, the generative center, which may NOT be \
+the thesis: say what the piece seems secretly about and ask if that is \
+the essay being written); exactly 1 of level \"alive\" (the single sentence \
+where the voice clicks on, and what changes there); at most 1 of level \
+\"almost\" (something gestured at twice but never stated, asked as a \
+question). Maximum 5 items total.\n\
+RULES: every item must contain a verbatim quote. Evaluative adjectives \
+(great, beautiful, strong, powerful) are BANNED unless followed by the \
+craft mechanism. Advice verbs (cut, add, rewrite, change, consider) are \
+BANNED — observations and questions only. No summary praise. If the piece \
+is weak, return fewer, truer items — scarcity is the credibility signal. \
+Write in the language of the manuscript."
+        .to_owned()
+}
+
 pub fn user_prompt(text: &str) -> String {
     format!("The manuscript:\n\n{text}")
 }
@@ -120,6 +153,15 @@ mod tests {
         // Sequential anchoring finds the SECOND occurrence next.
         let second = anchor(text, "зарыта мысль", range.start + 1).unwrap();
         assert_eq!(second.start, 22);
+    }
+
+    #[test]
+    fn believing_prompt_carries_the_rules() {
+        let p = believing_system_prompt();
+        assert!(p.contains("believing game"));
+        assert!(p.contains("BANNED"));
+        assert!(p.contains("center of gravity"));
+        assert!(p.contains("JSON array"));
     }
 
     #[test]
