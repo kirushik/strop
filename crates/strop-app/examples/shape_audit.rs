@@ -14,7 +14,7 @@
 //!
 //! `SIG <target> = ...` lines are stable glyph-id signatures for diffing.
 
-use gpui::{Application, Font, FontWeight, SharedString, TextRun, prelude::*, px};
+use gpui::{Font, FontWeight, SharedString, TextRun, prelude::*, px};
 
 const PT_SERIF: &[u8] = include_bytes!("../../../assets/fonts/PTSerif-Regular.ttf");
 const PT_SERIF_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/PTSerif-Italic.ttf");
@@ -72,7 +72,7 @@ fn whole(text: &'static str, font: Font) -> Vec<(usize, Font)> {
 
 fn main() {
     let order = std::env::var("ORDER").unwrap_or_else(|_| "targets-first".into());
-    Application::new().run(move |cx: &mut gpui::App| {
+    gpui_platform::application().run(move |cx: &mut gpui::App| {
         cx.text_system()
             .add_fonts(vec![
                 PT_SERIF.into(),
@@ -99,11 +99,17 @@ fn main() {
             )
             .expect("open audit window");
         window
-            .update(cx, |_, window, cx| {
+            .update(cx, |_, window, _| {
                 run_audit(window, &order);
-                cx.quit();
             })
             .expect("audit window update");
+        // quit() before the event loop starts is a no-op in current gpui
+        // (the Linux platform's stop signal only lands once calloop runs),
+        // so defer it to a foreground task.
+        cx.spawn(async move |cx| {
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
     });
 }
 

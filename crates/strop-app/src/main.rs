@@ -8,8 +8,8 @@ mod tutorial;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Application, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
-    actions, prelude::*, px, size,
+    App, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
+    prelude::*, px, size,
 };
 use strop_core::Store;
 use strop_core::document::{BlockMap, SpanSet};
@@ -93,7 +93,9 @@ fn data_file() -> (PathBuf, bool) {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    // gpui_platform::application() replaced gpui::Application::new() after
+    // the facade/platform crate split.
+    gpui_platform::application().run(|cx: &mut App| {
         cx.text_system()
             .add_fonts(vec![
                 PT_SERIF.into(),
@@ -246,7 +248,7 @@ fn main() {
                     }
                     editor
                 });
-                window.focus(&editor.focus_handle(cx));
+                window.focus(&editor.focus_handle(cx), cx);
                 editor
             },
         )

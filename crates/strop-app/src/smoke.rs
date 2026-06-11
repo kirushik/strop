@@ -40,7 +40,8 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 .unwrap_or_default();
             eprintln!("SMOKE {key}: {state}");
         }
-        cx.update(|cx| cx.quit()).ok();
+        // AsyncApp::update is now infallible (returns R, not Result).
+        cx.update(|cx| cx.quit());
     })
     .detach();
 }

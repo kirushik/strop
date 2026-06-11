@@ -508,8 +508,15 @@ impl Element for NoteInputElement {
         );
         if let Some(line) = line.take() {
             let cursor_x = line.width;
-            line.paint(bounds.origin, window.line_height(), window, cx)
-                .ok();
+            line.paint(
+                bounds.origin,
+                window.line_height(),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .ok();
             if focus_handle.is_focused(window) {
                 window.paint_quad(fill(
                     Bounds::new(
@@ -1025,12 +1032,13 @@ impl Editor {
                     editor.store_dirty = true;
                 }
                 editor.alt_input = None;
-                window.focus(&editor.focus_handle);
+                window.focus(&editor.focus_handle, cx);
                 cx.notify();
             },
         )
         .detach();
-        window.focus(&input.read(cx).focus_handle);
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
         self.alt_input = Some((block, input));
         cx.notify();
     }
@@ -1058,12 +1066,13 @@ impl Editor {
                     }
                 }
                 editor.rename_input = None;
-                window.focus(&editor.focus_handle);
+                window.focus(&editor.focus_handle, cx);
                 cx.notify();
             },
         )
         .detach();
-        window.focus(&input.read(cx).focus_handle);
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
         self.rename_input = Some((ix, input));
         cx.notify();
     }
@@ -1361,12 +1370,13 @@ impl Editor {
                 }
                 editor.note_input = None;
                 // Focus returns to the text — the composer's handle is gone.
-                window.focus(&editor.focus_handle);
+                window.focus(&editor.focus_handle, cx);
                 cx.notify();
             },
         )
         .detach();
-        window.focus(&input.read(cx).focus_handle);
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
         self.note_input = Some(input);
     }
 
@@ -1697,13 +1707,14 @@ impl Editor {
                 NoteInputEvent::Cancel => {
                     editor.find_input = None;
                     editor.replace_input = None;
-                    window.focus(&editor.focus_handle);
+                    window.focus(&editor.focus_handle, cx);
                     cx.notify();
                 }
             },
         )
         .detach();
-        window.focus(&input.read(cx).focus_handle);
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
         self.find_input = Some(input);
         self.find_current = 0;
         cx.notify();
@@ -1719,9 +1730,11 @@ impl Editor {
             return;
         };
         if find.read(cx).focus_handle.is_focused(window) {
-            window.focus(&rep.read(cx).focus_handle);
+            let h = rep.read(cx).focus_handle.clone();
+            window.focus(&h, cx);
         } else {
-            window.focus(&find.read(cx).focus_handle);
+            let h = find.read(cx).focus_handle.clone();
+            window.focus(&h, cx);
         }
         cx.notify();
     }
@@ -1752,7 +1765,8 @@ impl Editor {
             },
         )
         .detach();
-        window.focus(&input.read(cx).focus_handle);
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
         self.palette_input = Some(input);
         self.palette_selected = 0;
         cx.notify();
@@ -1760,7 +1774,7 @@ impl Editor {
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_input = None;
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -1806,20 +1820,21 @@ impl Editor {
                 NoteInputEvent::Commit(title) => editor.finish_rename(title.clone(), window, cx),
                 NoteInputEvent::Cancel => {
                     editor.doc_rename_input = None;
-                    window.focus(&editor.focus_handle);
+                    window.focus(&editor.focus_handle, cx);
                     cx.notify();
                 }
             },
         )
         .detach();
-        window.focus(&input.read(cx).focus_handle);
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
         self.doc_rename_input = Some(input);
         cx.notify();
     }
 
     fn finish_rename(&mut self, title: String, window: &mut Window, cx: &mut Context<Self>) {
         self.doc_rename_input = None;
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         let Some(stem) = crate::files::stem_from_title(&title) else {
             cx.notify();
             return;
@@ -2056,7 +2071,7 @@ impl Editor {
                 NoteInputEvent::Cancel => {
                     editor.find_input = None;
                     editor.replace_input = None;
-                    window.focus(&editor.focus_handle);
+                    window.focus(&editor.focus_handle, cx);
                     cx.notify();
                 }
             },
@@ -3096,6 +3111,9 @@ impl Editor {
                     self.apply_replace(None, &text, false, cx);
                     return;
                 }
+                // New variant post-0.2.2; pasting file paths did nothing
+                // before, keep it that way (file *drops* import images).
+                ClipboardEntry::ExternalPaths(_) => {}
             }
         }
     }
@@ -4404,6 +4422,8 @@ impl Element for EditorElement {
                     .paint(
                         bounds.origin + point(par.indent - px(24.), y + px(2.)),
                         par.line_height,
+                        TextAlign::Left,
+                        None,
                         window,
                         cx,
                     )
