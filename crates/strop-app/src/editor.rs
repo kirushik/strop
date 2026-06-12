@@ -2973,7 +2973,15 @@ impl Editor {
 
     /// Start the cursor-blink heartbeat. GNOME-style: solid while typing,
     /// blinking when idle, solid again (and quiet — no repaints) after 10s.
+    ///
+    /// STROP_TEST_STILL (the visual harness, scripts/wflip.sh) suppresses
+    /// the heartbeat entirely: captures are byte-compared, and a blinking
+    /// cursor is nondeterminism. `cursor_visible` starts true and nothing
+    /// ever toggles it, so the caret stays solid in every frame.
     pub fn start_blink(&self, cx: &mut Context<Self>) {
+        if std::env::var("STROP_TEST_STILL").is_ok() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -6257,6 +6265,11 @@ impl Editor {
 /// Days-from-epoch to civil date (Howard Hinnant's algorithm); good enough
 /// for checkpoint labels (UTC — rough UI, backlogged with the rest).
 fn format_unix(secs: i64) -> String {
+    // STROP_TEST_STILL (scripts/wflip.sh): captures are byte-compared, so
+    // every rendered timestamp freezes to a fixed string.
+    if std::env::var("STROP_TEST_STILL").is_ok() {
+        return "0000-00-00 00:00".into();
+    }
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
     let z = days + 719468;
