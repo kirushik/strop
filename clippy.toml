@@ -1,0 +1,5 @@
+disallowed-methods = [
+  { path = "gpui::Entity::update", reason = "draw-pass discipline (docs/VISUAL-RIG.md): a notify inside element draw code re-dirties the window mid-frame — the 2026-06-12 Wayland corruption class. Use draw_guard::EntityUpdateExt::update_checked (asserts not-in-draw), or update_in_draw inside element prepaint/paint (no Context, notify unreachable)." },
+  { path = "gpui::Entity::update_in", reason = "same as Entity::update: use draw_guard::EntityUpdateExt::update_checked / update_in_draw." },
+  { path = "gpui::canvas", reason = "canvas closures run inside the draw pass; use draw_guard::capture_canvas so IN_DRAW is set and stray entity updates are caught." },
+]

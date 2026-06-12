@@ -20,7 +20,7 @@ use gpui::{
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextAlign, TextRun,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, canvas, div, fill, point,
+    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point,
     prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
@@ -29,6 +29,7 @@ use strop_core::document::{
 use strop_core::{Store, typograph};
 
 use crate::config::{Config, Language};
+use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const BG_COLOR: u32 = 0xFBFAF8;
@@ -555,6 +556,7 @@ impl Element for NoteInputElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let _guard = DrawGuard::enter();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = window.line_height().into();
@@ -570,6 +572,7 @@ impl Element for NoteInputElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let _guard = DrawGuard::enter();
         let input = self.input.read(cx);
         let content = if input.masked {
             // Dots except the last 4 chars — enough to recognize which key
@@ -611,6 +614,7 @@ impl Element for NoteInputElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let _guard = DrawGuard::enter();
         let focus_handle = self.input.read(cx).focus_handle.clone();
         window.handle_input(
             &focus_handle,
@@ -2033,7 +2037,7 @@ impl Editor {
             let already = panel.model.read(cx).content.trim() == pick.as_str();
             if !already {
                 let pick = pick.clone();
-                panel.model.update(cx, |input, cx| {
+                panel.model.update_checked(cx, |input, cx| {
                     input.content = pick;
                     cx.notify();
                 });
@@ -3751,7 +3755,7 @@ impl Editor {
                             cx.stop_propagation();
                             if let Some(panel) = &editor.ai_settings {
                                 let m = model_id.clone();
-                                panel.model.update(cx, |input, cx| {
+                                panel.model.update_checked(cx, |input, cx| {
                                     input.content = m;
                                     cx.notify();
                                 });
@@ -5302,6 +5306,7 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let _guard = DrawGuard::enter();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = relative(1.).into();
@@ -5317,6 +5322,7 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let _guard = DrawGuard::enter();
         let perf_start = std::env::var_os("STROP_PERF").map(|_| Instant::now());
         // Ensure encoded-image handles exist for every Image block (the
         // actual decode is async inside GPUI's asset cache).
@@ -5338,7 +5344,7 @@ impl Element for EditorElement {
                 .collect()
         };
         if !needed.is_empty() {
-            self.editor.update(cx, |editor, _| {
+            self.editor.update_in_draw(cx, |editor| {
                 for id in needed {
                     let Some(store) = &editor.store else { continue };
                     let Some(bytes) = store.get_asset(&id) else { continue };
@@ -5704,7 +5710,7 @@ impl Element for EditorElement {
 
         // Write the clamped/adjusted scroll back; no notify needed, we're
         // mid-frame and painting with this exact value.
-        self.editor.update(cx, |editor, _| {
+        self.editor.update_in_draw(cx, |editor| {
             editor.scroll_top = scroll_top;
             editor.autoscroll_request = false;
         });
@@ -5747,6 +5753,7 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let _guard = DrawGuard::enter();
         let focus_handle = self.editor.read(cx).focus_handle.clone();
         window.handle_input(
             &focus_handle,
@@ -5869,7 +5876,7 @@ impl Element for EditorElement {
         if geometry_changed {
             window.request_animation_frame();
         }
-        self.editor.update(cx, |editor, _| {
+        self.editor.update_in_draw(cx, |editor| {
             editor.last_frame = Some(TextFrame {
                 bounds,
                 line_height,
@@ -7045,7 +7052,7 @@ impl Editor {
                                     .relative()
                                     .cursor(CursorStyle::IBeam)
                                     .child(
-                                        canvas(
+                                        capture_canvas(
                                             // Plain shared-cell write: never
                                             // entity.update() during a draw
                                             // pass (see zone_row_bounds).

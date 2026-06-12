@@ -1,5 +1,11 @@
+// Draw-pass discipline (docs/VISUAL-RIG.md): raw Entity::update and canvas
+// are banned crate-wide; clippy.toml points each ban at its draw_guard
+// wrapper. Deny, not warn — a mid-draw notify is a corruption bug, not style.
+#![deny(clippy::disallowed_methods)]
+
 mod commands;
 mod config;
+mod draw_guard;
 mod editor;
 mod files;
 mod smoke;
@@ -14,6 +20,7 @@ use gpui::{
 use strop_core::Store;
 use strop_core::document::{BlockMap, SpanSet};
 
+use draw_guard::EntityUpdateExt as _;
 use editor::Editor;
 
 actions!(strop, [Quit]);
@@ -268,7 +275,7 @@ fn main() {
             .expect("window just opened");
         let window_for_quit = window;
         cx.on_app_quit(move |cx| {
-            editor.update(cx, |editor, _| {
+            editor.update_checked(cx, |editor, _| {
                 editor.save_now();
                 // Caret remembered for next open (resume mid-sentence);
                 // never a question, never a dialog (DESIGN §4b tension 6).
