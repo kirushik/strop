@@ -15,3 +15,7 @@ image = { workspace = true }
 blake3 = { workspace = true }
 ureq = { workspace = true }
 similar = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+proptest-state-machine = "0.8"
