@@ -5854,6 +5854,25 @@ impl Element for EditorElement {
 
         let paragraphs = std::mem::take(&mut prepaint.paragraphs);
         let content_height = prepaint.content_height;
+        // Overlays (margin lane, AI card/idle hint, selection popover)
+        // position themselves from `last_frame` — the PREVIOUS paint's
+        // geometry. When this paint's geometry differs (window resize,
+        // output scale change, panel reflow), they just rendered against
+        // stale numbers and nothing else would schedule a repaint — the
+        // wflip.sh plain-fixture failure: the idle hint stuck at the old
+        // column edge after a scale flip. Request one follow-up frame;
+        // the notify is deferred to after this draw (never mid-draw — the
+        // 2026-06-12 corruption rule), and it converges: the next paint
+        // sees identical geometry and schedules nothing.
+        let geometry_changed = self
+            .editor
+            .read(cx)
+            .last_frame
+            .as_ref()
+            .is_none_or(|f| f.bounds != bounds || f.scroll_top != scroll_top);
+        if geometry_changed {
+            window.request_animation_frame();
+        }
         self.editor.update(cx, |editor, _| {
             editor.last_frame = Some(TextFrame {
                 bounds,
