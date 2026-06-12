@@ -666,10 +666,13 @@ struct ParagraphLayout {
     /// Kind-derived decorations, resolved at prepaint.
     bg: Option<gpui::Rgba>,
     quote_rule: bool,
-    marker: Option<SharedString>,
+    marker: Option<gpui::ShapedLine>,
     /// Painted superior footnote figures (DESIGN §2-footnotes):
     /// (paragraph-local byte offset of the invisible carrier, label).
-    fn_marks: Vec<(usize, SharedString)>,
+    /// Pre-shaped in prepaint: shaping in the PAINT phase poisons the
+    /// frame's text-layout/sprite bookkeeping on scale-change redraws
+    /// (the 2026-06-12 multi-monitor corruption). Paint only draws.
+    fn_marks: Vec<(usize, gpui::ShapedLine)>,
     /// The block's font size — superior figures scale from it.
     font_size: Pixels,
     /// Decoded image for Image blocks, with its display size.
@@ -5534,7 +5537,7 @@ impl Element for EditorElement {
             // skipped for refs inside history-diff deletions, where the
             // carrier re-inks (muted, struck) and a painted number on top
             // would double up.
-            let fn_marks: Vec<(usize, SharedString)> = par_spans
+            let fn_marks: Vec<(usize, gpui::ShapedLine)> = par_spans
                 .iter()
                 .filter_map(|(r, attr)| {
                     let InlineAttr::FootnoteRef(id) = attr else {
@@ -5550,9 +5553,38 @@ impl Element for EditorElement {
                         .get(id)
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| id.clone());
-                    Some((r.start - range.start, SharedString::from(label)))
+                    let label = SharedString::from(label);
+                    let run = TextRun {
+                        len: label.len(),
+                        font: gpui::font("PT Serif"),
+                        color: rgb(LINK_COLOR).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    // Shaped HERE, in prepaint: never shape during paint.
+                    let shaped = window.text_system().shape_line(
+                        label,
+                        bstyle.size * 0.65,
+                        &[run],
+                        None,
+                    );
+                    Some((r.start - range.start, shaped))
                 })
                 .collect();
+            let marker: Option<gpui::ShapedLine> = marker
+                .filter(|_| std::env::var("STROP_NO_MARKER_SHAPE").is_err())
+                .map(|m| {
+                let run = TextRun {
+                    len: m.len(),
+                    font: gpui::font("PT Serif"),
+                    color: rgb(MUTED_COLOR).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                window.text_system().shape_line(m, px(16.), &[run], None)
+            });
             let runs = runs_for_paragraph(
                 &range,
                 &selection,
@@ -5755,19 +5787,9 @@ impl Element for EditorElement {
                     eprintln!("strop: paint image: {e}");
                 }
             }
-            if let Some(marker) = &par.marker {
-                let run = TextRun {
-                    len: marker.len(),
-                    font: gpui::font("PT Serif"),
-                    color: rgb(MUTED_COLOR).into(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped =
-                    window
-                        .text_system()
-                        .shape_line(marker.clone(), px(16.), &[run], None);
+            if let Some(shaped) = &par.marker
+                && std::env::var("STROP_NO_MARKER_PAINT").is_err()
+            {
                 shaped
                     .paint(
                         bounds.origin + point(par.indent - px(24.), y + px(2.)),
@@ -5790,22 +5812,9 @@ impl Element for EditorElement {
             // of the font size so the top lands near cap height, accent
             // ink — size signals "footnote", color "interactive". The
             // transparent carrier under it keeps the advance.
-            for (local, label) in &par.fn_marks {
+            for (local, shaped) in &par.fn_marks {
                 let line_ix = par.line_of(*local, true);
                 let x = par.x_for(*local, line_ix);
-                let mark_size = par.font_size * 0.65;
-                let run = TextRun {
-                    len: label.len(),
-                    font: gpui::font("PT Serif"),
-                    color: rgb(LINK_COLOR).into(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped =
-                    window
-                        .text_system()
-                        .shape_line(label.clone(), mark_size, &[run], None);
                 // paint() centers ascent+descent inside line_height;
                 // cancel that and put the small baseline 35% of the font
                 // size above the body baseline.
