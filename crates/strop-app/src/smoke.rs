@@ -3,12 +3,27 @@
 //! replay it after the first frames, printing cursor geometry per key, then
 //! quit. Drive with: `STROP_SMOKE="down up" cargo run -p strop-app`.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseUpEvent, PlatformInput, WindowHandle, point, px,
+    AnyWindowHandle, App, AppContext as _, ClipboardItem, Keystroke, Modifiers, MouseButton,
+    MouseDownEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
+    WindowHandle, point, px,
 };
+
+/// Clipboard TRANSPORT shim for the headless rig only: gpui's wayland
+/// `write_to_clipboard` is silently dropped unless the window holds real
+/// seat focus, which a headless sway with WLR_LIBINPUT_NO_DEVICES never
+/// grants. The `clipb64:` token stores the text here too; the two paste
+/// read-sites fall back to it when the platform clipboard reads empty.
+/// Only the transport is shimmed — binding routing and insertion paths
+/// stay fully real. Never set outside a STROP_SMOKE run.
+static CLIP_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn clipboard_override() -> Option<String> {
+    CLIP_OVERRIDE.lock().ok()?.clone()
+}
 
 use crate::editor::Editor;
 
@@ -37,6 +52,52 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .update(cx, |editor, _, _| editor.debug_footnotes())
                     .unwrap_or_default();
                 eprintln!("SMOKE fn-geo:\n{geo}");
+                continue;
+            }
+            // `clipb64:<base64>` seeds the clipboard (text); `wheel:X,Y,DY`
+            // synthesizes a scroll-wheel event at window coords; `dump:ui`
+            // prints the layer-stack snapshot (H1 — DESIGN §0.6 checks).
+            if let Some(b64) = key.strip_prefix("clipb64:") {
+                let text = decode_base64(b64).expect("bad clipb64 in STROP_SMOKE");
+                *CLIP_OVERRIDE.lock().expect("clipboard override poisoned") = Some(text.clone());
+                cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+                eprintln!("SMOKE {key}: clipboard set");
+                continue;
+            }
+            if let Some(spec) = key.strip_prefix("wheel:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .expect("bad wheel in STROP_SMOKE")
+                };
+                let (x, y, dy) = (next(), next(), next());
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position: point(px(x), px(y)),
+                            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                            modifiers: Modifiers::default(),
+                            touch_phase: TouchPhase::Moved,
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                let state = window
+                    .update(cx, |editor, _, _| editor.debug_cursor())
+                    .unwrap_or_default();
+                eprintln!("SMOKE {key}: {state}");
+                continue;
+            }
+            if key == "dump:ui" {
+                let dump = window
+                    .update(cx, |editor, window, cx| editor.debug_ui_dump(window, cx))
+                    .unwrap_or_default();
+                println!("UI-DUMP: {dump}");
                 continue;
             }
             if let Some(pos) = key.strip_prefix("click:") {
@@ -100,4 +161,49 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// Standard-alphabet base64 (RFC 4648), padding optional. Tiny on purpose:
+/// the harness shouldn't pull a dependency for one smoke token.
+fn decode_base64(s: &str) -> Option<String> {
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let mut acc: u32 = 0;
+    let mut nbits = 0u32;
+    let mut out = Vec::new();
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        acc = (acc << 6) | val(c)?;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_base64;
+
+    #[test]
+    fn base64_decodes_standard_strings() {
+        assert_eq!(decode_base64("c2stdGVzdC0xMjM0").as_deref(), Some("sk-test-1234"));
+        assert_eq!(decode_base64("YQ==").as_deref(), Some("a"));
+        assert_eq!(decode_base64("YWI=").as_deref(), Some("ab"));
+        assert_eq!(decode_base64("YWJj").as_deref(), Some("abc"));
+        assert_eq!(decode_base64("").as_deref(), Some(""));
+        assert_eq!(decode_base64("!!"), None);
+    }
 }

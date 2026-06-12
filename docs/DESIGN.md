@@ -33,6 +33,14 @@ These came from use, not theory; they outrank any pattern below.
    *finish*. Strop should lean toward Bryce-school explorability —
    the software invites trying things — without costume-party UI.
 
+### §0.6 Layer discipline (2026-06-12, second papercut round)
+Every transient surface (palette, AI settings, shortcuts, selection popover, find/replace, inline composers, history takeover) lives on one conceptual stack. Laws:
+1. The topmost layer owns every input channel: keystrokes, paste, scroll, click. Nothing leaks to the surfaces beneath it.
+2. Esc always dismisses exactly the topmost layer, regardless of where keyboard focus happens to be. An open layer with no obvious way to close it is a bug by definition.
+3. Light-dismiss layers (palette, selection popover, shortcuts) also close on any click outside them. Form layers (AI settings, rename, end-session) survive stray clicks; they close on Esc, their own buttons, or their backdrop.
+4. Closing a layer restores focus to the surface beneath it — in practice, the editor.
+Rationale: Raskin, *The Humane Interface*, ch. 2–3 — input must follow the user's locus of attention; a paste that lands behind the visible dialog violates the most basic expectation a user has of a computer. These laws are mechanically enforced by scripts/contracts.sh (H6).
+
 ## 1. Design principles (ranked; provenance in the research report)
 
 The canon converges on one spine: **safety enables exploration,

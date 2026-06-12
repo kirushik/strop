@@ -11,7 +11,9 @@ WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
 SWAY=$!
 sleep 2
 WD=$(ls -t "$XDG_RUNTIME_DIR" | grep -E '^wayland-[0-9]+$' | head -1)
+# WRUN_TAIL widens the output window (dump:ui smoke runs need every
+# UI-DUMP line, not just the last two).
 env -u DISPLAY WAYLAND_DISPLAY="$WD" STROP_SMOKE="$KEYS" \
-  timeout 60 "$PWD/target/debug/strop" "$DOC" 2>&1 | tail -2
+  timeout 60 "$PWD/target/debug/strop" "$DOC" 2>&1 | tail -"${WRUN_TAIL:-2}"
 kill $SWAY 2>/dev/null || true
 rm -f "$CFG"

@@ -155,11 +155,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
         KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("NoteInput")),
         KeyBinding::new("tab", NoteTab, Some("NoteInput")),
+        // DESIGN §0.6 law 1: the focused field owns the paste chord. The
+        // deeper context outranks "Editor", so ctrl-v can no longer fall
+        // through a field into the document behind it.
+        KeyBinding::new("ctrl-v", NotePaste, Some("NoteInput")),
+        KeyBinding::new("shift-insert", NotePaste, Some("NoteInput")),
         // The palette's query field: same editing actions, plus row motion.
         KeyBinding::new("enter", NoteCommit, Some("PaletteInput")),
         KeyBinding::new("escape", NoteCancel, Some("PaletteInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("PaletteInput")),
         KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("PaletteInput")),
+        KeyBinding::new("ctrl-v", NotePaste, Some("PaletteInput")),
+        KeyBinding::new("shift-insert", NotePaste, Some("PaletteInput")),
         KeyBinding::new("up", PaletteUp, Some("PaletteInput")),
         KeyBinding::new("down", PaletteDown, Some("PaletteInput")),
         // The AI settings panel's fields (F4): tab cycles, enter commits
@@ -169,6 +176,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", NoteCancel, Some("SettingsInput")),
         KeyBinding::new("backspace", NoteBackspace, Some("SettingsInput")),
         KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("SettingsInput")),
+        KeyBinding::new("ctrl-v", NotePaste, Some("SettingsInput")),
+        KeyBinding::new("shift-insert", NotePaste, Some("SettingsInput")),
         KeyBinding::new("tab", NoteTab, Some("SettingsInput")),
         KeyBinding::new("up", SettingsUp, Some("SettingsInput")),
         KeyBinding::new("down", SettingsDown, Some("SettingsInput")),
@@ -404,11 +413,30 @@ impl NoteInput {
         self.content.truncate(cut);
         cx.notify();
     }
+
+    /// ctrl-v in any field (DESIGN §0.6 law 1): paste lands in the focused
+    /// field, never in the document behind it — the API-key field was the
+    /// motivating bug. Fields are single-line, so newlines flatten to
+    /// spaces; masked fields paste normally (masking is display-only).
+    fn paste(&mut self, _: &NotePaste, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .or_else(crate::smoke::clipboard_override)
+        else {
+            return;
+        };
+        let text: String = text
+            .replace("\r\n", " ")
+            .replace(['\n', '\r'], " ");
+        // The existing insertion path: same place IME commits land.
+        self.replace_text_in_range(None, &text, window, cx);
+    }
 }
 
 actions!(
     note_input,
-    [NoteCommit, NoteCancel, NoteBackspace, NoteBackspaceWord, NoteTab]
+    [NoteCommit, NoteCancel, NoteBackspace, NoteBackspaceWord, NoteTab, NotePaste]
 );
 
 impl EntityInputHandler for NoteInput {
@@ -504,6 +532,7 @@ impl Render for NoteInput {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::backspace_word))
+            .on_action(cx.listener(Self::paste))
             .w_full()
             .min_h(px(22.))
             .px(px(6.))
@@ -2690,6 +2719,13 @@ impl Editor {
                     .font_family("PT Serif")
                     .flex()
                     .flex_col()
+                    // §0.6: clicks inside the palette stay in the palette
+                    // (rows handle their own); clicks outside reach the
+                    // document's handler, which light-dismisses it. The
+                    // wheel is contained the same way — the list scrolls,
+                    // the document behind it never does.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .p(px(8.))
@@ -3526,18 +3562,37 @@ impl Editor {
         )
     }
 
+    /// DESIGN §0.6 law 2: Esc dismisses exactly the TOPMOST layer, one per
+    /// press, regardless of where keyboard focus sits. This is the Editor-
+    /// context half; a focused field's own Esc goes through NoteCancel,
+    /// which closes the same layer. Order: AI settings → palette →
+    /// shortcuts → selection popover → find/replace → history takeover.
     fn escape_mode(&mut self, _: &EscapeMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.ai_settings.is_some() {
             self.close_ai_settings(window, cx);
             return;
         }
+        if self.palette_input.is_some() {
+            // The known bug: palette open + focus on the editor + Esc
+            // previously fell through to the (empty) fallback.
+            self.close_palette(window, cx);
+            return;
+        }
         if self.shortcuts_open {
             self.shortcuts_open = false;
+            window.focus(&self.focus_handle, cx);
             cx.notify();
             return;
         }
         if self.selection_popover {
             self.selection_popover = false;
+            cx.notify();
+            return;
+        }
+        if self.find_input.is_some() || self.replace_input.is_some() {
+            self.find_input = None;
+            self.replace_input = None;
+            window.focus(&self.focus_handle, cx);
             cx.notify();
             return;
         }
@@ -3598,9 +3653,11 @@ impl Editor {
             .justify_center()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     editor.shortcuts_open = false;
+                    // §0.6 law 4: closing a layer restores focus beneath it.
+                    window.focus(&editor.focus_handle, cx);
                     cx.notify();
                 }),
             )
@@ -3618,6 +3675,7 @@ impl Editor {
                     .p(px(18.))
                     .font_family("PT Serif")
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .pb(px(10.))
@@ -3810,6 +3868,7 @@ impl Editor {
                     .flex_col()
                     .gap(px(10.))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .flex()
@@ -4197,6 +4256,12 @@ impl Editor {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else {
+            // Headless-rig transport shim (see smoke::clipboard_override):
+            // present so a leak test CAN catch a field paste falling
+            // through to the document — never set outside smoke runs.
+            if let Some(text) = crate::smoke::clipboard_override() {
+                self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
+            }
             return;
         };
         for entry in item.into_entries() {
@@ -4317,6 +4382,12 @@ impl Editor {
     // -- Scrolling ------------------------------------------------------------
 
     fn on_scroll_wheel(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // §0.6 law 1, second line of defense: while a blocking overlay is
+        // up, the document never scrolls — even if a wheel event slips
+        // past the overlay's own stop_propagation.
+        if self.palette_input.is_some() || self.ai_settings.is_some() || self.shortcuts_open {
+            return;
+        }
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
@@ -4482,6 +4553,25 @@ impl Editor {
         self.bump_activity();
         self.publish_primary(cx);
         cx.notify();
+    }
+
+    /// DESIGN §0.6 law 3: any mouse-down outside a light-dismiss layer
+    /// (palette, shortcuts, selection popover) closes it. Registered on
+    /// the window root — the layers themselves stop propagation, so only
+    /// genuinely-outside clicks arrive here.
+    fn light_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_input.is_some() {
+            self.close_palette(window, cx);
+        }
+        if self.shortcuts_open {
+            self.shortcuts_open = false;
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+        if self.selection_popover {
+            self.selection_popover = false;
+            cx.notify();
+        }
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -4653,6 +4743,68 @@ impl Editor {
             );
         }
         out
+    }
+
+    /// One-line JSON snapshot of the layer stack for the smoke harness
+    /// (H1, `dump:ui`). Overlays list topmost first — the §0.6 Esc order.
+    pub fn debug_ui_dump(&self, window: &Window, cx: &App) -> String {
+        let mut overlays: Vec<&str> = Vec::new();
+        if self.ai_settings.is_some() {
+            overlays.push("ai_settings");
+        }
+        if self.palette_input.is_some() {
+            overlays.push("palette");
+        }
+        if self.shortcuts_open {
+            overlays.push("shortcuts");
+        }
+        if self.selection_popover {
+            overlays.push("popover");
+        }
+        if self.find_input.is_some() || self.replace_input.is_some() {
+            overlays.push("find");
+        }
+        if self.history_view.is_some() {
+            overlays.push("history");
+        }
+        // Every live single-line field, so "focused" can name its context.
+        let mut fields: Vec<Entity<NoteInput>> = Vec::new();
+        if let Some(panel) = &self.ai_settings {
+            fields.extend([
+                panel.base_url.clone(),
+                panel.api_key.clone(),
+                panel.model.clone(),
+            ]);
+        }
+        fields.extend(self.palette_input.clone());
+        fields.extend(self.find_input.clone());
+        fields.extend(self.replace_input.clone());
+        fields.extend(self.doc_rename_input.clone());
+        fields.extend(self.note_input.clone());
+        fields.extend(self.rename_input.as_ref().map(|(_, i)| i.clone()));
+        fields.extend(self.alt_input.as_ref().map(|(_, i)| i.clone()));
+        fields.extend(self.end_session_input.clone());
+        fields.extend(self.goal_input.clone());
+        let focused_field = fields
+            .iter()
+            .find(|f| f.read(cx).focus_handle.is_focused(window));
+        let focused = focused_field.map_or("Editor", |f| f.read(cx).key_context);
+        let focused_input_text = focused_field.map(|f| f.read(cx).content.clone());
+        let doc_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.doc.text().hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
+        serde_json::json!({
+            "overlays": overlays,
+            "focused": focused,
+            "scroll_y": f32::from(self.scroll_top),
+            "doc_chars": self.doc.rope().len_chars(),
+            "doc_hash": doc_hash,
+            "focused_input_text": focused_input_text,
+        })
+        .to_string()
     }
 
     /// Cursor geometry for the smoke harness: byte offset, paragraph index,
@@ -7840,6 +7992,14 @@ impl Render for Editor {
             // outside the column's listener stack — actions from their
             // inputs bubble here.
             .on_action(cx.listener(Self::note_tab))
+            // §0.6 law 3 (click-outside) lives on the root so the whole
+            // window counts as "outside", gutters and titlebar included.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                    editor.light_dismiss(window, cx);
+                }),
+            )
             .child(self.render_titlebar(cx))
             .child(
                 div()

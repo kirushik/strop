@@ -435,13 +435,25 @@ PLAN promised now exists in the running editor.
   semantics identical — fresh ScaleContext per rasterization). Evidence:
   `cargo clippy --workspace --all-targets` = 0 warnings, tests green.
   draw_guard.rs needed nothing: every wrapper has live call sites.
-- [ ] **H1. Layer discipline** (PENDING): DESIGN §0.6 (topmost layer
-  owns every input channel); ctrl-v paste into NoteInput/PaletteInput/
-  SettingsInput fields (the API-key field is the motivating bug); Esc
-  closes exactly the topmost layer even when its input lost focus;
-  click-outside closes light-dismiss layers; every close path restores
-  focus to the editor; palette wheel never scrolls the document; smoke
-  tokens clipb64:/wheel:/dump:ui for behavioral verification.
+- [x] **H1. Layer discipline** (shipped 2026-06-12): DESIGN §0.6 is law;
+  NotePaste on ctrl-v/shift-insert in NoteInput/PaletteInput/
+  SettingsInput (newlines flatten, masked fields paste — the API-key
+  bug); escape_mode closes exactly the topmost layer (AI settings →
+  palette → shortcuts → popover → find/replace → history); click-
+  outside light-dismiss moved to the window ROOT (gutters and titlebar
+  count as outside); every close path refocuses the editor; palette/
+  shortcuts/AI panels stop wheel propagation AND the document scroll
+  handler early-returns under a blocking overlay. Smoke tokens
+  clipb64:/wheel:/dump:ui added (clipboard transport shimmed for the
+  rig — headless sway grants no seat focus, so gpui drops real
+  clipboard writes; routing and insertion paths stay real). Evidence:
+  wrun dumps — paste lands in the masked field with doc_hash unchanged
+  (9f2e12b5d731d172 before and after, focused_input_text
+  "sk-test-key-9999"); palette closes on outside click AND on Esc;
+  wheel over palette leaves scroll_y at 120.0; shortcuts/popover/find
+  each close on Esc with focused=="Editor". Note: with click-outside in
+  place, "palette open + editor focused" is unreachable by mouse; the
+  escape_mode palette branch stays as §0.6 defense.
 - [ ] **H2. Chrome correctness** (PENDING): client-side resize edges
   (zed's client_side_decorations pattern — GNOME Wayland has no SSD,
   so this is the only way Strop can be resized); outline toggle moves
