@@ -82,3 +82,18 @@ as a *captive compositor we own*:
   the smoke harness for every interaction.
 - **Xvfb**: same isolation for the X11 backend (rig currently borrows
   the session's XWayland at :0 — that's the focus-stealing).
+
+## Update (sway era)
+
+With `sway`/`grim` installed the wishlist rig is live and replaced both
+loopholes for everyday work: `scripts/wshot.sh out.png SCALE [doc]
+[keys…]` (headless sway at any scale + grim capture) and
+`scripts/wrun.sh doc [keys…]` (sandboxed smoke runs, e.g. fixture
+creation). Nothing ever appears on the user's desktop. First trophy:
+the 2026-06-12 Wayland glyph corruption — reproduced, bisected (scale,
+footnotes, marks, lists, atlas pressure), and root-caused in one
+session: an entity.update() inside a canvas prepaint closure re-dirtied
+the window mid-draw; Wayland's frame-callback scheduling then tore the
+renderer's per-frame sprite bookkeeping. Rule extracted: NEVER mutate
+app state from a draw-pass closure — capture geometry through an
+Rc<RefCell> instead.

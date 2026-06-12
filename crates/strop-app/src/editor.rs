@@ -308,7 +308,13 @@ pub struct Editor {
     /// canvas child at paint time), so a click on the mirror maps to the
     /// same offset in the def line (DESIGN §2-footnotes, the Word
     /// notes-pane behavior).
-    zone_row_bounds: HashMap<usize, Bounds<Pixels>>,
+    /// Written by the zone rows' bounds-capture canvas during prepaint.
+    /// MUST be an Rc<RefCell>, not entity state: mutating the Editor
+    /// entity from inside a draw pass (handle.update in a canvas closure)
+    /// re-dirties the window mid-frame, and under Wayland's frame-callback
+    /// scheduling that tore the renderer's per-frame sprite bookkeeping —
+    /// the cross-surface glyph corruption of 2026-06-12.
+    zone_row_bounds: std::rc::Rc<std::cell::RefCell<HashMap<usize, Bounds<Pixels>>>>,
     last_frame: Option<TextFrame>,
 }
 
@@ -871,7 +877,7 @@ impl Editor {
             end_session_input: None,
             session_goal: None,
             goal_input: None,
-            zone_row_bounds: HashMap::new(),
+            zone_row_bounds: std::rc::Rc::default(),
             last_frame: None,
         }
     }
@@ -4621,7 +4627,8 @@ impl Editor {
                 f32::from(origin.y + y)
             );
         }
-        let mut rows: Vec<_> = self.zone_row_bounds.iter().collect();
+        let bounds_map = self.zone_row_bounds.borrow();
+        let mut rows: Vec<_> = bounds_map.iter().collect();
         rows.sort_by_key(|(ix, _)| **ix);
         for (ix, b) in rows {
             out += &format!(
@@ -6899,7 +6906,7 @@ impl Editor {
         x: Pixels,
         window: &mut Window,
     ) -> Option<usize> {
-        let bounds = self.zone_row_bounds.get(&row)?;
+        let bounds = *self.zone_row_bounds.borrow().get(&row)?;
         let run = TextRun {
             len: text.len(),
             font: gpui::font("PT Serif"),
@@ -6928,7 +6935,7 @@ impl Editor {
         hidden: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let handle = cx.entity();
+        let row_bounds = self.zone_row_bounds.clone();
         div()
             .id("footnote-zone")
             .absolute()
@@ -6957,7 +6964,7 @@ impl Editor {
                     .text_size(px(14.))
                     .text_color(rgb(MUTED_COLOR))
                     .children(footnotes.into_iter().enumerate().map(|(ix, note)| {
-                        let handle = handle.clone();
+                        let row_bounds = row_bounds.clone();
                         let ZoneNote {
                             no,
                             def,
@@ -7002,10 +7009,13 @@ impl Editor {
                                     .cursor(CursorStyle::IBeam)
                                     .child(
                                         canvas(
-                                            move |bounds, _, cx| {
-                                                handle.update(cx, |editor, _| {
-                                                    editor.zone_row_bounds.insert(ix, bounds);
-                                                });
+                                            // Plain shared-cell write: never
+                                            // entity.update() during a draw
+                                            // pass (see zone_row_bounds).
+                                            move |bounds, _, _| {
+                                                row_bounds
+                                                    .borrow_mut()
+                                                    .insert(ix, bounds);
                                             },
                                             |_, _, _, _| {},
                                         )
