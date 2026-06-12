@@ -362,3 +362,60 @@ section. Ordering: root-fix verification first, then highest-leverage.
 **Phase F complete** (2026-06-12): the designed shell is built — F0
 keystone through F6 explorability. Every DESIGN §1–§4 surface that
 PLAN promised now exists in the running editor.
+
+## Phase G — testing harness (2026-06-12)
+
+> The corruption hunt earned its conclusion: bugs this expensive must be
+> caught by machinery, not by eyes. Phase G turns the rig into tests and
+> the engine into a property-checked model.
+
+- [x] **G1. wflip.sh — the scale-flip harness** (scripts/wflip.sh +
+  scripts/fixtures/flip-*.md): one headless sway output whose scale
+  flips 2→1→2 mid-session; oracle 1 byte-compares same-scale captures
+  from one process (state leakage), oracle 2 compares the post-flip
+  frame against a fresh boot at that scale (the user's monitor-
+  migration bug, literally). STROP_TEST_STILL=1 freezes cursor blink
+  and timestamps so captures byte-compare; isolated XDG dirs per boot;
+  fixtures re-imported from .md every boot. Born failing on purpose:
+  list/footnote fixtures showed deterministic wrong-size glyphs
+  (AE 5578/5994), plain passed — and the harness's first catch was an
+  unrelated real bug (overlays positioned from one-frame-stale
+  last_frame geometry after any resize; fixed via a deferred
+  request_animation_frame when painted geometry changes).
+- [x] **G2. The corruption root cause** (vendor/gpui_wgpu +
+  docs/UPSTREAM-gpui-scale-bug.md): NOT the mixed WrappedLine/
+  ShapedLine paints the bisect first blamed — three different marker
+  painting strategies produced byte-identical corruption. Atlas
+  instrumentation (per-tile content hashes) proved glyph rasterization
+  non-deterministic: gpui_wgpu's shared swash ScaleContext returns
+  subtly different bitmaps for identical RenderGlyphParams once the
+  font has been scaled at another device scale; the sprite atlas
+  caches the poisoned tiles forever. Workaround shipped as a vendored
+  one-change patch (fresh ScaleContext per rasterization) wired via
+  [patch]; wflip green on all fixtures (AE ≤ 6), wmigrate clean, and
+  the fix also corrected pre-existing palette corruption visible in
+  plain 2x sessions. Upstream issue draft: docs/UPSTREAM-gpui-scale-bug.md.
+- [x] **G3. Draw-pass guard** (clippy.toml + strop-app/src/draw_guard.rs):
+  the "never mutate app state from a draw pass" rule is now machinery —
+  clippy disallowed-methods bans raw Entity::update/update_in and
+  gpui::canvas (deny, not warn); EntityUpdateExt::update_checked
+  debug-asserts no draw on the stack, update_in_draw hands the closure
+  &mut T only (notify unreachable by construction); capture_canvas
+  wraps canvas closures in the IN_DRAW guard. All sites migrated.
+- [x] **G4. Core property suite** (strop-core/tests/model.rs): Document
+  driven by a state machine against a String reference model with a
+  live Store mirror; markdown round-trip and inline-escape properties
+  over generated block/span models (gated to markdown's representable
+  subset — the gates encode CommonMark semantics, with known export
+  gaps documented: list depth flattens, no escapes inside code spans);
+  typograph byte-safety/quiescence. First run caught three real bugs,
+  fixed in their own commit: SpanSet::remove broke sort order (covers()
+  then saw phantom gaps), Highlight was export-only (==…== had no
+  importer), and cross-block spans exported unclosed markers.
+  proptest-regressions/ checked in; PROPTEST_CASES overrides the
+  256-case default.
+- [ ] **G5. Coverage policy** (documented, not enforced yet): once
+  cargo-llvm-cov is installed in CI/dev, `cargo llvm-cov
+  --fail-under-lines 85 -p strop-core` is the gate — strop-core only;
+  the GPUI shell is exercised by the visual rig, where line coverage
+  is the wrong metric.

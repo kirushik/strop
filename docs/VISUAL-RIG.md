@@ -96,4 +96,40 @@ session: an entity.update() inside a canvas prepaint closure re-dirtied
 the window mid-draw; Wayland's frame-callback scheduling then tore the
 renderer's per-frame sprite bookkeeping. Rule extracted: NEVER mutate
 app state from a draw-pass closure — capture geometry through an
-Rc<RefCell> instead.
+Rc<RefCell> instead. (Now machinery, not prose: clippy.toml bans raw
+Entity::update/canvas, and strop-app/src/draw_guard.rs asserts the rule
+at runtime.)
+
+## wflip.sh — the scale-flip harness (Phase G)
+
+`scripts/wmigrate.sh` (two outputs, move the window) reproduces the
+multi-monitor scale bug class but its captures can't be compared
+mechanically — every shot differs legitimately. `scripts/wflip.sh`
+turns the repro into a TEST by flipping ONE output's scale mid-session
+(`swaymsg "output HEADLESS-1 scale 1"` drives the same wl_surface
+buffer-scale path), so captures from equal scales must match:
+
+- Oracle 1: capture at 2x, flip to 1x and back, capture at 2x again —
+  same process, same renderer, same scale: any pixel difference is
+  state leaked across the flip.
+- Oracle 2: the post-flip 1x capture vs a FRESH boot at 1x with the
+  same fixture — exactly what a user sees after dragging the window to
+  the other monitor.
+
+Determinism is engineered, not hoped for: `STROP_TEST_STILL=1` (in the
+app) suppresses cursor blink and freezes rendered timestamps; each boot
+gets isolated XDG_STATE_HOME/XDG_CONFIG_HOME; fixtures are re-imported
+from `scripts/fixtures/flip-*.md` for every boot (a .strop sibling
+would silently lack spans/blocks until a save). Every fixture opens the
+palette: the corruption poisons rasterization state, but wrong-size
+sprites only SHOW in glyphs shaped fresh after the flip — overlay text
+is that surface. Tolerance is WFLIP_AE_TOL (default 50 px of 1.92M;
+clean runs measure ≤ 6, corruption measured ~5,600).
+
+Second trophy, courtesy of this harness: the scale-change corruption
+was NOT the mixed-paint pattern the first bisect blamed — it's
+non-deterministic glyph rasterization in upstream gpui_wgpu (shared
+swash ScaleContext state; full story in docs/UPSTREAM-gpui-scale-bug.md,
+workaround vendored in vendor/gpui_wgpu). The harness also caught
+overlays positioning from one-frame-stale geometry after any resize —
+on the PLAIN fixture, before the marker bug was even touched.
