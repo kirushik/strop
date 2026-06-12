@@ -215,7 +215,7 @@ fn mark_highlights(md: &str) -> String {
         let mut i = 0usize;
         while i < chars.len() {
             if next < paired && marks[next] == i {
-                out.push_str(if next % 2 == 0 { "<mark>" } else { "</mark>" });
+                out.push_str(if next.is_multiple_of(2) { "<mark>" } else { "</mark>" });
                 next += 1;
                 i += 2;
             } else {

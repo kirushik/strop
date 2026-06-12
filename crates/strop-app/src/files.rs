@@ -295,10 +295,10 @@ pub fn reveal(path: &Path) {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !ok {
-        if let Some(dir) = path.parent() {
-            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
-        }
+    if !ok
+        && let Some(dir) = path.parent()
+    {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
 }
 

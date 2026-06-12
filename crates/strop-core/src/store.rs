@@ -342,14 +342,14 @@ impl Store {
     /// the most recent checkpoint — empty sessions never clutter the rail
     /// (the research's top Docs complaint).
     pub fn add_checkpoint_if_changed(&self, name: &str, manual: bool) {
-        if let Some(last) = self.checkpoints().last() {
-            if let Some(at_last) = self.state_at(&last.frontiers) {
-                // Full (text, spans, blocks) comparison: a session that only
-                // bolded or restructured headings still deserves a rewind
-                // point — text-only comparison made such work unreachable.
-                if at_last == self.read_state() {
-                    return;
-                }
+        if let Some(last) = self.checkpoints().last()
+            && let Some(at_last) = self.state_at(&last.frontiers)
+        {
+            // Full (text, spans, blocks) comparison: a session that only
+            // bolded or restructured headings still deserves a rewind
+            // point — text-only comparison made such work unreachable.
+            if at_last == self.read_state() {
+                return;
             }
         }
         self.add_checkpoint(name, manual);

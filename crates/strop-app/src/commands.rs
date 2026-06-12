@@ -368,7 +368,7 @@ pub fn ranked_with_freq(
             })
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
     scored.into_iter().map(|(_, c)| c).collect()
 }
 
@@ -386,7 +386,7 @@ pub fn frequent(freq: &std::collections::HashMap<String, u32>) -> Vec<&'static C
                 .map(|n| (n, c))
         })
         .collect();
-    hits.sort_by(|a, b| b.0.cmp(&a.0)); // stable: table order breaks ties
+    hits.sort_by_key(|&(count, _)| std::cmp::Reverse(count)); // stable: table order breaks ties
     hits.truncate(5);
     hits.into_iter().map(|(_, c)| c).collect()
 }

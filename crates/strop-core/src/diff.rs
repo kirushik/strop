@@ -32,11 +32,11 @@ fn push(out: &mut Vec<DiffSeg>, op: DiffOp, text: &str) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = out.last_mut() {
-        if last.op == op {
-            last.text.push_str(text);
-            return;
-        }
+    if let Some(last) = out.last_mut()
+        && last.op == op
+    {
+        last.text.push_str(text);
+        return;
     }
     out.push(DiffSeg {
         op,

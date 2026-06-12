@@ -49,7 +49,6 @@ impl FontKey {
 struct CosmicTextSystemState {
     font_system: FontSystem,
     scratch: ShapeBuffer,
-    swash_scale_context: ScaleContext,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
     loaded_fonts: Vec<LoadedFont>,
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
@@ -74,7 +73,6 @@ impl CosmicTextSystem {
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
             scratch: ShapeBuffer::default(),
-            swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
@@ -90,7 +88,6 @@ impl CosmicTextSystem {
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
             scratch: ShapeBuffer::default(),
-            swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
@@ -390,7 +387,8 @@ impl CosmicTextSystemState {
         // STROP PATCH (the only change in this vendored crate — see
         // docs/UPSTREAM-gpui-scale-bug.md and the header of this file):
         // rasterize with a FRESH ScaleContext instead of the long-lived
-        // self.swash_scale_context. The shared context's internal caches
+        // shared one upstream keeps in CosmicTextSystemState (the field is
+        // removed here). The shared context's internal caches
         // make rasterization non-deterministic across a window scale
         // change: after this font has been scaled at another device scale,
         // identical RenderGlyphParams yield subtly different (≈1px

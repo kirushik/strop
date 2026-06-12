@@ -354,10 +354,11 @@ fn delimiter_stacking_ok(
         v
     });
     for p in inner_points {
-        if p > s.start && p < s.end {
-            if chars[p - 1].is_whitespace() || chars[p].is_whitespace() {
-                return false;
-            }
+        if p > s.start
+            && p < s.end
+            && (chars[p - 1].is_whitespace() || chars[p].is_whitespace())
+        {
+            return false;
         }
     }
     true

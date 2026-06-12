@@ -252,10 +252,10 @@ fn main() {
                     // The if-then ritual's open half (DESIGN §4.1): caret
                     // restored, last close's intent surfaced — and nothing
                     // is ever asked at open (the §4 invariant).
-                    if let Some((store, _)) = &store {
-                        if let Some(entry) = files::load_intent(store.path()) {
-                            editor.restore_session(entry);
-                        }
+                    if let Some((store, _)) = &store
+                        && let Some(entry) = files::load_intent(store.path())
+                    {
+                        editor.restore_session(entry);
                     }
                     editor.start_blink(cx);
                     if let Some((store, _)) = store {

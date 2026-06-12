@@ -213,17 +213,18 @@ fn run_audit(window: &mut gpui::Window, order: &str) {
         // fallback-heavy chrome. Distinct from targets so the layout cache
         // can't serve them.
         let decoy_texts: Vec<(String, Font, f32)> = {
-            let mut v: Vec<(String, Font, f32)> = Vec::new();
-            v.push(("Strop is a writer’s editor with an editor inside — one that diagnoses.".into(), serif(), 20.));
-            v.push(("Хороший редактор называет проблему — «здесь зарыта мысль» — и оставляет решение автору.".into(), serif(), 20.));
-            v.push(("Гомогенизация голоса — не свойство модели, а свойство интерфейса.".into(), serif(), 20.));
-            v.push(("The reader is right that something is wrong. It it it?".into(), serif(), 20.));
-            v.push(("B  I  U  S  H  {}  ↺".into(), serif(), 14.));
-            v.push(("fn main() { println!(\"привет\"); }".into(), mono(), 16.));
-            v.push(("History  named  vs draft  Restore".into(), serif(), 13.));
-            v.push(("Перо знает о бумаге больше, чем писатель о читателе.".into(), serif(), 20.));
-            v.push(("Voice: within your normal range (5 texts) ✓".into(), serif(), 12.));
-            v.push(("частота тире: +3.1σ от вашей нормы".into(), serif(), 12.));
+            let mut v: Vec<(String, Font, f32)> = vec![
+                ("Strop is a writer’s editor with an editor inside — one that diagnoses.".into(), serif(), 20.),
+                ("Хороший редактор называет проблему — «здесь зарыта мысль» — и оставляет решение автору.".into(), serif(), 20.),
+                ("Гомогенизация голоса — не свойство модели, а свойство интерфейса.".into(), serif(), 20.),
+                ("The reader is right that something is wrong. It it it?".into(), serif(), 20.),
+                ("B  I  U  S  H  {}  ↺".into(), serif(), 14.),
+                ("fn main() { println!(\"привет\"); }".into(), mono(), 16.),
+                ("History  named  vs draft  Restore".into(), serif(), 13.),
+                ("Перо знает о бумаге больше, чем писатель о читателе.".into(), serif(), 20.),
+                ("Voice: within your normal range (5 texts) ✓".into(), serif(), 12.),
+                ("частота тире: +3.1σ от вашей нормы".into(), serif(), 12.),
+            ];
             for i in 0..20 {
                 v.push((format!("Без№{i} смешанный текст mixed line {i} с дефисами-и-тире — и цифрами 12{i}."), serif(), 20.));
                 v.push((format!("Заголовок-приманка номер {i}"), sans_bold(), 24.));
@@ -263,21 +264,20 @@ fn run_audit(window: &mut gpui::Window, order: &str) {
                         // ligature-free chars (all Cyrillic + plain Latin).
                         if let Some((_, label, parsed)) =
                             by_id.iter().find(|(id, _, _)| *id == run.font_id.0)
+                            && ch.is_alphanumeric()
                         {
-                            if ch.is_alphanumeric() {
-                                match parsed.glyph_index(ch) {
-                                    Some(expected) if u32::from(expected.0) != num => {
-                                        println!(
-                                            "MISMATCH {} byte={} ch='{}' shaped={} cmap={} font={}#{}",
-                                            t.label, glyph.index, ch, num, expected.0, run.font_id.0, label
-                                        );
-                                    }
-                                    None => println!(
-                                        "NO-CMAP {} ch='{}' font={}#{} (claimed face lacks the char!)",
-                                        t.label, ch, run.font_id.0, label
-                                    ),
-                                    _ => {}
+                            match parsed.glyph_index(ch) {
+                                Some(expected) if u32::from(expected.0) != num => {
+                                    println!(
+                                        "MISMATCH {} byte={} ch='{}' shaped={} cmap={} font={}#{}",
+                                        t.label, glyph.index, ch, num, expected.0, run.font_id.0, label
+                                    );
                                 }
+                                None => println!(
+                                    "NO-CMAP {} ch='{}' font={}#{} (claimed face lacks the char!)",
+                                    t.label, ch, run.font_id.0, label
+                                ),
+                                _ => {}
                             }
                         }
                     }

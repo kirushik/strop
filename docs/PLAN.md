@@ -419,3 +419,49 @@ PLAN promised now exists in the running editor.
   --fail-under-lines 85 -p strop-core` is the gate — strop-core only;
   the GPUI shell is exercised by the visual rig, where line coverage
   is the wrong metric.
+
+## Phase H — second papercut round (2026-06-12)
+
+> The class behind most of this round: transient surfaces never had a
+> shared stack discipline — paste lands behind the visible dialog, Esc
+> doesn't close what the eye sees on top, wheel scrolls the document
+> under the palette. DESIGN §0.6 names the laws; H1 enforces them.
+
+- [x] **H0. Clippy zero** (shipped 2026-06-12): all 24 workspace +
+  all-targets warnings fixed (collapsible-if let-chains, sort_by_key,
+  is_multiple_of, needless range loops, one documented
+  too_many_arguments allow on runs_for_paragraph); vendor touch limited
+  to removing the never-read `swash_scale_context` field (patch
+  semantics identical — fresh ScaleContext per rasterization). Evidence:
+  `cargo clippy --workspace --all-targets` = 0 warnings, tests green.
+  draw_guard.rs needed nothing: every wrapper has live call sites.
+- [ ] **H1. Layer discipline** (PENDING): DESIGN §0.6 (topmost layer
+  owns every input channel); ctrl-v paste into NoteInput/PaletteInput/
+  SettingsInput fields (the API-key field is the motivating bug); Esc
+  closes exactly the topmost layer even when its input lost focus;
+  click-outside closes light-dismiss layers; every close path restores
+  focus to the editor; palette wheel never scrolls the document; smoke
+  tokens clipb64:/wheel:/dump:ui for behavioral verification.
+- [ ] **H2. Chrome correctness** (PENDING): client-side resize edges
+  (zed's client_side_decorations pattern — GNOME Wayland has no SSD,
+  so this is the only way Strop can be resized); outline toggle moves
+  to the titlebar's far left (it opens a LEFT rail); shared tooltip
+  helper on every titlebar button (name + chord); chrome strings
+  English-only per DESIGN §0.7.
+- [ ] **H3. Selection popover v2** (PENDING): three groups
+  [B I S {} ==] | [H1 H2 H3] | [¹] with hairline dividers, self-styled
+  labels, tooltips, active states; underline deliberately absent (see
+  DESIGN toolbar note).
+- [ ] **H4. Footnotes: one visual home** (PENDING): a footnote body
+  renders in exactly one place — the zone shows it iff the ref is in
+  the viewport and the def block is not; def blocks at the document
+  end render as a styled "Footnotes" section (hairline rule, ~0.9×
+  body); bidirectional jumps keep working; wflip stays green.
+- [ ] **H5. (next round)**: reserved — owned by the next round.
+- [ ] **H6. contracts.sh** (next round): mechanical enforcement of the
+  DESIGN §0.6 layer laws as a scripted contract suite.
+
+### Backlog (from H1)
+- NoteInput has no selection model (append-only single-line composer);
+  ctrl-a select-all in fields is blocked on the DESIGN §0 directive-1
+  "real single-line editor" rework.

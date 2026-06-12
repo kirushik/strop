@@ -799,7 +799,7 @@ fn format_thousands(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -908,11 +908,10 @@ impl Editor {
                     // navigation markers for "a sitting", not safety.
                     if editor.dirty_since_checkpoint
                         && editor.last_input.elapsed() >= Duration::from_secs(900)
+                        && let Some(store) = &editor.store
                     {
-                        if let Some(store) = &editor.store {
-                            store.add_checkpoint_if_changed("Session", false);
-                            editor.dirty_since_checkpoint = false;
-                        }
+                        store.add_checkpoint_if_changed("Session", false);
+                        editor.dirty_since_checkpoint = false;
                     }
                 });
                 if alive.is_err() {
@@ -1004,10 +1003,10 @@ impl Editor {
                         .and_then(|(_, loaded)| loaded.map(|l| l.text)),
                     _ => std::fs::read_to_string(&path).ok(),
                 };
-                if let Some(text) = text {
-                    if text.split_whitespace().count() >= 200 {
-                        texts.push(text);
-                    }
+                if let Some(text) = text
+                    && text.split_whitespace().count() >= 200
+                {
+                    texts.push(text);
                 }
             }
         }
@@ -1280,18 +1279,18 @@ impl Editor {
             &input,
             window,
             move |editor, _, event: &NoteInputEvent, window, cx| {
-                if let NoteInputEvent::Commit(name) = event {
-                    if !name.trim().is_empty() {
-                        if let Some(store) = &editor.store {
-                            store.rename_checkpoint(ix, name.trim());
-                            editor.store_dirty = true;
-                        }
-                        if let Some(hv) = &mut editor.history_view {
-                            if let Some(e) = hv.entries.get_mut(ix) {
-                                e.name = name.trim().to_owned();
-                                e.manual = true;
-                            }
-                        }
+                if let NoteInputEvent::Commit(name) = event
+                    && !name.trim().is_empty()
+                {
+                    if let Some(store) = &editor.store {
+                        store.rename_checkpoint(ix, name.trim());
+                        editor.store_dirty = true;
+                    }
+                    if let Some(hv) = &mut editor.history_view
+                        && let Some(e) = hv.entries.get_mut(ix)
+                    {
+                        e.name = name.trim().to_owned();
+                        e.manual = true;
                     }
                 }
                 editor.rename_input = None;
@@ -1615,10 +1614,10 @@ impl Editor {
                     }
                 } else {
                     this.update(cx, |editor: &mut Editor, _| {
-                        if let Some(store) = &editor.store {
-                            if let Err(e) = store.save_copy_to(&path) {
-                                eprintln!("strop: save copy: {e}");
-                            }
+                        if let Some(store) = &editor.store
+                            && let Err(e) = store.save_copy_to(&path)
+                        {
+                            eprintln!("strop: save copy: {e}");
                         }
                     })
                     .ok();
@@ -3148,7 +3147,7 @@ impl Editor {
         let (start, _) = self.paragraph_bounds(offset);
         if offset == start {
             // Continue the search from the end of the previous paragraph.
-            return self.previous_word_boundary(offset - 1).max(0);
+            return self.previous_word_boundary(offset - 1);
         }
         let line = self.doc.slice_bytes(start..offset);
         line.split_word_bound_indices()
@@ -5130,6 +5129,9 @@ fn blend_over(top: gpui::Rgba, bottom: gpui::Rgba) -> gpui::Rgba {
 /// boundaries. Selection and highlight paint via
 /// `WrappedLine::paint_background`; IME composition gets an underline;
 /// formatting maps to font weight/style and decorations.
+// One parameter per cut source; bundling them into a struct would only
+// rename the arity, not reduce it.
+#[allow(clippy::too_many_arguments)]
 fn runs_for_paragraph(
     par_range: &Range<usize>,
     selection: &Range<usize>,
@@ -5789,16 +5791,16 @@ impl Element for EditorElement {
                 ));
             }
             let origin = bounds.origin + point(par.indent, y);
-            if let Some((render, sz)) = &par.image {
-                if let Err(e) = window.paint_image(
+            if let Some((render, sz)) = &par.image
+                && let Err(e) = window.paint_image(
                     Bounds::new(origin, *sz),
                     Corners::default(),
                     render.clone(),
                     0,
                     false,
-                ) {
-                    eprintln!("strop: paint image: {e}");
-                }
+                )
+            {
+                eprintln!("strop: paint image: {e}");
             }
             if let Some(shaped) = &par.marker {
                 shaped
@@ -5849,10 +5851,10 @@ impl Element for EditorElement {
             }
         }
 
-        if focus_handle.is_focused(window) {
-            if let Some(cursor) = prepaint.cursor.take() {
-                window.paint_quad(cursor);
-            }
+        if focus_handle.is_focused(window)
+            && let Some(cursor) = prepaint.cursor.take()
+        {
+            window.paint_quad(cursor);
         }
 
         let paragraphs = std::mem::take(&mut prepaint.paragraphs);
@@ -6730,8 +6732,8 @@ impl Editor {
                     .into_any_element(),
             );
             if is_open {
-                for k in ix..end {
-                    rows.push(entry_row(k, &entries[k], true));
+                for (k, entry) in entries.iter().enumerate().take(end).skip(ix) {
+                    rows.push(entry_row(k, entry, true));
                 }
             }
             ix = end;
@@ -6921,12 +6923,11 @@ impl Editor {
                                                     cx.stop_propagation();
                                                     if let Some(hv) =
                                                         &mut editor.history_view
+                                                        && hv.compare_current != value
                                                     {
-                                                        if hv.compare_current != value {
-                                                            hv.compare_current = value;
-                                                            editor.rebuild_preview();
-                                                            cx.notify();
-                                                        }
+                                                        hv.compare_current = value;
+                                                        editor.rebuild_preview();
+                                                        cx.notify();
                                                     }
                                                 },
                                             ),

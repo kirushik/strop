@@ -397,8 +397,8 @@ impl Baseline {
         let overall_sigma = (delta - self.delta_mean) / self.delta_sd;
         let ru = self.lang == Lang::Ru;
         let mut scored: Vec<(f32, String)> = Vec::new();
-        for i in 0..v.len() {
-            let z = (v[i] - self.mean[i]) / self.sd[i];
+        for (i, value) in v.iter().enumerate() {
+            let z = (value - self.mean[i]) / self.sd[i];
             if z.abs() > 2. {
                 let name = feature_name(i, self.lang);
                 scored.push((
