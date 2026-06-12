@@ -41,3 +41,11 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Workaround for the Wayland scale-change glyph corruption
+# (docs/UPSTREAM-gpui-scale-bug.md): gpui_wgpu vendored with a one-change
+# patch in cosmic_text_system.rs (fresh swash ScaleContext per glyph
+# rasterization). Everything else still comes from the zed git pin above.
+# Remove vendor/gpui_wgpu and this [patch] once fixed upstream.
+[patch."https://github.com/zed-industries/zed"]
+gpui_wgpu = { path = "vendor/gpui_wgpu" }

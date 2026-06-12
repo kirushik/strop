@@ -2689,7 +2689,6 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=992f395c3d696d96946302cd0a8721a72954ba39#992f395c3d696d96946302cd0a8721a72954ba39"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2699,7 +2698,6 @@ dependencies = [
  "gpui",
  "gpui_util",
  "itertools 0.14.0",
- "js-sys",
  "log",
  "parking_lot",
  "pollster 0.4.0",
@@ -2708,9 +2706,6 @@ dependencies = [
  "smallvec",
  "swash",
  "unicode-segmentation",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
  "wgpu",
  "zed-font-kit",
 ]

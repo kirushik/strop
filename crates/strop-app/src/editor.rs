@@ -5580,9 +5580,7 @@ impl Element for EditorElement {
                     Some((r.start - range.start, shaped))
                 })
                 .collect();
-            let marker: Option<gpui::ShapedLine> = marker
-                .filter(|_| std::env::var("STROP_NO_MARKER_SHAPE").is_err())
-                .map(|m| {
+            let marker: Option<gpui::ShapedLine> = marker.map(|m| {
                 let run = TextRun {
                     len: m.len(),
                     font: gpui::font("PT Serif"),
@@ -5795,9 +5793,7 @@ impl Element for EditorElement {
                     eprintln!("strop: paint image: {e}");
                 }
             }
-            if let Some(shaped) = &par.marker
-                && std::env::var("STROP_NO_MARKER_PAINT").is_err()
-            {
+            if let Some(shaped) = &par.marker {
                 shaped
                     .paint(
                         bounds.origin + point(par.indent - px(24.), y + px(2.)),
