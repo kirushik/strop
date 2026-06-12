@@ -230,6 +230,12 @@ impl SpanSet {
                 });
             }
         }
+        // A split tail can land after a later-starting span of another
+        // attr; the set must stay sorted — covers() walks it assuming
+        // order and would otherwise see phantom gaps (toggle would then
+        // re-add instead of clearing). Found by the model.rs state
+        // machine, 2026-06-12.
+        result.sort_by_key(|s| s.range.start);
         self.spans = result;
     }
 
@@ -936,5 +942,23 @@ mod tests {
         assert_eq!(at3.len(), 2);
         assert_eq!(set.attrs_at(5).count(), 1);
         assert_eq!(set.attrs_at(6).count(), 0); // end-exclusive
+    }
+
+    #[test]
+    fn remove_keeps_spans_sorted() {
+        // A partial remove used to push the split tail in place, leaving
+        // it after later-starting spans of other attrs; covers() assumes
+        // sorted order and saw phantom gaps. Found by the tests/model.rs
+        // state machine (2026-06-12).
+        let mut set = SpanSet::default();
+        set.add(0..10, InlineAttr::Emphasis);
+        set.add(2..3, InlineAttr::Underline);
+        set.remove(0..5, &InlineAttr::Emphasis);
+        let starts: Vec<usize> = set.spans().iter().map(|s| s.range.start).collect();
+        let mut sorted = starts.clone();
+        sorted.sort_unstable();
+        assert_eq!(starts, sorted, "spans must stay sorted after remove");
+        assert!(set.covers(5..10, &InlineAttr::Emphasis));
+        assert!(set.covers(2..3, &InlineAttr::Underline));
     }
 }

@@ -30,7 +30,11 @@ fn close_marker(attr: &InlineAttr) -> String {
 }
 
 fn escape_into(c: char, out: &mut String) {
-    if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '~') {
+    // '=' is escaped because Highlight exports as ==…== (not CommonMark;
+    // imported via the mark_highlights pre-pass) — a literal '=' must
+    // never be mistaken for a marker, including against a neighboring
+    // marker edge ("==a\=\=\=" vs "==a===").
+    if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '~' | '=') {
         out.push('\\');
     }
     if c == '\u{2028}' {
@@ -47,7 +51,16 @@ fn inline_md(line: &str, base: usize, spans: &SpanSet) -> String {
     let mut out = String::new();
     let mut stack: Vec<InlineAttr> = Vec::new();
     for i in 0..=chars.len() {
-        let here: Vec<InlineAttr> = spans.attrs_at(base + i).cloned().collect();
+        // At end-of-block every marker MUST close even when the span
+        // itself continues across the newline (markdown inline formatting
+        // cannot cross blocks; the next block reopens it). Leaving it
+        // open emitted literal '**'-garbage — found by the model.rs
+        // round-trip property, 2026-06-12.
+        let here: Vec<InlineAttr> = if i == chars.len() {
+            Vec::new()
+        } else {
+            spans.attrs_at(base + i).cloned().collect()
+        };
         // Close everything above (and including) any attr that ended here,
         // remembering still-active ones to reopen.
         let mut reopen = Vec::new();
@@ -167,9 +180,74 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
 /// Markdown -> document state. Lossy where the schema is deliberately
 /// smaller than Markdown (tables, raw HTML beyond `<u>` import as visible
 /// literal text — never silently dropped).
+/// Replace paired, unescaped `==` highlight markers with `<mark>` tags so
+/// the (extension-less) CommonMark parser can carry them — the import half
+/// of InlineAttr::Highlight, which pulldown-cmark has no extension for.
+/// Pairs are resolved per line (the exporter never spans a marker across
+/// lines), skipping fenced code blocks and inline backtick spans; an
+/// unpaired marker stays literal text.
+fn mark_highlights(md: &str) -> String {
+    fn mark_line(line: &str) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let mut marks = Vec::new();
+        let mut i = 0;
+        let mut in_code = false;
+        while i < chars.len() {
+            match chars[i] {
+                '\\' => i += 2, // backslash escape (incl. \=)
+                '`' => {
+                    in_code = !in_code;
+                    i += 1;
+                }
+                '=' if !in_code && chars.get(i + 1) == Some(&'=') => {
+                    marks.push(i);
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        let paired = marks.len() / 2 * 2;
+        if paired == 0 {
+            return line.to_string();
+        }
+        let mut out = String::new();
+        let mut next = 0usize; // index into marks
+        let mut i = 0usize;
+        while i < chars.len() {
+            if next < paired && marks[next] == i {
+                out.push_str(if next % 2 == 0 { "<mark>" } else { "</mark>" });
+                next += 1;
+                i += 2;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    let mut out = String::with_capacity(md.len());
+    let mut in_fence = false;
+    for (ix, line) in md.split('\n').enumerate() {
+        if ix > 0 {
+            out.push('\n');
+        }
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push_str(line);
+        } else if in_fence || line.starts_with("    ") {
+            out.push_str(line); // fenced or indented code: raw
+        } else {
+            out.push_str(&mark_line(line));
+        }
+    }
+    out
+}
+
 pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
     use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+    let md = &mark_highlights(md);
     let mut text = String::new();
     let mut chars = 0usize; // char length of `text`
     let mut spans = SpanSet::default();
@@ -183,6 +261,7 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
     let mut image_alt: Option<String> = None; // capturing alt text
     let mut inline_starts: Vec<(usize, InlineAttr)> = Vec::new();
     let mut underline_start: Option<usize> = None;
+    let mut highlight_start: Option<usize> = None;
 
     macro_rules! push_str {
         ($s:expr) => {{
@@ -347,6 +426,13 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                         spans.add(start..chars, InlineAttr::Underline);
                     }
                 }
+                // Produced by the mark_highlights pre-pass (==…==).
+                "<mark>" => highlight_start = Some(chars),
+                "</mark>" => {
+                    if let Some(start) = highlight_start.take() {
+                        spans.add(start..chars, InlineAttr::Highlight);
+                    }
+                }
                 other => push_str!(other),
             },
             Event::FootnoteReference(id) => {
@@ -465,5 +551,60 @@ mod tests {
         let text = "a*b_c`d[e]";
         let md = to_markdown(text, &SpanSet::default(), &BlockMap::new(1));
         assert_eq!(md, "a\\*b\\_c\\`d\\[e\\]\n");
+    }
+
+    #[test]
+    fn highlight_roundtrips() {
+        // The bug the model.rs property found (2026-06-12): Highlight
+        // exported as ==…== but import had no parser for it — exported
+        // highlights silently became literal equals signs.
+        let mut spans = SpanSet::default();
+        spans.add(2..7, InlineAttr::Highlight);
+        let text = "до выделено после";
+        let md = to_markdown(text, &spans, &BlockMap::new(1));
+        assert!(md.contains("=="), "highlight must export as ==…==: {md:?}");
+        let (text2, spans2, _) = from_markdown(&md);
+        assert_eq!(text2, text);
+        assert!(spans2.covers(2..7, &InlineAttr::Highlight));
+        assert!(!spans2.covers(1..2, &InlineAttr::Highlight));
+        assert!(!spans2.covers(7..8, &InlineAttr::Highlight));
+    }
+
+    #[test]
+    fn literal_equals_signs_survive() {
+        // "==" in prose must not be eaten as a highlight marker.
+        let text = "a == b == c";
+        let md = to_markdown(text, &SpanSet::default(), &BlockMap::new(1));
+        let (text2, spans2, _) = from_markdown(&md);
+        assert_eq!(text2, text);
+        assert!(spans2.spans().is_empty());
+    }
+
+    #[test]
+    fn cross_block_span_closes_at_block_end() {
+        // Bold across a paragraph break (selection over Enter): each
+        // block must carry balanced markers; the second reopens. The
+        // unclosed-marker export was found by the model.rs property.
+        let mut spans = SpanSet::default();
+        spans.add(1..5, InlineAttr::Strong); // "b\ncd" incl. the newline
+        let text = "ab\ncde";
+        let md = to_markdown(text, &spans, &BlockMap::new(2));
+        assert_eq!(md, "a**b**\n\n**cd**e\n");
+        let (text2, spans2, _) = from_markdown(&md);
+        assert_eq!(text2, text);
+        assert!(spans2.covers(1..2, &InlineAttr::Strong));
+        assert!(spans2.covers(3..5, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn highlight_beside_literal_equals() {
+        // Highlighted text whose content touches '=' itself.
+        let mut spans = SpanSet::default();
+        spans.add(0..2, InlineAttr::Highlight);
+        let text = "a= rest";
+        let md = to_markdown(text, &spans, &BlockMap::new(1));
+        let (text2, spans2, _) = from_markdown(&md);
+        assert_eq!(text2, text);
+        assert!(spans2.covers(0..2, &InlineAttr::Highlight));
     }
 }
