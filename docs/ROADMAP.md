@@ -158,12 +158,12 @@ unless they'd be expensive to reverse.
   animation (~180ms ease on card top), CriticMarkup export of notes.
   (Diagnosis-card anatomy landed with C3; checkpoint rename-in-place and
   image alt editing landed 2026-06-11.)
-- **Visual self-verification** (blocked on a one-time user action): the
-  agent cannot screenshot GNOME Wayland headlessly — portal screenshot is
-  permission-gated (a dialog may be pending; approving it once grants it),
-  or `sudo apt install sway grim` enables a nested headless compositor the
-  agent fully controls. Either unblocks autonomous visual audit/polish of
-  all UI built to date.
+- [x] **Visual self-verification** (UNBLOCKED 2026-06-13): `sway` + `grim`
+  are now installed; `scripts/wshot.sh` drives a nested headless compositor
+  (`WLR_BACKENDS=headless`) the agent fully controls and screenshots
+  without touching the user's desktop. Used to verify the onboarding pass
+  (provider picker, NeedsSetup strip, titlebar Diagnose glyph) pixel-by-
+  pixel. The GNOME-portal route is no longer needed.
 
 - [x] **History & versions visualization** (researched + rebuilt
   2026-06-11): the research verdict — list beats scrubber (Etherpad's
@@ -273,3 +273,40 @@ proven and patched:
   (add_checkpoint_if_changed compares text only) — bold/heading work
   without text edits is unreachable by rewind. Compare (text, spans,
   blocks) instead?
+
+## Onboarding pass — first launch → first AI feedback (2026-06-13)
+
+Audited the whole path from a freshly-installed launch to the writer's
+first AI-assisted feedback. Verdict: Moment 0 (tutorial + pre-seeded
+demo cards) was right; the path to a *real* pass leaked steam in four
+places, three avoidable. Fixed (full rationale in DESIGN.md §2 AI panel
++ §2 toolbar; visually verified via the now-working sway+grim rig):
+
+- [x] **The BYO-key cliff → a key-free local path.** An unconfigured pass
+  fires a background `/models` probe at Ollama's default port (instant
+  connection-refused when absent — negligible cost). On a hit, the
+  NeedsSetup card offers a one-click, no-key, fully-local first pass; the
+  manuscript never leaves the machine. (`pick_local_model` skips
+  embedders; unit-tested.)
+- [x] **Provider picker** in the settings panel (chips: Local · OpenRouter ·
+  Poe · OpenAI · Custom) — prefills base_url, "Get a key →" opens the
+  provider's key page, the active chip resolves from a hand-typed URL.
+  Replaces three blank fields (DESIGN principle 9). `provider_for`
+  unit-tested.
+- [x] **Setup→run continuity** (`pending_pass`): the pass that triggered
+  setup is the pass that runs once a provider exists. Save reads "Save &
+  run"; the local one-click runs it directly. No re-issuing the chord.
+- [x] **Titlebar Diagnose button** (E3-research's deferred item): the core
+  feature's first always-visible seam, drawn as a margin card, tooltip
+  teaches `ctrl-shift-d`. The margin idle hint was suppressed exactly in
+  the tutorial state (cards present), so first-run discovery rested on one
+  sentence of prose.
+- [x] **Bottom-strip stacking**: the default-sized window renders AI status
+  as the bottom strip; it now stacks title/detail/actions so the setup
+  buttons can't be clipped by the privacy line.
+- [x] **Tutorial copy**: names the demo cards' provenance ("an editorial
+  pass wrote these") and describes the new, gentler setup path. The three
+  anchored demo quotes are preserved verbatim.
+- [ ] Not done (no local model present in this env): live end-to-end of the
+  one-click local pass. Logic is unit-tested + the render branch is built;
+  needs a hands-on run on a machine with Ollama.

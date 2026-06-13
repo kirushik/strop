@@ -119,7 +119,16 @@ xdg_popup (Zed's documented popup fragility under wlroots compositors).
 Headings: ctrl-1..3 becomes the promoted chord (the iA/Bear/Typora
 convention), `# ` autoformat stays, ctrl-alt-1..3 remain as silent
 aliases. No undo/redo buttons — zero category precedent; the history
-surface is the discoverable safety net.
+surface is the discoverable safety net. **One exception, shipped
+2026-06-13: a Diagnose button** (E3-research's deferred "titlebar
+diagnosis button — buttons teach chords"). The product's reason to
+exist had no always-visible seam on first run — the margin idle hint
+is suppressed exactly when demo cards exist, i.e. in the tutorial. The
+button is drawn as a little margin card (the shape a diagnosis takes,
+not a stock glyph), sits just left of the margin side (results-adjacent),
+and its tooltip teaches `ctrl-shift-d`. It clears the "60-second
+capability enumeration" test for the core feature, which prose alone
+did not.
 
 H3 completes the popover into three hairline-divided groups: inline
 marks `[B I S {} ==]` | headings `[H1 H2 H3]` | footnote `[¹]`. Each
@@ -173,6 +182,31 @@ async test-call validation with inline states; fetch /models into a
 pickable, filterable list (Open WebUI is the closest flow model);
 writes config.toml through toml_edit so comments and hand edits
 survive; config file remains the storage and stays hand-editable.
+
+*Onboarding pass (2026-06-13).* The panel led with three blank fields —
+the BYO-key cliff sat directly on the path to the one feature that
+justifies the app. Closed with four moves (provenance: the onboarding
+audit this section heads):
+- **Provider picker** (principle 9, "defaults are the product"): one
+  chip per opinionated provider — Local (Ollama) · OpenRouter · Poe ·
+  OpenAI · Custom — prefills base_url; a "Get a key →" link `xdg-open`s
+  the provider's key page; the chip lights up even for a hand-typed URL
+  (substring match), so the file stays authoritative. Free-text fields
+  remain for Custom and power users.
+- **Local auto-detect** (the cliff-killer; local-first thesis made
+  literal): an unconfigured pass fires a background `/models` probe at
+  Ollama's default port (connection-refused returns instantly when
+  absent). On a hit, the NeedsSetup card upgrades to a one-click,
+  key-free, fully-private first pass — no account, nothing leaves the
+  machine.
+- **Setup→run continuity**: the pass that *triggered* setup is queued
+  (`pending_pass`) and runs the moment a provider exists — Save reads
+  "Save & run", the local one-click runs it directly. No "now press the
+  chord again" dead end.
+- **Bottom-strip robustness**: the default-sized window renders AI status
+  as the bottom strip (margin doesn't fit); it now stacks title · detail ·
+  actions so a long privacy line can never push the setup buttons off the
+  edge.
 
 ## 3. The explorability layer (the Bryce verdict, suit on)
 

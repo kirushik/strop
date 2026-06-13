@@ -426,6 +426,12 @@ pub struct Editor {
     diagnosis_mode: Option<String>,
     /// What the last pass was, so an error card's Retry can repeat it.
     last_pass_believing: bool,
+    /// A pass the writer asked for before a provider existed (Some =
+    /// believing?). Finishing setup — the panel's Save, or the one-click
+    /// local-model path — consumes it and runs the pass, so the request
+    /// that *triggered* setup is the request that gets answered (no
+    /// "now press ctrl-shift-d again" dead end).
+    pending_pass: Option<bool>,
     /// Find bar (ctrl-f): live-highlighting query input; Enter advances.
     find_input: Option<Entity<NoteInput>>,
     /// The command palette (PLAN.md E1): the menu, summoned not mounted.
@@ -1067,6 +1073,7 @@ impl Editor {
             config: Config::default(),
             active_note: None,
             ai_status: None,
+            pending_pass: None,
             ai_generation: 0,
             diagnosis_mode: None,
             last_pass_believing: false,
@@ -1945,7 +1952,12 @@ impl Editor {
         self.config = crate::config::load();
         let ai = self.config.ai.clone();
         if !ai.configured() {
-            self.ai_status = Some(AiStatus::NeedsSetup);
+            // Remember what was asked: once a provider exists, this exact
+            // pass runs without the writer re-issuing it.
+            self.pending_pass = Some(believing);
+            self.ai_generation += 1;
+            self.ai_status = Some(AiStatus::NeedsSetup { local_model: None });
+            self.probe_local_model(self.ai_generation, cx);
             cx.notify();
             return;
         }
@@ -2072,7 +2084,68 @@ impl Editor {
         // ignored when it lands (no need to abort the request itself).
         self.ai_generation += 1;
         self.ai_status = None;
+        self.pending_pass = None;
         cx.notify();
+    }
+
+    /// Background probe for a local OpenAI-compatible model (Ollama's
+    /// default port). Reuses `list_models` — connection-refused returns
+    /// instantly when nothing is listening, so the cost on machines
+    /// without it is negligible. On success it upgrades the live
+    /// NeedsSetup card to offer a key-free, fully-local first pass.
+    fn probe_local_model(&mut self, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let client = strop_core::llm::LlmClient::new(LOCAL_OLLAMA_URL, "ollama", "");
+                    client.list_models().ok().and_then(pick_local_model)
+                })
+                .await;
+            let Some(model) = found else { return };
+            this.update(cx, |editor: &mut Editor, cx| {
+                // Only if the writer is still looking at the same unfulfilled
+                // setup card (not cancelled, not already configured/running).
+                if editor.ai_generation == generation
+                    && matches!(editor.ai_status, Some(AiStatus::NeedsSetup { .. }))
+                {
+                    editor.ai_status = Some(AiStatus::NeedsSetup {
+                        local_model: Some(model),
+                    });
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// One-click local path: point the config at Ollama, then run the pass
+    /// the writer already asked for. No key, no signup, no leaving the app —
+    /// and the manuscript never leaves the machine.
+    fn use_local_model(&mut self, model: String, cx: &mut Context<Self>) {
+        match crate::config::save_ai(LOCAL_OLLAMA_URL, None, &model) {
+            Ok(_) => {
+                self.config = crate::config::load();
+                self.ai_status = None;
+                self.run_pending_pass(cx);
+            }
+            Err(e) => {
+                self.ai_status = Some(AiStatus::Error {
+                    title: "Couldn't save the local provider".to_owned(),
+                    detail: e,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Run whatever pass was queued while the provider was being set up;
+    /// defaults to a diagnosis if the queue is empty (the writer reached
+    /// setup some other way — running the core feature is the right guess).
+    fn run_pending_pass(&mut self, cx: &mut Context<Self>) {
+        let believing = self.pending_pass.take().unwrap_or(false);
+        self.run_pass(believing, cx);
     }
 
     /// Guided config-file flow: ensure the commented template exists,
@@ -2098,7 +2171,9 @@ impl Editor {
         self.config = crate::config::load();
         let ai = self.config.ai.clone();
         if !ai.configured() {
-            self.ai_status = Some(AiStatus::NeedsSetup);
+            self.ai_generation += 1;
+            self.ai_status = Some(AiStatus::NeedsSetup { local_model: None });
+            self.probe_local_model(self.ai_generation, cx);
             cx.notify();
             return;
         }
@@ -2356,6 +2431,26 @@ impl Editor {
         .detach();
     }
 
+    /// A provider chip was clicked: drop its base URL into the field, clear
+    /// stale test state, and — for the local provider, which needs no key —
+    /// list its models straight away so the writer can pick and go.
+    fn ai_settings_pick_provider(&mut self, base_url: &'static str, list: bool, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.ai_settings else {
+            return;
+        };
+        panel.test = AiSettingsTest::Idle;
+        if !base_url.is_empty() {
+            panel.base_url.update_checked(cx, |input, cx| {
+                input.content = base_url.to_owned();
+                cx.notify();
+            });
+        }
+        if list {
+            self.ai_settings_list_models(cx);
+        }
+        cx.notify();
+    }
+
     /// [List models]: GET {base}/models on the background executor; the
     /// result is the pickable, filterable list (Open WebUI's flow).
     fn ai_settings_list_models(&mut self, cx: &mut Context<Self>) {
@@ -2426,16 +2521,27 @@ impl Editor {
                 self.config = crate::config::load();
                 self.close_ai_settings(window, cx);
                 self.ai_generation += 1;
-                let generation = self.ai_generation;
-                self.ai_status = Some(AiStatus::Note {
-                    title: if self.config.ai.configured() {
-                        format!("AI configured: {model} via {}", host_of(&base_url))
-                    } else {
-                        "AI settings saved (provider still incomplete)".to_owned()
-                    },
-                    detail: String::new(),
-                });
-                self.schedule_status_fade(generation, cx);
+                // The whole point of setup was to run a pass — so if one was
+                // queued (the writer pressed ctrl-shift-d, hit the wall, and
+                // came here), answer it now instead of making them re-ask.
+                if self.config.ai.configured() && self.pending_pass.is_some() {
+                    self.run_pending_pass(cx);
+                } else {
+                    let generation = self.ai_generation;
+                    self.ai_status = Some(AiStatus::Note {
+                        title: if self.config.ai.configured() {
+                            format!("AI configured: {model} via {}", host_of(&base_url))
+                        } else {
+                            "AI settings saved (provider still incomplete)".to_owned()
+                        },
+                        detail: if self.config.ai.configured() {
+                            "Run a pass with ctrl-shift-d.".to_owned()
+                        } else {
+                            String::new()
+                        },
+                    });
+                    self.schedule_status_fade(generation, cx);
+                }
             }
             Err(e) => {
                 if let Some(panel) = &mut self.ai_settings {
@@ -4076,6 +4182,47 @@ impl Editor {
                                     .child("esc closes · tab moves between fields"),
                             ),
                     )
+                    // Provider picker (DESIGN principle 9): one click prefills
+                    // the endpoint and points at where to get a key. Local
+                    // first — no account, no key, fully private.
+                    .child({
+                        let current = provider_for(&panel.base_url.read(cx).content);
+                        let mut row = div().flex().flex_wrap().gap(px(5.));
+                        for p in PROVIDERS {
+                            let active = match current {
+                                Some(c) => std::ptr::eq(c, p),
+                                None => p.host_match.is_empty(), // Custom owns the unmatched state
+                            };
+                            let base = p.base_url;
+                            let list = p.host_match == "11434";
+                            row = row.child(
+                                div()
+                                    .id(("ai-provider", p.label.as_ptr() as usize))
+                                    .px(px(9.))
+                                    .py(px(3.))
+                                    .rounded(px(12.))
+                                    .border_1()
+                                    .border_color(rgb(RULE_COLOR))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .text_size(px(11.5))
+                                    .when(active, |d| {
+                                        d.bg(rgba(0x1A1A1812u32)).text_color(rgb(TEXT_COLOR))
+                                    })
+                                    .when(!active, |d| d.text_color(rgb(MUTED_COLOR)))
+                                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                    .tooltip(tip(p.note, None))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.ai_settings_pick_provider(base, list, cx);
+                                        }),
+                                    )
+                                    .child(p.label),
+                            );
+                        }
+                        row
+                    })
                     .child(
                         div()
                             .flex()
@@ -4084,12 +4231,15 @@ impl Editor {
                             .on_mouse_down(MouseButton::Left, focus_field(0))
                             .child(label("Base URL"))
                             .child(panel.base_url.clone())
-                            .child(helper(
-                                "Poe https://api.poe.com/v1 · OpenRouter \
-                                 https://openrouter.ai/api/v1 · Ollama \
-                                 http://localhost:11434/v1"
-                                    .into(),
-                            )),
+                            .child({
+                                let url = panel.base_url.read(cx).content.clone();
+                                match provider_for(&url) {
+                                    Some(p) => helper(p.note.into()),
+                                    None => helper(
+                                        "any OpenAI-compatible /chat/completions endpoint".into(),
+                                    ),
+                                }
+                            }),
                     )
                     .child(
                         div()
@@ -4097,7 +4247,41 @@ impl Editor {
                             .flex_col()
                             .gap(px(3.))
                             .on_mouse_down(MouseButton::Left, focus_field(1))
-                            .child(label("API key"))
+                            .child({
+                                // "Get a key →" jumps to the current provider's
+                                // key page — the missing-account step, in one
+                                // click, without leaving for a search engine.
+                                let key_url = (!key_from_env)
+                                    .then(|| provider_for(&panel.base_url.read(cx).content))
+                                    .flatten()
+                                    .and_then(|p| p.key_url);
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .child(label("API key"))
+                                    .when_some(key_url, |d, url| {
+                                        d.child(
+                                            div()
+                                                .id("ai-get-key")
+                                                .text_size(px(10.5))
+                                                .text_color(rgb(0x4F6F8A))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |_: &MouseDownEvent, _, _| {
+                                                        let _ = std::process::Command::new(
+                                                            "xdg-open",
+                                                        )
+                                                        .arg(url)
+                                                        .spawn();
+                                                    },
+                                                )
+                                                .child("Get a key →"),
+                                        )
+                                    })
+                            })
                             .child(panel.api_key.clone())
                             .child(helper(if key_from_env {
                                 "key comes from STROP_API_KEY; this field is ignored \
@@ -4140,13 +4324,19 @@ impl Editor {
                                     editor.ai_settings_list_models(cx);
                                 }),
                             ))
-                            .child(button("ai-settings-save", "Save").on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    editor.save_ai_settings(&SaveAiSettings, window, cx);
-                                }),
-                            )),
+                            .child(
+                                button(
+                                    "ai-settings-save",
+                                    if self.pending_pass.is_some() { "Save & run" } else { "Save" },
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.save_ai_settings(&SaveAiSettings, window, cx);
+                                    }),
+                                ),
+                            ),
                     )
                     .when_some(status_line, |d, status| d.child(status))
                     .when_some(models_note, |d, note| {
@@ -5030,12 +5220,16 @@ impl Editor {
             None => String::new(),
         };
         let ai = match &self.ai_status {
-            None => "",
-            Some(AiStatus::NeedsSetup) => " ai=needs-setup",
-            Some(AiStatus::Running { .. }) => " ai=running",
-            Some(AiStatus::Note { .. }) => " ai=note",
-            Some(AiStatus::Error { .. }) => " ai=error",
+            None => "".to_owned(),
+            Some(AiStatus::NeedsSetup { local_model: Some(m) }) => {
+                format!(" ai=needs-setup local={m}")
+            }
+            Some(AiStatus::NeedsSetup { local_model: None }) => " ai=needs-setup".to_owned(),
+            Some(AiStatus::Running { .. }) => " ai=running".to_owned(),
+            Some(AiStatus::Note { .. }) => " ai=note".to_owned(),
+            Some(AiStatus::Error { .. }) => " ai=error".to_owned(),
         };
+        let pending = if self.pending_pass.is_some() { " ai_pending=1" } else { "" };
         let panel = match &self.ai_settings {
             None => String::new(),
             Some(p) => format!(
@@ -5081,7 +5275,7 @@ impl Editor {
             session += &format!(" whisper=chord/{}", self.chord_whisper_generation);
         }
         let doc_state = format!(
-            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai}{panel}{session} mode={}",
+            "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai}{pending}{panel}{session} mode={}",
             self.selected_range,
             self.doc.blocks().kind(self.doc.block_of_byte(cursor)),
             self.doc.spans().spans(),
@@ -6653,6 +6847,47 @@ impl Editor {
                     .h_full()
                     .on_mouse_down(MouseButton::Left, drag),
             )
+            // The core feature earns a seat in the chrome (E3-research's
+            // deferred "titlebar diagnosis button — buttons teach chords").
+            // It lives where its results live: just left of the margin side.
+            // Drawn as a little margin card (the shape a diagnosis takes), so
+            // it rhymes with the feature instead of borrowing a stock glyph.
+            .child({
+                let running = matches!(self.ai_status, Some(AiStatus::Running { .. }));
+                let mark = if running { rgb(SAGE_COLOR) } else { rgb(MUTED_COLOR) };
+                div()
+                    .id("diagnose-toggle")
+                    .px(px(8.))
+                    .py(px(2.))
+                    .rounded(px(5.))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(running, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .tooltip(tip("Run Editorial Diagnosis", Some("ctrl-shift-d")))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.run_diagnosis(&RunDiagnosis, window, cx);
+                        }),
+                    )
+                    .child(
+                        // A 14×11 card outline with two short text lines.
+                        div()
+                            .w(px(14.))
+                            .h(px(11.))
+                            .rounded(px(2.))
+                            .border_1()
+                            .border_color(mark)
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(2.))
+                            .px(px(2.5))
+                            .child(div().w(px(7.)).h(px(1.)).bg(mark))
+                            .child(div().w(px(5.)).h(px(1.)).bg(mark)),
+                    )
+            })
             // The day-zero affordance: a user who knows nothing clicks the
             // one unexplained button and lands in a searchable list of every
             // capability (GNOME primary-menu position).
@@ -7692,8 +7927,11 @@ enum PaletteRow {
 /// The AI surface's state machine (PLAN.md E3). Status lives where the
 /// results will land — the margin — not in a toast or a titlebar whisper.
 enum AiStatus {
-    /// No provider configured: the empty state teaches setup.
-    NeedsSetup,
+    /// No provider configured: the empty state teaches setup. `local_model`
+    /// is filled by the background Ollama probe — when present, the card
+    /// offers a one-click, key-free, fully-local first pass (the cliff is
+    /// gone for anyone running a local model).
+    NeedsSetup { local_model: Option<String> },
     Running {
         label: String,
     },
@@ -7740,6 +7978,87 @@ enum AiSettingsTest {
     Running,
     Ok { ms: u64 },
     Failed { message: String },
+}
+
+/// Ollama's default OpenAI-compatible endpoint — the zero-key local path.
+const LOCAL_OLLAMA_URL: &str = "http://localhost:11434/v1";
+
+/// One opinionated provider per row (DESIGN principle 9: defaults are the
+/// product). `key_url` is the page where a writer mints a key; None means
+/// no key is needed (local) or the field is free (custom).
+struct ProviderInfo {
+    label: &'static str,
+    base_url: &'static str,
+    /// Substring that identifies this provider in an arbitrary base URL,
+    /// so a hand-typed config still lights up the right chip and key link.
+    host_match: &'static str,
+    key_url: Option<&'static str>,
+    /// Local-first first: no account, no key, private. Then the cloud
+    /// paths, cheapest-to-start first.
+    note: &'static str,
+}
+
+const PROVIDERS: &[ProviderInfo] = &[
+    ProviderInfo {
+        label: "Local (Ollama)",
+        base_url: LOCAL_OLLAMA_URL,
+        host_match: "11434",
+        key_url: None,
+        note: "no key, no account — your text never leaves this machine",
+    },
+    ProviderInfo {
+        label: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1",
+        host_match: "openrouter.ai",
+        key_url: Some("https://openrouter.ai/keys"),
+        note: "one key, hundreds of models (several free)",
+    },
+    ProviderInfo {
+        label: "Poe",
+        base_url: "https://api.poe.com/v1",
+        host_match: "api.poe.com",
+        key_url: Some("https://poe.com/api_key"),
+        note: "one subscription across Claude, GPT, Gemini",
+    },
+    ProviderInfo {
+        label: "OpenAI",
+        base_url: "https://api.openai.com/v1",
+        host_match: "api.openai.com",
+        key_url: Some("https://platform.openai.com/api-keys"),
+        note: "GPT models direct from OpenAI",
+    },
+    ProviderInfo {
+        label: "Custom",
+        base_url: "",
+        host_match: "",
+        key_url: None,
+        note: "any other OpenAI-compatible endpoint",
+    },
+];
+
+/// The provider whose `host_match` is in `base_url` (so a hand-typed URL
+/// still resolves). None for an empty/unrecognized URL.
+fn provider_for(base_url: &str) -> Option<&'static ProviderInfo> {
+    let url = base_url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    PROVIDERS
+        .iter()
+        .find(|p| !p.host_match.is_empty() && url.contains(p.host_match))
+}
+
+/// Choose a model from a provider's /models list for the one-click local
+/// path: skip obvious embedding-only models, else take the first.
+fn pick_local_model(models: Vec<String>) -> Option<String> {
+    models
+        .iter()
+        .find(|m| {
+            let m = m.to_lowercase();
+            !m.contains("embed") && !m.contains("bge") && !m.contains("rerank")
+        })
+        .or_else(|| models.first())
+        .cloned()
 }
 
 fn host_of(base_url: &str) -> String {
@@ -8047,7 +8366,12 @@ impl Editor {
                     .rounded(px(6.))
                     .flex_col()
             } else {
-                div().absolute().bottom_0().left_0().right_0().border_t_1().flex_row().items_center()
+                // Narrow window: a full-width strip pinned to the bottom,
+                // never over prose. Stack the content (title · detail ·
+                // actions) so the buttons can't be pushed off the right edge
+                // by a long privacy line — the default-sized window lands
+                // here, so the setup actions must always be reachable.
+                div().absolute().bottom_0().left_0().right_0().border_t_1().flex_col()
             }
             .p(px(10.))
             .bg(rgb(bg))
@@ -8096,39 +8420,86 @@ impl Editor {
                     .child(format!("Margin: ctrl-shift-d — {mode} diagnosis"))
                     .into_any_element()
             }
-            Some(AiStatus::NeedsSetup) => card(0xFFFDF6)
-                .child(div().font_weight(FontWeight::BOLD).child("Diagnosis needs a model"))
-                .child(div().text_color(rgb(MUTED_COLOR)).child(
-                    "Strop sends your text directly to the OpenAI-compatible endpoint you \
-                     configure — only when you run a pass, never while you type.",
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(6.))
-                        .child(action_button("ai-setup", "Set up…").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.open_ai_settings(&OpenAiSettings, window, cx);
-                            }),
+            Some(AiStatus::NeedsSetup { local_model }) => {
+                let base = card(0xFFFDF6);
+                match local_model.clone() {
+                    // The cliff is gone: a local model answered the probe.
+                    // Lead with the one-click, key-free, private path.
+                    Some(model) => base
+                        .child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .child("A local model is ready"),
+                        )
+                        .child(div().text_color(rgb(MUTED_COLOR)).child(format!(
+                            "{model} is running on this machine. Diagnose with it now — no \
+                             key, no account, and your text never leaves your computer.",
+                        )))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.))
+                                .child(
+                                    action_button("ai-use-local", "Run with this model")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                editor.use_local_model(model.clone(), cx);
+                                            }),
+                                        ),
+                                )
+                                .child(action_button("ai-setup", "Other provider…").on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.open_ai_settings(&OpenAiSettings, window, cx);
+                                    }),
+                                ))
+                                .child(action_button("ai-setup-dismiss", "Dismiss").on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.cancel_ai_run(&CancelAiRun, window, cx);
+                                    }),
+                                )),
+                        )
+                        .into_any_element(),
+                    None => base
+                        .child(div().font_weight(FontWeight::BOLD).child("Diagnosis needs a model"))
+                        .child(div().text_color(rgb(MUTED_COLOR)).child(
+                            "Strop sends your text directly to the OpenAI-compatible endpoint you \
+                             configure — only when you run a pass, never while you type.",
                         ))
-                        .child(action_button("ai-test", "Test connection").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.test_ai_connection(&TestAiConnection, window, cx);
-                            }),
-                        ))
-                        .child(action_button("ai-setup-dismiss", "Dismiss").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.cancel_ai_run(&CancelAiRun, window, cx);
-                            }),
-                        )),
-                )
-                .into_any_element(),
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.))
+                                .child(action_button("ai-setup", "Set up…").on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.open_ai_settings(&OpenAiSettings, window, cx);
+                                    }),
+                                ))
+                                .child(action_button("ai-test", "Test connection").on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.test_ai_connection(&TestAiConnection, window, cx);
+                                    }),
+                                ))
+                                .child(action_button("ai-setup-dismiss", "Dismiss").on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.cancel_ai_run(&CancelAiRun, window, cx);
+                                    }),
+                                )),
+                        )
+                        .into_any_element(),
+                }
+            }
             Some(AiStatus::Running { label }) => card(0xFFFDF6)
                 .child(div().text_color(rgb(MUTED_COLOR)).child(format!("Running: {label}…")))
                 .child(
@@ -8608,6 +8979,41 @@ mod tests {
         assert_eq!(format_thousands(999), "999");
         assert_eq!(format_thousands(1234), "1,234");
         assert_eq!(format_thousands(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn provider_resolves_from_hand_typed_urls() {
+        // A bare host substring is enough: a config edited by hand still
+        // lights up the right chip and "Get a key" link.
+        assert_eq!(provider_for("http://localhost:11434/v1").unwrap().label, "Local (Ollama)");
+        assert_eq!(provider_for("https://openrouter.ai/api/v1/").unwrap().label, "OpenRouter");
+        assert_eq!(provider_for("https://api.poe.com/v1").unwrap().label, "Poe");
+        assert_eq!(provider_for("https://api.openai.com/v1").unwrap().label, "OpenAI");
+        // Local needs no key; the cloud paths point somewhere to get one.
+        assert!(provider_for("http://localhost:11434/v1").unwrap().key_url.is_none());
+        assert!(provider_for("https://openrouter.ai/api/v1").unwrap().key_url.is_some());
+        // Unknown / empty falls through to the free-text (Custom) state.
+        assert!(provider_for("https://my.proxy.internal/v1").is_none());
+        assert!(provider_for("").is_none());
+        // Custom is never matched by host (its host_match is empty), so it
+        // can't shadow a real provider.
+        assert!(PROVIDERS.iter().any(|p| p.label == "Custom" && p.host_match.is_empty()));
+    }
+
+    #[test]
+    fn local_model_pick_skips_embedders() {
+        // Ollama commonly serves embedding models alongside chat ones; the
+        // one-click path must not hand the diagnosis prompt to an embedder.
+        assert_eq!(
+            pick_local_model(vec!["nomic-embed-text".into(), "llama3.3:latest".into()]),
+            Some("llama3.3:latest".into())
+        );
+        // No chat model? Still offer something rather than nothing.
+        assert_eq!(
+            pick_local_model(vec!["bge-large".into()]),
+            Some("bge-large".into())
+        );
+        assert_eq!(pick_local_model(vec![]), None);
     }
 
     fn base() -> TextRun {

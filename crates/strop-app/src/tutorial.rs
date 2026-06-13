@@ -22,9 +22,9 @@ Select a word and try `ctrl-b` bold, `ctrl-i` italic, `ctrl-shift-h` highlight. 
 
 ## The margin
 
-The cards on the right are the point of this editor. Each one names a problem and asks a question; deciding is your job, and a dismissed card never comes back. There is two of them anchored in this section, so you can feel how a diagnosis reads.
+The cards on the right are the point of this editor — and an editorial pass wrote the two diagnoses in this section, the same kind you can run on your own words in a minute. Each one names a problem and asks a question; deciding is your job, and a dismissed card never comes back. There is two of them anchored here, so you can feel how a diagnosis reads before you run one.
 
-`ctrl-shift-d` runs a real editorial pass over your own text — first run “Set Up AI Provider” from the palette. The pass has depths: developmental (structure), line (clarity), copy (mechanics) — switch in the palette. `ctrl-shift-b` runs the believing pass instead: what already works and where the center of gravity is. `ctrl-m` adds your own margin note.
+To run your own: press `ctrl-shift-d`, or click the little card in the title bar. If a model is already running on your computer (Ollama), Strop offers it on the spot — no key, no account, and your text never leaves your machine. Otherwise it walks you through a provider once, then answers the pass you asked for. A pass has depths — developmental (structure), line (clarity), copy (mechanics); switch them in the palette. `ctrl-shift-b` runs the believing pass instead: what already works and where the center of gravity is. `ctrl-m` adds your own margin note.
 
 ## Rewind
 
