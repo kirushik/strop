@@ -454,12 +454,21 @@ PLAN promised now exists in the running editor.
   each close on Esc with focused=="Editor". Note: with click-outside in
   place, "palette open + editor focused" is unreachable by mouse; the
   escape_mode palette branch stays as §0.6 defense.
-- [ ] **H2. Chrome correctness** (PENDING): client-side resize edges
-  (zed's client_side_decorations pattern — GNOME Wayland has no SSD,
-  so this is the only way Strop can be resized); outline toggle moves
-  to the titlebar's far left (it opens a LEFT rail); shared tooltip
-  helper on every titlebar button (name + chord); chrome strings
-  English-only per DESIGN §0.7.
+- [x] **H2. Chrome correctness** (shipped 2026-06-13): client-side
+  resize handles — `WindowOptions { window_decorations: Client }` in
+  main.rs (gpui defaulted to Server, so GNOME left the window with
+  *neither* SSD nor resize borders — the bug), plus eight invisible
+  edge/corner strips with static resize cursors in `render` (keyed on
+  `window_decorations()`; tiled edges skipped). Declarative per-strip
+  cursors, no draw-pass canvas/global. Outline toggle moved to the
+  titlebar's far left (it opens a LEFT rail); shared `tip()` tooltip
+  helper (name + mono chord chip) on every titlebar button, the doc
+  title, and the now-clickable word count (→ set session goal); three
+  chrome strings English-only per DESIGN §0.7 (the voice headline no
+  longer switches on document language). Verified: clean build + clippy
+  zero; wshot confirms titlebar order [outline · title · words … palette
+  · history · — □ ×]. Behavioral resize can't be asserted headless;
+  verified by code review against zed's reference pattern.
 - [ ] **H3. Selection popover v2** (PENDING): three groups
   [B I S {} ==] | [H1 H2 H3] | [¹] with hairline dividers, self-styled
   labels, tooltips, active states; underline deliberately absent (see

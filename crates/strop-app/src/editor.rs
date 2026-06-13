@@ -15,13 +15,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle, Element, ElementId,
-    ElementInputHandler, ExternalPaths, RenderImage,
+    AnyView, App, Bounds, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
+    Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextAlign, TextRun,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point,
-    prelude::*, px, relative, rgb, rgba, size,
+    Pixels, Point, ResizeEdge, ScrollWheelEvent, SharedString, StrikethroughStyle, Style,
+    TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions,
+    div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
     Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus, SpanSet,
@@ -54,6 +54,180 @@ const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
 const MUTED_COLOR: u32 = 0x8A8678;
 const RULE_COLOR: u32 = 0xE8E4DC;
+/// Client-side decorations (H2): thickness of the invisible resize band
+/// laid along each window edge/corner. GNOME Wayland grants no server-side
+/// borders, so without these strips Strop cannot be resized at all. Strips
+/// sit flush on top of the content (not as a reserved inset — that would
+/// shift every overlay's window-origin coordinates); the top band doubling
+/// as a resize handle over the titlebar is the conventional CSD behavior.
+const RESIZE_INSET: f32 = 8.;
+
+/// A small hover tooltip: a control's name and, optionally, its chord in a
+/// mono chip (DESIGN §0 — every titlebar control should teach its shortcut).
+struct Tip {
+    label: SharedString,
+    chord: Option<SharedString>,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .bg(rgb(0xFCFAF4))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(5.))
+            .shadow_md()
+            .px(px(8.))
+            .py(px(3.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .font_family("PT Sans")
+            .text_size(px(12.))
+            .text_color(rgb(TEXT_COLOR))
+            .child(self.label.clone())
+            .when_some(self.chord.clone(), |d, chord| {
+                d.child(
+                    div()
+                        .font_family(CODE_FONT)
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child(chord),
+                )
+            })
+    }
+}
+
+/// Build a `.tooltip(…)` closure: hovering the element reveals its name and
+/// shortcut. `chord` is the canonical key string from commands.rs, verbatim.
+fn tip(
+    label: impl Into<SharedString>,
+    chord: Option<&'static str>,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let label = label.into();
+    let chord = chord.map(SharedString::from);
+    move |_window, cx| {
+        let (label, chord) = (label.clone(), chord.clone());
+        cx.new(|_| Tip { label, chord }).into()
+    }
+}
+
+/// One client-side resize handle (H2): an invisible edge/corner strip that
+/// starts an interactive resize on press. Static cursor — no per-frame
+/// hover tracking, no draw-pass mutation. The caller positions it.
+fn resize_strip(
+    id: &'static str,
+    edge: ResizeEdge,
+    cursor: CursorStyle,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .absolute()
+        .cursor(cursor)
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            window.start_window_resize(edge);
+        })
+}
+
+/// The eight client-side resize handles for the current tiling state (H2).
+/// Edges span full width/height; corners layer on top. A tiled edge (the
+/// window is snapped to it) is neither inset nor draggable. Cursor mapping
+/// mirrors zed's `client_side_decorations`.
+fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
+    let i = px(RESIZE_INSET);
+    let z = px(0.);
+    let mut v: Vec<gpui::AnyElement> = Vec::new();
+    if !tiling.top {
+        v.push(
+            resize_strip("rz-top", ResizeEdge::Top, CursorStyle::ResizeUpDown)
+                .top(z)
+                .left(z)
+                .right(z)
+                .h(i)
+                .into_any_element(),
+        );
+    }
+    if !tiling.bottom {
+        v.push(
+            resize_strip("rz-bottom", ResizeEdge::Bottom, CursorStyle::ResizeUpDown)
+                .bottom(z)
+                .left(z)
+                .right(z)
+                .h(i)
+                .into_any_element(),
+        );
+    }
+    if !tiling.left {
+        v.push(
+            resize_strip("rz-left", ResizeEdge::Left, CursorStyle::ResizeLeftRight)
+                .left(z)
+                .top(z)
+                .bottom(z)
+                .w(i)
+                .into_any_element(),
+        );
+    }
+    if !tiling.right {
+        v.push(
+            resize_strip("rz-right", ResizeEdge::Right, CursorStyle::ResizeLeftRight)
+                .right(z)
+                .top(z)
+                .bottom(z)
+                .w(i)
+                .into_any_element(),
+        );
+    }
+    if !tiling.top && !tiling.left {
+        v.push(
+            resize_strip("rz-tl", ResizeEdge::TopLeft, CursorStyle::ResizeUpLeftDownRight)
+                .top(z)
+                .left(z)
+                .w(i)
+                .h(i)
+                .into_any_element(),
+        );
+    }
+    if !tiling.top && !tiling.right {
+        v.push(
+            resize_strip("rz-tr", ResizeEdge::TopRight, CursorStyle::ResizeUpRightDownLeft)
+                .top(z)
+                .right(z)
+                .w(i)
+                .h(i)
+                .into_any_element(),
+        );
+    }
+    if !tiling.bottom && !tiling.left {
+        v.push(
+            resize_strip(
+                "rz-bl",
+                ResizeEdge::BottomLeft,
+                CursorStyle::ResizeUpRightDownLeft,
+            )
+            .bottom(z)
+            .left(z)
+            .w(i)
+            .h(i)
+            .into_any_element(),
+        );
+    }
+    if !tiling.bottom && !tiling.right {
+        v.push(
+            resize_strip(
+                "rz-br",
+                ResizeEdge::BottomRight,
+                CursorStyle::ResizeUpLeftDownRight,
+            )
+            .bottom(z)
+            .right(z)
+            .w(i)
+            .h(i)
+            .into_any_element(),
+        );
+    }
+    v
+}
 
 actions!(
     editor,
@@ -2894,7 +3068,7 @@ impl Editor {
         let label = if query.is_empty() {
             String::new()
         } else if count == 0 {
-            "нет совпадений".into()
+            "no matches".into()
         } else {
             format!("{}/{count}", (self.find_current % count.max(1)) + 1)
         };
@@ -6179,6 +6353,8 @@ impl Editor {
     fn window_button(
         &self,
         label: &'static str,
+        tip_label: &'static str,
+        chord: Option<&'static str>,
         action: fn(&mut Window, &mut App),
     ) -> impl IntoElement {
         div()
@@ -6190,6 +6366,7 @@ impl Editor {
             .justify_center()
             .text_color(rgb(MUTED_COLOR))
             .hover(|d| d.bg(rgba(0x1A1A180Au32)).text_color(rgb(TEXT_COLOR)))
+            .tooltip(tip(tip_label, chord))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 action(window, cx);
@@ -6212,84 +6389,10 @@ impl Editor {
             .border_color(rgb(RULE_COLOR))
             .font_family("PT Serif")
             .text_size(px(13.))
+            // The outline opens the LEFT rail, so its control lives at the
+            // far left — spatial honesty (the H2 papercut: it was on the
+            // right). Three stacked bars, drawn like every titlebar glyph.
             .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .pl(px(14.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .on_mouse_down(MouseButton::Left, drag)
-                    .child(match (&self.doc_rename_input, &self.store) {
-                        // F2 / click: rename the document right here.
-                        (Some(input), _) => div()
-                            .w(px(220.))
-                            .child(input.clone())
-                            .into_any_element(),
-                        (None, Some(store)) => {
-                            let stem = store
-                                .path()
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Untitled")
-                                .to_owned();
-                            div()
-                                .id("doc-title")
-                                .px(px(4.))
-                                .rounded(px(4.))
-                                .cursor(CursorStyle::PointingHand)
-                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        editor.rename_document(&RenameDocument, window, cx);
-                                    }),
-                                )
-                                .child(stem)
-                                .into_any_element()
-                        }
-                        (None, None) => div().child("Strop").into_any_element(),
-                    })
-            )
-            .child({
-                // Word count, plus the session goal's live delta (DESIGN
-                // §4.2): reward arrives during the session or not at all.
-                let count = format_thousands(self.word_count);
-                match self.session_goal {
-                    None => div()
-                        .text_color(rgb(MUTED_COLOR))
-                        .child(format!("{count} words"))
-                        .into_any_element(),
-                    Some((goal, start)) => {
-                        let delta = self.word_count as i64 - start as i64;
-                        let reached = delta >= goal as i64;
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .text_color(rgb(MUTED_COLOR))
-                            .child(format!("{count} words"))
-                            .child(if reached {
-                                // Goal met: the separator quietly fills in
-                                // sage. No banner, no chime (§4b tension 3).
-                                div()
-                                    .size(px(5.))
-                                    .rounded_full()
-                                    .bg(rgb(SAGE_COLOR))
-                                    .into_any_element()
-                            } else {
-                                div().child("·").into_any_element()
-                            })
-                            .child(format!("{delta:+}/{goal}"))
-                            .into_any_element()
-                    }
-                }
-            })
-            .child(
-                // Outline rail toggle (DESIGN §1.6): three stacked bars of
-                // decreasing width — drawn, like every titlebar glyph.
                 div()
                     .id("outline-toggle")
                     .px(px(8.))
@@ -6299,6 +6402,7 @@ impl Editor {
                     .cursor(CursorStyle::PointingHand)
                     .when(self.outline_open, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .tooltip(tip("Outline", Some("ctrl-shift-o")))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, window, cx| {
@@ -6324,12 +6428,141 @@ impl Editor {
                             )
                     }),
             )
+            // Document name — click or F2 to rename in place, file and all.
+            .child(match (&self.doc_rename_input, &self.store) {
+                (Some(input), _) => div()
+                    .ml(px(8.))
+                    .w(px(220.))
+                    .child(input.clone())
+                    .into_any_element(),
+                (None, Some(store)) => {
+                    let stem = store
+                        .path()
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Untitled")
+                        .to_owned();
+                    div()
+                        .id("doc-title")
+                        .ml(px(8.))
+                        .px(px(4.))
+                        .rounded(px(4.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Rename", Some("f2")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.rename_document(&RenameDocument, window, cx);
+                            }),
+                        )
+                        .child(stem)
+                        .into_any_element()
+                }
+                (None, None) => div()
+                    .ml(px(8.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child("Strop")
+                    .into_any_element(),
+            })
+            // Word count + the session goal's live delta (DESIGN §4.2).
+            // Clickable: sets or changes the goal for this sitting.
+            .child(
+                div()
+                    .id("word-count")
+                    .ml(px(12.))
+                    .px(px(4.))
+                    .rounded(px(4.))
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .tooltip(tip("Set session goal", None))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.set_session_goal(&SetSessionGoal, window, cx);
+                        }),
+                    )
+                    .child({
+                        let count = format_thousands(self.word_count);
+                        match self.session_goal {
+                            None => div()
+                                .text_color(rgb(MUTED_COLOR))
+                                .child(format!("{count} words"))
+                                .into_any_element(),
+                            Some((goal, start)) => {
+                                let delta = self.word_count as i64 - start as i64;
+                                let reached = delta >= goal as i64;
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child(format!("{count} words"))
+                                    .child(if reached {
+                                        // Goal met: the separator quietly fills
+                                        // in sage. No banner (§4b tension 3).
+                                        div()
+                                            .size(px(5.))
+                                            .rounded_full()
+                                            .bg(rgb(SAGE_COLOR))
+                                            .into_any_element()
+                                    } else {
+                                        div().child("·").into_any_element()
+                                    })
+                                    .child(format!("{delta:+}/{goal}"))
+                                    .into_any_element()
+                            }
+                        }
+                    }),
+            )
+            // The center is the window-drag handle and the visual breathing
+            // room: it pushes the right cluster to the edge.
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .on_mouse_down(MouseButton::Left, drag),
+            )
+            // The day-zero affordance: a user who knows nothing clicks the
+            // one unexplained button and lands in a searchable list of every
+            // capability (GNOME primary-menu position).
+            .child(
+                div()
+                    .id("palette-toggle")
+                    .px(px(8.))
+                    .py(px(2.))
+                    .rounded(px(5.))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(self.palette_input.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .tooltip(tip("Command Palette", Some("ctrl-shift-p")))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.toggle_palette(&TogglePalette, window, cx);
+                        }),
+                    )
+                    .child(
+                        // Drawn hamburger (no PT-covered menu glyph).
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .children((0..3).map(|_| {
+                                div().w(px(11.)).h(px(1.5)).bg(rgb(MUTED_COLOR))
+                            })),
+                    ),
+            )
             .child(
                 div()
                     .id("history-toggle")
                     .px(px(8.))
                     .py(px(2.))
-                    .ml(px(8.))
+                    .ml(px(4.))
                     .rounded(px(5.))
                     .cursor(CursorStyle::PointingHand)
                     .text_color(if self.history_view.is_some() {
@@ -6339,6 +6572,7 @@ impl Editor {
                     })
                     .when(self.history_view.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .tooltip(tip("History & Rewind", Some("ctrl-alt-h")))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
@@ -6373,44 +6607,9 @@ impl Editor {
                             )),
                     ),
             )
-            .child(
-                // The day-zero affordance: a user who knows nothing clicks
-                // the only unexplained button and lands in a searchable
-                // list of every capability (GNOME primary-menu position).
-                div()
-                    .id("palette-toggle")
-                    .px(px(8.))
-                    .py(px(2.))
-                    .ml(px(4.))
-                    .rounded(px(5.))
-                    .cursor(CursorStyle::PointingHand)
-                    .when(self.palette_input.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            editor.toggle_palette(&TogglePalette, window, cx);
-                        }),
-                    )
-                    .child(
-                        // Drawn hamburger (no PT-covered menu glyph).
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .children((0..3).map(|_| {
-                                div().w(px(11.)).h(px(1.5)).bg(rgb(MUTED_COLOR))
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(28.))
-                    .h_full()
-                    .on_mouse_down(MouseButton::Left, drag),
-            )
-            .child(self.window_button("–", |window, _| window.minimize_window()))
+            .child(self.window_button("–", "Minimize", None, |window, _| {
+                window.minimize_window()
+            }))
             .child(
                 // Zoom: drawn square (U+25A1 isn't in PT).
                 div()
@@ -6421,6 +6620,7 @@ impl Editor {
                     .items_center()
                     .justify_center()
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .tooltip(tip("Maximize", None))
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         cx.stop_propagation();
                         window.zoom_window();
@@ -6433,7 +6633,7 @@ impl Editor {
                             .rounded(px(1.)),
                     ),
             )
-            .child(self.window_button("×", |_, cx| cx.quit()))
+            .child(self.window_button("×", "Close", Some("ctrl-q"), |_, cx| cx.quit()))
     }
 }
 
@@ -6959,29 +7159,15 @@ impl Editor {
                             &self.doc.text(),
                             baseline.lang(),
                         ));
-                        let ru = baseline.lang() == typograph::Lang::Ru;
+                        // Chrome is English-only (DESIGN §0.7), regardless of
+                        // the document's language.
                         let headline = if report.overall_sigma > 2. {
-                            if ru {
-                                format!(
-                                    "Голос: {:.1}σ за пределами вашей нормы ({} текстов)",
-                                    report.overall_sigma, baseline.docs
-                                )
-                            } else {
-                                format!(
-                                    "Voice: {:.1}σ outside your normal range ({} texts)",
-                                    report.overall_sigma, baseline.docs
-                                )
-                            }
-                        } else if ru {
                             format!(
-                                "Голос: в пределах вашей нормы ({} текстов)",
-                                baseline.docs
+                                "Voice: {:.1}σ outside your normal range ({} texts)",
+                                report.overall_sigma, baseline.docs
                             )
                         } else {
-                            format!(
-                                "Voice: within your normal range ({} texts)",
-                                baseline.docs
-                            )
+                            format!("Voice: within your normal range ({} texts)", baseline.docs)
                         };
                         d.child(
                             div()
@@ -7726,7 +7912,7 @@ impl Editor {
                     .font_family("PT Serif")
                     .text_size(px(11.))
                     .text_color(rgb(MUTED_COLOR))
-                    .child(format!("Поля редактора: ctrl-shift-d — {mode} diagnosis"))
+                    .child(format!("Margin: ctrl-shift-d — {mode} diagnosis"))
                     .into_any_element()
             }
             Some(AiStatus::NeedsSetup) => card(0xFFFDF6)
@@ -7982,6 +8168,12 @@ impl Render for Editor {
         let hist_panel_w = self.history_panel_width(window);
         // The outline rail pushes from the left the same way (DESIGN §1.6).
         let outline_w = self.outline_width(window);
+        // Client-side resize handles (H2): only when the compositor left us
+        // to draw our own decorations (GNOME Wayland always does).
+        let resize_tiling = match window.window_decorations() {
+            Decorations::Client { tiling } => Some(tiling),
+            Decorations::Server => None,
+        };
         div()
             .size_full()
             .relative()
@@ -8207,6 +8399,13 @@ impl Render for Editor {
             .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
             .when(self.ai_settings.is_some(), |d| {
                 d.child(self.render_ai_settings(cx))
+            })
+            // Resize handles are the literal topmost layer: the window must
+            // stay resizable from its edges even with a modal panel open
+            // (an OS gesture, not an app layer — DESIGN §0.6 is about input
+            // focus, not window chrome).
+            .when_some(resize_tiling, |d, tiling| {
+                d.children(resize_handles(tiling))
             })
     }
 }

@@ -41,6 +41,9 @@ Every transient surface (palette, AI settings, shortcuts, selection popover, fin
 4. Closing a layer restores focus to the surface beneath it — in practice, the editor.
 Rationale: Raskin, *The Humane Interface*, ch. 2–3 — input must follow the user's locus of attention; a paste that lands behind the visible dialog violates the most basic expectation a user has of a computer. These laws are mechanically enforced by scripts/contracts.sh (H6).
 
+### §0.7 Chrome language (2026-06-12, second papercut round)
+UI chrome is English-only in v1 — one language, consistently, until real i18n (string tables, not literals sprinkled through the render tree). Russian stays only where it is content or affordance rather than chrome: palette search aliases (RU synonyms are a discoverability feature, not a translation), the tutorial and sample prose, and of course the user's own documents. A status line that switched languages based on the *document's* language — the original "Поля редактора" / "Голос:…" bug — is the anti-pattern: chrome speaks the UI's language, never the text's.
+
 ## 1. Design principles (ranked; provenance in the research report)
 
 The canon converges on one spine: **safety enables exploration,

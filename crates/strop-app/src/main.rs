@@ -14,8 +14,8 @@ mod tutorial;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
-    prelude::*, px, size,
+    App, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations,
+    WindowOptions, actions, prelude::*, px, size,
 };
 use strop_core::Store;
 use strop_core::document::{BlockMap, SpanSet};
@@ -232,6 +232,12 @@ fn main() {
                     ..Default::default()
                 }),
                 focus: !smoke,
+                // Strop draws its own titlebar and (since H2) its own resize
+                // borders. Request client-side decorations so the compositor
+                // hands us the resize affordance instead of leaving the
+                // window with neither (GNOME Wayland does no server-side
+                // decorations — the H2 "can't resize by dragging" bug).
+                window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
             |window, cx| {
