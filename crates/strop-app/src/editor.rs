@@ -251,7 +251,7 @@ actions!(
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
-        ToggleOutline, EndSession, SetSessionGoal,
+        ToggleOutline, EndSession, SetSessionGoal, ToggleReview,
     ]
 );
 
@@ -432,6 +432,16 @@ pub struct Editor {
     /// that *triggered* setup is the request that gets answered (no
     /// "now press ctrl-shift-d again" dead end).
     pending_pass: Option<bool>,
+    /// The door (DESIGN §4.4; core-loop research: separate GENERATE from
+    /// EVALUATE). `true` = drafting, door closed: the editorial margin goes
+    /// quiet so a writing burst is never pulled into evaluation by its own
+    /// earlier diagnoses (King's "door closed"; Elbow — premature editing
+    /// "damps out the voice"). `false` = reviewing, door open: diagnosis
+    /// cards surface. Default closed; a document opens to write. Running a
+    /// pass, reaching for an anchor, or the rail opens it. The writer's own
+    /// ctrl-m notes are NEVER hidden — the door quiets the editor, not the
+    /// writer's marginalia. In-memory (per session), no stored mode.
+    drafting: bool,
     /// Find bar (ctrl-f): live-highlighting query input; Enter advances.
     find_input: Option<Entity<NoteInput>>,
     /// The command palette (PLAN.md E1): the menu, summoned not mounted.
@@ -1074,6 +1084,11 @@ impl Editor {
             active_note: None,
             ai_status: None,
             pending_pass: None,
+            // Door closed by default: every document opens to write, not to
+            // be judged (protects re-entry — the warm-up re-read that slides
+            // into line-editing). The tutorial opens it (main.rs); so does a
+            // pass.
+            drafting: true,
             ai_generation: 0,
             diagnosis_mode: None,
             last_pass_believing: false,
@@ -1930,6 +1945,51 @@ impl Editor {
         self.run_pass(true, cx);
     }
 
+    /// The door (DESIGN §4.4): flip between drafting (margin quiet) and
+    /// reviewing (cards surface). The deliberate "register change" the
+    /// research asks for — never inferred, never automatic in v1, so a
+    /// drafting burst can never be interrupted by a wrong guess.
+    fn toggle_review(&mut self, _: &ToggleReview, _: &mut Window, cx: &mut Context<Self>) {
+        self.drafting = !self.drafting;
+        cx.notify();
+    }
+
+    /// Open the door from outside the editor (the tutorial, whose whole
+    /// point is to show the margin demo cards).
+    pub fn enter_reviewing(&mut self) {
+        self.drafting = false;
+    }
+
+    /// Open diagnosis/believing cards the closed door is currently holding
+    /// back (the rail's count). Notes (the writer's own) are never counted —
+    /// the door quiets the editor, not the writer.
+    fn resting_diagnoses(&self) -> usize {
+        self.doc
+            .notes()
+            .open()
+            .filter(|n| n.kind == NoteKind::Diagnosis)
+            .count()
+    }
+
+    /// Copy-level diagnoses suppressed while a developmental one is still
+    /// open — the mandatory altitude order (don't polish prose that the
+    /// structural edit may cut; Reedsy, Sommers). Zero unless both exist.
+    fn suppressed_copy(&self) -> usize {
+        let has_dev = self
+            .doc
+            .notes()
+            .open()
+            .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
+        if !has_dev {
+            return 0;
+        }
+        self.doc
+            .notes()
+            .open()
+            .filter(|n| n.kind == NoteKind::Diagnosis && n.level == "copy")
+            .count()
+    }
+
     /// The effective levels-of-edit depth: session override, else config,
     /// else "line" (Perkins' default register).
     fn effective_mode(&self) -> String {
@@ -1962,6 +2022,10 @@ impl Editor {
             return;
         }
         self.last_pass_believing = believing;
+        // You asked to evaluate — open the door, so results land in a margin
+        // the writer is actually looking at (and any earlier resting cards
+        // come back into view alongside them).
+        self.drafting = false;
         // Scope: the selection if there is one, else the whole document
         // (capped — a 24k-char window is plenty for an editorial pass).
         let scope = if self.selected_range.is_empty() {
@@ -5003,12 +5067,17 @@ impl Editor {
                 // Bidirectional activation: clicking inside an anchor
                 // activates its margin card.
                 let c = self.doc.rope().byte_to_char(ix.min(self.doc.len_bytes()));
-                self.active_note = self
+                let hit = self
                     .doc
                     .notes()
                     .open()
-                    .find(|n| n.range.start <= c && c < n.range.end)
-                    .map(|n| n.id);
+                    .find(|n| n.range.start <= c && c < n.range.end);
+                // Reaching for a resting diagnosis opens the door (DESIGN
+                // §4.4), so the card it activates is actually on screen.
+                if self.drafting && hit.is_some_and(|n| n.kind == NoteKind::Diagnosis) {
+                    self.drafting = false;
+                }
+                self.active_note = hit.map(|n| n.id);
             }
             2 => {
                 // Double-click on an image block edits its alt text.
@@ -5247,6 +5316,17 @@ impl Editor {
         let mut session = String::new();
         if self.outline_open {
             session += " outline=open";
+        }
+        // The door (DESIGN §4.4): drafting hides the editor's cards, reviewing
+        // shows them; the held-back counts let smoke prove the rail's content.
+        if self.drafting {
+            session += &format!(" door=draft resting={}", self.resting_diagnoses());
+        } else {
+            session += " door=review";
+            let held = self.suppressed_copy();
+            if held > 0 {
+                session += &format!(" copy_held={held}");
+            }
         }
         if let Some((goal, start)) = self.session_goal {
             session += &format!(" goal={:+}/{goal}", self.word_count as i64 - start as i64);
@@ -8140,7 +8220,27 @@ impl Editor {
         let rope = self.doc.rope();
         let len = self.doc.len_bytes();
         let mut cards: Vec<MarginCard> = Vec::new();
+        // The door (DESIGN §4.4): drafting hides the editor's cards (the
+        // writer's own notes stay); reviewing shows them, but suppresses
+        // copy-level cards while a developmental one is still open (the
+        // mandatory altitude order). Either way the held-back count surfaces
+        // in the rail (render_margin_rail) — nothing vanishes silently.
+        let drafting = self.drafting;
+        let has_dev = !drafting
+            && self
+                .doc
+                .notes()
+                .open()
+                .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
         for n in self.doc.notes().open() {
+            if n.kind == NoteKind::Diagnosis {
+                if drafting {
+                    continue;
+                }
+                if has_dev && n.level == "copy" {
+                    continue;
+                }
+            }
             let byte = rope.char_to_byte(n.range.start.min(rope.len_chars())).min(len);
             let Some(pos) = frame.position_of(byte, false) else {
                 continue;
@@ -8710,6 +8810,75 @@ impl Editor {
                 })),
         )
     }
+
+    /// The door's visible state (DESIGN §4.4, principle 5 — no hidden modes):
+    /// a thin rail at the lane top that names what the closed door is holding
+    /// ("3 resting · open") and opens it on a click; in reviewing it instead
+    /// notes copy-level cards held back until the structural ones clear.
+    /// Returns None when nothing is held — a quiet margin with nothing to
+    /// gate looks exactly like an empty one, so the mode only shows when it
+    /// is actually doing something.
+    fn render_margin_rail(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.margin_fits(window) {
+            return None;
+        }
+        let frame = self.last_frame.as_ref()?;
+        let col_right = f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+        let lane_left = col_right + MARGIN_GAP + 8.;
+        let top = BAR_HEIGHT + 8. + self.intent_banner_height();
+        let drafting = self.drafting;
+        let label = if drafting {
+            let n = self.resting_diagnoses();
+            if n == 0 {
+                return None;
+            }
+            format!("{n} resting · open")
+        } else {
+            let n = self.suppressed_copy();
+            if n == 0 {
+                return None;
+            }
+            format!("{n} copy-level · after structure")
+        };
+        let styled = |d: gpui::Div| {
+            d.absolute()
+                .top(px(top))
+                .left(px(lane_left))
+                .w(px(MARGIN_WIDTH - 8.))
+                .px(px(8.))
+                .py(px(4.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .bg(rgb(0xF7F5EF))
+                .font_family("PT Sans")
+                .text_size(px(11.))
+                .text_color(rgb(MUTED_COLOR))
+                .child(label.clone())
+        };
+        Some(if drafting {
+            styled(div())
+                .id("margin-door-open")
+                .cursor(CursorStyle::PointingHand)
+                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                .tooltip(tip("Open the door — show the editor's notes", Some("ctrl-shift-r")))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.drafting = false;
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()
+        } else {
+            styled(div()).into_any_element()
+        })
+    }
 }
 
 impl Render for Editor {
@@ -8818,6 +8987,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::add_note))
                     .on_action(cx.listener(Self::run_diagnosis))
                     .on_action(cx.listener(Self::run_believing))
+                    .on_action(cx.listener(Self::toggle_review))
                     .on_action(cx.listener(Self::find))
                     .on_action(cx.listener(Self::replace))
                     .on_action(cx.listener(Self::note_tab))
@@ -8898,6 +9068,10 @@ impl Render for Editor {
                 }
                 let d = match self.render_margin(window, cx) {
                     Some(margin) => d.child(margin),
+                    None => d,
+                };
+                let d = match self.render_margin_rail(window, cx) {
+                    Some(rail) => d.child(rail),
                     None => d,
                 };
                 let d = match self.render_ai_status(window, cx) {

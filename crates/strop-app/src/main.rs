@@ -254,6 +254,10 @@ fn main() {
                     }
                     if let Some(notes) = tutorial_notes {
                         editor.restore_annotations(notes);
+                        // The tutorial's whole point is to show the margin —
+                        // open the door (DESIGN §4.4) so the demo diagnoses
+                        // are visible on first run, not collapsed to the rail.
+                        editor.enter_reviewing();
                     }
                     // The if-then ritual's open half (DESIGN §4.1): caret
                     // restored, last close's intent surfaced — and nothing

@@ -255,9 +255,25 @@ preview, undo — never new nouns):
 3. **Pinned beat list / outline strip that ticks off** — externalized
    structure at the point of performance, scene/beat granularity. THE
    gap (see principle 6).
-4. **Drafting/diagnosing as honest modes**: while drafting, no critique
-   affordances anywhere; diagnosis is a deliberate register change.
-   The AI must never be the first to speak.
+4. **Drafting/diagnosing as honest modes — "the door"** (SHIPPED 2026-06-14,
+   core-loop research round). The single most-cited craft rule and tool
+   failure is the same: evaluation fired into the generate window kills both
+   momentum and voice (Elbow: premature editing "damps out the voice"). So
+   Strop keeps a **door** between drafting and reviewing (`ctrl-shift-r`).
+   *Drafting* (closed, the default — a document opens to write, not to be
+   judged): the editorial margin goes quiet; open diagnosis/believing cards
+   collapse to a thin **rail** ("3 resting · open") whose count is honest and
+   whose click reopens — nothing is lost, the door is one keystroke away.
+   *Reviewing* (open): cards surface, and copy-level cards stay suppressed
+   while any developmental card is open (the mandatory altitude order —
+   don't polish prose the structural edit may cut). The writer's own `ctrl-m`
+   notes are NEVER hidden — the door quiets the *editor*, not the writer.
+   Running a pass, or reaching for a resting anchor, opens the door (you
+   asked to evaluate). The tutorial opens it (the demo cards are its point).
+   **No behavioral inference in v1** (deferred, high-regret): a wrong guess
+   that fires a card mid-burst is the one unforgivable error, so the mode is
+   always manual — a missed surfacing is cheap, a wrongful interruption is
+   not. The AI must never be the first to speak.
 5. **Sprint timer + ambient elapsed time + one dismissible exit ramp.**
 6. **Repairable momentum, never chains**: "wrote on 9 of last 14 days";
    broken-streak framing measurably depresses the behavior (Silverman &
@@ -306,9 +322,58 @@ The real gap is structure-holding (principle 6): nothing in Strop holds
 the story's shape for the writer. That, not chrome restraint, stands
 between an ADHD first-timer and "The End".
 
+## 6. The core-loop arc (2026-06-14)
+
+A seven-dimension web-research round (writer day-to-day loop · version &
+backtracking psychology · competing drafts & merging · the editor
+relationship · instant/on-demand AI feedback · the style-sheet/editorial-
+agreement · tooling gaps; full dossiers + citations in
+`docs/research/writer-core-loop-2026-06-14.md`). The load-bearing finding:
+**writing alternates between a GENERATE mode and an EVALUATE mode, and almost
+every tool failure is a failure to respect which mode the writer is in.**
+Strop's whole thesis is best read as *mode discipline made into a product* —
+silent during generate, a named-problem-and-a-question editor during
+evaluate, never supplying the replacement text that homogenizes voice.
+
+The consolidated core-loop model (design against the **transitions**, not the
+stages): IGNITION (cold start) → DRAFTING bursts → the CARDINAL GUARD
+(drafting⇄evaluating mid-burst — the involuntary crossing that flattens
+voice) → HANDOFF (stop where you know what comes next) → RE-ENTRY (warm-up
+re-read that becomes line-editing) → ALTITUDE DESCENT (dev→line→copy).
+
+**The prioritized arc** (leverage × effort × regret; one round at a time, so
+Kirill stays in the loop between them):
+
+| Round | Opportunity | Lev | Eff | Regret | Status |
+|---|---|---|---|---|---|
+| 1 | **The Door** (draft/review gate) + altitude suppression + card-grammar | High | M | Low | **shipped 2026-06-14** |
+| 2 | History by *meaning* (checkpoints labeled by the cards open then; revert-as-forward made loud; defuse recency bias) | High | M–L | Med | next |
+| 3 | "Try it both ways" — in-place A/B fork + Cuttings drawer, **no merge** ("I don't assemble stories, I write them") | Med–High | M | Med | |
+| 4 | Strengths-first developmental **editorial letter** (whole-manuscript altitude) | High | M | Med | |
+| 5 | **Editorial Agreement** — Continuity Canon (enables drift cards) + Voice Charter (suppresses cards), born empty, infer-and-ratify, linter-style governance | High | L | **High** | |
+| later | voice-trajectory sparkline · re-entry on-ramp · behavioral mode inference · anti-tinker nudge | Med | S–L | mixed | |
+
+**Red lines the research drew** (hold across every round): never a "suggested
+rewrite" field (supplying text *is* the homogenizing anchor — Doshi & Hauser,
+Cornell/CHI'25); the editorial agreement may only ever learn what to *stop*
+flagging, surfaced in the open and ratified, never silent acceptance-driven
+adaptation; no auto-merge of forks; police *problems*, not *style*, by
+default (a born-empty Voice Charter must not flag intentional comma splices
+as errors — T1); behavioral mode-inference defaults ambiguous states to
+**quiet** (T6). The one finding that pushes against a Strop principle and
+*wins*: the agreement wants a seed but the open forbids questions → resolved
+as born-empty + an optional, skippable, post-landing "tell me a quirk", never
+a gate.
+
 ## Open questions for Kirill
 
 - Selection-popover formatting vs persistent format buttons (can't
   have both as primary — one demotes).
 - History side panel: full-height right panel would displace the
   margin while open — acceptable?
+- The door's open-time default is *drafting* everywhere except the tutorial
+  (protects re-entry). Revisit if returning to a manuscript with resting
+  cards behind the rail feels like hiding rather than focus.
+- Round 2 vs Round 3 ordering: history-by-meaning is the dependency-correct
+  next step, but "try it both ways" is the more demo-able answer to the
+  competing-edits question. Say which you want first.

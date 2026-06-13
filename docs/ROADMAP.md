@@ -310,3 +310,41 @@ places, three avoidable. Fixed (full rationale in DESIGN.md §2 AI panel
 - [ ] Not done (no local model present in this env): live end-to-end of the
   one-click local pass. Logic is unit-tested + the render branch is built;
   needs a hands-on run on a machine with Ollama.
+
+## Core-loop research + Round 1: the door (2026-06-14)
+
+Seven-dimension parallel web-research round on the writer's day-to-day core
+loop (full dossiers + citations: `docs/research/writer-core-loop-2026-06-14.md`;
+synthesis + prioritized arc: DESIGN.md §6). Verdict: Strop's thesis is **mode
+discipline made into a product** — the #1 cross-cutting pain is evaluation
+fired into the generate window, which kills momentum *and* voice. Most of the
+synthesis's "first slice" (the constrained Socratic card) was already shipped
+in C3; the genuinely-new spine is the draft/review gate. Shipped Round 1
+(DESIGN §4.4 + §6; tests + clippy green; smoke + sway/grim verified):
+
+- [x] **The door** (`ctrl-shift-r`, palette "Drafting / Reviewing"): a
+  per-session editor lens. Drafting (default — a doc opens to write) quiets
+  the editorial margin; open diagnosis/believing cards collapse to a thin
+  **rail** ("N resting · open", click reopens). Reviewing shows them. The
+  writer's own `ctrl-m` notes are never hidden. Running a pass, or clicking a
+  resting diagnosis anchor, opens the door; the tutorial opens it (demo cards
+  are its point — onboarding intact, verified `door=review` at first launch).
+  Visible state (principle 5), in-memory, no stored mode. Smoke proof:
+  tutorial → `ctrl-shift-r` → `door=draft resting=2` → `door=review`.
+- [x] **Altitude suppression** (reviewing): copy-level diagnosis cards are held
+  while any developmental card is open — the mandatory dev→line→copy order
+  (Reedsy, Sommers). Count surfaced in the rail (`copy_held=N`), never silent.
+- [x] **Card-grammar tightening** (`strop-core::diagnose` system prompt): the
+  canonical query form "this passage is doing X — is that intentional?", ≤2
+  sentences "so it is actually read", non-authoritative ("one editor's
+  reading, not a verdict"). Unit-tested.
+- [ ] Deferred by design (high-regret, await the card earning trust): behavioral
+  P-burst mode inference (a wrong mid-burst card is the unforgivable error —
+  default ambiguous to quiet); the editorial agreement's inference engine.
+- [ ] Possible refinement: in drafting, diagnosis *anchors* (the faint
+  underlines) still show as bookmarks; consider standing them down too for a
+  fully clean "door closed". Left in v1 — they're whisper-quiet and mark where
+  the resting cards live.
+
+Next rounds (DESIGN §6 table): R2 history-by-meaning · R3 "try it both ways"
+fork + Cuttings drawer · R4 editorial letter · R5 the editorial agreement.

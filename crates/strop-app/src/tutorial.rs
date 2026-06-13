@@ -26,6 +26,10 @@ The cards on the right are the point of this editor — and an editorial pass wr
 
 To run your own: press `ctrl-shift-d`, or click the little card in the title bar. If a model is already running on your computer (Ollama), Strop offers it on the spot — no key, no account, and your text never leaves your machine. Otherwise it walks you through a provider once, then answers the pass you asked for. A pass has depths — developmental (structure), line (clarity), copy (mechanics); switch them in the palette. `ctrl-shift-b` runs the believing pass instead: what already works and where the center of gravity is. `ctrl-m` adds your own margin note.
 
+## When to look
+
+Writing and editing are different jobs, and doing both at once is how sentences die — the inner editor strangles a line before it is fully born. So Strop keeps a door between them. While you draft, press `ctrl-shift-r` to close it: the margin goes quiet and its cards rest behind a thin rail (nothing is lost — one click on the rail, or `ctrl-shift-r` again, brings them back). When you are ready to read with an editor's eye, open the door; running a pass opens it for you. Your own notes never hide — the door quiets the editor, not you.
+
 ## Rewind
 
 Every keystroke is kept, across sessions — `ctrl-z` works after a restart. Try it: delete this whole paragraph — really, all of it — then press `ctrl-alt-h` and step back through versions to bring it home, or just `ctrl-z`. Nothing in Strop can be lost. Restoring is itself undoable, and `ctrl-alt-s` names a checkpoint; this document already has one — open history and look.

@@ -116,6 +116,37 @@ on hanging punctuation in body text: «выпендрёж». The bar IS:
 - Markdown (as export/import): pulldown-cmark. No incremental parsing needed
   at the export boundary.
 
+## D7. The door — drafting vs reviewing (2026-06-14, core-loop research)
+
+The seven-dimension research (DESIGN §6; dossiers in `docs/research/`)
+converged on one axis: writing alternates between GENERATE and EVALUATE, and
+tools fail by ignoring which mode the writer is in. Decisions taken for
+Round 1:
+
+- **A manual draft/review gate, not behavioral inference.** Strop was already
+  pull-only (the AI never speaks first), but existing cards still linger in
+  the margin during a drafting burst. The door (`ctrl-shift-r`) quiets them.
+  Inferring the mode from keystroke bursts is deferred: a wrong card fired
+  mid-burst is the one unforgivable error, so ambiguity must default to quiet
+  and v1 stays manual. A missed surfacing is cheap; a wrongful interruption
+  is not.
+- **Default = drafting, except the tutorial.** Every document opens to write
+  (protects re-entry — the warm-up re-read that slides into editing). The
+  tutorial opens the door because showing the margin is its whole point. Not
+  persisted (no stored mode; "settings are apologies"). Revisit if returning
+  to a manuscript with resting cards feels like hiding.
+- **The door quiets the editor, not the writer.** Only AI cards
+  (NoteKind::Diagnosis, both diagnosis and believing) collapse; the writer's
+  own `ctrl-m` notes always show. Nothing is lost — the rail's count is
+  honest and one click reopens.
+- **Altitude suppression, surfaced.** Copy-level cards hide while a
+  developmental one is open (dev→line→copy is mandatory), but the held count
+  shows in the rail — never silent hiding.
+- **Red lines for the rounds ahead** (research-drawn): never a "suggested
+  rewrite" field (supplying text is the homogenizing anchor); the future
+  editorial agreement may only learn what to *stop* flagging, in the open and
+  ratified; no auto-merge of competing drafts.
+
 ## Open items
 
 - [ ] Rich-text document schema (blocks + inline spans + annotation layer

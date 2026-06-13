@@ -14,8 +14,8 @@ use crate::editor::{
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode,
     ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList,
-    ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleStrikethrough,
-    ToggleStrong, ToggleUnderline, Undo,
+    ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview,
+    ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
 };
 
 pub struct Command {
@@ -190,6 +190,16 @@ pub fn all() -> &'static [Command] {
             Some("ctrl-shift-b"),
             RunBelieving,
             ["strengths", "believe", "что работает"]
+        ),
+        // The door (DESIGN §4.4): drafting quiets the editorial margin so a
+        // burst is never pulled into evaluation; reviewing opens it. The
+        // deliberate register change between GENERATE and EVALUATE.
+        cmd!(
+            "Drafting / Reviewing",
+            "Margin & AI",
+            Some("ctrl-shift-r"),
+            ToggleReview,
+            ["focus", "quiet margin", "review mode", "draft mode", "тишина", "правка", "режим правки", "черновик"]
         ),
         cmd!(
             "Add Margin Note",

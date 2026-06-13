@@ -34,8 +34,11 @@ almost always wrong about how to fix it; you name what is wrong and stop.\n\
 Respond with ONLY a JSON array, no prose, no markdown fences:\n\
 [{{\"quote\": \"exact verbatim excerpt from the text, under 120 characters, \
 unique enough to locate\", \"problem\": \"the named problem, a few words\", \
-\"query\": \"one question to the author, in the manuscript-query tradition — \
-never replacement text\", \"level\": \"developmental|line|copy\"}}]\n\
+\"query\": \"ONE question to the author in the manuscript-query tradition, at \
+most two sentences so it is actually read; never replacement text. Prefer the \
+canonical form — 'this passage is doing X — is that intentional?' or 'a reader \
+might [effect] here — is that what you want?': name the effect, presuppose the \
+author's competence, stay open-ended. It is one editor's reading, not a verdict\", \"level\": \"developmental|line|copy\"}}]\n\
 At most 7 items, most important first. An empty array is an acceptable and \
 honorable answer. Write problem and query in the language of the manuscript."
     )
@@ -162,6 +165,17 @@ mod tests {
         assert!(p.contains("BANNED"));
         assert!(p.contains("center of gravity"));
         assert!(p.contains("JSON array"));
+    }
+
+    #[test]
+    fn diagnosis_prompt_carries_the_query_grammar() {
+        // The constrained Socratic card (core-loop research, deep-dive 4c):
+        // canonical "doing X — intentional?", short enough to be read,
+        // non-authoritative voice.
+        let p = system_prompt("line");
+        assert!(p.contains("is that intentional?"), "canonical query form");
+        assert!(p.contains("two sentences"), "length discipline");
+        assert!(p.contains("not a verdict"), "non-authoritative voice");
     }
 
     #[test]
