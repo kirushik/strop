@@ -158,6 +158,15 @@ popovers (the zone already beats them), stacking policy: show all up to
 3, then collapse with count. Numbering stays painted-by-order over
 stable labels (the universal Word/Pandoc architecture — already ours).
 
+*One visual home (H4).* A footnote body renders in exactly one place at
+a time. The bottom zone is the page-bottom reading surface: it shows a
+footnote iff its reference is in the viewport **and** its definition
+block is not. The definition blocks at the document end render as a
+visible "Footnotes" section — a hairline rule above the first def, set
+~0.9× body size — so when the writer scrolls there, the zone stands
+down. Never both at once (the H4 papercut: the same note appearing twice
+when ref and section were both on screen).
+
 **AI settings panel** (Kirill's mandate + partial research): dedicated
 in-app panel; form = base_url · key (masked, paste-friendly) · model;
 async test-call validation with inline states; fetch /models into a

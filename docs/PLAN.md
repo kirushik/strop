@@ -480,11 +480,18 @@ PLAN promised now exists in the running editor.
   Underline deliberately omitted (DESIGN toolbar note; `ctrl-u` still
   works). Verified by wshot of an active selection: all three groups,
   styled labels, amber chip, clean superscript.
-- [ ] **H4. Footnotes: one visual home** (PENDING): a footnote body
-  renders in exactly one place — the zone shows it iff the ref is in
-  the viewport and the def block is not; def blocks at the document
-  end render as a styled "Footnotes" section (hairline rule, ~0.9×
-  body); bidirectional jumps keep working; wflip stays green.
+- [x] **H4. Footnotes: one visual home** (shipped 2026-06-13): a
+  footnote body renders in exactly one place. `visible_footnotes` now
+  skips any footnote whose def block overlaps the visible byte span, so
+  the bottom zone shows a note iff its ref is on screen AND its def is
+  not. The trailing def run renders as a "Footnotes" section: a
+  `section_rule` (detected by neighbour — first def after a non-def
+  block) paints a hairline across the column above it, and defs drop to
+  ~0.9× body (18px) muted. Bidirectional jumps untouched. Verified by
+  two wshots of a long fixture: at the top the body is in the zone only;
+  at the end it is in the styled section only (zone absent). wflip all
+  three fixtures green (oracle 1 AE=0, oracle 2 AE≤6) — no scale
+  corruption from the changed footnote path.
 - [ ] **H5. (next round)**: reserved — owned by the next round.
 - [ ] **H6. contracts.sh** (next round): mechanical enforcement of the
   DESIGN §0.6 layer laws as a scripted contract suite.

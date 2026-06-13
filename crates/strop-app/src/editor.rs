@@ -879,6 +879,9 @@ struct ParagraphLayout {
     /// Kind-derived decorations, resolved at prepaint.
     bg: Option<gpui::Rgba>,
     quote_rule: bool,
+    /// First block of the trailing footnote-definition run (H4): paints a
+    /// hairline "Footnotes" section rule above itself.
+    section_rule: bool,
     marker: Option<gpui::ShapedLine>,
     /// Painted superior footnote figures (DESIGN §2-footnotes):
     /// (paragraph-local byte offset of the invisible carrier, label).
@@ -1724,6 +1727,13 @@ impl Editor {
             } else {
                 rope.len_bytes()
             };
+            // One visual home (H4): if the definition block is itself on
+            // screen — the reader has scrolled down to the Footnotes
+            // section — don't also mirror it in the page-bottom zone. The
+            // zone is for footnotes whose def is off-screen above/below.
+            if start < hi && end > lo {
+                continue;
+            }
             let full = self.doc.slice_bytes(start..end);
             let (def, def_len) = if full.chars().count() > 110 {
                 let cut: String = full.chars().take(110).collect();
@@ -5398,6 +5408,10 @@ fn block_style(kind: &BlockKind) -> BlockStyle {
         },
         BlockKind::FootnoteDef { .. } => BlockStyle {
             muted: true,
+            // The page-bottom register: ~0.9× body (H4 — a Footnotes
+            // section, set apart in size as well as place).
+            size: px(18.),
+            line_height: px(25.),
             // Room for the painted "N." marker, list-style.
             indent: px(28.),
             ..Default::default()
@@ -5816,6 +5830,15 @@ impl Element for EditorElement {
         for (block_ix, par_text) in text.split('\n').enumerate() {
             let kind = kinds.get(block_ix).cloned().unwrap_or_default();
             let bstyle = block_style_scaled(&kind, font_scale);
+            // The footnote-definition run at the document end reads as one
+            // "Footnotes" section: a hairline rule sits above its first
+            // block (H4). Detected by neighbour, not by kind alone.
+            let section_rule = matches!(kind, BlockKind::FootnoteDef { .. })
+                && block_ix > 0
+                && !matches!(
+                    kinds.get(block_ix - 1),
+                    Some(BlockKind::FootnoteDef { .. })
+                );
             let marker = match &kind {
                 BlockKind::ListItem { ordered: false, .. } => {
                     ordered_no = 0;
@@ -5981,6 +6004,10 @@ impl Element for EditorElement {
                 })
                 .collect();
             top += bstyle.extra_top;
+            // Breathing room above the Footnotes section rule (H4).
+            if section_rule {
+                top += px(24.);
+            }
             let mut height = line.size(bstyle.line_height).height;
             let image = image_handles[block_ix].clone().and_then(|handle| {
                 let render = handle.use_render_image(window, cx)?;
@@ -6008,6 +6035,7 @@ impl Element for EditorElement {
                 indent: bstyle.indent,
                 bg: bstyle.bg,
                 quote_rule: bstyle.quote_rule,
+                section_rule,
                 marker,
                 fn_marks,
                 font_size: bstyle.size,
@@ -6118,6 +6146,17 @@ impl Element for EditorElement {
                     Bounds::new(
                         bounds.origin + point(px(10.), y),
                         size(px(3.), par.height),
+                    ),
+                    rgb(RULE_COLOR),
+                ));
+            }
+            // The Footnotes section rule (H4): a hairline across the column,
+            // floated in the gap above the first definition block.
+            if par.section_rule {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(0.), y - px(13.)),
+                        size(bounds.size.width, px(1.)),
                     ),
                     rgb(RULE_COLOR),
                 ));
