@@ -6970,13 +6970,13 @@ impl Editor {
                             editor.restore_selected(cx);
                         }),
                     )
-                    .child("Restore"),
+                    .child("Restore this version"),
             )
             .child(
                 div()
                     .flex_shrink_0()
                     .text_color(rgb(MUTED_COLOR))
-                    .child("Esc exits"),
+                    .child("Esc to exit"),
             )
     }
 
@@ -6998,18 +6998,6 @@ impl Editor {
             ),
             None => (&[][..], 0, false, false, &empty_expanded),
         };
-        let toggle = |label: &'static str, on: bool| {
-            div()
-                .id(label)
-                .px(px(6.))
-                .py(px(1.))
-                .rounded(px(4.))
-                .cursor(CursorStyle::PointingHand)
-                .text_color(if on { rgb(TEXT_COLOR) } else { rgb(MUTED_COLOR) })
-                .when(on, |d| d.bg(rgba(0x1A1A1812u32)))
-                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                .child(label)
-        };
         // One checkpoint row: dot marker (drawn: ●/○ aren't in PT), name,
         // time, word delta, drift scalar when flagged. Double-click renames
         // in place. Expanded auto rows indent under their group row.
@@ -7017,11 +7005,14 @@ impl Editor {
             let stamp = format_unix(e.created_unix);
             let (_, time) = stamp.split_once(' ').unwrap_or((stamp.as_str(), ""));
             let time = time.to_owned();
+            // Word delta against the previous version, spelled with its
+            // unit (the bare "+412 −0" read as a riddle).
             let (ins, del) = e.delta;
-            let delta = if ins == 0 && del == 0 {
-                String::new()
-            } else {
-                format!("+{ins} −{del}")
+            let delta = match (ins, del) {
+                (0, 0) => String::new(),
+                (i, 0) => format!("+{i} words"),
+                (0, d) => format!("−{d} words"),
+                (i, d) => format!("+{i} −{d} words"),
             };
             div()
                 .id(("hist-row", ix))
@@ -7080,11 +7071,21 @@ impl Editor {
                                         div()
                                             .min_w(px(0.))
                                             .truncate()
-                                            .text_color(rgb(TEXT_COLOR))
+                                            .text_color(if e.name.is_empty() {
+                                                rgb(MUTED_COLOR)
+                                            } else {
+                                                rgb(TEXT_COLOR)
+                                            })
                                             .when(e.manual, |d| {
                                                 d.font_weight(FontWeight::BOLD)
                                             })
-                                            .child(e.name.clone()),
+                                            // Autos have no name: label them so
+                                            // the row never reads as a blank.
+                                            .child(if e.name.is_empty() {
+                                                "Auto-save".to_owned()
+                                            } else {
+                                                e.name.clone()
+                                            }),
                                     ),
                             },
                         )
@@ -7097,9 +7098,11 @@ impl Editor {
                                 .gap(px(6.))
                                 .text_size(px(11.))
                                 .child(
-                                    div()
-                                        .text_color(rgb(MUTED_COLOR))
-                                        .child(format!("{time}  {delta}")),
+                                    div().text_color(rgb(MUTED_COLOR)).child(if delta.is_empty() {
+                                        time
+                                    } else {
+                                        format!("{time} · {delta}")
+                                    }),
                                 )
                                 .when_some(e.drift_sigma, |d, s| {
                                     // Scalar caps at >10σ: beyond that the
@@ -7241,18 +7244,69 @@ impl Editor {
                     .flex()
                     .justify_between()
                     .items_center()
-                    .child(div().text_color(rgb(MUTED_COLOR)).child("History"))
                     .child(
-                        toggle("named", named_only).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                if let Some(hv) = &mut editor.history_view {
-                                    hv.named_only = !hv.named_only;
-                                    cx.notify();
-                                }
-                            }),
-                        ),
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(TEXT_COLOR))
+                            .child("History"),
+                    )
+                    .child(
+                        // Named-only filter as a real checkbox-chip: the bare
+                        // word "named" gave no hint it was a control.
+                        div()
+                            .id("named-only")
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .cursor(CursorStyle::PointingHand)
+                            .text_size(px(11.))
+                            .text_color(if named_only {
+                                rgb(TEXT_COLOR)
+                            } else {
+                                rgb(MUTED_COLOR)
+                            })
+                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                            .tooltip(tip("Show only named checkpoints", None))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(hv) = &mut editor.history_view {
+                                        hv.named_only = !hv.named_only;
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .size(px(11.))
+                                    .rounded(px(2.))
+                                    .border_1()
+                                    .border_color(rgb(MUTED_COLOR))
+                                    .when(named_only, |d| d.bg(rgb(TEXT_COLOR))),
+                            )
+                            .child("Named only"),
+                    ),
+            )
+            .child(
+                // The interaction model, stated where it is seen first
+                // (it used to be a muted line buried at the very bottom).
+                // Google-Docs rewind: preview by clicking, restore is safe.
+                div()
+                    .px(px(14.))
+                    .py(px(7.))
+                    .border_b_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child(
+                        "Click a version to preview it in the document; Up/Down steps through \
+                         them. Double-click a name to rename. Restore brings a version back — \
+                         undoable, like everything here. Nothing is ever lost.",
                     ),
             )
             .child(
@@ -7356,11 +7410,11 @@ impl Editor {
                             .px(px(2.))
                             .text_size(px(11.))
                             .text_color(rgb(MUTED_COLOR))
-                            .child("Up/Down step versions · double-click renames · restoring is undoable"),
+                            .child("Show changes in the document, compared against:"),
                     )
                     .child(
                         div().flex().text_size(px(12.)).children(
-                            [("vs previous", false), ("vs draft", true)].map(
+                            [("Previous version", false), ("Current draft", true)].map(
                                 |(label, value)| {
                                     let on = compare_current == value;
                                     div()

@@ -492,7 +492,21 @@ PLAN promised now exists in the running editor.
   at the end it is in the styled section only (zone absent). wflip all
   three fixtures green (oracle 1 AE=0, oracle 2 AE≤6) — no scale
   corruption from the changed footnote path.
-- [ ] **H5. (next round)**: reserved — owned by the next round.
+- [x] **H5. History legibility** (shipped 2026-06-13): the panel was
+  "illegible — I can't figure out how to use it." Presentation-only
+  rework (the checkpoint/diff/restore plumbing was sound): the
+  interaction model moves to a guidance block at the TOP ("Click a
+  version to preview it… Restore is undoable… Nothing is ever lost") —
+  it had been a muted one-liner buried at the bottom; the "named" filter
+  becomes a real ☐ checkbox-chip ("Named only"); rows spell their unit
+  ("00:00 · +412 words", not "00:00  +412 −0") and label auto-saves
+  instead of rendering blank; the bottom control reads "Show changes in
+  the document, compared against: [Previous version | Current draft]"
+  (was a bare "vs previous | vs draft"); the Restore button says
+  "Restore this version". Verified by wshot of the welcome doc's
+  history. Direction = Kirill's own "Rewind powers of Google Docs, in a
+  local-first file" (recon from session 764cba82). Deeper structure
+  (two-base diff semantics, drift glyphs) untouched — backlogged.
 - [ ] **H6. contracts.sh** (next round): mechanical enforcement of the
   DESIGN §0.6 layer laws as a scripted contract suite.
 
