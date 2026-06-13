@@ -113,14 +113,26 @@ formatting buttons (even Bear collapses; iA/Typora/ghostwriter have
 none; persistent chrome budget goes to panel toggles, export, stats,
 modes). DECIDED: strip the titlebar to title/rename · word count ·
 history button · hamburger · window controls. Formatting moves to a
-**selection popover** (Medium lineage: B I S {} + two-level heading
-control; link when it exists), shown on mouse-up only, keyboard-
-summonable (ARIA toolbar rule), rendered as an in-surface GPUI overlay
-— NEVER a Wayland xdg_popup (Zed's documented popup fragility under
-wlroots compositors). Headings: ctrl-1..3 becomes the promoted chord
-(the iA/Bear/Typora convention), `# ` autoformat stays, ctrl-alt-1..3
-remain as silent aliases. No undo/redo buttons — zero category
-precedent; the history surface is the discoverable safety net.
+**selection popover** shown on mouse-up only, keyboard-summonable (ARIA
+toolbar rule), rendered as an in-surface GPUI overlay — NEVER a Wayland
+xdg_popup (Zed's documented popup fragility under wlroots compositors).
+Headings: ctrl-1..3 becomes the promoted chord (the iA/Bear/Typora
+convention), `# ` autoformat stays, ctrl-alt-1..3 remain as silent
+aliases. No undo/redo buttons — zero category precedent; the history
+surface is the discoverable safety net.
+
+H3 completes the popover into three hairline-divided groups: inline
+marks `[B I S {} ==]` | headings `[H1 H2 H3]` | footnote `[¹]`. Each
+label demonstrates its own mark (B bold, I italic, S struck, {} mono,
+== a highlit chip) so the bar teaches without text; every button carries
+a name+chord tooltip; active marks/headings tint. **Underline is
+deliberately absent** from the toolbar and from the mark set exposed to
+writers: Markdown has no underline, manuscript convention used it only
+as a typewriter-era stand-in for italics, and on screens an underline
+reads as a hyperlink (Butterick, *Practical Typography*: "underlining —
+absolutely not"). `SpanKind::Underline` stays in core for import
+fidelity only; `ctrl-u` still toggles it for users who insist, but it
+gets no button.
 
 **History.** The Docs/Figma hybrid, not panel-vs-mode: right side panel
 (PUSH, not overlay — single-document app, reflow is cheap), document

@@ -112,6 +112,12 @@ fn tip(
     }
 }
 
+/// A hairline vertical rule separating button groups in the selection
+/// popover (H3): inline marks | headings | footnote.
+fn popover_divider() -> gpui::Div {
+    div().w(px(1.)).h(px(16.)).mx(px(3.)).bg(rgb(RULE_COLOR))
+}
+
 /// One client-side resize handle (H2): an invisible edge/corner strip that
 /// starts an interactive resize on press. Static cursor — no per-frame
 /// hover tracking, no draw-pass mutation. The caller positions it.
@@ -6217,16 +6223,45 @@ impl Element for EditorElement {
 }
 
 impl Editor {
+    /// A mark button for the selection popover. The label demonstrates its
+    /// own mark — B is bold, I italic, S struck, {} mono, == a highlit chip
+    /// (H3) — so the toolbar teaches what it does without words.
     fn format_button(
         &self,
         label: &'static str,
         attr: InlineAttr,
+        tip_label: &'static str,
+        chord: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.attr_active(&attr);
+        let label_el = match &attr {
+            InlineAttr::Strong => div()
+                .font_weight(FontWeight::BOLD)
+                .child(label)
+                .into_any_element(),
+            InlineAttr::Emphasis => div().italic().child(label).into_any_element(),
+            InlineAttr::Strikethrough => div().line_through().child(label).into_any_element(),
+            InlineAttr::Code => div()
+                .font_family(CODE_FONT)
+                .text_size(px(12.))
+                .child(label)
+                .into_any_element(),
+            // HIGHLIGHT_COLOR carries an alpha byte (it's an rgba constant);
+            // rgb() would drop it and render pink. Match how the document
+            // paints a highlight: translucent amber over the surface.
+            InlineAttr::Highlight => div()
+                .bg(rgba(HIGHLIGHT_COLOR))
+                .px(px(3.))
+                .rounded(px(3.))
+                .text_color(rgb(TEXT_COLOR))
+                .child(label)
+                .into_any_element(),
+            _ => div().child(label).into_any_element(),
+        };
         div()
             .id(label)
-            .px(px(8.))
+            .px(px(7.))
             .py(px(2.))
             .rounded(px(5.))
             .cursor(CursorStyle::PointingHand)
@@ -6237,6 +6272,7 @@ impl Editor {
             })
             .when(active, |d| d.bg(rgba(0x1A1A1812u32)))
             .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .tooltip(tip(tip_label, chord))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
@@ -6244,20 +6280,22 @@ impl Editor {
                     editor.toggle_span(attr.clone(), cx);
                 }),
             )
-            .child(label)
+            .child(label_el)
     }
 
     fn heading_button(
         &self,
         label: &'static str,
         level: u8,
+        tip_label: &'static str,
+        chord: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let kind = self.doc.blocks().kind(self.doc.block_of_byte(self.selected_range.start));
         let active = matches!(kind, BlockKind::Heading(l) if *l == level);
         div()
             .id(label)
-            .px(px(8.))
+            .px(px(7.))
             .py(px(2.))
             .rounded(px(5.))
             .cursor(CursorStyle::PointingHand)
@@ -6268,6 +6306,7 @@ impl Editor {
             })
             .when(active, |d| d.bg(rgba(0x1A1A1812u32)))
             .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .tooltip(tip(tip_label, chord))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
@@ -6278,6 +6317,35 @@ impl Editor {
             .child(label)
     }
 
+    /// The footnote button (H3): a hand-drawn superior "1" (the literal ¹
+    /// U+00B9 isn't guaranteed in PT, and a fallback-font glyph is the
+    /// corruption class we fixed). Inserts a footnote at the caret.
+    fn footnote_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("fn-mark")
+            .px(px(7.))
+            .py(px(2.))
+            .rounded(px(5.))
+            .cursor(CursorStyle::PointingHand)
+            .text_color(rgb(MUTED_COLOR))
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .tooltip(tip("Footnote", Some("ctrl-alt-f")))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    editor.insert_footnote(&InsertFootnote, window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .h(px(14.))
+                    .child(div().text_size(px(9.)).child("1")),
+            )
+    }
+
     /// The selection popover (DESIGN §2-toolbar, Medium lineage): formatting
     /// rides the selection. An in-surface GPUI overlay — never a Wayland
     /// xdg_popup (Zed's documented popup fragility under wlroots).
@@ -6286,7 +6354,7 @@ impl Editor {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        const POPOVER_W: f32 = 196.;
+        const POPOVER_W: f32 = 300.;
         const POPOVER_H: f32 = 30.;
         if !self.selection_popover
             || self.selected_range.is_empty()
@@ -6331,18 +6399,38 @@ impl Editor {
                 .flex()
                 .items_center()
                 .justify_center()
-                .gap(px(2.))
+                .gap(px(1.))
                 .font_family("PT Serif")
                 .text_size(px(13.))
                 // Clicks on the popover chrome must not reach the canvas —
                 // they would collapse the very selection being formatted.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(self.format_button("B", InlineAttr::Strong, cx))
-                .child(self.format_button("I", InlineAttr::Emphasis, cx))
-                .child(self.format_button("S", InlineAttr::Strikethrough, cx))
-                .child(self.format_button("{}", InlineAttr::Code, cx))
-                .child(self.heading_button("H1", 1, cx))
-                .child(self.heading_button("H2", 2, cx)),
+                // Group 1 — inline marks.
+                .child(self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx))
+                .child(self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx))
+                .child(self.format_button(
+                    "S",
+                    InlineAttr::Strikethrough,
+                    "Strikethrough",
+                    Some("ctrl-shift-x"),
+                    cx,
+                ))
+                .child(self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx))
+                .child(self.format_button(
+                    "==",
+                    InlineAttr::Highlight,
+                    "Highlight",
+                    Some("ctrl-shift-h"),
+                    cx,
+                ))
+                .child(popover_divider())
+                // Group 2 — headings, the full ladder.
+                .child(self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx))
+                .child(self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx))
+                .child(self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx))
+                .child(popover_divider())
+                // Group 3 — footnote.
+                .child(self.footnote_button(cx)),
         )
     }
 

@@ -469,10 +469,17 @@ PLAN promised now exists in the running editor.
   zero; wshot confirms titlebar order [outline · title · words … palette
   · history · — □ ×]. Behavioral resize can't be asserted headless;
   verified by code review against zed's reference pattern.
-- [ ] **H3. Selection popover v2** (PENDING): three groups
-  [B I S {} ==] | [H1 H2 H3] | [¹] with hairline dividers, self-styled
-  labels, tooltips, active states; underline deliberately absent (see
-  DESIGN toolbar note).
+- [x] **H3. Selection popover v2** (shipped 2026-06-13): three
+  hairline-divided groups [B I S {} ==] | [H1 H2 H3] | [¹]. Labels
+  self-demonstrate (B bold, I italic via `.italic()`, S `.line_through()`,
+  {} mono, == an `rgba(HIGHLIGHT_COLOR)` chip — caught a pink-vs-amber
+  bug: the alpha-carrying constant had been passed to `rgb()`); H3 added;
+  footnote button inserts at caret with a hand-drawn superior "1" (¹
+  U+00B9 not trusted to PT — the fallback-glyph corruption class); every
+  button has a name+chord tooltip; marks/headings tint when active.
+  Underline deliberately omitted (DESIGN toolbar note; `ctrl-u` still
+  works). Verified by wshot of an active selection: all three groups,
+  styled labels, amber chip, clean superscript.
 - [ ] **H4. Footnotes: one visual home** (PENDING): a footnote body
   renders in exactly one place — the zone shows it iff the ref is in
   the viewport and the def block is not; def blocks at the document
