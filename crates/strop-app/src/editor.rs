@@ -71,9 +71,16 @@ const RESIZE_INSET: f32 = 8.;
 /// Client-side decoration shadow gutter (docs/research/window-decorations-csd.md):
 /// on Wayland CSD the compositor draws no shadow, so the window blends into the
 /// desktop. We reserve a transparent margin on each untiled edge and paint our
-/// own soft shadow + rounded corners + hairline border into it. Matches Zed's
-/// values; `set_client_inset` keeps hit-testing and overlay geometry correct.
-const CSD_SHADOW: f32 = 10.;
+/// own soft shadow + rounded corners + hairline border into it.
+/// `set_client_inset` keeps hit-testing and overlay geometry correct.
+///
+/// The gutter must be WIDER than the largest shadow extent, or the blur is
+/// clipped at the surface edge and reads as a hard slab (the first cut's bug:
+/// a single 0.35-alpha blur whose 10px radius exactly equalled the 10px gutter).
+/// A convincing window shadow is layered, not one blur — a tight contact layer
+/// that grounds the window plus softer cast/ambient layers biased DOWNWARD (light
+/// from above). Values below are restrained, GNOME/libadwaita-scale.
+const CSD_GUTTER: f32 = 22.;
 const CSD_ROUNDING: f32 = 10.;
 
 /// A small hover tooltip: a control's name and, optionally, its chord in a
@@ -9569,7 +9576,7 @@ impl Render for Editor {
             Decorations::Server => Tiling::default(),
         };
         let client = matches!(decorations, Decorations::Client { .. });
-        window.set_client_inset(px(if client { CSD_SHADOW } else { 0. }));
+        window.set_client_inset(px(if client { CSD_GUTTER } else { 0. }));
         let content = div()
             .size_full()
             .relative()
@@ -9822,8 +9829,20 @@ impl Render for Editor {
         // (macOS/Windows/X11) get none of it; the OS draws the shadow. Resize
         // handles ride the OUTER backdrop so the border stays grabbable
         // through the gutter (an OS gesture, topmost even under a modal).
-        let inset = |t: bool| px(if client && !t { CSD_SHADOW } else { 0. });
+        let inset = |t: bool| px(if client && !t { CSD_GUTTER } else { 0. });
         let floating = client && !tiling.top && !tiling.bottom && !tiling.left && !tiling.right;
+        // Round only the corners whose BOTH edges are free (a snapped edge is
+        // square — GTK/libadwaita behaviour). Applied to the shadow node AND the
+        // content node so the content's own background clips to the same radius
+        // and no square corner pokes through the rounded border.
+        let round = move |d: gpui::Div| {
+            d.when(!tiling.top && !tiling.left, |d| d.rounded_tl(px(CSD_ROUNDING)))
+                .when(!tiling.top && !tiling.right, |d| d.rounded_tr(px(CSD_ROUNDING)))
+                .when(!tiling.bottom && !tiling.left, |d| d.rounded_bl(px(CSD_ROUNDING)))
+                .when(!tiling.bottom && !tiling.right, |d| {
+                    d.rounded_br(px(CSD_ROUNDING))
+                })
+        };
         div()
             .size_full()
             .relative()
@@ -9837,35 +9856,27 @@ impl Render for Editor {
                     .right(inset(tiling.right))
                     .overflow_hidden()
                     .when(client, |d| {
-                        d.border_color(rgb(RULE_COLOR))
+                        let d = d
+                            .border_color(rgb(RULE_COLOR))
                             .when(!tiling.top, |d| d.border_t_1())
                             .when(!tiling.bottom, |d| d.border_b_1())
                             .when(!tiling.left, |d| d.border_l_1())
-                            .when(!tiling.right, |d| d.border_r_1())
-                            .when(!tiling.top && !tiling.left, |d| {
-                                d.rounded_tl(px(CSD_ROUNDING))
-                            })
-                            .when(!tiling.top && !tiling.right, |d| {
-                                d.rounded_tr(px(CSD_ROUNDING))
-                            })
-                            .when(!tiling.bottom && !tiling.left, |d| {
-                                d.rounded_bl(px(CSD_ROUNDING))
-                            })
-                            .when(!tiling.bottom && !tiling.right, |d| {
-                                d.rounded_br(px(CSD_ROUNDING))
-                            })
-                            .when(floating, |d| {
-                                d.shadow(vec![
-                                    BoxShadow::new(
-                                        px(0.),
-                                        px(2.),
-                                        Hsla { h: 0., s: 0., l: 0., a: 0.35 },
-                                    )
-                                    .blur_radius(px(CSD_SHADOW)),
-                                ])
-                            })
+                            .when(!tiling.right, |d| d.border_r_1());
+                        // Layered, downward-biased shadow — contact + cast +
+                        // ambient. Low alphas that sum softer than the old single
+                        // 0.35 slab; the soft layer reaches 6+14=20px down, inside
+                        // the 22px gutter, so nothing clips. Only on a fully
+                        // floating window; a snapped edge gets no shadow.
+                        let d = round(d).when(floating, |d| {
+                            let s = |y: f32, blur: f32, a: f32| {
+                                BoxShadow::new(px(0.), px(y), Hsla { h: 0., s: 0., l: 0., a })
+                                    .blur_radius(px(blur))
+                            };
+                            d.shadow(vec![s(1., 2., 0.14), s(3., 8., 0.10), s(6., 14., 0.07)])
+                        });
+                        d
                     })
-                    .child(content),
+                    .child(round(content)),
             )
             .when(client, |d| d.children(resize_handles(tiling)))
     }

@@ -4,18 +4,35 @@
 > actually is per platform, and exactly what gpui (pinned rev `992f395`)
 > gives us to fix it.
 >
-> **Status: IMPLEMENTED (2026-06-14).** `editor.rs` `render` wraps the content
-> in the shadow gutter under `Decorations::Client`; `main.rs` sets
-> `WindowBackgroundAppearance::Transparent`. Verified on a *floating* sway
-> window (the headless rig tiles by default — `WSHOT_FLOAT=WxH` floats it):
-> rounded corners + soft shadow + hairline border, every frame-anchored overlay
-> (margin card, gutter toolbar, pill) still pixel-aligned to the column —
-> `set_client_inset` keeps the geometry correct, exactly as §5 predicted. The
-> notes below are the spec it was built from. One deviation: the resize affordance
-> reuses the existing discrete `resize_handles` strips on the outer backdrop
-> rather than Zed's `canvas`-based cursor tracking, because the project bans raw
-> `canvas` (draw-pass discipline) — so the shadow band resizes but shows no
-> resize cursor. Acceptable; revisit if it grates.
+> **Status: IMPLEMENTED (2026-06-14); shadow REVISED (2026-06-15).** `editor.rs`
+> `render` wraps the content in the shadow gutter under `Decorations::Client`;
+> `main.rs` sets `WindowBackgroundAppearance::Transparent`. Verified on a
+> *floating* sway window with a light desktop (the headless rig tiles by default
+> and paints black by default — `WSHOT_FLOAT=WxH` floats it, `WSHOT_BG=#f1eee7`
+> gives a light desktop so the shadow is actually visible).
+>
+> **Shadow v1 was wrong** (Kirill, 2026-06-15: "too thick, too omnidirectional,
+> gradient feels odd, corner artifacts"). Root cause: a *single* `BoxShadow` at
+> offset (0,2), blur 10, alpha **0.35**, in a gutter that was *also* 10px — so the
+> blur was clipped at the surface edge into a hard slab, and a lone 0.35 layer with
+> a near-zero offset haloed uniformly instead of grounding the window. **v2** (the
+> shadow-theory research, `docs/research/` siblings + sources in this file's spirit):
+> three layered shadows — contact `(0,1) blur 2 @0.14` + cast `(0,3) blur 8 @0.10`
+> + ambient `(0,6) blur 14 @0.07` — all biased downward (light from above), summing
+> *softer* than the old single slab; the gutter widened to **22px** (`CSD_GUTTER`)
+> so the 20px-deep ambient layer never clips; and the **content node is rounded to
+> the same radius** as the border so its background can't poke a square corner
+> through the arc (the corner artifact — same class as Zed #58162). Restrained,
+> GNOME/libadwaita-scale rather than macOS-scale halo.
+>
+> Every frame-anchored overlay (margin card, gutter toolbar, pill) still
+> pixel-aligned to the column — `set_client_inset` keeps the geometry correct,
+> exactly as §5 predicted. One deviation: the resize affordance reuses the existing
+> discrete `resize_handles` strips on the outer backdrop rather than Zed's
+> `canvas`-based cursor tracking, because the project bans raw `canvas` (draw-pass
+> discipline) — so the shadow band resizes but shows no resize cursor. Reference
+> windows (GNOME) draw a small static resize GRIP glyph in the corner instead of a
+> cursor; that's a divs-only affordance we could add within the canvas ban.
 
 ## 1. The symptom
 

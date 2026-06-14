@@ -13,6 +13,10 @@ CFG=$(mktemp)
 # given window WIDTH: WSHOT_MODE=1100x800 exercises the narrow-margin left-shift
 # band, 850x800 the too-narrow notes pill.
 printf 'output HEADLESS-1 mode %s\noutput HEADLESS-1 scale %s\n' "${WSHOT_MODE:-1600x1200}" "$SCALE" > "$CFG"
+# WSHOT_BG paints the desktop behind the window a solid colour (default black).
+# A CSD drop shadow is invisible against black — set a light desktop (e.g.
+# WSHOT_BG=#f4f2ec) to judge the shadow the way a real GNOME desktop shows it.
+[ -n "$WSHOT_BG" ] && printf 'output HEADLESS-1 bg %s solid_color\n' "$WSHOT_BG" >> "$CFG"
 # WSHOT_FLOAT=WxH floats the window at that size instead of tiling it to fill
 # the output — the only way to exercise client-side decorations (the shadow
 # gutter / rounded corners are suppressed on tiled edges). Leaves a gap around
