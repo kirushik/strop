@@ -33,13 +33,26 @@
 > discipline) — so the shadow band resizes but shows no resize cursor. (Kirill chose
 > rounded corners and NO grip glyph, 2026-06-15.)
 >
-> **Resize grab fix (2026-06-15):** the strips were `RESIZE_INSET` (8px) thick at
-> the *surface* edge — i.e. only the outer 8px of the 22px shadow gutter. The
-> visible window border (a gutter-width in) had no grab region, so you could only
-> resize by catching the faint outer fringe of the shadow (Kirill). The bands now
-> span `CSD_GUTTER (+ RESIZE_INSET inner lip)` from the surface edge, so the whole
-> gutter through the visible border is draggable; the TOP band stays gutter-only so
-> it never steals clicks from the titlebar/window controls just inside it.
+> **Resize grab (2026-06-15, two iterations):** v1 strips were `RESIZE_INSET` (8px)
+> at the *surface* edge — only the outer fringe of the shadow; the visible border
+> was dead (Kirill: had to grab the faint shadow edge). v2 over-corrected to span
+> the WHOLE gutter to the surface edge — which made the transparent shadow grab
+> Strop's resize and hijack drags meant for a window behind it (Kirill again; this
+> is also what Zed's `resize_edge` does — `inset(shadow*1.5)` — so Zed has the same
+> wart). **v3 (final): the band STRADDLES the visible border** — `RESIZE_INSET`
+> each side of it (`out = CSD_GUTTER - RESIZE_INSET`, `thick = 2·RESIZE_INSET`),
+> NOT out to the external shadow edge, so the outer shadow stays grab-free and only
+> the edge you can see is draggable, the normal way. TOP reaches outward-only (no
+> inner lip) so it can't steal titlebar/window-control clicks.
+>
+> **Lane-vs-gutter math (2026-06-15):** `column_frame`/`margin_fits` measured
+> against the raw viewport, but the column + note lane live in the CONTENT box,
+> inset by `CSD_GUTTER` a side — so on a *floating* window the math overcounted by
+> ~44px and the lane overran the content edge, clipping the cards (the tiled rig
+> missed it: tiled inset = 0). Fixed with `content_width` (viewport − the live
+> insets). And the lane's horizontal anchor now comes from `column_right`
+> (`column_frame`-derived, current frame) instead of last frame's `frame.bounds`,
+> so the column + lane slide as ONE slab during a resize with no one-frame jitter.
 
 ## 1. The symptom
 

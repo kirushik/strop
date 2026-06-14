@@ -167,78 +167,78 @@ fn resize_strip(
 
 /// The eight client-side resize handles for the current tiling state (H2).
 ///
-/// These ride the OUTER backdrop, whose edge is the window surface — but the
-/// VISIBLE window border sits `CSD_GUTTER` in from there (the transparent
-/// shadow gutter). So the grab band must span the whole gutter, not perch on
-/// the surface edge: otherwise you can only resize by catching the faint outer
-/// fringe of the shadow, and the visible border itself is dead (the bug Kirill
-/// hit). Band = gutter + a small inner lip past the border, so aiming at the
-/// edge you can see just works. The TOP band stops at the gutter (no lip) so it
-/// never steals clicks from the titlebar/window controls just inside it. A
-/// tiled (snapped) edge gets no gutter and no handle. Cursors mirror zed's
-/// `client_side_decorations`.
+/// These ride the OUTER backdrop (whose edge is the window surface), but the
+/// VISIBLE window border sits `CSD_GUTTER` in — inside the transparent shadow
+/// gutter. The grab band STRADDLES that visible border (reaching `RESIZE_INSET`
+/// to each side of it), it does NOT extend out to the external shadow edge:
+/// otherwise the whole transparent gutter grabs Strop's resize and hijacks
+/// drags meant for a window behind it (Kirill). So the outer shadow stays
+/// grab-free and only the edge you can see is draggable, the normal way. The
+/// TOP reaches only OUTWARD from its border (never inward) so it can't steal
+/// clicks from the titlebar/window controls just inside. A tiled (snapped) edge
+/// gets no gutter and no handle.
 fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
-    let g = px(CSD_GUTTER); // gutter only — to the visible border
-    let band = px(CSD_GUTTER + RESIZE_INSET); // gutter + inner lip past it
-    let z = px(0.);
+    let out = px(CSD_GUTTER - RESIZE_INSET); // band's outer edge, from the surface
+    let thick = px(2. * RESIZE_INSET); // straddle: RESIZE_INSET each side of the border
+    let thin = px(RESIZE_INSET); // top: outward-only (border to outer edge)
     let mut v: Vec<gpui::AnyElement> = Vec::new();
     if !tiling.top {
         v.push(
             resize_strip("rz-top", ResizeEdge::Top, CursorStyle::ResizeUpDown)
-                .top(z)
-                .left(z)
-                .right(z)
-                .h(g)
+                .top(out)
+                .left(out)
+                .right(out)
+                .h(thin)
                 .into_any_element(),
         );
     }
     if !tiling.bottom {
         v.push(
             resize_strip("rz-bottom", ResizeEdge::Bottom, CursorStyle::ResizeUpDown)
-                .bottom(z)
-                .left(z)
-                .right(z)
-                .h(band)
+                .bottom(out)
+                .left(out)
+                .right(out)
+                .h(thick)
                 .into_any_element(),
         );
     }
     if !tiling.left {
         v.push(
             resize_strip("rz-left", ResizeEdge::Left, CursorStyle::ResizeLeftRight)
-                .left(z)
-                .top(z)
-                .bottom(z)
-                .w(band)
+                .left(out)
+                .top(out)
+                .bottom(out)
+                .w(thick)
                 .into_any_element(),
         );
     }
     if !tiling.right {
         v.push(
             resize_strip("rz-right", ResizeEdge::Right, CursorStyle::ResizeLeftRight)
-                .right(z)
-                .top(z)
-                .bottom(z)
-                .w(band)
+                .right(out)
+                .top(out)
+                .bottom(out)
+                .w(thick)
                 .into_any_element(),
         );
     }
     if !tiling.top && !tiling.left {
         v.push(
             resize_strip("rz-tl", ResizeEdge::TopLeft, CursorStyle::ResizeUpLeftDownRight)
-                .top(z)
-                .left(z)
-                .w(band)
-                .h(g)
+                .top(out)
+                .left(out)
+                .w(thick)
+                .h(thin)
                 .into_any_element(),
         );
     }
     if !tiling.top && !tiling.right {
         v.push(
             resize_strip("rz-tr", ResizeEdge::TopRight, CursorStyle::ResizeUpRightDownLeft)
-                .top(z)
-                .right(z)
-                .w(band)
-                .h(g)
+                .top(out)
+                .right(out)
+                .w(thick)
+                .h(thin)
                 .into_any_element(),
         );
     }
@@ -249,10 +249,10 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
                 ResizeEdge::BottomLeft,
                 CursorStyle::ResizeUpRightDownLeft,
             )
-            .bottom(z)
-            .left(z)
-            .w(band)
-            .h(band)
+            .bottom(out)
+            .left(out)
+            .w(thick)
+            .h(thick)
             .into_any_element(),
         );
     }
@@ -263,10 +263,10 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
                 ResizeEdge::BottomRight,
                 CursorStyle::ResizeUpLeftDownRight,
             )
-            .bottom(z)
-            .right(z)
-            .w(band)
-            .h(band)
+            .bottom(out)
+            .right(out)
+            .w(thick)
+            .h(thick)
             .into_any_element(),
         );
     }
@@ -8734,13 +8734,31 @@ impl Editor {
         cards
     }
 
+    /// Width the column and note lane actually have to live in: the viewport
+    /// MINUS the CSD shadow gutter on each untiled edge. Client decorations
+    /// inset the content by `CSD_GUTTER` a side, so the raw viewport overcounts
+    /// by ~44px on a floating window — the bug that let the lane overrun the
+    /// content's right edge and clip the cards. Tiled/server windows have no
+    /// gutter, so this is just the viewport there (why the tiled rig missed it).
+    fn content_width(&self, window: &Window) -> f32 {
+        let vw = f32::from(window.viewport_size().width);
+        match window.window_decorations() {
+            Decorations::Client { tiling } => {
+                let l = if tiling.left { 0. } else { CSD_GUTTER };
+                let r = if tiling.right { 0. } else { CSD_GUTTER };
+                vw - l - r
+            }
+            Decorations::Server => vw,
+        }
+    }
+
     fn margin_fits(&self, window: &Window) -> bool {
         if self.history_view.is_some() {
             return false; // history displaces the lane wholesale
         }
-        let vw = f32::from(window.viewport_size().width);
+        let cw = self.content_width(window);
         let (left, w) = self.column_frame(window);
-        vw - (left + w) >= NOTE_LANE_TOTAL
+        cw - (left + w) >= NOTE_LANE_TOTAL
     }
 
     /// The door rail's count, when it has something to hold: drafting hides
@@ -8781,9 +8799,11 @@ impl Editor {
     /// - Notes, NARROW: below that the lane can't fit; notes go to the pill and
     ///   the column stays stuck left (continuous with the shift above).
     fn column_frame(&self, window: &Window) -> (f32, f32) {
-        let vw = f32::from(window.viewport_size().width);
-        let w = COL_MAX_WIDTH.min((vw - 2. * COL_LEFT_MIN).max(DOC_MIN_WIDTH.min(vw)));
-        let centred = ((vw - w) / 2.).max(COL_LEFT_MIN);
+        // Measured in CONTENT space (the column lives inside the inset content),
+        // so centring here lands the column centred in the *visible* window.
+        let cw = self.content_width(window);
+        let w = COL_MAX_WIDTH.min((cw - 2. * COL_LEFT_MIN).max(DOC_MIN_WIDTH.min(cw)));
+        let centred = ((cw - w) / 2.).max(COL_LEFT_MIN);
         if self.history_view.is_some() || !self.lane_has_content() {
             return (centred, w);
         }
@@ -8791,8 +8811,20 @@ impl Editor {
         // margin is never smaller than the lane. `shifted` ≤ `centred` exactly
         // when centring's right margin < lane, so `min` gives a seamless
         // centred→shifted handoff; the floor parks it left for the pill.
-        let shifted = vw - w - NOTE_LANE_TOTAL;
+        let shifted = cw - w - NOTE_LANE_TOTAL;
         (shifted.min(centred).max(COL_LEFT_MIN), w)
+    }
+
+    /// The column's right edge in CONTENT space — where the note lane begins.
+    /// Derived from `column_frame` (the SAME basis the column is laid out with),
+    /// NOT from last frame's `frame.bounds`. That's the fix for two things: the
+    /// lane no longer lags the column by a frame during a resize (the jitter —
+    /// column + lane now slide as one slab, since the column's width is constant
+    /// so nothing reflows), and there's no gutter-offset drift between the fit
+    /// check and the actual placement.
+    fn column_right(&self, window: &Window) -> f32 {
+        let (left, w) = self.column_frame(window);
+        left + w
     }
 
     /// Narrow-window composer: the margin (and its in-card composer) is
@@ -8900,9 +8932,7 @@ impl Editor {
                 .child(dismiss)
         };
         Some(if fits {
-            let frame = self.last_frame.as_ref()?;
-            let col_right =
-                f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+            let col_right = self.column_right(window);
             body(
                 div()
                     .absolute()
@@ -8942,9 +8972,7 @@ impl Editor {
         // The intent banner holds the lane's top slot while it lives.
         let banner_h = self.intent_banner_height();
         let (left, width) = if fits {
-            let frame = self.last_frame.as_ref()?;
-            let col_right =
-                f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+            let col_right = self.column_right(window);
             (col_right + MARGIN_GAP + 8., MARGIN_WIDTH - 8.)
         } else {
             (0., 0.) // narrow: bottom strip, never floating over prose
@@ -9171,8 +9199,7 @@ impl Editor {
         if !self.margin_fits(window) {
             return None;
         }
-        let frame = self.last_frame.as_ref()?;
-        let col_right = f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+        let col_right = self.column_right(window);
         let mut cards = self.margin_cards();
         if cards.is_empty() {
             return None;
@@ -9341,8 +9368,7 @@ impl Editor {
         if !self.margin_fits(window) {
             return None;
         }
-        let frame = self.last_frame.as_ref()?;
-        let col_right = f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
+        let col_right = self.column_right(window);
         let lane_left = col_right + MARGIN_GAP + 8.;
         let top = BAR_HEIGHT + 8. + self.intent_banner_height();
         let drafting = self.drafting;
