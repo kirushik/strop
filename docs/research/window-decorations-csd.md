@@ -30,9 +30,16 @@
 > exactly as §5 predicted. One deviation: the resize affordance reuses the existing
 > discrete `resize_handles` strips on the outer backdrop rather than Zed's
 > `canvas`-based cursor tracking, because the project bans raw `canvas` (draw-pass
-> discipline) — so the shadow band resizes but shows no resize cursor. Reference
-> windows (GNOME) draw a small static resize GRIP glyph in the corner instead of a
-> cursor; that's a divs-only affordance we could add within the canvas ban.
+> discipline) — so the shadow band resizes but shows no resize cursor. (Kirill chose
+> rounded corners and NO grip glyph, 2026-06-15.)
+>
+> **Resize grab fix (2026-06-15):** the strips were `RESIZE_INSET` (8px) thick at
+> the *surface* edge — i.e. only the outer 8px of the 22px shadow gutter. The
+> visible window border (a gutter-width in) had no grab region, so you could only
+> resize by catching the faint outer fringe of the shadow (Kirill). The bands now
+> span `CSD_GUTTER (+ RESIZE_INSET inner lip)` from the surface edge, so the whole
+> gutter through the visible border is draggable; the TOP band stays gutter-only so
+> it never steals clicks from the titlebar/window controls just inside it.
 
 ## 1. The symptom
 

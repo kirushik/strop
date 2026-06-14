@@ -46,9 +46,17 @@ const MARGIN_GAP: f32 = 16.;
 /// lane, the narrow-width left-shift) is measured against it.
 const COL_MAX_WIDTH: f32 = 660.;
 /// Horizontal room the note lane needs to the right of the column: the gap,
-/// the lane itself, and the card's 8px inset. The column left-shifts (and the
-/// margin renders) only when this much space exists past `col_right`.
+/// the lane itself, and the card's 8px inset. The lane is reserved on the
+/// right at all times (see `column_frame`) so a note appearing never moves the
+/// column; the margin renders inline while this much space exists past it.
 const NOTE_LANE_TOTAL: f32 = MARGIN_GAP + MARGIN_WIDTH + 8.;
+/// The column is CENTRED at rest (it rhymes with the centred omnibox), and
+/// stays centred as long as the right margin can still host the note lane.
+/// Only when narrowing past that does it shift left — continuously, no
+/// breakpoint — to keep the lane, until it hits this minimum margin and the
+/// notes fall back to the pill. With no notes it is always centred. The column
+/// x is otherwise a pure function of width: panels overlay, they never push it.
+const COL_LEFT_MIN: f32 = 24.;
 /// History side panel (DESIGN §2-history): push, not overlay. The panel
 /// shrinks before the document does — prose keeps DOC_MIN_WIDTH.
 const HISTORY_PANEL_WIDTH: f32 = 320.;
@@ -158,11 +166,20 @@ fn resize_strip(
 }
 
 /// The eight client-side resize handles for the current tiling state (H2).
-/// Edges span full width/height; corners layer on top. A tiled edge (the
-/// window is snapped to it) is neither inset nor draggable. Cursor mapping
-/// mirrors zed's `client_side_decorations`.
+///
+/// These ride the OUTER backdrop, whose edge is the window surface — but the
+/// VISIBLE window border sits `CSD_GUTTER` in from there (the transparent
+/// shadow gutter). So the grab band must span the whole gutter, not perch on
+/// the surface edge: otherwise you can only resize by catching the faint outer
+/// fringe of the shadow, and the visible border itself is dead (the bug Kirill
+/// hit). Band = gutter + a small inner lip past the border, so aiming at the
+/// edge you can see just works. The TOP band stops at the gutter (no lip) so it
+/// never steals clicks from the titlebar/window controls just inside it. A
+/// tiled (snapped) edge gets no gutter and no handle. Cursors mirror zed's
+/// `client_side_decorations`.
 fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
-    let i = px(RESIZE_INSET);
+    let g = px(CSD_GUTTER); // gutter only — to the visible border
+    let band = px(CSD_GUTTER + RESIZE_INSET); // gutter + inner lip past it
     let z = px(0.);
     let mut v: Vec<gpui::AnyElement> = Vec::new();
     if !tiling.top {
@@ -171,7 +188,7 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
                 .top(z)
                 .left(z)
                 .right(z)
-                .h(i)
+                .h(g)
                 .into_any_element(),
         );
     }
@@ -181,7 +198,7 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
                 .bottom(z)
                 .left(z)
                 .right(z)
-                .h(i)
+                .h(band)
                 .into_any_element(),
         );
     }
@@ -191,7 +208,7 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
                 .left(z)
                 .top(z)
                 .bottom(z)
-                .w(i)
+                .w(band)
                 .into_any_element(),
         );
     }
@@ -201,7 +218,7 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
                 .right(z)
                 .top(z)
                 .bottom(z)
-                .w(i)
+                .w(band)
                 .into_any_element(),
         );
     }
@@ -210,8 +227,8 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
             resize_strip("rz-tl", ResizeEdge::TopLeft, CursorStyle::ResizeUpLeftDownRight)
                 .top(z)
                 .left(z)
-                .w(i)
-                .h(i)
+                .w(band)
+                .h(g)
                 .into_any_element(),
         );
     }
@@ -220,8 +237,8 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
             resize_strip("rz-tr", ResizeEdge::TopRight, CursorStyle::ResizeUpRightDownLeft)
                 .top(z)
                 .right(z)
-                .w(i)
-                .h(i)
+                .w(band)
+                .h(g)
                 .into_any_element(),
         );
     }
@@ -234,8 +251,8 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
             )
             .bottom(z)
             .left(z)
-            .w(i)
-            .h(i)
+            .w(band)
+            .h(band)
             .into_any_element(),
         );
     }
@@ -248,8 +265,8 @@ fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
             )
             .bottom(z)
             .right(z)
-            .w(i)
-            .h(i)
+            .w(band)
+            .h(band)
             .into_any_element(),
         );
     }
@@ -3987,7 +4004,7 @@ impl Editor {
     }
 
     /// The outline rail (DESIGN §1.6): session-only, no config.
-    fn toggle_outline(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_outline(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
         self.outline_open = !self.outline_open;
         cx.notify();
     }
@@ -8718,12 +8735,12 @@ impl Editor {
     }
 
     fn margin_fits(&self, window: &Window) -> bool {
+        if self.history_view.is_some() {
+            return false; // history displaces the lane wholesale
+        }
         let vw = f32::from(window.viewport_size().width);
-        let Some(frame) = self.last_frame.as_ref() else {
-            return false;
-        };
-        let col_right = f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
-        vw >= col_right + NOTE_LANE_TOTAL
+        let (left, w) = self.column_frame(window);
+        vw - (left + w) >= NOTE_LANE_TOTAL
     }
 
     /// The door rail's count, when it has something to hold: drafting hides
@@ -8740,7 +8757,7 @@ impl Editor {
     }
 
     /// Does anything want the right-hand note lane right now? An empty lane
-    /// never pulls the column off-centre — the left-shift is purely in the
+    /// never pulls the column off-centre — the column only shifts in the
     /// service of cards that would otherwise have nowhere to go.
     fn lane_has_content(&self) -> bool {
         !self.margin_cards().is_empty()
@@ -8749,27 +8766,33 @@ impl Editor {
             || self.next_intent.is_some()
     }
 
-    /// Whether to bias the prose column left instead of centring it. The
-    /// outline/history panels already push the column this way (DESIGN
-    /// §1.6/§2-history); here the *note lane* does the pushing. We shift only
-    /// when the lane has content AND centring can't host it but a left-bias
-    /// can — so wide windows stay symmetric and only the medium band
-    /// (~932–1204px) gives up its left breathing room. Below the band even a
-    /// left-bias won't fit; the narrow drawer (render_narrow_notes) takes over
-    /// and the column stays centred for reading.
-    fn column_left_bias(&self, window: &Window) -> bool {
-        // History displaces the lane wholesale — no note lane to make room for.
-        if self.history_view.is_some() || !self.lane_has_content() {
-            return false;
-        }
+    /// The prose column's geometry — (left inset, width) — as a function of
+    /// viewport width. This is the no-jump invariant in code: at rest the
+    /// column is CENTRED (rhyming with the centred omnibox), and it stays
+    /// centred while the right margin can host the note lane. The outline never
+    /// enters this — it overlays, so toggling it can't move the column — and
+    /// resizing slides everything continuously with no breakpoint snap.
+    ///
+    /// - No notes (or history): centred at every width.
+    /// - Notes, WIDE: still centred — the lane lives in the right margin.
+    /// - Notes, NARROWING: once centring would push the lane off the right
+    ///   edge, the column shifts left exactly enough to keep the lane (the two
+    ///   formulas meet at the crossover, so no jump), down to COL_LEFT_MIN.
+    /// - Notes, NARROW: below that the lane can't fit; notes go to the pill and
+    ///   the column stays stuck left (continuous with the shift above).
+    fn column_frame(&self, window: &Window) -> (f32, f32) {
         let vw = f32::from(window.viewport_size().width);
-        let outline_w = self.outline_width(window);
-        let hist_w = self.history_panel_width(window);
-        let avail = (vw - outline_w - hist_w).max(0.);
-        let col_w = COL_MAX_WIDTH.min(avail);
-        let centred_right_gap = vw - (outline_w + (avail - col_w) / 2. + col_w);
-        let left_right_gap = vw - (outline_w + col_w);
-        centred_right_gap < NOTE_LANE_TOTAL && left_right_gap >= NOTE_LANE_TOTAL
+        let w = COL_MAX_WIDTH.min((vw - 2. * COL_LEFT_MIN).max(DOC_MIN_WIDTH.min(vw)));
+        let centred = ((vw - w) / 2.).max(COL_LEFT_MIN);
+        if self.history_view.is_some() || !self.lane_has_content() {
+            return (centred, w);
+        }
+        // Keep the lane in the right margin: cap the left inset so the right
+        // margin is never smaller than the lane. `shifted` ≤ `centred` exactly
+        // when centring's right margin < lane, so `min` gives a seamless
+        // centred→shifted handoff; the floor parks it left for the pill.
+        let shifted = vw - w - NOTE_LANE_TOTAL;
+        (shifted.min(centred).max(COL_LEFT_MIN), w)
     }
 
     /// Narrow-window composer: the margin (and its in-card composer) is
@@ -9623,11 +9646,13 @@ impl Render for Editor {
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
         let hist_panel_w = self.history_panel_width(window);
-        // The outline rail pushes from the left the same way (DESIGN §1.6).
+        // The outline rail OVERLAYS the reserved left margin now (no push) —
+        // outline_w is still its width, for the rail's own render.
         let outline_w = self.outline_width(window);
-        // Narrow windows that can't centre the note lane bias the column left
-        // to reclaim the space (the same push the panels above use).
-        let left_bias = self.column_left_bias(window);
+        let in_history = self.history_view.is_some();
+        // The column's left inset and width — a pure function of viewport width
+        // (column_frame): the no-jump invariant. Used only outside history.
+        let (col_x, col_w) = self.column_frame(window);
         // Client-side decorations (H2 / window-decorations-csd.md): when the
         // compositor leaves us our own chrome (GNOME/sway Wayland always do),
         // we draw both the resize border AND the shadow gutter (below).
@@ -9672,10 +9697,19 @@ impl Render for Editor {
                     .flex_1()
                     .min_h(px(0.))
                     .flex()
-                    .map(|d| if left_bias { d.justify_start() } else { d.justify_center() })
                     .overflow_hidden()
-                    .when(hist_panel_w > 0., |d| d.pr(px(hist_panel_w)))
-                    .when(outline_w > 0., |d| d.pl(px(outline_w)))
+                    .map(|d| {
+                        if in_history {
+                            // History keeps the legacy push-and-recentre layout.
+                            d.justify_center()
+                                .when(hist_panel_w > 0., |d| d.pr(px(hist_panel_w)))
+                        } else {
+                            // Left-anchored column at a width-only x; the
+                            // outline overlays the reserved left margin (it no
+                            // longer pushes, so toggling it can't move prose).
+                            d.justify_start().pl(px(col_x))
+                        }
+                    })
                     .child(
                         div()
                             .key_context("Editor")
@@ -9774,8 +9808,15 @@ impl Render for Editor {
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                     .on_drop(cx.listener(Self::on_file_drop))
-                            .w_full()
-                            .max_w(px(660.))
+                            // History recentres/rewraps in the remaining width;
+                            // otherwise the column takes its width-only measure.
+                            .map(|d| {
+                                if in_history {
+                                    d.w_full().max_w(px(COL_MAX_WIDTH))
+                                } else {
+                                    d.w(px(col_w))
+                                }
+                            })
                             .h_full()
                             .pt(px(56.))
                             .pb(px(28.))
@@ -9930,14 +9971,13 @@ impl Render for Editor {
                         // 0.35 slab; the soft layer reaches 6+14=20px down, inside
                         // the 22px gutter, so nothing clips. Only on a fully
                         // floating window; a snapped edge gets no shadow.
-                        let d = round(d).when(floating, |d| {
+                        round(d).when(floating, |d| {
                             let s = |y: f32, blur: f32, a: f32| {
                                 BoxShadow::new(px(0.), px(y), Hsla { h: 0., s: 0., l: 0., a })
                                     .blur_radius(px(blur))
                             };
                             d.shadow(vec![s(1., 2., 0.14), s(3., 8., 0.10), s(6., 14., 0.07)])
-                        });
-                        d
+                        })
                     })
                     .child(round(content)),
             )

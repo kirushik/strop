@@ -93,6 +93,18 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE {key}: {state}");
                 continue;
             }
+            if key == "toggle:outline" {
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.toggle_outline(&crate::editor::ToggleOutline, window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE toggle:outline");
+                continue;
+            }
             if key == "seed:diag" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_seed_notes(cx))
