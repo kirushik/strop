@@ -93,6 +93,16 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE {key}: {state}");
                 continue;
             }
+            if key == "seed:diag" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_notes(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:diag: demo diagnosis cards seeded");
+                continue;
+            }
             if key == "dump:ui" {
                 let dump = window
                     .update(cx, |editor, window, cx| editor.debug_ui_dump(window, cx))

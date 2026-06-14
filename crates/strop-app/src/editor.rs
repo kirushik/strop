@@ -5464,6 +5464,41 @@ impl Editor {
 
     /// Cursor geometry for the smoke harness: byte offset, paragraph index,
     /// wrapped-line index within the paragraph, and x position.
+    /// Rig-only: inject a dense cluster of demo diagnosis cards so the visual
+    /// rig can exercise the margin lane (overlap packing, z-order, active-pin)
+    /// without a live AI pass. Quotes are written to match the seed fixture's
+    /// text; the middle card is activated. Driven by the `seed:diag` smoke
+    /// token — never reached outside a STROP_SMOKE run.
+    pub fn debug_seed_notes(&mut self, cx: &mut Context<Self>) {
+        use strop_core::diagnose::{Diagnosis, to_annotations};
+        let demos: Vec<Diagnosis> = [
+            ("sold his shadow", "buried lede",
+             "The strongest image of the piece opens it — do you want it spent in the first clause, or held?"),
+            ("quiet thing", "ambiguous shorthand",
+             "'quiet' reads as calm here, not silent — are you sure the reader lands where you mean?"),
+            ("dogs had begun to growl", "vague mechanism",
+             "the four 'There was' sentences are doing the work of the 'but also' — do you want the reader to feel that strain, or is it leaking?"),
+            ("children, who notice everything", "telling not showing",
+             "'not only' promises a 'but also' the list never grammatically completes — is the incompletion intentional?"),
+        ]
+        .into_iter()
+        .map(|(q, p, query)| Diagnosis {
+            quote: q.into(),
+            problem: p.into(),
+            query: query.into(),
+            level: "line".into(),
+        })
+        .collect();
+        let anns = to_annotations(&self.doc.text(), demos, self.doc.notes(), 0);
+        self.doc.add_diagnoses(anns);
+        self.drafting = false; // reviewing: the editor's cards are shown
+        if let Some(n) = self.doc.notes().open().nth(2) {
+            self.active_note = Some(n.id);
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
     pub fn debug_cursor(&self) -> String {
         let cursor = self.cursor_offset();
         let tail_start = self.doc.rope().byte_to_char(cursor).saturating_sub(12);
@@ -8605,15 +8640,36 @@ impl Editor {
             };
             let desired =
                 f32::from(frame.bounds.origin.y) + f32::from(pos.y) - f32::from(frame.scroll_top);
-            let text_len = n.title.chars().count() + n.body.chars().count();
-            let lines = (text_len / 30 + 1).clamp(1, 4) as f32;
-            let height = 30. + 18. * lines + 22.;
+            let is_diag = n.kind == NoteKind::Diagnosis;
+            let active = self.active_note == Some(n.id);
+            // Estimate the rendered card height so the packer separates cards by
+            // their REAL extent, not a flat cap (the old `text_len/30` clamped to
+            // 4 lines under-measured tall cards → they overlapped). Bias toward
+            // OVER-estimating: an extra gap is invisible, an overlap is the bug.
+            // CPL = conservative chars-per-line at the ~222px inner width, 13px
+            // PT Serif. Components: padding+border, header row, wrapped title
+            // (diagnoses only), wrapped body — or composer room for an active note.
+            const CPL: f32 = 30.;
+            const LINE_H: f32 = 18.;
+            let wrap = |chars: usize| (chars as f32 / CPL).ceil().max(1.);
+            let mut height = 18. + 16.; // padding + border, header row
+            if is_diag && !n.title.is_empty() {
+                height += wrap(n.title.chars().count()) * LINE_H;
+            }
+            let body_chars = n.body.chars().count();
+            if active && !is_diag {
+                // The composer (a text input) stands in for the body; give it
+                // room to grow with what's already typed, min two lines.
+                height += wrap(body_chars).max(2.) * LINE_H + 10.;
+            } else if body_chars > 0 || !is_diag {
+                height += wrap(body_chars) * LINE_H;
+            }
             cards.push(MarginCard {
                 id: n.id,
                 top: desired,
                 height,
                 body: n.body.clone(),
-                active: self.active_note == Some(n.id),
+                active,
                 kind: n.kind,
                 title: n.title.clone(),
                 level: n.level.clone(),
@@ -9094,9 +9150,16 @@ impl Editor {
         }
         let frame = self.last_frame.as_ref()?;
         let col_right = f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
-        let cards = self.margin_cards();
+        let mut cards = self.margin_cards();
         if cards.is_empty() {
             return None;
+        }
+        // Paint the active card LAST so it sits ON TOP of any neighbour it
+        // overlaps (GPUI paints siblings in tree order). Tops are unchanged —
+        // this is purely z-order: "the selected annotation is always on top."
+        if let Some(i) = cards.iter().position(|c| c.active) {
+            let active = cards.remove(i);
+            cards.push(active);
         }
         let lane_left = col_right + MARGIN_GAP;
         Some(
