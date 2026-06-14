@@ -42,6 +42,13 @@ const NOTE_TINT: u32 = 0xE3B84926; // wheat/amber ~15% — Docs-trained intuitio
 const NOTE_TINT_ACTIVE: u32 = 0xE3B8494D; // ~30% when active
 const MARGIN_WIDTH: f32 = 248.;
 const MARGIN_GAP: f32 = 16.;
+/// The prose column's capped width — everything else (centering, the note
+/// lane, the narrow-width left-shift) is measured against it.
+const COL_MAX_WIDTH: f32 = 660.;
+/// Horizontal room the note lane needs to the right of the column: the gap,
+/// the lane itself, and the card's 8px inset. The column left-shifts (and the
+/// margin renders) only when this much space exists past `col_right`.
+const NOTE_LANE_TOTAL: f32 = MARGIN_GAP + MARGIN_WIDTH + 8.;
 /// History side panel (DESIGN §2-history): push, not overlay. The panel
 /// shrinks before the document does — prose keeps DOC_MIN_WIDTH.
 const HISTORY_PANEL_WIDTH: f32 = 320.;
@@ -483,6 +490,11 @@ pub struct Editor {
     pub voice_baseline: Option<strop_core::voice::Baseline>,
     /// In-card composer for the active note's body.
     note_input: Option<Entity<NoteInput>>,
+    /// Narrow-window notes drawer (DESIGN §narrow-margin): below ~932px even
+    /// a left-shifted column can't host the 248px lane, so the cards would
+    /// vanish. Instead a top-right pill shows the count (never silent) and
+    /// this toggles the drop-down panel that lists them.
+    narrow_notes_open: bool,
     /// Selection popover (DESIGN §2-toolbar): formatting rides the
     /// selection. Shown on mouse-up over a selection or via ctrl-.;
     /// dismissed by mousedown, typing, scrolling, or escape.
@@ -1111,6 +1123,7 @@ impl Editor {
             alt_input: None,
             voice_baseline: None,
             note_input: None,
+            narrow_notes_open: false,
             selection_popover: false,
             outline_open: false,
             next_intent: None,
@@ -5053,6 +5066,10 @@ impl Editor {
             self.selection_popover = false;
             cx.notify();
         }
+        if self.narrow_notes_open {
+            self.narrow_notes_open = false;
+            cx.notify();
+        }
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -8346,7 +8363,53 @@ impl Editor {
             return false;
         };
         let col_right = f32::from(frame.bounds.origin.x) + f32::from(frame.bounds.size.width);
-        vw >= col_right + MARGIN_GAP + MARGIN_WIDTH + 8.
+        vw >= col_right + NOTE_LANE_TOTAL
+    }
+
+    /// The door rail's count, when it has something to hold: drafting hides
+    /// the editor's diagnoses (shows "N resting"); reviewing suppresses
+    /// copy-level cards under an open developmental one ("N copy-level").
+    /// `None` means the rail stands down — a quiet margin.
+    fn margin_rail_count(&self) -> Option<usize> {
+        let n = if self.drafting {
+            self.resting_diagnoses()
+        } else {
+            self.suppressed_copy()
+        };
+        (n > 0).then_some(n)
+    }
+
+    /// Does anything want the right-hand note lane right now? An empty lane
+    /// never pulls the column off-centre — the left-shift is purely in the
+    /// service of cards that would otherwise have nowhere to go.
+    fn lane_has_content(&self) -> bool {
+        !self.margin_cards().is_empty()
+            || self.margin_rail_count().is_some()
+            || self.ai_status.is_some()
+            || self.next_intent.is_some()
+    }
+
+    /// Whether to bias the prose column left instead of centring it. The
+    /// outline/history panels already push the column this way (DESIGN
+    /// §1.6/§2-history); here the *note lane* does the pushing. We shift only
+    /// when the lane has content AND centring can't host it but a left-bias
+    /// can — so wide windows stay symmetric and only the medium band
+    /// (~932–1204px) gives up its left breathing room. Below the band even a
+    /// left-bias won't fit; the narrow drawer (render_narrow_notes) takes over
+    /// and the column stays centred for reading.
+    fn column_left_bias(&self, window: &Window) -> bool {
+        // History displaces the lane wholesale — no note lane to make room for.
+        if self.history_view.is_some() || !self.lane_has_content() {
+            return false;
+        }
+        let vw = f32::from(window.viewport_size().width);
+        let outline_w = self.outline_width(window);
+        let hist_w = self.history_panel_width(window);
+        let avail = (vw - outline_w - hist_w).max(0.);
+        let col_w = COL_MAX_WIDTH.min(avail);
+        let centred_right_gap = vw - (outline_w + (avail - col_w) / 2. + col_w);
+        let left_right_gap = vw - (outline_w + col_w);
+        centred_right_gap < NOTE_LANE_TOTAL && left_right_gap >= NOTE_LANE_TOTAL
     }
 
     /// Narrow-window composer: the margin (and its in-card composer) is
@@ -8893,17 +8956,10 @@ impl Editor {
         let lane_left = col_right + MARGIN_GAP + 8.;
         let top = BAR_HEIGHT + 8. + self.intent_banner_height();
         let drafting = self.drafting;
+        let n = self.margin_rail_count()?;
         let label = if drafting {
-            let n = self.resting_diagnoses();
-            if n == 0 {
-                return None;
-            }
             format!("{n} resting · open")
         } else {
-            let n = self.suppressed_copy();
-            if n == 0 {
-                return None;
-            }
             format!("{n} copy-level · after structure")
         };
         let styled = |d: gpui::Div| {
@@ -8941,6 +8997,257 @@ impl Editor {
             styled(div()).into_any_element()
         })
     }
+
+    /// How many lane items the narrow drawer should advertise: the visible
+    /// cards in reviewing, the door's held-back count in drafting.
+    fn narrow_notes_count(&self, cards: &[MarginCard]) -> usize {
+        if cards.is_empty() {
+            self.margin_rail_count().unwrap_or(0)
+        } else {
+            cards.len()
+        }
+    }
+
+    /// The always-visible feedback that notes EXIST when the window is too
+    /// narrow for the lane (DESIGN §narrow-margin): a count pill in the
+    /// column's empty top-padding band — never over prose. Clicking it
+    /// toggles the panel. Below ~932px this is the only thing standing
+    /// between the writer and "where did my diagnoses go?".
+    fn render_narrow_notes_pill(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if self.margin_fits(window) || self.history_view.is_some() {
+            return None;
+        }
+        let count = self.narrow_notes_count(&self.margin_cards());
+        if count == 0 {
+            return None;
+        }
+        let open = self.narrow_notes_open;
+        let noun = if count == 1 { "note" } else { "notes" };
+        // The diagnose feature's mini-card motif, so the pill rhymes with what
+        // it holds (a drawn outline — no PT-absent glyph, the atlas rule).
+        let mark = rgb(MUTED_COLOR);
+        Some(
+            div()
+                .id("narrow-notes-pill")
+                .absolute()
+                .top(px(BAR_HEIGHT + 6.))
+                .right(px(12.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(if open { rgb(0xC8A951) } else { rgb(RULE_COLOR) })
+                .bg(rgb(0xF7F5EF))
+                .cursor(CursorStyle::PointingHand)
+                .hover(|d| d.bg(rgb(0xEFEBE0)))
+                .font_family("PT Sans")
+                .text_size(px(11.))
+                .text_color(rgb(MUTED_COLOR))
+                .tooltip(tip("Window too narrow for the margin — show notes", None))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.narrow_notes_open = !editor.narrow_notes_open;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(12.))
+                        .h(px(10.))
+                        .rounded(px(2.))
+                        .border_1()
+                        .border_color(mark)
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap(px(1.5))
+                        .px(px(2.))
+                        .child(div().w(px(6.)).h(px(1.)).bg(mark))
+                        .child(div().w(px(4.)).h(px(1.)).bg(mark)),
+                )
+                .child(format!("{count} {noun}"))
+                .into_any_element(),
+        )
+    }
+
+    /// The narrow drawer's panel: the cards the lane can't show, stacked and
+    /// scrollable, dropped under the pill. Viewing only — editing a note still
+    /// lands in the bottom composer strip (render_composer_strip); clicking a
+    /// writer's note here opens that composer. In drafting the door is closed,
+    /// so the panel offers to open it instead of listing hidden diagnoses.
+    fn render_narrow_notes_panel(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.narrow_notes_open || self.margin_fits(window) || self.history_view.is_some() {
+            return None;
+        }
+        let cards = self.margin_cards();
+        if self.narrow_notes_count(&cards) == 0 {
+            return None;
+        }
+        let vw = f32::from(window.viewport_size().width);
+        let vh = f32::from(window.viewport_size().height);
+        let panel_w = (vw - 24.).min(340.);
+        let mut list = div()
+            .id("narrow-notes-list")
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .p(px(10.))
+            .max_h(px((vh * 0.6).max(120.)))
+            .overflow_y_scroll();
+        if cards.is_empty() {
+            // Drafting: the door holds the diagnoses back. Offer to open it,
+            // mirroring the wide-window rail (render_margin_rail).
+            let n = self.margin_rail_count().unwrap_or(0);
+            list = list.child(
+                div()
+                    .id("narrow-open-door")
+                    .cursor(CursorStyle::PointingHand)
+                    .px(px(6.))
+                    .py(px(6.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .bg(rgb(0xF7F5EF))
+                    .font_family("PT Sans")
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                    .tooltip(tip("Open the door — show the editor's notes", Some("ctrl-shift-r")))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.drafting = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(format!("{n} resting — open the door")),
+            );
+        } else {
+            for card in &cards {
+                list = list.child(self.narrow_note_card(card, cx));
+            }
+        }
+        Some(
+            div()
+                .absolute()
+                .top(px(BAR_HEIGHT + 34.))
+                .right(px(12.))
+                .w(px(panel_w))
+                .bg(rgb(0xFCFAF4))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .rounded(px(8.))
+                .shadow_lg()
+                .text_color(rgb(TEXT_COLOR))
+                // Contained like the palette: clicks/scroll stay inside.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    /// One card in the narrow drawer: the same content the margin shows, in a
+    /// stacked (non-absolute) box. No inline composer — a writer's note opens
+    /// the bottom strip on click; diagnoses are read-only here as everywhere.
+    fn narrow_note_card(&self, card: &MarginCard, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let MarginCard { id, body, kind, title, level, .. } = card;
+        let (id, kind) = (*id, *kind);
+        let is_diagnosis = kind == NoteKind::Diagnosis;
+        let label = if is_diagnosis {
+            if level.is_empty() { "Diagnosis".to_owned() } else { level.clone() }
+        } else {
+            "Note".to_owned()
+        };
+        let body = body.clone();
+        let title = title.clone();
+        div()
+            .id(("narrow-note", id as usize))
+            .p(px(8.))
+            .rounded(px(6.))
+            .bg(rgb(0xFFFDF6))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .cursor(CursorStyle::PointingHand)
+            .font_family("PT Serif")
+            .text_size(px(13.))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let note = editor.doc.notes().get(id);
+                    if note.is_some_and(|n| n.kind == NoteKind::Note) {
+                        let body = note.map(|n| n.body.clone()).unwrap_or_default();
+                        editor.open_composer(id, body, window, cx);
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child(label)
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .id(("narrow-done", id as usize))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.set_note_status(id, NoteStatus::Done, cx);
+                                        }),
+                                    )
+                                    .child("done"),
+                            )
+                            .child(
+                                div()
+                                    .id(("narrow-dismiss", id as usize))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.set_note_status(id, NoteStatus::Dismissed, cx);
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    ),
+            )
+            .when(is_diagnosis && !title.is_empty(), |d| {
+                d.child(div().font_weight(FontWeight::BOLD).child(title.clone()))
+            })
+            .child(if body.is_empty() && !is_diagnosis {
+                div().text_color(rgb(MUTED_COLOR)).child("(empty note)")
+            } else {
+                div().child(body.clone())
+            })
+            .into_any_element()
+    }
 }
 
 impl Render for Editor {
@@ -8951,6 +9258,9 @@ impl Render for Editor {
         let hist_panel_w = self.history_panel_width(window);
         // The outline rail pushes from the left the same way (DESIGN §1.6).
         let outline_w = self.outline_width(window);
+        // Narrow windows that can't centre the note lane bias the column left
+        // to reclaim the space (the same push the panels above use).
+        let left_bias = self.column_left_bias(window);
         // Client-side resize handles (H2): only when the compositor left us
         // to draw our own decorations (GNOME Wayland always does).
         let resize_tiling = match window.window_decorations() {
@@ -8982,7 +9292,7 @@ impl Render for Editor {
                     .flex_1()
                     .min_h(px(0.))
                     .flex()
-                    .justify_center()
+                    .map(|d| if left_bias { d.justify_start() } else { d.justify_center() })
                     .overflow_hidden()
                     .when(hist_panel_w > 0., |d| d.pr(px(hist_panel_w)))
                     .when(outline_w > 0., |d| d.pl(px(outline_w)))
@@ -9175,8 +9485,18 @@ impl Render for Editor {
                 Some(whisper) => d.child(whisper),
                 None => d,
             })
+            // Narrow-window notes: the count pill (low — just feedback) and,
+            // when toggled, the drop-down panel (high — an explicit overlay).
+            .map(|d| match self.render_narrow_notes_pill(window, cx) {
+                Some(pill) => d.child(pill),
+                None => d,
+            })
             .map(|d| match self.render_selection_popover(window, cx) {
                 Some(popover) => d.child(popover),
+                None => d,
+            })
+            .map(|d| match self.render_narrow_notes_panel(window, cx) {
+                Some(panel) => d.child(panel),
                 None => d,
             })
             // Last children = topmost: the palette, the keyboard map and
