@@ -6716,13 +6716,66 @@ impl Editor {
     /// The selection popover (DESIGN §2-toolbar, Medium lineage): formatting
     /// rides the selection. An in-surface GPUI overlay — never a Wayland
     /// xdg_popup (Zed's documented popup fragility under wlroots).
+    /// The formatting tools — inline marks, the heading ladder, footnote — in
+    /// document order, grouped by a divider. `vertical` lays them out as the
+    /// gutter-float's column; otherwise as the fallback popover's row. Same
+    /// buttons either way; only the divider rotates.
+    fn format_tools(&self, vertical: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let divider = || {
+            if vertical {
+                div().h(px(1.)).w(px(18.)).my(px(3.)).bg(rgb(RULE_COLOR))
+            } else {
+                popover_divider()
+            }
+        };
+        div()
+            .flex()
+            .map(|d| {
+                if vertical {
+                    d.flex_col().items_center().gap(px(1.))
+                } else {
+                    d.items_center().justify_center().gap(px(1.))
+                }
+            })
+            // Group 1 — inline marks.
+            .child(self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx))
+            .child(self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx))
+            .child(self.format_button(
+                "S",
+                InlineAttr::Strikethrough,
+                "Strikethrough",
+                Some("ctrl-shift-x"),
+                cx,
+            ))
+            .child(self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx))
+            .child(self.format_button(
+                "==",
+                InlineAttr::Highlight,
+                "Highlight",
+                Some("ctrl-shift-h"),
+                cx,
+            ))
+            .child(divider())
+            // Group 2 — headings, the full ladder.
+            .child(self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx))
+            .child(self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx))
+            .child(self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx))
+            .child(divider())
+            // Group 3 — footnote.
+            .child(self.footnote_button(cx))
+    }
+
+    /// Formatting rides the selection (DESIGN §2-toolbar) — but "the text I'm
+    /// writing is sacred": covering even a sliver of prose with chrome is the
+    /// last resort. So the toolbar floats VERTICALLY in the empty left gutter,
+    /// aligned to the selection's line, never over the words. Only when there
+    /// is no gutter to hold it (a narrow or left-shifted window) does it fall
+    /// back to the horizontal popover that does float above the line.
     fn render_selection_popover(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        const POPOVER_W: f32 = 300.;
-        const POPOVER_H: f32 = 30.;
         if !self.selection_popover
             || self.selected_range.is_empty()
             || self.is_selecting
@@ -6738,18 +6791,60 @@ impl Editor {
         let line_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
             + f32::from(par.line_height) * line as f32
             - f32::from(frame.scroll_top);
+        let line_h = f32::from(par.line_height);
         let viewport = window.viewport_size();
-        let left = (f32::from(frame.bounds.origin.x) + f32::from(x) - POPOVER_W / 2.)
-            .clamp(8., (f32::from(viewport.width) - POPOVER_W - 8.).max(8.));
-        // Above the selection start; below its line when the titlebar is in
-        // the way; clamped on-screen either way.
+        let vw = f32::from(viewport.width);
+        let vh = f32::from(viewport.height);
+        let col_left = f32::from(frame.bounds.origin.x);
+        let outline_w = self.outline_width(window);
+
+        // Gutter-float: a vertical toolbar hugging the column's left edge, in
+        // the empty margin. Needs a gutter wide enough to hold it — the note
+        // lane lives on the RIGHT, so the left gutter never collides with a
+        // card. Estimate the stack height to keep it on-screen.
+        const GUTTER_W: f32 = 44.;
+        const GUTTER_TOOLBAR_H: f32 = 252.;
+        let left_gutter = col_left - outline_w;
+        if left_gutter >= GUTTER_W + 14. {
+            let top = line_top.clamp(BAR_HEIGHT + 8., (vh - GUTTER_TOOLBAR_H - 8.).max(BAR_HEIGHT + 8.));
+            let left = (col_left - 12. - GUTTER_W).max(outline_w + 6.);
+            return Some(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(GUTTER_W))
+                    .bg(rgb(0xFCFAF4))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .rounded(px(8.))
+                    .shadow_md()
+                    .py(px(5.))
+                    .px(px(1.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .font_family("PT Serif")
+                    .text_size(px(13.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(self.format_tools(true, cx)),
+            );
+        }
+
+        // Fallback (narrow / left-shifted window — no gutter): the horizontal
+        // popover above the selection start, dropping below its line when the
+        // titlebar is in the way, clamped on-screen either way.
+        const POPOVER_W: f32 = 300.;
+        const POPOVER_H: f32 = 30.;
+        let left = (col_left + f32::from(x) - POPOVER_W / 2.)
+            .clamp(8., (vw - POPOVER_W - 8.).max(8.));
         let above = line_top - POPOVER_H - 8.;
         let top = if above >= BAR_HEIGHT + 4. {
             above
         } else {
-            line_top + f32::from(par.line_height) + 8.
+            line_top + line_h + 8.
         }
-        .clamp(BAR_HEIGHT + 4., f32::from(viewport.height) - POPOVER_H - 8.);
+        .clamp(BAR_HEIGHT + 4., vh - POPOVER_H - 8.);
         Some(
             div()
                 .absolute()
@@ -6766,38 +6861,12 @@ impl Editor {
                 .flex()
                 .items_center()
                 .justify_center()
-                .gap(px(1.))
                 .font_family("PT Serif")
                 .text_size(px(13.))
                 // Clicks on the popover chrome must not reach the canvas —
                 // they would collapse the very selection being formatted.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                // Group 1 — inline marks.
-                .child(self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx))
-                .child(self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx))
-                .child(self.format_button(
-                    "S",
-                    InlineAttr::Strikethrough,
-                    "Strikethrough",
-                    Some("ctrl-shift-x"),
-                    cx,
-                ))
-                .child(self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx))
-                .child(self.format_button(
-                    "==",
-                    InlineAttr::Highlight,
-                    "Highlight",
-                    Some("ctrl-shift-h"),
-                    cx,
-                ))
-                .child(popover_divider())
-                // Group 2 — headings, the full ladder.
-                .child(self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx))
-                .child(self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx))
-                .child(self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx))
-                .child(popover_divider())
-                // Group 3 — footnote.
-                .child(self.footnote_button(cx)),
+                .child(self.format_tools(false, cx)),
         )
     }
 
