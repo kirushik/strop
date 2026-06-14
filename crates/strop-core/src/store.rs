@@ -776,6 +776,46 @@ mod tests {
     }
 
     #[test]
+    fn note_draft_persists_without_commit_and_skips_undo() {
+        use crate::document::Document;
+        // The keystroke-durability fix: an open composer's draft is mirrored
+        // onto the note (set_note_body_draft) by the idle heartbeat, with no
+        // Enter-commit. It must reach disk, and it must NOT push its own undo
+        // state (or every keystroke would become a ctrl-z stop).
+        let path = temp_path("note-draft");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+
+        let mut doc = Document::new("", SpanSet::default(), BlockMap::default());
+        doc.edit_bytes_coalescing(0..0, "body");
+        let id = doc.add_note(0..4, String::new(), 0);
+        store.apply(&doc.take_ops());
+        doc.set_note_body_draft(id, "half-typed thought".into());
+        store
+            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200), doc.notes())
+            .unwrap();
+
+        // The uncommitted draft is on disk after reload.
+        let (_store2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.annotations.notes().len(), 1);
+        assert_eq!(loaded.annotations.notes()[0].body, "half-typed thought");
+
+        // The draft pushed no undo state: undoing once reverts the add_note
+        // (removing the note), not a body edit that would leave it behind.
+        let mut d = Document::new("", SpanSet::default(), BlockMap::default());
+        let nid = d.add_note(0..0, String::new(), 0);
+        d.set_note_body_draft(nid, "draft".into());
+        d.undo().unwrap();
+        assert!(
+            d.notes().notes().is_empty(),
+            "the draft path must not push its own undo state"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn typing_and_substitutions_mirror_exactly() {
         let path = temp_path("typograph");
         let _ = fs::remove_file(&path);

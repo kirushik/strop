@@ -739,6 +739,9 @@ impl Render for NoteInput {
             .border_color(rgb(RULE_COLOR))
             .text_size(px(13.))
             .text_color(rgb(TEXT_COLOR))
+            // Single-line field: clip rather than let a long line escape the
+            // box; the element below scrolls itself to keep the caret in view.
+            .overflow_hidden()
             .child(NoteInputElement { input: cx.entity() })
     }
 }
@@ -848,19 +851,17 @@ impl Element for NoteInputElement {
         );
         if let Some(line) = line.take() {
             let cursor_x = line.width;
-            line.paint(
-                bounds.origin,
-                window.line_height(),
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            )
-            .ok();
+            // Single-line field: when the text outgrows the box, scroll it
+            // left so the caret rides the right edge instead of spilling past
+            // the card (Image-1 bug). The parent clips the overflow.
+            let shift = (cursor_x - bounds.size.width + px(2.)).max(px(0.));
+            let origin = point(bounds.origin.x - shift, bounds.origin.y);
+            line.paint(origin, window.line_height(), TextAlign::Left, None, window, cx)
+                .ok();
             if focus_handle.is_focused(window) {
                 window.paint_quad(fill(
                     Bounds::new(
-                        bounds.origin + point(cursor_x, px(2.)),
+                        origin + point(cursor_x, px(2.)),
                         size(px(1.5), window.line_height() - px(4.)),
                     ),
                     rgb(TEXT_COLOR),
@@ -1133,7 +1134,13 @@ impl Editor {
                 cx.background_executor()
                     .timer(Duration::from_millis(1000))
                     .await;
-                let alive = this.update(cx, |editor: &mut Editor, _| {
+                let alive = this.update(cx, |editor: &mut Editor, cx| {
+                    // Keystroke-durability for the open note composer: mirror
+                    // its live draft onto the note every tick so a crash never
+                    // loses what's been typed. Every other field in the app is
+                    // already keystroke-durable; the composer was the lone
+                    // RAM-only one (it wrote to the doc only on Enter-commit).
+                    editor.sync_active_note_draft(cx);
                     if editor.store_dirty && editor.last_input.elapsed() >= Duration::from_secs(1)
                     {
                         editor.save_now();
@@ -1156,6 +1163,14 @@ impl Editor {
         .detach();
     }
 
+    /// The single "the document changed, it must be saved" chokepoint. Every
+    /// mutation site routes through here instead of poking `store_dirty`
+    /// directly, so no field can silently skip persistence the way the note
+    /// composer once did. Keep this the ONLY place that sets the flag true.
+    fn mark_dirty(&mut self) {
+        self.store_dirty = true;
+    }
+
     /// Fan buffer changes out to every offset-tracking consumer (formatting
     /// spans, durable store). Must run after every mutation.
     fn sync_mutations(&mut self) {
@@ -1164,16 +1179,38 @@ impl Editor {
             return;
         }
         self.word_count = count_words(self.doc.rope().chunks());
-        if let Some(store) = &self.store {
-            store.apply(&ops);
-            self.store_dirty = true;
-            self.dirty_since_checkpoint = true;
-            self.session_had_edits = true;
-            // The first edit honors the open-time intent: the banner has
-            // done its job and clears itself (DESIGN §4.1).
-            if self.next_intent.take().is_some() {
-                crate::files::clear_intent(store.path());
+        // Apply to the store and capture its path before releasing the borrow,
+        // so the dirty-flag chokepoint (mark_dirty) can take &mut self.
+        let intent_path = match &self.store {
+            Some(store) => {
+                store.apply(&ops);
+                store.path().to_path_buf()
             }
+            None => return,
+        };
+        self.mark_dirty();
+        self.dirty_since_checkpoint = true;
+        self.session_had_edits = true;
+        // The first edit honors the open-time intent: the banner has done its
+        // job and clears itself (DESIGN §4.1).
+        if self.next_intent.take().is_some() {
+            crate::files::clear_intent(&intent_path);
+        }
+    }
+
+    /// Mirror the open note composer's draft onto the note so the idle-save
+    /// heartbeat persists it like any other keystroke. No-op (and no dirty
+    /// flag) while the body is unchanged, so an idle composer doesn't force a
+    /// save every tick; undo boundaries stay on the Enter-commit path.
+    fn sync_active_note_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.active_note else { return };
+        let Some(input) = self.note_input.as_ref() else {
+            return;
+        };
+        let body = input.read(cx).content.clone();
+        if self.doc.note_body(id).is_some_and(|cur| cur != body.as_str()) {
+            self.doc.set_note_body_draft(id, body);
+            self.mark_dirty();
         }
     }
 
@@ -1274,7 +1311,7 @@ impl Editor {
             let name = format!("Checkpoint {}", store.checkpoints().len() + 1);
             store.add_checkpoint(&name, true);
             self.dirty_since_checkpoint = false;
-            self.store_dirty = true;
+            self.mark_dirty();
             eprintln!("strop: recorded \"{name}\"");
         }
         cx.notify();
@@ -1491,7 +1528,7 @@ impl Editor {
                             caption: caption.clone(),
                         },
                     );
-                    editor.store_dirty = true;
+                    editor.mark_dirty();
                 }
                 editor.alt_input = None;
                 window.focus(&editor.focus_handle, cx);
@@ -1518,7 +1555,7 @@ impl Editor {
                 {
                     if let Some(store) = &editor.store {
                         store.rename_checkpoint(ix, name.trim());
-                        editor.store_dirty = true;
+                        editor.mark_dirty();
                     }
                     if let Some(hv) = &mut editor.history_view
                         && let Some(e) = hv.entries.get_mut(ix)
@@ -1577,7 +1614,7 @@ impl Editor {
         self.caret_attrs.clear();
         self.exit_history(cx);
         self.sync_mutations();
-        self.store_dirty = true;
+        self.mark_dirty();
         self.bump_activity();
         cx.notify();
     }
@@ -1673,7 +1710,7 @@ impl Editor {
         self.goal_x = None;
         self.caret_attrs.clear();
         self.sync_mutations();
-        self.store_dirty = true;
+        self.mark_dirty();
         self.bump_activity();
         cx.notify();
     }
@@ -1886,7 +1923,7 @@ impl Editor {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let id = self.doc.add_note(char_range, String::new(), now);
-        self.store_dirty = true;
+        self.mark_dirty();
         self.open_composer(id, String::new(), window, cx);
         self.bump_activity();
         cx.notify();
@@ -1908,7 +1945,7 @@ impl Editor {
                 match event {
                     NoteInputEvent::Commit(body) => {
                         editor.doc.set_note_body(id, body.clone());
-                        editor.store_dirty = true;
+                        editor.mark_dirty();
                     }
                     NoteInputEvent::Cancel => {}
                 }
@@ -1930,7 +1967,7 @@ impl Editor {
             self.active_note = None;
             self.note_input = None;
         }
-        self.store_dirty = true;
+        self.mark_dirty();
         self.bump_activity();
         cx.notify();
     }
@@ -2093,7 +2130,7 @@ impl Editor {
                         );
                         let kept = annotations.len();
                         editor.doc.add_diagnoses(annotations);
-                        editor.store_dirty = true;
+                        editor.mark_dirty();
                         // Silent success is the second invisibility bug:
                         // 0 anchored must be said out loud.
                         editor.ai_status = Some(AiStatus::Note {
@@ -3144,7 +3181,7 @@ impl Editor {
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.sync_mutations();
-        self.store_dirty = true;
+        self.mark_dirty();
         // Land on what is now the match at the same index.
         let matches = self.find_matches(&query);
         if !matches.is_empty() {
@@ -3178,7 +3215,7 @@ impl Editor {
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.sync_mutations();
-        self.store_dirty = true;
+        self.mark_dirty();
         self.find_current = 0;
         eprintln!("strop: replaced {count} matches");
         self.bump_activity();
@@ -3366,7 +3403,7 @@ impl Editor {
         let range =
             rope.byte_to_char(self.selected_range.start)..rope.byte_to_char(self.selected_range.end);
         self.doc.toggle_format(range, attr);
-        self.store_dirty = true;
+        self.mark_dirty();
         cx.notify();
     }
 
@@ -3697,7 +3734,7 @@ impl Editor {
                 let block = self.doc.block_of_byte(cursor);
                 if *self.doc.blocks().kind(block) != BlockKind::Paragraph {
                     self.doc.set_block_kind(block, BlockKind::Paragraph);
-                    self.store_dirty = true;
+                    self.mark_dirty();
                     self.bump_activity();
                     cx.notify();
                     return;
@@ -4616,7 +4653,7 @@ impl Editor {
         for block in start_block + 1..=end_block {
             self.doc.set_block_kind_in_current_tx(block, target.clone());
         }
-        self.store_dirty = true;
+        self.mark_dirty();
         self.bump_activity();
         cx.notify();
     }
@@ -4753,7 +4790,7 @@ impl Editor {
             return;
         };
         let src = store.put_asset(imported.bytes, imported.ext);
-        self.store_dirty = true;
+        self.mark_dirty();
         let cursor = self.cursor_offset().min(self.doc.len_bytes());
         let (_, par_end) = self.paragraph_bounds(cursor);
         self.doc.edit_bytes(par_end..par_end, "\n");
@@ -8287,6 +8324,19 @@ impl Editor {
                 }
             }
         }
+        // Floor the lane: a card whose anchor scrolled up under the titlebar
+        // (or whose neighbours pushed it there) must never paint over the
+        // window controls or the intent banner. Push the stack down past that
+        // line, preserving order and gaps. Without this an active card near
+        // the top lands on the close button (Image-3 bug).
+        let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
+        let mut bottom = floor;
+        for card in cards.iter_mut() {
+            if card.top < bottom {
+                card.top = bottom;
+            }
+            bottom = card.top + card.height + MARGIN_GAP;
+        }
         cards
     }
 
@@ -8502,8 +8552,19 @@ impl Editor {
                 // Idle hint, only in the wide margin and only when the
                 // margin is otherwise empty (the intent banner counts —
                 // that one sentence should open the session alone).
+                // The door rail (render_margin_rail) claims the same top-of-
+                // lane slot whenever it's holding something back; in drafting
+                // that happens with zero visible cards, so margin_cards being
+                // empty isn't enough — check the rail's own condition too, or
+                // the hint paints straight over it (Image-4 bug).
+                let rail_showing = if self.drafting {
+                    self.resting_diagnoses() > 0
+                } else {
+                    self.suppressed_copy() > 0
+                };
                 if !fits
                     || !self.margin_cards().is_empty()
+                    || rail_showing
                     || self.doc.len_bytes() == 0
                     || self.next_intent.is_some()
                 {
@@ -8698,6 +8759,7 @@ impl Editor {
                         .left(px(if active { 0. } else { 8. }))
                         .w(px(MARGIN_WIDTH - 8.))
                         .p(px(8.))
+                        .overflow_hidden()
                         .rounded(px(6.))
                         .bg(rgb(0xFFFDF6))
                         .border_1()

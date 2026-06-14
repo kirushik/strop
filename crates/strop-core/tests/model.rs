@@ -25,7 +25,7 @@ use proptest::prelude::*;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
 
 use strop_core::Store;
-use strop_core::document::{BlockKind, BlockMap, Document, InlineAttr, SpanSet};
+use strop_core::document::{BlockKind, BlockMap, Document, InlineAttr, NoteStatus, SpanSet};
 use strop_core::markdown::{from_markdown, to_markdown};
 use strop_core::typograph::{Lang, process};
 
@@ -84,6 +84,13 @@ enum Transition {
     DeleteRange { start: usize, end: usize },
     ToggleSpan { start: usize, end: usize, attr: InlineAttr },
     SetBlockKind { block: usize, kind: BlockKind },
+    /// Margin notes are persisted state too — and they were the one field
+    /// that wasn't keystroke-durable, so the model now drives them: each is
+    /// its own undoable transaction (add/edit-body/set-status), and the
+    /// invariant check asserts the count survives every op and every undo.
+    AddNote { start: usize, end: usize, body: String },
+    SetNoteBody { index: usize, body: String },
+    SetNoteStatus { index: usize, done: bool },
     Undo,
     Redo,
     /// Check-only: serialize → parse → compare, when the current document
@@ -97,8 +104,13 @@ enum Transition {
 #[derive(Clone, Debug, Default)]
 struct RefModel {
     text: String,
-    undo: Vec<String>,
-    redo: Vec<String>,
+    /// Number of notes that exist (any status — dismissing keeps the record).
+    /// Carried alongside the text in the undo/redo stacks so a note add/edit
+    /// undoes in lockstep with the real Document and the count oracle never
+    /// drifts.
+    note_count: usize,
+    undo: Vec<(String, usize)>,
+    redo: Vec<(String, usize)>,
 }
 
 impl RefModel {
@@ -132,6 +144,9 @@ impl ReferenceStateMachine for RefMachine {
     fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
         let len = state.len_chars();
         let lines = state.lines();
+        // Index into the existing notes (empty range collapses to `0`, which
+        // the precondition then rejects when there are no notes yet).
+        let note_ix = 0usize..=state.note_count.saturating_sub(1);
         prop_oneof![
             3 => (0..=len, small_text()).prop_map(|(pos, s)| Transition::InsertChars { pos, s }),
             2 => (0..=len, 0..=len).prop_map(|(a, b)| Transition::DeleteRange {
@@ -143,6 +158,15 @@ impl ReferenceStateMachine for RefMachine {
             }),
             2 => (0..lines, block_kind())
                 .prop_map(|(block, kind)| Transition::SetBlockKind { block, kind }),
+            2 => (0..=len, 0..=len, small_text()).prop_map(|(a, b, body)| Transition::AddNote {
+                start: a.min(b),
+                end: a.max(b),
+                body,
+            }),
+            1 => (note_ix.clone(), small_text())
+                .prop_map(|(index, body)| Transition::SetNoteBody { index, body }),
+            1 => (note_ix, any::<bool>())
+                .prop_map(|(index, done)| Transition::SetNoteStatus { index, done }),
             1 => Just(Transition::Undo),
             1 => Just(Transition::Redo),
             1 => Just(Transition::MarkdownRoundtrip),
@@ -159,6 +183,9 @@ impl ReferenceStateMachine for RefMachine {
             Transition::DeleteRange { start, end } => start < end && *end <= len,
             Transition::ToggleSpan { start, end, .. } => start < end && *end <= len,
             Transition::SetBlockKind { block, .. } => *block < state.lines(),
+            Transition::AddNote { start, end, .. } => start < end && *end <= len,
+            Transition::SetNoteBody { index, .. } => *index < state.note_count,
+            Transition::SetNoteStatus { index, .. } => *index < state.note_count,
             _ => true,
         }
     }
@@ -166,30 +193,43 @@ impl ReferenceStateMachine for RefMachine {
     fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
         match transition {
             Transition::InsertChars { pos, s } => {
-                state.undo.push(state.text.clone());
+                state.undo.push((state.text.clone(), state.note_count));
                 state.redo.clear();
                 let b = state.char_to_byte(*pos);
                 state.text.insert_str(b, s);
             }
             Transition::DeleteRange { start, end } => {
-                state.undo.push(state.text.clone());
+                state.undo.push((state.text.clone(), state.note_count));
                 state.redo.clear();
                 let (bs, be) = (state.char_to_byte(*start), state.char_to_byte(*end));
                 state.text.replace_range(bs..be, "");
             }
-            Transition::ToggleSpan { .. } | Transition::SetBlockKind { .. } => {
-                // Format-only transaction: text unchanged, undo point taken.
-                state.undo.push(state.text.clone());
+            Transition::ToggleSpan { .. }
+            | Transition::SetBlockKind { .. }
+            | Transition::SetNoteBody { .. }
+            | Transition::SetNoteStatus { .. } => {
+                // Text-preserving transaction: text and count unchanged, undo
+                // point taken (each gets its own transaction in Document).
+                state.undo.push((state.text.clone(), state.note_count));
                 state.redo.clear();
             }
+            Transition::AddNote { .. } => {
+                state.undo.push((state.text.clone(), state.note_count));
+                state.redo.clear();
+                state.note_count += 1;
+            }
             Transition::Undo => {
-                if let Some(prev) = state.undo.pop() {
-                    state.redo.push(std::mem::replace(&mut state.text, prev));
+                if let Some((prev_text, prev_notes)) = state.undo.pop() {
+                    let cur_text = std::mem::replace(&mut state.text, prev_text);
+                    state.redo.push((cur_text, state.note_count));
+                    state.note_count = prev_notes;
                 }
             }
             Transition::Redo => {
-                if let Some(next) = state.redo.pop() {
-                    state.undo.push(std::mem::replace(&mut state.text, next));
+                if let Some((next_text, next_notes)) = state.redo.pop() {
+                    let cur_text = std::mem::replace(&mut state.text, next_text);
+                    state.undo.push((cur_text, state.note_count));
+                    state.note_count = next_notes;
                 }
             }
             Transition::MarkdownRoundtrip => {}
@@ -457,6 +497,30 @@ impl StateMachineTest for DocTest {
                 sut.shadow_redo.clear();
                 sut.doc.set_block_kind(*block, kind.clone());
             }
+            Transition::AddNote { start, end, body } => {
+                sut.shadow_undo.push(triple(&sut.doc));
+                sut.shadow_redo.clear();
+                sut.doc.add_note(*start..*end, body.clone(), 0);
+            }
+            Transition::SetNoteBody { index, body } => {
+                // Preconditions keep `index` inside the live note slice, and
+                // the oracle's count tracks undo exactly, so this never panics.
+                let id = sut.doc.notes().notes()[*index].id;
+                sut.shadow_undo.push(triple(&sut.doc));
+                sut.shadow_redo.clear();
+                sut.doc.set_note_body(id, body.clone());
+            }
+            Transition::SetNoteStatus { index, done } => {
+                let id = sut.doc.notes().notes()[*index].id;
+                sut.shadow_undo.push(triple(&sut.doc));
+                sut.shadow_redo.clear();
+                let status = if *done {
+                    NoteStatus::Done
+                } else {
+                    NoteStatus::Dismissed
+                };
+                sut.doc.set_note_status(id, status);
+            }
             Transition::Undo => {
                 let expected = sut.shadow_undo.pop();
                 let before = triple(&sut.doc);
@@ -551,6 +615,24 @@ impl StateMachineTest for DocTest {
             sut.doc.rope().len_lines(),
             "block map misaligned with lines"
         );
+
+        // 4. Notes: every add survives, dismissing keeps the record, and
+        // each one undoes in lockstep — so the count tracks the oracle
+        // through arbitrary edit/undo/redo sequences. Anchors stay clamped
+        // inside the text as edits shift them.
+        let notes = sut.doc.notes().notes();
+        assert_eq!(
+            notes.len(),
+            ref_state.note_count,
+            "note count diverged from the model"
+        );
+        for n in notes {
+            assert!(
+                n.range.start <= n.range.end && n.range.end <= len_chars,
+                "note anchor out of bounds: {:?} (len {len_chars})",
+                n.range
+            );
+        }
     }
 
     fn teardown(

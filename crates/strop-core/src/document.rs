@@ -412,6 +412,13 @@ impl Annotations {
                 if n.range.end > op.pos {
                     n.range.end += ins;
                 }
+                // A zero-width anchor sitting exactly at the insertion point
+                // would advance its start (>=) but not its end (>), inverting
+                // the range. Keep the boundaries ordered. (Caught by the
+                // notes property test.)
+                if n.range.end < n.range.start {
+                    n.range.end = n.range.start;
+                }
             }
         }
         self.notes.sort_by_key(|n| n.range.start);
@@ -555,6 +562,20 @@ impl Document {
         self.undo_states.push(snapshot);
         self.redo_states.clear();
         self.notes.set_body(id, body);
+    }
+
+    /// Mirror an in-progress composer draft onto the note without disturbing
+    /// the undo stack: the keystroke autosave path (Editor heartbeat) writes
+    /// here every tick so a crash mid-compose never loses the draft, while
+    /// undo boundaries stay tied to the Enter-commit in `set_note_body`.
+    pub fn set_note_body_draft(&mut self, id: u64, body: String) {
+        self.notes.set_body(id, body);
+    }
+
+    /// Current persisted body of a note, for change-detection on the draft
+    /// autosave path (skip the write — and the dirty flag — when unchanged).
+    pub fn note_body(&self, id: u64) -> Option<&str> {
+        self.notes.get(id).map(|n| n.body.as_str())
     }
 
     /// Add a batch of diagnoses as ONE undoable transaction (one ctrl-z
