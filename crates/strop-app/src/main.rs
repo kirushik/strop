@@ -14,8 +14,8 @@ mod tutorial;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations,
-    WindowOptions, actions, prelude::*, px, size,
+    App, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, actions, prelude::*, px, size,
 };
 use strop_core::Store;
 use strop_core::document::{BlockMap, SpanSet};
@@ -238,6 +238,11 @@ fn main() {
                 // window with neither (GNOME Wayland does no server-side
                 // decorations — the H2 "can't resize by dragging" bug).
                 window_decorations: Some(WindowDecorations::Client),
+                // Transparent surface so the CSD shadow gutter (editor.rs:
+                // render) shows through on the untiled edges. Opaque platforms
+                // (macOS/Windows/X11/SSD) ignore the gutter and the OS draws
+                // the shadow; this only affects the Wayland CSD path.
+                window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
             |window, cx| {

@@ -2,8 +2,20 @@
 
 > Why Strop's window has no visible edge on Wayland, what "best practice"
 > actually is per platform, and exactly what gpui (pinned rev `992f395`)
-> gives us to fix it. Decision from this round: **research-only** — implement
-> in a later pass. This is the spec for that pass.
+> gives us to fix it.
+>
+> **Status: IMPLEMENTED (2026-06-14).** `editor.rs` `render` wraps the content
+> in the shadow gutter under `Decorations::Client`; `main.rs` sets
+> `WindowBackgroundAppearance::Transparent`. Verified on a *floating* sway
+> window (the headless rig tiles by default — `WSHOT_FLOAT=WxH` floats it):
+> rounded corners + soft shadow + hairline border, every frame-anchored overlay
+> (margin card, gutter toolbar, pill) still pixel-aligned to the column —
+> `set_client_inset` keeps the geometry correct, exactly as §5 predicted. The
+> notes below are the spec it was built from. One deviation: the resize affordance
+> reuses the existing discrete `resize_handles` strips on the outer backdrop
+> rather than Zed's `canvas`-based cursor tracking, because the project bans raw
+> `canvas` (draw-pass discipline) — so the shadow band resizes but shows no
+> resize cursor. Acceptable; revisit if it grates.
 
 ## 1. The symptom
 

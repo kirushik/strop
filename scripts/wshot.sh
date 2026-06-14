@@ -13,6 +13,14 @@ CFG=$(mktemp)
 # given window WIDTH: WSHOT_MODE=1100x800 exercises the narrow-margin left-shift
 # band, 850x800 the too-narrow notes pill.
 printf 'output HEADLESS-1 mode %s\noutput HEADLESS-1 scale %s\n' "${WSHOT_MODE:-1600x1200}" "$SCALE" > "$CFG"
+# WSHOT_FLOAT=WxH floats the window at that size instead of tiling it to fill
+# the output — the only way to exercise client-side decorations (the shadow
+# gutter / rounded corners are suppressed on tiled edges). Leaves a gap around
+# the window so grim captures the gutter + shadow.
+if [ -n "$WSHOT_FLOAT" ]; then
+  FW="${WSHOT_FLOAT%x*}"; FH="${WSHOT_FLOAT#*x}"
+  printf 'for_window [title=".*Strop"] floating enable, resize set %s %s, move position center\n' "$FW" "$FH" >> "$CFG"
+fi
 rm -f /tmp/strop-wshot.log
 WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
   sway -c "$CFG" > /tmp/sway.log 2>&1 &

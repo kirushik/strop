@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    AnyView, App, Bounds, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
-    Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, RenderImage,
+    AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
+    Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     Pixels, Point, ResizeEdge, ScrollWheelEvent, SharedString, StrikethroughStyle, Style,
@@ -68,6 +68,13 @@ const RULE_COLOR: u32 = 0xE8E4DC;
 /// shift every overlay's window-origin coordinates); the top band doubling
 /// as a resize handle over the titlebar is the conventional CSD behavior.
 const RESIZE_INSET: f32 = 8.;
+/// Client-side decoration shadow gutter (docs/research/window-decorations-csd.md):
+/// on Wayland CSD the compositor draws no shadow, so the window blends into the
+/// desktop. We reserve a transparent margin on each untiled edge and paint our
+/// own soft shadow + rounded corners + hairline border into it. Matches Zed's
+/// values; `set_client_inset` keeps hit-testing and overlay geometry correct.
+const CSD_SHADOW: f32 = 10.;
+const CSD_ROUNDING: f32 = 10.;
 
 /// A small hover tooltip: a control's name and, optionally, its chord in a
 /// mono chip (DESIGN §0 — every titlebar control should teach its shortcut).
@@ -9551,13 +9558,19 @@ impl Render for Editor {
         // Narrow windows that can't centre the note lane bias the column left
         // to reclaim the space (the same push the panels above use).
         let left_bias = self.column_left_bias(window);
-        // Client-side resize handles (H2): only when the compositor left us
-        // to draw our own decorations (GNOME Wayland always does).
-        let resize_tiling = match window.window_decorations() {
-            Decorations::Client { tiling } => Some(tiling),
-            Decorations::Server => None,
+        // Client-side decorations (H2 / window-decorations-csd.md): when the
+        // compositor leaves us our own chrome (GNOME/sway Wayland always do),
+        // we draw both the resize border AND the shadow gutter (below).
+        // set_client_inset tells the platform how far the content is inset so
+        // hit-testing and overlay geometry stay correct.
+        let decorations = window.window_decorations();
+        let tiling = match decorations {
+            Decorations::Client { tiling } => tiling,
+            Decorations::Server => Tiling::default(),
         };
-        div()
+        let client = matches!(decorations, Decorations::Client { .. });
+        window.set_client_inset(px(if client { CSD_SHADOW } else { 0. }));
+        let content = div()
             .size_full()
             .relative()
             .bg(rgb(BG_COLOR))
@@ -9800,14 +9813,61 @@ impl Render for Editor {
             .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
             .when(self.ai_settings.is_some(), |d| {
                 d.child(self.render_ai_settings(cx))
-            })
-            // Resize handles are the literal topmost layer: the window must
-            // stay resizable from its edges even with a modal panel open
-            // (an OS gesture, not an app layer — DESIGN §0.6 is about input
-            // focus, not window chrome).
-            .when_some(resize_tiling, |d, tiling| {
-                d.children(resize_handles(tiling))
-            })
+            });
+
+        // CSD chrome (window-decorations-csd.md): the content sits in an inner
+        // surface inset by the shadow gutter on each untiled edge, with a soft
+        // drop shadow, rounded corners and a hairline border — the visible
+        // window boundary GNOME/sway Wayland never draw. Server decorations
+        // (macOS/Windows/X11) get none of it; the OS draws the shadow. Resize
+        // handles ride the OUTER backdrop so the border stays grabbable
+        // through the gutter (an OS gesture, topmost even under a modal).
+        let inset = |t: bool| px(if client && !t { CSD_SHADOW } else { 0. });
+        let floating = client && !tiling.top && !tiling.bottom && !tiling.left && !tiling.right;
+        div()
+            .size_full()
+            .relative()
+            .bg(rgba(0x00000000))
+            .child(
+                div()
+                    .absolute()
+                    .top(inset(tiling.top))
+                    .bottom(inset(tiling.bottom))
+                    .left(inset(tiling.left))
+                    .right(inset(tiling.right))
+                    .overflow_hidden()
+                    .when(client, |d| {
+                        d.border_color(rgb(RULE_COLOR))
+                            .when(!tiling.top, |d| d.border_t_1())
+                            .when(!tiling.bottom, |d| d.border_b_1())
+                            .when(!tiling.left, |d| d.border_l_1())
+                            .when(!tiling.right, |d| d.border_r_1())
+                            .when(!tiling.top && !tiling.left, |d| {
+                                d.rounded_tl(px(CSD_ROUNDING))
+                            })
+                            .when(!tiling.top && !tiling.right, |d| {
+                                d.rounded_tr(px(CSD_ROUNDING))
+                            })
+                            .when(!tiling.bottom && !tiling.left, |d| {
+                                d.rounded_bl(px(CSD_ROUNDING))
+                            })
+                            .when(!tiling.bottom && !tiling.right, |d| {
+                                d.rounded_br(px(CSD_ROUNDING))
+                            })
+                            .when(floating, |d| {
+                                d.shadow(vec![
+                                    BoxShadow::new(
+                                        px(0.),
+                                        px(2.),
+                                        Hsla { h: 0., s: 0., l: 0., a: 0.35 },
+                                    )
+                                    .blur_radius(px(CSD_SHADOW)),
+                                ])
+                            })
+                    })
+                    .child(content),
+            )
+            .when(client, |d| d.children(resize_handles(tiling)))
     }
 }
 
