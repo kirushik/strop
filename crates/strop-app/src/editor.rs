@@ -356,6 +356,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-insert", NotePaste, Some("PaletteInput")),
         KeyBinding::new("up", PaletteUp, Some("PaletteInput")),
         KeyBinding::new("down", PaletteDown, Some("PaletteInput")),
+        // Find mode: tab hops to the replace field, ctrl-h summons it. Both
+        // bubble to the root's on_action handlers (the omnibox lives outside
+        // the Editor key context, like the bottom strips it replaced).
+        KeyBinding::new("tab", NoteTab, Some("PaletteInput")),
+        KeyBinding::new("ctrl-h", Replace, Some("PaletteInput")),
         // The AI settings panel's fields (F4): tab cycles, enter commits
         // (test, or pick from the model list), up/down walk the list,
         // ctrl-enter saves, escape closes.
@@ -449,9 +454,9 @@ pub struct Editor {
     /// ctrl-m notes are NEVER hidden — the door quiets the editor, not the
     /// writer's marginalia. In-memory (per session), no stored mode.
     drafting: bool,
-    /// Find bar (ctrl-f): live-highlighting query input; Enter advances.
-    find_input: Option<Entity<NoteInput>>,
-    /// The command palette (PLAN.md E1): the menu, summoned not mounted.
+    /// The omnibox (DESIGN §2-omnibox, PLAN.md E1): one summoned-not-mounted
+    /// top-centre field that finds (plain), runs commands (`>`) or jumps to
+    /// headings (`@`). `palette_*` is its backing state across all modes.
     palette_input: Option<Entity<NoteInput>>,
     palette_selected: usize,
     /// Mirror of the palette query (debug_cursor has no `cx` to read the
@@ -478,9 +483,9 @@ pub struct Editor {
     /// Bumped on every panel-spawned request and on close, so a stale
     /// test/list response from a closed panel is dropped silently.
     ai_settings_generation: u64,
-    find_current: usize,
-    /// Replace field (ctrl-h adds it beside find): Enter on it replaces
-    /// the current match; the All button replaces every match (one undo).
+    /// Replace field (ctrl-h adds it under the omnibox query): Enter on it
+    /// replaces the current match; the All button replaces every match (one
+    /// undo). The current-match index is `palette_selected` (find mode).
     replace_input: Option<Entity<NoteInput>>,
     /// Rename-in-place for a history row: (entry index, composer).
     rename_input: Option<(usize, Entity<NoteInput>)>,
@@ -574,13 +579,6 @@ impl NoteInput {
             marked: None,
             key_context: "NoteInput",
             masked: false,
-        }
-    }
-
-    fn for_palette(cx: &mut Context<Self>) -> Self {
-        Self {
-            key_context: "PaletteInput",
-            ..Self::new(cx, String::new())
         }
     }
 
@@ -1105,7 +1103,6 @@ impl Editor {
             ai_generation: 0,
             diagnosis_mode: None,
             last_pass_believing: false,
-            find_input: None,
             palette_input: None,
             palette_selected: 0,
             palette_query: String::new(),
@@ -1117,7 +1114,6 @@ impl Editor {
             shortcuts_open: false,
             ai_settings: None,
             ai_settings_generation: 0,
-            find_current: 0,
             replace_input: None,
             rename_input: None,
             alt_input: None,
@@ -2700,53 +2696,114 @@ impl Editor {
         self.set_diagnosis_mode("copy", cx);
     }
 
+    /// The omnibox (DESIGN §2-omnibox): one top-centre field, prefix-
+    /// dispatched — plain text finds, `>` runs a command, `@` jumps to a
+    /// heading. `palette_input` is its field; the `palette_*` machinery is
+    /// shared across all three modes. `initial` seeds the query (and so the
+    /// mode): "" = find, ">" = command, "@" = heading.
+    fn open_omni(&mut self, initial: String, window: &mut Window, cx: &mut Context<Self>) {
+        // A fresh field every open (the old entity drops); PaletteInput
+        // context gives it up/down row motion and the editing chords.
+        let input = cx.new(|cx| NoteInput {
+            key_context: "PaletteInput",
+            ..NoteInput::new(cx, initial.clone())
+        });
+        cx.observe(&input, |editor, input, cx| {
+            let q = input.read(cx).content.clone();
+            editor.palette_query = q.clone();
+            editor.palette_selected = 0; // query changed: selection restarts
+            // Find previews live — the match scrolls into view as you type,
+            // behind the omnibox (this is what dissolves the old bottom-strip
+            // "match hidden under the find field" bug).
+            if matches!(omni_mode(&q).0, OmniMode::Find) {
+                editor.omni_apply_match(0, cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, input, event: &NoteInputEvent, window, cx| match event {
+                NoteInputEvent::Commit(_) => {
+                    let q = input.read(cx).content.clone();
+                    // Find: Enter cycles to the next match, bar stays open.
+                    // Command/heading: Enter runs the selected row and closes.
+                    if matches!(omni_mode(&q).0, OmniMode::Find) {
+                        editor.omni_find_next(cx);
+                    } else {
+                        editor.execute_palette_entry(&q, editor.palette_selected, window, cx);
+                    }
+                }
+                NoteInputEvent::Cancel => editor.close_palette(window, cx),
+            },
+        )
+        .detach();
+        let input_focus = input.read(cx).focus_handle.clone();
+        window.focus(&input_focus, cx);
+        self.palette_input = Some(input);
+        self.replace_input = None;
+        self.palette_selected = 0;
+        self.palette_query = initial.clone();
+        // Read once per open, not per keystroke; executions write through to
+        // disk AND to this copy, so the session stays self-consistent.
+        self.palette_freq = crate::files::load_palette_freq();
+        if !initial.is_empty() && matches!(omni_mode(&initial).0, OmniMode::Find) {
+            self.omni_apply_match(0, cx);
+        }
+        cx.notify();
+    }
+
+    /// ctrl-f / the titlebar search pill: the omnibox in find mode, seeded
+    /// with the selection so "select, ctrl-f" searches for it.
     fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
         let seed = if self.selected_range.is_empty() {
             String::new()
         } else {
             self.doc.slice_bytes(self.selected_range.clone())
         };
-        let input = cx.new(|cx| NoteInput::new(cx, seed));
-        cx.observe(&input, |_, _, cx| cx.notify()).detach();
-        cx.subscribe_in(
-            &input,
-            window,
-            |editor, input, event: &NoteInputEvent, window, cx| match event {
-                NoteInputEvent::Commit(_) => {
-                    // Enter: jump to the next match, keep the bar open.
-                    let query = input.read(cx).content.clone();
-                    let matches = editor.find_matches(&query);
-                    if matches.is_empty() {
-                        return;
-                    }
-                    editor.find_current = (editor.find_current + 1) % matches.len();
-                    let m = matches[editor.find_current].clone();
-                    editor.selected_range = m;
-                    editor.selection_reversed = false;
-                    editor.bump_activity();
-                    cx.notify();
-                    let _ = window; // focus stays on the bar
-                }
-                NoteInputEvent::Cancel => {
-                    editor.find_input = None;
-                    editor.replace_input = None;
-                    window.focus(&editor.focus_handle, cx);
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
-        let input_focus = input.read(cx).focus_handle.clone();
-        window.focus(&input_focus, cx);
-        self.find_input = Some(input);
-        self.find_current = 0;
+        self.open_omni(seed, window, cx);
+    }
+
+    /// The find-mode match ranges for the current query (empty otherwise).
+    /// Case-insensitive (first-lowercase-char folding — exact for RU/EN,
+    /// approximate for ß-class expansions).
+    fn omni_match_ranges(&self) -> Vec<Range<usize>> {
+        match omni_mode(&self.palette_query) {
+            (OmniMode::Find, rest) => self.find_matches(rest),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Move the document selection to the ix-th find match and scroll it into
+    /// view (live preview for type / arrow / Enter / click). No-op off find
+    /// mode or with no matches.
+    fn omni_apply_match(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let matches = self.omni_match_ranges();
+        if matches.is_empty() {
+            return;
+        }
+        let ix = ix.min(matches.len() - 1);
+        self.palette_selected = ix;
+        self.selected_range = matches[ix].clone();
+        self.selection_reversed = false;
+        self.bump_activity();
         cx.notify();
     }
 
-    /// Case-insensitive (first-lowercase-char folding — exact for RU/EN,
-    /// approximate for ß-class expansions) match positions in byte ranges.
-    /// Tab in the find/replace bar hops between the two fields (the
-    /// action bubbles up from the NoteInput context to the editor).
+    /// Enter in find mode: advance to the next match, wrapping.
+    fn omni_find_next(&mut self, cx: &mut Context<Self>) {
+        let matches = self.omni_match_ranges();
+        if matches.is_empty() {
+            return;
+        }
+        let next = (self.palette_selected + 1) % matches.len();
+        self.omni_apply_match(next, cx);
+    }
+
+    /// Tab hops between the omnibox query field and the replace field (the
+    /// action bubbles up from the PaletteInput/NoteInput context to here),
+    /// and cycles the AI settings panel's fields.
     fn note_tab(&mut self, _: &NoteTab, window: &mut Window, cx: &mut Context<Self>) {
         // AI settings panel: tab cycles base URL → key → model → base URL.
         if let Some(panel) = &self.ai_settings {
@@ -2760,60 +2817,37 @@ impl Editor {
             cx.notify();
             return;
         }
-        let (Some(find), Some(rep)) = (self.find_input.clone(), self.replace_input.clone())
+        let (Some(omni), Some(rep)) = (self.palette_input.clone(), self.replace_input.clone())
         else {
             return;
         };
-        if find.read(cx).focus_handle.is_focused(window) {
+        if omni.read(cx).focus_handle.is_focused(window) {
             let h = rep.read(cx).focus_handle.clone();
             window.focus(&h, cx);
         } else {
-            let h = find.read(cx).focus_handle.clone();
+            let h = omni.read(cx).focus_handle.clone();
             window.focus(&h, cx);
         }
         cx.notify();
     }
 
-    /// ctrl-shift-p / F10 / the titlebar menu button: the command palette.
-    /// Every command the app has, searchable, with its chord on the row —
-    /// this is the menu bar of a chrome-minimal editor (PLAN.md E1).
+    /// ctrl-shift-p / F10 / the titlebar menu button: the omnibox in command
+    /// mode — every command the app has, searchable, chord on the row (the
+    /// menu bar of a chrome-minimal editor, PLAN.md E1). Already in command
+    /// mode → close; in another mode → switch to it; closed → open.
     fn toggle_palette(&mut self, _: &TogglePalette, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette_input.is_some() {
+        if self.palette_input.is_some()
+            && matches!(omni_mode(&self.palette_query).0, OmniMode::Command)
+        {
             self.close_palette(window, cx);
             return;
         }
-        let input = cx.new(NoteInput::for_palette);
-        cx.observe(&input, |editor, input, cx| {
-            editor.palette_selected = 0; // query changed: selection restarts
-            editor.palette_query = input.read(cx).content.clone();
-            cx.notify();
-        })
-        .detach();
-        cx.subscribe_in(
-            &input,
-            window,
-            |editor, input, event: &NoteInputEvent, window, cx| match event {
-                NoteInputEvent::Commit(_) => {
-                    let query = input.read(cx).content.clone();
-                    editor.execute_palette_entry(&query, editor.palette_selected, window, cx);
-                }
-                NoteInputEvent::Cancel => editor.close_palette(window, cx),
-            },
-        )
-        .detach();
-        let input_focus = input.read(cx).focus_handle.clone();
-        window.focus(&input_focus, cx);
-        self.palette_input = Some(input);
-        self.palette_selected = 0;
-        self.palette_query.clear();
-        // Read once per open, not per keystroke; executions write through
-        // to disk AND to this copy, so the session stays self-consistent.
-        self.palette_freq = crate::files::load_palette_freq();
-        cx.notify();
+        self.open_omni(">".into(), window, cx);
     }
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_input = None;
+        self.replace_input = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -2900,33 +2934,76 @@ impl Editor {
     /// palette is both the menu and the door to the other essays. The
     /// empty state opens with a Frequent section (DESIGN §3.3): the five
     /// most-executed commands, which repeat in their home sections below.
-    fn palette_rows(&self, query: &str) -> Vec<PaletteRow> {
-        let mut rows: Vec<PaletteRow> = Vec::new();
-        if query.trim().is_empty() {
-            rows.extend(
-                crate::commands::frequent(&self.palette_freq)
-                    .into_iter()
-                    .map(PaletteRow::Frequent),
-            );
-        }
-        rows.extend(
-            crate::commands::ranked_with_freq(query, &self.palette_freq)
+    /// The rows for the current query, dispatched by prefix mode: find
+    /// matches (with a line snippet), commands + frequent + recents, or
+    /// headings filtered by the same fuzzy matcher.
+    fn omni_rows(&self, query: &str) -> Vec<OmniRow> {
+        let (mode, rest) = omni_mode(query);
+        match mode {
+            OmniMode::Find => self
+                .find_matches(rest)
                 .into_iter()
-                .map(PaletteRow::Cmd),
-        );
-        let current = self.store.as_ref().map(|s| s.path().to_owned());
-        for p in crate::files::recents() {
-            if Some(&p) == current.as_ref() {
-                continue;
-            }
-            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if query.trim().is_empty()
-                || crate::commands::score_text(query.trim(), name).is_some()
-            {
-                rows.push(PaletteRow::Recent(p));
+                .take(100)
+                .map(|range| {
+                    let line = self.doc.rope().byte_to_line(range.start.min(self.doc.len_bytes()));
+                    OmniRow::Match {
+                        line,
+                        snippet: self.omni_line_snippet(line),
+                    }
+                })
+                .collect(),
+            OmniMode::Heading => self
+                .outline_items()
+                .into_iter()
+                .filter(|(_, _, text, _)| {
+                    rest.is_empty() || crate::commands::score_text(rest, text).is_some()
+                })
+                .map(|(_, level, text, byte)| OmniRow::Heading { byte, level, text })
+                .collect(),
+            OmniMode::Command => {
+                let mut rows: Vec<OmniRow> = Vec::new();
+                if rest.trim().is_empty() {
+                    rows.extend(
+                        crate::commands::frequent(&self.palette_freq)
+                            .into_iter()
+                            .map(OmniRow::Frequent),
+                    );
+                }
+                rows.extend(
+                    crate::commands::ranked_with_freq(rest, &self.palette_freq)
+                        .into_iter()
+                        .map(OmniRow::Cmd),
+                );
+                let current = self.store.as_ref().map(|s| s.path().to_owned());
+                for p in crate::files::recents() {
+                    if Some(&p) == current.as_ref() {
+                        continue;
+                    }
+                    let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if rest.trim().is_empty()
+                        || crate::commands::score_text(rest.trim(), name).is_some()
+                    {
+                        rows.push(OmniRow::Recent(p));
+                    }
+                }
+                rows
             }
         }
-        rows
+    }
+
+    /// A trimmed, length-capped preview of a document line, for find rows.
+    fn omni_line_snippet(&self, line: usize) -> String {
+        let rope = self.doc.rope();
+        if line >= rope.len_lines() {
+            return String::new();
+        }
+        let raw: String = rope.line(line).chars().take(160).collect();
+        let trimmed = raw.trim();
+        let mut s: String = trimmed.chars().take(80).collect();
+        if trimmed.chars().count() > 80 {
+            s.push('…');
+        }
+        s
     }
 
     fn execute_palette_entry(
@@ -2936,12 +3013,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let rows = self.palette_rows(query);
+        let rows = self.omni_rows(query);
         let Some(row) = rows.get(ix) else {
             return;
         };
         match row {
-            PaletteRow::Cmd(cmd) | PaletteRow::Frequent(cmd) => {
+            OmniRow::Cmd(cmd) | OmniRow::Frequent(cmd) => {
                 let cmd = *cmd;
                 let action = (cmd.make)();
                 // Frequency writes through on every execution (DESIGN
@@ -2954,10 +3031,20 @@ impl Editor {
                 self.close_palette(window, cx);
                 window.dispatch_action(action, cx);
             }
-            PaletteRow::Recent(path) => {
+            OmniRow::Recent(path) => {
                 let path = path.clone();
                 self.close_palette(window, cx);
                 crate::files::open_in_new_window(&path);
+            }
+            OmniRow::Match { .. } => {
+                // Clicking/selecting a find row jumps to it and keeps the
+                // omnibox open (find is iterative — Esc commits).
+                self.omni_apply_match(ix, cx);
+            }
+            OmniRow::Heading { byte, .. } => {
+                let byte = *byte;
+                self.close_palette(window, cx);
+                self.set_cursor(byte.min(self.doc.len_bytes()), false, cx);
             }
         }
     }
@@ -2994,30 +3081,46 @@ impl Editor {
     }
 
     fn palette_up(&mut self, _: &PaletteUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.palette_selected = self.palette_selected.saturating_sub(1);
-        cx.notify();
+        let sel = self.palette_selected.saturating_sub(1);
+        // Find mode previews the row live (selection + scroll); the others
+        // just move the highlight.
+        if matches!(omni_mode(&self.palette_query).0, OmniMode::Find) {
+            self.omni_apply_match(sel, cx);
+        } else {
+            self.palette_selected = sel;
+            cx.notify();
+        }
     }
 
     fn palette_down(&mut self, _: &PaletteDown, _: &mut Window, cx: &mut Context<Self>) {
         let len = self
             .palette_input
             .as_ref()
-            .map_or(0, |i| self.palette_rows(&i.read(cx).content).len());
-        if len > 0 {
-            self.palette_selected = (self.palette_selected + 1).min(len - 1);
+            .map_or(0, |i| self.omni_rows(&i.read(cx).content).len());
+        if len == 0 {
+            return;
         }
-        cx.notify();
+        let sel = (self.palette_selected + 1).min(len - 1);
+        if matches!(omni_mode(&self.palette_query).0, OmniMode::Find) {
+            self.omni_apply_match(sel, cx);
+        } else {
+            self.palette_selected = sel;
+            cx.notify();
+        }
     }
 
-    fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
-        let input = self.palette_input.clone().expect("palette open");
+    fn render_omni(&self, cx: &Context<Self>) -> impl IntoElement {
+        let input = self.palette_input.clone().expect("omnibox open");
         let query = input.read(cx).content.clone();
-        let rows = self.palette_rows(&query);
+        let (mode, rest) = omni_mode(&query);
+        let rows = self.omni_rows(&query);
         let selected = self.palette_selected.min(rows.len().saturating_sub(1));
-        let grouped = query.trim().is_empty();
+        // Sections group only the command empty-state (Frequent / File / …);
+        // find and heading rows are flat.
+        let grouped = mode == OmniMode::Command && rest.trim().is_empty();
         let home = std::env::var("HOME").unwrap_or_default();
         let mut list = div()
-            .id("palette-list")
+            .id("omni-list")
             .max_h(px(420.))
             .overflow_y_scroll()
             .flex()
@@ -3025,49 +3128,56 @@ impl Editor {
             .pb(px(6.));
         let mut last_section = "";
         for (ix, row) in rows.iter().enumerate() {
-            let section = match row {
-                PaletteRow::Cmd(cmd) => cmd.section,
-                PaletteRow::Frequent(_) => "Frequent",
-                PaletteRow::Recent(_) => "Recent Documents",
-            };
-            if grouped && section != last_section {
-                last_section = section;
-                list = list.child(
-                    div()
-                        .px(px(12.))
-                        .pt(px(10.))
-                        .pb(px(2.))
-                        .text_size(px(10.))
-                        .text_color(rgb(MUTED_COLOR))
-                        .child(section.to_uppercase()),
-                );
-            }
-            let (label, right): (String, Option<String>) = match row {
-                PaletteRow::Cmd(cmd) | PaletteRow::Frequent(cmd) => {
-                    (cmd.label.to_owned(), cmd.keys.map(|k| k.to_owned()))
+            if grouped {
+                let section = match row {
+                    OmniRow::Cmd(cmd) => cmd.section,
+                    OmniRow::Frequent(_) => "Frequent",
+                    OmniRow::Recent(_) => "Recent Documents",
+                    _ => "",
+                };
+                if section != last_section {
+                    last_section = section;
+                    list = list.child(
+                        div()
+                            .px(px(12.))
+                            .pt(px(10.))
+                            .pb(px(2.))
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(section.to_uppercase()),
+                    );
                 }
-                PaletteRow::Recent(p) => {
-                    let stem = p
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("?")
-                        .to_owned();
+            }
+            // Left label, optional right detail, optional leading gutter
+            // (find's line number / heading's level indent).
+            let (label, right, lead): (String, Option<String>, Option<String>) = match row {
+                OmniRow::Cmd(cmd) | OmniRow::Frequent(cmd) => {
+                    (cmd.label.to_owned(), cmd.keys.map(|k| k.to_owned()), None)
+                }
+                OmniRow::Recent(p) => {
+                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_owned();
                     let dir = p
                         .parent()
                         .map(|d| d.display().to_string().replace(&home, "~"))
                         .unwrap_or_default();
-                    (stem, Some(dir))
+                    (stem, Some(dir), None)
+                }
+                OmniRow::Match { line, snippet, .. } => {
+                    (snippet.clone(), None, Some(format!("{}", line + 1)))
+                }
+                OmniRow::Heading { level, text, .. } => {
+                    let indent = "  ".repeat((*level as usize).saturating_sub(1));
+                    (format!("{indent}{text}"), Some(format!("H{level}")), None)
                 }
             };
             list = list.child(
                 div()
-                    .id(("palette-row", ix))
+                    .id(("omni-row", ix))
                     .px(px(12.))
                     .py(px(4.))
                     .flex()
-                    .justify_between()
                     .items_center()
-                    .gap(px(12.))
+                    .gap(px(10.))
                     .cursor(CursorStyle::PointingHand)
                     .when(ix == selected, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
@@ -3083,8 +3193,21 @@ impl Editor {
                             editor.execute_palette_entry(&q, ix, window, cx);
                         }),
                     )
+                    .when_some(lead, |d, lead| {
+                        d.child(
+                            div()
+                                .w(px(28.))
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED_COLOR))
+                                .child(lead),
+                        )
+                    })
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
                             .text_size(px(13.))
                             .text_color(rgb(TEXT_COLOR))
                             .child(label),
@@ -3092,9 +3215,10 @@ impl Editor {
                     .when_some(right, |d, right| {
                         d.child(
                             div()
+                                .flex_shrink_0()
                                 .text_size(px(11.))
                                 .text_color(rgb(MUTED_COLOR))
-                                .min_w(px(0.))
+                                .max_w(px(220.))
                                 .truncate()
                                 .child(right),
                         )
@@ -3102,15 +3226,36 @@ impl Editor {
             );
         }
         if rows.is_empty() {
+            let msg = match mode {
+                OmniMode::Find if rest.is_empty() => {
+                    "Type to find · > for commands · @ for headings"
+                }
+                OmniMode::Find => "No matches",
+                OmniMode::Heading => "No headings",
+                OmniMode::Command => "No matching command",
+            };
             list = list.child(
                 div()
                     .px(px(12.))
                     .py(px(8.))
                     .text_size(px(13.))
                     .text_color(rgb(MUTED_COLOR))
-                    .child("No matching command"),
+                    .child(msg),
             );
         }
+        // Find mode carries a match counter and (when ctrl-h was pressed) the
+        // replace field, right under the query — never a bottom strip, so a
+        // match can't scroll behind it.
+        let match_count = if mode == OmniMode::Find && !rest.is_empty() {
+            let n = rows.len();
+            Some(if n == 0 {
+                "0".to_owned()
+            } else {
+                format!("{}/{n}", selected + 1)
+            })
+        } else {
+            None
+        };
         div()
             .absolute()
             .top(px(BAR_HEIGHT + 6.))
@@ -3120,7 +3265,7 @@ impl Editor {
             .justify_center()
             .child(
                 div()
-                    .w(px(460.))
+                    .w(px(480.))
                     .bg(rgb(0xFCFAF4))
                     .border_1()
                     .border_color(rgb(RULE_COLOR))
@@ -3129,11 +3274,10 @@ impl Editor {
                     .font_family("PT Serif")
                     .flex()
                     .flex_col()
-                    // §0.6: clicks inside the palette stay in the palette
-                    // (rows handle their own); clicks outside reach the
-                    // document's handler, which light-dismisses it. The
-                    // wheel is contained the same way — the list scrolls,
-                    // the document behind it never does.
+                    // §0.6: clicks inside the omnibox stay in it (rows handle
+                    // their own); clicks outside reach the document's handler,
+                    // which light-dismisses it. The wheel is contained the
+                    // same way — the list scrolls, the document never does.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .child(
@@ -3141,15 +3285,64 @@ impl Editor {
                             .p(px(8.))
                             .border_b_1()
                             .border_color(rgb(RULE_COLOR))
-                            .child(input.clone()),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w(px(0.)).child(input.clone()))
+                            .when_some(match_count, |d, c| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(MUTED_COLOR))
+                                        .child(c),
+                                )
+                            }),
                     )
+                    .when_some(self.replace_input.clone(), |d, rep| {
+                        d.child(
+                            div()
+                                .p(px(8.))
+                                .border_b_1()
+                                .border_color(rgb(RULE_COLOR))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .text_size(px(13.))
+                                .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Replace"))
+                                .child(div().flex_1().min_w(px(0.)).child(rep))
+                                .child(
+                                    div()
+                                        .id("replace-all")
+                                        .flex_shrink_0()
+                                        .px(px(8.))
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .bg(rgb(0xE8DFC8))
+                                        .hover(|d| d.bg(rgb(0xDFD3B0)))
+                                        .text_size(px(12.))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                editor.replace_all(cx);
+                                            }),
+                                        )
+                                        .child("All"),
+                                ),
+                        )
+                    })
                     .child(list),
             )
     }
 
-    /// ctrl-h: ensure the find bar exists, add the replace field.
+    /// ctrl-h: open the omnibox in find mode (if not already there) and add
+    /// the replace field beneath the query.
     fn replace(&mut self, _: &Replace, window: &mut Window, cx: &mut Context<Self>) {
-        if self.find_input.is_none() {
+        let in_find = self.palette_input.is_some()
+            && matches!(omni_mode(&self.palette_query).0, OmniMode::Find);
+        if !in_find {
             self.find(&Find, window, cx);
         }
         if self.replace_input.is_some() {
@@ -3164,30 +3357,32 @@ impl Editor {
                 NoteInputEvent::Commit(replacement) => {
                     editor.replace_current(replacement.clone(), cx);
                 }
-                NoteInputEvent::Cancel => {
-                    editor.find_input = None;
-                    editor.replace_input = None;
-                    window.focus(&editor.focus_handle, cx);
-                    cx.notify();
-                }
+                NoteInputEvent::Cancel => editor.close_palette(window, cx),
             },
         )
         .detach();
+        // Already searching? Move focus to the new field so the replacement
+        // types straight in. Opened fresh (no query yet) → keep the query
+        // focused so the search term comes first.
+        if in_find {
+            let h = input.read(cx).focus_handle.clone();
+            window.focus(&h, cx);
+        }
         self.replace_input = Some(input);
         cx.notify();
     }
 
     /// Replace the current match and advance to the next.
     fn replace_current(&mut self, replacement: String, cx: &mut Context<Self>) {
-        let Some(find) = self.find_input.clone() else {
+        let (OmniMode::Find, query) = omni_mode(&self.palette_query) else {
             return;
         };
-        let query = find.read(cx).content.clone();
+        let query = query.to_owned();
         let matches = self.find_matches(&query);
         if matches.is_empty() {
             return;
         }
-        let ix = self.find_current % matches.len();
+        let ix = self.palette_selected % matches.len();
         let target = matches[ix].clone();
         self.doc.edit_bytes(target.clone(), &replacement);
         let cursor = target.start + replacement.len();
@@ -3198,8 +3393,8 @@ impl Editor {
         // Land on what is now the match at the same index.
         let matches = self.find_matches(&query);
         if !matches.is_empty() {
-            self.find_current = ix % matches.len();
-            self.selected_range = matches[self.find_current].clone();
+            self.palette_selected = ix % matches.len();
+            self.selected_range = matches[self.palette_selected].clone();
         }
         self.bump_activity();
         cx.notify();
@@ -3211,11 +3406,13 @@ impl Editor {
     /// edits run back-to-front so a single undo per edit would be tedious —
     /// instead snapshot once by funnelling through one transaction).
     fn replace_all(&mut self, cx: &mut Context<Self>) {
-        let (Some(find), Some(rep)) = (self.find_input.clone(), self.replace_input.clone())
-        else {
+        let Some(rep) = self.replace_input.clone() else {
             return;
         };
-        let query = find.read(cx).content.clone();
+        let (OmniMode::Find, query) = omni_mode(&self.palette_query) else {
+            return;
+        };
+        let query = query.to_owned();
         let replacement = rep.read(cx).content.clone();
         let matches = self.find_matches(&query);
         if matches.is_empty() {
@@ -3229,7 +3426,7 @@ impl Editor {
         self.selection_reversed = false;
         self.sync_mutations();
         self.mark_dirty();
-        self.find_current = 0;
+        self.palette_selected = 0;
         eprintln!("strop: replaced {count} matches");
         self.bump_activity();
         cx.notify();
@@ -3294,61 +3491,6 @@ impl Editor {
                 .text_size(px(13.))
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Alt text:"))
                 .child(div().flex_1().child(input)),
-        )
-    }
-
-    fn render_find_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let input = self.find_input.clone()?;
-        let query = input.read(cx).content.clone();
-        let count = self.find_matches(&query).len();
-        let label = if query.is_empty() {
-            String::new()
-        } else if count == 0 {
-            "no matches".into()
-        } else {
-            format!("{}/{count}", (self.find_current % count.max(1)) + 1)
-        };
-        Some(
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .bg(rgb(0xF4F1EA))
-                .border_t_1()
-                .border_color(rgb(RULE_COLOR))
-                .px(px(28.))
-                .py(px(8.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .font_family("PT Serif")
-                .text_size(px(13.))
-                .child(div().text_color(rgb(MUTED_COLOR)).child("Find:"))
-                .child(div().flex_1().child(input))
-                .child(div().text_color(rgb(MUTED_COLOR)).child(label))
-                .when_some(self.replace_input.clone(), |d, rep| {
-                    d.child(div().text_color(rgb(MUTED_COLOR)).child("›"))
-                        .child(div().flex_1().child(rep))
-                        .child(
-                            div()
-                                .id("replace-all")
-                                .px(px(8.))
-                                .py(px(1.))
-                                .rounded(px(4.))
-                                .cursor(CursorStyle::PointingHand)
-                                .bg(rgb(0xE8DFC8))
-                                .hover(|d| d.bg(rgb(0xDFD3B0)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        editor.replace_all(cx);
-                                    }),
-                                )
-                                .child("All"),
-                        )
-                }),
         )
     }
 
@@ -3999,11 +4141,8 @@ impl Editor {
             cx.notify();
             return;
         }
-        if self.find_input.is_some() || self.replace_input.is_some() {
-            self.find_input = None;
-            self.replace_input = None;
-            window.focus(&self.focus_handle, cx);
-            cx.notify();
+        if self.palette_input.is_some() {
+            self.close_palette(window, cx);
             return;
         }
         if self.history_view.is_some() {
@@ -5264,8 +5403,8 @@ impl Editor {
         if self.selection_popover {
             overlays.push("popover");
         }
-        if self.find_input.is_some() || self.replace_input.is_some() {
-            overlays.push("find");
+        if self.replace_input.is_some() {
+            overlays.push("replace");
         }
         if self.history_view.is_some() {
             overlays.push("history");
@@ -5280,7 +5419,6 @@ impl Editor {
             ]);
         }
         fields.extend(self.palette_input.clone());
-        fields.extend(self.find_input.clone());
         fields.extend(self.replace_input.clone());
         fields.extend(self.doc_rename_input.clone());
         fields.extend(self.note_input.clone());
@@ -5395,10 +5533,12 @@ impl Editor {
         // query (Frequent/ prefix marks the frequency section) and the
         // chord whisper's visibility window.
         if self.palette_input.is_some() {
-            let top = match self.palette_rows(&self.palette_query).into_iter().next() {
-                Some(PaletteRow::Frequent(cmd)) => Some(format!("Frequent/{}", cmd.label)),
-                Some(PaletteRow::Cmd(cmd)) => Some(cmd.label.to_owned()),
-                Some(PaletteRow::Recent(p)) => Some(format!("Recent/{}", p.display())),
+            let top = match self.omni_rows(&self.palette_query).into_iter().next() {
+                Some(OmniRow::Frequent(cmd)) => Some(format!("Frequent/{}", cmd.label)),
+                Some(OmniRow::Cmd(cmd)) => Some(cmd.label.to_owned()),
+                Some(OmniRow::Recent(p)) => Some(format!("Recent/{}", p.display())),
+                Some(OmniRow::Match { line, .. }) => Some(format!("Match/L{}", line + 1)),
+                Some(OmniRow::Heading { text, .. }) => Some(format!("Heading/{text}")),
                 None => None,
             };
             session += &format!(" palette_top={:?}", top.unwrap_or_default());
@@ -6116,12 +6256,15 @@ impl Element for EditorElement {
         };
         let find_matches: Vec<Range<usize>> = if in_history {
             diff_inserts.clone() // inserts reuse the sage tint
+        } else if editor.palette_input.is_some() {
+            // Tint every match while the omnibox is in find mode — the live
+            // preview the old bottom strip never gave.
+            match omni_mode(&editor.palette_query) {
+                (OmniMode::Find, rest) => editor.find_matches(rest),
+                _ => Vec::new(),
+            }
         } else {
-            editor
-                .find_input
-                .as_ref()
-                .map(|i| editor.find_matches(&i.read(cx).content))
-                .unwrap_or_default()
+            Vec::new()
         };
         // Open-annotation anchors (byte ranges, active, is_diagnosis):
         // notes tint; diagnoses underline quietly until activated.
@@ -7042,13 +7185,60 @@ impl Editor {
                         }
                     }),
             )
-            // The center is the window-drag handle and the visual breathing
-            // room: it pushes the right cluster to the edge.
+            // The centre holds the omnibox pill (DESIGN §2-omnibox): a
+            // search-field-shaped button, not a live field — "text is sacred",
+            // so the chrome only ever opens the real thing. The space around
+            // it stays the window-drag handle.
             .child(
                 div()
                     .flex_1()
                     .h_full()
-                    .on_mouse_down(MouseButton::Left, drag),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(12.))
+                    .on_mouse_down(MouseButton::Left, drag)
+                    .child(
+                        div()
+                            .id("omni-pill")
+                            .flex_1()
+                            .max_w(px(320.))
+                            .px(px(10.))
+                            .py(px(3.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(rgb(RULE_COLOR))
+                            .bg(rgb(0xFCFAF4))
+                            .cursor(CursorStyle::PointingHand)
+                            .when(self.palette_input.is_some(), |d| d.bg(rgb(0xF2EFE6)))
+                            .hover(|d| d.bg(rgb(0xF2EFE6)))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .tooltip(tip("Search · > commands · @ headings", Some("ctrl-f")))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.find(&Find, window, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child("Search"),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child("Ctrl F"),
+                            ),
+                    ),
             )
             // The core feature earns a seat in the chrome (E3-research's
             // deferred "titlebar diagnosis button — buttons teach chords").
@@ -8118,13 +8308,44 @@ fn auto_group_start(entries: &[HistoryEntry], ix: usize) -> usize {
     start
 }
 
-/// One palette row: a command from the registry, the same command worn
-/// as a "Frequent" badge (the empty state's top section, DESIGN §3.3),
-/// or a recent document.
-enum PaletteRow {
+/// The omnibox's three modes, chosen by the query's first character
+/// (DESIGN §2-omnibox): `>` runs a command, `@` jumps to a heading, anything
+/// else finds text. The prefix is stripped from the returned query slice
+/// (and a leading space after it trimmed for command/heading — find keeps
+/// every character, since spaces are searchable).
+#[derive(Clone, Copy, PartialEq)]
+enum OmniMode {
+    Find,
+    Command,
+    Heading,
+}
+
+fn omni_mode(query: &str) -> (OmniMode, &str) {
+    if let Some(rest) = query.strip_prefix('>') {
+        (OmniMode::Command, rest.trim_start())
+    } else if let Some(rest) = query.strip_prefix('@') {
+        (OmniMode::Heading, rest.trim_start())
+    } else {
+        (OmniMode::Find, query)
+    }
+}
+
+/// One omnibox row. Commands (and their "Frequent" badge, DESIGN §3.3) and
+/// recent documents are the command mode; a find match carries its range +
+/// a line snippet; a heading carries its byte offset + level.
+enum OmniRow {
     Cmd(&'static crate::commands::Command),
     Frequent(&'static crate::commands::Command),
     Recent(std::path::PathBuf),
+    Match {
+        line: usize,
+        snippet: String,
+    },
+    Heading {
+        byte: usize,
+        level: u8,
+        text: String,
+    },
 }
 
 /// The AI surface's state machine (PLAN.md E3). Status lives where the
@@ -9346,6 +9567,13 @@ impl Render for Editor {
             // outside the column's listener stack — actions from their
             // inputs bubble here.
             .on_action(cx.listener(Self::note_tab))
+            // The omnibox lives outside the Editor key context (it's a root
+            // overlay, like the strips it replaced), so its actions must be
+            // handled here to be reachable: replace (ctrl-h), and the row
+            // motion that PaletteInput's up/down keys dispatch.
+            .on_action(cx.listener(Self::replace))
+            .on_action(cx.listener(Self::palette_up))
+            .on_action(cx.listener(Self::palette_down))
             // §0.6 law 3 (click-outside) lives on the root so the whole
             // window counts as "outside", gutters and titlebar included.
             .on_mouse_down(
@@ -9534,10 +9762,6 @@ impl Render for Editor {
                     d
                 }
             })
-            .map(|d| match self.render_find_strip(cx) {
-                Some(strip) => d.child(strip),
-                None => d,
-            })
             .map(|d| match self.render_alt_strip() {
                 Some(strip) => d.child(strip),
                 None => d,
@@ -9568,10 +9792,10 @@ impl Render for Editor {
                 Some(panel) => d.child(panel),
                 None => d,
             })
-            // Last children = topmost: the palette, the keyboard map and
+            // Last children = topmost: the omnibox, the keyboard map and
             // the AI settings panel cover everything below.
             .when(self.palette_input.is_some(), |d| {
-                d.child(self.render_palette(cx))
+                d.child(self.render_omni(cx))
             })
             .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
             .when(self.ai_settings.is_some(), |d| {
