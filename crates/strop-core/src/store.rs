@@ -48,24 +48,9 @@ pub struct Checkpoint {
     pub manual: bool,
 }
 
-/// One token per block, newline-joined (block text never contains '\n').
-/// Wholesale-rebuilt at save, like marks.
-fn kind_token(kind: &BlockKind) -> String {
-    match kind {
-        BlockKind::Paragraph => "p".into(),
-        BlockKind::Heading(n) => format!("h{n}"),
-        BlockKind::Blockquote => "quote".into(),
-        BlockKind::ListItem { ordered, depth } => {
-            format!("li:{}:{depth}", if *ordered { "o" } else { "b" })
-        }
-        BlockKind::Divider => "div".into(),
-        BlockKind::CodeBlock { info } => format!("code:{info}"),
-        BlockKind::FootnoteDef { id } => format!("fn:{id}"),
-        // Image asset plumbing lands with B3; src survives the round trip.
-        BlockKind::Image { src, .. } => format!("img:{src}"),
-    }
-}
-
+/// Legacy reader for the pre-JSON newline-joined token format. Kept so old
+/// `.strop` files (and older Loro frontiers reached by `state_at`) still load;
+/// new saves write JSON (see `save_with_state`). One token per block.
 fn kind_from_token(token: &str) -> BlockKind {
     match token {
         "p" => BlockKind::Paragraph,
@@ -257,9 +242,13 @@ impl Store {
         }
         let blocks = match self.doc.get_map(BLOCKS_CONTAINER).get("kinds") {
             Some(v) => match v.into_value() {
-                Ok(LoroValue::String(tokens)) => {
-                    BlockMap::from_kinds(tokens.lines().map(kind_from_token).collect())
-                }
+                // JSON first; fall back to the legacy newline-joined token
+                // format so pre-existing .strop files and older Loro frontiers
+                // (read by state_at) still load.
+                Ok(LoroValue::String(s)) => match serde_json::from_str::<Vec<BlockKind>>(&s) {
+                    Ok(kinds) => BlockMap::from_kinds(kinds),
+                    Err(_) => BlockMap::from_kinds(s.lines().map(kind_from_token).collect()),
+                },
                 _ => BlockMap::default(),
             },
             None => BlockMap::default(),
@@ -396,13 +385,19 @@ impl Store {
             Err(e) => eprintln!("strop: encode annotations: {e}"),
         }
         self.rebuild_marks(spans);
-        let tokens: Vec<String> = blocks.kinds().iter().map(kind_token).collect();
-        if let Err(e) = self
-            .doc
-            .get_map(BLOCKS_CONTAINER)
-            .insert("kinds", tokens.join("\n"))
-        {
-            eprintln!("strop: persist blocks: {e}");
+        // Block kinds persist as JSON (like history/annotations/checkpoints in
+        // this file), not a newline-joined token stream: a '\n' or '\r' inside
+        // a CodeBlock.info / Image.src (reachable via .md import of an
+        // entity-encoded URL) used to desync the token count and silently
+        // collapse the whole BlockMap on reopen. JSON also carries Image
+        // alt/caption, which the token format dropped.
+        match serde_json::to_string(blocks.kinds()) {
+            Ok(json) => {
+                if let Err(e) = self.doc.get_map(BLOCKS_CONTAINER).insert("kinds", json) {
+                    eprintln!("strop: persist blocks: {e}");
+                }
+            }
+            Err(e) => eprintln!("strop: encode blocks: {e}"),
         }
         match serde_json::to_string(history) {
             Ok(json) => {
@@ -690,6 +685,96 @@ mod tests {
         assert!(store.get_asset(&kept_id).is_some(), "referenced asset kept");
         assert!(store.get_asset(&orphan_id).is_none(), "orphan collected");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn block_kind_metadata_with_newline_survives_roundtrip() {
+        use crate::document::BlockKind;
+        // A '\n' inside CodeBlock.info used to become a token boundary,
+        // desyncing the kind count and collapsing the BlockMap on reopen.
+        let path = temp_path("kind-newline");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("first\nsecond"); // two rope lines => two blocks
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::CodeBlock { info: "ru\nst".into() },
+            BlockKind::Heading(2),
+        ]);
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &blocks,
+                &History::default(),
+                &Annotations::default(),
+            )
+            .unwrap();
+        let (_s2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.blocks.len(), 2, "kind count must match rope lines");
+        assert_eq!(
+            loaded.blocks.kinds()[0],
+            BlockKind::CodeBlock { info: "ru\nst".into() },
+            "metadata field must round-trip intact"
+        );
+        assert_eq!(loaded.blocks.kinds()[1], BlockKind::Heading(2));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn image_alt_and_caption_survive_roundtrip() {
+        use crate::document::BlockKind;
+        // The token format dropped alt/caption; JSON persistence keeps the
+        // author-entered alt (a shipped editor writes it).
+        let path = temp_path("img-alt");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("img");
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "asset:abc.png".into(),
+            alt: "a kitten on a mat".into(),
+            caption: "fig 1".into(),
+        }]);
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &blocks,
+                &History::default(),
+                &Annotations::default(),
+            )
+            .unwrap();
+        let (_s2, loaded) = Store::open(&path).unwrap();
+        assert_eq!(
+            loaded.unwrap().blocks.kinds()[0],
+            BlockKind::Image {
+                src: "asset:abc.png".into(),
+                alt: "a kitten on a mat".into(),
+                caption: "fig 1".into(),
+            }
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_token_block_kinds_still_load() {
+        use crate::document::BlockKind;
+        // Backward compat: the legacy newline-joined token format must still
+        // parse via the read_state fallback.
+        assert_eq!(kind_from_token("p"), BlockKind::Paragraph);
+        assert_eq!(kind_from_token("h2"), BlockKind::Heading(2));
+        assert_eq!(
+            kind_from_token("img:asset:abc.png"),
+            BlockKind::Image {
+                src: "asset:abc.png".into(),
+                alt: String::new(),
+                caption: String::new(),
+            }
+        );
+        assert_eq!(
+            kind_from_token("code:rust"),
+            BlockKind::CodeBlock { info: "rust".into() }
+        );
+        // Unknown tokens degrade to Paragraph (never panic).
+        assert_eq!(kind_from_token("???"), BlockKind::Paragraph);
     }
 
     #[test]

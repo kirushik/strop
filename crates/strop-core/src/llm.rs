@@ -115,22 +115,15 @@ impl LlmClient {
             .header("Authorization", &format!("Bearer {}", self.api_key))
             .call()
             .map_err(|e| LlmError::Network(e.to_string()))?;
+        // http_status_as_error(false) means a 401/429/5xx arrives here as Ok;
+        // route it through the same error mapping chat() uses, so a bad key
+        // surfaces as Auth — not a misleading "empty model list".
+        let status = response.status().as_u16();
         let text = response
             .body_mut()
             .read_to_string()
             .map_err(|e| LlmError::Network(e.to_string()))?;
-        #[derive(Deserialize)]
-        struct Models {
-            #[serde(default)]
-            data: Vec<ModelEntry>,
-        }
-        #[derive(Deserialize)]
-        struct ModelEntry {
-            id: String,
-        }
-        let parsed: Models = serde_json::from_str(&text)
-            .map_err(|e| LlmError::Shape(format!("models list: {e}")))?;
-        Ok(parsed.data.into_iter().map(|m| m.id).collect())
+        parse_models_response(status, &text)
     }
 }
 
@@ -193,7 +186,7 @@ fn parse_chat_response(status: u16, text: &str) -> Result<String, LlmError> {
         return Err(LlmError::Provider(message));
     }
     let response =
-        parsed.map_err(|e| LlmError::Shape(format!("{e}; body: {}", &text[..text.len().min(200)])))?;
+        parsed.map_err(|e| LlmError::Shape(format!("{e}; body: {}", body_preview(text))))?;
     response
         .choices
         .into_iter()
@@ -201,6 +194,63 @@ fn parse_chat_response(status: u16, text: &str) -> Result<String, LlmError> {
         .map(|c| c.message.content)
         .filter(|c| !c.is_empty())
         .ok_or_else(|| LlmError::Shape("no choices in response".into()))
+}
+
+/// `GET /models` response parsing, split out so the status/error matrix is
+/// unit-testable without a network. A >=400 status is mapped to the same
+/// error kinds as `chat()`; a 200 with an empty/odd body still yields an
+/// empty list (the settings picker reports "the provider returned an empty
+/// list" for a genuinely empty 200 — that microbehaviour is preserved).
+fn parse_models_response(status: u16, text: &str) -> Result<Vec<String>, LlmError> {
+    #[derive(Deserialize)]
+    struct Models {
+        #[serde(default)]
+        data: Vec<ModelEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ModelEntry {
+        id: String,
+    }
+    let error_message = serde_json::from_str::<ChatResponse>(text)
+        .ok()
+        .and_then(|r| r.error)
+        .map(|e| match e.message {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        });
+    match status {
+        401 | 403 => {
+            return Err(LlmError::Auth(
+                error_message.unwrap_or_else(|| format!("HTTP {status}")),
+            ));
+        }
+        429 => {
+            return Err(LlmError::RateLimited(
+                error_message.unwrap_or_else(|| "HTTP 429".into()),
+            ));
+        }
+        s if s >= 400 => {
+            return Err(LlmError::Provider(
+                error_message.unwrap_or_else(|| format!("HTTP {s}: {}", body_preview(text))),
+            ));
+        }
+        _ => {}
+    }
+    let parsed: Models = serde_json::from_str(text)
+        .map_err(|e| LlmError::Shape(format!("models list: {e}")))?;
+    Ok(parsed.data.into_iter().map(|m| m.id).collect())
+}
+
+/// A char-boundary-safe prefix (<= `200` bytes) of a response body, for error
+/// messages. Slicing `&text[..200]` directly panics when byte 200 lands in
+/// the middle of a multibyte char (a garbage non-JSON reply with Cyrillic /
+/// emoji). Snap down to the nearest boundary instead.
+fn body_preview(text: &str) -> &str {
+    let mut end = text.len().min(200);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Lenient JSON-array extraction for prompt-and-parse structured output:
@@ -254,6 +304,50 @@ mod tests {
         // Garbage body.
         assert!(matches!(
             parse_chat_response(200, "<html>nope</html>"),
+            Err(LlmError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn shape_error_body_preview_survives_multibyte_garbage() {
+        // A non-JSON reply (status 200, no error field) longer than 200 bytes
+        // whose char straddles byte 200 used to panic slicing &text[..200].
+        let mut body = "x".repeat(199);
+        body.push('я'); // bytes 199..=200; byte 200 is mid-char
+        assert!(!body.is_char_boundary(200));
+        // Must return a Shape error, never panic.
+        assert!(matches!(parse_chat_response(200, &body), Err(LlmError::Shape(_))));
+    }
+
+    #[test]
+    fn models_response_surfaces_failures_but_keeps_empty_list_ok() {
+        // 401 with a provider error body must become Auth, not Ok([]).
+        let bad_key = r#"{"error":{"message":"bad key"}}"#;
+        assert!(matches!(
+            parse_models_response(401, bad_key),
+            Err(LlmError::Auth(m)) if m == "bad key"
+        ));
+        assert!(matches!(
+            parse_models_response(429, "{}"),
+            Err(LlmError::RateLimited(_))
+        ));
+        assert!(matches!(
+            parse_models_response(500, r#"{"error":{"message":"boom"}}"#),
+            Err(LlmError::Provider(m)) if m == "boom"
+        ));
+        // Happy path: ids extracted in order.
+        let ok = r#"{"data":[{"id":"gpt-x"},{"id":"gpt-y"}]}"#;
+        assert_eq!(
+            parse_models_response(200, ok).unwrap(),
+            vec!["gpt-x".to_string(), "gpt-y".to_string()]
+        );
+        // MUST stay Ok(empty): the settings panel shows "the provider returned
+        // an empty list" for a genuine 200 empty list.
+        assert_eq!(parse_models_response(200, r#"{"data":[]}"#).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_models_response(200, "{}").unwrap(), Vec::<String>::new());
+        // Non-JSON 200 body -> Shape, not a silent empty list.
+        assert!(matches!(
+            parse_models_response(200, "<html>nope</html>"),
             Err(LlmError::Shape(_))
         ));
     }

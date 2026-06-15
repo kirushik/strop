@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::buffer::{Buffer, TextOp, Transaction};
 
+/// Count line breaks in `text` using ropey's Unicode line-break set, so a
+/// block-map split count always agrees with `Rope::len_lines()`: CRLF counts
+/// as one break, and CR / VT / FF / NEL / U+2028 / U+2029 all count — unlike a
+/// plain '\n' scan, which a paste of classic-Mac or PDF-copied text defeats.
+fn count_line_breaks(text: &str) -> usize {
+    ropey::Rope::from_str(text).len_lines() - 1
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InlineAttr {
     Emphasis,
@@ -516,14 +524,17 @@ impl Document {
         self.pending_ops.extend(ops);
     }
 
-    /// (block containing the edit start, newlines deleted) — computed
-    /// against the pre-edit rope.
+    /// (block containing the edit start, line breaks deleted) — computed
+    /// against the pre-edit rope. The break count uses ropey's own
+    /// line metric so it agrees with `len_lines()` for *every* separator
+    /// (LF, CR, CRLF-as-one, VT, FF, NEL, U+2028, U+2029) — not just '\n',
+    /// which a paste of classic-Mac / PDF-copied text can smuggle in.
     fn pre_edit_info(&self, byte_range: &Range<usize>) -> (usize, usize) {
         let rope = self.buffer.rope();
         let start = rope.byte_to_char(byte_range.start);
         let end = rope.byte_to_char(byte_range.end);
         let block = rope.char_to_line(start);
-        let merged = rope.slice(start..end).chars().filter(|c| *c == '\n').count();
+        let merged = rope.char_to_line(end) - block;
         (block, merged)
     }
 
@@ -601,7 +612,7 @@ impl Document {
             self.redo_states.clear();
         }
         self.blocks
-            .on_edit(block, merged, text.matches('\n').count());
+            .on_edit(block, merged, count_line_breaks(text));
         self.absorb_buffer_ops();
     }
 
@@ -613,7 +624,7 @@ impl Document {
             self.redo_states.clear();
         }
         self.blocks
-            .on_edit(block, merged, text.matches('\n').count());
+            .on_edit(block, merged, count_line_breaks(text));
         self.absorb_buffer_ops();
     }
 
@@ -981,5 +992,33 @@ mod tests {
         assert_eq!(starts, sorted, "spans must stay sorted after remove");
         assert!(set.covers(5..10, &InlineAttr::Emphasis));
         assert!(set.covers(2..3, &InlineAttr::Underline));
+    }
+
+    #[test]
+    fn block_map_invariant_survives_non_lf_separators() {
+        // ropey (unicode_lines) counts CR/VT/FF/NEL/LS/PS as line breaks, but
+        // the split count used to scan only '\n' — a paste of classic-Mac or
+        // PDF-copied text broke kinds.len() == rope.len_lines().
+        for sep in ["\r", "\u{000b}", "\u{000c}", "\u{2028}", "\u{2029}", "\u{0085}"] {
+            let mut doc = Document::new("ab", SpanSet::default(), BlockMap::default());
+            doc.edit_bytes(1..1, sep);
+            assert_eq!(
+                doc.blocks().len(),
+                doc.rope().len_lines(),
+                "invariant broken inserting {sep:?}"
+            );
+            // Deleting it must rejoin the blocks.
+            doc.edit_bytes(1..1 + sep.len(), "");
+            assert_eq!(
+                doc.blocks().len(),
+                doc.rope().len_lines(),
+                "invariant broken deleting {sep:?}"
+            );
+        }
+        // CRLF must count as ONE break (the trap a naive Unicode scan falls
+        // into) — and the coalescing paste path must hold too.
+        let mut doc = Document::new("ab", SpanSet::default(), BlockMap::default());
+        doc.edit_bytes_coalescing(1..1, "\r\n");
+        assert_eq!(doc.blocks().len(), doc.rope().len_lines());
     }
 }

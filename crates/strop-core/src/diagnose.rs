@@ -120,7 +120,11 @@ pub fn to_annotations(
         let Some(range) = anchor(text, &d.quote, cursor) else {
             continue; // model hallucinated the quote; drop silently
         };
-        cursor = range.start;
+        // Advance PAST this match so a repeated identical quote anchors to its
+        // NEXT occurrence (anchor() wraps around via its or_else fallback when
+        // the tail no longer contains the quote, so single/out-of-order quotes
+        // still resolve). range.start would re-find the same occurrence.
+        cursor = range.end;
         if existing.is_dismissed(&range, &d.problem) {
             continue;
         }
@@ -176,6 +180,25 @@ mod tests {
         assert!(p.contains("is that intentional?"), "canonical query form");
         assert!(p.contains("two sentences"), "length discipline");
         assert!(p.contains("not a verdict"), "non-authoritative voice");
+    }
+
+    #[test]
+    fn repeated_quote_anchors_to_successive_occurrences() {
+        // Two diagnoses quoting the same phrase must land on the first AND the
+        // second occurrence, not stack on the first (cursor advances by
+        // range.end). With cursor=range.start the second re-found 6..18.
+        let text = "Здесь зарыта мысль, и зарыта мысль глубоко.";
+        let mk = |problem: &str| Diagnosis {
+            quote: "зарыта мысль".into(),
+            problem: problem.into(),
+            query: "?".into(),
+            level: "line".into(),
+        };
+        let existing = Annotations::default();
+        let out = to_annotations(text, vec![mk("p1"), mk("p2")], &existing, 1);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].range, 6..18);
+        assert_eq!(out[1].range, 22..34);
     }
 
     #[test]

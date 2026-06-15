@@ -82,10 +82,17 @@ fn inline_md(line: &str, base: usize, spans: &SpanSet) -> String {
             }
         }
         if let Some(c) = chars.get(i) {
+            // A hard break (U+2028) that is the final char(s) of a block is
+            // unrepresentable in CommonMark: escape_into would emit a stray
+            // "\\\n" that re-imports as a literal backslash. Drop the trailing
+            // run instead (a mid-block break still exports normally).
+            let trailing_break =
+                *c == '\u{2028}' && chars[i + 1..].iter().all(|h| *h == '\u{2028}');
             // A footnote ref's marker replaces its carrier text entirely.
-            if !here
-                .iter()
-                .any(|a| matches!(a, InlineAttr::FootnoteRef(_)))
+            if !trailing_break
+                && !here
+                    .iter()
+                    .any(|a| matches!(a, InlineAttr::FootnoteRef(_)))
             {
                 escape_into(*c, &mut out);
             }
@@ -161,7 +168,25 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
                 out.push_str("\n\n");
             }
             BlockKind::Image { src, alt, .. } => {
-                out.push_str(&format!("![{alt}]({src})\n\n"));
+                // Escape the alt (it is author-editable and may hold ']' or
+                // emphasis markers that would otherwise break the `![...]`),
+                // and angle-bracket a src that contains whitespace or parens.
+                // Plain alt + an asset/relative src export byte-identically
+                // (`![plain](asset:abc.png)`), which the editor's asset-link
+                // rewrite (`](asset:…)`) depends on.
+                let mut esc_alt = String::new();
+                for c in alt.chars() {
+                    escape_into(c, &mut esc_alt);
+                }
+                let src_field = if src
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>'))
+                {
+                    format!("<{src}>")
+                } else {
+                    src.clone()
+                };
+                out.push_str(&format!("![{esc_alt}]({src_field})\n\n"));
             }
             BlockKind::Paragraph => {
                 out.push_str(&inline_md(line, base, spans));
@@ -257,6 +282,7 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
     let mut lists: Vec<bool> = Vec::new(); // ordered?
     let mut item_fresh = false; // suppress begin_block for the item's first para
     let mut code_info: Option<String> = None;
+    let mut code_fresh = false; // first Text event of a brand-new fence?
     let mut footnote_def: Option<String> = None;
     let mut image_alt: Option<String> = None; // capturing alt text
     let mut inline_starts: Vec<(usize, InlineAttr)> = Vec::new();
@@ -347,6 +373,7 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                     CodeBlockKind::Fenced(info) => info.to_string(),
                     CodeBlockKind::Indented => String::new(),
                 });
+                code_fresh = true;
             }
             Event::End(TagEnd::CodeBlock) => code_info = None,
             Event::Start(Tag::FootnoteDefinition(id)) => {
@@ -400,12 +427,19 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                 if let Some(alt) = image_alt.as_mut() {
                     alt.push_str(&t);
                 } else if let Some(info) = &code_info {
-                    // Each code line is its own CodeBlock block.
+                    // Each code line is its own CodeBlock block. `code_fresh`
+                    // forces a new block on the first line of every fence, so
+                    // two adjacent fences never fuse — while a SINGLE fence
+                    // whose body arrives across multiple Text events (CRLF /
+                    // indent splits) still appends with no spurious newline
+                    // (code_fresh is true only for that fence's first event).
                     let body = t.strip_suffix('\n').unwrap_or(&t);
                     for (i, line) in body.split('\n').enumerate() {
-                        if i > 0 || kinds.last().map(|k| !matches!(k, BlockKind::CodeBlock { .. }))
-                            != Some(false)
-                        {
+                        let force_new = i > 0
+                            || code_fresh
+                            || kinds.last().map(|k| !matches!(k, BlockKind::CodeBlock { .. }))
+                                != Some(false);
+                        if force_new {
                             begin_block(
                                 &mut text,
                                 &mut chars,
@@ -415,6 +449,7 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                         }
                         push_str!(line);
                     }
+                    code_fresh = false; // consumed after this fence's first text event
                 } else {
                     push_str!(t.as_ref());
                 }
@@ -594,6 +629,71 @@ mod tests {
         assert_eq!(text2, text);
         assert!(spans2.covers(1..2, &InlineAttr::Strong));
         assert!(spans2.covers(3..5, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn adjacent_code_blocks_keep_their_boundary() {
+        // Two separate fences, blank line between, must not concatenate into
+        // one block (pre-fix: text "foobar", a single CodeBlock).
+        let md = "```\nfoo\n```\n\n```\nbar\n```\n";
+        let (text, _, blocks) = from_markdown(md);
+        assert_eq!(text, "foo\nbar");
+        assert_eq!(blocks.kinds().len(), 2);
+        assert!(
+            blocks
+                .kinds()
+                .iter()
+                .all(|k| matches!(k, BlockKind::CodeBlock { .. }))
+        );
+    }
+
+    #[test]
+    fn image_alt_with_bracket_roundtrips() {
+        // alt is author-editable and can hold ']'; it must survive export.
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "a.png".into(),
+            alt: "a]b".into(),
+            caption: String::new(),
+        }]);
+        let md = to_markdown("", &SpanSet::default(), &blocks);
+        let (_, _, blocks2) = from_markdown(&md);
+        assert!(
+            blocks2
+                .kinds()
+                .iter()
+                .any(|k| matches!(k, BlockKind::Image { alt, .. } if alt == "a]b")),
+            "image with bracketed alt must survive round-trip, got {:?}",
+            blocks2.kinds()
+        );
+    }
+
+    #[test]
+    fn image_plain_alt_export_unchanged() {
+        // Guards the editor's asset-link rewrite, which matches `](asset:…)`.
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "asset:abc.png".into(),
+            alt: "plain".into(),
+            caption: String::new(),
+        }]);
+        let md = to_markdown("", &SpanSet::default(), &blocks);
+        assert_eq!(md, "![plain](asset:abc.png)\n");
+    }
+
+    #[test]
+    fn trailing_hard_break_drops_cleanly() {
+        // A hard break at the very end of a block can't be represented; export
+        // must not leave a stray backslash that re-imports as '\' (pre-fix the
+        // round-trip yielded "a\\").
+        let text = "a\u{2028}";
+        let md = to_markdown(text, &SpanSet::default(), &BlockMap::new(1));
+        assert!(!md.contains('\\'), "no stray backslash exported: {md:?}");
+        let (text2, _, _) = from_markdown(&md);
+        assert_eq!(text2, "a");
+        // A mid-block hard break still survives the full round-trip.
+        let mid = "a\u{2028}b";
+        let md2 = to_markdown(mid, &SpanSet::default(), &BlockMap::new(1));
+        let (text3, _, _) = from_markdown(&md2);
+        assert_eq!(text3, mid);
     }
 
     #[test]

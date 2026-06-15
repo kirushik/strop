@@ -602,6 +602,19 @@ pub enum NoteInputEvent {
 
 impl gpui::EventEmitter<NoteInputEvent> for NoteInput {}
 
+/// Remove the trailing IME preedit (`marked_len` bytes) from `content`,
+/// snapping the cut down to a char boundary first. The raw
+/// `truncate(len - marked_len)` panics if a manual edit (backspace) left a
+/// stale `marked` length that no longer aligns with a boundary. A no-op on
+/// the common path where the cut already lands on a boundary.
+fn drop_marked_tail(content: &mut String, marked_len: usize) {
+    let mut start = content.len().saturating_sub(marked_len);
+    while start > 0 && !content.is_char_boundary(start) {
+        start -= 1;
+    }
+    content.truncate(start);
+}
+
 impl NoteInput {
     fn new(cx: &mut Context<Self>, content: String) -> Self {
         Self {
@@ -632,6 +645,10 @@ impl NoteInput {
     }
 
     fn backspace(&mut self, _: &NoteBackspace, _: &mut Window, cx: &mut Context<Self>) {
+        // A manual edit ends any active IME composition: leaving a stale
+        // `marked` (byte length) behind would make the next preedit truncate
+        // mid-char (panic) or eat committed text. No-op when not composing.
+        self.marked = None;
         self.content.pop();
         cx.notify();
     }
@@ -640,6 +657,7 @@ impl NoteInput {
     /// universal gestures stay universal). Append-only model, so "word
     /// left of the caret" means the trailing word.
     fn backspace_word(&mut self, _: &NoteBackspaceWord, _: &mut Window, cx: &mut Context<Self>) {
+        self.marked = None; // end any composition (see backspace)
         let trimmed = self.content.trim_end();
         let cut = trimmed
             .char_indices()
@@ -716,8 +734,7 @@ impl EntityInputHandler for NoteInput {
         cx: &mut Context<Self>,
     ) {
         if let Some(m) = self.marked.take() {
-            let byte_start = self.content.len().saturating_sub(m.end - m.start);
-            self.content.truncate(byte_start);
+            drop_marked_tail(&mut self.content, m.end - m.start);
         }
         self.content.push_str(text);
         cx.notify();
@@ -732,8 +749,7 @@ impl EntityInputHandler for NoteInput {
         cx: &mut Context<Self>,
     ) {
         if let Some(m) = self.marked.take() {
-            let byte_start = self.content.len().saturating_sub(m.end - m.start);
-            self.content.truncate(byte_start);
+            drop_marked_tail(&mut self.content, m.end - m.start);
         }
         self.marked = Some(0..text.len());
         self.content.push_str(text);
@@ -3760,34 +3776,11 @@ impl Editor {
     }
 
     fn previous_word_boundary(&self, offset: usize) -> usize {
-        if offset == 0 {
-            return 0;
-        }
-        let (start, _) = self.paragraph_bounds(offset);
-        if offset == start {
-            // Continue the search from the end of the previous paragraph.
-            return self.previous_word_boundary(offset - 1);
-        }
-        let line = self.doc.slice_bytes(start..offset);
-        line.split_word_bound_indices()
-            .rev()
-            .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
-            .map_or(start, |(ix, _)| start + ix)
+        previous_word_boundary(&self.doc, offset)
     }
 
     fn next_word_boundary(&self, offset: usize) -> usize {
-        let len = self.doc.len_bytes();
-        if offset >= len {
-            return len;
-        }
-        let (_, end) = self.paragraph_bounds(offset);
-        if offset == end {
-            return self.next_word_boundary(offset + 1).min(len);
-        }
-        let line = self.doc.slice_bytes(offset..end);
-        line.split_word_bound_indices()
-            .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
-            .map_or(end, |(ix, seg)| offset + ix + seg.len())
+        next_word_boundary(&self.doc, offset)
     }
 
     /// GTK/Windows paragraph motion: to start of current paragraph, or of
@@ -10017,6 +10010,60 @@ impl Focusable for Editor {
     }
 }
 
+// Word-motion boundaries as free functions over `&Document` (no GPUI context),
+// so they are unit-testable and — crucially — *iterative*. The previous
+// recursive form added one stack frame per consecutive blank line, so a paste
+// of tens of thousands of empty lines could overflow the stack (an uncatchable
+// abort). The loop is byte-for-byte equivalent for every input.
+
+fn previous_word_boundary(doc: &Document, mut offset: usize) -> usize {
+    let rope = doc.rope();
+    loop {
+        if offset == 0 {
+            return 0;
+        }
+        let start = rope.line_to_byte(rope.byte_to_line(offset));
+        if offset == start {
+            // Continue from the end of the previous paragraph (iterate, never
+            // recurse: a long blank run must not grow the stack).
+            offset -= 1;
+            continue;
+        }
+        let line = doc.slice_bytes(start..offset);
+        return line
+            .split_word_bound_indices()
+            .rev()
+            .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
+            .map_or(start, |(ix, _)| start + ix);
+    }
+}
+
+fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
+    let rope = doc.rope();
+    let len = doc.len_bytes();
+    loop {
+        if offset >= len {
+            return len;
+        }
+        let line_ix = rope.byte_to_line(offset);
+        let end = if line_ix + 1 < rope.len_lines() {
+            rope.line_to_byte(line_ix + 1).saturating_sub(1)
+        } else {
+            len
+        };
+        if offset == end {
+            offset += 1;
+            continue;
+        }
+        let line = doc.slice_bytes(offset..end);
+        return line
+            .split_word_bound_indices()
+            .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
+            .map_or(end, |(ix, seg)| offset + ix + seg.len())
+            .min(len);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10183,5 +10230,52 @@ mod tests {
         let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &[], &[], &[], &base());
         assert_eq!(runs[0].font.family.as_ref(), CODE_FONT);
         assert!(runs[1].underline.is_some());
+    }
+
+    #[test]
+    fn word_motion_survives_long_blank_run() {
+        // A pathological run of empty paragraphs must not blow the stack: word
+        // motion has to iterate, not recurse one frame per line. (Recursive,
+        // this overflows the 2 MB test-thread stack and aborts the binary.)
+        let n = 200_000;
+
+        let mut text = String::with_capacity(n + 4);
+        for _ in 0..n {
+            text.push('\n');
+        }
+        text.push_str("word");
+        let doc = Document::new(&text, SpanSet::default(), BlockMap::default());
+        assert_eq!(previous_word_boundary(&doc, n), 0);
+
+        let mut text2 = String::with_capacity(n + 4);
+        text2.push_str("word");
+        for _ in 0..n {
+            text2.push('\n');
+        }
+        let doc2 = Document::new(&text2, SpanSet::default(), BlockMap::default());
+        let len = doc2.len_bytes();
+        assert_eq!(next_word_boundary(&doc2, 0), 4); // selects "word"
+        assert_eq!(next_word_boundary(&doc2, 4), len); // blank run -> doc end
+    }
+
+    #[test]
+    fn drop_marked_tail_never_splits_a_char() {
+        // The exact IME panic sequence: a committed multibyte char with a now-
+        // stale marked length left over after a manual backspace.
+        let mut s = String::from("ね"); // 3 bytes
+        drop_marked_tail(&mut s, 2); // pre-fix: truncate(1) panics inside 'ね'
+        assert!(s.is_char_boundary(s.len()));
+        assert_eq!(s, "");
+
+        // A marked length longer than content saturates to empty, never panics.
+        let mut t = String::from("é");
+        drop_marked_tail(&mut t, 9);
+        assert_eq!(t, "");
+
+        // Common path preserved: committed prefix + a whole preedit; dropping
+        // exactly the preedit length leaves the prefix, the snap is a no-op.
+        let mut u = String::from("Helloねこ");
+        drop_marked_tail(&mut u, "ねこ".len());
+        assert_eq!(u, "Hello");
     }
 }
