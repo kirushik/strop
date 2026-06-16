@@ -465,7 +465,7 @@ pub struct Editor {
     /// older generation is silently dropped.
     ai_generation: u64,
     /// Session override of the levels-of-edit depth; None = config's
-    /// [ai].mode (the thesis switch, handoff §2.2).
+    /// [ai].mode (the thesis switch, editorial-foundations §2.2).
     diagnosis_mode: Option<String>,
     /// What the last pass was, so an error card's Retry can repeat it.
     last_pass_believing: bool,

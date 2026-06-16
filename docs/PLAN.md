@@ -10,7 +10,7 @@
 
 ## E0. Gap analysis (the audit, 2026-06-12)
 
-Cross-checked against `ai-writers-editor-handoff.md` and docs/.
+Cross-checked against `editorial-foundations.md` and docs/.
 
 **Invisible capabilities** — exist, work, untestable by a user who hasn't
 read the source:
@@ -19,7 +19,7 @@ read the source:
 |---|---|
 | Editorial diagnosis (THE thesis) | ctrl-shift-d, undocumented in-app |
 | Believing pass (Elbow) | ctrl-shift-b, same |
-| Levels-of-edit modes (THE differentiator per handoff §2.2) | **hardcoded `"line"`** — developmental/copy prompts exist in core, no switch anywhere |
+| Levels-of-edit modes (THE differentiator per editorial-foundations §2.2) | **hardcoded `"line"`** — developmental/copy prompts exist in core, no switch anywhere |
 | Markdown export | ctrl-shift-e, silent success |
 | Open file | ctrl-o (gpui prompt), no menu/palette |
 | Save a copy | ctrl-shift-s |
@@ -36,9 +36,9 @@ read the source:
 | AI run status / errors | `last_ai_error` string, barely rendered; no in-progress state |
 | Voice baseline corpus | config-file globs only |
 
-**Thesis-surface gaps** (handoff cross-check):
+**Thesis-surface gaps** (editorial-foundations cross-check):
 - §2.2 levels-of-edit → modes: core-complete, UX-absent (the one thing the
-  handoff calls a likely open gap in the field — currently invisible).
+  editorial-foundations calls a likely open gap in the field — currently invisible).
 - §4.1 Williams-vs-Klinkenborg stance: unsurfaced (acceptable post-MVP,
   but the mode picker must leave room for a stance setting).
 - §3e accept-friction: diagnosis cards already require explicit
@@ -113,7 +113,7 @@ here. Sequenced so dogfooding unblocks as early as possible.
   Retry (repeats the same pass kind) / Dismiss. "Test AI Connection" =
   1-token chat that moves 401s to setup time; on provider errors it
   GETs /models and lists the first 8 ids — that IS the model picker.
-  **Levels-of-edit mode switch shipped** (the thesis surface, handoff
+  **Levels-of-edit mode switch shipped** (the thesis surface, editorial-foundations
   §2.2): Diagnosis Mode Developmental/Line/Copy palette commands +
   [ai].mode config default + idle margin hint showing the current mode;
   debug_cursor reports ai=/mode= for smoke. Deferred: ticking elapsed

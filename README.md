@@ -1,56 +1,41 @@
 # Strop
 
-A writer's editor with an editor inside.
+> **strop** — a strip of leather you rub a razor on to make the blade sharp.
+> 
+> **strop** *(UK informal)* — a bad mood, especially one in which a person will not do as they are asked.
+> 
+> <sub>— [Cambridge Dictionary](https://dictionary.cambridge.org/dictionary/english/strop)</sub>
 
-Strop diagnoses prose the way a good human editor does — naming problems
-as queries to the author, never rewriting a word — and is built to resist
-the voice homogenization that LLM writing tools cause. Documents live in
-single portable `.strop` files carrying their full edit history.
+**In the human–AI centaur, don't be the horse.**
 
-## What works (MVP, Linux/Wayland)
+<p align="center">
+  <img src="assets/screenshot.png" width="820"
+       alt="Strop diagnosing the Declaration of Independence: sharp editorial queries anchored in the right margin, never a rewrite.">
+</p>
 
-- **Typing-first canvas**: PT Serif 20/28 on a 64ch measure, cursor
-  affinity, goal-x vertical motion, the full GTK keyboard/mouse baseline
-  (see docs/keymap-baseline.md), PRIMARY selection, drag-by-word.
-- **Typograph as you type**: document-language-aware «ёлочки»/"curly"
-  quotes, em dashes with NBSP binding, RU short-word NBSP, ellipsis —
-  deterministic, and one ctrl-z always restores exactly what you typed.
-- **Rich text**: bold/italic/underline/strike/highlight/inline code
-  (ctrl-b/i/u, ctrl-shift-x/h, ctrl-e), headings (`# ` shortcut or
-  ctrl-alt-1..3, PT Sans Bold on the 28px rhythm), quotes, lists,
-  dividers, code blocks (PT Mono), footnotes with a viewport bottom zone
-  (ctrl-alt-f), images (paste/drop; EXIF-stripped, size-capped, stored
-  in-file content-addressed).
-- **History**: word-coalesced undo that survives restarts; named
-  checkpoints (ctrl-alt-s) with a rewind panel (↺) — Google-Docs Rewind
-  in a local-first file; every keystroke retained in the Loro op log.
-- **Markdown**: byte-exact roundtrip import/export (`strop notes.md`
-  imports; ctrl-shift-e exports next to the file).
-- **The margin**: ctrl-m author notes; **ctrl-shift-d runs an editorial
-  diagnosis** through any OpenAI-compatible provider (Poe/OpenAI/
-  OpenRouter/ollama/Anthropic-compat) — named problems anchored in the
-  right margin as questions, never replacement text, at a chosen depth
-  (developmental / line / copy — the levels-of-edit switch). Dismissed
-  diagnoses are never re-raised. The margin teaches its own setup,
-  shows run status, and names failures actionably.
-- **The shell**: ctrl-shift-p command palette (every command, fuzzy,
-  EN+RU aliases, recent documents) — the menu of a chrome-minimal
-  editor; ctrl-? keyboard map; first run opens a live tutorial document
-  with pre-seeded margin cards.
-- **Files, visible from birth**: documents live in ~/Documents/Strop;
-  ctrl-n new window, F2/titlebar-click renames file and all, Reveal in
-  Files, recents; scripts/install-desktop.sh registers .strop
-  double-click.
-- **Settings**: ~/.config/strop/config.toml — "Set Up AI Provider"
-  writes a commented template; re-read before every pass; STROP_API_KEY
-  overrides the file.
+In the *advanced chess* Garry Kasparov championed, a human paired with a machine
+beats both the best grandmaster and the best engine — as long as the human stays
+in charge of the ideas. Most AI writing tools invert that: the machine drafts, you
+approve, and your voice dissolves into a language model's median style.
 
-```sh
-cargo run --release -p strop-app [file.strop|file.md]
-```
+Strop keeps you in charge. You write every sentence. The machine is the editor in
+the margin — it reads your draft the way a sharp editor would, names what isn't
+working as a question, and never rewrites a line.
 
-- `crates/strop-core` — framework-agnostic engine (buffer, document,
-  typograph, markdown, images, store, llm, diagnose). Never imports UI.
-- `crates/strop-app` — the GPUI shell.
-- `docs/DECISIONS.md`, `docs/document-model.md`, `docs/ROADMAP.md` — why
-  everything is the way it is, and what's next.
+## What it does
+
+- **An editor that diagnoses, never prescribes.** An explicit command (or a shortcut pressed) runs an editorial pass at a depth you choose — developmental, line, or copy. It returns named problems as questions in the margin ("Is this the real beginning?"), never replacement text. Dismiss one and it stays gone.
+- **Your voice, not the model's.** Bring your own LLM — any OpenAI-compatible API, including a local Ollama. A pass only ever sends text to the provider you pick; point it at a local model and nothing leaves your machine.
+- **A calm canvas.** Typing-first, with typography handled as you write — language-aware quotes, em dashes, the right non-breaking spaces — and any substitution it makes is undone with a single keystroke.
+- **History you own.** `.strop` files are auto-saving and always carry the whole editing history. Don't lose Undo after restarts, save named snapshots for future reference, easily compare between revisions.
+- **Plain, portable files.** One `.strop` file per document; Markdown in and out.
+
+## Where it's at
+
+Strop is early, and built in the open. There is no release yet — it currently only tested on **Linux (Wayland)**, and you build it from source: see **[DEVELOPMENT.md](DEVELOPMENT.md)**.
+
+## License
+
+[GPL-3.0-or-later](COPYING). Built on Zed's
+[gpui](https://github.com/zed-industries/zed); bundled PT fonts are © ParaType
+under the SIL Open Font License. Attribution in [NOTICE](NOTICE).

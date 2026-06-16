@@ -127,7 +127,7 @@ Design constraints that make it workable:
 
 `LoroMap("meta")`: `lang` (explicit typograph-language override; absent =
 auto-detect), `title` (absent = first heading, else first line), future
-stance settings (Williams-vs-Klinkenborg, handoff §4.1). Deliberately tiny.
+stance settings (Williams-vs-Klinkenborg, editorial-foundations §4.1). Deliberately tiny.
 
 ## 5. Storage mapping
 

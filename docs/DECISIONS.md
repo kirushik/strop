@@ -2,7 +2,7 @@
 
 Decisions made 2026-06-10 with Kirill, backed by four research tracks (GPUI
 viability, framework alternatives, text-engine layer, typography). Companion
-context: `ai-writers-editor-handoff.md` (editorial theory, scope, voice-
+context: `editorial-foundations.md` (editorial theory, scope, voice-
 preservation thesis).
 
 ## D1. Shell: Rust + GPUI
@@ -58,7 +58,7 @@ doc, which owns durability, cross-session history, checkpoints, and (later)
 sync. `.strop` file = Loro snapshot + incremental updates.
 
 Side effects we get for free: future paid cloud sync = Loro's sync protocol;
-the full edit history doubles as the author's own voice corpus (handoff fork
+the full edit history doubles as the author's own voice corpus (editorial-foundations fork
 #4 cold-start mitigation).
 
 Rejected: CRDT-as-buffer (xi-editor postmortem), automerge (heavier, JSON-
@@ -68,9 +68,9 @@ files-as-truth.
 ## D4. AI scope: diagnosis-only first
 
 Margin queries naming problems; zero generated prose in v1. Defers the voice-
-preservation problem until the voice-distance metric exists (handoff §3e,
+preservation problem until the voice-distance metric exists (editorial-foundations §3e,
 fork §4.3). Interaction model: on-request, discrete, anchored to ranges —
-never ghost text (ownership/homogenization findings, handoff §3d). BYO LLM
+never ghost text (ownership/homogenization findings, editorial-foundations §3d). BYO LLM
 provider.
 
 ## D5. Typography: the Birman bar, as actually published
@@ -152,7 +152,7 @@ Round 1:
 - [ ] Rich-text document schema (blocks + inline spans + annotation layer
       anchored to ranges) — design before the editor widget.
 - [ ] When to jump from gpui 0.2.2 (crates.io) to a pinned zed@main git rev.
-- [ ] Voice-distance metric harness (handoff §3e) — the artifact that decides
+- [ ] Voice-distance metric harness (editorial-foundations §3e) — the artifact that decides
       whether generation ever ships.
-- [ ] Diagnostic engine: one engine with mode rulesets vs three (handoff §4.2).
-- [ ] Williams-vs-Klinkenborg stance setting (handoff §4.1).
+- [ ] Diagnostic engine: one engine with mode rulesets vs three (editorial-foundations §4.2).
+- [ ] Williams-vs-Klinkenborg stance setting (editorial-foundations §4.1).

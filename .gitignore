@@ -1,1 +1,6 @@
 /target
+
+# Local Claude Code working state (machine-specific, not part of the project)
+.claude/worktrees/
+.claude/*.lock
+.claude/settings.local.json

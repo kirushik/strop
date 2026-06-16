@@ -1,0 +1,37 @@
+Strop
+Copyright (C) 2025-2026 Kirill Pimenov and contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the COPYING file for the full license text.
+
+================================================================================
+Third-party components
+================================================================================
+
+Strop's own source is GPL-3.0-or-later. The compiled application links a large
+tree of third-party crates; the great majority are permissively licensed (MIT,
+Apache-2.0, BSD, ISC, Zlib, Unicode-3.0). The items worth calling out:
+
+gpui, gpui_platform, gpui_wgpu  —  Apache-2.0
+    The UI framework, from Zed Industries
+    (https://github.com/zed-industries/zed). `vendor/gpui_wgpu/` is a copy of
+    Zed's gpui_wgpu carrying a single local modification (a per-glyph swash
+    ScaleContext, working around an upstream Wayland scale-change glyph
+    rasterization bug — see docs/UPSTREAM-gpui-scale-bug.md).
+
+zlog, ztracing, ztracing_macro  —  GPL-3.0-or-later
+    Pulled in transitively through gpui -> sum_tree. Because these are linked
+    into the binary, the assembled Strop application is GPL-3.0-or-later as a
+    whole. (This is the same situation as the Zed editor itself.)
+
+PT Serif, PT Sans, PT Mono  —  SIL Open Font License 1.1
+    Copyright (C) ParaType. Bundled in assets/fonts/; license text in
+    assets/fonts/PTSerif-OFL.txt, PTSans-OFL.txt, and PTMono-OFL.txt.
+
+ropey (MIT), loro (MIT), pulldown-cmark (MIT), image (MIT OR Apache-2.0), and
+the remaining direct dependencies are permissively licensed.
+
+A complete, machine-generated per-crate license inventory can be produced with
+`cargo about generate`, or inspected with `cargo deny list`.

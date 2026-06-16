@@ -1,4 +1,4 @@
-//! The diagnosis run (C3): the handoff's editorial theory as a prompt and
+//! The diagnosis run (C3): Strop's editorial theory (docs/editorial-foundations.md) as a prompt and
 //! a parser. Named problems as queries to the author; zero rewrites; the
 //! Gaiman guardrail; voice is never a defect.
 
