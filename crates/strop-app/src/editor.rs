@@ -6322,7 +6322,7 @@ impl Element for EditorElement {
                 .to_bits(),
             selection: {
                 let s = &editor.selected_range;
-                (!in_history && s.start != s.end).then(|| (s.start, s.end))
+                (!in_history && s.start != s.end).then_some((s.start, s.end))
             },
             marked: editor
                 .marked_range
