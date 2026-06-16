@@ -84,6 +84,48 @@ This validates the plan: the warm-frame target is to cut bookkeeping toward
   chrome cost on note/footnote-heavy docs. Verified: builds, no panic, prepaint
   unchanged via the headless rig (incl. `seed:diag`).
 
+### Wave 3 — the keystone: layout reuse — DONE
+`prepaint` is no longer O(document) per frame. Two tiers of reuse:
+
+- **All-or-nothing frame reuse** (`LayoutKey` + `Document::revision`): when nothing
+  layout-affecting changed since the last paint — scroll, cursor blink, or a
+  collapsed-caret move — carry the previous frame's paragraphs forward verbatim
+  and recompute only the scroll clamp and caret quad. The key captures revision
+  (text/spans/blocks/notes), wrap width, font scale, *non-empty* selection (an
+  empty one paints no highlight, so a caret move is a no-op), marked range, find
+  query and active note; history preview and image blocks opt out (preview text
+  and async image decode aren't captured by the revision). Measured on the 918-
+  block fixture: **3–5 ms → 7–35 µs** (~500×).
+
+- **Per-block shaped-line reuse** on full rebuilds (edits/format/selection): each
+  block keeps its already-shaped `WrappedLine` from the previous frame when its
+  `(text, runs, size, indent)` — exactly the shape key — is unchanged; only the
+  blocks that actually changed are re-shaped. Matched by index (a split/merge
+  shifts indices and re-shapes from the edit down).
+  - *Why it's load-bearing:* the all-or-nothing reuse stops feeding GPUI's own
+    two-frame `LineLayoutCache`, so it goes cold during a run of reuse frames.
+    Without per-block reuse, the first edit after any scroll/pause/caret-move
+    re-shaped the whole document — **measured 120 ms**, *worse* than the 3–5 ms
+    baseline, a nasty resume-typing hitch. Per-block reuse makes rebuilds
+    independent of GPUI's cache: edits are **2–4.5 ms** even with a cold cache.
+
+**Net:** navigation/idle is microseconds, editing is low-single-digit ms; only
+the cold-open first frame is still a full O(N) shape (**151 ms** — no previous
+frame to reuse; a Wave-5 / async-first-paint target).
+
+**Foundations & invariants:** `Document::revision` is a monotonic counter bumped
+in all 16 `&mut` mutators, never serialized (over-bump = wasted rebuild; a missed
+bump would risk a stale frame — test
+`revision_bumps_on_every_layout_mutation_and_is_stable_otherwise`). The per-block
+match key is the *complete* shape key, so a reused line is byte-identical to a
+freshly shaped one.
+
+**Verified:** full workspace suite green; headless pixel-diff vs `main`
+(`scripts/wshot.sh`, `STROP_TEST_STILL=1`): **0 differing pixels** for pure
+scroll, and **0 in the document body** for edits (the only delta was the titlebar
+filename across the two capture files). Timings via `STROP_PERF` on the headless
+rig.
+
 ### Deferred (need measurement / review)
 - Drop the per-keystroke `store.apply` Loro `commit()` (Q): audit verdict
   "overstated / low value / needs-measurement"; touches CRDT frontier semantics.
