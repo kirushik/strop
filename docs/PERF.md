@@ -70,6 +70,20 @@ This validates the plan: the warm-frame target is to cut bookkeeping toward
 - Verified: `cargo test -p strop-core` green (99 tests, incl. the proptest
   state machine).
 
+### Wave 2 — view-tree / chrome dedup (strop-app) — DONE
+- **`has_margin_cards()`**: cheap emptiness predicate behind `lane_has_content`.
+  `column_frame` is called ~9× per render and each used to *build + position +
+  height-estimate* every margin card just to test whether the lane is occupied;
+  now it asks the filter-only predicate. The full `margin_cards()` build remains
+  only where cards actually render (once).
+- **`visible_footnotes()` early-out**: return immediately when the doc has no
+  `FootnoteRef` spans, skipping the O(paragraphs) viewport scan + per-ref
+  O(blocks) def search that ran every render (incl. idle blinks) even with zero
+  footnotes. Behaviour-identical (the full path also returns `(vec![], 0)` then).
+- Render-side, so `STROP_PERF` (prepaint timer) doesn't reflect them; they cut
+  chrome cost on note/footnote-heavy docs. Verified: builds, no panic, prepaint
+  unchanged via the headless rig (incl. `seed:diag`).
+
 ### Deferred (need measurement / review)
 - Drop the per-keystroke `store.apply` Loro `commit()` (Q): audit verdict
   "overstated / low value / needs-measurement"; touches CRDT frontier semantics.

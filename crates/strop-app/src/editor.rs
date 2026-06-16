@@ -1773,6 +1773,18 @@ impl Editor {
     /// §2-footnotes: all up to 3, then the 3 nearest the viewport center
     /// and a "+N more" row). Derived from the last painted frame.
     fn visible_footnotes(&self) -> (Vec<ZoneNote>, usize) {
+        // Common case: a document with no footnote refs surfaces no zone notes.
+        // Skip the whole-viewport paragraph scan and per-ref block search that
+        // otherwise run unconditionally on every render (incl. idle blinks).
+        if !self
+            .doc
+            .spans()
+            .spans()
+            .iter()
+            .any(|s| matches!(s.attr, InlineAttr::FootnoteRef(_)))
+        {
+            return (Vec::new(), 0);
+        }
         let Some(frame) = self.last_frame.as_ref() else {
             return (Vec::new(), 0);
         };
@@ -8797,11 +8809,33 @@ impl Editor {
         (n > 0).then_some(n)
     }
 
+    /// Cheap emptiness predicate for `lane_has_content`: would ANY open note
+    /// surface as a margin card right now? Mirrors `margin_cards`'s door filter
+    /// (drafting hides diagnoses; an open developmental card suppresses copy
+    /// ones) but skips positioning and height-estimating every card — work
+    /// `column_frame` (several calls per render) never needed just to test
+    /// whether the lane is occupied.
+    fn has_margin_cards(&self) -> bool {
+        if self.last_frame.is_none() {
+            return false;
+        }
+        let drafting = self.drafting;
+        let has_dev = !drafting
+            && self
+                .doc
+                .notes()
+                .open()
+                .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
+        self.doc.notes().open().any(|n| {
+            !(n.kind == NoteKind::Diagnosis && (drafting || (has_dev && n.level == "copy")))
+        })
+    }
+
     /// Does anything want the right-hand note lane right now? An empty lane
     /// never pulls the column off-centre — the column only shifts in the
     /// service of cards that would otherwise have nowhere to go.
     fn lane_has_content(&self) -> bool {
-        !self.margin_cards().is_empty()
+        self.has_margin_cards()
             || self.margin_rail_count().is_some()
             || self.ai_status.is_some()
             || self.next_intent.is_some()
@@ -9060,7 +9094,7 @@ impl Editor {
                     self.suppressed_copy() > 0
                 };
                 if !fits
-                    || !self.margin_cards().is_empty()
+                    || self.has_margin_cards()
                     || rail_showing
                     || self.doc.len_bytes() == 0
                     || self.next_intent.is_some()
