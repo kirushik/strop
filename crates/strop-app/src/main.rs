@@ -8,10 +8,12 @@ mod config;
 mod draw_guard;
 mod editor;
 mod files;
+mod single_instance;
 mod smoke;
 mod tutorial;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
     App, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
@@ -135,6 +137,7 @@ fn main() {
                 let (p, welcome) = data_file();
                 (Some(p), welcome)
             };
+        let mut instance_guard: Option<single_instance::InstanceGuard> = None;
         let store = match &doc_path {
             None => None,
             Some(p) => {
@@ -143,6 +146,29 @@ fn main() {
                 } else {
                     p.clone()
                 };
+                // One writer per document: if a live instance already holds
+                // this file, ask it to surface and exit BEFORE we open (and
+                // mutate) the Loro store — two writers on one store is the
+                // multiplayer-persistence hole this closes. Liveness is the
+                // rendezvous socket, so a crashed instance never locks the
+                // file (single_instance.rs). Smoke runs never claim.
+                if !smoke {
+                    match single_instance::claim(&store_path) {
+                        Ok(single_instance::Claim::AlreadyOpen) => {
+                            eprintln!(
+                                "strop: “{}” is already open — raising that window",
+                                store_path.display()
+                            );
+                            // Nothing opened, nothing to flush: leave the
+                            // primary untouched and end this process.
+                            std::process::exit(0);
+                        }
+                        Ok(single_instance::Claim::Primary(guard)) => {
+                            instance_guard = Some(guard);
+                        }
+                        Err(e) => eprintln!("strop: single-instance check failed: {e}"),
+                    }
+                }
                 match Store::open(store_path) {
                     Ok(opened) => {
                         if !smoke {
@@ -308,6 +334,24 @@ fn main() {
             async {}
         })
         .detach();
+
+        // Surface this window when a later `strop <same file>` hands off
+        // (best-effort: app activation, which the Wayland backend maps to
+        // xdg-activation where the compositor honours it). The task owns the
+        // guard, so the rendezvous socket is released when the app quits.
+        if let Some(guard) = instance_guard {
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(400))
+                        .await;
+                    if guard.pull_raise() {
+                        cx.update(|cx| cx.activate(true));
+                    }
+                }
+            })
+            .detach();
+        }
 
         smoke::maybe_run(window, cx);
         if !smoke {
