@@ -1309,10 +1309,7 @@ impl Editor {
         let mut texts: Vec<String> = Vec::new();
         for pattern in &self.config.voice.corpus {
             let expanded = if let Some(rest) = pattern.strip_prefix("~/") {
-                format!(
-                    "{}/{rest}",
-                    std::env::var("HOME").unwrap_or_default()
-                )
+                crate::paths::home_dir().join(rest).to_string_lossy().into_owned()
             } else {
                 pattern.clone()
             };
@@ -3165,7 +3162,7 @@ impl Editor {
         // Sections group only the command empty-state (Frequent / File / …);
         // find and heading rows are flat.
         let grouped = mode == OmniMode::Command && rest.trim().is_empty();
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::paths::home_dir().to_string_lossy().into_owned();
         let mut list = div()
             .id("omni-list")
             .max_h(px(420.))

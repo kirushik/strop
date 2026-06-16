@@ -81,3 +81,44 @@ jobs:
         run: cargo clippy -p strop-app --all-targets -- -D warnings
       - name: tests (headless — pure-logic helpers open no window)
         run: cargo test -p strop-app
+
+  macos:
+    # Informational while macOS is brought up: `continue-on-error` means a red
+    # here never blocks a merge — it's a porting TODO, not a broken build. The
+    # value is the feedback loop we otherwise can't get (no Mac hardware). Drop
+    # `continue-on-error` and fold this into the required set once it's reliably
+    # green. gpui selects its Metal backend (gpui_macos) here; the vendored
+    # gpui_wgpu patch is Linux-only, so an "unused patch" warning is expected.
+    name: macOS — build + launch smoke (informational)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos
+      - name: build (debug)
+        run: cargo build -p strop-app
+      - name: launch smoke — open a window, run a scripted session, exit 0
+        run: |
+          set +e
+          # Tier-1 liveness: with no file and no STROP_SMOKE_HOLD the app opens
+          # a window over the built-in sample, replays a few caret motions, and
+          # quits on its own (smoke.rs). We watchdog it by hand — macOS has no
+          # `timeout(1)` — so a hung WindowServer/Metal init can't wedge the job.
+          STROP_SMOKE="down down up right left" ./target/debug/strop &
+          PID=$!
+          for _ in $(seq 1 60); do
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "::warning::smoke still alive after 60s — killing (window/Metal init likely hung on the runner)"
+            kill "$PID" 2>/dev/null
+            exit 1
+          fi
+          wait "$PID"
+          code=$?
+          echo "smoke exit code: $code"
+          exit $code

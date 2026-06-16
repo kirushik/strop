@@ -8,6 +8,7 @@ mod config;
 mod draw_guard;
 mod editor;
 mod files;
+mod paths;
 mod single_instance;
 mod smoke;
 mod tutorial;
@@ -55,14 +56,9 @@ The voice-distance metric is the regression test for the whole thesis: an edit t
 Перо знает о бумаге больше, чем писатель о читателе; редактор — тот, кто читал за обоих.\n\
 And somewhere past the tenth paragraph, the window must scroll — which is, frankly, the only reason this sentence exists.";
 
-/// Remembered window bounds, in ~/.local/state (or XDG_STATE_HOME).
+/// Remembered window bounds, in the per-user state dir (see `paths`).
 fn state_file() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME not set")).join(".local/state")
-        })
-        .join("strop/window.json")
+    paths::state_dir().join("window.json")
 }
 
 fn load_bounds() -> Option<(f32, f32, f32, f32)> {

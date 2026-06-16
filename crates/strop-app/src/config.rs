@@ -1,4 +1,5 @@
-//! User settings: ~/.config/strop/config.toml (XDG_CONFIG_HOME honored).
+//! User settings: `config.toml` in the per-user config dir (see `paths` —
+//! `~/.config/strop` on Linux, the OS-native config folder elsewhere).
 //! Missing file = defaults; a malformed file is reported and defaults win
 //! (never crash the editor over a typo in TOML).
 
@@ -98,12 +99,7 @@ pub fn write_template_if_missing() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME not set")).join(".config")
-        })
-        .join("strop/config.toml")
+    crate::paths::config_dir().join("config.toml")
 }
 
 /// Write the [ai] provider fields through toml_edit (DESIGN §0 directive 3:

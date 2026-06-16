@@ -7,38 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").expect("HOME not set"))
-}
-
-/// `$XDG_DOCUMENTS_DIR/Strop` — the localized documents folder per
-/// xdg-user-dirs (~/.config/user-dirs.dirs), falling back to ~/Documents.
-pub fn documents_dir() -> PathBuf {
-    let base = user_dirs_documents().unwrap_or_else(|| home().join("Documents"));
-    base.join("Strop")
-}
-
-fn user_dirs_documents() -> Option<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"));
-    let text = std::fs::read_to_string(config.join("user-dirs.dirs")).ok()?;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(value) = line.strip_prefix("XDG_DOCUMENTS_DIR=") {
-            let value = value.trim_matches('"');
-            let expanded = value.replace("$HOME", &home().to_string_lossy());
-            if !expanded.is_empty() {
-                return Some(PathBuf::from(expanded));
-            }
-        }
-    }
-    None
-}
-
 /// First free "Untitled.strop" / "Untitled 2.strop" / … in the Strop folder.
 pub fn untitled_path() -> PathBuf {
-    let dir = documents_dir();
+    let dir = crate::paths::documents_dir();
     // Documents are visible from birth — the folder must exist before the
     // first autosave tries to land there.
     let _ = std::fs::create_dir_all(&dir);
@@ -54,14 +25,11 @@ pub fn untitled_path() -> PathBuf {
 
 /// One-time migration of the old hidden scratch into the visible folder.
 pub fn migrate_scratch() -> Option<PathBuf> {
-    let old = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share"))
-        .join("strop/scratch.strop");
+    let old = crate::paths::data_dir().join("scratch.strop");
     if !old.exists() {
         return None;
     }
-    let dir = documents_dir();
+    let dir = crate::paths::documents_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let mut target = dir.join("Scratch.strop");
     let mut n = 2;
@@ -85,10 +53,7 @@ pub fn migrate_scratch() -> Option<PathBuf> {
 }
 
 fn recents_file() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"))
-        .join("strop/recents.json")
+    crate::paths::state_dir().join("recents.json")
 }
 
 /// Most-recent-first, existing files only.
@@ -137,10 +102,7 @@ pub fn replace_recent(old: &Path, new: &Path) {
 /// ordering): label → execution count, written through on every palette
 /// execution so the palette slowly becomes *your* instrument.
 fn palette_freq_file() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"))
-        .join("strop/palette_freq.json")
+    crate::paths::state_dir().join("palette_freq.json")
 }
 
 pub fn load_palette_freq() -> std::collections::HashMap<String, u32> {
@@ -189,10 +151,7 @@ pub struct IntentEntry {
 }
 
 fn intents_file() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"))
-        .join("strop/intents.json")
+    crate::paths::state_dir().join("intents.json")
 }
 
 fn intent_key(doc: &Path) -> String {
@@ -320,7 +279,7 @@ pub fn new_window_blank() {
 
 /// First free "Welcome to Strop[ N].strop" — the tutorial document's home.
 pub fn welcome_path() -> PathBuf {
-    let dir = documents_dir();
+    let dir = crate::paths::documents_dir();
     let _ = std::fs::create_dir_all(&dir);
     let first = dir.join("Welcome to Strop.strop");
     if !first.exists() {
