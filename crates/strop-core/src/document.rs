@@ -16,6 +16,24 @@ use crate::buffer::{Buffer, TextOp, Transaction};
 /// as one break, and CR / VT / FF / NEL / U+2028 / U+2029 all count — unlike a
 /// plain '\n' scan, which a paste of classic-Mac or PDF-copied text defeats.
 fn count_line_breaks(text: &str) -> usize {
+    // Fast path for the hot edit case (typing non-break chars): only build a
+    // throwaway Rope — the price of ropey's exact CRLF-as-one / CR / VT / FF /
+    // NEL / U+2028 / U+2029 counting — when a line-break char is actually
+    // present. The common keystroke inserts none and returns 0 immediately.
+    if !text.contains(|c: char| {
+        matches!(
+            c,
+            '\u{000A}'
+                | '\u{000B}'
+                | '\u{000C}'
+                | '\u{000D}'
+                | '\u{0085}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    }) {
+        return 0;
+    }
     ropey::Rope::from_str(text).len_lines() - 1
 }
 
@@ -657,10 +675,13 @@ impl Document {
     }
 
     pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
-        let snapshot = self.snapshot();
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes(byte_range, text) {
-            self.undo_states.push(snapshot);
+            // The buffer edit mutates only the rope + its own undo stack;
+            // spans/blocks/notes stay pre-edit until on_edit/absorb_buffer_ops
+            // run below, so snapshotting here captures the same pre-edit
+            // side-state as before — but only when a transaction opens.
+            self.undo_states.push(self.snapshot());
             self.redo_states.clear();
         }
         self.blocks
@@ -669,10 +690,14 @@ impl Document {
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
-        let snapshot = self.snapshot();
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes_coalescing(byte_range, text) {
-            self.undo_states.push(snapshot);
+            // Snapshot only when a new transaction actually opens. While
+            // typing inside a word the buffer coalesces and returns false, so
+            // the full SpanSet+BlockMap+Annotations clone is skipped on the
+            // ~5-of-6 mid-word keystrokes it used to be allocated and dropped
+            // on. Pre-edit side-state is intact here (see edit_bytes).
+            self.undo_states.push(self.snapshot());
             self.redo_states.clear();
         }
         self.blocks
