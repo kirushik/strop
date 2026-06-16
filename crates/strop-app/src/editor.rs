@@ -3558,6 +3558,7 @@ impl Editor {
     }
 
     pub fn save_now(&mut self) {
+        let perf = std::env::var_os("STROP_PERF").map(|_| std::time::Instant::now());
         self.sync_mutations();
         if let Some(store) = &self.store {
             match store.save_with_state(
@@ -3569,6 +3570,9 @@ impl Editor {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
             }
+        }
+        if let Some(t) = perf {
+            eprintln!("strop-perf: save_now {:?}", t.elapsed());
         }
     }
 

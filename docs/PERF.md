@@ -126,11 +126,32 @@ scroll, and **0 in the document body** for edits (the only delta was the titleba
 filename across the two capture files). Timings via `STROP_PERF` on the headless
 rig.
 
-### Deferred (need measurement / review)
+### Wave 5 — cold-open + save — MEASURED, deferred to supervised work
+Both remaining big items touch correctness-sensitive paths (persistence
+atomicity; startup sequencing), so they were measured but not changed unsupervised.
+
+- **Autosave stall (`save_now`, now `STROP_PERF`-timed):** measured **8 ms** on
+  the 52k-word fixture with a shallow history — noticeable (½ a frame) but not a
+  freeze. It grows with session length: `save_with_state` re-serializes
+  annotations + block kinds + `export_history(200)` (**up to 400 full
+  `SpanSet+BlockMap+Annotations` snapshots**) to JSON into Loro and re-runs
+  `rebuild_marks` every save, then exports a full `ExportMode::Snapshot` and
+  writes it — all on the UI thread (`store.rs:372-412`, `:501`). The safe wins
+  (snapshot the export bytes on the UI thread then hand `fs::write` to the
+  background executor; per-subsystem dirty flags so unchanged marks/history/
+  blocks aren't re-serialized) need review because a wrong dirty flag silently
+  fails to persist. Deferred.
+- **Cold-open first frame (151 ms):** the one frame with no previous layout to
+  reuse, so it does a full O(N) cold shape of every block. Cutting it needs
+  viewport-only first-paint (defer off-screen shaping) — a bigger, higher-risk
+  change than the reuse path. Deferred.
+
+### Deferred (low value / need review)
 - Drop the per-keystroke `store.apply` Loro `commit()` (Q): audit verdict
   "overstated / low value / needs-measurement"; touches CRDT frontier semantics.
-- Off-thread autosave snapshot export (Wave 5, `store.rs:501`): the "freezes
-  when I pause" mechanism, but magnitude is doc-history-dependent — measure first.
+- Span-bucketing sweep (O(blocks×spans) → O(blocks+spans) in the full-rebuild
+  per-block filter): edits are already 2–4.5 ms post-Wave-3; marginal.
+- `find_matches` memo by (query, revision): only active during find; transient.
 
 ## Tooling
 
