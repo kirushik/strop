@@ -1,0 +1,7 @@
+# Pin the toolchain so CI cache keys stay stable across upstream stable
+# releases — the git-pinned gpui tree is expensive to rebuild, and a floating
+# `stable` would bust the cache every ~6 weeks — and so contributors build with
+# exactly what CI uses. Bump deliberately (it invalidates the build cache once).
+[toolchain]
+channel = "1.96.0"
+components = ["clippy"]

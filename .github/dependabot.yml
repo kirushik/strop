@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # crates.io dependencies. Note: the git-pinned gpui/wgpu/font-kit/xim-rs
+  # forks are NOT bumped here — Dependabot doesn't track git revs — so this
+  # covers the registry deps (loro, ropey, image, ureq, interprocess, …).
+  # Minor/patch are grouped into one PR to keep the noise down.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Keep the Actions in the CI workflow current (and, once pinned to SHAs,
+  # security-patched).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

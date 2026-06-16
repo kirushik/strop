@@ -1,0 +1,66 @@
+# cargo-deny — supply-chain gate (CI: `cargo deny check`).
+#
+# Strop sits on a large upstream tree (Zed's gpui, loro, wgpu), so this config
+# distinguishes "things we chose" from "things we inherited and can't fix":
+# vulnerabilities always fail; specific unmaintained/yanked advisories that are
+# purely transitive and have no safe upgrade are acknowledged by ID below, each
+# with a note, so the gate stays green without hiding anything. Revisit the
+# ignore list whenever the gpui pin moves.
+
+[advisories]
+# Vulnerabilities and unsound advisories keep their default (deny). Yanked
+# crates only warn: `swash 0.2.8` is yanked but is exactly the version our
+# vendored gpui_wgpu patch pins (docs/UPSTREAM-gpui-scale-bug.md).
+yanked = "warn"
+ignore = [
+    "RUSTSEC-2024-0384", # `instant` unmaintained — transitive (wgpu/gpui)
+    "RUSTSEC-2024-0436", # `paste` unmaintained — transitive (wgpu/naga)
+    "RUSTSEC-2025-0052", # `async-std` discontinued — transitive (gpui)
+    "RUSTSEC-2023-0089", # `atomic-polyfill` unmaintained — transitive
+    "RUSTSEC-2026-0173", # `proc-macro-error2` unmaintained — transitive (gpui → stacksafe)
+]
+
+[licenses]
+# Permissive licenses present in the tree, plus GPL-3.0-or-later (Strop itself
+# and the zlog/ztracing chain that forces the app's copyleft — see NOTICE).
+# Dual-licensed crates (self_cell, r-efi, …) are satisfied by their permissive
+# option, so the GPL-2.0/LGPL tokens they also carry need not be allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MIT-0",
+    "Unlicense",
+    "NCSA",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "bzip2-1.0.6",
+    "GPL-3.0-or-later",
+]
+confidence-threshold = 0.8
+# First-party crates are GPL-3.0-or-later (allowed above anyway); don't gate them.
+private = { ignore = true }
+
+[bans]
+# gpui's tree carries many duplicate versions; flag, don't fail.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[sources.allow-org]
+# gpui is pulled from Zed's repo (pinned by rev in the workspace Cargo.toml)
+# and drags in several sibling Zed forks — wgpu, font-kit, xim-rs. We already
+# build on this org's code, so trust the whole org for git sources; any other
+# git source still fails (unknown-git = "deny").
+github = ["zed-industries"]

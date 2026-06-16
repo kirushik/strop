@@ -1,17 +1,21 @@
-# Strop CI. Two independent jobs:
+# Strop CI.
 #
-#   core — the framework-agnostic engine (strop-core). Fast, dependency-light,
-#          and the reliable gate: it runs every property test (the persistence
-#          round-trip, the no-panic suite, the state machine) at an elevated
-#          PROPTEST_CASES, plus clippy with warnings denied. Runs in seconds.
+# Gating jobs — required for a merge, via the `ci-success` aggregator below:
+#   core — strop-core: clippy -D warnings + the property suite at an elevated
+#          PROPTEST_CASES. Fast, dependency-light, the reliable gate.
+#   app  — strop-app on Linux: builds the git-pinned gpui (wgpu + Wayland),
+#          clippy, and the headless logic tests.
+#   deny — cargo-deny: licenses, advisories, and git sources (deny.toml).
 #
-#   app  — the GPUI/Wayland shell (strop-app). Builds the git-pinned gpui from
-#          zed (wgpu + Wayland), so it needs system libraries and a long but
-#          cached compile. Its tests are pure-logic and run headless (they open
-#          no window). The apt list below mirrors Zed's Linux build deps; if a
-#          first run fails on a missing library, the linker error names it —
-#          adjust here. If this job proves too slow for every push, move its
-#          triggers to `workflow_dispatch` only; `core` stays the gate.
+# Informational jobs — continue-on-error, they NEVER block a merge. They exist
+# for the feedback loop we can't get locally (no Mac/Windows hardware):
+#   macos   — build + a launch smoke.
+#   windows — build + tests (single_instance over named pipes) + launch smoke.
+# Promote either into the required set (drop continue-on-error and add it to
+# `ci-success.needs`) once it is reliably green.
+#
+# The toolchain version is pinned in rust-toolchain.toml; rustup honours it in
+# the repo dir, so the cache key stays stable across upstream stable releases.
 #
 # Deliberately NO `cargo fmt --check`: this repo is hand-formatted, not
 # rustfmt-canonical, so a format gate would fail on untouched code.
@@ -23,6 +27,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+
+# A new push to the same ref cancels superseded, still-running jobs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: read-only by default. No job here writes to the repo.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,6 +61,15 @@ jobs:
           # cheap insurance against boundary regressions the default 256 misses.
           PROPTEST_CASES: "2048"
         run: cargo test -p strop-core
+
+  deny:
+    name: supply chain — cargo-deny (licenses, advisories, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   app:
     name: app shell — clippy + headless logic tests
@@ -86,7 +108,7 @@ jobs:
     # Informational while macOS is brought up: `continue-on-error` means a red
     # here never blocks a merge — it's a porting TODO, not a broken build. The
     # value is the feedback loop we otherwise can't get (no Mac hardware). Drop
-    # `continue-on-error` and fold this into the required set once it's reliably
+    # `continue-on-error` and add this to `ci-success.needs` once it is reliably
     # green. gpui selects its Metal backend (gpui_macos) here; the vendored
     # gpui_wgpu patch is Linux-only, so an "unused patch" warning is expected.
     name: macOS — build + launch smoke (informational)
@@ -162,3 +184,24 @@ jobs:
           code=$?
           echo "smoke exit code: $code"
           exit $code
+
+  ci-success:
+    # The single required status check for branch protection. It needs only the
+    # gating jobs; the macOS/Windows legs are intentionally absent so they can
+    # never block. `if: always()` + explicit result checks avoid the classic
+    # trap where a skipped dependency leaves a "required" check pending forever.
+    name: CI passed
+    needs: [core, app, deny]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: require core, app, and deny to have succeeded
+        run: |
+          ok=true
+          for r in "core=${{ needs.core.result }}" \
+                   "app=${{ needs.app.result }}" \
+                   "deny=${{ needs.deny.result }}"; do
+            echo "$r"
+            case "$r" in *=success) ;; *) ok=false ;; esac
+          done
+          $ok
