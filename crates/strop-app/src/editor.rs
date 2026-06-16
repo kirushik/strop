@@ -8610,6 +8610,25 @@ struct MarginCard {
     kind: NoteKind,
     title: String,
     level: String,
+    /// Anchor lost in a checkpoint restore (see `Annotation::orphaned`): the
+    /// label gains a quiet "· detached" so a card sitting at a best-effort
+    /// offset never reads as confidently anchored.
+    orphaned: bool,
+}
+
+/// A note card's header label: "Note" / a diagnosis level (or "Diagnosis"),
+/// with a quiet "· detached" when the anchor was lost in a restore.
+fn note_card_label(is_diagnosis: bool, level: &str, orphaned: bool) -> String {
+    let base = if is_diagnosis {
+        if level.is_empty() { "Diagnosis" } else { level }
+    } else {
+        "Note"
+    };
+    if orphaned {
+        format!("{base} · detached")
+    } else {
+        base.to_owned()
+    }
 }
 
 impl Editor {
@@ -8683,6 +8702,7 @@ impl Editor {
                 kind: n.kind,
                 title: n.title.clone(),
                 level: n.level.clone(),
+                orphaned: n.orphaned,
             });
         }
         // cards are in document order (notes are kept sorted by anchor).
@@ -9221,10 +9241,12 @@ impl Editor {
                         kind,
                         title,
                         level,
+                        orphaned,
                         ..
                     } = card;
                     let composer = if active { self.note_input.clone() } else { None };
                     let is_diagnosis = kind == NoteKind::Diagnosis;
+                    let label = note_card_label(is_diagnosis, &level, orphaned);
                     div()
                         .id(("note-card", id as usize))
                         .absolute()
@@ -9270,15 +9292,7 @@ impl Editor {
                                 .justify_between()
                                 .text_size(px(11.))
                                 .text_color(rgb(MUTED_COLOR))
-                                .child(if is_diagnosis {
-                                    if level.is_empty() {
-                                        "Diagnosis".to_owned()
-                                    } else {
-                                        level.clone()
-                                    }
-                                } else {
-                                    "Note".to_owned()
-                                })
+                                .child(label)
                                 .child(
                                     div()
                                         .flex()
@@ -9574,14 +9588,10 @@ impl Editor {
     /// stacked (non-absolute) box. No inline composer — a writer's note opens
     /// the bottom strip on click; diagnoses are read-only here as everywhere.
     fn narrow_note_card(&self, card: &MarginCard, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let MarginCard { id, body, kind, title, level, .. } = card;
+        let MarginCard { id, body, kind, title, level, orphaned, .. } = card;
         let (id, kind) = (*id, *kind);
         let is_diagnosis = kind == NoteKind::Diagnosis;
-        let label = if is_diagnosis {
-            if level.is_empty() { "Diagnosis".to_owned() } else { level.clone() }
-        } else {
-            "Note".to_owned()
-        };
+        let label = note_card_label(is_diagnosis, level, *orphaned);
         let body = body.clone();
         let title = title.clone();
         div()

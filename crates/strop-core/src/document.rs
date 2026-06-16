@@ -19,6 +19,16 @@ fn count_line_breaks(text: &str) -> usize {
     ropey::Rope::from_str(text).len_lines() - 1
 }
 
+/// The substring of `text` spanning char positions `start..end` (clamped by
+/// the caller). Used to capture the passage a note covers before a wholesale
+/// restore so it can be re-located by content.
+fn char_slice(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InlineAttr {
     Emphasis,
@@ -306,6 +316,12 @@ pub enum NoteKind {
 /// An overlay annotation anchored to a char range — never part of the text
 /// stream. `title`/`level` are diagnosis fields (named problem;
 /// developmental|line|copy); serde defaults keep older files loading.
+///
+/// `orphaned` records that a checkpoint restore could not find the passage
+/// this note covered in the restored text: the note detached and was parked
+/// at its best-effort former offset rather than following live content. It
+/// rides through persistence so the rail can flag a lost anchor; ordinary
+/// editing never sets it. (Set only by `Annotations::reanchor`.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Annotation {
     pub id: u64,
@@ -319,6 +335,8 @@ pub struct Annotation {
     pub title: String,
     #[serde(default)]
     pub level: String,
+    #[serde(default)]
+    pub orphaned: bool,
 }
 
 /// The annotation overlay. Anchors adjust like non-expanding spans
@@ -343,6 +361,7 @@ impl Annotations {
             kind: NoteKind::Note,
             title: String::new(),
             level: String::new(),
+            orphaned: false,
         });
         self.notes.sort_by_key(|n| n.range.start);
         id
@@ -426,6 +445,39 @@ impl Annotations {
                 // notes property test.)
                 if n.range.end < n.range.start {
                     n.range.end = n.range.start;
+                }
+            }
+        }
+        self.notes.sort_by_key(|n| n.range.start);
+    }
+
+    /// Re-anchor every note by the passage it covered, when the whole text is
+    /// replaced wholesale (checkpoint restore). Each note follows its covered
+    /// substring to wherever that text now lives in `new_text`; the search
+    /// starts from the note's own former offset, so repeated passages resolve
+    /// in document order exactly like `diagnose::anchor` does for quotes.
+    ///
+    /// A note whose covered passage is gone (or that was a zero-width point
+    /// with nothing to match) DETACHES: it is flagged `orphaned` and parked at
+    /// its clamped former offset — never collapsed onto the document end,
+    /// which is what a naive wholesale-delete adjustment would do. Status,
+    /// body, kind and identity are preserved; only `range`/`orphaned` change.
+    pub fn reanchor(&mut self, old_text: &str, new_text: &str) {
+        let old_len = old_text.chars().count();
+        let new_len = new_text.chars().count();
+        for n in &mut self.notes {
+            let start = n.range.start.min(old_len);
+            let end = n.range.end.min(old_len).max(start);
+            let covered = char_slice(old_text, start, end);
+            match crate::diagnose::anchor(new_text, &covered, start.min(new_len)) {
+                Some(found) => {
+                    n.range = found;
+                    n.orphaned = false;
+                }
+                None => {
+                    let p = start.min(new_len);
+                    n.range = p..p;
+                    n.orphaned = true;
                 }
             }
         }
@@ -702,14 +754,23 @@ impl Document {
     /// stays append-only, and ctrl-z takes you back to the present.
     pub fn restore_state(&mut self, text: &str, spans: SpanSet, blocks: BlockMap) {
         let snapshot = self.snapshot();
+        // Re-anchor notes by content (the least-surprising restore semantics):
+        // each live note follows the passage it covers into the restored text;
+        // a note whose passage is gone detaches honestly instead of piling at
+        // the document end. Computed against the OLD buffer text — captured
+        // here, before the wholesale swap erases it — then installed after.
+        let old_text = self.buffer.text();
+        let mut reanchored = self.notes.clone();
+        reanchored.reanchor(&old_text, text);
+
         let len = self.buffer.len_bytes();
         if self.buffer.edit_bytes(0..len, text) {
             self.undo_states.push(snapshot);
             self.redo_states.clear();
         }
         self.absorb_buffer_ops();
-        // The wholesale text op mangled span/block adjustment; the restored
-        // state is authoritative.
+        // The wholesale text op mangled span/block/note adjustment; the
+        // restored state and the content-based re-anchoring are authoritative.
         self.spans = spans;
         let lines = self.buffer.rope().len_lines();
         self.blocks = if blocks.len() == lines {
@@ -717,6 +778,7 @@ impl Document {
         } else {
             BlockMap::new(lines)
         };
+        self.notes = reanchored;
     }
 
     /// Export undo/redo state for persistence (most-recent `cap` entries).
@@ -963,6 +1025,60 @@ mod tests {
         assert_eq!(doc.notes().get(id).unwrap().range, 0..6);
         doc.undo();
         assert!(doc.notes().notes().is_empty());
+    }
+
+    #[test]
+    fn restore_reanchors_notes_to_their_content() {
+        // A note follows the passage it covers to wherever that text lives in
+        // the restored version — not collapsed to the document end.
+        let mut doc = Document::new("alpha beta gamma", SpanSet::default(), BlockMap::default());
+        let id = doc.add_note(6..10, "on beta".into(), 0); // "beta"
+        doc.restore_state("xx beta yy", SpanSet::default(), BlockMap::new(1));
+        let n = doc.notes().get(id).unwrap();
+        assert_eq!(n.range, 3..7, "note should track its passage to its new offset");
+        assert!(!n.orphaned, "a found passage is not orphaned");
+        assert_eq!(doc.text(), "xx beta yy");
+    }
+
+    #[test]
+    fn restore_reanchors_repeated_passages_in_document_order() {
+        // Two notes on different occurrences of the same word must keep their
+        // own occurrence (positional hint), not both snap to the first.
+        let mut doc = Document::new("foo foo foo", SpanSet::default(), BlockMap::default());
+        let a = doc.add_note(0..3, "first".into(), 0);
+        let b = doc.add_note(8..11, "third".into(), 0);
+        doc.restore_state("foo foo foo", SpanSet::default(), BlockMap::new(1));
+        assert_eq!(doc.notes().get(a).unwrap().range, 0..3);
+        assert_eq!(doc.notes().get(b).unwrap().range, 8..11);
+    }
+
+    #[test]
+    fn restore_detaches_note_whose_passage_is_gone() {
+        // The passage vanished in the restored version: the note DETACHES —
+        // flagged orphaned and parked at its clamped former offset, never
+        // piled at the document end.
+        let mut doc = Document::new("keep DELETED keep", SpanSet::default(), BlockMap::default());
+        let id = doc.add_note(5..12, "on deleted".into(), 0); // "DELETED"
+        doc.restore_state("keep keep", SpanSet::default(), BlockMap::new(1));
+        let n = doc.notes().get(id).unwrap();
+        assert!(n.orphaned, "a vanished passage detaches");
+        assert_eq!(n.range.start, n.range.end, "a detached note is a point");
+        let end = doc.rope().len_chars();
+        assert!(n.range.start < end, "detached note must not pile at the document end");
+    }
+
+    #[test]
+    fn restore_reanchor_is_one_undoable_step() {
+        // Undo of a restore brings every note back to its exact pre-restore
+        // anchor and clears the orphaned flag.
+        let mut doc = Document::new("keep WORD keep", SpanSet::default(), BlockMap::default());
+        let id = doc.add_note(5..9, "on word".into(), 0); // "WORD"
+        doc.restore_state("nothing here", SpanSet::default(), BlockMap::new(1));
+        assert!(doc.notes().get(id).unwrap().orphaned);
+        doc.undo();
+        let n = doc.notes().get(id).unwrap();
+        assert_eq!(n.range, 5..9, "undo restores the pre-restore anchor");
+        assert!(!n.orphaned, "undo clears the orphaned flag");
     }
 
     #[test]

@@ -67,6 +67,7 @@ pub fn document() -> (String, SpanSet, BlockMap, Annotations) {
             kind: NoteKind::Diagnosis,
             title: "Agreement slip".to_owned(),
             level: "copy".to_owned(),
+            orphaned: false,
         });
     }
     if let Some(range) = char_range("it never averages your voice toward the mean") {
@@ -81,6 +82,7 @@ pub fn document() -> (String, SpanSet, BlockMap, Annotations) {
             kind: NoteKind::Diagnosis,
             title: "Unearned claim?".to_owned(),
             level: "line".to_owned(),
+            orphaned: false,
         });
     }
     if let Some(range) = char_range("deciding is your job") {
@@ -95,6 +97,7 @@ pub fn document() -> (String, SpanSet, BlockMap, Annotations) {
             kind: NoteKind::Note,
             title: String::new(),
             level: String::new(),
+            orphaned: false,
         });
     }
     (text, spans, blocks, notes)

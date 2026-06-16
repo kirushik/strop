@@ -137,6 +137,7 @@ pub fn to_annotations(
             kind: NoteKind::Diagnosis,
             title: d.problem,
             level: d.level,
+            orphaned: false,
         });
     }
     out
