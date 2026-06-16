@@ -69,6 +69,16 @@ pub fn documents_dir() -> PathBuf {
     base.join("Strop")
 }
 
+/// Ephemeral rendezvous directory for the single-instance socket. Lin
+/// `$XDG_RUNTIME_DIR/strop` (tmpfs, cleared on logout); macOS and Windows have
+/// no runtime dir, so the OS temp dir stands in. On Windows the path is only a
+/// source for the named-pipe name — nothing is written there.
+pub fn runtime_dir() -> PathBuf {
+    project()
+        .and_then(|p| p.runtime_dir().map(Path::to_path_buf))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// The user's home directory, non-panicking. Used only to expand a leading
 /// `~/` in user-supplied corpus globs and to tilde-compress displayed paths
 /// (`editor.rs`).
