@@ -1,0 +1,83 @@
+# Strop CI. Two independent jobs:
+#
+#   core — the framework-agnostic engine (strop-core). Fast, dependency-light,
+#          and the reliable gate: it runs every property test (the persistence
+#          round-trip, the no-panic suite, the state machine) at an elevated
+#          PROPTEST_CASES, plus clippy with warnings denied. Runs in seconds.
+#
+#   app  — the GPUI/Wayland shell (strop-app). Builds the git-pinned gpui from
+#          zed (wgpu + Wayland), so it needs system libraries and a long but
+#          cached compile. Its tests are pure-logic and run headless (they open
+#          no window). The apt list below mirrors Zed's Linux build deps; if a
+#          first run fails on a missing library, the linker error names it —
+#          adjust here. If this job proves too slow for every push, move its
+#          triggers to `workflow_dispatch` only; `core` stays the gate.
+#
+# Deliberately NO `cargo fmt --check`: this repo is hand-formatted, not
+# rustfmt-canonical, so a format gate would fail on untouched code.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: core engine — clippy + property tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core
+      - name: clippy (warnings denied)
+        run: cargo clippy -p strop-core --all-targets -- -D warnings
+      - name: tests (elevated proptest cases)
+        env:
+          # The harness (tests/model.rs, tests/robustness.rs) reads this; the
+          # bug-hunt pass validated green at 4096 in ~1.5s, so 2048 per push is
+          # cheap insurance against boundary regressions the default 256 misses.
+          PROPTEST_CASES: "2048"
+        run: cargo test -p strop-core
+
+  app:
+    name: app shell — clippy + headless logic tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: gpui system dependencies (Zed Linux build reqs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libvulkan-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libasound2-dev \
+            libfontconfig-dev \
+            libssl-dev \
+            libxcb1-dev \
+            libx11-dev \
+            libxext-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: app
+      - name: clippy (warnings denied)
+        run: cargo clippy -p strop-app --all-targets -- -D warnings
+      - name: tests (headless — pure-logic helpers open no window)
+        run: cargo test -p strop-app
