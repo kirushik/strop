@@ -1,0 +1,135 @@
+# Strop release builds.
+#
+# Trigger: push a `v*` tag (e.g. `v0.1.0`). Builds a --release binary on each of
+# the three CI platforms, packages it with its license files, and attaches the
+# archives to a GitHub Release created as a DRAFT — nothing is published until a
+# human reviews and hits publish.
+#
+# `workflow_dispatch` runs the build matrix WITHOUT creating a release, so the
+# three --release builds (which ci.yml never exercises — it builds debug) can be
+# dry-run on a branch before a tag is ever cut.
+#
+# Honesty for the early releases: only Linux is runtime-tested. The macOS and
+# Windows binaries build and pass a headless launch smoke (ci.yml) but are
+# otherwise unverified, and they are UNSIGNED — Gatekeeper / SmartScreen will
+# warn, and users must clear quarantine by hand. The release body says so.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Read-only by default; the release job opts into contents:write locally.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: strop
+          - os: macos-latest # Apple Silicon runner
+            target: aarch64-apple-darwin
+            bin: strop
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: strop.exe
+    steps:
+      - uses: actions/checkout@v6
+      - name: gpui system dependencies (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libvulkan-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libasound2-dev \
+            libfontconfig-dev \
+            libssl-dev \
+            libxcb1-dev \
+            libx11-dev \
+            libxext-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: build (release)
+        run: cargo build --release -p strop-app
+      - name: package
+        shell: bash
+        run: |
+          # Version from the tag (v0.1.0 -> 0.1.0); "dev" for a dispatch dry-run.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ver="dev"
+          else
+            ver="${GITHUB_REF_NAME#v}"
+          fi
+          name="strop-${ver}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/release/${{ matrix.bin }}" "dist/$name/"
+          # GPL: convey the licence and notices with the binary.
+          cp README.md COPYING NOTICE "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name" >/dev/null
+            echo "ASSET=dist/$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strop-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: create draft GitHub Release
+    needs: build
+    # Tag pushes only — a dispatch run stops after building artifacts.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Strop ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: artifacts/**/*
+          body: |
+            > **Early release.** Only **Linux (Wayland)** is runtime-tested.
+            > The **macOS** and **Windows** binaries build and pass a headless
+            > launch smoke, but are otherwise unverified — and **unsigned**, so
+            > Gatekeeper (macOS) and SmartScreen (Windows) will warn. On macOS,
+            > clear quarantine with `xattr -d com.apple.quarantine ./strop`.
+            >
+            > Building from source is the supported path — see
+            > [DEVELOPMENT.md](https://github.com/kirushik/strop/blob/main/DEVELOPMENT.md).
+            > The Linux binary is dynamically linked against the gpui system
+            > libraries listed there (Wayland, Vulkan, fontconfig, …).
+
+            ---

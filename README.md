@@ -32,7 +32,7 @@ working as a question, and never rewrites a line.
 
 ## Where it's at
 
-Strop is early, and built in the open. There is no release yet — it currently only tested on **Linux (Wayland)**, and you build it from source: see **[DEVELOPMENT.md](DEVELOPMENT.md)**.
+Strop is early, and built in the open. **[v0.1.0](https://github.com/kirushik/strop/releases/latest)** is the first rough cut — see the [changelog](CHANGELOG.md). Only **Linux (Wayland)** is runtime-tested; the macOS and Windows binaries build and pass a headless launch smoke but are otherwise unverified and unsigned. Building from source is the supported path: see **[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
 ## License
 
