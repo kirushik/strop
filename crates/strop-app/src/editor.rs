@@ -6701,11 +6701,6 @@ impl Element for EditorElement {
             }
             // Reuse the previous frame's shaped line when this block's text,
             // runs and metrics are unchanged (per-block layout reuse, matched by
-            // index — a split/merge shifts indices and simply re-shapes from the
-            // edit down). The (text, runs, size, indent) tuple is exactly the
-            // shape key, so a match is byte-identical.
-            // Reuse the previous frame's shaped line when this block's text,
-            // runs and metrics are unchanged (per-block layout reuse, matched by
             // index — a split/merge shifts indices and re-shapes from the edit
             // down). (text, runs, size, indent) is exactly the shape key, so a
             // match is byte-identical. `WrappedLine` isn't `Clone`, so the
