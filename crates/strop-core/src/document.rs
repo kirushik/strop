@@ -16,6 +16,24 @@ use crate::buffer::{Buffer, TextOp, Transaction};
 /// as one break, and CR / VT / FF / NEL / U+2028 / U+2029 all count — unlike a
 /// plain '\n' scan, which a paste of classic-Mac or PDF-copied text defeats.
 fn count_line_breaks(text: &str) -> usize {
+    // Fast path for the hot edit case (typing non-break chars): only build a
+    // throwaway Rope — the price of ropey's exact CRLF-as-one / CR / VT / FF /
+    // NEL / U+2028 / U+2029 counting — when a line-break char is actually
+    // present. The common keystroke inserts none and returns 0 immediately.
+    if !text.contains(|c: char| {
+        matches!(
+            c,
+            '\u{000A}'
+                | '\u{000B}'
+                | '\u{000C}'
+                | '\u{000D}'
+                | '\u{0085}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    }) {
+        return 0;
+    }
     ropey::Rope::from_str(text).len_lines() - 1
 }
 
@@ -497,6 +515,13 @@ pub struct Document {
     undo_states: Vec<(SpanSet, BlockMap, Annotations)>,
     redo_states: Vec<(SpanSet, BlockMap, Annotations)>,
     pending_ops: Vec<TextOp>,
+    /// Monotonic counter bumped by every layout-affecting mutation (text,
+    /// spans, blocks, note ranges). The view caches its laid-out frame keyed
+    /// on this, so a scroll/blink/caret-move with an unchanged document reuses
+    /// the previous layout instead of rebuilding it. Transient (never
+    /// serialized); over-bumping only costs a wasted rebuild, missing a bump
+    /// would risk a stale frame — so every `&mut self` mutator bumps it.
+    revision: u64,
 }
 
 impl Document {
@@ -526,6 +551,12 @@ impl Document {
 
     pub fn blocks(&self) -> &BlockMap {
         &self.blocks
+    }
+
+    /// Monotonic layout revision (see the `revision` field): equal across two
+    /// reads ⟺ no layout-affecting mutation happened between them.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Block index containing a byte offset.
@@ -599,11 +630,13 @@ impl Document {
     }
 
     pub fn set_notes(&mut self, notes: Annotations) {
+        self.revision += 1;
         self.notes = notes;
     }
 
     /// Add an author note as its own undoable transaction.
     pub fn add_note(&mut self, range: Range<usize>, body: String, created_unix: i64) -> u64 {
+        self.revision += 1;
         let snapshot = self.snapshot();
         self.buffer.push_empty_transaction();
         self.undo_states.push(snapshot);
@@ -612,6 +645,7 @@ impl Document {
     }
 
     pub fn set_note_status(&mut self, id: u64, status: NoteStatus) {
+        self.revision += 1;
         let snapshot = self.snapshot();
         self.buffer.push_empty_transaction();
         self.undo_states.push(snapshot);
@@ -620,6 +654,7 @@ impl Document {
     }
 
     pub fn set_note_body(&mut self, id: u64, body: String) {
+        self.revision += 1;
         let snapshot = self.snapshot();
         self.buffer.push_empty_transaction();
         self.undo_states.push(snapshot);
@@ -632,6 +667,7 @@ impl Document {
     /// here every tick so a crash mid-compose never loses the draft, while
     /// undo boundaries stay tied to the Enter-commit in `set_note_body`.
     pub fn set_note_body_draft(&mut self, id: u64, body: String) {
+        self.revision += 1;
         self.notes.set_body(id, body);
     }
 
@@ -647,6 +683,7 @@ impl Document {
         if diagnoses.is_empty() {
             return;
         }
+        self.revision += 1;
         let snapshot = self.snapshot();
         self.buffer.push_empty_transaction();
         self.undo_states.push(snapshot);
@@ -657,10 +694,14 @@ impl Document {
     }
 
     pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
-        let snapshot = self.snapshot();
+        self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes(byte_range, text) {
-            self.undo_states.push(snapshot);
+            // The buffer edit mutates only the rope + its own undo stack;
+            // spans/blocks/notes stay pre-edit until on_edit/absorb_buffer_ops
+            // run below, so snapshotting here captures the same pre-edit
+            // side-state as before — but only when a transaction opens.
+            self.undo_states.push(self.snapshot());
             self.redo_states.clear();
         }
         self.blocks
@@ -669,10 +710,15 @@ impl Document {
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
-        let snapshot = self.snapshot();
+        self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes_coalescing(byte_range, text) {
-            self.undo_states.push(snapshot);
+            // Snapshot only when a new transaction actually opens. While
+            // typing inside a word the buffer coalesces and returns false, so
+            // the full SpanSet+BlockMap+Annotations clone is skipped on the
+            // ~5-of-6 mid-word keystrokes it used to be allocated and dropped
+            // on. Pre-edit side-state is intact here (see edit_bytes).
+            self.undo_states.push(self.snapshot());
             self.redo_states.clear();
         }
         self.blocks
@@ -682,6 +728,7 @@ impl Document {
 
     /// Toggle `attr` over a char range as its own undoable transaction.
     pub fn toggle_format(&mut self, range: Range<usize>, attr: InlineAttr) {
+        self.revision += 1;
         let snapshot = self.snapshot();
         self.buffer.push_empty_transaction();
         self.undo_states.push(snapshot);
@@ -695,6 +742,7 @@ impl Document {
 
     /// Set a block's kind as its own undoable transaction.
     pub fn set_block_kind(&mut self, block: usize, kind: BlockKind) {
+        self.revision += 1;
         let snapshot = self.snapshot();
         self.buffer.push_empty_transaction();
         self.undo_states.push(snapshot);
@@ -705,6 +753,7 @@ impl Document {
     /// Change a block's kind inside the current transaction (rides a text
     /// edit, e.g. the `# `-shortcut or Enter-at-heading-end).
     pub fn set_block_kind_in_current_tx(&mut self, block: usize, kind: BlockKind) {
+        self.revision += 1;
         self.blocks.set_kind(block, kind);
     }
 
@@ -712,6 +761,7 @@ impl Document {
     /// caret formatting riding a typing transaction) — undone together
     /// with the typed text.
     pub fn format_in_current_tx(&mut self, range: Range<usize>, attr: InlineAttr, on: bool) {
+        self.revision += 1;
         if on {
             self.spans.add(range, attr);
         } else {
@@ -723,6 +773,7 @@ impl Document {
     /// Outer None = nothing to undo; inner None = format-only (keep cursor).
     pub fn undo(&mut self) -> Option<Option<usize>> {
         let cursor = self.buffer.undo()?;
+        self.revision += 1;
         if let Some((spans, blocks, notes)) = self.undo_states.pop() {
             self.redo_states.push((
                 std::mem::replace(&mut self.spans, spans),
@@ -738,6 +789,7 @@ impl Document {
 
     pub fn redo(&mut self) -> Option<Option<usize>> {
         let cursor = self.buffer.redo()?;
+        self.revision += 1;
         if let Some((spans, blocks, notes)) = self.redo_states.pop() {
             self.undo_states.push((
                 std::mem::replace(&mut self.spans, spans),
@@ -753,6 +805,7 @@ impl Document {
     /// checkpoint restore semantics: rewinding is a forward edit, history
     /// stays append-only, and ctrl-z takes you back to the present.
     pub fn restore_state(&mut self, text: &str, spans: SpanSet, blocks: BlockMap) {
+        self.revision += 1;
         let snapshot = self.snapshot();
         // Re-anchor notes by content (the least-surprising restore semantics):
         // each live note follows the passage it covers into the restored text;
@@ -848,6 +901,37 @@ mod tests {
             range,
             attr: InlineAttr::Strong,
         }
+    }
+
+    #[test]
+    fn revision_bumps_on_every_layout_mutation_and_is_stable_otherwise() {
+        let mut doc = Document::new("hello world", SpanSet::default(), BlockMap::default());
+        let r0 = doc.revision();
+        // Read-only access never bumps (the view's reuse fast-path depends on
+        // this: equal revisions across two reads ⟺ no layout change between).
+        let _ = (doc.text(), doc.spans().spans().len(), doc.blocks().len());
+        assert_eq!(doc.revision(), r0, "read-only access must not bump revision");
+
+        doc.edit_bytes_coalescing(5..5, "X");
+        let r1 = doc.revision();
+        assert!(r1 > r0, "text edit must bump revision");
+
+        // Format toggle changes no text (buffer.version may not move) but must
+        // still bump — this is the case a text-only signal would miss.
+        doc.toggle_format(0..5, InlineAttr::Strong);
+        let r2 = doc.revision();
+        assert!(r2 > r1, "format toggle must bump revision");
+
+        let id = doc.add_note(0..5, "n".into(), 0);
+        let r3 = doc.revision();
+        assert!(r3 > r2, "adding a note must bump revision");
+
+        doc.set_note_status(id, NoteStatus::Done);
+        let r4 = doc.revision();
+        assert!(r4 > r3, "note status change must bump revision");
+
+        doc.undo();
+        assert!(doc.revision() > r4, "undo must bump revision");
     }
 
     #[test]

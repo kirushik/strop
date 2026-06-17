@@ -936,6 +936,9 @@ struct TextFrame {
     scroll_top: Pixels,
     content_height: Pixels,
     paragraphs: Vec<ParagraphLayout>,
+    /// The key the paragraphs were laid out for; the next prepaint reuses them
+    /// when its key matches (see `LayoutKey`).
+    layout_key: LayoutKey,
 }
 
 struct ParagraphLayout {
@@ -967,6 +970,10 @@ struct ParagraphLayout {
     font_size: Pixels,
     /// Decoded image for Image blocks, with its display size.
     image: Option<(Arc<RenderImage>, gpui::Size<Pixels>)>,
+    /// The input runs this line was shaped with. Compared on the next rebuild
+    /// to decide whether the shaped line can be reused verbatim (per-block
+    /// layout reuse) instead of re-shaping — a few `TextRun`s per block.
+    runs: Vec<TextRun>,
 }
 
 impl ParagraphLayout {
@@ -1773,6 +1780,18 @@ impl Editor {
     /// §2-footnotes: all up to 3, then the 3 nearest the viewport center
     /// and a "+N more" row). Derived from the last painted frame.
     fn visible_footnotes(&self) -> (Vec<ZoneNote>, usize) {
+        // Common case: a document with no footnote refs surfaces no zone notes.
+        // Skip the whole-viewport paragraph scan and per-ref block search that
+        // otherwise run unconditionally on every render (incl. idle blinks).
+        if !self
+            .doc
+            .spans()
+            .spans()
+            .iter()
+            .any(|s| matches!(s.attr, InlineAttr::FootnoteRef(_)))
+        {
+            return (Vec::new(), 0);
+        }
         let Some(frame) = self.last_frame.as_ref() else {
             return (Vec::new(), 0);
         };
@@ -3539,6 +3558,7 @@ impl Editor {
     }
 
     pub fn save_now(&mut self) {
+        let perf = std::env::var_os("STROP_PERF").map(|_| std::time::Instant::now());
         self.sync_mutations();
         if let Some(store) = &self.store {
             match store.save_with_state(
@@ -3550,6 +3570,9 @@ impl Editor {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
             }
+        }
+        if let Some(t) = perf {
+            eprintln!("strop-perf: save_now {:?}", t.elapsed());
         }
     }
 
@@ -5848,12 +5871,34 @@ struct EditorElement {
     editor: Entity<Editor>,
 }
 
+/// The inputs that determine the laid-out paragraphs. Two frames with equal
+/// keys produce a byte-identical layout, so the later one reuses the earlier
+/// frame's paragraphs instead of re-shaping the whole document (the prepaint
+/// fast-path). Scroll offset and caret position are deliberately absent — they
+/// don't affect paragraph geometry, only the carried-forward scroll/caret quad,
+/// which is recomputed every frame regardless.
+#[derive(Clone, PartialEq)]
+struct LayoutKey {
+    /// Document content (text + spans + blocks + note ranges) — see
+    /// `Document::revision`.
+    revision: u64,
+    width_bits: u32,
+    font_scale_bits: u32,
+    /// Non-empty selection only: an empty selection paints no highlight, so a
+    /// collapsed-caret move leaves the layout identical.
+    selection: Option<(usize, usize)>,
+    marked: Option<(usize, usize)>,
+    find_query: Option<String>,
+    active_note: Option<u64>,
+}
+
 struct PrepaintState {
     paragraphs: Vec<ParagraphLayout>,
     cursor: Option<PaintQuad>,
     line_height: Pixels,
     scroll_top: Pixels,
     content_height: Pixels,
+    layout_key: LayoutKey,
 }
 
 impl IntoElement for EditorElement {
@@ -6256,6 +6301,123 @@ impl Element for EditorElement {
 
         let preview = editor.history_preview.clone();
         let in_history = preview.is_some();
+
+        // --- Layout reuse fast-path ------------------------------------------
+        // When the document, width, font and selection-highlight are unchanged
+        // since the last paint, the laid-out paragraphs are byte-identical, so
+        // there is no reason to re-materialize the text, re-project spans and
+        // re-shape every block (the whole-document O(N) prepaint). Scroll,
+        // cursor blink and collapsed-caret moves all land here — they touch
+        // only the scroll offset and the caret quad, both recomputed below from
+        // the carried-forward paragraphs. History preview and image blocks opt
+        // out: the preview text and async image decode aren't captured by the
+        // document revision.
+        let layout_key = LayoutKey {
+            revision: editor.doc.revision(),
+            width_bits: f32::from(wrap_width).to_bits(),
+            font_scale_bits: editor
+                .config
+                .font_size
+                .map_or(1f32, |s| (s / 20.).clamp(0.6, 2.))
+                .to_bits(),
+            selection: {
+                let s = &editor.selected_range;
+                (!in_history && s.start != s.end).then_some((s.start, s.end))
+            },
+            marked: editor
+                .marked_range
+                .as_ref()
+                .filter(|_| !in_history)
+                .map(|m| (m.start, m.end)),
+            find_query: if in_history {
+                None
+            } else if editor.palette_input.is_some() {
+                match omni_mode(&editor.palette_query) {
+                    (OmniMode::Find, rest) => Some(rest.to_string()),
+                    _ => None,
+                }
+            } else {
+                None
+            },
+            active_note: editor.active_note,
+        };
+        let can_reuse = !in_history
+            && !editor
+                .doc
+                .blocks()
+                .kinds()
+                .iter()
+                .any(|k| matches!(k, BlockKind::Image { .. }))
+            && editor.last_frame.as_ref().is_some_and(|f| {
+                f.bounds.size.width == wrap_width && f.layout_key == layout_key
+            });
+        if can_reuse {
+            let cursor_offset = editor.cursor_offset();
+            let cursor_affinity = editor.cursor_affinity_down;
+            let cursor_blink_visible = editor.cursor_visible; // !in_history holds here
+            let autoscroll = editor.autoscroll_request;
+            let mut scroll_top = editor.scroll_top;
+            // `editor`'s immutable borrow ends here (last use above); the
+            // mutable update_in_draw below is then free to run.
+            let (paragraphs, content_height) = self.editor.update_in_draw(cx, |ed| {
+                let f = ed
+                    .last_frame
+                    .as_mut()
+                    .expect("can_reuse implies a stored frame");
+                (std::mem::take(&mut f.paragraphs), f.content_height)
+            });
+            let max_scroll = (content_height + line_height - viewport).max(px(0.));
+            scroll_top = scroll_top.clamp(px(0.), max_scroll);
+            let cursor_pos = paragraphs
+                .iter()
+                .find(|p| cursor_offset <= p.range.end)
+                .map(|par| {
+                    let (line, x) =
+                        par.position(cursor_offset - par.range.start, cursor_affinity);
+                    (
+                        point(x, par.top + par.line_height * (line as f32)),
+                        par.line_height,
+                    )
+                });
+            if autoscroll && let Some((pos, cursor_lh)) = cursor_pos {
+                if pos.y < scroll_top {
+                    scroll_top = pos.y;
+                } else if pos.y + cursor_lh > scroll_top + viewport {
+                    scroll_top = pos.y + cursor_lh - viewport;
+                }
+            }
+            self.editor.update_in_draw(cx, |editor| {
+                editor.scroll_top = scroll_top;
+                editor.autoscroll_request = false;
+            });
+            let cursor = cursor_pos.and_then(|(pos, cursor_lh)| {
+                let y = pos.y - scroll_top;
+                if !cursor_blink_visible || y + cursor_lh <= px(0.) || y >= viewport {
+                    return None;
+                }
+                Some(fill(
+                    Bounds::new(bounds.origin + point(pos.x, y), size(px(2.), cursor_lh)),
+                    rgb(TEXT_COLOR),
+                ))
+            });
+            if let Some(start) = perf_start {
+                eprintln!(
+                    "strop-perf: prepaint {:?} (reuse, {} blocks)",
+                    start.elapsed(),
+                    paragraphs.len()
+                );
+            }
+            return PrepaintState {
+                paragraphs,
+                cursor,
+                line_height,
+                scroll_top,
+                content_height,
+                layout_key,
+            };
+        }
+        // --- End fast-path; full rebuild below -------------------------------
+
         let (text, diff_inserts, diff_deletes, preview_spans, preview_kinds) = match preview {
             Some(p) => (p.text, p.inserts, p.deletes, Some(p.spans_bytes), Some(p.kinds)),
             None => (editor.doc.text(), Vec::new(), Vec::new(), None, None),
@@ -6363,6 +6525,21 @@ impl Element for EditorElement {
             .collect();
         let scale = window.scale_factor();
 
+        // Previous frame's paragraphs, for per-block shaped-line reuse on this
+        // rebuild: a block whose text, runs and metrics are unchanged keeps its
+        // already-shaped line instead of re-shaping. This makes a full rebuild
+        // after a run of reuse frames cheap WITHOUT depending on GPUI's own
+        // two-frame line cache (which the reuse frames let go cold). Taken only
+        // when the wrap width matches — a resize reflows every line. Safe here:
+        // the immutable `editor` borrow's last use was the setup above; the
+        // loop below reads only locals + `window`.
+        let mut prev: Option<Vec<Option<ParagraphLayout>>> =
+            self.editor.update_in_draw(cx, |editor| match &mut editor.last_frame {
+                Some(f) if f.bounds.size.width == wrap_width => {
+                    Some(std::mem::take(&mut f.paragraphs).into_iter().map(Some).collect())
+                }
+                _ => None,
+            });
         let mut paragraphs = Vec::new();
         let mut top = px(0.);
         let mut offset = 0;
@@ -6522,27 +6699,51 @@ impl Element for EditorElement {
                     );
                 }
             }
-            let line = window
-                .text_system()
-                .shape_text(
-                    SharedString::from(par_text.to_owned()),
-                    bstyle.size,
-                    &runs,
-                    Some(wrap_width - bstyle.indent),
-                    None,
-                )
-                .expect("shape_text failed")
-                .into_iter()
-                .next()
-                .expect("shape_text returned no lines");
-            let boundaries: Vec<usize> = line
-                .wrap_boundaries()
-                .iter()
-                .map(|b| {
-                    let run = &line.unwrapped_layout.runs[b.run_ix];
-                    run.glyphs[b.glyph_ix].index
-                })
-                .collect();
+            // Reuse the previous frame's shaped line when this block's text,
+            // runs and metrics are unchanged (per-block layout reuse, matched by
+            // index — a split/merge shifts indices and re-shapes from the edit
+            // down). (text, runs, size, indent) is exactly the shape key, so a
+            // match is byte-identical. `WrappedLine` isn't `Clone`, so the
+            // matching slot is moved out of `prev`.
+            let reused = match prev.as_mut().and_then(|v| v.get_mut(block_ix)) {
+                Some(slot)
+                    if slot.as_ref().is_some_and(|p| {
+                        p.font_size == bstyle.size
+                            && p.indent == bstyle.indent
+                            && p.line.text.as_ref() == par_text
+                            && p.runs == runs
+                    }) =>
+                {
+                    slot.take()
+                }
+                _ => None,
+            };
+            let (line, boundaries) = if let Some(p) = reused {
+                (p.line, p.boundaries)
+            } else {
+                let line = window
+                    .text_system()
+                    .shape_text(
+                        SharedString::from(par_text.to_owned()),
+                        bstyle.size,
+                        &runs,
+                        Some(wrap_width - bstyle.indent),
+                        None,
+                    )
+                    .expect("shape_text failed")
+                    .into_iter()
+                    .next()
+                    .expect("shape_text returned no lines");
+                let boundaries: Vec<usize> = line
+                    .wrap_boundaries()
+                    .iter()
+                    .map(|b| {
+                        let run = &line.unwrapped_layout.runs[b.run_ix];
+                        run.glyphs[b.glyph_ix].index
+                    })
+                    .collect();
+                (line, boundaries)
+            };
             top += bstyle.extra_top;
             // Breathing room above the Footnotes section rule (H4).
             if section_rule {
@@ -6580,6 +6781,7 @@ impl Element for EditorElement {
                 fn_marks,
                 font_size: bstyle.size,
                 image,
+                runs,
             });
             top += height + paragraph_gap;
             offset = range.end + 1; // step over '\n'
@@ -6642,6 +6844,7 @@ impl Element for EditorElement {
             line_height,
             scroll_top,
             content_height,
+            layout_key,
         }
     }
 
@@ -6770,6 +6973,7 @@ impl Element for EditorElement {
 
         let paragraphs = std::mem::take(&mut prepaint.paragraphs);
         let content_height = prepaint.content_height;
+        let layout_key = prepaint.layout_key.clone();
         // Overlays (margin lane, AI card/idle hint, selection popover)
         // position themselves from `last_frame` — the PREVIOUS paint's
         // geometry. When this paint's geometry differs (window resize,
@@ -6796,6 +7000,7 @@ impl Element for EditorElement {
                 scroll_top,
                 content_height,
                 paragraphs,
+                layout_key,
             });
         });
     }
@@ -8797,11 +9002,33 @@ impl Editor {
         (n > 0).then_some(n)
     }
 
+    /// Cheap emptiness predicate for `lane_has_content`: would ANY open note
+    /// surface as a margin card right now? Mirrors `margin_cards`'s door filter
+    /// (drafting hides diagnoses; an open developmental card suppresses copy
+    /// ones) but skips positioning and height-estimating every card — work
+    /// `column_frame` (several calls per render) never needed just to test
+    /// whether the lane is occupied.
+    fn has_margin_cards(&self) -> bool {
+        if self.last_frame.is_none() {
+            return false;
+        }
+        let drafting = self.drafting;
+        let has_dev = !drafting
+            && self
+                .doc
+                .notes()
+                .open()
+                .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
+        self.doc.notes().open().any(|n| {
+            !(n.kind == NoteKind::Diagnosis && (drafting || (has_dev && n.level == "copy")))
+        })
+    }
+
     /// Does anything want the right-hand note lane right now? An empty lane
     /// never pulls the column off-centre — the column only shifts in the
     /// service of cards that would otherwise have nowhere to go.
     fn lane_has_content(&self) -> bool {
-        !self.margin_cards().is_empty()
+        self.has_margin_cards()
             || self.margin_rail_count().is_some()
             || self.ai_status.is_some()
             || self.next_intent.is_some()
@@ -9060,7 +9287,7 @@ impl Editor {
                     self.suppressed_copy() > 0
                 };
                 if !fits
-                    || !self.margin_cards().is_empty()
+                    || self.has_margin_cards()
                     || rail_showing
                     || self.doc.len_bytes() == 0
                     || self.next_intent.is_some()
