@@ -20,7 +20,7 @@ blake3 = "1.8"
 toml = "0.8"
 toml_edit = "0.22"
 ureq = { version = "3", features = ["json"] }
-similar = { version = "2", features = ["unicode", "inline"] }
+similar = { version = "3", features = ["unicode", "inline"] }
 glob = "0.3"
 
 # Git pin on zed-industries/zed (post gpui/gpui_platform split), tag
