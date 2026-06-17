@@ -6075,7 +6075,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strop-core",
- "toml 0.8.23",
+ "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.22.27",
  "ttf-parser 0.21.1",
  "unicode-segmentation",
