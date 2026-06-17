@@ -6076,7 +6076,7 @@ dependencies = [
  "serde_json",
  "strop-core",
  "toml 0.8.23",
- "toml_edit 0.22.27",
+ "toml_edit 0.25.12+spec-1.1.0",
  "ttf-parser 0.21.1",
  "unicode-segmentation",
 ]
@@ -6589,6 +6589,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.3",
 ]
 
