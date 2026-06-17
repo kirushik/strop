@@ -3697,7 +3697,13 @@ impl Editor {
             if self.config.auto_copy_selection {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             }
+            // The PRIMARY selection is an X11/Wayland concept; gpui exposes it
+            // only on Linux/BSD. macOS and Windows have no PRIMARY — the
+            // regular clipboard above is the only target there.
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             cx.write_to_primary(ClipboardItem::new_string(text));
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            let _ = text;
         }
     }
 
@@ -5315,14 +5321,21 @@ impl Editor {
 
     fn on_middle_click(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         // freedesktop PRIMARY contract: middle button pastes the primary
-        // selection (never the clipboard) at the click position.
-        let Some(text) = cx.read_from_primary().and_then(|item| item.text()) else {
-            return;
-        };
-        let (ix, _) = self.index_for_mouse(ev.position);
-        self.selected_range = ix..ix;
-        self.selection_reversed = false;
-        self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
+        // selection (never the clipboard) at the click position. PRIMARY is
+        // X11/Wayland-only (gpui exposes read_from_primary on Linux/BSD); on
+        // macOS/Windows middle-click carries no paste, so this is a no-op.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let Some(text) = cx.read_from_primary().and_then(|item| item.text()) else {
+                return;
+            };
+            let (ix, _) = self.index_for_mouse(ev.position);
+            self.selected_range = ix..ix;
+            self.selection_reversed = false;
+            self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let _ = (ev, cx);
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
