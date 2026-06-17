@@ -317,7 +317,11 @@ mod tests {
     use super::*;
 
     /// One sequential test for everything env-dependent (env is process
-    /// global; parallel tests must not each repoint HOME).
+    /// global; parallel tests must not each repoint HOME). Linux/BSD only:
+    /// it isolates by repointing HOME/XDG_*, but `directories` honours those
+    /// only on the XDG platforms — on macOS/Windows it reads the OS Known
+    /// Folders, so the redirection (and thus the isolation) has no effect.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn lifecycle_in_isolated_home() {
         let tmp = std::env::temp_dir().join(format!("strop-files-test-{}", std::process::id()));

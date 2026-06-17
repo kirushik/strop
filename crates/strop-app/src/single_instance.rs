@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use interprocess::local_socket::{GenericFilePath, Listener, ListenerOptions, Stream, prelude::*};
+use interprocess::local_socket::{Listener, ListenerOptions, Stream, prelude::*};
 
 /// The hand-off message a secondary sends a live primary. Content is
 /// irrelevant — receiving *anything* means "another instance wants this file
@@ -59,6 +59,26 @@ pub fn socket_path(file: &Path) -> PathBuf {
     crate::paths::runtime_dir().join(format!("strop-{id:016x}.sock"))
 }
 
+/// The interprocess name for that rendezvous socket. Windows named pipes live
+/// in their own namespace (a bare name becomes `\\.\pipe\<name>`) and reject a
+/// filesystem path outright ("not a named pipe path"), so there we use just
+/// the unique file-name component as the pipe name; Unix uses the socket's
+/// filesystem path directly.
+#[cfg(windows)]
+fn socket_name(socket: &Path) -> std::io::Result<interprocess::local_socket::Name<'_>> {
+    use interprocess::local_socket::GenericNamespaced;
+    let name = socket.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad rendezvous socket name")
+    })?;
+    name.to_ns_name::<GenericNamespaced>()
+}
+
+#[cfg(not(windows))]
+fn socket_name(socket: &Path) -> std::io::Result<interprocess::local_socket::Name<'_>> {
+    use interprocess::local_socket::GenericFilePath;
+    socket.to_fs_name::<GenericFilePath>()
+}
+
 /// Try to claim `file` for this process. Connects first: a live primary
 /// answers and is sent a raise (-> `AlreadyOpen`); otherwise any stale socket
 /// is cleared and we bind it ourselves (-> `Primary`).
@@ -78,7 +98,7 @@ pub fn claim(file: &Path) -> std::io::Result<Claim> {
         }
     }
     let listener = match ListenerOptions::new()
-        .name(socket.as_path().to_fs_name::<GenericFilePath>()?)
+        .name(socket_name(&socket)?)
         .create_sync()
     {
         Ok(listener) => listener,
@@ -108,7 +128,7 @@ pub fn claim(file: &Path) -> std::io::Result<Claim> {
 /// Connect to a primary and ask it to surface. `true` iff something live
 /// accepted the connection.
 fn connect_and_raise(socket: &Path) -> bool {
-    let Ok(name) = socket.to_fs_name::<GenericFilePath>() else {
+    let Ok(name) = socket_name(socket) else {
         return false;
     };
     match Stream::connect(name) {
