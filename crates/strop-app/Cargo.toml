@@ -24,4 +24,4 @@ glob = { workspace = true }
 interprocess = "2.4.2"
 
 [dev-dependencies]
-ttf-parser = "0.21"
+ttf-parser = "0.25"
