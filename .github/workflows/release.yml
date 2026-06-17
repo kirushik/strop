@@ -66,11 +66,16 @@ jobs:
             libx11-dev \
             libxext-dev
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
       - name: build (release)
-        run: cargo build --release -p strop-app
+        # Build the exact matrix triple so the artifact label is true by
+        # construction (not an assumption about the runner's host arch), and
+        # --locked so the published binary matches the committed Cargo.lock.
+        run: cargo build --release --locked --target ${{ matrix.target }} -p strop-app
       - name: package
         shell: bash
         run: |
@@ -82,7 +87,7 @@ jobs:
           fi
           name="strop-${ver}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/release/${{ matrix.bin }}" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$name/"
           # GPL: convey the licence and notices with the binary.
           cp README.md COPYING NOTICE "dist/$name/"
           cd dist
