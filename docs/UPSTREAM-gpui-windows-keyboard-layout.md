@@ -1,10 +1,11 @@
 # Keyboard-layout independence for shortcuts (and an upstream gpui-on-Windows gap)
 
 Status: Linux works today; Windows is broken by code analysis (not yet
-confirmed on hardware); macOS is uncertain and shares the risk. The Windows
-fix is upstream in `gpui_windows`, which Strop does not vendor — so this file
-is the analysis + a verification ask for the Windows testers, not a shipped
-fix.
+confirmed on hardware); macOS is uncertain and shares the risk. **The Windows
+fix is now shipped as `patches/gpui_windows-keyboard-layout.patch`, applied via
+a zed fork** (see `patches/README.md`) — the route chosen after cargo-patch
+proved unworkable for a git-sourced dep on ephemeral CI. This file remains the
+analysis + the on-hardware verification ask.
 
 ## The principle
 
@@ -58,11 +59,15 @@ VK through the active layout, which re-introduces the layout dependence the VK
 code had already removed. Net effect: under a Cyrillic layout, letter-key
 chords (`Ctrl+Shift+P`, `Ctrl+C`, `Ctrl+B`, …) would not match.
 
-This cannot be fixed from Strop: the keystroke is produced inside
-`gpui_windows` before the keymap sees it, there is no app-level hook to rewrite
-it, and `gpui_windows` is not in `vendor/` (only `gpui_wgpu` is). Fixing it
-means either an upstream gpui change or vendoring the whole `gpui_windows`
-crate (large, DirectX-bearing) — out of scope for the Windows-papercut pass.
+It can't be fixed from Strop's own code: the keystroke is produced inside
+`gpui_windows` before the keymap sees it, and there's no app-level hook to
+rewrite it. So the fix lives in the gpui tree, carried as
+`patches/gpui_windows-keyboard-layout.patch` and consumed via a zed fork
+(`patches/README.md`). The patch is three lines — return the US-layout letter
+directly for `VK_A..=VK_Z` (whose VK codes are the ASCII letters) before the
+layout-sensitive `MapVirtualKeyW` call — so a chord stays Latin-named whatever
+the active layout. An upstream PR remains the eventual home; the fork just
+unblocks Strop's Windows users in the meantime.
 
 Recommended upstream fix: in `get_key_from_vkey` (or its caller), when the
 keystroke carries `ctrl`/`alt`/`win` and the layout-mapped character is

@@ -1,0 +1,19 @@
+--- a/crates/gpui_windows/src/keyboard.rs
++++ b/crates/gpui_windows/src/keyboard.rs
+@@ -160,6 +160,16 @@
+ }
+ 
+ fn get_key_from_vkey(vkey: VIRTUAL_KEY) -> Option<String> {
++    // VK_A..=VK_Z carry the US-layout letter regardless of the active keyboard
++    // layout, so keyboard shortcuts resolve identically under non-Latin layouts
++    // such as Cyrillic. MapVirtualKeyW below maps through the active layout and
++    // would return the layout glyph (the physical P key yields a Cyrillic letter
++    // under a Russian layout), which never matches a Latin binding like
++    // "ctrl-shift-p".
++    if let 0x41..=0x5A = vkey.0 {
++        return Some((vkey.0 as u8 as char).to_ascii_lowercase().to_string());
++    }
++
+     let key_data = unsafe { MapVirtualKeyW(vkey.0 as u32, MAPVK_VK_TO_CHAR) };
+     if key_data == 0 {
+         return None;
