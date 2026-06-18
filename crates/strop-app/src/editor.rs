@@ -2338,7 +2338,7 @@ impl Editor {
     /// open it in the system editor, and say what happens next.
     fn open_ai_config(&mut self, _: &OpenAiConfig, _: &mut Window, cx: &mut Context<Self>) {
         let path = crate::config::write_template_if_missing();
-        let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+        crate::files::open_external(&path);
         self.ai_generation += 1;
         let generation = self.ai_generation;
         self.ai_status = Some(AiStatus::Note {
@@ -4587,11 +4587,7 @@ impl Editor {
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     move |_: &MouseDownEvent, _, _| {
-                                                        let _ = std::process::Command::new(
-                                                            "xdg-open",
-                                                        )
-                                                        .arg(url)
-                                                        .spawn();
+                                                        crate::files::open_external(url);
                                                     },
                                                 )
                                                 .child("Get a key →"),

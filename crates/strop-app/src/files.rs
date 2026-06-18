@@ -5,6 +5,7 @@
 //! Strop's old silent scratch.strop was exactly it. Documents are born as
 //! real files in the user's documents folder, findable from second one.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// First free "Untitled.strop" / "Untitled 2.strop" / … in the Strop folder.
@@ -232,32 +233,82 @@ fn record_caret_at(file: &Path, doc: &Path, caret: usize) {
     save_intents_at(file, &map);
 }
 
-/// Select the file in the system file manager (freedesktop FileManager1),
-/// falling back to opening the containing folder.
-pub fn reveal(path: &Path) {
-    let uri = format!("file://{}", path.display());
-    let ok = std::process::Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.freedesktop.FileManager1",
-            "--object-path",
-            "/org/freedesktop/FileManager1",
-            "--method",
-            "org.freedesktop.FileManager1.ShowItems",
-            &format!("['{uri}']"),
-            "",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok
-        && let Some(dir) = path.parent()
+/// Open a path or URL with the OS default handler. Best-effort and
+/// fire-and-forget — a system with no handler registered does nothing, the
+/// same failure the bare `xdg-open` had. Per-OS because there is no single
+/// portable launcher: the `start` shell verb (Windows), `open` (macOS),
+/// `xdg-open` (Linux). On Windows it goes through `cmd` with CREATE_NO_WINDOW
+/// so the console-subsystem launcher never flashes a window of its own.
+pub fn open_external(target: impl AsRef<OsStr>) {
+    let target = target.as_ref();
+    #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        use std::os::windows::process::CommandExt;
+        // `cmd /C start "" <target>`: the empty "" is the (required) window
+        // title slot, so a quoted target is never consumed as the title.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["/C", "start", ""])
+            .arg(target)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(target).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    }
+}
+
+/// Select the file in the system file manager, falling back to opening the
+/// containing folder. Per-OS: Explorer's `/select,` (Windows), Finder's
+/// `open -R` (macOS), the freedesktop FileManager1 D-Bus call with an
+/// `xdg-open`-the-folder fallback (Linux).
+pub fn reveal(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        // explorer /select,<path> opens the folder with the file highlighted.
+        // explorer returns a non-zero exit even on success, so don't check it.
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path);
+        let _ = std::process::Command::new("explorer").arg(arg).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let uri = format!("file://{}", path.display());
+        let ok = std::process::Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.FileManager1",
+                "--object-path",
+                "/org/freedesktop/FileManager1",
+                "--method",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("['{uri}']"),
+                "",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok
+            && let Some(dir) = path.parent()
+        {
+            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        }
     }
 }
 
