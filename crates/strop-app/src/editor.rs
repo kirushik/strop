@@ -20,8 +20,8 @@ use gpui::{
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     Pixels, Point, ResizeEdge, ScrollWheelEvent, SharedString, StrikethroughStyle, Style,
-    TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions,
-    div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
+    WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
     Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus, SpanSet,
@@ -7300,6 +7300,9 @@ impl Editor {
     ) -> impl IntoElement {
         div()
             .id(label)
+            // Clickable, not a drag handle: occlude so the Windows titlebar
+            // hit-test resolves to this control rather than HTCAPTION.
+            .occlude()
             .w(px(34.))
             .h_full()
             .flex()
@@ -7319,6 +7322,14 @@ impl Editor {
     /// controls. Formatting lives in the selection popover (DESIGN
     /// §2-toolbar: zero category precedent for persistent format buttons).
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Dragging the bar moves the window — by two mechanisms, because the
+        // platforms split. `start_window_move()` drives Wayland/X11/macOS but
+        // is a no-op on Windows, where the OS only moves a window whose
+        // hit-test claims HTCAPTION — which is exactly what
+        // `window_control_area(Drag)` makes gpui report. Both ride the whole
+        // bar; interactive children opt out below (stop_propagation for the
+        // move handler, and `occlude()` so the Windows hit-test resolves to the
+        // child, not the caption — otherwise their clicks would start a drag).
         let drag =
             |_: &MouseDownEvent, window: &mut Window, _: &mut App| window.start_window_move();
         div()
@@ -7326,6 +7337,8 @@ impl Editor {
             .w_full()
             .flex()
             .items_center()
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(MouseButton::Left, drag)
             .border_b_1()
             .border_color(rgb(RULE_COLOR))
             .font_family("PT Serif")
@@ -7336,6 +7349,7 @@ impl Editor {
             .child(
                 div()
                     .id("outline-toggle")
+                    .occlude()
                     .px(px(8.))
                     .py(px(2.))
                     .ml(px(8.))
@@ -7372,6 +7386,7 @@ impl Editor {
             // Document name — click or F2 to rename in place, file and all.
             .child(match (&self.doc_rename_input, &self.store) {
                 (Some(input), _) => div()
+                    .occlude()
                     .ml(px(8.))
                     .w(px(220.))
                     .child(input.clone())
@@ -7385,6 +7400,7 @@ impl Editor {
                         .to_owned();
                     div()
                         .id("doc-title")
+                        .occlude()
                         .ml(px(8.))
                         .px(px(4.))
                         .rounded(px(4.))
@@ -7413,6 +7429,7 @@ impl Editor {
             .child(
                 div()
                     .id("word-count")
+                    .occlude()
                     .ml(px(12.))
                     .px(px(4.))
                     .rounded(px(4.))
@@ -7471,10 +7488,10 @@ impl Editor {
                     .items_center()
                     .justify_center()
                     .px(px(12.))
-                    .on_mouse_down(MouseButton::Left, drag)
                     .child(
                         div()
                             .id("omni-pill")
+                            .occlude()
                             .flex_1()
                             .max_w(px(320.))
                             .px(px(10.))
@@ -7524,6 +7541,7 @@ impl Editor {
                 let mark = if running { rgb(SAGE_COLOR) } else { rgb(MUTED_COLOR) };
                 div()
                     .id("diagnose-toggle")
+                    .occlude()
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(5.))
@@ -7561,6 +7579,7 @@ impl Editor {
             .child(
                 div()
                     .id("palette-toggle")
+                    .occlude()
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(5.))
@@ -7589,6 +7608,7 @@ impl Editor {
             .child(
                 div()
                     .id("history-toggle")
+                    .occlude()
                     .px(px(8.))
                     .py(px(2.))
                     .ml(px(4.))
@@ -7643,6 +7663,7 @@ impl Editor {
                 // Zoom: drawn square (U+25A1 isn't in PT).
                 div()
                     .id("win-zoom")
+                    .occlude()
                     .w(px(34.))
                     .h_full()
                     .flex()
