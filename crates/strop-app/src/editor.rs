@@ -299,13 +299,26 @@ pub fn bind_keys(cx: &mut App) {
     // palette and the keymap can never disagree about a chord.
     let editor_ctx: std::rc::Rc<gpui::KeyBindingContextPredicate> =
         gpui::KeyBindingContextPredicate::parse("Editor").unwrap().into();
+    // App-global commands (Command::global) bind to the root "App" context so
+    // their chords fire from any focus — palette, note field, settings — not
+    // just when the document is focused. Document mutations keep "Editor", so
+    // e.g. ctrl-b typed into a field can't bold the document behind it. The
+    // matching handlers live on both the root and the editor column (render);
+    // the deeper one wins when the document is focused, so neither double-fires.
+    let app_ctx: std::rc::Rc<gpui::KeyBindingContextPredicate> =
+        gpui::KeyBindingContextPredicate::parse("App").unwrap().into();
     cx.bind_keys(crate::commands::all().iter().filter_map(|cmd| {
         let keys = cmd.keys?;
+        let predicate = if cmd.global() {
+            app_ctx.clone()
+        } else {
+            editor_ctx.clone()
+        };
         Some(
             KeyBinding::load(
                 keys,
                 (cmd.make)(),
-                Some(editor_ctx.clone()),
+                Some(predicate),
                 false,
                 None,
                 &gpui::DummyKeyboardMapper,
@@ -9958,17 +9971,53 @@ impl Render for Editor {
             .bg(rgb(BG_COLOR))
             .flex()
             .flex_col()
-            // Bottom strips (find/replace, composer) mount on this root,
-            // outside the column's listener stack — actions from their
-            // inputs bubble here.
+            // The whole window sits under one "App" key context so the
+            // app-global commands (every menu verb that isn't a text
+            // mutation — palette, find, file ops, AI, history, session) fire
+            // from ANY focus, not only when the document holds it. bind_keys
+            // binds those to "App" and the document-mutating ones to the inner
+            // "Editor" context. Their handlers live here on the root so they
+            // stay reachable when a field overlay (palette, note, settings)
+            // has focus and the "Editor" subtree is off the dispatch path; the
+            // editor column carries the same handlers, and the deeper one wins
+            // when the document is focused, so these duplicates never
+            // double-fire.
+            .key_context("App")
+            // Field overlays mount on this root, outside the column's listener
+            // stack, so their actions bubble here: tab between fields, replace
+            // (ctrl-h), and the palette row motion PaletteInput's up/down emit.
             .on_action(cx.listener(Self::note_tab))
-            // The omnibox lives outside the Editor key context (it's a root
-            // overlay, like the strips it replaced), so its actions must be
-            // handled here to be reachable: replace (ctrl-h), and the row
-            // motion that PaletteInput's up/down keys dispatch.
             .on_action(cx.listener(Self::replace))
             .on_action(cx.listener(Self::palette_up))
             .on_action(cx.listener(Self::palette_down))
+            // App-global command handlers, mirrored from the editor column so
+            // they fire while a field overlay holds focus (see "App" above).
+            .on_action(cx.listener(Self::new_document))
+            .on_action(cx.listener(Self::open_file))
+            .on_action(cx.listener(Self::rename_document))
+            .on_action(cx.listener(Self::reveal_in_files))
+            .on_action(cx.listener(Self::copy_document_path))
+            .on_action(cx.listener(Self::save_copy_as))
+            .on_action(cx.listener(Self::export_markdown))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::toggle_outline))
+            .on_action(cx.listener(Self::run_diagnosis))
+            .on_action(cx.listener(Self::run_believing))
+            .on_action(cx.listener(Self::toggle_review))
+            .on_action(cx.listener(Self::mode_developmental))
+            .on_action(cx.listener(Self::mode_line))
+            .on_action(cx.listener(Self::mode_copy))
+            .on_action(cx.listener(Self::open_ai_config))
+            .on_action(cx.listener(Self::open_ai_settings))
+            .on_action(cx.listener(Self::test_ai_connection))
+            .on_action(cx.listener(Self::cancel_ai_run))
+            .on_action(cx.listener(Self::toggle_history))
+            .on_action(cx.listener(Self::add_checkpoint))
+            .on_action(cx.listener(Self::set_session_goal))
+            .on_action(cx.listener(Self::end_session))
+            .on_action(cx.listener(Self::toggle_palette))
+            .on_action(cx.listener(Self::show_shortcuts))
+            .on_action(cx.listener(Self::open_welcome))
             // §0.6 law 3 (click-outside) lives on the root so the whole
             // window counts as "outside", gutters and titlebar included.
             .on_mouse_down(
