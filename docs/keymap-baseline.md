@@ -12,6 +12,12 @@ status.
 nice-to-have (expected by power users / prose-tool veterans) · `Cmd` = ⌘,
 `Opt` = ⌥. "Mod" in CodeMirror terms = Ctrl on Linux/Windows, Cmd on macOS.
 
+**Keyboard-layout independence:** chords name physical keys, so `Ctrl+Shift+P`
+must work whatever the active layout (a writer in a Russian layout presses the
+same key and gets the palette). Linux delivers this; Windows/macOS have a
+gpui-level gap for letter keys under non-Latin layouts. Analysis and the
+tester-verification ask live in `docs/UPSTREAM-gpui-windows-keyboard-layout.md`.
+
 **Sources used throughout:**
 
 - **macOS selectors:** [NSStandardKeyBindingResponding](https://developer.apple.com/documentation/appkit/nsstandardkeybindingresponding) (full selector vocabulary); [Text System Defaults and Key Bindings](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/TextDefaultsBindings/TextDefaultsBindings.html) (StandardKeyBinding.dict mechanism, `^~$#` modifier syntax); [StandardKeyBinding.dict dump](https://gist.github.com/zsimic/1367779); [Apple: Mac keyboard shortcuts](https://support.apple.com/en-us/102650).
