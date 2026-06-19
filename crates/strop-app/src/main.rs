@@ -1,3 +1,11 @@
+// Windows attaches a console to a console-subsystem binary launched from
+// Explorer — for a GUI app that is a spare black window next to ours. The
+// "windows" subsystem suppresses it. Gated to release builds so `cargo run`
+// and debug builds keep their console (eprintln!/panic output go nowhere
+// under the windows subsystem). The `target_os = "windows"` arm is belt-and-
+// braces — the attribute is already ignored on non-Windows targets — and just
+// keeps it scoped to where it means something.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 // Draw-pass discipline (docs/VISUAL-RIG.md): raw Entity::update and canvas
 // are banned crate-wide; clippy.toml points each ban at its draw_guard
 // wrapper. Deny, not warn — a mid-draw notify is a corruption bug, not style.
@@ -251,6 +259,14 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.clone().into()),
+                    // Strop draws its own titlebar, so the OS must not stack a
+                    // native one on top of it. On Windows this flag is what
+                    // flips gpui's `hide_title_bar` — without it the native
+                    // caption is kept (the reported "two title bars" bug, and
+                    // why the window was draggable only by the native one). On
+                    // macOS it makes the system titlebar transparent so our
+                    // chrome shows through. Linux/Wayland CSD ignores it.
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 focus: !smoke,

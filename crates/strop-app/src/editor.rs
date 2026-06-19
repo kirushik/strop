@@ -20,8 +20,8 @@ use gpui::{
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     Pixels, Point, ResizeEdge, ScrollWheelEvent, SharedString, StrikethroughStyle, Style,
-    TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions,
-    div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
+    WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
     Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus, SpanSet,
@@ -299,13 +299,26 @@ pub fn bind_keys(cx: &mut App) {
     // palette and the keymap can never disagree about a chord.
     let editor_ctx: std::rc::Rc<gpui::KeyBindingContextPredicate> =
         gpui::KeyBindingContextPredicate::parse("Editor").unwrap().into();
+    // App-global commands (Command::global) bind to the root "App" context so
+    // their chords fire from any focus — palette, note field, settings — not
+    // just when the document is focused. Document mutations keep "Editor", so
+    // e.g. ctrl-b typed into a field can't bold the document behind it. The
+    // matching handlers live on both the root and the editor column (render);
+    // the deeper one wins when the document is focused, so neither double-fires.
+    let app_ctx: std::rc::Rc<gpui::KeyBindingContextPredicate> =
+        gpui::KeyBindingContextPredicate::parse("App").unwrap().into();
     cx.bind_keys(crate::commands::all().iter().filter_map(|cmd| {
         let keys = cmd.keys?;
+        let predicate = if cmd.global() {
+            app_ctx.clone()
+        } else {
+            editor_ctx.clone()
+        };
         Some(
             KeyBinding::load(
                 keys,
                 (cmd.make)(),
-                Some(editor_ctx.clone()),
+                Some(predicate),
                 false,
                 None,
                 &gpui::DummyKeyboardMapper,
@@ -2325,7 +2338,7 @@ impl Editor {
     /// open it in the system editor, and say what happens next.
     fn open_ai_config(&mut self, _: &OpenAiConfig, _: &mut Window, cx: &mut Context<Self>) {
         let path = crate::config::write_template_if_missing();
-        let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+        crate::files::open_external(&path);
         self.ai_generation += 1;
         let generation = self.ai_generation;
         self.ai_status = Some(AiStatus::Note {
@@ -4574,11 +4587,7 @@ impl Editor {
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     move |_: &MouseDownEvent, _, _| {
-                                                        let _ = std::process::Command::new(
-                                                            "xdg-open",
-                                                        )
-                                                        .arg(url)
-                                                        .spawn();
+                                                        crate::files::open_external(url);
                                                     },
                                                 )
                                                 .child("Get a key →"),
@@ -7300,6 +7309,9 @@ impl Editor {
     ) -> impl IntoElement {
         div()
             .id(label)
+            // Clickable, not a drag handle: occlude so the Windows titlebar
+            // hit-test resolves to this control rather than HTCAPTION.
+            .occlude()
             .w(px(34.))
             .h_full()
             .flex()
@@ -7319,6 +7331,14 @@ impl Editor {
     /// controls. Formatting lives in the selection popover (DESIGN
     /// §2-toolbar: zero category precedent for persistent format buttons).
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Dragging the bar moves the window — by two mechanisms, because the
+        // platforms split. `start_window_move()` drives Wayland/X11/macOS but
+        // is a no-op on Windows, where the OS only moves a window whose
+        // hit-test claims HTCAPTION — which is exactly what
+        // `window_control_area(Drag)` makes gpui report. Both ride the whole
+        // bar; interactive children opt out below (stop_propagation for the
+        // move handler, and `occlude()` so the Windows hit-test resolves to the
+        // child, not the caption — otherwise their clicks would start a drag).
         let drag =
             |_: &MouseDownEvent, window: &mut Window, _: &mut App| window.start_window_move();
         div()
@@ -7326,6 +7346,8 @@ impl Editor {
             .w_full()
             .flex()
             .items_center()
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(MouseButton::Left, drag)
             .border_b_1()
             .border_color(rgb(RULE_COLOR))
             .font_family("PT Serif")
@@ -7336,6 +7358,7 @@ impl Editor {
             .child(
                 div()
                     .id("outline-toggle")
+                    .occlude()
                     .px(px(8.))
                     .py(px(2.))
                     .ml(px(8.))
@@ -7372,6 +7395,7 @@ impl Editor {
             // Document name — click or F2 to rename in place, file and all.
             .child(match (&self.doc_rename_input, &self.store) {
                 (Some(input), _) => div()
+                    .occlude()
                     .ml(px(8.))
                     .w(px(220.))
                     .child(input.clone())
@@ -7385,6 +7409,7 @@ impl Editor {
                         .to_owned();
                     div()
                         .id("doc-title")
+                        .occlude()
                         .ml(px(8.))
                         .px(px(4.))
                         .rounded(px(4.))
@@ -7413,6 +7438,7 @@ impl Editor {
             .child(
                 div()
                     .id("word-count")
+                    .occlude()
                     .ml(px(12.))
                     .px(px(4.))
                     .rounded(px(4.))
@@ -7471,10 +7497,10 @@ impl Editor {
                     .items_center()
                     .justify_center()
                     .px(px(12.))
-                    .on_mouse_down(MouseButton::Left, drag)
                     .child(
                         div()
                             .id("omni-pill")
+                            .occlude()
                             .flex_1()
                             .max_w(px(320.))
                             .px(px(10.))
@@ -7524,6 +7550,7 @@ impl Editor {
                 let mark = if running { rgb(SAGE_COLOR) } else { rgb(MUTED_COLOR) };
                 div()
                     .id("diagnose-toggle")
+                    .occlude()
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(5.))
@@ -7561,6 +7588,7 @@ impl Editor {
             .child(
                 div()
                     .id("palette-toggle")
+                    .occlude()
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(5.))
@@ -7589,6 +7617,7 @@ impl Editor {
             .child(
                 div()
                     .id("history-toggle")
+                    .occlude()
                     .px(px(8.))
                     .py(px(2.))
                     .ml(px(4.))
@@ -7643,6 +7672,7 @@ impl Editor {
                 // Zoom: drawn square (U+25A1 isn't in PT).
                 div()
                     .id("win-zoom")
+                    .occlude()
                     .w(px(34.))
                     .h_full()
                     .flex()
@@ -9937,17 +9967,53 @@ impl Render for Editor {
             .bg(rgb(BG_COLOR))
             .flex()
             .flex_col()
-            // Bottom strips (find/replace, composer) mount on this root,
-            // outside the column's listener stack — actions from their
-            // inputs bubble here.
+            // The whole window sits under one "App" key context so the
+            // app-global commands (every menu verb that isn't a text
+            // mutation — palette, find, file ops, AI, history, session) fire
+            // from ANY focus, not only when the document holds it. bind_keys
+            // binds those to "App" and the document-mutating ones to the inner
+            // "Editor" context. Their handlers live here on the root so they
+            // stay reachable when a field overlay (palette, note, settings)
+            // has focus and the "Editor" subtree is off the dispatch path; the
+            // editor column carries the same handlers, and the deeper one wins
+            // when the document is focused, so these duplicates never
+            // double-fire.
+            .key_context("App")
+            // Field overlays mount on this root, outside the column's listener
+            // stack, so their actions bubble here: tab between fields, replace
+            // (ctrl-h), and the palette row motion PaletteInput's up/down emit.
             .on_action(cx.listener(Self::note_tab))
-            // The omnibox lives outside the Editor key context (it's a root
-            // overlay, like the strips it replaced), so its actions must be
-            // handled here to be reachable: replace (ctrl-h), and the row
-            // motion that PaletteInput's up/down keys dispatch.
             .on_action(cx.listener(Self::replace))
             .on_action(cx.listener(Self::palette_up))
             .on_action(cx.listener(Self::palette_down))
+            // App-global command handlers, mirrored from the editor column so
+            // they fire while a field overlay holds focus (see "App" above).
+            .on_action(cx.listener(Self::new_document))
+            .on_action(cx.listener(Self::open_file))
+            .on_action(cx.listener(Self::rename_document))
+            .on_action(cx.listener(Self::reveal_in_files))
+            .on_action(cx.listener(Self::copy_document_path))
+            .on_action(cx.listener(Self::save_copy_as))
+            .on_action(cx.listener(Self::export_markdown))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::toggle_outline))
+            .on_action(cx.listener(Self::run_diagnosis))
+            .on_action(cx.listener(Self::run_believing))
+            .on_action(cx.listener(Self::toggle_review))
+            .on_action(cx.listener(Self::mode_developmental))
+            .on_action(cx.listener(Self::mode_line))
+            .on_action(cx.listener(Self::mode_copy))
+            .on_action(cx.listener(Self::open_ai_config))
+            .on_action(cx.listener(Self::open_ai_settings))
+            .on_action(cx.listener(Self::test_ai_connection))
+            .on_action(cx.listener(Self::cancel_ai_run))
+            .on_action(cx.listener(Self::toggle_history))
+            .on_action(cx.listener(Self::add_checkpoint))
+            .on_action(cx.listener(Self::set_session_goal))
+            .on_action(cx.listener(Self::end_session))
+            .on_action(cx.listener(Self::toggle_palette))
+            .on_action(cx.listener(Self::show_shortcuts))
+            .on_action(cx.listener(Self::open_welcome))
             // §0.6 law 3 (click-outside) lives on the root so the whole
             // window counts as "outside", gutters and titlebar included.
             .on_mouse_down(

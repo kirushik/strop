@@ -29,6 +29,27 @@ pub struct Command {
     pub make: fn() -> Box<dyn Action>,
 }
 
+impl Command {
+    /// Should this command's chord fire from ANY in-app focus, not just when
+    /// the document has keyboard focus? The menu's navigation and app verbs
+    /// (File, View, Margin & AI, History, Session, Help, plus Find/Replace)
+    /// qualify — a writer expects Ctrl+Shift+P to open the palette while a
+    /// field overlay is focused. Text mutations (Format, Structure, Undo/Redo,
+    /// and Add Margin Note, which all act on the document selection) stay
+    /// editor-scoped, so a chord typed into the palette or a note field can
+    /// never reach the document behind it. `bind_keys` maps the two groups to
+    /// the "App" and "Editor" key contexts respectively.
+    pub fn global(&self) -> bool {
+        match self.section {
+            "Format" | "Structure" => false,
+            "Edit" => matches!(self.label, "Find in Document" | "Find and Replace"),
+            "Margin & AI" => self.label != "Add Margin Note",
+            // File, View, History, Session, Help.
+            _ => true,
+        }
+    }
+}
+
 macro_rules! cmd {
     ($label:literal, $section:literal, $keys:expr, $action:ty, [$($alias:literal),*]) => {
         Command {
@@ -496,6 +517,37 @@ mod tests {
             if let Some(k) = c.keys {
                 assert!(seen.insert(k), "duplicate binding {k}");
             }
+        }
+    }
+
+    #[test]
+    fn global_commands_are_the_app_verbs_not_text_mutations() {
+        let by_label = |l: &str| all().iter().find(|c| c.label == l).unwrap();
+        // App verbs must fire from any focus (palette, note field, settings).
+        for l in [
+            "Open Command Palette",
+            "Find in Document",
+            "Find and Replace",
+            "Run Editorial Diagnosis",
+            "Toggle History & Rewind",
+            "Toggle Outline",
+            "Set Up AI Provider…",
+            "New Document",
+            "End Session…",
+        ] {
+            assert!(by_label(l).global(), "{l} should be global");
+        }
+        // Text mutations stay editor-scoped so a chord typed into a field can
+        // never reach the document behind it.
+        for l in [
+            "Toggle Bold",
+            "Heading 1",
+            "Undo",
+            "Redo",
+            "Add Margin Note",
+            "Insert Footnote",
+        ] {
+            assert!(!by_label(l).global(), "{l} should be editor-scoped");
         }
     }
 }

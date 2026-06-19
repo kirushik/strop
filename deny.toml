@@ -9,8 +9,8 @@
 
 [advisories]
 # Vulnerabilities and unsound advisories keep their default (deny). Yanked
-# crates only warn: `swash 0.2.8` is yanked but is exactly the version our
-# vendored gpui_wgpu patch pins (docs/UPSTREAM-gpui-scale-bug.md).
+# crates only warn: `swash 0.2.8` is yanked but is exactly the version
+# gpui_wgpu pins (docs/UPSTREAM-gpui-scale-bug.md).
 yanked = "warn"
 ignore = [
     "RUSTSEC-2024-0384", # `instant` unmaintained — transitive (wgpu/gpui)
@@ -59,8 +59,9 @@ unknown-registry = "deny"
 unknown-git = "deny"
 
 [sources.allow-org]
-# gpui is pulled from Zed's repo (pinned by rev in the workspace Cargo.toml)
-# and drags in several sibling Zed forks — wgpu, font-kit, xim-rs. We already
-# build on this org's code, so trust the whole org for git sources; any other
-# git source still fails (unknown-git = "deny").
-github = ["zed-industries"]
+# gpui is pulled from a Strop fork of Zed's repo (github.com/kirushik/zed,
+# pinned by rev — see the workspace Cargo.toml and docs/gpui-fork.md) and drags in
+# several sibling Zed forks — wgpu, font-kit, xim-rs. Trust both the upstream
+# org and the fork owner for git sources; any other git source still fails
+# (unknown-git = "deny").
+github = ["zed-industries", "kirushik"]

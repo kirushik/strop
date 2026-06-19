@@ -130,6 +130,6 @@ Second trophy, courtesy of this harness: the scale-change corruption
 was NOT the mixed-paint pattern the first bisect blamed — it's
 non-deterministic glyph rasterization in upstream gpui_wgpu (shared
 swash ScaleContext state; full story in docs/UPSTREAM-gpui-scale-bug.md,
-workaround vendored in vendor/gpui_wgpu). The harness also caught
+workaround on the zed fork — docs/gpui-fork.md). The harness also caught
 overlays positioning from one-frame-stale geometry after any resize —
 on the PLAIN fixture, before the marker bug was even touched.

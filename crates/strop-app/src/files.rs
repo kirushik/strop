@@ -5,6 +5,7 @@
 //! Strop's old silent scratch.strop was exactly it. Documents are born as
 //! real files in the user's documents folder, findable from second one.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// First free "Untitled.strop" / "Untitled 2.strop" / … in the Strop folder.
@@ -232,32 +233,107 @@ fn record_caret_at(file: &Path, doc: &Path, caret: usize) {
     save_intents_at(file, &map);
 }
 
-/// Select the file in the system file manager (freedesktop FileManager1),
-/// falling back to opening the containing folder.
-pub fn reveal(path: &Path) {
-    let uri = format!("file://{}", path.display());
-    let ok = std::process::Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.freedesktop.FileManager1",
-            "--object-path",
-            "/org/freedesktop/FileManager1",
-            "--method",
-            "org.freedesktop.FileManager1.ShowItems",
-            &format!("['{uri}']"),
-            "",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok
-        && let Some(dir) = path.parent()
+/// Open a path or URL with the OS default handler. Best-effort and
+/// fire-and-forget — a system with no handler registered does nothing, the
+/// same failure the bare `xdg-open` had. Per-OS because there is no single
+/// portable launcher: `ShellExecuteW` (Windows), `open` (macOS), `xdg-open`
+/// (Linux).
+pub fn open_external(target: impl AsRef<OsStr>) {
+    let target = target.as_ref();
+    #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        // ShellExecuteW(.., "open", target, ..) — the documented "open with the
+        // default handler" call. Deliberately NOT `cmd /C start`: cmd re-parses
+        // its command line, so a `&` in a URL query string would split it into
+        // separate commands — a broken link, and an injection vector if the URL
+        // were ever untrusted. ShellExecuteW takes the target as one wide
+        // string, so nothing is reinterpreted; it also spawns no console.
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                operation: *const u16,
+                file: *const u16,
+                parameters: *const u16,
+                directory: *const u16,
+                show_cmd: i32,
+            ) -> isize;
+        }
+
+        let file: Vec<u16> = target.encode_wide().chain(std::iter::once(0)).collect();
+        let open: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        const SW_SHOWNORMAL: i32 = 1;
+        // Best-effort: the returned pseudo-HINSTANCE (> 32 on success) is
+        // ignored, matching the other branches' fire-and-forget contract.
+        unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                open.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(target).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    }
+}
+
+/// Select the file in the system file manager, falling back to opening the
+/// containing folder. Per-OS: Explorer's `/select,` (Windows), Finder's
+/// `open -R` (macOS), the freedesktop FileManager1 D-Bus call with an
+/// `xdg-open`-the-folder fallback (Linux).
+pub fn reveal(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        // explorer /select,<path> opens the folder with the file highlighted.
+        // explorer returns a non-zero exit even on success, so don't check it.
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path);
+        let _ = std::process::Command::new("explorer").arg(arg).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let uri = format!("file://{}", path.display());
+        let ok = std::process::Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.FileManager1",
+                "--object-path",
+                "/org/freedesktop/FileManager1",
+                "--method",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("['{uri}']"),
+                "",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok
+            && let Some(dir) = path.parent()
+        {
+            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        }
     }
 }
 
