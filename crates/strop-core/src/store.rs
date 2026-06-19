@@ -426,12 +426,23 @@ impl Store {
             .chain(history.asset_refs())
             .map(str::to_owned)
             .collect();
+        let stored: Vec<String> = assets.keys().map(|k| k.to_string()).collect();
+        // Cheap gate — the fix for multi-second idle-save stalls. If every stored
+        // asset is already referenced by the LIVE doc or undo history, nothing can
+        // be orphaned, so the delete loop below would delete nothing regardless of
+        // what the checkpoints reference. Skip the per-checkpoint historical
+        // checkout (`state_at`) — it costs ~1s each on a large oplog and was
+        // running on EVERY save just to re-confirm "still referenced". Only when a
+        // stored asset is MISSING from the live set (an image was deleted) do we
+        // pay to check whether some checkpoint still needs it before reclaiming.
+        if stored.iter().all(|id| reachable.contains(id)) {
+            return;
+        }
         for cp in self.checkpoints() {
             if let Some((_, _, cp_blocks)) = self.state_at(&cp.frontiers) {
                 reachable.extend(cp_blocks.asset_refs().map(str::to_owned));
             }
         }
-        let stored: Vec<String> = assets.keys().map(|k| k.to_string()).collect();
         for id in stored {
             if !reachable.contains(&id) {
                 if let Err(e) = assets.delete(&id) {
