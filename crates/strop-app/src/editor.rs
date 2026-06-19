@@ -9790,7 +9790,12 @@ impl Editor {
                         .w(px(MARGIN_WIDTH - 8.))
                         .p(px(8.))
                         .overflow_hidden()
-                        .rounded(px(6.))
+                        // Two kinds of object, two shapes (no text tag, no
+                        // colour wash): the writer's own notes are softly
+                        // rounded (personal marginalia); AI diagnoses are
+                        // crisper-cornered (formal editorial), reinforcing the
+                        // bold-title cue. AI provenance, felt not labelled.
+                        .rounded(px(if is_diagnosis { 3. } else { 9. }))
                         .bg(rgb(0xFFFDF6))
                         .border_1()
                         .border_color(if active {
