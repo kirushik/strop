@@ -42,6 +42,19 @@ const NOTE_TINT: u32 = 0xE3B84926; // wheat/amber ~15% — Docs-trained intuitio
 const NOTE_TINT_ACTIVE: u32 = 0xE3B8494D; // ~30% when active
 const MARGIN_WIDTH: f32 = 248.;
 const MARGIN_GAP: f32 = 16.;
+/// Margin-card box metrics, shared by the height MEASUREMENT
+/// (`refresh_card_heights`) and the RENDER (`render_margin`) so a card's packed
+/// extent equals its painted one. Text wraps at the card's inner width; the
+/// line-height is pinned so one shaped row equals one painted row.
+const CARD_LINE_H: f32 = 18.;
+const CARD_CHROME_H: f32 = 36.; // vertical padding (16) + border (2) + header row (18)
+const CARD_INNER_W: f32 = MARGIN_WIDTH - 8. - 16.; // card width (MARGIN_WIDTH−8) − p(8) both sides
+/// Band kept around the viewport when culling cards to it: a card whose anchor
+/// sits within this many px of a visible edge still renders.
+const CARD_OVERSCAN: f32 = 120.;
+/// Gap kept below the selected card when it is clamped to fit the viewport, so
+/// it never sits flush against (or past) the bottom edge.
+const CARD_BOTTOM_MARGIN: f32 = 8.;
 /// The prose column's capped width — everything else (centering, the note
 /// lane, the narrow-width left-shift) is measured against it.
 const COL_MAX_WIDTH: f32 = 660.;
@@ -582,6 +595,17 @@ pub struct Editor {
     /// scheduling that tore the renderer's per-frame sprite bookkeeping —
     /// the cross-surface glyph corruption of 2026-06-12.
     zone_row_bounds: std::rc::Rc<std::cell::RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// Measured margin-card heights, keyed by content hash (see
+    /// `refresh_card_heights`). A diagnosis's content is immutable and a note's
+    /// changes only at a composer commit, so a card's real shaped height is
+    /// measured once at the lane width and cached — replacing the char-count
+    /// estimate that under-sized tall cards and let them overlap. Read by
+    /// `margin_cards`; refreshed in `render`, where the text system is in hand.
+    card_heights: HashMap<u64, f32>,
+    /// The actively-composed note's live height — its composer text changes
+    /// every keystroke, so it can't ride the content-hash cache. Measured each
+    /// frame in `refresh_card_heights`; `None` when no note is composing.
+    active_card_height: Option<f32>,
     last_frame: Option<TextFrame>,
 }
 
@@ -1186,6 +1210,8 @@ impl Editor {
             alt_input: None,
             voice_baseline: None,
             note_input: None,
+            card_heights: HashMap::new(),
+            active_card_height: None,
             narrow_notes_open: false,
             selection_popover: false,
             outline_open: false,
@@ -8876,7 +8902,170 @@ fn note_card_label(is_diagnosis: bool, level: &str, orphaned: bool) -> String {
     }
 }
 
+/// Hash a card's identity-for-height: kind + title + body. Immutable for a
+/// diagnosis; for a note it changes only at a composer commit — so a cache hit
+/// means the stored measured height is still exact.
+fn card_height_key(kind: NoteKind, title: &str, body: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    matches!(kind, NoteKind::Diagnosis).hash(&mut h);
+    title.hash(&mut h);
+    body.hash(&mut h);
+    h.finish()
+}
+
+/// A margin card's placement inputs: its anchor target (viewport-space top it
+/// wants), measured height, whether it's a hard PIN (a writer note or the
+/// active card — holds its anchor) and whether it's the ACTIVE/selected card.
+#[derive(Clone, Copy, Debug)]
+struct PlaceItem {
+    anchor: f32,
+    height: f32,
+    pin: bool,
+    active: bool,
+}
+
+/// Place margin cards in ONE pass and return each card's top (viewport-space),
+/// in input order. Items come in document/anchor order. Three guarantees,
+/// pinned down by the packer proptests:
+///   1. no two cards overlap (`top[i+1] >= top[i] + height[i] + gap`);
+///   2. every card sits at or below `floor` (never under the titlebar);
+///   3. the ACTIVE card lies fully within `[floor, viewport_bottom]` whenever
+///      its height fits there and no pinned note occupies the slack above it.
+/// Mechanics: writer notes (Layer A) and the active card hold their anchors;
+/// inactive diagnoses (Layer B) yield around them. The active card's anchor is
+/// first clamped UP so the whole card fits the viewport (the "selected card ran
+/// off the bottom edge" bug). A floor+downward sweep gives the non-overlap
+/// guarantee; a pull-up then slides the rigid run of movable cards above each
+/// pin up into existing slack only — so the non-overlap guarantee survives.
+fn place_margin_cards(items: &[PlaceItem], floor: f32, viewport_bottom: f32, gap: f32) -> Vec<f32> {
+    let n = items.len();
+    // Anchor targets (floored); the active card is clamped up to fit the lane.
+    let anchor: Vec<f32> = items
+        .iter()
+        .map(|it| {
+            let a = it.anchor.max(floor);
+            if it.active {
+                (viewport_bottom - it.height - CARD_BOTTOM_MARGIN).min(a).max(floor)
+            } else {
+                a
+            }
+        })
+        .collect();
+    // Pass 1 — floor + downward no-overlap sweep.
+    let mut top = vec![floor; n];
+    let mut bottom = floor;
+    for i in 0..n {
+        top[i] = anchor[i].max(bottom);
+        bottom = top[i] + items[i].height + gap;
+    }
+    // Pass 2 — raise each pin toward its anchor, COMPRESSING the movable run
+    // directly above it into its internal slack (not a rigid slide — that left
+    // loose gaps between spread-out cards unused and stranded the selected card
+    // off the bottom edge). A pin never rises past the floor or a pinned note
+    // above it. Bottom-up so a lower pin makes room before a higher one runs.
+    for i in (0..n).rev() {
+        if !items[i].pin || top[i] <= anchor[i] {
+            continue;
+        }
+        // The movable run directly above pin i is [k, i); `base` is the floor or
+        // the bottom of the nearest pin above (which holds its own anchor).
+        let mut k = i;
+        while k > 0 && !items[k - 1].pin {
+            k -= 1;
+        }
+        let base = if k > 0 {
+            top[k - 1] + items[k - 1].height + gap
+        } else {
+            floor
+        };
+        let need: f32 = items[k..i].iter().map(|it| it.height + gap).sum();
+        // Highest pin i may sit: its anchor, unless the run above needs the room
+        // (then it sits just low enough that the run still clears the floor).
+        top[i] = anchor[i].max(base + need).min(top[i]);
+        // Pack the run beneath it: keep each card where it is when there's slack,
+        // push it up only as far as avoiding overlap demands.
+        let mut limit = top[i];
+        for j in (k..i).rev() {
+            let cap = limit - items[j].height - gap;
+            if top[j] > cap {
+                top[j] = cap;
+            }
+            limit = top[j];
+        }
+    }
+    top
+}
+
 impl Editor {
+    /// Shape `text` at the card's inner width and return its REAL wrapped
+    /// height (the measurement that replaced the `chars/30` estimate). Embedded
+    /// newlines and multi-row wraps are summed; empty text is zero.
+    fn shape_text_height(window: &Window, text: &str) -> f32 {
+        if text.is_empty() {
+            return 0.;
+        }
+        let s = SharedString::from(text.to_owned());
+        let run = TextRun {
+            len: s.len(),
+            font: gpui::font("PT Serif"),
+            color: rgb(TEXT_COLOR).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        match window
+            .text_system()
+            .shape_text(s, px(13.), &[run], Some(px(CARD_INNER_W)), None)
+        {
+            Ok(lines) => lines
+                .iter()
+                .map(|l| f32::from(l.size(px(CARD_LINE_H)).height))
+                .sum(),
+            Err(_) => CARD_LINE_H,
+        }
+    }
+
+    /// A card's painted height: chrome + a wrapped title (diagnoses only) + a
+    /// wrapped body, with at least `min_body_rows` of body/composer room.
+    fn measure_card_height(window: &Window, title: &str, body: &str, min_body_rows: f32) -> f32 {
+        let body_h = Self::shape_text_height(window, body).max(min_body_rows * CARD_LINE_H);
+        CARD_CHROME_H + Self::shape_text_height(window, title) + body_h
+    }
+
+    /// Measure-and-cache every open card's height while the window's text system
+    /// is in hand (called from `render`), so `margin_cards`'s placement runs on
+    /// real extents, not estimates. Committed/immutable content is cached by
+    /// hash; the one actively-composed note is measured live each frame from its
+    /// composer (its text changes every keystroke, so it can't be cached).
+    fn refresh_card_heights(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let composing = self.note_input.is_some();
+        let live = self.note_input.as_ref().map(|i| i.read(cx).content.clone());
+        let active = self.active_note;
+        // Collect specs first: can't hold a `doc` borrow while mutating the cache.
+        let specs: Vec<(NoteKind, String, String, bool)> = self
+            .doc
+            .notes()
+            .open()
+            .map(|n| (n.kind, n.title.clone(), n.body.clone(), active == Some(n.id)))
+            .collect();
+        self.active_card_height = None;
+        for (kind, title, body, is_active) in specs {
+            let is_diag = kind == NoteKind::Diagnosis;
+            if is_active && composing && !is_diag {
+                let body = live.as_deref().unwrap_or("");
+                self.active_card_height = Some(Self::measure_card_height(window, "", body, 2.));
+                continue;
+            }
+            let key = card_height_key(kind, &title, &body);
+            if !self.card_heights.contains_key(&key) {
+                let (t, min_rows) = if is_diag { (title.as_str(), 0.) } else { ("", 1.) };
+                let h = Self::measure_card_height(window, t, &body, min_rows);
+                self.card_heights.insert(key, h);
+            }
+        }
+    }
+
     /// The Docs-style margin solver (via Liveblocks' AnchoredThreads):
     /// downward sweep normally; with an active card, it snaps to its anchor,
     /// later cards push down, earlier cards push up from it in reverse.
@@ -8916,28 +9105,36 @@ impl Editor {
                 f32::from(frame.bounds.origin.y) + f32::from(pos.y) - f32::from(frame.scroll_top);
             let is_diag = n.kind == NoteKind::Diagnosis;
             let active = self.active_note == Some(n.id);
-            // Estimate the rendered card height so the packer separates cards by
-            // their REAL extent, not a flat cap (the old `text_len/30` clamped to
-            // 4 lines under-measured tall cards → they overlapped). Bias toward
-            // OVER-estimating: an extra gap is invisible, an overlap is the bug.
-            // CPL = conservative chars-per-line at the ~222px inner width, 13px
-            // PT Serif. Components: padding+border, header row, wrapped title
-            // (diagnoses only), wrapped body — or composer room for an active note.
-            const CPL: f32 = 30.;
-            const LINE_H: f32 = 18.;
-            let wrap = |chars: usize| (chars as f32 / CPL).ceil().max(1.);
-            let mut height = 18. + 16.; // padding + border, header row
-            if is_diag && !n.title.is_empty() {
-                height += wrap(n.title.chars().count()) * LINE_H;
+            // Cull to the viewport: a card whose ANCHOR is off-screen doesn't
+            // belong in the lane — it would pile at the floor (the scroll-pileup
+            // bug) and attribute to nothing visible. The active card is exempt:
+            // you're working it, so it stays even if its anchor scrolled away.
+            let vp_top = f32::from(frame.bounds.origin.y);
+            let vp_bot = vp_top + f32::from(frame.bounds.size.height);
+            if !active && (desired < vp_top - CARD_OVERSCAN || desired > vp_bot + CARD_OVERSCAN) {
+                continue;
             }
-            let body_chars = n.body.chars().count();
-            if active && !is_diag {
-                // The composer (a text input) stands in for the body; give it
-                // room to grow with what's already typed, min two lines.
-                height += wrap(body_chars).max(2.) * LINE_H + 10.;
-            } else if body_chars > 0 || !is_diag {
-                height += wrap(body_chars) * LINE_H;
-            }
+            // Real MEASURED height (refresh_card_heights), never an estimate.
+            // The active composer rides a live field; every other card reads the
+            // content-hash cache, with a one-frame char-count fallback for a
+            // brand-new card the refresh hasn't measured yet.
+            let height = if active && !is_diag && self.note_input.is_some() {
+                self.active_card_height
+                    .unwrap_or(CARD_CHROME_H + 2. * CARD_LINE_H)
+            } else {
+                let key = card_height_key(n.kind, &n.title, &n.body);
+                self.card_heights.get(&key).copied().unwrap_or_else(|| {
+                    let body_rows = (n.body.chars().count() as f32 / 30.)
+                        .ceil()
+                        .max(if is_diag { 0. } else { 1. });
+                    let title_rows = if is_diag && !n.title.is_empty() {
+                        (n.title.chars().count() as f32 / 30.).ceil()
+                    } else {
+                        0.
+                    };
+                    CARD_CHROME_H + (title_rows + body_rows) * CARD_LINE_H
+                })
+            };
             cards.push(MarginCard {
                 id: n.id,
                 top: desired,
@@ -8950,44 +9147,26 @@ impl Editor {
                 orphaned: n.orphaned,
             });
         }
-        // cards are in document order (notes are kept sorted by anchor).
-        let active_ix = cards.iter().position(|c| c.active);
-        match active_ix {
-            None => {
-                let mut bottom = f32::MIN;
-                for card in cards.iter_mut() {
-                    card.top = card.top.max(bottom);
-                    bottom = card.top + card.height + MARGIN_GAP;
-                }
-            }
-            Some(a) => {
-                // Ascending from the active card (which gets its anchor y).
-                let mut bottom = f32::MIN;
-                for card in cards[a..].iter_mut() {
-                    card.top = card.top.max(bottom);
-                    bottom = card.top + card.height + MARGIN_GAP;
-                }
-                // Descending above it, nearest first: push up out of the way.
-                let mut top_limit = cards[a].top;
-                for card in cards[..a].iter_mut().rev() {
-                    let max_top = top_limit - card.height - MARGIN_GAP;
-                    card.top = card.top.min(max_top);
-                    top_limit = card.top;
-                }
-            }
-        }
-        // Floor the lane: a card whose anchor scrolled up under the titlebar
-        // (or whose neighbours pushed it there) must never paint over the
-        // window controls or the intent banner. Push the stack down past that
-        // line, preserving order and gaps. Without this an active card near
-        // the top lands on the close button (Image-3 bug).
+        // Place them in one pass (see `place_margin_cards`): writer notes and
+        // the active card hold their anchors, inactive diagnoses yield around
+        // them, the selected card is kept fully in view, and no two overlap.
+        // `top` currently holds each card's anchor target.
         let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
-        let mut bottom = floor;
-        for card in cards.iter_mut() {
-            if card.top < bottom {
-                card.top = bottom;
-            }
-            bottom = card.top + card.height + MARGIN_GAP;
+        let viewport_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
+        let items: Vec<PlaceItem> = cards
+            .iter()
+            .map(|c| PlaceItem {
+                anchor: c.top,
+                height: c.height,
+                pin: c.kind == NoteKind::Note || c.active,
+                active: c.active,
+            })
+            .collect();
+        for (card, top) in cards
+            .iter_mut()
+            .zip(place_margin_cards(&items, floor, viewport_bottom, MARGIN_GAP))
+        {
+            card.top = top;
         }
         cards
     }
@@ -9533,6 +9712,7 @@ impl Editor {
                         .cursor(CursorStyle::PointingHand)
                         .font_family("PT Serif")
                         .text_size(px(13.))
+                        .line_height(px(CARD_LINE_H))
                         .text_color(rgb(TEXT_COLOR))
                         .on_mouse_down(
                             MouseButton::Left,
@@ -9938,6 +10118,9 @@ impl Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Measure-and-cache margin-card heights up front (the window's text
+        // system is in hand here) so margin_cards places on real extents.
+        self.refresh_card_heights(window, cx);
         // History mode pushes the document aside (DESIGN §2-history: push,
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
@@ -10380,6 +10563,84 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // Margin packer invariants, against random card stacks. Floor and viewport
+    // are fixed; cards are sorted by anchor (the order margin_cards feeds).
+    const PACK_FLOOR: f32 = 44.;
+    const PACK_VP_BOTTOM: f32 = 800.;
+    const PACK_GAP: f32 = 16.;
+
+    proptest! {
+        // INV1 (no overlap) + INV2 (every card at/below the floor): hold for ANY
+        // stack — notes, diagnoses, an active card, any mix.
+        #[test]
+        fn packed_cards_never_overlap_and_clear_the_floor(
+            raw in proptest::collection::vec((0f32..3000., 20f32..400., any::<bool>()), 0..12usize),
+            active_sel in 0usize..64,
+        ) {
+            let n = raw.len();
+            let active = if n == 0 { usize::MAX } else { active_sel % n };
+            let mut items: Vec<PlaceItem> = raw
+                .iter()
+                .enumerate()
+                .map(|(i, &(anchor, height, is_note))| PlaceItem {
+                    anchor,
+                    height,
+                    pin: is_note || i == active,
+                    active: i == active,
+                })
+                .collect();
+            items.sort_by(|a, b| a.anchor.total_cmp(&b.anchor));
+            let tops = place_margin_cards(&items, PACK_FLOOR, PACK_VP_BOTTOM, PACK_GAP);
+            for i in 0..tops.len() {
+                prop_assert!(tops[i] >= PACK_FLOOR - 0.01, "card {i} above floor");
+                if i + 1 < tops.len() {
+                    prop_assert!(
+                        tops[i + 1] + 0.01 >= tops[i] + items[i].height + PACK_GAP,
+                        "cards {i}/{} overlap", i + 1
+                    );
+                }
+            }
+        }
+
+        // INV3: the SELECTED card is fully within the viewport in the realistic
+        // diagnosis-only case (no writer note pinned in the slack above it) when
+        // its height fits the lane. This is the bug Kirill caught by eye — a tall
+        // active card anchored to the last sentence ran off the bottom edge.
+        #[test]
+        fn selected_card_stays_fully_in_view(
+            cards in proptest::collection::vec((0f32..3000., 20f32..100.), 1..5usize),
+            active_sel in 0usize..64,
+        ) {
+            let n = cards.len();
+            let active = active_sel % n;
+            let mut items: Vec<PlaceItem> = cards
+                .iter()
+                .enumerate()
+                .map(|(i, &(anchor, height))| PlaceItem {
+                    anchor,
+                    height,
+                    pin: i == active, // diagnosis-only: the only pin is the active card
+                    active: i == active,
+                })
+                .collect();
+            items.sort_by(|a, b| a.anchor.total_cmp(&b.anchor));
+            let active = items.iter().position(|it| it.active).unwrap();
+            let h = items[active].height;
+            // The selected card is guaranteed fully in view when the whole stack
+            // fits the lane (the design's target under the ≤7 visible cap);
+            // over-crowding past that is Phase 4/5 territory, not the packer's.
+            let total: f32 = items.iter().map(|it| it.height + PACK_GAP).sum();
+            prop_assume!(total <= PACK_VP_BOTTOM - PACK_FLOOR);
+            let tops = place_margin_cards(&items, PACK_FLOOR, PACK_VP_BOTTOM, PACK_GAP);
+            prop_assert!(tops[active] >= PACK_FLOOR - 0.01, "active card under the floor");
+            prop_assert!(
+                tops[active] + h <= PACK_VP_BOTTOM + 0.01,
+                "active card {} + {h} overruns viewport {PACK_VP_BOTTOM}", tops[active]
+            );
+        }
+    }
 
     #[test]
     fn thousands_separator() {

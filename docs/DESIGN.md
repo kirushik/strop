@@ -365,6 +365,82 @@ as errors — T1); behavioral mode-inference defaults ambiguous states to
 as born-empty + an optional, skippable, post-landing "tell me a quirk", never
 a gate.
 
+## 7. The margin card system (two layers, in motion)
+
+The editorial margin hosts two kinds of object that look alike and behave
+nothing alike. Conflating them into one `MarginCard` is the root of the
+placement bugs (overlap, scroll pile-up) and the dynamic confusion. They split
+by **behaviour over time**, not appearance. (Companion analysis + the dynamic
+failure-mode catalogue + the build order: `docs/margin-card-dynamics.md`.)
+
+**Layer A — the writer's marginalia** (`ctrl-m` notes). Authored, owned, part
+of GENERATE: where ideas, loose self-feedback, and TODOs land (principle 6,
+externalize working memory). Mode-agnostic — the door (§4.4) never touches
+them; present while drafting *and* reviewing. Long-lived; only the writer
+resolves them. In layout they are the **stable spine**: high priority, pinned
+to their anchor, and they do **not** reshuffle when the editorial layer toggles.
+
+**Layer B — the editorial review** (AI diagnoses). Metadata *about* the work,
+part of EVALUATE. Mode-gated (reviewing only). Born in **passes** (≤7 per pass,
+Tension 4; multiple passes accumulate). Transient — created to be resolved and
+cleared. **Decays**: an edit to the anchored text can make a diagnosis wrong, so
+a stale card is greyed and deprioritised — never auto-dismissed; only the writer
+permanently dismisses (principle 10). In layout they **yield around** Layer A.
+
+One column. The layers are told apart by **treatment + priority + visible AI
+provenance** (principle 12), never by a second column or a wash of card-body
+colour (which would wreck the calm paper field).
+
+**No asynchronous source — so no "unread."** Single-user, local files: the
+writer makes every Layer-A note by hand, and Layer-B cards appear only inside a
+pass the writer explicitly ran (the AI never speaks first, §4.4). Every card
+birth is witnessed; nothing arrives while you're away. So there is **no
+read/unread state and no "new since last session"** — re-entry shows the
+document exactly as you left it (itself the principle-2 safety the writer must
+*feel*). The only freshness axis that exists is **which pass** a card came from,
+session-independent. (Reopens only if cross-device Loro sync ever lands;
+deferred.)
+
+**Layout — one PAVA pass, culled to the viewport.** Replace the three fighting
+passes (downward sweep · reverse up-push · floor re-sweep) with a single
+isotonic/PAVA solver carrying per-card weights — active highest (pins to
+anchor), Layer-A high, Layer-B default — so overlapping cards pool into a
+cluster centred on their anchors with no sag and one settled position. **Cull to
+viewport**: a card occupies the lane only while its anchor is on (or just off)
+screen; off-screen cards roll up into honest `▲N / ▼N` edge chips (the door's
+rail grammar — nothing vanishes silently). **Orphaned** cards (anchor lost in a
+restore) leave the lane for an `N detached` holder, never floating untethered.
+**Connector: highlight-only** — attribution is the anchor highlight + proximity
++ bidirectional hover-emphasis, no leader lines; this is *why* culling and tight
+anchor-tracking are load-bearing, not optional.
+
+**Lifecycle.** birth → drift (anchors ride edits via `apply_op`) → staleness
+(Layer B only: edited anchor → greyed/deprioritised) → activation (z-raise +
+expand-in-place + glow the anchor; minimal repack) → resolution (done/dismiss =
+status, not delete; reversible through history). Across passes, Layer-B cards
+carry a `pass_id` + pass metadata; a new pass reconciles carried-over cards
+(stale ones grey out) and dismissals **teach suppression** so the tool stops
+re-flagging what you waved off — the minimal seed of the Editorial Agreement
+(Round 6/§6 Round 5: learn only what to *stop* saying).
+
+**Motion discipline** (principle 11 — craft felt, not seen): one settled
+position per frame; the active composer grows *downward* from a pinned top
+(never reflows upward per keystroke); identity is stable by `id` through reorder
+(slide, don't flicker); activation barely moves the lane; transitions ease.
+
+**Aging cue** (the distinction for accumulated passes): by **pass**, not
+wall-clock, and correlated with **trust** — a stale (edited-anchor) card faded
+reads as both "older" and "verify me." Carried on a thin left-edge tab in 2–3
+muted tones (the sticky-note-pack metaphor) or a two-tier crisp/settled,
+**never** a full-card colour wash.
+
+**Decided 2026-06-19 (with Kirill):** one column; `pass_id` + per-pass metadata
+added to the model (breaking change acceptable at 0.1.0 — testers tolerant, no
+non-tester usage; best-effort migrate legacy cards, don't overspend); decay =
+grey-out + deprioritise, the writer is the sole permanent dismisser. **Refused:**
+auto-dismiss of stale cards (harsh, confusing); per-card colour washes (noise);
+leader lines; a second margin column; read/unread state (no async source).
+
 ## Open questions for Kirill
 
 - Selection-popover formatting vs persistent format buttons (can't
@@ -377,3 +453,6 @@ a gate.
 - Round 2 vs Round 3 ordering: history-by-meaning is the dependency-correct
   next step, but "try it both ways" is the more demo-able answer to the
   competing-edits question. Say which you want first.
+- Margin §7: re-validating carried-over Layer-B cards on a new pass wants an AI
+  call per stale card. Worth the cost/latency, or is grey-out + let-the-writer-
+  judge enough for v1 (re-validation deferred)?
