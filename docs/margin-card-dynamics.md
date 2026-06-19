@@ -212,3 +212,38 @@ at the caret margin" is deferred (n=1 today, too early). Do not let it accrete.
 re-create a card matching an open-or-dismissed same-(kind, content-hash) on a
 new pass). Not a hidden adaptive system; revisit as the surfaced, revocable
 Editorial Agreement seed later.
+
+## 7. Implementation status (2026-06-19, branch `better_card_placement`)
+
+**Shipped (committed, tested):**
+- Phase 1 — measured/cached heights, viewport culling, pure proptested packer
+  `place_margin_cards` (`0b46b43`).
+- Off-screen edge counts `▲N / ▼N` — pulled forward from Phase 5 because silent
+  disappearance violates principle 2 (`c4c8a81`).
+- Phase 2 — diagnosis anchor as a wavy squiggle (coexists with `ctrl-u`) +
+  corner-shape layer distinction (notes rounder, AI crisper) (`c4c8a81`,
+  `233cdcc`).
+- Phase 3 — `pass_id` + staleness latch (`unverified` when the flagged text is
+  edited; notes never decay; never auto-dismissed) + re-run dedupe
+  (`is_suppressed`) + grey treatment (`c2230b5`).
+- Perf — asset-GC idle-save stall fixed, 6.8 s → 24 ms (`8629b4f`); oplog bloat
+  (`rebuild_marks`) diagnosed in `docs/perf-save-stall-2026-06.md`.
+- Phase 6 (partial) — `card_slot` + `note_surfaces` extracted as pure tested
+  functions (`c9f1231`).
+
+**Deferred — need the running app to tune the FEEL** (building subtle visual/
+timing UX blind risks regressing the "nothing vanishes / no interruption"
+properties without a way to catch it). The door + culling + edge-counts already
+cover most of the attention/honesty goal; what remains is presentation:
+- Phase 4 — titlebar working-state + elapsed (move the in-flight card out of the
+  lane), caret-margin pip, auto-reveal timing (announce-loud-once +
+  reveal-on-pause), visible-cap (~7, rest older passes behind the rail via
+  `pass_id`).
+- Phase 5 — clickable jump-to-hidden on the edge pills, bucket precedence
+  (detached/cluster), eased motion / stable-by-id reorder / composer grow-down,
+  per-pass aging tab.
+- Phase 6 remaining — GC-gate regression test; GPUI headless integration tests
+  for the height-measurement + culling paths.
+
+**Open decisions (Kirill):** the oplog-bloat persistence fix (perf doc, options
+1–3); whether to compact the existing 2.86 MB file (destructive).
