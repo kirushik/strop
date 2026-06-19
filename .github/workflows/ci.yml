@@ -68,11 +68,32 @@ jobs:
   deny:
     name: supply chain — cargo-deny (licenses, advisories, sources)
     runs-on: ubuntu-latest
+    # cargo-deny only runs `cargo metadata` — it compiles nothing. The old
+    # EmbarkStudios Docker action was slow for a non-obvious reason: its musl
+    # container has no toolchain, so rust-toolchain.toml forced a full 1.96.0
+    # install (~13s) AND, with a cold cargo home, `cargo metadata` re-cloned the
+    # giant Zed git deps every run (~1m40s of silent work). Running on the host
+    # with a cached cargo home fixes both: any cargo resolves the graph (workspace
+    # is edition 2024, so the runner's preinstalled stable is fine — no 1.96.0
+    # download), and the Zed clone + advisory db are reused across runs.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: cache cargo home (git deps + registry + advisory db)
+        uses: actions/cache@v4
         with:
-          command: check
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/advisory-dbs
+          key: cargo-deny-${{ hashFiles('Cargo.lock', 'deny.toml') }}
+          restore-keys: cargo-deny-
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
 
   app:
     name: app shell — clippy + headless logic tests
