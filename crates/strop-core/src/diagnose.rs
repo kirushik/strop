@@ -113,6 +113,7 @@ pub fn to_annotations(
     diagnoses: Vec<Diagnosis>,
     existing: &crate::document::Annotations,
     created_unix: i64,
+    pass_id: u64,
 ) -> Vec<Annotation> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
@@ -125,7 +126,9 @@ pub fn to_annotations(
         // the tail no longer contains the quote, so single/out-of-order quotes
         // still resolve). range.start would re-find the same occurrence.
         cursor = range.end;
-        if existing.is_dismissed(&range, &d.problem) {
+        // Skip what the writer already dismissed (don't re-nag) AND what an open
+        // card already covers (don't stack a duplicate on a re-run).
+        if existing.is_suppressed(&range, &d.problem) {
             continue;
         }
         out.push(Annotation {
@@ -138,6 +141,8 @@ pub fn to_annotations(
             title: d.problem,
             level: d.level,
             orphaned: false,
+            pass_id,
+            unverified: false,
         });
     }
     out
@@ -196,7 +201,7 @@ mod tests {
             level: "line".into(),
         };
         let existing = Annotations::default();
-        let out = to_annotations(text, vec![mk("p1"), mk("p2")], &existing, 1);
+        let out = to_annotations(text, vec![mk("p1"), mk("p2")], &existing, 1, 1);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].range, 6..18);
         assert_eq!(out[1].range, 22..34);
@@ -206,7 +211,20 @@ mod tests {
     fn dismissed_diagnoses_stay_dismissed() {
         let text = "слабое место здесь";
         let mut existing = Annotations::default();
-        let id = existing.add(0..12, "q".into(), 0);
+        // A previously-DISMISSED diagnosis (empty title) covering the span.
+        let id = existing.push(Annotation {
+            id: 0,
+            range: 0..12,
+            body: "q".into(),
+            status: NoteStatus::Open,
+            created_unix: 0,
+            kind: NoteKind::Diagnosis,
+            title: String::new(),
+            level: "line".into(),
+            orphaned: false,
+            pass_id: 0,
+            unverified: false,
+        });
         existing.set_status(id, crate::document::NoteStatus::Dismissed);
         // Same span, same problem name -> suppressed only when title matches.
         let mk = |problem: &str| Diagnosis {
@@ -215,11 +233,37 @@ mod tests {
             query: "?".into(),
             level: "line".into(),
         };
-        // The dismissed note has empty title; a diagnosis with empty title
-        // would be suppressed, a differently-named one would not.
-        let kept = to_annotations(text, vec![mk("hedging")], &existing, 1);
+        // The dismissed diagnosis has empty title; a diagnosis with empty title
+        // is suppressed, a differently-named one is not.
+        let kept = to_annotations(text, vec![mk("hedging")], &existing, 1, 1);
         assert_eq!(kept.len(), 1);
-        let suppressed = to_annotations(text, vec![Diagnosis { problem: "".into(), ..mk("") }], &existing, 1);
+        let suppressed =
+            to_annotations(text, vec![Diagnosis { problem: "".into(), ..mk("") }], &existing, 1, 1);
         assert!(suppressed.is_empty());
+    }
+
+    #[test]
+    fn open_duplicate_is_suppressed_on_rerun() {
+        // A re-run that re-flags the same problem over an OPEN card must not
+        // stack a duplicate (don't nag, don't bloat the lane).
+        let text = "слабое место здесь";
+        let mut existing = Annotations::default();
+        let mk = |problem: &str| Diagnosis {
+            quote: "слабое место".into(),
+            problem: problem.into(),
+            query: "?".into(),
+            level: "line".into(),
+        };
+        let first = to_annotations(text, vec![mk("buried lede")], &existing, 1, 1);
+        assert_eq!(first.len(), 1);
+        for a in first {
+            existing.push(a);
+        }
+        // Second pass re-flags the same problem at the same span -> suppressed.
+        let again = to_annotations(text, vec![mk("buried lede")], &existing, 2, 2);
+        assert!(again.is_empty(), "open duplicate should be suppressed");
+        // A different problem at the same span still comes through.
+        let other = to_annotations(text, vec![mk("passive voice")], &existing, 2, 2);
+        assert_eq!(other.len(), 1);
     }
 }

@@ -490,6 +490,9 @@ pub struct Editor {
     /// Bumped on every run and on cancel: an in-flight response from an
     /// older generation is silently dropped.
     ai_generation: u64,
+    /// Monotonic review-pass counter; each successful diagnosis pass bumps it
+    /// and stamps its new cards' `pass_id`, so a later pass can rest older ones.
+    diagnosis_pass: u64,
     /// Session override of the levels-of-edit depth; None = config's
     /// [ai].mode (the thesis switch, editorial-foundations §2.2).
     diagnosis_mode: Option<String>,
@@ -1192,6 +1195,7 @@ impl Editor {
             // pass.
             drafting: true,
             ai_generation: 0,
+            diagnosis_pass: 0,
             diagnosis_mode: None,
             last_pass_believing: false,
             palette_input: None,
@@ -2233,11 +2237,14 @@ impl Editor {
                         let count = diagnoses.len();
                         // Anchor against the text as it is NOW — quotes
                         // that no longer match are dropped.
+                        editor.diagnosis_pass += 1;
+                        let pass_id = editor.diagnosis_pass;
                         let annotations = strop_core::diagnose::to_annotations(
                             &editor.doc.text(),
                             diagnoses,
                             editor.doc.notes(),
                             now,
+                            pass_id,
                         );
                         let kept = annotations.len();
                         editor.doc.add_diagnoses(annotations);
@@ -5567,7 +5574,7 @@ impl Editor {
             level: "line".into(),
         })
         .collect();
-        let anns = to_annotations(&self.doc.text(), demos, self.doc.notes(), 0);
+        let anns = to_annotations(&self.doc.text(), demos, self.doc.notes(), 0, 0);
         self.doc.add_diagnoses(anns);
         self.drafting = false; // reviewing: the editor's cards are shown
         if let Some(n) = self.doc.notes().open().nth(2) {
@@ -8900,6 +8907,9 @@ struct MarginCard {
     /// label gains a quiet "· detached" so a card sitting at a best-effort
     /// offset never reads as confidently anchored.
     orphaned: bool,
+    /// A diagnosis whose flagged text was edited since it was raised — greyed
+    /// as "unverified" (Annotation::unverified). Always false for writer notes.
+    unverified: bool,
 }
 
 /// A note card's header label: "Note" / a diagnosis level (or "Diagnosis"),
@@ -9178,6 +9188,7 @@ impl Editor {
                 title: n.title.clone(),
                 level: n.level.clone(),
                 orphaned: n.orphaned,
+                unverified: n.unverified,
             });
         }
         // Place them in one pass (see `place_margin_cards`): writer notes and
@@ -9777,6 +9788,7 @@ impl Editor {
                         title,
                         level,
                         orphaned,
+                        unverified,
                         ..
                     } = card;
                     let composer = if active { self.note_input.clone() } else { None };
@@ -9807,7 +9819,10 @@ impl Editor {
                         .font_family("PT Serif")
                         .text_size(px(13.))
                         .line_height(px(CARD_LINE_H))
-                        .text_color(rgb(TEXT_COLOR))
+                        // Unverified (flagged text edited since): greyed — the
+                        // claim may no longer hold, so it recedes until the
+                        // writer judges it. Never auto-dismissed.
+                        .text_color(rgb(if unverified { MUTED_COLOR } else { TEXT_COLOR }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |editor, _: &MouseDownEvent, window, cx| {

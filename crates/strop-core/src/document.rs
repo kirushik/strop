@@ -355,6 +355,15 @@ pub struct Annotation {
     pub level: String,
     #[serde(default)]
     pub orphaned: bool,
+    /// The review pass that raised this diagnosis (0 = legacy, or a writer
+    /// note). Lets a newer pass rest older-pass cards behind the rail.
+    #[serde(default)]
+    pub pass_id: u64,
+    /// A diagnosis whose flagged text was edited since it was raised: the claim
+    /// may no longer hold, so the card greys — NEVER auto-dismissed, only the
+    /// writer dismisses. Set in `apply_op`; writer notes never go unverified.
+    #[serde(default)]
+    pub unverified: bool,
 }
 
 /// The annotation overlay. Anchors adjust like non-expanding spans
@@ -380,6 +389,8 @@ impl Annotations {
             title: String::new(),
             level: String::new(),
             orphaned: false,
+            pass_id: 0,
+            unverified: false,
         });
         self.notes.sort_by_key(|n| n.range.start);
         id
@@ -432,6 +443,21 @@ impl Annotations {
         })
     }
 
+    /// Should a freshly-anchored diagnosis at `range`/`title` be suppressed on a
+    /// new pass? Yes if the writer already DISMISSED that problem there (don't
+    /// re-nag) OR an OPEN one already covers it (don't stack a duplicate on a
+    /// re-run). Matched by title + span overlap — the "same issue" proxy. (Done
+    /// is excluded: a resolved issue that genuinely recurs may surface again.)
+    pub fn is_suppressed(&self, range: &Range<usize>, title: &str) -> bool {
+        self.notes.iter().any(|n| {
+            n.kind == NoteKind::Diagnosis
+                && matches!(n.status, NoteStatus::Dismissed | NoteStatus::Open)
+                && n.title == title
+                && n.range.start < range.end
+                && range.start < n.range.end
+        })
+    }
+
     pub fn apply_op(&mut self, op: &TextOp) {
         let del_end = op.pos + op.delete;
         let ins = op.insert.chars().count();
@@ -445,6 +471,19 @@ impl Annotations {
             }
         };
         for n in &mut self.notes {
+            // Staleness: a diagnosis whose flagged text is edited can no longer
+            // be vouched for → mark it unverified (it greys; only the writer
+            // dismisses). Tested on the ORIGINAL range, before adjustment: a
+            // deletion overlapping the span, or an insertion strictly inside it.
+            // Typing OUTSIDE the span never greys it (so writing near a card
+            // doesn't grey the world); writer notes never decay.
+            if n.kind == NoteKind::Diagnosis && !n.unverified {
+                let hit = (op.delete > 0 && op.pos < n.range.end && del_end > n.range.start)
+                    || (ins > 0 && op.pos > n.range.start && op.pos < n.range.end);
+                if hit {
+                    n.unverified = true;
+                }
+            }
             if op.delete > 0 {
                 n.range.start = clamp(n.range.start);
                 n.range.end = clamp(n.range.end);
@@ -894,6 +933,37 @@ mod tests {
             delete,
             insert: insert.into(),
         }
+    }
+
+    #[test]
+    fn diagnosis_greys_only_when_its_flagged_text_is_edited() {
+        let mk = |kind: NoteKind, range: Range<usize>| Annotation {
+            id: 0,
+            range,
+            body: "x".into(),
+            status: NoteStatus::Open,
+            created_unix: 0,
+            kind,
+            title: "t".into(),
+            level: "line".into(),
+            orphaned: false,
+            pass_id: 1,
+            unverified: false,
+        };
+        let mut anns = Annotations::default();
+        let diag = anns.push(mk(NoteKind::Diagnosis, 10..20));
+        let note = anns.push(mk(NoteKind::Note, 10..20));
+
+        // An edit OUTSIDE the span (insert at 0) greys nothing; it just shifts
+        // both anchors to 11..21.
+        anns.apply_op(&op(0, 0, "x"));
+        assert!(!anns.get(diag).unwrap().unverified, "outside edit must not grey");
+
+        // An edit INSIDE the (shifted) span greys the diagnosis — and only it;
+        // the writer's own note never decays.
+        anns.apply_op(&op(15, 0, "y"));
+        assert!(anns.get(diag).unwrap().unverified, "in-span edit greys the diagnosis");
+        assert!(!anns.get(note).unwrap().unverified, "writer notes never grey");
     }
 
     fn strong(range: Range<usize>) -> Span {

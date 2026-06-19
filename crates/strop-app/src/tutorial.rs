@@ -68,6 +68,8 @@ pub fn document() -> (String, SpanSet, BlockMap, Annotations) {
             title: "Agreement slip".to_owned(),
             level: "copy".to_owned(),
             orphaned: false,
+            pass_id: 0,
+            unverified: false,
         });
     }
     if let Some(range) = char_range("it never averages your voice toward the mean") {
@@ -83,6 +85,8 @@ pub fn document() -> (String, SpanSet, BlockMap, Annotations) {
             title: "Unearned claim?".to_owned(),
             level: "line".to_owned(),
             orphaned: false,
+            pass_id: 0,
+            unverified: false,
         });
     }
     if let Some(range) = char_range("deciding is your job") {
@@ -98,6 +102,8 @@ pub fn document() -> (String, SpanSet, BlockMap, Annotations) {
             title: String::new(),
             level: String::new(),
             orphaned: false,
+            pass_id: 0,
+            unverified: false,
         });
     }
     (text, spans, blocks, notes)
