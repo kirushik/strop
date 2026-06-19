@@ -32,8 +32,8 @@ Linux (Wayland) is runtime-tested.
 ### Internal
 - gpui patches — the Windows keyboard fix and the Wayland scale-change glyph
   workaround — are consolidated onto a single zed fork rev. The vendored
-  `gpui_wgpu` crate and its `[patch]` override are removed; `patches/` holds the
-  diffs and the re-sync recipe.
+  `gpui_wgpu` crate and its `[patch]` override are removed; see
+  `docs/gpui-fork.md`.
 
 ## [0.1.0] — 2026-06-17
 

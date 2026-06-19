@@ -60,7 +60,7 @@ unknown-git = "deny"
 
 [sources.allow-org]
 # gpui is pulled from a Strop fork of Zed's repo (github.com/kirushik/zed,
-# pinned by rev — see the workspace Cargo.toml and patches/) and drags in
+# pinned by rev — see the workspace Cargo.toml and docs/gpui-fork.md) and drags in
 # several sibling Zed forks — wgpu, font-kit, xim-rs. Trust both the upstream
 # org and the fork owner for git sources; any other git source still fails
 # (unknown-git = "deny").

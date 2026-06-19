@@ -2,9 +2,9 @@
 
 Status: Linux works today; Windows is broken by code analysis (not yet
 confirmed on hardware); macOS is uncertain and shares the risk. **The Windows
-fix is now shipped as `patches/gpui_windows-keyboard-layout.patch`, applied via
-a zed fork** (see `patches/README.md`) — the route chosen after cargo-patch
-proved unworkable for a git-sourced dep on ephemeral CI. This file remains the
+fix is now shipped as a commit on the zed fork Strop pins** (see
+`gpui-fork.md`) — the route chosen after cargo-patch proved unworkable for a
+git-sourced dep on ephemeral CI. This file remains the
 analysis + the on-hardware verification ask.
 
 ## The principle
@@ -61,9 +61,8 @@ chords (`Ctrl+Shift+P`, `Ctrl+C`, `Ctrl+B`, …) would not match.
 
 It can't be fixed from Strop's own code: the keystroke is produced inside
 `gpui_windows` before the keymap sees it, and there's no app-level hook to
-rewrite it. So the fix lives in the gpui tree, carried as
-`patches/gpui_windows-keyboard-layout.patch` and consumed via a zed fork
-(`patches/README.md`). The patch is three lines — return the US-layout letter
+rewrite it. So the fix lives in the gpui tree, carried as a commit on the zed
+fork Strop pins (`gpui-fork.md`). The patch is three lines — return the US-layout letter
 directly for `VK_A..=VK_Z` (whose VK codes are the ASCII letters) before the
 layout-sensitive `MapVirtualKeyW` call — so a chord stays Latin-named whatever
 the active layout. An upstream PR remains the eventual home; the fork just

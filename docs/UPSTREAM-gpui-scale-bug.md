@@ -2,9 +2,9 @@
 
 Status: root cause isolated to the shared swash `ScaleContext` in
 `gpui_wgpu::cosmic_text_system::render_glyph_image`; workaround shipped
-in Strop as `patches/gpui_wgpu-scale-context.patch`, carried on the zed fork
-(`patches/README.md`) — it was a vendored `vendor/gpui_wgpu` one-change patch
-until 2026-06-19. Issue not yet filed upstream. This file is the issue draft
+in Strop as a commit on the zed fork the workspace pins (`gpui-fork.md`) — it
+was a vendored `vendor/gpui_wgpu` one-change patch until 2026-06-19. Issue not
+yet filed upstream. This file is the issue draft
 plus the full evidence trail.
 
 ## One-line summary
@@ -101,10 +101,9 @@ upstream to decide; the practical contract violation is that
 
 ## Workaround shipped in Strop
 
-`patches/gpui_wgpu-scale-context.patch` — ONE change in
-`render_glyph_image`: a fresh `ScaleContext` per call. Carried as a commit on
-the zed fork the workspace pins (`patches/README.md`); until 2026-06-19 it was a
-vendored copy of the crate (`vendor/gpui_wgpu`) plus a
+ONE change in `render_glyph_image`: a fresh `ScaleContext` per call. Carried as
+a commit on the zed fork the workspace pins (`gpui-fork.md`); until 2026-06-19
+it was a vendored copy of the crate (`vendor/gpui_wgpu`) plus a
 `[patch."https://github.com/zed-industries/zed"]` override, both now removed.
 Cost is a per-glyph hint-cache rebuild, paid only on sprite-atlas misses.
 Suggested upstream fix: scope or key the scale context correctly (or reset it

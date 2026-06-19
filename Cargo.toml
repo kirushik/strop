@@ -27,10 +27,11 @@ glob = "0.3"
 # `strop-patches` — based at upstream rev 992f395c (tag v0.233.10, 2026-04-24)
 # plus two local fixes that have to live INSIDE the gpui tree. The fork is
 # byte-identical to that upstream rev except those two commits, so it costs
-# nothing over a plain pin while keeping both patches as one source of truth
-# and no vendored crate in-tree. The `.patch` files in `patches/` are the
-# re-sync record (and the apply/refresh recipe). Both fixes are headed upstream
-# as separate PRs; point back at zed-industries/zed once they land.
+# nothing over a plain pin while keeping every gpui-tree change as one source of
+# truth (the fork commits ARE the patches — no copy in-tree to drift) and no
+# vendored crate. docs/gpui-fork.md has the branch, the per-commit links and the
+# re-sync recipe. Both fixes are headed upstream as separate PRs; point back at
+# zed-industries/zed once they land.
 #   - gpui_windows: layout-independent letter keys, so Ctrl+Shift+P (and every
 #     letter chord) fires under non-Latin keyboard layouts (Cyrillic, …).
 #   - gpui_wgpu: a fresh swash ScaleContext per glyph — the Wayland
