@@ -48,6 +48,18 @@ jobs:
             bin: strop.exe
     steps:
       - uses: actions/checkout@v6
+      - name: exclude build dirs from Defender (Windows build speedup)
+        # The dist build (thin LTO + cg=1) is the slowest leg; Defender scanning
+        # every compiler artifact drags it further. Exclude the build dirs.
+        # Non-fatal — see the matching note in ci.yml.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          foreach ($p in @($env:GITHUB_WORKSPACE, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup")) {
+            try   { Add-MpPreference -ExclusionPath $p -ErrorAction Stop; Write-Host "excluded $p" }
+            catch { Write-Host "::warning::could not exclude $p from Defender: $_" }
+          }
       - name: gpui system dependencies (Linux only)
         if: runner.os == 'Linux'
         run: |
