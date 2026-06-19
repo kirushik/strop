@@ -9022,6 +9022,35 @@ fn place_margin_cards(items: &[PlaceItem], floor: f32, viewport_bottom: f32, gap
     top
 }
 
+/// Where a packed card sits relative to the viewport: rendered (`Shown`), or
+/// rolled into the above/below edge count. The active card always shows (it's
+/// clamped to fit); any other card needs at least one line of itself in view —
+/// the rule that keeps the "N above / N below" counts honest (nothing vanishes).
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum CardSlot {
+    Shown,
+    Above,
+    Below,
+}
+
+fn card_slot(top: f32, height: f32, vp_top: f32, vp_bottom: f32, active: bool) -> CardSlot {
+    if active || (top + height > vp_top + CARD_LINE_H && top < vp_bottom - CARD_LINE_H) {
+        CardSlot::Shown
+    } else if top + height <= vp_top + CARD_LINE_H {
+        CardSlot::Above
+    } else {
+        CardSlot::Below
+    }
+}
+
+/// The door (DESIGN §4.4): does this open note surface as a margin card right
+/// now? Writer notes always do; a diagnosis is hidden while drafting, and a
+/// copy-level one is held back while a developmental one is still open (the
+/// mandatory altitude order). The held-back ones surface as the rail's count.
+fn note_surfaces(kind: NoteKind, level: &str, drafting: bool, has_dev: bool) -> bool {
+    kind != NoteKind::Diagnosis || (!drafting && !(has_dev && level == "copy"))
+}
+
 impl Editor {
     /// Shape `text` at the card's inner width and return its REAL wrapped
     /// height (the measurement that replaced the `chars/30` estimate). Embedded
@@ -9124,13 +9153,8 @@ impl Editor {
                 .open()
                 .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
         for n in self.doc.notes().open() {
-            if n.kind == NoteKind::Diagnosis {
-                if drafting {
-                    continue;
-                }
-                if has_dev && n.level == "copy" {
-                    continue;
-                }
+            if !note_surfaces(n.kind, &n.level, drafting, has_dev) {
+                continue;
             }
             let byte = rope.char_to_byte(n.range.start.min(rope.len_chars())).min(len);
             let Some(pos) = frame.position_of(byte, false) else {
@@ -9223,15 +9247,10 @@ impl Editor {
         let vp_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
         let mut visible = Vec::with_capacity(cards.len());
         for card in cards {
-            let shows = card.active
-                || (card.top + card.height > vp_top + CARD_LINE_H
-                    && card.top < vp_bottom - CARD_LINE_H);
-            if shows {
-                visible.push(card);
-            } else if card.top + card.height <= vp_top + CARD_LINE_H {
-                above += 1;
-            } else {
-                below += 1;
+            match card_slot(card.top, card.height, vp_top, vp_bottom, card.active) {
+                CardSlot::Shown => visible.push(card),
+                CardSlot::Above => above += 1,
+                CardSlot::Below => below += 1,
             }
         }
         MarginLayout {
@@ -9298,9 +9317,10 @@ impl Editor {
                 .notes()
                 .open()
                 .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
-        self.doc.notes().open().any(|n| {
-            !(n.kind == NoteKind::Diagnosis && (drafting || (has_dev && n.level == "copy")))
-        })
+        self.doc
+            .notes()
+            .open()
+            .any(|n| note_surfaces(n.kind, &n.level, drafting, has_dev))
     }
 
     /// Does anything want the right-hand note lane right now? An empty lane
@@ -10755,6 +10775,44 @@ mod tests {
                 "active card {} + {h} overruns viewport {PACK_VP_BOTTOM}", tops[active]
             );
         }
+
+        // Card visibility: the selected card always shows; any card counted in
+        // an edge bucket is genuinely off that edge — so "N above / N below"
+        // never hides an on-screen card nor claims an off-screen one (Exhibit B).
+        #[test]
+        fn card_visibility_is_honest(
+            top in -1500f32..1500.,
+            height in 10f32..300.,
+            active in any::<bool>(),
+        ) {
+            let (vp_top, vp_bottom) = (44f32, 800f32);
+            let slot = card_slot(top, height, vp_top, vp_bottom, active);
+            if active {
+                prop_assert_eq!(slot, CardSlot::Shown, "the selected card always shows");
+            }
+            match slot {
+                CardSlot::Shown => prop_assert!(
+                    active || (top + height > vp_top && top < vp_bottom),
+                    "a Shown card overlaps the viewport"
+                ),
+                CardSlot::Above => prop_assert!(top + height <= vp_top + CARD_LINE_H),
+                CardSlot::Below => prop_assert!(top >= vp_bottom - CARD_LINE_H),
+            }
+        }
+    }
+
+    #[test]
+    fn door_filter_note_surfaces() {
+        // Writer notes always surface, in either mode.
+        assert!(note_surfaces(NoteKind::Note, "", true, true));
+        assert!(note_surfaces(NoteKind::Note, "", false, false));
+        // Diagnoses are hidden while drafting.
+        assert!(!note_surfaces(NoteKind::Diagnosis, "developmental", true, false));
+        // Reviewing: developmental shows; copy is held back iff a developmental
+        // one is still open (the altitude order), else it shows.
+        assert!(note_surfaces(NoteKind::Diagnosis, "developmental", false, true));
+        assert!(!note_surfaces(NoteKind::Diagnosis, "copy", false, true));
+        assert!(note_surfaces(NoteKind::Diagnosis, "copy", false, false));
     }
 
     #[test]
