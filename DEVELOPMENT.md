@@ -62,3 +62,43 @@ This repo is **hand-formatted on purpose** — do **not** run `cargo fmt`; it wo
 reflow large stretches of untouched code, and there is no format gate in CI. CI
 runs the `strop-core` gate (clippy + property tests) on every push; the `strop-app`
 job builds the git-pinned gpui and runs headless logic tests.
+
+## Release builds
+
+Guiding principle: **a release is built once (in CI, on a `v*` tag) but the binary
+is downloaded and run many times.** So we spend CI compile time freely to make the
+artifact smaller and faster — the cost lands on one machine, the benefit on every
+user, on every launch.
+
+`.github/workflows/release.yml` builds the **`dist`** Cargo profile (`cargo build
+--profile dist`), kept separate from `release` so a local `cargo build --release`
+stays quick. The profile mirrors Zed's own gpui release profile:
+
+- `lto = "thin"` — ~all of fat-LTO's win with a parallelizable link (fat's extra
+  gain on a tree this size is low single digits for a long serial link tail).
+- `codegen-units = 1` for whole-graph optimization, with the one big app crate
+  (`strop-app`) overridden back to `16` so it doesn't serialize the compile.
+- `opt-level = 3` — Strop is latency-sensitive (GPU text/scroll hot paths), so
+  **not** `s`/`z`.
+- `strip = "symbols"`, then CI runs a **full** `strip` on the artifact (cargo's
+  strip leaves the ~5 MB static symbol table on the pinned toolchain). The strip
+  command is per-OS — see the comment in `release.yml` (GNU `--strip-all` on
+  Linux; bare `strip` + ad-hoc `codesign` on macOS; skipped on Windows, whose
+  symbols live in a separate `.pdb`).
+
+Deliberate non-choices, so they don't get "optimized" back in:
+
+- **Keep `panic = unwind`** (not `abort`). The win is the smallest of all knobs
+  and it's the only one that changes runtime semantics — a panic would abort with
+  no Drop/cleanup, worse for an editor with unsaved work. Zed keeps unwind too.
+  Revisit only alongside a crash reporter.
+- **Baseline `target-cpu`** (not `v2`/`v3`). The SIMD-heavy crates
+  (wgpu/cosmic-text/swash) already runtime-detect; `v3` (AVX2) SIGILL-crashes on
+  older/low-power x86 with no fallback — unacceptable support risk for a
+  distributed binary. If ever wanted, set it via CI `RUSTFLAGS`, not the profile.
+- **No UPX / executable packing.** It decompresses on *every launch* (startup
+  latency — wrong for a run-many app) and trips antivirus / macOS notarization.
+
+Measured size deltas from the 2026-06 pass are recorded in
+[`docs/dependency-review-2026-06.md`](docs/dependency-review-2026-06.md) (≈49.9 MB
+default-release → 35.8 MB stripped `dist`, −28%).

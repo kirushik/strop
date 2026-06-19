@@ -42,6 +42,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI builds each crate once per job and never reuse incremental artifacts
+  # across runs (rust-cache restores the dep rlibs, not the incremental DB), so
+  # incremental only adds write overhead and bloats the cache. Off is faster.
+  CARGO_INCREMENTAL: 0
+  # CI compiles and runs tests; it doesn't debug the binary. Skip debuginfo for
+  # the dev profile — a real win on Windows, where full PDB generation over the
+  # gpui tree is slow. Trade-off: panic backtraces lose symbols/line info; if a
+  # green pipeline ever needs them, bump this to "line-tables-only".
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   core:
@@ -68,11 +77,32 @@ jobs:
   deny:
     name: supply chain — cargo-deny (licenses, advisories, sources)
     runs-on: ubuntu-latest
+    # cargo-deny only runs `cargo metadata` — it compiles nothing. The old
+    # EmbarkStudios Docker action was slow for a non-obvious reason: its musl
+    # container has no toolchain, so rust-toolchain.toml forced a full 1.96.0
+    # install (~13s) AND, with a cold cargo home, `cargo metadata` re-cloned the
+    # giant Zed git deps every run (~1m40s of silent work). Running on the host
+    # with a cached cargo home fixes both: any cargo resolves the graph (workspace
+    # is edition 2024, so the runner's preinstalled stable is fine — no 1.96.0
+    # download), and the Zed clone + advisory db are reused across runs.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: cache cargo home (git deps + registry + advisory db)
+        uses: actions/cache@v4
         with:
-          command: check
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/advisory-dbs
+          key: cargo-deny-${{ hashFiles('Cargo.lock', 'deny.toml') }}
+          restore-keys: cargo-deny-
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
 
   app:
     name: app shell — clippy + headless logic tests
@@ -153,6 +183,19 @@ jobs:
     name: Windows — build + tests + launch smoke
     runs-on: windows-latest
     steps:
+      - name: exclude build dirs from Defender (Windows build speedup)
+        # Defender real-time scanning of every .rlib/.rmeta/.pdb the compiler
+        # emits is a major drag on Windows runners. Exclude the workspace and the
+        # cargo/rustup homes so the cache restore, toolchain, and gpui build all
+        # run unscanned. First step so it covers everything. Non-fatal: if a
+        # runner blocks Add-MpPreference, we just build without the speedup.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          foreach ($p in @($env:GITHUB_WORKSPACE, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup")) {
+            try   { Add-MpPreference -ExclusionPath $p -ErrorAction Stop; Write-Host "excluded $p" }
+            catch { Write-Host "::warning::could not exclude $p from Defender: $_" }
+          }
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

@@ -1,0 +1,177 @@
+# Dependency review — 2026-06 (v0.2.0)
+
+A full pass over Strop's dependency tree: duplicates, version freshness, feature
+bloat, reimplementation candidates, supply-chain surface, build size. Done as an
+open-ended audit; this is the record of what was found, what changed, and what
+was deliberately left alone.
+
+## TL;DR
+
+| Metric | Before (pin `f3f236eb`) | After | Δ |
+| --- | --- | --- | --- |
+| `Cargo.lock` packages | 826 | 783 | **−43 (−5.2%)** |
+| Distinct duplicated crate names | 44 | 40 | −4 |
+| `async-std` / `async-tar` | present | **gone** | clears RUSTSEC-2025-0052 |
+| Release binary (`target/release/strop`) | 50.9 MB | 49.9 MB | −1.0 MB |
+| Tests | 135 pass | 135 pass | no regression |
+| Clippy | clean | clean | — |
+
+Both the baseline and the after-figures are measured against the **git** pin
+(apples-to-apples). All changes were validated by building Strop against the
+rebased fork (`cargo build`/`test`/`clippy`/`build --release`, all green).
+
+> **On the image trim and the package count.** The −43 lock-count win is the
+> async-std cluster (from the rebase) plus version unification. The `image` trim
+> is a **compile-time and binary-size** win, not a lock-count one: it stops
+> *compiling* the avif (`ravif`/`rav1e`/`av1-grain`/`avif-serialize`) and `exr`
+> codecs. `Cargo.lock` still lists `ravif`/`exr` under `image`'s dependency array
+> — but that is Cargo **version-pinning `image`'s optional deps under a git
+> source, not the `avif`/`exr` features being enabled.** The enabled features are
+> only png/jpeg/webp/gif/bmp/tiff/ico/pnm (+ rayon); confirm with
+> `cargo tree -e features | grep 'image feature'` (no `avif`/`exr`) and
+> `cargo tree -i ravif --target all` (nothing depends on it). So those codecs are
+> never downloaded or built for any target; re-resolving the lock (`cargo
+> generate-lockfile`) does not remove the pins.
+
+## The shape of the tree
+
+826 packages, but Strop's own manifests are lean. The duplicate/version sprawl
+is **almost entirely inherited from gpui** (the Zed fork drags wgpu, naga,
+cosmic-text, accesskit/atspi, zbus, resvg, …). Examples before this pass:
+`itertools` ×4, `hashbrown` ×4, `bitflags` ×2 — all transitive, none ours. Our
+direct deps already keep a single version each, and the only "two versions of X"
+that touched our own choices (`toml_edit` 0.22 vs 0.25) turned out to be a
+transitive build-dep artifact we don't control.
+
+Conclusion: **the leverage is in gpui's feature/dependency surface, not in
+Strop's manifests.** Since the gpui pin is a *writable* fork
+(`github.com/kirushik/zed`, local checkout at `../../Thirdparty/zed`), that's
+where the big cuts were made.
+
+## Changes made
+
+### Fork (`kirushik/zed`, branch `strop-patches-on-main`, tip `c0a1cafa`)
+
+1. **Rebased the two gpui-tree patches onto upstream `main`** (origin/main @
+   `69b602c7`, 2026-06-18 — 122 commits past the old base). Both patch files are
+   byte-identical on the new base, so the rebase was conflict-free. This is the
+   single biggest win and it is *free of any code change*: upstream landed a
+   refactor that moves `async-fs`/`async-tar`/`sha2`/`tempfile`/`util` behind a
+   new optional `github-download` feature on `http_client`. `gpui` /
+   `gpui_linux` depend on `http_client` **without** that feature (only Zed's
+   `languages`/`project` crates enable it), so the rebase deletes the whole
+   `async-tar → async-std → async-channel v1` cluster — exactly the
+   RUSTSEC-2025-0052 "async-std discontinued" advisory we suppress in
+   `deny.toml`. It also unified `rustix`/`nix`/`linux-raw-sys`/`event-listener`/
+   `async-channel`/`futures-lite` down to single versions.
+
+2. **Narrowed `image` to the formats gpui actually decodes.** gpui's
+   `ImageFormat` (platform.rs) only handles png/jpeg/webp/gif/bmp/tiff/ico/pnm;
+   `image`'s default features additionally pull `avif` (→ `ravif` → `rav1e`, a
+   ~50-crate AV1 *encoder*), `exr`, `qoi`, `hdr`, `dds`, `tga`. Set
+   `default-features = false` + the explicit eight formats on the four
+   gpui-family crates that declare `image` (gpui, gpui_linux, gpui_macos,
+   gpui_windows). The workspace `image` default is untouched, so the wider Zed
+   app crates keep their formats — only gpui (and thus Strop) slims down. This
+   stops those codecs from being **compiled** (binary + cold-build win); they
+   remain version-pinned in `Cargo.lock` as `image`'s optional deps but are never
+   built — see the note under TL;DR.
+
+   Note: this could not be expressed as `image = { workspace = true,
+   default-features = false }` — Cargo forbids overriding `default-features` on a
+   `workspace = true` inherit — so the gpui-family crates declare `image` with an
+   explicit `version` instead.
+
+### Strop repo
+
+3. **Dropped `anyhow`** from `strop-app` — it was declared but had zero
+   references anywhere in the source.
+4. **Narrowed `similar` to `["unicode"]`** — the `inline` feature was enabled but
+   no inline-diff API (`iter_inline_changes`/`InlineChange`) is used; the diff
+   code only needs `from_unicode_words` + core ops.
+
+## Deliberately NOT changed (discipline cuts both ways)
+
+- **`toml` + `toml_edit` kept as a pair.** They split cleanly: `toml` for
+  deserialization (`toml::from_str` in config.rs), `toml_edit` for the
+  comment-preserving config writer. Consolidating onto `toml_edit::de` would save
+  ~1 crate but requires enabling `toml_edit`'s `serde` feature — which would *add*
+  serde plumbing to the `toml_edit` already shared with gpui's
+  `proc-macro-crate` → zbus chain. Net ≈ wash, with real churn in a delicate
+  writer. Not worth it.
+- **`image`'s `rayon` feature kept.** Tempting to drop (Strop's image work is
+  decode + re-encode, which rayon doesn't accelerate), but `rayon` is
+  load-bearing in gpui via `sum_tree` regardless — so the feature is *free*, and
+  dropping it would only risk image-op latency for no supply-chain gain.
+- **Reimplementation candidates declined.** The single-use small deps
+  (`blake3` = content hashing, `glob` = `**` matching, `directories` =
+  cross-platform XDG/mac/Win paths, `interprocess` = local-socket single-instance)
+  are each either a correctness/crypto concern or genuinely cross-platform.
+  Hand-rolling any of them trades a few transitive crates for a maintenance and
+  correctness liability. Not worth it.
+
+## Deferred follow-ups (need fork *code* surgery, higher risk)
+
+These are the remaining large inherited subtrees. All are **hard** — gpui uses
+them unconditionally — so they need feature-gating work inside the fork (ideally
+upstreamed), not a manifest tweak. Rough sizes in Strop's current tree:
+
+| Subtree | ~crates | Why it's hard | Notes |
+| --- | --- | --- | --- |
+| SVG: `resvg`/`usvg`/`tiny-skia`/`fontdb`/`svgtypes`/`roxmltree` | ~70 | gpui renders icons through `svg_renderer.rs` + `ImageFormat::Svg` unconditionally | **Strop never calls `gpui::svg()`** (verified) — highest-value cut if gpui gained a `svg` feature gate. |
+| Accessibility: `accesskit`/`accesskit_unix`/`atspi*` | ~25 | hard deps in gpui + gpui_linux, woven through window/div/text | `zbus` would stay (see below). |
+| Keyring: `oo7` (+ `aes`/`cipher`) | ~10–15 | hard dep in gpui_linux, 3 call sites in `linux/platform.rs` | `zbus` stays — `ashpd` needs it for the file dialogs Strop *does* use. |
+
+## Finalize — done
+
+1. **Fork pushed:** `strop-patches-on-main` is on `kirushik/zed`, tip
+   `c0a1cafaef4e8d8060fa62e0a66c530433b353ba` (re-signed — byte-identical tree to
+   the review build).
+2. **Pin swapped:** root `Cargo.toml` pins `gpui`/`gpui_platform` to that rev (the
+   TEMP local-path override is gone); `Cargo.lock` was regenerated and committed.
+3. **Advisories dropped:** `RUSTSEC-2025-0052` (async-std) removed from
+   `deny.toml`; `RUSTSEC-2024-0384` (`instant`) too — the rebase removed `instant`
+   as well. The remaining three ignores (`paste`, `atomic-polyfill`,
+   `proc-macro-error2`) are still present in the tree and stay.
+
+Standing fork details (branch, the three commits, re-sync recipe) live in
+[`gpui-fork.md`](gpui-fork.md).
+
+## How to re-measure
+
+`cargo`/`rustc` on PATH are broken snap shims in this environment; use the real
+toolchain and set `RUSTC`:
+
+```sh
+TC=$HOME/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin
+export RUSTC=$TC/rustc PATH=$TC:$PATH
+$TC/cargo tree --duplicates | grep -E '^[a-z]' | awk '{print $1}' | sort -u | wc -l  # dup names
+grep -c '^\[\[package\]\]' Cargo.lock                                                # package count
+$TC/cargo tree -i async-std                                                          # advisory subtree
+```
+
+## Release binary optimization (measurements)
+
+The standing release-build **principles and the profile rationale** live in
+[`DEVELOPMENT.md` → "Release builds"](../DEVELOPMENT.md) (not here — this dated
+doc is a point-in-time review, not living policy). What this 2026-06 pass added: a
+`[profile.dist]` (thin LTO + `codegen-units = 1` + `strip`, mirroring Zed's gpui
+profile) and a full-strip step in `release.yml`.
+
+One finding worth keeping with the numbers: on the pinned toolchain
+`strip = "symbols"` drops debuginfo but *leaves* the static symbol table
+(`.symtab`/`.strtab`, ≈5.4 MB) — verified by `readelf -S` that those are the only
+sections a full `strip` removes (every runtime section — `.dynsym`, `.eh_frame`,
+`.got`, `.plt`, `.text` — is preserved), so the CI `strip --strip-all` is safe.
+
+**Measured (x86_64-linux, this machine):**
+
+| Binary | Size | vs default release |
+| --- | --- | --- |
+| default `release` profile | 49.9 MB | — |
+| `dist` profile (LTO+cg1+strip=symbols) | 41.4 MB | −8.5 MB (−17%) |
+| `dist` + full `strip` (the CI artifact) | 35.8 MB | **−14.1 MB (−28%)** |
+
+Cold `dist` build ≈ 2 min here (fast multi-core box; GitHub runners slower, but
+it's a once-per-release cost). The download archive (`.tar.gz`/`.zip`) compresses
+further — strip mainly shrinks the *installed* footprint.
