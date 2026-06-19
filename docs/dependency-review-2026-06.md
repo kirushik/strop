@@ -24,11 +24,14 @@ rebased fork (`cargo build`/`test`/`clippy`/`build --release`, all green).
 > async-std cluster (from the rebase) plus version unification. The `image` trim
 > is a **compile-time and binary-size** win, not a lock-count one: it stops
 > *compiling* the avif (`ravif`/`rav1e`/`av1-grain`/`avif-serialize`) and `exr`
-> codecs (verified — the enabled `image` features are only
-> png/jpeg/webp/gif/bmp/tiff/ico/pnm + rayon), but Cargo still **version-pins**
-> those codecs in `Cargo.lock` as `image`'s unused optional deps. They are never
-> downloaded or built for any target. Re-resolving the lock (`cargo
-> generate-lockfile`) does not remove them.
+> codecs. `Cargo.lock` still lists `ravif`/`exr` under `image`'s dependency array
+> — but that is Cargo **version-pinning `image`'s optional deps under a git
+> source, not the `avif`/`exr` features being enabled.** The enabled features are
+> only png/jpeg/webp/gif/bmp/tiff/ico/pnm (+ rayon); confirm with
+> `cargo tree -e features | grep 'image feature'` (no `avif`/`exr`) and
+> `cargo tree -i ravif --target all` (nothing depends on it). So those codecs are
+> never downloaded or built for any target; re-resolving the lock (`cargo
+> generate-lockfile`) does not remove the pins.
 
 ## The shape of the tree
 
@@ -47,7 +50,7 @@ where the big cuts were made.
 
 ## Changes made
 
-### Fork (`kirushik/zed`, branch `strop-patches-on-main`, tip `96bebcc2db`)
+### Fork (`kirushik/zed`, branch `strop-patches-on-main`, tip `c0a1cafa`)
 
 1. **Rebased the two gpui-tree patches onto upstream `main`** (origin/main @
    `69b602c7`, 2026-06-18 — 122 commits past the old base). Both patch files are
@@ -119,25 +122,20 @@ upstreamed), not a manifest tweak. Rough sizes in Strop's current tree:
 | Accessibility: `accesskit`/`accesskit_unix`/`atspi*` | ~25 | hard deps in gpui + gpui_linux, woven through window/div/text | `zbus` would stay (see below). |
 | Keyring: `oo7` (+ `aes`/`cipher`) | ~10–15 | hard dep in gpui_linux, 3 call sites in `linux/platform.rs` | `zbus` stays — `ashpd` needs it for the file dialogs Strop *does* use. |
 
-## Finalize (the parts this review couldn't push)
+## Finalize — done
 
-The review session has write access to the local fork checkout but **cannot
-push** to `kirushik/zed` (FIDO-key signing). To land:
+1. **Fork pushed:** `strop-patches-on-main` is on `kirushik/zed`, tip
+   `c0a1cafaef4e8d8060fa62e0a66c530433b353ba` (re-signed — byte-identical tree to
+   the review build).
+2. **Pin swapped:** root `Cargo.toml` pins `gpui`/`gpui_platform` to that rev (the
+   TEMP local-path override is gone); `Cargo.lock` was regenerated and committed.
+3. **Advisories dropped:** `RUSTSEC-2025-0052` (async-std) removed from
+   `deny.toml`; `RUSTSEC-2024-0384` (`instant`) too — the rebase removed `instant`
+   as well. The remaining three ignores (`paste`, `atomic-polyfill`,
+   `proc-macro-error2`) are still present in the tree and stay.
 
-1. **Push the fork branch:** in `../../Thirdparty/zed`,
-   `git push origin strop-patches-on-main` (commits are `--no-gpg-sign`).
-2. **Swap Strop's pin:** in this repo's root `Cargo.toml`, replace the TEMP
-   local-path override with the `git + rev = 96bebcc2db…` lines already written
-   just above it, then `cargo build` to refresh `Cargo.lock` (commit the lock).
-3. **Drop the cleared advisory:** remove the `RUSTSEC-2025-0052` line from
-   `deny.toml`'s `ignore` list (async-std is gone). The other four ignores stay.
-4. Optional: rename `strop-patches-on-main` → `strop-patches` if you prefer the
-   stable branch name (the rev pin is by SHA, so the name doesn't matter to the
-   build).
-
-Until step 2, the root `Cargo.toml` carries an absolute local-path override
-(marked TEMP) so the trimmed tree builds locally; that override must not be
-committed.
+Standing fork details (branch, the three commits, re-sync recipe) live in
+[`gpui-fork.md`](gpui-fork.md).
 
 ## How to re-measure
 

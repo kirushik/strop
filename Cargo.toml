@@ -28,8 +28,11 @@ glob = "0.3"
 # 2026-06-19 dependency review (docs/dependency-review-2026-06.md): -43 crates vs
 # the old f3f236eb pin (826 -> 783) — async-std/async-tar gone (cleared
 # RUSTSEC-2025-0052). The image trim additionally stops compiling avif(rav1e)/exr
-# (smaller binary, faster cold build); those stay version-pinned in Cargo.lock as
-# image's unused optional deps but are never built.
+# (smaller binary, faster cold build). Cargo.lock still lists ravif/exr under
+# `image` — that's Cargo version-pinning image's OPTIONAL deps under a git source,
+# NOT the avif/exr features being on. Enabled features are png/jpeg/webp/gif/bmp/
+# tiff/ico/pnm only (`cargo tree -e features | grep 'image feature'`), so they're
+# never built.
 #
 # The fork is the single source of truth for our gpui-tree changes — the three
 # commits ARE the diffs, no vendored copy. docs/gpui-fork.md has the links and
