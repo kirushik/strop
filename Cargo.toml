@@ -53,3 +53,25 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Distribution builds — CI: `cargo build --profile dist`. Built ONCE in CI, then
+# downloaded and run many times, so we trade compile time for a smaller, faster
+# binary. Kept separate from `release` so a local `cargo build --release` stays
+# quick. Mirrors Zed's own gpui release profile (thin LTO + codegen-units=1) — see
+# docs/dependency-review-2026-06.md ("Release binary optimization").
+[profile.dist]
+inherits = "release"
+opt-level = 3          # latency-sensitive GPU/text hot paths: keep max speed (not "s"/"z")
+lto = "thin"           # ~all of fat-LTO's win with a parallel link; Zed's choice
+codegen-units = 1      # whole-graph optimization across the dep tree
+strip = "symbols"      # drops debuginfo (no crash reporter to feed). NOTE: on this
+                       # toolchain this LEAVES the static symbol table (.symtab/
+                       # .strtab, ~5 MB); release.yml additionally runs
+                       # `strip --strip-all` on the artifact to remove it.
+# (trim-paths isn't a stable profile key on the pinned toolchain; if a public
+#  build should hide CI/home paths, set RUSTFLAGS="--remap-path-prefix=..." in CI.)
+
+[profile.dist.package.strop-app]
+# Keep the one big app crate parallel so codegen-units=1 doesn't serialize its
+# compile — thin LTO re-merges across units anyway (Zed does this for `zed`).
+codegen-units = 16

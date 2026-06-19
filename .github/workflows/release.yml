@@ -1,12 +1,13 @@
 # Strop release builds.
 #
-# Trigger: push a `v*` tag (e.g. `v0.1.0`). Builds a --release binary on each of
-# the three CI platforms, packages it with its license files, and attaches the
-# archives to a GitHub Release created as a DRAFT — nothing is published until a
-# human reviews and hits publish.
+# Trigger: push a `v*` tag (e.g. `v0.1.0`). Builds the `dist` profile binary
+# (thin LTO + codegen-units=1 + full strip — see Cargo.toml) on each of the three
+# CI platforms, packages it with its license files, and attaches the archives to
+# a GitHub Release created as a DRAFT — nothing is published until a human reviews
+# and hits publish.
 #
 # `workflow_dispatch` runs the build matrix WITHOUT creating a release, so the
-# three --release builds (which ci.yml never exercises — it builds debug) can be
+# three dist builds (which ci.yml never exercises — it builds debug) can be
 # dry-run on a branch before a tag is ever cut.
 #
 # Honesty for the early releases: only Linux is runtime-tested. The macOS and
@@ -71,11 +72,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-      - name: build (release)
+      - name: build (dist)
         # Build the exact matrix triple so the artifact label is true by
         # construction (not an assumption about the runner's host arch), and
         # --locked so the published binary matches the committed Cargo.lock.
-        run: cargo build --release --locked --target ${{ matrix.target }} -p strop-app
+        # `dist` profile = thin LTO + codegen-units=1 + strip (see Cargo.toml):
+        # spend CI compile time once for a smaller, faster download-and-run binary.
+        run: cargo build --profile dist --locked --target ${{ matrix.target }} -p strop-app
+      - name: strip symbol table
+        # `strip=symbols` in the profile drops debuginfo but leaves the static
+        # symbol table (.symtab/.strtab ~5 MB here); a full strip removes it.
+        # Per-OS because the tools differ:
+        #   Linux  — GNU binutils: `strip --strip-all`.
+        #   macOS  — cctools strip has NO `--strip-all` (and its `-s` means
+        #            something else); bare `strip` IS the full strip for an
+        #            executable. It also invalidates the linker's ad-hoc
+        #            signature, so re-sign — Apple Silicon won't launch an
+        #            unsigned/altered binary.
+        #   Windows — skipped: MSVC keeps symbols in a separate .pdb, not the .exe.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          f="target/${{ matrix.target }}/dist/${{ matrix.bin }}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            strip "$f"
+            codesign --force --sign - "$f"
+          else
+            strip --strip-all "$f"
+          fi
       - name: package
         shell: bash
         run: |
@@ -87,7 +111,7 @@ jobs:
           fi
           name="strop-${ver}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$name/"
+          cp "target/${{ matrix.target }}/dist/${{ matrix.bin }}" "dist/$name/"
           # GPL: convey the licence and notices with the binary.
           cp README.md COPYING NOTICE "dist/$name/"
           cd dist

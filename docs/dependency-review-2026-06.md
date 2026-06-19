@@ -151,3 +151,29 @@ $TC/cargo tree --duplicates | grep -E '^[a-z]' | awk '{print $1}' | sort -u | wc
 grep -c '^\[\[package\]\]' Cargo.lock                                                # package count
 $TC/cargo tree -i async-std                                                          # advisory subtree
 ```
+
+## Release binary optimization (measurements)
+
+The standing release-build **principles and the profile rationale** live in
+[`DEVELOPMENT.md` → "Release builds"](../DEVELOPMENT.md) (not here — this dated
+doc is a point-in-time review, not living policy). What this 2026-06 pass added: a
+`[profile.dist]` (thin LTO + `codegen-units = 1` + `strip`, mirroring Zed's gpui
+profile) and a full-strip step in `release.yml`.
+
+One finding worth keeping with the numbers: on the pinned toolchain
+`strip = "symbols"` drops debuginfo but *leaves* the static symbol table
+(`.symtab`/`.strtab`, ≈5.4 MB) — verified by `readelf -S` that those are the only
+sections a full `strip` removes (every runtime section — `.dynsym`, `.eh_frame`,
+`.got`, `.plt`, `.text` — is preserved), so the CI `strip --strip-all` is safe.
+
+**Measured (x86_64-linux, this machine):**
+
+| Binary | Size | vs default release |
+| --- | --- | --- |
+| default `release` profile | 49.9 MB | — |
+| `dist` profile (LTO+cg1+strip=symbols) | 41.4 MB | −8.5 MB (−17%) |
+| `dist` + full `strip` (the CI artifact) | 35.8 MB | **−14.1 MB (−28%)** |
+
+Cold `dist` build ≈ 2 min here (fast multi-core box; GitHub runners slower, but
+it's a once-per-release cost). The download archive (`.tar.gz`/`.zip`) compresses
+further — strip mainly shrinks the *installed* footprint.
