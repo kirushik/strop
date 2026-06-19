@@ -10,6 +10,14 @@ gpui tree: the pinned rev is exactly what compiles, and these commits *are* the
 diffs. There is no vendored dependency source in this repo, and no second copy
 of the patches to drift out of sync — to read a change, open its commit.
 
+> **2026-06-19 dependency review:** the patches were rebased onto upstream `main`
+> (origin/main @ `69b602c7`) on branch **`strop-patches-on-main`** (tip
+> `96bebcc2db`), and a third commit narrows `image` to the formats gpui decodes.
+> The rebase alone drops the `async-std`/`async-tar` subtree (clears
+> RUSTSEC-2025-0052). The pin swap to the new rev is pending a push of that
+> branch — see [`dependency-review-2026-06.md`](dependency-review-2026-06.md) for
+> the metrics and the finalize checklist.
+
 ## Patches (commits on `strop-patches`)
 
 - **gpui_windows: layout-independent letter keys** —
