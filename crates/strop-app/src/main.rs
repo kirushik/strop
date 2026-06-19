@@ -2,8 +2,10 @@
 // Explorer — for a GUI app that is a spare black window next to ours. The
 // "windows" subsystem suppresses it. Gated to release builds so `cargo run`
 // and debug builds keep their console (eprintln!/panic output go nowhere
-// under the windows subsystem). No-op on every non-Windows target.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// under the windows subsystem). The `target_os = "windows"` arm is belt-and-
+// braces — the attribute is already ignored on non-Windows targets — and just
+// keeps it scoped to where it means something.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 // Draw-pass discipline (docs/VISUAL-RIG.md): raw Entity::update and canvas
 // are banned crate-wide; clippy.toml points each ban at its draw_guard
 // wrapper. Deny, not warn — a mid-draw notify is a corruption bug, not style.

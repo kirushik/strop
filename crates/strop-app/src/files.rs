@@ -236,22 +236,47 @@ fn record_caret_at(file: &Path, doc: &Path, caret: usize) {
 /// Open a path or URL with the OS default handler. Best-effort and
 /// fire-and-forget — a system with no handler registered does nothing, the
 /// same failure the bare `xdg-open` had. Per-OS because there is no single
-/// portable launcher: the `start` shell verb (Windows), `open` (macOS),
-/// `xdg-open` (Linux). On Windows it goes through `cmd` with CREATE_NO_WINDOW
-/// so the console-subsystem launcher never flashes a window of its own.
+/// portable launcher: `ShellExecuteW` (Windows), `open` (macOS), `xdg-open`
+/// (Linux).
 pub fn open_external(target: impl AsRef<OsStr>) {
     let target = target.as_ref();
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        // `cmd /C start "" <target>`: the empty "" is the (required) window
-        // title slot, so a quoted target is never consumed as the title.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("cmd")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["/C", "start", ""])
-            .arg(target)
-            .spawn();
+        // ShellExecuteW(.., "open", target, ..) — the documented "open with the
+        // default handler" call. Deliberately NOT `cmd /C start`: cmd re-parses
+        // its command line, so a `&` in a URL query string would split it into
+        // separate commands — a broken link, and an injection vector if the URL
+        // were ever untrusted. ShellExecuteW takes the target as one wide
+        // string, so nothing is reinterpreted; it also spawns no console.
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                operation: *const u16,
+                file: *const u16,
+                parameters: *const u16,
+                directory: *const u16,
+                show_cmd: i32,
+            ) -> isize;
+        }
+
+        let file: Vec<u16> = target.encode_wide().chain(std::iter::once(0)).collect();
+        let open: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        const SW_SHOWNORMAL: i32 = 1;
+        // Best-effort: the returned pseudo-HINSTANCE (> 32 on success) is
+        // ignored, matching the other branches' fire-and-forget contract.
+        unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                open.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
+        }
     }
     #[cfg(target_os = "macos")]
     {
