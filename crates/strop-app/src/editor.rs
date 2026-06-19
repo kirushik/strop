@@ -6189,16 +6189,20 @@ fn runs_for_paragraph(
                 }
             }
 
-            // Note anchors tint (wheat); diagnosis anchors underline
-            // quietly in muted ink — never red, never wavy — promoting to
-            // a tint when active. Selection composites over everything.
+            // Note anchors tint (wheat); diagnosis anchors get a quiet WAVY
+            // squiggle in muted ink — the spellcheck idiom, so a tool mark
+            // never reads as the writer's own straight underline (ctrl-u; the
+            // one mark §2 keeps) — promoting to a tint when active. If a span
+            // carries the writer's underline already, that straight line wins
+            // (get_or_insert): their formatting outranks the tool's mark.
+            // Selection composites over everything.
             for (r, active, is_diagnosis) in notes {
                 if r.start <= w[0] && w[1] <= r.end {
                     if *is_diagnosis && !active {
                         underline.get_or_insert(UnderlineStyle {
                             color: Some(rgb(MUTED_COLOR).into()),
                             thickness: px(1.),
-                            wavy: false,
+                            wavy: true,
                         });
                         continue;
                     }
@@ -8872,6 +8876,17 @@ struct PreviewDoc {
     kinds: Vec<BlockKind>,
 }
 
+struct MarginLayout {
+    /// Cards to render — packed and at least partly in view.
+    cards: Vec<MarginCard>,
+    /// Open cards hidden above / below the viewport (anchor culled off-screen,
+    /// or pushed out by packing) — surfaced as honest edge counts so a card
+    /// never vanishes without a trace (DESIGN principle 2). Door-held cards are
+    /// NOT counted here; the rail (render_margin_rail) owns those.
+    above: usize,
+    below: usize,
+}
+
 struct MarginCard {
     id: u64,
     top: f32,
@@ -9066,16 +9081,26 @@ impl Editor {
         }
     }
 
-    /// The Docs-style margin solver (via Liveblocks' AnchoredThreads):
-    /// downward sweep normally; with an active card, it snaps to its anchor,
-    /// later cards push down, earlier cards push up from it in reverse.
-    fn margin_cards(&self) -> Vec<MarginCard> {
+    /// Build the margin cards: door-filter the open notes, measure + place them
+    /// (`place_margin_cards`), and — when `cull` is set (the wide lane) — drop
+    /// those whose anchor is off-screen or that packing pushed out of view,
+    /// reporting their counts as honest `above`/`below` edges so nothing
+    /// vanishes silently. `cull = false` (the narrow drawer) returns every open
+    /// card with no edge counts; the drawer ignores positions.
+    fn margin_cards(&self, cull: bool) -> MarginLayout {
         let Some(frame) = self.last_frame.as_ref() else {
-            return Vec::new();
+            return MarginLayout {
+                cards: Vec::new(),
+                above: 0,
+                below: 0,
+            };
         };
         let rope = self.doc.rope();
         let len = self.doc.len_bytes();
         let mut cards: Vec<MarginCard> = Vec::new();
+        // Open cards hidden above / below the viewport — surfaced as edge counts.
+        let mut above = 0usize;
+        let mut below = 0usize;
         // The door (DESIGN §4.4): drafting hides the editor's cards (the
         // writer's own notes stay); reviewing shows them, but suppresses
         // copy-level cards while a developmental one is still open (the
@@ -9111,7 +9136,15 @@ impl Editor {
             // you're working it, so it stays even if its anchor scrolled away.
             let vp_top = f32::from(frame.bounds.origin.y);
             let vp_bot = vp_top + f32::from(frame.bounds.size.height);
-            if !active && (desired < vp_top - CARD_OVERSCAN || desired > vp_bot + CARD_OVERSCAN) {
+            if cull
+                && !active
+                && (desired < vp_top - CARD_OVERSCAN || desired > vp_bot + CARD_OVERSCAN)
+            {
+                if desired < vp_top {
+                    above += 1;
+                } else {
+                    below += 1;
+                }
                 continue;
             }
             // Real MEASURED height (refresh_card_heights), never an estimate.
@@ -9168,7 +9201,33 @@ impl Editor {
         {
             card.top = top;
         }
-        cards
+        if !cull {
+            return MarginLayout { cards, above, below };
+        }
+        // Packing can shove an on-screen-anchored card off the bottom (e.g. the
+        // active card pins high and the run below it overflows). Count those too,
+        // never clip them silently: keep only cards with a real slice in view,
+        // tally the rest as above / below.
+        let vp_top = f32::from(frame.bounds.origin.y);
+        let vp_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
+        let mut visible = Vec::with_capacity(cards.len());
+        for card in cards {
+            let shows = card.active
+                || (card.top + card.height > vp_top + CARD_LINE_H
+                    && card.top < vp_bottom - CARD_LINE_H);
+            if shows {
+                visible.push(card);
+            } else if card.top + card.height <= vp_top + CARD_LINE_H {
+                above += 1;
+            } else {
+                below += 1;
+            }
+        }
+        MarginLayout {
+            cards: visible,
+            above,
+            below,
+        }
     }
 
     /// Width the column and note lane actually have to live in: the viewport
@@ -9659,10 +9718,40 @@ impl Editor {
             return None;
         }
         let col_right = self.column_right(window);
-        let mut cards = self.margin_cards();
-        if cards.is_empty() {
+        let MarginLayout {
+            mut cards,
+            above,
+            below,
+        } = self.margin_cards(true);
+        if cards.is_empty() && above == 0 && below == 0 {
             return None;
         }
+        let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
+        // A quiet pill at a lane edge when cards are hidden past it — the honest
+        // "there's more here, it didn't vanish" cue (DESIGN principle 2).
+        let edge_chip = move |label: String, at_bottom: bool| {
+            let chip = div()
+                .absolute()
+                .left(px((MARGIN_WIDTH - 88.) / 2.))
+                .w(px(88.))
+                .flex()
+                .justify_center()
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(10.))
+                .bg(rgb(0xFFFDF6))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .text_size(px(10.))
+                .text_color(rgb(MUTED_COLOR))
+                .font_family("PT Serif")
+                .child(label);
+            if at_bottom {
+                chip.bottom(px(6.))
+            } else {
+                chip.top(px(floor))
+            }
+        };
         // Paint the active card LAST so it sits ON TOP of any neighbour it
         // overlaps (GPUI paints siblings in tree order). Tops are unchanged —
         // this is purely z-order: "the selected annotation is always on top."
@@ -9803,7 +9892,13 @@ impl Editor {
                                 div().child(body.clone())
                             })
                         })
-                })),
+                }))
+                .when(above > 0, |d| {
+                    d.child(edge_chip(format!("{above} above"), false))
+                })
+                .when(below > 0, |d| {
+                    d.child(edge_chip(format!("{below} below"), true))
+                }),
         )
     }
 
@@ -9891,7 +9986,7 @@ impl Editor {
         if self.margin_fits(window) || self.history_view.is_some() {
             return None;
         }
-        let count = self.narrow_notes_count(&self.margin_cards());
+        let count = self.narrow_notes_count(&self.margin_cards(false).cards);
         if count == 0 {
             return None;
         }
@@ -9962,7 +10057,7 @@ impl Editor {
         if !self.narrow_notes_open || self.margin_fits(window) || self.history_view.is_some() {
             return None;
         }
-        let cards = self.margin_cards();
+        let cards = self.margin_cards(false).cards;
         if self.narrow_notes_count(&cards) == 0 {
             return None;
         }

@@ -188,6 +188,17 @@ colored tab (deferred behind staleness-grey — revisit only if testers report
 batch confusion), and the elapsed-escalation prose ("taking a while" → just
 spinner + bare elapsed seconds).
 
+**Edge counts pulled forward (2026-06-19, with the Phase 2 squiggle).** The
+off-screen `▲N / ▼N` pills shipped early, ahead of the rest of the count
+grammar: a tester (Kirill) selected the second-to-last card, which pinned high
+and pushed its neighbour off the bottom edge with NO trace — a direct violation
+of principle 2 ("nothing can be lost, and the writer must FEEL that"), so the
+honest indicator couldn't wait for Phase 5. `margin_cards` now returns a
+`MarginLayout { cards, above, below }`; `above`/`below` count both anchor-culled
+and packing-pushed-off cards (door-held cards stay the rail's job). Still
+deferred to Phase 5: clickable jump-to-hidden, the bucket precedence with
+detached/cluster, narrow-drawer count semantics (`cull = false` there).
+
 **Diagnosis anchor mark.** Wavy/dotted squiggle (spellcheck idiom), never a
 straight underline — coexists with the writer's `ctrl-u` and avoids resurrecting
 the mark §2 banished.
