@@ -42,6 +42,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI builds each crate once per job and never reuse incremental artifacts
+  # across runs (rust-cache restores the dep rlibs, not the incremental DB), so
+  # incremental only adds write overhead and bloats the cache. Off is faster.
+  CARGO_INCREMENTAL: 0
+  # CI compiles and runs tests; it doesn't debug the binary. Skip debuginfo for
+  # the dev profile — a real win on Windows, where full PDB generation over the
+  # gpui tree is slow. Trade-off: panic backtraces lose symbols/line info; if a
+  # green pipeline ever needs them, bump this to "line-tables-only".
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   core:
