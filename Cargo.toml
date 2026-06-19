@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/strop-core", "crates/strop-app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -23,17 +23,25 @@ ureq = { version = "3", features = ["json"] }
 similar = { version = "3", features = ["unicode", "inline"] }
 glob = "0.3"
 
-# Git pin on zed-industries/zed (post gpui/gpui_platform split), tag
-# v0.233.10 (2026-04-24). Carries the 2026 Linux raster rewrite (wgpu +
-# cosmic-text) and per-span font-fallback wiring that the vendored 0.2.2
-# only hotpatched around (vendor/gpui kept untouched until this lands).
-# Apps now need both the `gpui` facade and `gpui_platform` (which selects
-# gpui_linux/gpui_wgpu on Linux): `Application::new()` became
-# `gpui_platform::application()`.
-# X11 backend off: Wayland-only dev machine; re-enable "x11" (on
-# gpui_platform) when packaging for distribution.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "992f395c3d696d96946302cd0a8721a72954ba39", default-features = false, features = ["font-kit", "wayland", "x11"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "992f395c3d696d96946302cd0a8721a72954ba39", default-features = false, features = ["wayland", "x11"] }
+# Pinned to a FORK of zed-industries/zed — github.com/kirushik/zed, branch
+# `strop-patches` — based at upstream rev 992f395c (tag v0.233.10, 2026-04-24)
+# plus two local fixes that have to live INSIDE the gpui tree. The fork is
+# byte-identical to that upstream rev except those two commits, so it costs
+# nothing over a plain pin while keeping both patches as one source of truth
+# and no vendored crate in-tree. The `.patch` files in `patches/` are the
+# re-sync record (and the apply/refresh recipe). Both fixes are headed upstream
+# as separate PRs; point back at zed-industries/zed once they land.
+#   - gpui_windows: layout-independent letter keys, so Ctrl+Shift+P (and every
+#     letter chord) fires under non-Latin keyboard layouts (Cyrillic, …).
+#   - gpui_wgpu: a fresh swash ScaleContext per glyph — the Wayland
+#     scale-change glyph corruption (docs/UPSTREAM-gpui-scale-bug.md), formerly
+#     carried as vendor/gpui_wgpu + a [patch] override (both now removed).
+# Upstream carries the 2026 Linux raster rewrite (wgpu + cosmic-text) and
+# per-span font-fallback. Apps need both the `gpui` facade and `gpui_platform`
+# (selects gpui_linux/gpui_wgpu on Linux): `Application::new()` became
+# `gpui_platform::application()`. X11 kept on for distribution packaging.
+gpui = { git = "https://github.com/kirushik/zed", rev = "f3f236eb58663cf0e43f866be3d25833918c4452", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/kirushik/zed", rev = "f3f236eb58663cf0e43f866be3d25833918c4452", default-features = false, features = ["wayland", "x11"] }
 
 [profile.dev]
 # gpui is a huge dep tree; keep its codegen optimized even in dev builds
@@ -41,11 +49,3 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
-
-# Workaround for the Wayland scale-change glyph corruption
-# (docs/UPSTREAM-gpui-scale-bug.md): gpui_wgpu vendored with a one-change
-# patch in cosmic_text_system.rs (fresh swash ScaleContext per glyph
-# rasterization). Everything else still comes from the zed git pin above.
-# Remove vendor/gpui_wgpu and this [patch] once fixed upstream.
-[patch."https://github.com/zed-industries/zed"]
-gpui_wgpu = { path = "vendor/gpui_wgpu" }

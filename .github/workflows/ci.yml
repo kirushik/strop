@@ -109,9 +109,8 @@ jobs:
 
   macos:
     # Required (promoted 2026-06-17). gpui selects its Metal backend (gpui_macos)
-    # here; the vendored gpui_wgpu patch is Linux-only, so an "unused patch"
-    # warning is expected. If the launch-smoke flakes on Metal/WindowServer init,
-    # re-add `continue-on-error: true` and drop this from `ci-success.needs`.
+    # here. If the launch-smoke flakes on Metal/WindowServer init, re-add
+    # `continue-on-error: true` and drop this from `ci-success.needs`.
     name: macOS — build + launch smoke
     runs-on: macos-latest
     steps:

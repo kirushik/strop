@@ -7,6 +7,34 @@ versions may still break things).
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-06-19
+
+Windows papercuts and layout-independent shortcuts. Still unsigned, and only
+Linux (Wayland) is runtime-tested.
+
+### Fixed
+- **Windows: no stray console window** — the GUI release no longer opens a
+  black console window beside it.
+- **Windows: one title bar, and it drags** — the app's own title bar is no
+  longer stacked under a native one, and the window drags from it (not only the
+  native strip); the title-bar buttons stay clickable.
+- **Shortcuts work from any focus** — `Ctrl+Shift+P` and the other menu
+  commands now fire while the command palette, a margin-note field, or the AI
+  settings panel is focused — not only when the document has focus. (All
+  platforms.)
+- **Keyboard-layout-independent shortcuts on Windows** — letter chords like
+  `Ctrl+Shift+P` fire under non-Latin layouts (e.g. Cyrillic), matching the
+  existing Linux behaviour.
+- **Open / reveal work off Linux** — "Reveal in Files", opening `config.toml`,
+  and the "Get a key" link use each OS's native handler instead of Linux-only
+  `xdg-open` / `gdbus`.
+
+### Internal
+- gpui patches — the Windows keyboard fix and the Wayland scale-change glyph
+  workaround — are consolidated onto a single zed fork rev. The vendored
+  `gpui_wgpu` crate and its `[patch]` override are removed; `patches/` holds the
+  diffs and the re-sync recipe.
+
 ## [0.1.0] — 2026-06-17
 
 The first rough, early cut. Strop is a writer's editor built on the thesis that
@@ -66,5 +94,6 @@ unverified and unsigned.
 - Configuration via `~/.config/strop/config.toml`.
 - GPL-3.0-or-later. Supply-chain gating (cargo-deny) and three-OS CI.
 
-[Unreleased]: https://github.com/kirushik/strop/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kirushik/strop/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/kirushik/strop/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kirushik/strop/releases/tag/v0.1.0
