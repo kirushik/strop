@@ -412,6 +412,16 @@ pub fn bind_keys(cx: &mut App) {
         // through a field into the document behind it.
         KeyBinding::new("ctrl-v", NotePaste, Some("NoteInput")),
         KeyBinding::new("shift-insert", NotePaste, Some("NoteInput")),
+        // The multi-line note composer: Enter commits (the fast jot gesture),
+        // shift/ctrl-enter add a line break, up/down walk caret rows. The base
+        // chords match NoteInput; the extras are bound below via the helper.
+        KeyBinding::new("enter", NoteCommit, Some("NoteComposer")),
+        KeyBinding::new("escape", NoteCancel, Some("NoteComposer")),
+        KeyBinding::new("backspace", NoteBackspace, Some("NoteComposer")),
+        KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("NoteComposer")),
+        KeyBinding::new("tab", NoteTab, Some("NoteComposer")),
+        KeyBinding::new("ctrl-v", NotePaste, Some("NoteComposer")),
+        KeyBinding::new("shift-insert", NotePaste, Some("NoteComposer")),
         // The palette's query field: same editing actions, plus row motion.
         KeyBinding::new("enter", NoteCommit, Some("PaletteInput")),
         KeyBinding::new("escape", NoteCancel, Some("PaletteInput")),
@@ -440,6 +450,60 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", SettingsDown, Some("SettingsInput")),
         KeyBinding::new("ctrl-enter", SaveAiSettings, Some("SettingsInput")),
     ]);
+    // Universal text-field editing (Kirill's rule — universal gestures stay
+    // universal): caret movement, selection, delete-forward, copy/cut, applied
+    // to EVERY field at once. Palette/Settings keep up/down for list-nav, so
+    // only the multi-line composer gets vertical caret rows + line breaks.
+    for ctx in ["NoteInput", "NoteComposer", "PaletteInput", "SettingsInput"] {
+        cx.bind_keys(field_editing_bindings(ctx));
+    }
+    cx.bind_keys(composer_only_bindings("NoteComposer"));
+}
+
+/// The shared caret-movement / selection / delete / clipboard bindings every
+/// text field honors. `NoteMove { motion, select }` collapses the 16 movement
+/// chords into one action.
+fn field_editing_bindings(ctx: &'static str) -> Vec<KeyBinding> {
+    use Motion::*;
+    let mv = |keys: &str, motion: Motion, select: bool| {
+        KeyBinding::new(keys, NoteMove { motion, select }, Some(ctx))
+    };
+    vec![
+        mv("left", Left, false),
+        mv("shift-left", Left, true),
+        mv("right", Right, false),
+        mv("shift-right", Right, true),
+        mv("ctrl-left", WordLeft, false),
+        mv("ctrl-shift-left", WordLeft, true),
+        mv("ctrl-right", WordRight, false),
+        mv("ctrl-shift-right", WordRight, true),
+        mv("home", LineStart, false),
+        mv("shift-home", LineStart, true),
+        mv("end", LineEnd, false),
+        mv("shift-end", LineEnd, true),
+        mv("ctrl-home", DocStart, false),
+        mv("ctrl-shift-home", DocStart, true),
+        mv("ctrl-end", DocEnd, false),
+        mv("ctrl-shift-end", DocEnd, true),
+        KeyBinding::new("delete", NoteDelete, Some(ctx)),
+        KeyBinding::new("ctrl-delete", NoteDeleteWord, Some(ctx)),
+        KeyBinding::new("ctrl-a", NoteSelectAll, Some(ctx)),
+        KeyBinding::new("ctrl-c", NoteCopy, Some(ctx)),
+        KeyBinding::new("ctrl-x", NoteCut, Some(ctx)),
+    ]
+}
+
+/// Extras only the multi-line composer wants: vertical caret rows and hard
+/// line breaks. (Single-line fields use up/down for list-nav or nothing.)
+fn composer_only_bindings(ctx: &'static str) -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("up", NoteMove { motion: Motion::Up, select: false }, Some(ctx)),
+        KeyBinding::new("shift-up", NoteMove { motion: Motion::Up, select: true }, Some(ctx)),
+        KeyBinding::new("down", NoteMove { motion: Motion::Down, select: false }, Some(ctx)),
+        KeyBinding::new("shift-down", NoteMove { motion: Motion::Down, select: true }, Some(ctx)),
+        KeyBinding::new("shift-enter", NoteNewline, Some(ctx)),
+        KeyBinding::new("ctrl-enter", NoteNewline, Some(ctx)),
+    ]
 }
 
 /// How the writer is engaging the margin right now. There is one keyboard
@@ -715,6 +779,12 @@ enum SelectGranularity {
 pub struct NoteInput {
     focus_handle: FocusHandle,
     content: String,
+    /// Caret byte offset into `content`, always on a char boundary.
+    cursor: usize,
+    /// Selection anchor byte offset; `Some` ⇒ the selection spans
+    /// `anchor`↔`cursor`. Cleared by any non-extending caret move.
+    anchor: Option<usize>,
+    /// IME preedit byte range within `content`, while composing.
     marked: Option<Range<usize>>,
     /// Keymap context: "NoteInput" everywhere except the palette ("up"/
     /// "down" move its selection) and the AI settings panel (tab cycles
@@ -728,6 +798,18 @@ pub struct NoteInput {
     /// lane is ~5 words wide, so a one-line field is miserable to write in.
     /// Every other field (palette, URL, key, rename) stays single-line.
     multiline: bool,
+    /// Geometry of the last paint, for click hit-testing and vertical motion.
+    /// Written by the element each paint, read by the mouse + up/down handlers
+    /// (there is always a paint before the next interaction). Maps over the
+    /// DISPLAY string; caret↔geometry conversions go through char index so a
+    /// masked field (dots ≠ real bytes) still lands the caret correctly.
+    geometry: Option<FieldGeometry>,
+}
+
+/// What the field painted last frame, enough to map a point ↔ a caret index.
+enum FieldGeometry {
+    Single(gpui::ShapedLine),
+    Wrapped(std::sync::Arc<gpui::WrappedLineLayout>),
 }
 
 pub enum NoteInputEvent {
@@ -737,35 +819,116 @@ pub enum NoteInputEvent {
 
 impl gpui::EventEmitter<NoteInputEvent> for NoteInput {}
 
-/// Remove the trailing IME preedit (`marked_len` bytes) from `content`,
-/// snapping the cut down to a char boundary first. The raw
-/// `truncate(len - marked_len)` panics if a manual edit (backspace) left a
-/// stale `marked` length that no longer aligns with a boundary. A no-op on
-/// the common path where the cut already lands on a boundary.
-fn drop_marked_tail(content: &mut String, marked_len: usize) {
-    let mut start = content.len().saturating_sub(marked_len);
-    while start > 0 && !content.is_char_boundary(start) {
-        start -= 1;
+// --- Pure text/caret helpers (unit-tested; no GPUI) ----------------------
+
+/// The char boundary at or before `i-1` (caret one char left). 0 at the start.
+fn prev_boundary(s: &str, i: usize) -> usize {
+    let mut j = i.saturating_sub(1);
+    while j > 0 && !s.is_char_boundary(j) {
+        j -= 1;
     }
-    content.truncate(start);
+    j
+}
+
+/// The char boundary at or after `i+1` (caret one char right). `len` at the end.
+fn next_boundary(s: &str, i: usize) -> usize {
+    let mut j = (i + 1).min(s.len());
+    while j < s.len() && !s.is_char_boundary(j) {
+        j += 1;
+    }
+    j
+}
+
+/// Word-left of byte `i`: skip whitespace, then the word — the trailing-word
+/// rule `backspace_word` already used, now anchored at the caret.
+fn prev_word(s: &str, i: usize) -> usize {
+    let head = s[..i].trim_end_matches(|c: char| c.is_whitespace());
+    head.char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(b, c)| b + c.len_utf8())
+        .unwrap_or(0)
+}
+
+/// Word-right of byte `i`: skip whitespace, then the word, landing after it.
+fn next_word(s: &str, i: usize) -> usize {
+    let tail = &s[i..];
+    let mut it = tail.char_indices().peekable();
+    while let Some(&(_, c)) = it.peek() {
+        if c.is_whitespace() {
+            it.next();
+        } else {
+            break;
+        }
+    }
+    while let Some(&(b, c)) = it.peek() {
+        if c.is_whitespace() {
+            return i + b;
+        }
+        it.next();
+    }
+    s.len()
+}
+
+/// Start of the logical line (after the previous `\n`, or 0).
+fn line_start(s: &str, i: usize) -> usize {
+    s[..i].rfind('\n').map(|b| b + 1).unwrap_or(0)
+}
+
+/// End of the logical line (the next `\n`, or `len`).
+fn line_end(s: &str, i: usize) -> usize {
+    s[i..].find('\n').map(|b| i + b).unwrap_or(s.len())
+}
+
+fn byte_to_utf16(s: &str, byte: usize) -> usize {
+    s[..byte.min(s.len())].chars().map(|c| c.len_utf16()).sum()
+}
+
+fn utf16_to_byte(s: &str, utf16: usize) -> usize {
+    let mut u = 0;
+    for (b, c) in s.char_indices() {
+        if u >= utf16 {
+            return b;
+        }
+        u += c.len_utf16();
+    }
+    s.len()
+}
+
+fn byte_to_char_idx(s: &str, byte: usize) -> usize {
+    s[..byte.min(s.len())].chars().count()
+}
+
+fn char_idx_to_byte(s: &str, ch: usize) -> usize {
+    s.char_indices().nth(ch).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 impl NoteInput {
     fn new(cx: &mut Context<Self>, content: String) -> Self {
+        let cursor = content.len();
         Self {
             focus_handle: cx.focus_handle(),
             content,
+            cursor,
+            anchor: None,
             marked: None,
             key_context: "NoteInput",
             masked: false,
             multiline: false,
+            geometry: None,
         }
     }
 
     /// The in-card note composer: a multi-line, soft-wrapping field. The lane
     /// is only a few words wide, so the body must grow downward as you type.
+    /// Its own key context carries the extras single-line fields don't want:
+    /// up/down caret rows and shift/ctrl-enter line breaks.
     fn note_body(cx: &mut Context<Self>, content: String) -> Self {
-        Self { multiline: true, ..Self::new(cx, content) }
+        Self {
+            multiline: true,
+            key_context: "NoteComposer",
+            ..Self::new(cx, content)
+        }
     }
 
     /// The display string: real content, except a masked field shows dots for
@@ -794,6 +957,171 @@ impl NoteInput {
         }
     }
 
+    /// The selected byte range (`start <= end`), or an empty range at the caret.
+    fn sel_range(&self) -> Range<usize> {
+        match self.anchor {
+            Some(a) if a <= self.cursor => a..self.cursor,
+            Some(a) => self.cursor..a,
+            None => self.cursor..self.cursor,
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.anchor.is_some_and(|a| a != self.cursor)
+    }
+
+    /// Replace `range` (default: the selection) with `text`, leaving the caret
+    /// after it and clearing the selection + any IME mark. The single splice
+    /// point — typing, paste, delete, and IME commit all route here, so every
+    /// edit happens AT THE CARET, never at the end.
+    fn replace(&mut self, range: Range<usize>, text: &str) {
+        self.content.replace_range(range.clone(), text);
+        self.cursor = range.start + text.len();
+        self.anchor = None;
+        self.marked = None;
+    }
+
+    /// Move the caret to byte `target`; `extend` keeps/starts a selection,
+    /// otherwise the selection collapses.
+    fn move_to(&mut self, target: usize, extend: bool) {
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = target.min(self.content.len());
+        if self.anchor == Some(self.cursor) {
+            self.anchor = None;
+        }
+    }
+
+    /// Horizontal / logical caret target for a motion (everything but up/down,
+    /// which need paint geometry and live in `move_vertical`).
+    fn horizontal_target(&self, motion: Motion) -> usize {
+        let s = &self.content;
+        let c = self.cursor;
+        match motion {
+            // Plain left/right; selection-collapse is handled by the caller.
+            Motion::Left => prev_boundary(s, c),
+            Motion::Right => next_boundary(s, c),
+            Motion::WordLeft => prev_word(s, c),
+            Motion::WordRight => next_word(s, c),
+            Motion::LineStart => line_start(s, c),
+            Motion::LineEnd => line_end(s, c),
+            Motion::DocStart => 0,
+            Motion::DocEnd => s.len(),
+            // Vertical motion is routed to `move_vertical`; never reached here.
+            Motion::Up | Motion::Down => c,
+        }
+    }
+
+    /// Dispatch a `NoteMove`: vertical motions need geometry, the rest are pure.
+    fn do_move(&mut self, motion: Motion, extend: bool, cx: &mut Context<Self>) {
+        match motion {
+            Motion::Up => self.move_vertical(false, extend, cx),
+            Motion::Down => self.move_vertical(true, extend, cx),
+            _ => self.apply_motion(motion, extend, cx),
+        }
+    }
+
+    /// Apply a horizontal/logical motion (keyboard arrows, word, home/end).
+    fn apply_motion(&mut self, motion: Motion, extend: bool, cx: &mut Context<Self>) {
+        // A non-extending Left/Right with an active selection collapses to the
+        // selection edge WITHOUT moving past it.
+        let collapsing = !extend
+            && self.has_selection()
+            && matches!(motion, Motion::Left | Motion::Right);
+        let target = if collapsing {
+            match motion {
+                Motion::Left => self.sel_range().start,
+                _ => self.sel_range().end,
+            }
+        } else {
+            self.horizontal_target(motion)
+        };
+        self.move_to(target, extend);
+        cx.notify();
+    }
+
+    /// Vertical caret motion in the multi-line composer: walk one row up/down
+    /// at the current x, via the last paint's wrapped geometry.
+    fn move_vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
+        let line_height = px(CARD_LINE_H);
+        let target = match &self.geometry {
+            Some(FieldGeometry::Wrapped(layout)) => {
+                let disp_byte = self.cursor_display_byte();
+                let here = layout
+                    .position_for_index(disp_byte, line_height)
+                    .unwrap_or_default();
+                let dy = if down { line_height } else { -line_height };
+                let probe = point(here.x, (here.y + dy).max(px(0.)));
+                let disp = layout
+                    .closest_index_for_position(probe, line_height)
+                    .unwrap_or_else(|e| e);
+                self.display_byte_to_cursor(disp)
+            }
+            // Single-line (or no geometry): up→start, down→end.
+            _ => {
+                if down {
+                    self.content.len()
+                } else {
+                    0
+                }
+            }
+        };
+        self.move_to(target, extend);
+        cx.notify();
+    }
+
+    /// A real-content byte offset translated into the DISPLAY string (masked
+    /// fields: dots ≠ real bytes; map through char index, which both share).
+    fn real_to_display_byte(&self, byte: usize) -> usize {
+        if self.masked {
+            let ch = byte_to_char_idx(&self.content, byte);
+            char_idx_to_byte(&self.display_content(), ch)
+        } else {
+            byte
+        }
+    }
+
+    /// The caret, as a byte offset into the DISPLAY string.
+    fn cursor_display_byte(&self) -> usize {
+        self.real_to_display_byte(self.cursor)
+    }
+
+    /// A DISPLAY-string byte offset back to a real-content caret byte.
+    fn display_byte_to_cursor(&self, disp_byte: usize) -> usize {
+        if self.masked {
+            let ch = byte_to_char_idx(&self.display_content(), disp_byte);
+            char_idx_to_byte(&self.content, ch)
+        } else {
+            disp_byte.min(self.content.len())
+        }
+    }
+
+    /// Place the caret from a click at field-local `x`/`y` (the element passes
+    /// the point already relative to the text origin).
+    fn place_caret_at(&mut self, local: Point<Pixels>, extend: bool, cx: &mut Context<Self>) {
+        let disp = match &self.geometry {
+            Some(FieldGeometry::Single(line)) => line.closest_index_for_x(local.x),
+            Some(FieldGeometry::Wrapped(layout)) => layout
+                .closest_index_for_position(local, px(CARD_LINE_H))
+                .unwrap_or_else(|e| e),
+            None => return,
+        };
+        let target = self.display_byte_to_cursor(disp);
+        self.move_to(target, extend);
+        cx.notify();
+    }
+
+    fn select_all(&mut self, _: &NoteSelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.anchor = Some(0);
+        self.cursor = self.content.len();
+        cx.notify();
+    }
+
     fn commit(&mut self, _: &NoteCommit, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(NoteInputEvent::Commit(self.content.clone()));
     }
@@ -802,35 +1130,81 @@ impl NoteInput {
         cx.emit(NoteInputEvent::Cancel);
     }
 
-    fn backspace(&mut self, _: &NoteBackspace, _: &mut Window, cx: &mut Context<Self>) {
-        // A manual edit ends any active IME composition: leaving a stale
-        // `marked` (byte length) behind would make the next preedit truncate
-        // mid-char (panic) or eat committed text. No-op when not composing.
-        self.marked = None;
-        self.content.pop();
+    /// A hard line break (multiline only): Shift+Enter / Ctrl+Enter. Single-line
+    /// fields don't bind it, so Enter there is always commit.
+    fn newline(&mut self, _: &NoteNewline, _: &mut Window, cx: &mut Context<Self>) {
+        self.replace(self.sel_range(), "\n");
         cx.notify();
     }
 
-    /// ctrl-backspace: muscle memory holds in every field (Kirill's rule —
-    /// universal gestures stay universal). Append-only model, so "word
-    /// left of the caret" means the trailing word.
+    fn backspace(&mut self, _: &NoteBackspace, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_selection() {
+            self.replace(self.sel_range(), "");
+        } else {
+            let from = prev_boundary(&self.content, self.cursor);
+            self.replace(from..self.cursor, "");
+        }
+        cx.notify();
+    }
+
+    /// ctrl-backspace: delete the word (or selection) left of the caret.
+    /// Muscle memory holds in every field (Kirill's rule — universal gestures
+    /// stay universal).
     fn backspace_word(&mut self, _: &NoteBackspaceWord, _: &mut Window, cx: &mut Context<Self>) {
-        self.marked = None; // end any composition (see backspace)
-        let trimmed = self.content.trim_end();
-        let cut = trimmed
-            .char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        self.content.truncate(cut);
+        if self.has_selection() {
+            self.replace(self.sel_range(), "");
+        } else {
+            let from = prev_word(&self.content, self.cursor);
+            self.replace(from..self.cursor, "");
+        }
+        cx.notify();
+    }
+
+    /// Delete: the char (or selection) to the RIGHT of the caret.
+    fn delete(&mut self, _: &NoteDelete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_selection() {
+            self.replace(self.sel_range(), "");
+        } else {
+            let to = next_boundary(&self.content, self.cursor);
+            self.replace(self.cursor..to, "");
+        }
+        cx.notify();
+    }
+
+    /// ctrl-delete: the word (or selection) to the right of the caret.
+    fn delete_word(&mut self, _: &NoteDeleteWord, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_selection() {
+            self.replace(self.sel_range(), "");
+        } else {
+            let to = next_word(&self.content, self.cursor);
+            self.replace(self.cursor..to, "");
+        }
+        cx.notify();
+    }
+
+    fn copy(&mut self, _: &NoteCopy, _: &mut Window, cx: &mut Context<Self>) {
+        // Never copy a masked secret out; everything else copies the selection.
+        if self.masked || !self.has_selection() {
+            return;
+        }
+        let text = self.content[self.sel_range()].to_owned();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn cut(&mut self, _: &NoteCut, _: &mut Window, cx: &mut Context<Self>) {
+        if self.masked || !self.has_selection() {
+            return;
+        }
+        let text = self.content[self.sel_range()].to_owned();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.replace(self.sel_range(), "");
         cx.notify();
     }
 
     /// ctrl-v in any field (DESIGN §0.6 law 1): paste lands in the focused
     /// field, never in the document behind it — the API-key field was the
-    /// motivating bug. Fields are single-line, so newlines flatten to
-    /// spaces; masked fields paste normally (masking is display-only).
+    /// motivating bug. Single-line fields flatten newlines to spaces; the
+    /// multi-line composer keeps them. Masked fields paste normally.
     fn paste(&mut self, _: &NotePaste, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx
             .read_from_clipboard()
@@ -839,28 +1213,72 @@ impl NoteInput {
         else {
             return;
         };
-        let text: String = text
-            .replace("\r\n", " ")
-            .replace(['\n', '\r'], " ");
-        // The existing insertion path: same place IME commits land.
+        let text: String = if self.multiline {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.replace("\r\n", " ").replace(['\n', '\r'], " ")
+        };
+        // The shared splice path: inserts at the caret, over the selection.
         self.replace_text_in_range(None, &text, window, cx);
     }
 }
 
 actions!(
     note_input,
-    [NoteCommit, NoteCancel, NoteBackspace, NoteBackspaceWord, NoteTab, NotePaste]
+    [
+        NoteCommit,
+        NoteCancel,
+        NoteNewline,
+        NoteBackspace,
+        NoteBackspaceWord,
+        NoteDelete,
+        NoteDeleteWord,
+        NoteTab,
+        NotePaste,
+        NoteCopy,
+        NoteCut,
+        NoteSelectAll,
+    ]
 );
+
+/// A caret motion. Up/Down go through `move_vertical` (they need the wrapped
+/// paint geometry); the rest are pure (`horizontal_target`).
+#[derive(Clone, Copy, PartialEq)]
+enum Motion {
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    LineStart,
+    LineEnd,
+    DocStart,
+    DocEnd,
+    Up,
+    Down,
+}
+
+/// One action for every caret move: `select` extends the selection (Shift+).
+/// Collapsing 20 keystrokes into one keeps the binding table readable and the
+/// handler a single dispatch.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = note_input, no_json)]
+struct NoteMove {
+    motion: Motion,
+    select: bool,
+}
 
 impl EntityInputHandler for NoteInput {
     fn text_for_range(
         &mut self,
-        _: Range<usize>,
-        _: &mut Option<Range<usize>>,
+        range_utf16: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        Some(self.content.clone())
+        let start = utf16_to_byte(&self.content, range_utf16.start);
+        let end = utf16_to_byte(&self.content, range_utf16.end);
+        *adjusted = Some(byte_to_utf16(&self.content, start)..byte_to_utf16(&self.content, end));
+        Some(self.content[start..end].to_owned())
     }
 
     fn selected_text_range(
@@ -869,15 +1287,18 @@ impl EntityInputHandler for NoteInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let end = self.content.chars().map(|c| c.len_utf16()).sum();
+        let r = self.sel_range();
+        let reversed = self.anchor.is_some_and(|a| a > self.cursor);
         Some(UTF16Selection {
-            range: end..end,
-            reversed: false,
+            range: byte_to_utf16(&self.content, r.start)..byte_to_utf16(&self.content, r.end),
+            reversed,
         })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked.clone()
+        self.marked
+            .as_ref()
+            .map(|m| byte_to_utf16(&self.content, m.start)..byte_to_utf16(&self.content, m.end))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -886,31 +1307,43 @@ impl EntityInputHandler for NoteInput {
 
     fn replace_text_in_range(
         &mut self,
-        _: Option<Range<usize>>,
+        range_utf16: Option<Range<usize>>,
         text: &str,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(m) = self.marked.take() {
-            drop_marked_tail(&mut self.content, m.end - m.start);
-        }
-        self.content.push_str(text);
+        // Range to replace: the OS-supplied one, else the IME preedit, else the
+        // current selection (which is the empty caret when nothing is selected).
+        let range = range_utf16
+            .map(|r| utf16_to_byte(&self.content, r.start)..utf16_to_byte(&self.content, r.end))
+            .or_else(|| self.marked.clone())
+            .unwrap_or_else(|| self.sel_range());
+        self.replace(range, text);
         cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
-        _: Option<Range<usize>>,
+        range_utf16: Option<Range<usize>>,
         text: &str,
-        _: Option<Range<usize>>,
+        new_selected_utf16: Option<Range<usize>>,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(m) = self.marked.take() {
-            drop_marked_tail(&mut self.content, m.end - m.start);
-        }
-        self.marked = Some(0..text.len());
-        self.content.push_str(text);
+        let range = range_utf16
+            .map(|r| utf16_to_byte(&self.content, r.start)..utf16_to_byte(&self.content, r.end))
+            .or_else(|| self.marked.clone())
+            .unwrap_or_else(|| self.sel_range());
+        // Splice the preedit in and keep it marked so the next compose step
+        // replaces it cleanly (no manual tail-truncation — the byte range is
+        // exact, which is what the old append model couldn't guarantee).
+        self.content.replace_range(range.clone(), text);
+        let marked = range.start..range.start + text.len();
+        self.cursor = new_selected_utf16
+            .map(|s| marked.start + utf16_to_byte(text, s.end))
+            .unwrap_or(marked.end);
+        self.anchor = None;
+        self.marked = Some(marked);
         cx.notify();
     }
 
@@ -926,11 +1359,19 @@ impl EntityInputHandler for NoteInput {
 
     fn character_index_for_point(
         &mut self,
-        _: Point<Pixels>,
+        point: Point<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        None
+        let disp = match &self.geometry {
+            Some(FieldGeometry::Single(line)) => line.closest_index_for_x(point.x),
+            Some(FieldGeometry::Wrapped(layout)) => layout
+                .closest_index_for_position(point, px(CARD_LINE_H))
+                .unwrap_or_else(|e| e),
+            None => return None,
+        };
+        let cursor = self.display_byte_to_cursor(disp);
+        Some(byte_to_utf16(&self.content, cursor))
     }
 }
 
@@ -941,9 +1382,19 @@ impl Render for NoteInput {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::backspace_word))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::delete_word))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::select_all))
+            // Every caret move is one action; one handler dispatches them all.
+            .on_action(cx.listener(|this, a: &NoteMove, _, cx| {
+                this.do_move(a.motion, a.select, cx)
+            }))
             .w_full()
             .min_h(px(22.))
             .px(px(6.))
@@ -1098,43 +1549,70 @@ impl Element for NoteInputElement {
         );
         let line_height = window.line_height();
         let focused = focus_handle.is_focused(window);
+        // Caret + selection are read from the field, mapped into the display
+        // string (masked: dots ≠ real bytes).
+        let (cursor_db, sel_db, has_sel) = {
+            let input = self.input.read(cx);
+            let r = input.sel_range();
+            (
+                input.cursor_display_byte(),
+                input.real_to_display_byte(r.start)..input.real_to_display_byte(r.end),
+                input.has_selection(),
+            )
+        };
+        let sel_color = rgba(0xC8A95155); // the active-card gold, translucent
         match layout {
             ComposerLayout::Single(line) => {
                 let Some(line) = line.take() else { return };
-                let cursor_x = line.width;
-                // When the text outgrows the box, scroll it left so the caret
-                // rides the right edge instead of spilling past the card
-                // (Image-1 bug). The parent clips the overflow.
-                let shift = (cursor_x - bounds.size.width + px(2.)).max(px(0.));
+                let caret_x = line.x_for_index(cursor_db);
+                // Scroll so the caret stays in view: shift left when it runs
+                // past the right edge, right when it backs past the left edge.
+                let shift = (caret_x - bounds.size.width + px(2.)).max(px(0.));
                 let origin = point(bounds.origin.x - shift, bounds.origin.y);
+                if has_sel {
+                    let x0 = line.x_for_index(sel_db.start);
+                    let x1 = line.x_for_index(sel_db.end);
+                    window.paint_quad(fill(
+                        Bounds::new(origin + point(x0, px(1.)), size(x1 - x0, line_height - px(2.))),
+                        sel_color,
+                    ));
+                }
                 line.paint(origin, line_height, TextAlign::Left, None, window, cx)
                     .ok();
                 if focused {
                     window.paint_quad(fill(
                         Bounds::new(
-                            origin + point(cursor_x, px(2.)),
+                            origin + point(caret_x, px(2.)),
                             size(px(1.5), line_height - px(4.)),
                         ),
                         rgb(TEXT_COLOR),
                     ));
                 }
+                self.store_geometry(FieldGeometry::Single(line), cx);
+                self.register_mouse(bounds, origin, window);
             }
             ComposerLayout::Wrapped(line) => {
                 let origin = bounds.origin;
-                // The caret sits at the END of the content (append-only model):
-                // ask the wrapped layout where that byte index lands, which is
-                // the right row and x even after the text has wrapped.
-                let caret = line.as_ref().and_then(|l| {
-                    l.position_for_index(l.len(), line_height)
-                });
-                if let Some(line) = line.take() {
-                    line.paint(origin, line_height, TextAlign::Left, None, window, cx)
-                        .ok();
+                let Some(line) = line.take() else {
+                    // Empty field: caret at the box origin, store nothing usable.
+                    if focused {
+                        window.paint_quad(fill(
+                            Bounds::new(origin + point(px(0.), px(2.)), size(px(1.5), line_height - px(4.))),
+                            rgb(TEXT_COLOR),
+                        ));
+                    }
+                    self.register_mouse(bounds, origin, window);
+                    return;
+                };
+                let caret = line
+                    .position_for_index(cursor_db, line_height)
+                    .unwrap_or_default();
+                if has_sel {
+                    paint_wrapped_selection(window, &line, origin, line_height, &sel_db, sel_color);
                 }
+                line.paint(origin, line_height, TextAlign::Left, None, window, cx)
+                    .ok();
                 if focused {
-                    // Empty field (no shaped line, or index 0): caret at the
-                    // box origin, top row.
-                    let caret = caret.unwrap_or_default();
                     window.paint_quad(fill(
                         Bounds::new(
                             origin + caret + point(px(0.), px(2.)),
@@ -1143,8 +1621,69 @@ impl Element for NoteInputElement {
                         rgb(TEXT_COLOR),
                     ));
                 }
+                self.store_geometry(FieldGeometry::Wrapped(std::sync::Arc::clone(&line)), cx);
+                self.register_mouse(bounds, origin, window);
             }
         }
+    }
+}
+
+impl NoteInputElement {
+    fn store_geometry(&self, geom: FieldGeometry, cx: &mut App) {
+        self.input.update(cx, |input, _| input.geometry = Some(geom));
+    }
+
+    /// Click to place the caret. `text_origin` is where glyph x=0 painted (the
+    /// single-line scroll already folded in), so the hit point is field-local.
+    fn register_mouse(
+        &self,
+        bounds: Bounds<Pixels>,
+        text_origin: Point<Pixels>,
+        window: &mut Window,
+    ) {
+        let input = self.input.clone();
+        window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+            if phase != gpui::DispatchPhase::Bubble || !bounds.contains(&ev.position) {
+                return;
+            }
+            let local = ev.position - text_origin;
+            input.update(cx, |input, cx| {
+                window.focus(&input.focus_handle, cx);
+                input.place_caret_at(local, ev.modifiers.shift, cx);
+            });
+        });
+    }
+}
+
+/// Paint the selection highlight across the wrapped rows it spans: one rect per
+/// visual row, from the row's selection start-x to its end-x.
+fn paint_wrapped_selection(
+    window: &mut Window,
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    sel: &Range<usize>,
+    color: gpui::Rgba,
+) {
+    let Some(start) = line.position_for_index(sel.start, line_height) else {
+        return;
+    };
+    let Some(end) = line.position_for_index(sel.end, line_height) else {
+        return;
+    };
+    let mut y = start.y;
+    while y <= end.y {
+        let x0 = if y == start.y { start.x } else { px(0.) };
+        // Each row but the last extends to the field's right edge; the last
+        // stops at the caret end.
+        let x1 = if y == end.y { end.x } else { px(COMPOSER_INNER_W) };
+        if x1 > x0 {
+            window.paint_quad(fill(
+                Bounds::new(origin + point(x0, y + px(1.)), size(x1 - x0, line_height - px(2.))),
+                color,
+            ));
+        }
+        y += line_height;
     }
 }
 
@@ -3257,6 +3796,23 @@ impl Editor {
             },
         )
         .detach();
+        // Click-away commits the rename (the title is a real edit, like the
+        // note composer's body — losing focus should save it, not drop it).
+        // Guarded on the field still being open so an Enter-then-blur, which
+        // already finished, doesn't rename a second time.
+        let handle = input.read(cx).focus_handle.clone();
+        let weak = cx.entity().downgrade();
+        window
+            .on_focus_out(&handle, cx, move |_, window, cx| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.update(cx, |editor, cx| {
+                    if let Some(field) = editor.doc_rename_input.clone() {
+                        let title = field.read(cx).content.clone();
+                        editor.finish_rename(title, window, cx);
+                    }
+                });
+            })
+            .detach();
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.doc_rename_input = Some(input);
@@ -11288,25 +11844,64 @@ mod tests {
         assert_eq!(next_word_boundary(&doc2, 4), len); // blank run -> doc end
     }
 
+    // --- Field caret helpers (the Unicode-boundary logic) ----------------
+    // The append-only field had none of this; these guard the byte arithmetic
+    // that mid-text editing relies on, on multibyte text (the IME panic class).
+
     #[test]
-    fn drop_marked_tail_never_splits_a_char() {
-        // The exact IME panic sequence: a committed multibyte char with a now-
-        // stale marked length left over after a manual backspace.
-        let mut s = String::from("ね"); // 3 bytes
-        drop_marked_tail(&mut s, 2); // pre-fix: truncate(1) panics inside 'ね'
-        assert!(s.is_char_boundary(s.len()));
-        assert_eq!(s, "");
+    fn caret_boundaries_never_split_a_char() {
+        let s = "néж"; // 'n'=1B, 'é'=2B, 'ж'=2B  → byte len 5
+        assert_eq!(prev_boundary(s, 5), 3); // from end, left over 'ж'
+        assert_eq!(prev_boundary(s, 3), 1); // over 'é'
+        assert_eq!(prev_boundary(s, 1), 0);
+        assert_eq!(prev_boundary(s, 0), 0); // saturates at start
+        assert_eq!(next_boundary(s, 0), 1);
+        assert_eq!(next_boundary(s, 1), 3); // over 'é' (skip its mid-byte)
+        assert_eq!(next_boundary(s, 5), 5); // saturates at end
+        // Every boundary the helpers return is a real char boundary.
+        for i in [0, 1, 3, 5] {
+            assert!(s.is_char_boundary(prev_boundary(s, i)));
+            assert!(s.is_char_boundary(next_boundary(s, i)));
+        }
+    }
 
-        // A marked length longer than content saturates to empty, never panics.
-        let mut t = String::from("é");
-        drop_marked_tail(&mut t, 9);
-        assert_eq!(t, "");
+    #[test]
+    fn caret_word_motion_matches_backspace_word() {
+        let s = "hello  wörld";
+        // word-left from the end stops before "wörld".
+        assert_eq!(prev_word(s, s.len()), "hello  ".len());
+        // word-left again clears to the start.
+        assert_eq!(prev_word(s, "hello  ".len()), 0);
+        // word-right from start lands after "hello".
+        assert_eq!(next_word(s, 0), "hello".len());
+        // from inside the gap, word-right lands after "wörld" (= end).
+        assert_eq!(next_word(s, "hello ".len()), s.len());
+    }
 
-        // Common path preserved: committed prefix + a whole preedit; dropping
-        // exactly the preedit length leaves the prefix, the snap is a no-op.
-        let mut u = String::from("Helloねこ");
-        drop_marked_tail(&mut u, "ねこ".len());
-        assert_eq!(u, "Hello");
+    #[test]
+    fn caret_logical_line_bounds() {
+        let s = "ab\ncde\nf";
+        assert_eq!(line_start(s, 5), 3); // inside "cde"
+        assert_eq!(line_end(s, 5), 6); // up to the second '\n'
+        assert_eq!(line_start(s, 1), 0); // first line
+        assert_eq!(line_end(s, 7), s.len()); // last line, no trailing '\n'
+    }
+
+    #[test]
+    fn utf16_and_char_conversions_roundtrip() {
+        // '🜂' (alchemical fire) is 2 UTF-16 units / 4 UTF-8 bytes — the case
+        // that breaks naive index math.
+        let s = "a🜂b";
+        assert_eq!(byte_to_utf16(s, 0), 0);
+        assert_eq!(byte_to_utf16(s, 1), 1);
+        // byte 5 = start of 'b'; before it: 'a' (1) + '🜂' (2 surrogate units) = 3.
+        assert_eq!(byte_to_utf16(s, 5), 3);
+        assert_eq!(utf16_to_byte(s, 1), 1);
+        assert_eq!(utf16_to_byte(s, 3), 5);
+        assert_eq!(utf16_to_byte(s, 99), s.len()); // clamps
+        // Display-mapping uses CHAR index; '🜂' is one char, so byte 5 = char 2.
+        assert_eq!(byte_to_char_idx(s, 5), 2);
+        assert_eq!(char_idx_to_byte(s, 2), 5);
     }
 
     // --- Margin-card interaction FSM (CardFocus) -------------------------
