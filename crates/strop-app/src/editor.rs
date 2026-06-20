@@ -6340,6 +6340,21 @@ impl Editor {
             .find(|f| f.read(cx).focus_handle.is_focused(window));
         let focused = focused_field.map_or("Editor", |f| f.read(cx).key_context);
         let focused_input_text = focused_field.map(|f| f.read(cx).content.clone());
+        // The focused field's caret + selection as CHAR indices, so the smoke
+        // rig can assert mouse/keyboard selection behavior (not just eyeball it).
+        let (field_cursor, field_sel) = focused_field
+            .map(|f| {
+                let n = f.read(cx);
+                let r = n.sel_range();
+                (
+                    Some(byte_to_char_idx(&n.content, n.cursor)),
+                    Some([
+                        byte_to_char_idx(&n.content, r.start),
+                        byte_to_char_idx(&n.content, r.end),
+                    ]),
+                )
+            })
+            .unwrap_or((None, None));
         let doc_hash = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -6353,6 +6368,8 @@ impl Editor {
             "doc_chars": self.doc.rope().len_chars(),
             "doc_hash": doc_hash,
             "focused_input_text": focused_input_text,
+            "field_cursor": field_cursor,
+            "field_sel": field_sel,
         })
         .to_string()
     }
