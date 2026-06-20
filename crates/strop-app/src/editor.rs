@@ -555,6 +555,13 @@ pub struct Editor {
     pub voice_baseline: Option<strop_core::voice::Baseline>,
     /// In-card composer for the active note's body.
     note_input: Option<Entity<NoteInput>>,
+    /// The note id `note_input` is editing. The draft sync writes ONLY here —
+    /// never to whatever is merely `active_note`. Clicking an AI card (or
+    /// another note's anchor) changes the active card but must not redirect the
+    /// open composer onto it; doing so leaked the note's live text onto every
+    /// clicked AI card and persisted it. Set and cleared together with
+    /// `note_input` (invariant: both Some or both None).
+    composing_note: Option<u64>,
     /// Narrow-window notes drawer (DESIGN §narrow-margin): below ~932px even
     /// a left-shifted column can't host the 248px lane, so the cards would
     /// vanish. Instead a top-right pill shows the count (never silent) and
@@ -1214,6 +1221,7 @@ impl Editor {
             alt_input: None,
             voice_baseline: None,
             note_input: None,
+            composing_note: None,
             card_heights: HashMap::new(),
             active_card_height: None,
             narrow_notes_open: false,
@@ -1309,7 +1317,11 @@ impl Editor {
     /// flag) while the body is unchanged, so an idle composer doesn't force a
     /// save every tick; undo boundaries stay on the Enter-commit path.
     fn sync_active_note_draft(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.active_note else { return };
+        // Mirror the live composer onto the note IT edits (`composing_note`),
+        // never onto whatever is merely `active_note` — clicking an AI card or
+        // another note's anchor changes the active card, and the draft must not
+        // follow it there (that leaked the note's text onto AI cards, persisted).
+        let Some(id) = self.composing_note else { return };
         let Some(input) = self.note_input.as_ref() else {
             return;
         };
@@ -2065,6 +2077,7 @@ impl Editor {
                     NoteInputEvent::Cancel => {}
                 }
                 editor.note_input = None;
+                editor.composing_note = None;
                 // Focus returns to the text — the composer's handle is gone.
                 window.focus(&editor.focus_handle, cx);
                 cx.notify();
@@ -2074,6 +2087,7 @@ impl Editor {
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.note_input = Some(input);
+        self.composing_note = Some(id);
     }
 
     fn set_note_status(&mut self, id: u64, status: NoteStatus, cx: &mut Context<Self>) {
@@ -2081,6 +2095,7 @@ impl Editor {
         if self.active_note == Some(id) {
             self.active_note = None;
             self.note_input = None;
+            self.composing_note = None;
         }
         self.mark_dirty();
         self.bump_activity();
@@ -9811,7 +9826,13 @@ impl Editor {
                         unverified,
                         ..
                     } = card;
-                    let composer = if active { self.note_input.clone() } else { None };
+                    // The composer renders only on the note it is actually
+                    // editing (composing_note) — never on a clicked AI card.
+                    let composer = if self.composing_note == Some(id) {
+                        self.note_input.clone()
+                    } else {
+                        None
+                    };
                     let is_diagnosis = kind == NoteKind::Diagnosis;
                     let label = note_card_label(is_diagnosis, &level, orphaned);
                     div()

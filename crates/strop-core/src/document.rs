@@ -412,7 +412,13 @@ impl Annotations {
 
     pub fn set_body(&mut self, id: u64, body: String) {
         if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
-            n.body = body;
+            // Only the writer's own notes are editable. A diagnosis body is
+            // fixed (AI cards are read-only review queries), so the composer /
+            // draft path can NEVER overwrite one — the corruption where a
+            // note's live draft leaked onto every clicked AI card and persisted.
+            if n.kind == NoteKind::Note {
+                n.body = body;
+            }
         }
     }
 
@@ -964,6 +970,37 @@ mod tests {
         anns.apply_op(&op(15, 0, "y"));
         assert!(anns.get(diag).unwrap().unverified, "in-span edit greys the diagnosis");
         assert!(!anns.get(note).unwrap().unverified, "writer notes never grey");
+    }
+
+    #[test]
+    fn composer_body_path_never_mutates_a_diagnosis() {
+        let mk = |kind: NoteKind, body: &str| Annotation {
+            id: 0,
+            range: 0..1,
+            body: body.into(),
+            status: NoteStatus::Open,
+            created_unix: 0,
+            kind,
+            title: "t".into(),
+            level: "line".into(),
+            orphaned: false,
+            pass_id: 0,
+            unverified: false,
+        };
+        let mut anns = Annotations::default();
+        let note = anns.push(mk(NoteKind::Note, "mine"));
+        let diag = anns.push(mk(NoteKind::Diagnosis, "the AI's query"));
+
+        // The composer/draft path edits a writer note...
+        anns.set_body(note, "edited".into());
+        assert_eq!(anns.get(note).unwrap().body, "edited");
+        // ...but can never overwrite a diagnosis body (the leak class).
+        anns.set_body(diag, "leaked draft".into());
+        assert_eq!(
+            anns.get(diag).unwrap().body,
+            "the AI's query",
+            "a diagnosis body must be immutable to the composer path"
+        );
     }
 
     fn strong(range: Range<usize>) -> Span {
