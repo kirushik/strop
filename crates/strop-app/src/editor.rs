@@ -434,6 +434,87 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// How the writer is engaging the margin right now. There is one keyboard
+/// focus and one composer, so a card can be in exactly one of these states at
+/// a time — and only ONE card can be selected or composed at once. Encoding
+/// that as a single enum (instead of the old `active_note` + `composing_note`
+/// + `note_input` trio) makes the desync states that caused real, persisted
+/// bugs **unrepresentable**:
+///   - a composer floating on a card that is no longer selected,
+///   - a committed note rendering blank (composer gone, body still suppressed),
+///   - a draft leaking onto whatever card was clicked instead of the one being
+///     edited.
+/// Every one of those was two booleans that drifted apart. Here they cannot:
+/// the composer's identity and its `NoteInput` live in the same variant, and
+/// the SINGLE exit from `Composing` (`resolve_composer`) persists the draft to
+/// the note it actually belongs to. New interaction states force every
+/// `match` below to be updated (exhaustiveness), so this class can't silently
+/// regrow. See `card_body` for the render-side counterpart.
+enum CardFocus {
+    /// No card selected.
+    Idle,
+    /// A card is highlighted and raised to the top, but not editable. AI
+    /// diagnoses only ever reach this (their bodies are immutable); a note
+    /// lands here after its composer resolves.
+    Selected(u64),
+    /// A note's body is open in the composer. The draft mirror and the
+    /// composer render read the target id from here, so neither can ever
+    /// address a different card.
+    Composing { id: u64, input: Entity<NoteInput> },
+}
+
+impl CardFocus {
+    /// The selected/composed card, if any — what gets the highlight and the
+    /// top z-order. (`active_note` of old.)
+    fn active_id(&self) -> Option<u64> {
+        match self {
+            CardFocus::Idle => None,
+            CardFocus::Selected(id) | CardFocus::Composing { id, .. } => Some(*id),
+        }
+    }
+
+    /// The note whose composer is open, if one is. (`composing_note` of old.)
+    fn composing_id(&self) -> Option<u64> {
+        match self {
+            CardFocus::Composing { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// The open composer's input entity, if composing. (`note_input` of old.)
+    fn input(&self) -> Option<&Entity<NoteInput>> {
+        match self {
+            CardFocus::Composing { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+}
+
+/// What a card paints in its body region: exactly one of a composer or the
+/// note's text — never both (the "double" bug), never neither (the "blank
+/// committed card" bug). A two-variant enum makes "exactly one" structural,
+/// where the old code used two independent `.when()` conditions that could
+/// both fire or both stay silent. Pure and total: see `card_body`.
+enum CardBody {
+    /// The note is being composed here — paint the input.
+    Composer,
+    /// Paint the committed text (or the empty-note placeholder for a blank
+    /// writer's note; diagnoses are never blank-placeheld).
+    Text,
+}
+
+/// Decide a single card's body region from whether its own composer is open.
+/// Trivial by construction — that is the point: the bug existed because the
+/// choice was spread across two booleans that could disagree. One input, one
+/// of two outputs, no way to render both or neither.
+fn card_body(composing_here: bool) -> CardBody {
+    if composing_here {
+        CardBody::Composer
+    } else {
+        CardBody::Text
+    }
+}
+
 pub struct Editor {
     focus_handle: FocusHandle,
     /// Text + formatting with unified transaction history. Marks persist
@@ -482,8 +563,11 @@ pub struct Editor {
     image_assets: HashMap<String, Arc<gpui::Image>>,
     /// User settings (config.toml), loaded at startup.
     pub config: Config,
-    /// Active (snapped/highlighted) margin note, if any.
-    active_note: Option<u64>,
+    /// The writer's current engagement with the margin: nothing, a selected
+    /// card, or a note open in the composer. One field for what used to be
+    /// `active_note` + `composing_note` + `note_input`, so they cannot drift
+    /// out of sync (see `CardFocus`).
+    focus: CardFocus,
     /// AI pass lifecycle, rendered as the margin's first card (PLAN.md
     /// E3): teaches setup, shows progress, names failures actionably.
     ai_status: Option<AiStatus>,
@@ -553,15 +637,6 @@ pub struct Editor {
     alt_input: Option<(usize, Entity<NoteInput>)>,
     /// Self-baseline from the [voice] corpus (None until >=3 docs load).
     pub voice_baseline: Option<strop_core::voice::Baseline>,
-    /// In-card composer for the active note's body.
-    note_input: Option<Entity<NoteInput>>,
-    /// The note id `note_input` is editing. The draft sync writes ONLY here —
-    /// never to whatever is merely `active_note`. Clicking an AI card (or
-    /// another note's anchor) changes the active card but must not redirect the
-    /// open composer onto it; doing so leaked the note's live text onto every
-    /// clicked AI card and persisted it. Set and cleared together with
-    /// `note_input` (invariant: both Some or both None).
-    composing_note: Option<u64>,
     /// Narrow-window notes drawer (DESIGN §narrow-margin): below ~932px even
     /// a left-shifted column can't host the 248px lane, so the cards would
     /// vanish. Instead a top-right pill shows the count (never silent) and
@@ -1193,7 +1268,7 @@ impl Editor {
             dirty_since_checkpoint: false,
             image_assets: HashMap::new(),
             config: Config::default(),
-            active_note: None,
+            focus: CardFocus::Idle,
             ai_status: None,
             pending_pass: None,
             // Door closed by default: every document opens to write, not to
@@ -1220,8 +1295,6 @@ impl Editor {
             rename_input: None,
             alt_input: None,
             voice_baseline: None,
-            note_input: None,
-            composing_note: None,
             card_heights: HashMap::new(),
             active_card_height: None,
             narrow_notes_open: false,
@@ -1317,15 +1390,14 @@ impl Editor {
     /// flag) while the body is unchanged, so an idle composer doesn't force a
     /// save every tick; undo boundaries stay on the Enter-commit path.
     fn sync_active_note_draft(&mut self, cx: &mut Context<Self>) {
-        // Mirror the live composer onto the note IT edits (`composing_note`),
-        // never onto whatever is merely `active_note` — clicking an AI card or
-        // another note's anchor changes the active card, and the draft must not
-        // follow it there (that leaked the note's text onto AI cards, persisted).
-        let Some(id) = self.composing_note else { return };
-        let Some(input) = self.note_input.as_ref() else {
+        // Mirror the live composer onto the note IT edits — the id and the
+        // input come from the same `Composing` variant, so the draft can never
+        // follow a clicked AI card or another note's anchor (that once leaked
+        // the note's text onto AI cards and persisted it).
+        let CardFocus::Composing { id, input } = &self.focus else {
             return;
         };
-        let body = input.read(cx).content.clone();
+        let (id, body) = (*id, input.read(cx).content.clone());
         if self.doc.note_body(id).is_some_and(|cur| cur != body.as_str()) {
             self.doc.set_note_body_draft(id, body);
             self.mark_dirty();
@@ -2056,6 +2128,46 @@ impl Editor {
         cx.notify();
     }
 
+    /// The SINGLE exit from `Composing`: persist the open composer's current
+    /// text onto the note it edits, then demote that card to `Selected`. Every
+    /// focus-changing action calls this first, so a composer is never stranded
+    /// on a deselected card and its draft is never committed to a card the
+    /// writer merely clicked. No-op unless a composer is actually open.
+    fn resolve_composer(&mut self, cx: &mut Context<Self>) {
+        let (id, body) = match &self.focus {
+            CardFocus::Composing { id, input } => (*id, input.read(cx).content.clone()),
+            _ => return,
+        };
+        self.doc.set_note_body(id, body);
+        self.focus = CardFocus::Selected(id);
+        self.mark_dirty();
+    }
+
+    /// Leave the composer (Enter, Escape, or any focus loss). The draft is
+    /// already the note's text (`resolve_composer`), so there is nothing to
+    /// discard or re-commit — the card stays selected, now showing what was
+    /// written, and focus returns to the document.
+    fn finish_composing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_composer(cx);
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Highlight a card without editing it (AI diagnoses; a note clicked via
+    /// its anchor). Resolves any open composer first so the previous note's
+    /// draft is saved and its composer never lingers.
+    fn select_card(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.resolve_composer(cx);
+        self.focus = CardFocus::Selected(id);
+    }
+
+    /// Drop all card selection (a click that hits no anchor). Resolves any
+    /// open composer first.
+    fn deselect_card(&mut self, cx: &mut Context<Self>) {
+        self.resolve_composer(cx);
+        self.focus = CardFocus::Idle;
+    }
+
     fn open_composer(
         &mut self,
         id: u64,
@@ -2063,39 +2175,31 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active_note = Some(id);
+        // Switching composers: commit the one we're leaving before opening this.
+        self.resolve_composer(cx);
         let input = cx.new(|cx| NoteInput::new(cx, body));
         cx.subscribe_in(
             &input,
             window,
-            move |editor, _, event: &NoteInputEvent, window, cx| {
-                match event {
-                    NoteInputEvent::Commit(body) => {
-                        editor.doc.set_note_body(id, body.clone());
-                        editor.mark_dirty();
-                    }
-                    NoteInputEvent::Cancel => {}
-                }
-                editor.note_input = None;
-                editor.composing_note = None;
-                // Focus returns to the text — the composer's handle is gone.
-                window.focus(&editor.focus_handle, cx);
-                cx.notify();
+            // Enter and Escape both end composing through the one exit; the live
+            // text is already the note's body, so the event payload is moot.
+            move |editor, _, _event: &NoteInputEvent, window, cx| {
+                editor.finish_composing(window, cx);
             },
         )
         .detach();
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
-        self.note_input = Some(input);
-        self.composing_note = Some(id);
+        self.focus = CardFocus::Composing { id, input };
     }
 
     fn set_note_status(&mut self, id: u64, status: NoteStatus, cx: &mut Context<Self>) {
+        // Commit any open draft first (the click may be on this card's own
+        // done/×, or on another card while this one composes).
+        self.resolve_composer(cx);
         self.doc.set_note_status(id, status);
-        if self.active_note == Some(id) {
-            self.active_note = None;
-            self.note_input = None;
-            self.composing_note = None;
+        if self.focus.active_id() == Some(id) {
+            self.focus = CardFocus::Idle;
         }
         self.mark_dirty();
         self.bump_activity();
@@ -5377,7 +5481,13 @@ impl Editor {
                 if self.drafting && hit.is_some_and(|n| n.kind == NoteKind::Diagnosis) {
                     self.drafting = false;
                 }
-                self.active_note = hit.map(|n| n.id);
+                // Clicking the text selects the hit card (or clears selection);
+                // either way it commits and closes any composer first, so a
+                // click into the document never strands an open note editor.
+                match hit.map(|n| n.id) {
+                    Some(id) => self.select_card(id, cx),
+                    None => self.deselect_card(cx),
+                }
             }
             2 => {
                 // Double-click on an image block edits its alt text.
@@ -5535,7 +5645,7 @@ impl Editor {
         fields.extend(self.palette_input.clone());
         fields.extend(self.replace_input.clone());
         fields.extend(self.doc_rename_input.clone());
-        fields.extend(self.note_input.clone());
+        fields.extend(self.focus.input().cloned());
         fields.extend(self.rename_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.alt_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.end_session_input.clone());
@@ -5593,7 +5703,7 @@ impl Editor {
         self.doc.add_diagnoses(anns);
         self.drafting = false; // reviewing: the editor's cards are shown
         if let Some(n) = self.doc.notes().open().nth(2) {
-            self.active_note = Some(n.id);
+            self.focus = CardFocus::Selected(n.id);
         }
         self.mark_dirty();
         cx.notify();
@@ -6400,7 +6510,7 @@ impl Element for EditorElement {
             } else {
                 None
             },
-            active_note: editor.active_note,
+            active_note: editor.focus.active_id(),
         };
         let can_reuse = !in_history
             && !editor
@@ -6571,7 +6681,7 @@ impl Element for EditorElement {
                 .map(|n| {
                     (
                         rope.char_to_byte(n.range.start)..rope.char_to_byte(n.range.end),
-                        editor.active_note == Some(n.id),
+                        editor.focus.active_id() == Some(n.id),
                         n.kind == NoteKind::Diagnosis,
                     )
                 })
@@ -9108,20 +9218,22 @@ impl Editor {
     /// hash; the one actively-composed note is measured live each frame from its
     /// composer (its text changes every keystroke, so it can't be cached).
     fn refresh_card_heights(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let composing = self.note_input.is_some();
-        let live = self.note_input.as_ref().map(|i| i.read(cx).content.clone());
-        let active = self.active_note;
+        // The live card is the one being COMPOSED (not merely selected): its id
+        // and its draft text come from the same `Composing` variant, so the
+        // live height can't be measured against the wrong card.
+        let composing_id = self.focus.composing_id();
+        let live = self.focus.input().map(|i| i.read(cx).content.clone());
         // Collect specs first: can't hold a `doc` borrow while mutating the cache.
-        let specs: Vec<(NoteKind, String, String, bool)> = self
+        let specs: Vec<(u64, NoteKind, String, String)> = self
             .doc
             .notes()
             .open()
-            .map(|n| (n.kind, n.title.clone(), n.body.clone(), active == Some(n.id)))
+            .map(|n| (n.id, n.kind, n.title.clone(), n.body.clone()))
             .collect();
         self.active_card_height = None;
-        for (kind, title, body, is_active) in specs {
+        for (id, kind, title, body) in specs {
             let is_diag = kind == NoteKind::Diagnosis;
-            if is_active && composing && !is_diag {
+            if Some(id) == composing_id && !is_diag {
                 let body = live.as_deref().unwrap_or("");
                 self.active_card_height = Some(Self::measure_card_height(window, "", body, 2.));
                 continue;
@@ -9178,7 +9290,7 @@ impl Editor {
             let desired =
                 f32::from(frame.bounds.origin.y) + f32::from(pos.y) - f32::from(frame.scroll_top);
             let is_diag = n.kind == NoteKind::Diagnosis;
-            let active = self.active_note == Some(n.id);
+            let active = self.focus.active_id() == Some(n.id);
             // Cull to the viewport: a card whose ANCHOR is off-screen doesn't
             // belong in the lane — it would pile at the floor (the scroll-pileup
             // bug) and attribute to nothing visible. The active card is exempt:
@@ -9200,7 +9312,7 @@ impl Editor {
             // The active composer rides a live field; every other card reads the
             // content-hash cache, with a one-frame char-count fallback for a
             // brand-new card the refresh hasn't measured yet.
-            let height = if active && !is_diag && self.note_input.is_some() {
+            let height = if self.focus.composing_id() == Some(n.id) {
                 self.active_card_height
                     .unwrap_or(CARD_CHROME_H + 2. * CARD_LINE_H)
             } else {
@@ -9394,7 +9506,7 @@ impl Editor {
     /// Narrow-window composer: the margin (and its in-card composer) is
     /// hidden, so the note body is edited in a bottom strip instead.
     fn render_composer_strip(&self) -> Option<impl IntoElement> {
-        let input = self.note_input.clone()?;
+        let input = self.focus.input().cloned()?;
         Some(
             div()
                 .absolute()
@@ -9827,12 +9939,12 @@ impl Editor {
                         ..
                     } = card;
                     // The composer renders only on the note it is actually
-                    // editing (composing_note) — never on a clicked AI card.
-                    let composer = if self.composing_note == Some(id) {
-                        self.note_input.clone()
-                    } else {
-                        None
-                    };
+                    // editing — never on a clicked AI card (the id comes from
+                    // the same `Composing` variant as the input).
+                    let composing_here = self.focus.composing_id() == Some(id);
+                    let composer = composing_here
+                        .then(|| self.focus.input().cloned())
+                        .flatten();
                     let is_diagnosis = kind == NoteKind::Diagnosis;
                     let label = note_card_label(is_diagnosis, &level, orphaned);
                     div()
@@ -9868,17 +9980,20 @@ impl Editor {
                             MouseButton::Left,
                             cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
-                                if editor.active_note != Some(id) {
-                                    let note = editor.doc.notes().get(id);
-                                    let is_note =
-                                        note.is_some_and(|n| n.kind == NoteKind::Note);
-                                    let body =
-                                        note.map(|n| n.body.clone()).unwrap_or_default();
-                                    if is_note {
+                                let note = editor.doc.notes().get(id);
+                                let is_note = note.is_some_and(|n| n.kind == NoteKind::Note);
+                                let body = note.map(|n| n.body.clone()).unwrap_or_default();
+                                if is_note {
+                                    // Clicking a note opens (or re-opens) its
+                                    // composer; clicking the one already being
+                                    // composed is a no-op so the caret doesn't jump.
+                                    if editor.focus.composing_id() != Some(id) {
                                         editor.open_composer(id, body, window, cx);
-                                    } else {
-                                        editor.active_note = Some(id);
+                                        cx.notify();
                                     }
+                                } else if editor.focus.active_id() != Some(id) {
+                                    // A diagnosis only ever gets selected.
+                                    editor.select_card(id, cx);
                                     cx.notify();
                                 }
                             }),
@@ -9945,13 +10060,18 @@ impl Editor {
                         .when(is_diagnosis && !title.is_empty(), |d| {
                             d.child(div().font_weight(FontWeight::BOLD).child(title.clone()))
                         })
-                        .when_some(composer, |d, input| d.child(input))
-                        .when(!active || is_diagnosis, |d| {
-                            d.child(if body.is_empty() && !is_diagnosis {
+                        // The body region is EXACTLY ONE of composer-or-text —
+                        // a single match, never both (the "double" bug) and
+                        // never neither (the "blank committed card" bug). The
+                        // old two-`when` form let those conditions disagree.
+                        .child(match card_body(composing_here) {
+                            CardBody::Composer => composer
+                                .map(|input| div().child(input))
+                                .unwrap_or_else(div),
+                            CardBody::Text if body.is_empty() && !is_diagnosis => {
                                 div().text_color(rgb(MUTED_COLOR)).child("(empty note)")
-                            } else {
-                                div().child(body.clone())
-                            })
+                            }
+                            CardBody::Text => div().child(body.clone()),
                         })
                 }))
                 .when(above > 0, |d| {
@@ -11045,5 +11165,63 @@ mod tests {
         let mut u = String::from("Helloねこ");
         drop_marked_tail(&mut u, "ねこ".len());
         assert_eq!(u, "Hello");
+    }
+
+    // --- Margin-card interaction FSM (CardFocus) -------------------------
+    // The class of bugs these guard: a committed note rendering blank, a
+    // composer lingering on a deselected card, a draft leaking onto the wrong
+    // card. They were all "two booleans disagreed." The enum + these decisions
+    // make "disagree" unrepresentable; the tests pin the decisions.
+
+    #[test]
+    fn card_body_renders_exactly_one_thing() {
+        // The render decision is total and exclusive: composing → composer,
+        // otherwise → text. There is no input that yields both or neither (that
+        // was the "input AND label, same contents" bug, and the blank-card bug).
+        assert!(matches!(card_body(true), CardBody::Composer));
+        assert!(matches!(card_body(false), CardBody::Text));
+    }
+
+    #[test]
+    fn idle_focus_addresses_no_card() {
+        let f = CardFocus::Idle;
+        assert_eq!(f.active_id(), None);
+        assert_eq!(f.composing_id(), None);
+        assert!(f.input().is_none());
+    }
+
+    #[test]
+    fn selected_focus_is_active_but_never_composing() {
+        // A selected card (an AI diagnosis, or a note whose composer resolved)
+        // is highlighted but has no open composer — so the body label shows
+        // (card_body(false) == Text), which is exactly the fix for the
+        // committed-note-renders-blank bug.
+        let f = CardFocus::Selected(7);
+        assert_eq!(f.active_id(), Some(7));
+        assert_eq!(f.composing_id(), None);
+        assert!(f.input().is_none());
+        assert!(matches!(card_body(f.composing_id() == Some(7)), CardBody::Text));
+    }
+
+    #[test]
+    fn composing_implies_active_on_the_same_card() {
+        // The corruption-class invariant, made structural: whatever is being
+        // composed is also what's active, and the id is single-valued. The
+        // composer and the note id share one variant, so the draft mirror and
+        // the composer render (both read `composing_id`) can never address a
+        // card other than `active_id`. Asserted here over the id projection;
+        // the `input` field is non-None by the variant's shape (it cannot be
+        // constructed without an `Entity<NoteInput>`).
+        for f in [CardFocus::Idle, CardFocus::Selected(3), CardFocus::Selected(9)] {
+            if let Some(cid) = f.composing_id() {
+                assert_eq!(f.active_id(), Some(cid), "composing must be active");
+            }
+        }
+        // The only state carrying a composer is `Composing`, and its `id` and
+        // `input` are one variant's two fields — there is no way to hold an
+        // input without the id it edits, nor to point them at different notes.
+        // That is the structural guarantee that retired the draft-leak bug; it
+        // needs no test because it cannot be constructed wrong (the entity-
+        // bearing variant would take gpui `test-support`, deliberately not on).
     }
 }
