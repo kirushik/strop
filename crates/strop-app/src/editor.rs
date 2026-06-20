@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
+    AnyView, App, AvailableSpace, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
     Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
@@ -49,6 +49,14 @@ const MARGIN_GAP: f32 = 16.;
 const CARD_LINE_H: f32 = 18.;
 const CARD_CHROME_H: f32 = 36.; // vertical padding (16) + border (2) + header row (18)
 const CARD_INNER_W: f32 = MARGIN_WIDTH - 8. - 16.; // card width (MARGIN_WIDTH−8) − p(8) both sides
+/// The composer's text wraps slightly narrower than committed body text: the
+/// in-card input box adds its own horizontal padding (6 each side) + border
+/// (1 each side). Measuring the live card at this width keeps the reserved
+/// extent equal to what the wrapped composer actually paints (no clipping, no
+/// overlap with the next card).
+const COMPOSER_INNER_W: f32 = CARD_INNER_W - 14.;
+/// The composer box's own vertical chrome: py(2) top+bottom + border(1) both.
+const COMPOSER_BOX_CHROME: f32 = 6.;
 /// Band kept around the viewport when culling cards to it: a card whose anchor
 /// sits within this many px of a visible edge still renders.
 const CARD_OVERSCAN: f32 = 120.;
@@ -715,6 +723,11 @@ pub struct NoteInput {
     /// Secret-field display: dots except the last 4 chars (the API key).
     /// The real content is untouched — typing and paste work normally.
     masked: bool,
+    /// Soft-wrap the text across multiple rows, growing downward, instead of
+    /// the single-line scroll. Only the in-card note composer sets this: its
+    /// lane is ~5 words wide, so a one-line field is miserable to write in.
+    /// Every other field (palette, URL, key, rename) stays single-line.
+    multiline: bool,
 }
 
 pub enum NoteInputEvent {
@@ -745,6 +758,29 @@ impl NoteInput {
             marked: None,
             key_context: "NoteInput",
             masked: false,
+            multiline: false,
+        }
+    }
+
+    /// The in-card note composer: a multi-line, soft-wrapping field. The lane
+    /// is only a few words wide, so the body must grow downward as you type.
+    fn note_body(cx: &mut Context<Self>, content: String) -> Self {
+        Self { multiline: true, ..Self::new(cx, content) }
+    }
+
+    /// The display string: real content, except a masked field shows dots for
+    /// all but the last 4 chars. Shared by measurement and paint so they agree.
+    fn display_content(&self) -> String {
+        if self.masked {
+            let chars: Vec<char> = self.content.chars().collect();
+            let visible_from = chars.len().saturating_sub(4);
+            chars
+                .iter()
+                .enumerate()
+                .map(|(i, c)| if i < visible_from { '•' } else { *c })
+                .collect()
+        } else {
+            self.content.clone()
         }
     }
 
@@ -918,9 +954,10 @@ impl Render for NoteInput {
             .border_color(rgb(RULE_COLOR))
             .text_size(px(13.))
             .text_color(rgb(TEXT_COLOR))
-            // Single-line field: clip rather than let a long line escape the
-            // box; the element below scrolls itself to keep the caret in view.
-            .overflow_hidden()
+            // Single-line fields clip and the element scrolls itself to keep
+            // the caret in view; the multi-line note composer wraps and grows
+            // instead, so it must NOT clip.
+            .when(!self.multiline, |d| d.overflow_hidden())
             .child(NoteInputElement { input: cx.entity() })
     }
 }
@@ -944,9 +981,16 @@ impl IntoElement for NoteInputElement {
     }
 }
 
+/// What `prepaint` shaped for `paint`: a single horizontally-scrolled line, or
+/// a soft-wrapped block that paints across rows (the note composer).
+enum ComposerLayout {
+    Single(Option<gpui::ShapedLine>),
+    Wrapped(Option<WrappedLine>),
+}
+
 impl Element for NoteInputElement {
     type RequestLayoutState = ();
-    type PrepaintState = Option<gpui::ShapedLine>;
+    type PrepaintState = ComposerLayout;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -966,34 +1010,40 @@ impl Element for NoteInputElement {
         let _guard = DrawGuard::enter();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
-        (window.request_layout(style, [], cx), ())
+        if self.input.read(cx).multiline {
+            // Grow with the wrapped text: measure its height at the field's
+            // available width each layout pass.
+            let input = self.input.clone();
+            let line_height = window.line_height();
+            let id = window.request_measured_layout(style, move |known, available, window, cx| {
+                let content = input.read(cx).display_content();
+                let width = known.width.unwrap_or(match available.width {
+                    AvailableSpace::Definite(w) => w,
+                    _ => px(COMPOSER_INNER_W),
+                });
+                let height = composer_wrapped_height(window, &content, width, line_height);
+                size(width, height)
+            });
+            (id, ())
+        } else {
+            style.size.height = window.line_height().into();
+            (window.request_layout(style, [], cx), ())
+        }
     }
 
     fn prepaint(
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
         let _guard = DrawGuard::enter();
         let input = self.input.read(cx);
-        let content = if input.masked {
-            // Dots except the last 4 chars — enough to recognize which key
-            // this is without ever showing it whole (DESIGN §2-ai).
-            let chars: Vec<char> = input.content.chars().collect();
-            let visible_from = chars.len().saturating_sub(4);
-            chars
-                .iter()
-                .enumerate()
-                .map(|(i, c)| if i < visible_from { '•' } else { *c })
-                .collect()
-        } else {
-            input.content.clone()
-        };
+        let multiline = input.multiline;
+        let content = input.display_content();
         let style = window.text_style();
         let run = TextRun {
             len: content.len(),
@@ -1003,12 +1053,30 @@ impl Element for NoteInputElement {
             underline: None,
             strikethrough: None,
         };
-        Some(window.text_system().shape_line(
-            SharedString::from(content),
-            style.font_size.to_pixels(window.rem_size()),
-            &[run],
-            None,
-        ))
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        if multiline {
+            // Soft-wrap at the box width; the composer flattens newlines to
+            // spaces, so this is one WrappedLine that paints across rows.
+            let line = window
+                .text_system()
+                .shape_text(
+                    SharedString::from(content),
+                    font_size,
+                    &[run],
+                    Some(bounds.size.width),
+                    None,
+                )
+                .ok()
+                .and_then(|mut lines| (!lines.is_empty()).then(|| lines.remove(0)));
+            ComposerLayout::Wrapped(line)
+        } else {
+            ComposerLayout::Single(Some(window.text_system().shape_line(
+                SharedString::from(content),
+                font_size,
+                &[run],
+                None,
+            )))
+        }
     }
 
     fn paint(
@@ -1017,7 +1085,7 @@ impl Element for NoteInputElement {
         _: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        line: &mut Self::PrepaintState,
+        layout: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -1028,25 +1096,86 @@ impl Element for NoteInputElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(line) = line.take() {
-            let cursor_x = line.width;
-            // Single-line field: when the text outgrows the box, scroll it
-            // left so the caret rides the right edge instead of spilling past
-            // the card (Image-1 bug). The parent clips the overflow.
-            let shift = (cursor_x - bounds.size.width + px(2.)).max(px(0.));
-            let origin = point(bounds.origin.x - shift, bounds.origin.y);
-            line.paint(origin, window.line_height(), TextAlign::Left, None, window, cx)
-                .ok();
-            if focus_handle.is_focused(window) {
-                window.paint_quad(fill(
-                    Bounds::new(
-                        origin + point(cursor_x, px(2.)),
-                        size(px(1.5), window.line_height() - px(4.)),
-                    ),
-                    rgb(TEXT_COLOR),
-                ));
+        let line_height = window.line_height();
+        let focused = focus_handle.is_focused(window);
+        match layout {
+            ComposerLayout::Single(line) => {
+                let Some(line) = line.take() else { return };
+                let cursor_x = line.width;
+                // When the text outgrows the box, scroll it left so the caret
+                // rides the right edge instead of spilling past the card
+                // (Image-1 bug). The parent clips the overflow.
+                let shift = (cursor_x - bounds.size.width + px(2.)).max(px(0.));
+                let origin = point(bounds.origin.x - shift, bounds.origin.y);
+                line.paint(origin, line_height, TextAlign::Left, None, window, cx)
+                    .ok();
+                if focused {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            origin + point(cursor_x, px(2.)),
+                            size(px(1.5), line_height - px(4.)),
+                        ),
+                        rgb(TEXT_COLOR),
+                    ));
+                }
+            }
+            ComposerLayout::Wrapped(line) => {
+                let origin = bounds.origin;
+                // The caret sits at the END of the content (append-only model):
+                // ask the wrapped layout where that byte index lands, which is
+                // the right row and x even after the text has wrapped.
+                let caret = line.as_ref().and_then(|l| {
+                    l.position_for_index(l.len(), line_height)
+                });
+                if let Some(line) = line.take() {
+                    line.paint(origin, line_height, TextAlign::Left, None, window, cx)
+                        .ok();
+                }
+                if focused {
+                    // Empty field (no shaped line, or index 0): caret at the
+                    // box origin, top row.
+                    let caret = caret.unwrap_or_default();
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            origin + caret + point(px(0.), px(2.)),
+                            size(px(1.5), line_height - px(4.)),
+                        ),
+                        rgb(TEXT_COLOR),
+                    ));
+                }
             }
         }
+    }
+}
+
+/// Total wrapped height of the composer's text at a given width (one row per
+/// painted row), at least one line tall so an empty field still has a caret.
+fn composer_wrapped_height(window: &Window, content: &str, width: Pixels, line_height: Pixels) -> Pixels {
+    if content.is_empty() {
+        return line_height;
+    }
+    let style = window.text_style();
+    let run = TextRun {
+        len: content.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    match window.text_system().shape_text(
+        SharedString::from(content.to_owned()),
+        style.font_size.to_pixels(window.rem_size()),
+        &[run],
+        Some(width),
+        None,
+    ) {
+        Ok(lines) => lines
+            .iter()
+            .map(|l| l.size(line_height).height)
+            .fold(px(0.), |a, h| a + h)
+            .max(line_height),
+        Err(_) => line_height,
     }
 }
 
@@ -2177,7 +2306,7 @@ impl Editor {
     ) {
         // Switching composers: commit the one we're leaving before opening this.
         self.resolve_composer(cx);
-        let input = cx.new(|cx| NoteInput::new(cx, body));
+        let input = cx.new(|cx| NoteInput::note_body(cx, body));
         cx.subscribe_in(
             &input,
             window,
@@ -9181,6 +9310,14 @@ impl Editor {
     /// height (the measurement that replaced the `chars/30` estimate). Embedded
     /// newlines and multi-row wraps are summed; empty text is zero.
     fn shape_text_height(window: &Window, text: &str) -> f32 {
+        Self::shape_text_height_w(window, text, CARD_INNER_W)
+    }
+
+    /// Wrapped height of `text` at a given inner width, in PT Serif 13 / one
+    /// shaped row per painted row. Committed body text wraps at `CARD_INNER_W`;
+    /// the live composer wraps at the narrower `COMPOSER_INNER_W` (its box has
+    /// padding), so its reservation matches what it paints.
+    fn shape_text_height_w(window: &Window, text: &str, width: f32) -> f32 {
         if text.is_empty() {
             return 0.;
         }
@@ -9195,7 +9332,7 @@ impl Editor {
         };
         match window
             .text_system()
-            .shape_text(s, px(13.), &[run], Some(px(CARD_INNER_W)), None)
+            .shape_text(s, px(13.), &[run], Some(px(width)), None)
         {
             Ok(lines) => lines
                 .iter()
@@ -9234,8 +9371,13 @@ impl Editor {
         for (id, kind, title, body) in specs {
             let is_diag = kind == NoteKind::Diagnosis;
             if Some(id) == composing_id && !is_diag {
+                // The live composer wraps at its (narrower) box width and adds
+                // the box's own vertical chrome; reserve exactly that so the
+                // growing field never clips or overlaps the card below.
                 let body = live.as_deref().unwrap_or("");
-                self.active_card_height = Some(Self::measure_card_height(window, "", body, 2.));
+                let body_h = Self::shape_text_height_w(window, body, COMPOSER_INNER_W)
+                    .max(2. * CARD_LINE_H);
+                self.active_card_height = Some(CARD_CHROME_H + body_h + COMPOSER_BOX_CHROME);
                 continue;
             }
             let key = card_height_key(kind, &title, &body);
