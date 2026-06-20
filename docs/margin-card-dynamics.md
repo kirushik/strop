@@ -247,3 +247,60 @@ cover most of the attention/honesty goal; what remains is presentation:
 
 **Open decisions (Kirill):** the oplog-bloat persistence fix (perf doc, options
 1–3); whether to compact the existing 2.86 MB file (destructive).
+
+## 8. The composer interaction FSM (2026-06-20)
+
+Three reported bugs turned out to be one structural defect, and the fix is the
+general lesson for this whole subsystem.
+
+**Symptoms.** (a) Press Enter on a note → the card renders blank chrome until
+deselected. (b) Click away mid-edit → the input AND the text label both render,
+same text. (c) Earlier: the draft mirror leaked a note's text onto clicked AI
+cards, persisted.
+
+**Root cause.** The card-interaction state lived in three fields —
+`active_note` + `composing_note` + `note_input` — mutated by several handlers
+that didn't keep them consistent, while the render read the composer from one
+field and the body label from another. Every place two of those booleans
+*disagreed* was a visible bug. We had been hand-policing an implicit state
+machine.
+
+**Fix — make the illegal states unrepresentable.**
+```
+enum CardFocus { Idle, Selected(id), Composing { id, input } }
+```
+The composer's id and its `NoteInput` are one variant's two fields, so
+"composing but not active", "active-committed but blank", and "draft on the
+wrong card" cannot be constructed. Every focus change funnels through
+`resolve_composer` — the single exit from `Composing` — which commits the live
+draft to the note it actually edits, then demotes to `Selected`. The render's
+body region is one exhaustive `match` (`card_body → Composer | Text`): exactly
+one of input-or-text, never both, never neither. Commits `5cb4dbb` (fix) on top
+of `dec5c4b` (the earlier draft-leak patch the enum subsumes).
+
+**Why an enum and not lifetimes / typestate (the question asked).** Lifetimes
+scope borrows, not lifecycle-over-time — wrong tool. Typestate (a phantom-typed
+`Editor<State>`) is actively wrong here: the editor is ONE long-lived
+retained-mode entity re-rendered every frame; you can't swap its type per
+interaction. The right Rust tool is a data-carrying enum + exhaustive match +
+funneled transitions: low ceremony, and a new interaction state forces every
+match to be updated.
+
+**Where types still don't save you.** The other half of this subsystem is pixel
+geometry (reserved height == painted height). Types can't catch a wrong
+constant; that stays a measured-equals-painted discipline (the `CARD_*` /
+`COMPOSER_*` constants, shared by measurement and render). The multi-line
+composer (`02426a0`) needed exactly that care: it wraps at `COMPOSER_INNER_W`
+and reserves the box's chrome so the growing field never clips/overlaps.
+
+**Residual, NOT bugs (left deliberately):** abandoning an empty note (ctrl-m
+then click away with no text) leaves an `(empty note)` placeholder card — the
+writer dismisses it with `×`, consistent with "only the user dismisses". Could
+auto-remove an empty note on resolve if it ever feels like litter. The
+narrow-window composer strip reuses the same (now multi-line) input; functional,
+not visually tuned.
+
+**Tests (strop-app 39 → 43):** `card_body` total+exclusive; `CardFocus`
+accessors for Idle/Selected; composing-implies-active over the id projection.
+The entity-bearing `Composing` variant is correct by construction; a full
+transition test would need gpui `test-support` (deliberately off).
