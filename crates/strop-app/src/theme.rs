@@ -1,31 +1,40 @@
 //! The color language. One place for every semantically-meaningful color, so
 //! the palette stays consistent and *habit-forming* for the writer: a color
-//! means the same thing everywhere it appears.
+//! means the same thing everywhere it appears. Full rationale, sources, and
+//! the accessibility math live in `docs/color-language.md`.
 //!
-//! The vocabulary (four content meanings + a few editor mechanics):
+//! **The one axis: warm = the human, cool = the machine.** Everything the
+//! writer authors or touches wears warm amber/gold; everything the AI says
+//! wears a calm cool blue that never competes with the writer's warm hand.
+//! **Confidence rides saturation, not a new hue:** a live AI note is a clear
+//! cool tint; as its anchor goes stale the color *drains toward neutral*
+//! (`STALE_BG`) — doubt = desaturation, not red. Red (`ERROR`) is reserved for
+//! true errors only. Green (`SAGE_COLOR`) marks the one moment of success.
+//! Because meaning rides a warm / cool / neutral axis — never red-vs-green —
+//! the language stays legible for color-blind readers, and every card tint is
+//! faint enough to keep near-black body text at WCAG AAA.
 //!
-//! - **Warm amber = the writer / active engagement.** Your own marks and the
-//!   thing you're touching right now: your margin notes (`NOTE_CARD_BG`,
-//!   `NOTE_TINT`), the active/selected card border (`ACTIVE_BORDER`), the
-//!   selection inside a field (`FIELD_SELECTION_BG`). Habit: *warm = mine.*
-//! - **Cool neutral = the tool (AI).** AI diagnosis surfaces lean cool and
-//!   slightly grey (`DIAGNOSIS_CARD_BG`) so they read as the assistant's output
-//!   sitting *over* the page rather than ink *on* it. Habit: *cool = the tool.*
-//! - **Muted taupe = provisional / quiet / structural.** Unverified diagnoses,
-//!   stale anchors, secondary labels, hairline rules (`MUTED_COLOR`,
-//!   `RULE_COLOR`). Habit: *greyed = not sure / not load-bearing.*
-//! - **Sage = achieved.** The reached-goal dot, used sparingly, no celebration
-//!   (`SAGE_COLOR`). Habit: *sage = done.*
+//! The vocabulary:
+//! - **Warm amber = the writer / active engagement.** Your margin notes
+//!   (`NOTE_CARD_BG`, `NOTE_TINT`), the active/selected border (`ACTIVE_BORDER`),
+//!   the in-field selection (`FIELD_SELECTION_BG`). Habit: *warm = mine.*
+//! - **Cool blue = the AI tool.** Diagnosis card fills (`DIAGNOSIS_CARD_BG`) and
+//!   the AI's marks/ink (`AI_ACCENT`: the wavy anchor squiggle, in-card accents).
+//!   Habit: *cool = the assistant.*
+//! - **Drained neutral / muted taupe = provisional / quiet / structural.** Stale
+//!   or unverified cards (`STALE_BG`), secondary labels (`MUTED_COLOR`), hairline
+//!   rules (`RULE_COLOR`). Habit: *greyed = not sure / not load-bearing.*
+//! - **Sage = achieved** (`SAGE_COLOR`); **red = error** (`ERROR`), nothing else.
 //!
 //! `SELECTION_COLOR` (blue) and `HIGHLIGHT_COLOR` (yellow) are plain editor
-//! mechanics in the prose canvas, not part of the semantic vocabulary; `LINK`
-//! and `CODE_BG` are likewise structural. Incidental chrome (pure white field
-//! fills, panel backgrounds) is not promoted here — only colors that *carry
-//! meaning* live in this module. When you reach for a new color, first ask which
-//! of the four meanings it belongs to; add a new meaning only deliberately.
+//! mechanics in the prose canvas; `LINK`/`CODE_BG` are structural. Incidental
+//! chrome (panel fills, hover overlays) is not yet promoted here — see the doc's
+//! "deferred" list. When you reach for a new color, first ask which meaning it
+//! belongs to; add a new meaning only deliberately.
 //!
 //! Values are `0xRRGGBB` or `0xRRGGBBAA` (alpha when translucent), the form
-//! gpui's `rgb()` / `rgba()` take.
+//! gpui's `rgb()` / `rgba()` take. Card tints are verified AAA against
+//! `TEXT_COLOR`; see the doc for ratios.
 
 // --- Surface & ink -------------------------------------------------------
 
@@ -45,14 +54,26 @@ pub const RULE_COLOR: u32 = 0xE8E4DC;
 /// panel): a neutral near-white, no warm/cool lean — it carries no layer
 /// meaning, it's just "a small surface".
 pub const CARD_BG: u32 = 0xFFFDF6;
-/// Layer A — the WRITER'S own note: a warm cream wash. Reads as ink *on the
-/// page*, and rhymes with the amber note-anchor tint. The "paper-tint"
-/// differentiation chosen 2026-06-23 (margin-card-dynamics §11).
-pub const NOTE_CARD_BG: u32 = 0xFCF6E9;
-/// Layer B — an AI DIAGNOSIS card: a faintly cool, grey-leaning off-white.
-/// Subtly *not warm*, so it reads as the tool's output over the page. Pairs
-/// with the lifecycle difference (AI cards are gated by the door; notes aren't).
-pub const DIAGNOSIS_CARD_BG: u32 = 0xF5F6F8;
+/// Layer A — the WRITER'S own note: a warm cream wash (AAA, 15.86:1). Reads as
+/// ink *on the page*, and rhymes with the amber note-anchor tint. The
+/// "paper-tint" differentiation chosen 2026-06-23 (margin-card-dynamics §11).
+pub const NOTE_CARD_BG: u32 = 0xFAF4E2;
+/// Layer B — a live AI DIAGNOSIS card: a faint cool BLUE wash (AAA, 15.64:1).
+/// Cool = the machine voice (the complement to the writer's warm), so it reads
+/// as the tool's output over the page. Pairs with the lifecycle difference
+/// (AI cards are gated by the door; notes aren't).
+pub const DIAGNOSIS_CARD_BG: u32 = 0xEEF3FB;
+/// A stale / unverified card: the cool tint DRAINED toward the paper's own
+/// warmth (AAA, 15.01:1). Doubt = desaturation, "fading back into the page" —
+/// never red (staleness is not an error).
+pub const STALE_BG: u32 = 0xEFEEEA;
+
+// --- Cool blue: the AI / machine voice -----------------------------------
+
+/// The AI's ink: the wavy diagnosis-anchor squiggle and in-card accents (AA
+/// text, 6.48:1 vs page / 6.06:1 on the AI wash). The legible "machine voice"
+/// against the writer's warm amber.
+pub const AI_ACCENT: u32 = 0x3D5C8C;
 
 // --- Warm amber: the writer & active engagement --------------------------
 
@@ -73,6 +94,13 @@ pub const NOTE_TINT_ACTIVE: u32 = 0xE3B8494D;
 /// The reached-goal dot (DESIGN §4.2): subtle, no celebration.
 pub const SAGE_COLOR: u32 = 0x7D8C66;
 
+// --- Red: errors ONLY (never "stale") ------------------------------------
+
+/// True errors / destructive outcomes only (AA text, 5.66:1). Reserved: doubt
+/// and staleness desaturate (`STALE_BG`); they do not turn red. Pair with a
+/// non-color cue (icon/text) so it's legible without color (WCAG 1.4.1).
+pub const ERROR: u32 = 0xB23B2E;
+
 // --- Editor mechanics (not part of the semantic vocabulary) --------------
 
 /// Prose text selection (the OS-idiom blue), translucent.
@@ -81,5 +109,6 @@ pub const SELECTION_COLOR: u32 = 0xB4D5FE88;
 pub const HIGHLIGHT_COLOR: u32 = 0xF9E29CAA;
 /// Inline-code background tint.
 pub const CODE_BG_COLOR: u32 = 0x1A1A1814;
-/// Hyperlink ink.
-pub const LINK_COLOR: u32 = 0x1A56A0;
+/// Hyperlink ink (AA text, 6.80:1) — cool, shares the machine-voice family
+/// ("points outward, not your warm words"); the underline carries the meaning.
+pub const LINK_COLOR: u32 = 0x2156A8;

@@ -39,9 +39,9 @@ use unicode_segmentation::UnicodeSegmentation;
 // The semantic color language lives in `theme`; everything below is layout.
 pub use crate::theme::{BG_COLOR, TEXT_COLOR};
 use crate::theme::{
-    ACTIVE_BORDER, CARD_BG, CODE_BG_COLOR, DIAGNOSIS_CARD_BG, HIGHLIGHT_COLOR, LINK_COLOR,
-    MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR,
-    SELECTION_COLOR,
+    ACTIVE_BORDER, AI_ACCENT, CARD_BG, CODE_BG_COLOR, DIAGNOSIS_CARD_BG, ERROR, HIGHLIGHT_COLOR,
+    LINK_COLOR, MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR,
+    SELECTION_COLOR, STALE_BG,
 };
 
 const MARGIN_WIDTH: f32 = 248.;
@@ -4287,17 +4287,19 @@ impl Editor {
                     .text_color(rgb(MUTED_COLOR))
                     .child("testing…"),
             ),
+            // ✓ / ✗ glyphs carry the pass/fail distinction without relying on
+            // color (WCAG 1.4.1); failure wears the reserved ERROR red.
             AiSettingsTest::Ok { ms } => Some(
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(0x4F7A4A))
-                    .child(format!("OK · {ms}ms")),
+                    .child(format!("✓ OK · {ms}ms")),
             ),
             AiSettingsTest::Failed { message } => Some(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(0xA3492F))
-                    .child(message.clone()),
+                    .text_color(rgb(ERROR))
+                    .child(format!("✗ {message}")),
             ),
         };
         let mut model_list = div()
@@ -6144,8 +6146,11 @@ fn runs_for_paragraph(
             for (r, active, is_diagnosis) in notes {
                 if r.start <= w[0] && w[1] <= r.end {
                     if *is_diagnosis && !active {
+                        // The AI's anchor mark wears the cool machine-voice ink
+                        // (color language): a wavy blue squiggle, distinct from
+                        // the writer's warm amber note tint.
                         underline.get_or_insert(UnderlineStyle {
-                            color: Some(rgb(MUTED_COLOR).into()),
+                            color: Some(rgb(AI_ACCENT).into()),
                             thickness: px(1.),
                             wavy: true,
                         });
@@ -8265,11 +8270,11 @@ impl Editor {
                                 .flex_col()
                                 .gap(px(1.))
                                 .text_size(px(11.))
-                                .text_color(if report.overall_sigma > 2. {
-                                    rgb(0xA04A3A)
-                                } else {
-                                    rgb(MUTED_COLOR)
-                                })
+                                // A voice anomaly is a descriptive flag, not an
+                                // error — red is reserved (color language). The
+                                // "Nσ outside your normal range" headline carries
+                                // the signal in text, so it stays muted.
+                                .text_color(rgb(MUTED_COLOR))
                                 .children(std::iter::once(headline).chain(report.flags)),
                         )
                     }
@@ -9819,10 +9824,17 @@ impl Editor {
                         .rounded(px(if is_diagnosis { 3. } else { 9. }))
                         // Paper-tint differentiation (theme color language): a
                         // warm cream wash for the writer's own note (ink on the
-                        // page), a cool neutral for an AI diagnosis (tool output
-                        // over the page). Reinforces the corner/title cues and
-                        // the lifecycle split (notes persist; AI cards gate).
-                        .bg(rgb(if is_diagnosis { DIAGNOSIS_CARD_BG } else { NOTE_CARD_BG }))
+                        // page), a cool blue wash for a live AI diagnosis (the
+                        // machine voice, over the page). An unverified diagnosis
+                        // DRAINS to neutral — doubt = desaturation, fading back
+                        // into the page (never red; that's reserved for errors).
+                        .bg(rgb(if unverified {
+                            STALE_BG
+                        } else if is_diagnosis {
+                            DIAGNOSIS_CARD_BG
+                        } else {
+                            NOTE_CARD_BG
+                        }))
                         .border_1()
                         .border_color(if active {
                             rgb(ACTIVE_BORDER)
