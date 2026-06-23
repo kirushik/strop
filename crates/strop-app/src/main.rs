@@ -19,6 +19,7 @@ mod files;
 mod paths;
 mod single_instance;
 mod smoke;
+mod text_field;
 mod tutorial;
 
 use std::path::PathBuf;
