@@ -1374,6 +1374,34 @@ impl Editor {
         });
     }
 
+    /// Wire click-away-commits for a single-line field: the instant it loses
+    /// focus, emit `Commit` so the field's own subscriber saves and tears it
+    /// down — it becomes a label immediately, not at some later stray click
+    /// (the low-latency rule; matches the doc-rename field). `still` re-fetches
+    /// the live field, so a blur that races an Enter/Escape (already gone) is a
+    /// no-op. NOT for end-session, whose Commit quits — blur there must not.
+    fn commit_field_on_blur(
+        &self,
+        input: &Entity<TextField>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        still: impl Fn(&Editor) -> Option<Entity<TextField>> + 'static,
+    ) {
+        let handle = input.read(cx).focus_handle.clone();
+        let weak = cx.entity().downgrade();
+        window
+            .on_focus_out(&handle, cx, move |_, _window, cx| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.update(cx, |editor, cx| {
+                    if let Some(field) = still(editor) {
+                        let text = field.read(cx).content.clone();
+                        field.update(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
+                    }
+                });
+            })
+            .detach();
+    }
+
     fn edit_image_alt(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
         let BlockKind::Image { src, alt, caption } = self.doc.blocks().kind(block).clone()
         else {
@@ -1401,6 +1429,12 @@ impl Editor {
             },
         )
         .detach();
+        self.commit_field_on_blur(&input, window, cx, move |e| {
+            e.alt_input
+                .as_ref()
+                .filter(|(b, _)| *b == block)
+                .map(|(_, f)| f.clone())
+        });
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.alt_input = Some((block, input));
@@ -1435,6 +1469,12 @@ impl Editor {
             },
         )
         .detach();
+        self.commit_field_on_blur(&input, window, cx, move |e| {
+            e.rename_input
+                .as_ref()
+                .filter(|(i, _)| *i == ix)
+                .map(|(_, f)| f.clone())
+        });
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.rename_input = Some((ix, input));
@@ -1866,6 +1906,23 @@ impl Editor {
             },
         )
         .detach();
+        // Click-away commits immediately (low-latency: the input becomes a label
+        // the instant focus leaves, not when some later click happens to resolve
+        // it). Guarded on THIS composer still being open — switching to another
+        // card or clicking the document already resolved it through its own path,
+        // so the stale handle must not double-commit.
+        let handle = input.read(cx).focus_handle.clone();
+        let weak = cx.entity().downgrade();
+        window
+            .on_focus_out(&handle, cx, move |_, window, cx| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.update(cx, |editor, cx| {
+                    if editor.focus.composing_id() == Some(id) {
+                        editor.finish_composing(window, cx);
+                    }
+                });
+            })
+            .detach();
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.focus = CardFocus::Composing { id, input };
@@ -3956,6 +4013,7 @@ impl Editor {
         )
         .detach();
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        self.commit_field_on_blur(&input, window, cx, |e| e.goal_input.clone());
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.goal_input = Some(input);
