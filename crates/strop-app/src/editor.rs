@@ -7352,6 +7352,13 @@ impl Editor {
             .border_color(rgb(RULE_COLOR))
             .font_family("PT Serif")
             .text_size(px(13.))
+            // macOS draws its native traffic-light buttons over the top-left of
+            // our (full-size-content) titlebar — recentred by `traffic_light_
+            // position` in main.rs. Reserve their width so the outline toggle and
+            // document name start to their right instead of underneath them.
+            .when(cfg!(target_os = "macos"), |bar| {
+                bar.child(div().w(px(76.)).h_full())
+            })
             // The outline opens the LEFT rail, so its control lives at the
             // far left — spatial honesty (the H2 papercut: it was on the
             // right). Three stacked bars, drawn like every titlebar glyph.
@@ -7665,34 +7672,41 @@ impl Editor {
                             )),
                     ),
             )
-            .child(self.window_button("–", "Minimize", None, |window, _| {
-                window.minimize_window()
-            }))
-            .child(
-                // Zoom: drawn square (U+25A1 isn't in PT).
-                div()
-                    .id("win-zoom")
-                    .occlude()
-                    .w(px(34.))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("Maximize", None))
-                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        cx.stop_propagation();
-                        window.zoom_window();
-                    })
-                    .child(
-                        div()
-                            .size(px(9.))
-                            .border_1()
-                            .border_color(rgb(MUTED_COLOR))
-                            .rounded(px(1.)),
-                    ),
-            )
-            .child(self.window_button("×", "Close", Some("ctrl-q"), |_, cx| cx.quit()))
+            // Windows/Linux get our own drawn window controls. macOS keeps its
+            // native traffic lights (top-left) instead, so we omit these here —
+            // which also retires the macOS papercut that our "×" quit the whole
+            // app, and sidesteps the fact that the "–"/"×" glyph labels are the
+            // very thing the macOS glyph bug hides (issue #10).
+            .when(!cfg!(target_os = "macos"), |bar| {
+                bar.child(self.window_button("–", "Minimize", None, |window, _| {
+                    window.minimize_window()
+                }))
+                .child(
+                    // Zoom: drawn square (U+25A1 isn't in PT).
+                    div()
+                        .id("win-zoom")
+                        .occlude()
+                        .w(px(34.))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Maximize", None))
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            cx.stop_propagation();
+                            window.zoom_window();
+                        })
+                        .child(
+                            div()
+                                .size(px(9.))
+                                .border_1()
+                                .border_color(rgb(MUTED_COLOR))
+                                .rounded(px(1.)),
+                        ),
+                )
+                .child(self.window_button("×", "Close", Some("ctrl-q"), |_, cx| cx.quit()))
+            })
     }
 }
 
