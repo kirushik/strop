@@ -162,6 +162,19 @@ fn char_idx_to_byte(s: &str, ch: usize) -> usize {
     s.char_indices().nth(ch).map(|(b, _)| b).unwrap_or(s.len())
 }
 
+/// The single-line vs multiline newline policy, applied at the splice point so
+/// every entry path (typing, paste, OS insertText/dictation, IME commit) obeys
+/// it. A single-line field can hold NO line break (a filename, a palette query,
+/// an API key): \n / \r flatten to a space, a CRLF collapsing to one. The
+/// multiline composer keeps breaks, normalizing CRLF/CR to a lone \n.
+fn sanitize_for_field(text: &str, multiline: bool) -> String {
+    if multiline {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.replace("\r\n", " ").replace(['\n', '\r'], " ")
+    }
+}
+
 // === The widget ==========================================================
 
 /// Drag-selection granularity, set by the initiating click count.
@@ -206,6 +219,11 @@ pub struct TextField {
     /// The unit (or point) the initiating click fixed; a drag unions the unit
     /// under the pointer with this, so word/line drags grow whole units.
     selection_origin: Option<Range<usize>>,
+    /// Where glyph x=0 painted last frame, WINDOW-relative (single-line folds
+    /// in the caret-scroll shift; wrapped is the bounds origin). The OS
+    /// hit-test path (`character_index_for_point`) is handed a window point, so
+    /// it subtracts this to reach field-local space — like the mouse handlers.
+    text_origin: Point<Pixels>,
 }
 
 /// What the field painted last frame, enough to map a point ↔ a caret index.
@@ -297,6 +315,7 @@ impl TextField {
             is_selecting: false,
             drag_unit: DragUnit::Char,
             selection_origin: None,
+            text_origin: Point::default(),
         }
     }
 
@@ -379,7 +398,12 @@ impl TextField {
     /// delete, and IME commit all route here, so every edit happens AT THE
     /// CARET, never at the end.
     fn replace(&mut self, range: Range<usize>, text: &str) {
-        self.content.replace_range(range.clone(), text);
+        // Newline policy lives HERE, the single splice point, so EVERY path —
+        // typing, paste, OS insertText/dictation, IME commit — obeys it, not
+        // just the old paste guard. Flatten FIRST, then splice and measure, so
+        // the caret offset uses the FLATTENED length and never desyncs.
+        let text = sanitize_for_field(text, self.multiline);
+        self.content.replace_range(range.clone(), &text);
         self.cursor = range.start + text.len();
         self.anchor = None;
         self.marked = None;
@@ -700,12 +724,10 @@ impl TextField {
         else {
             return;
         };
-        let text: String = if self.multiline {
-            text.replace("\r\n", "\n").replace('\r', "\n")
-        } else {
-            text.replace("\r\n", " ").replace(['\n', '\r'], " ")
-        };
-        // The shared splice path: inserts at the caret, over the selection.
+        // The newline policy now lives in `replace` (the single splice point),
+        // so paste, OS insertText/dictation, and IME commit all obey it; no
+        // per-path flattening here (it would only double-normalize). The shared
+        // splice path inserts at the caret, over the selection.
         self.replace_text_in_range(None, &text, window, cx);
     }
 }
@@ -808,10 +830,20 @@ impl EntityInputHandler for TextField {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let start = utf16_to_byte(&self.content, range_utf16.start);
-        let end = utf16_to_byte(&self.content, range_utf16.end);
-        *adjusted = Some(byte_to_utf16(&self.content, start)..byte_to_utf16(&self.content, end));
-        Some(self.content[start..end].to_owned())
+        // The OS read path (IME surrounding-text, accessibility/screen readers).
+        // A masked field must hand back DOTS, never the secret: slice the dotted
+        // DISPLAY string by its OWN utf16/byte offsets (`•` is 3 bytes / 1 utf16
+        // unit, so real-content offsets don't carry over). Edits still target the
+        // real content — only this read-out is masked.
+        let source = if self.masked {
+            self.display_content()
+        } else {
+            self.content.clone()
+        };
+        let start = utf16_to_byte(&source, range_utf16.start);
+        let end = utf16_to_byte(&source, range_utf16.end);
+        *adjusted = Some(byte_to_utf16(&source, start)..byte_to_utf16(&source, end));
+        Some(source[start..end].to_owned())
     }
 
     fn selected_text_range(
@@ -895,7 +927,11 @@ impl EntityInputHandler for TextField {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let cursor = self.byte_at_local(point)?;
+        // gpui hands this a WINDOW-relative point (it does NOT subtract element
+        // bounds, unlike the mouse path). Localize it the same way the mouse
+        // handlers do — minus the painted text origin — or a field off the
+        // window origin / a scrolled single-line field returns the wrong index.
+        let cursor = self.byte_at_local(point - self.text_origin)?;
         Some(byte_to_utf16(&self.content, cursor))
     }
 }
@@ -957,8 +993,13 @@ impl IntoElement for TextFieldElement {
 }
 
 impl TextFieldElement {
-    fn store_geometry(&self, geom: FieldGeometry, cx: &mut App) {
-        self.input.update(cx, |input, _| input.geometry = Some(geom));
+    fn store_geometry(&self, geom: FieldGeometry, text_origin: Point<Pixels>, cx: &mut App) {
+        // Stash the window-relative text origin alongside the geometry, so the OS
+        // hit-test path can localize its window point exactly as the mouse does.
+        self.input.update(cx, |input, _| {
+            input.geometry = Some(geom);
+            input.text_origin = text_origin;
+        });
     }
 
     /// The complete mouse model: click-to-place + drag-select, double-click
@@ -1234,7 +1275,7 @@ impl Element for TextFieldElement {
                         rgb(TEXT_COLOR),
                     ));
                 }
-                self.store_geometry(FieldGeometry::Single(line), cx);
+                self.store_geometry(FieldGeometry::Single(line), origin, cx);
                 self.register_mouse(bounds, origin, window);
             }
             ComposerLayout::Wrapped(lines) => {
@@ -1280,7 +1321,7 @@ impl Element for TextFieldElement {
                         rgb(TEXT_COLOR),
                     ));
                 }
-                self.store_geometry(FieldGeometry::Wrapped(rows), cx);
+                self.store_geometry(FieldGeometry::Wrapped(rows), origin, cx);
                 self.register_mouse(bounds, origin, window);
             }
         }
@@ -1370,5 +1411,21 @@ mod tests {
         let from = s.len();
         let landed = prev_word(&s, from);
         assert_eq!(&s[landed..], "word");
+    }
+
+    #[test]
+    fn single_line_field_flattens_newlines_multiline_keeps_them() {
+        // The newline guard lives in `replace`, so whatever path a break arrives
+        // by — paste, OS insertText/dictation, multi-line IME commit — it gets
+        // sanitized. Single-line: \n / \r → space, a CRLF collapsing to one; the
+        // caret then lands after the FLATTENED text (offset = range.start + len).
+        for raw in ["a\nb", "a\r\nb", "a\rb"] {
+            let flat = sanitize_for_field(raw, false);
+            assert_eq!(flat, "a b");
+            assert_eq!(flat.len(), 3); // == caret offset after inserting at 0
+        }
+        // The multiline composer preserves the break (CRLF/CR normalized to \n).
+        assert_eq!(sanitize_for_field("a\nb", true), "a\nb");
+        assert_eq!(sanitize_for_field("a\r\nb", true), "a\nb");
     }
 }
