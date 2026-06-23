@@ -344,16 +344,32 @@ fn main() {
                     editor
                 });
                 window.focus(&editor.focus_handle(cx), cx);
-                // Single-window app: route every OS-driven close to quit, so
-                // `on_app_quit` (below) flushes the document + exit state. This
-                // matters on macOS, where the native traffic-light close is now
-                // the only window control (we hide our own there) and macOS does
-                // NOT terminate an app on last-window-close by default; it also
-                // covers Alt-F4 / window-manager closes elsewhere. Our own "×"
-                // (non-macOS) already calls cx.quit() directly.
+                // Single-window app: route an OS-driven close request (the macOS
+                // traffic-light close — now our only window control there since we
+                // hide our own; or a compositor/WM close on Linux/Windows) to
+                // quit, so `on_app_quit` (below) flushes the document + exit state.
+                // macOS does NOT terminate on last-window-close by default, so
+                // without this the native close would just hide the window. Our own
+                // "×" (shown off-macOS) calls cx.quit() directly.
+                //
+                // Return `false` to VETO the platform's synchronous window close
+                // and let cx.quit() be the sole teardown driver — mirroring Zed's
+                // own handler (crates/zed/src/zed.rs). Returning `true` would let
+                // the platform close and DROP the Editor entity *before* quit's
+                // shutdown() runs `on_app_quit`, turning its save_now()/
+                // record_exit_state() into a silent no-op (the handler below uses
+                // update_checked). shutdown() runs on_app_quit *before* clearing
+                // windows, so vetoing keeps the Editor alive until it's saved.
+                //
+                // Calling cx.quit() synchronously here is fine — a clean close of a
+                // normal document exits in ~0.1s. A *slow* close is a separate
+                // problem: the `on_app_quit` save below is synchronous, so a large
+                // document (a multi-MB Loro doc with mark churn) can block teardown
+                // for several seconds and trip the compositor's not-responding
+                // watchdog. That's an engine save-perf issue, not a quit-path one.
                 window.on_window_should_close(cx, |_, cx| {
                     cx.quit();
-                    true
+                    false
                 });
                 editor
             },
