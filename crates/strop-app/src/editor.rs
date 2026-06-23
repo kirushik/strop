@@ -4995,6 +4995,51 @@ impl Editor {
         }
     }
 
+    /// Clicking an off-screen-count pill ("N above" / "N below") pages the
+    /// document toward the nearest hidden card in that direction, bringing it
+    /// (and the run past it) into view — the pills look clickable like the rest
+    /// of the lane, so they now do the reasonable thing. The caret is left
+    /// alone; this only scrolls.
+    fn reveal_offscreen(&mut self, below: bool, cx: &mut Context<Self>) {
+        let new_scroll = {
+            let Some(frame) = self.last_frame.as_ref() else {
+                return;
+            };
+            let vp_h = frame.bounds.size.height;
+            let scroll = self.scroll_top;
+            let rope = self.doc.rope();
+            let len = self.doc.len_bytes();
+            // Content-space y of every open note's anchor (pre-scroll).
+            let mut ys: Vec<Pixels> = self
+                .doc
+                .notes()
+                .open()
+                .filter_map(|n| {
+                    let byte = rope
+                        .char_to_byte(n.range.start.min(rope.len_chars()))
+                        .min(len);
+                    frame.position_of(byte, false).map(|p| p.y)
+                })
+                .collect();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // The visible band in content space is [scroll, scroll + vp_h]. Land
+            // the target ~80px inside the near edge so it's clearly revealed.
+            let target = if below {
+                ys.into_iter().find(|y| *y > scroll + vp_h).map(|y| y - px(80.))
+            } else {
+                ys.into_iter().rev().find(|y| *y < scroll).map(|y| y - vp_h + px(80.))
+            };
+            target.map(|t| t.clamp(px(0.), frame.max_scroll()))
+        };
+        if let Some(t) = new_scroll
+            && t != self.scroll_top
+        {
+            self.scroll_top = t;
+            self.selection_popover = false;
+            cx.notify();
+        }
+    }
+
     /// One tick of drag-edge autoscroll: while the pointer is held beyond
     /// the viewport edge, keep scrolling (speed ∝ overshoot) and extending.
     fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
@@ -5173,6 +5218,14 @@ impl Editor {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A click in the right note lane is NOT a document click — the lane's
+        // own cards and pills handle it. The lane is a sibling element painted
+        // over this (full-width) column, so a card/pill's stop_propagation
+        // doesn't reach this handler; without this guard, clicking any margin
+        // card or off-screen pill also jumped the text caret.
+        if f32::from(ev.position.x) > self.column_right(window) + MARGIN_GAP {
+            return;
+        }
         // Footnote jumps (DESIGN §2-footnotes): a plain click on a ref's
         // mark goes to its def; a click on a def's "N." gutter goes back
         // to the ref. Never starts a drag selection.
@@ -9690,6 +9743,31 @@ impl Editor {
             let active = cards.remove(i);
             cards.push(active);
         }
+        // The off-screen-count pills are clickable (issue 2): a click pages the
+        // document toward the nearest hidden card that way. Built before the
+        // container so each `cx.listener` borrow is its own statement.
+        let above_chip = (above > 0).then(|| {
+            edge_chip(format!("{above} above"), false)
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.reveal_offscreen(false, cx);
+                    }),
+                )
+        });
+        let below_chip = (below > 0).then(|| {
+            edge_chip(format!("{below} below"), true)
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.reveal_offscreen(true, cx);
+                    }),
+                )
+        });
         let lane_left = col_right + MARGIN_GAP;
         Some(
             div()
@@ -9698,6 +9776,11 @@ impl Editor {
                 .bottom_0()
                 .left(px(lane_left))
                 .w(px(MARGIN_WIDTH))
+                // The margin lane is part of the document surface (issue 3):
+                // scrolling over it scrolls the document, like the prose column.
+                // Only the prose element caught the wheel before; the panels
+                // still stop_propagation, so they stay unaffected.
+                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                 .children(cards.into_iter().map(|card| {
                     let MarginCard {
                         id,
@@ -9852,12 +9935,8 @@ impl Editor {
                             CardBody::Text => div().child(body.clone()),
                         })
                 }))
-                .when(above > 0, |d| {
-                    d.child(edge_chip(format!("{above} above"), false))
-                })
-                .when(below > 0, |d| {
-                    d.child(edge_chip(format!("{below} below"), true))
-                }),
+                .children(above_chip)
+                .children(below_chip),
         )
     }
 
