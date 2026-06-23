@@ -368,3 +368,63 @@ edge is unserved). Both are additive on the same widget.
 - **Edge-hold drag autoscroll** in `TextField`: single-line fields autoscroll
   via caret-follow, but *holding* a drag past the edge without moving doesn't
   scroll. Needs the prose canvas's `autoscroll_tick` timer pattern.
+
+## 11. Review round (2026-06-23): navigation, packer, focus — and the harness
+
+A five-lens adversarial review (a workflow: textfield / margin / focus / gpui /
+color, each finding then independently verified) turned up 14 real defects on
+this branch. Several were the *same* off-screen-card bug seen from different
+angles. Each non-obvious one was fixed as a CLASS, with the cheapest test
+abstraction that makes the whole class discoverable — per Kirill's standing rule.
+
+- **One source of truth for off-screen cards.** The pill COUNT, the navigation
+  TARGET, and the RENDERED set were computed from three different filters, so a
+  pill could read "1 below" yet do nothing, or scroll to a door-suppressed
+  non-card. `MarginLayout` now carries `above/below: Vec<OffscreenRef>` (id +
+  content-anchor-y + `anchor_culled`); the pill count is `.len()` and
+  `reveal_offscreen` navigates that exact list. Divergence is now impossible by
+  construction.
+- **Two reveals, by how the card hid.** Anchor scrolled off-screen → scroll it to
+  the NEAR edge (`reveal_scroll`, pure + proptested: lands the anchor
+  `REVEAL_INSET` from the edge, never a page away — the "pagination feel" fix).
+  Anchor on-screen but packing pushed the card out → SELECT it, so Pass 3 forces
+  it in. Either way the pill always acts.
+- **The active card wins the lane (packer Pass 3).** A tall writer note pinned in
+  the slack above a selected diagnosis used to shove it off the bottom while
+  `card_slot` still reported it `Shown` — invisible AND uncounted (principle 2
+  violation). Pass 3 re-clamps the active card fully into view (overlapping the
+  note above; it paints last, on top). `card_slot` lost its `active` special case
+  — pure geometry now, so it can't lie. INV3 proptest strengthened to include
+  competing note pins; INV1 excuses the one sanctioned active-card overlap.
+- **The active card is door-exempt.** Selecting a copy-level diagnosis suppressed
+  under an open developmental one lit the anchor but rendered no card.
+  `margin_cards` now surfaces the active card regardless of the door (mirroring
+  its anchor-cull exemption).
+- **Anchor hit-test trailing edge.** A click on the trailing half of an anchor's
+  last glyph snaps to `c == end` and missed the strict `< end` test (dead zone).
+  Extracted `note_at_char` (pure, unit-tested): strict-contain first, then accept
+  the trailing boundary — back-to-back anchors never double-claim.
+- **Composer exit always restores focus.** `select_card`/`set_note_status` (lane
+  clicks) resolved the composer WITHOUT re-focusing the document, stranding the
+  keyboard. Focus restoration moved INTO `resolve_composer` — the one documented
+  exit from `Composing` (§8) — so every exit handles it by construction.
+- **Unified scroll.** One `on_scroll_wheel` on the document root, not per-element,
+  so the whole surface (gutters, lane, whitespace) scrolls, not just the prose.
+- **TextField hardening** (`text_field.rs`): the single-line newline policy moved
+  to the one splice point `replace` (so dictation / IME commit can't inject a
+  `\n` into a filename, not just paste); masked `text_for_range` returns dots (the
+  IME/a11y read path was leaking the API key past the copy/cut guard);
+  `character_index_for_point` localizes the window point like the mouse path.
+- **Bold-title height.** Diagnosis titles are painted bold but were measured
+  normal-weight, under-reserving a row at the wrap boundary → overlap. Measure
+  with the paint weight.
+
+**Test abstractions chosen, by class:** pure proptests
+(`reveal_scroll_lands_at_the_near_edge`, strengthened `selected_card_stays_fully_in_view`,
+geometry-only `card_visibility_is_honest`) and pure unit tests (`note_at_char`,
+`single_line_field_flattens_newlines`) for the algorithmic classes;
+correct-by-construction structure (single source of truth, single focus-restoring
+exit, one scroll handler, masked read-path) where a value test would be brittle;
+visual rig (`wrun`/`wshot`) for the integration colours and scroll. Still on the
+Phase 6 list: GPUI headless integration tests for the height-measurement +
+culling paths (the bold-title and masked/hit-test fixes ride reasoning until then).

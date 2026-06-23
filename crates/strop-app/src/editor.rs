@@ -39,9 +39,9 @@ use unicode_segmentation::UnicodeSegmentation;
 // The semantic color language lives in `theme`; everything below is layout.
 pub use crate::theme::{BG_COLOR, TEXT_COLOR};
 use crate::theme::{
-    ACTIVE_BORDER, AI_ACCENT, CARD_BG, CODE_BG_COLOR, DIAGNOSIS_CARD_BG, ERROR, HIGHLIGHT_COLOR,
-    LINK_COLOR, MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR,
-    SELECTION_COLOR, STALE_BG,
+    ACTIVE_BORDER, AI_ACCENT, CARD_BG, CODE_BG_COLOR, DIAGNOSIS_CARD_BG, DIAGNOSIS_TINT_ACTIVE,
+    ERROR, FIND_MATCH_BG, HIGHLIGHT_COLOR, LINK_COLOR, MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT,
+    NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR, SELECTION_COLOR, STALE_BG,
 };
 
 const MARGIN_WIDTH: f32 = 248.;
@@ -67,6 +67,10 @@ const CARD_OVERSCAN: f32 = 120.;
 /// Gap kept below the selected card when it is clamped to fit the viewport, so
 /// it never sits flush against (or past) the bottom edge.
 const CARD_BOTTOM_MARGIN: f32 = 8.;
+/// How far inside the near edge `reveal_offscreen` lands a revealed anchor —
+/// enough to show the card, small enough that the pill reveals "one more card",
+/// not a whole page (the pagination-feel fix). See `reveal_scroll`.
+const REVEAL_INSET: f32 = 120.;
 /// The prose column's capped width — everything else (centering, the note
 /// lane, the narrow-width left-shift) is measured against it.
 const COL_MAX_WIDTH: f32 = 660.;
@@ -1851,7 +1855,7 @@ impl Editor {
     /// focus-changing action calls this first, so a composer is never stranded
     /// on a deselected card and its draft is never committed to a card the
     /// writer merely clicked. No-op unless a composer is actually open.
-    fn resolve_composer(&mut self, cx: &mut Context<Self>) {
+    fn resolve_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (id, body) = match &self.focus {
             CardFocus::Composing { id, input } => (*id, input.read(cx).content.clone()),
             _ => return,
@@ -1859,30 +1863,36 @@ impl Editor {
         self.doc.set_note_body(id, body);
         self.focus = CardFocus::Selected(id);
         self.mark_dirty();
+        // The composer field just left the tree; hand keyboard control back to
+        // the document so the next keystroke edits prose, not nothing. This is
+        // the SINGLE place a composer exit restores focus — because EVERY exit
+        // funnels through here, a lane click (selecting another card, done/×)
+        // can no longer strand the keyboard the way it did when only
+        // finish_composing refocused. Callers that want a *different* target
+        // (open_composer focuses the new field) just re-focus after us.
+        window.focus(&self.focus_handle, cx);
     }
 
     /// Leave the composer (Enter, Escape, or any focus loss). The draft is
-    /// already the note's text (`resolve_composer`), so there is nothing to
-    /// discard or re-commit — the card stays selected, now showing what was
-    /// written, and focus returns to the document.
+    /// already the note's text and focus is restored by `resolve_composer`, so
+    /// the card just stays selected, now showing what was written.
     fn finish_composing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.resolve_composer(cx);
-        window.focus(&self.focus_handle, cx);
+        self.resolve_composer(window, cx);
         cx.notify();
     }
 
     /// Highlight a card without editing it (AI diagnoses; a note clicked via
     /// its anchor). Resolves any open composer first so the previous note's
     /// draft is saved and its composer never lingers.
-    fn select_card(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.resolve_composer(cx);
+    fn select_card(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_composer(window, cx);
         self.focus = CardFocus::Selected(id);
     }
 
     /// Drop all card selection (a click that hits no anchor). Resolves any
     /// open composer first.
-    fn deselect_card(&mut self, cx: &mut Context<Self>) {
-        self.resolve_composer(cx);
+    fn deselect_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_composer(window, cx);
         self.focus = CardFocus::Idle;
     }
 
@@ -1894,7 +1904,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         // Switching composers: commit the one we're leaving before opening this.
-        self.resolve_composer(cx);
+        self.resolve_composer(window, cx);
         let input = cx.new(|cx| TextField::multiline(cx, body));
         cx.subscribe_in(
             &input,
@@ -1928,10 +1938,16 @@ impl Editor {
         self.focus = CardFocus::Composing { id, input };
     }
 
-    fn set_note_status(&mut self, id: u64, status: NoteStatus, cx: &mut Context<Self>) {
+    fn set_note_status(
+        &mut self,
+        id: u64,
+        status: NoteStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Commit any open draft first (the click may be on this card's own
         // done/×, or on another card while this one composes).
-        self.resolve_composer(cx);
+        self.resolve_composer(window, cx);
         self.doc.set_note_status(id, status);
         if self.focus.active_id() == Some(id) {
             self.focus = CardFocus::Idle;
@@ -4997,47 +5013,43 @@ impl Editor {
         }
     }
 
-    /// Clicking an off-screen-count pill ("N above" / "N below") pages the
-    /// document toward the nearest hidden card in that direction, bringing it
-    /// (and the run past it) into view — the pills look clickable like the rest
-    /// of the lane, so they now do the reasonable thing. The caret is left
-    /// alone; this only scrolls.
-    fn reveal_offscreen(&mut self, below: bool, cx: &mut Context<Self>) {
-        let new_scroll = {
-            let Some(frame) = self.last_frame.as_ref() else {
-                return;
-            };
-            let vp_h = frame.bounds.size.height;
-            let scroll = self.scroll_top;
-            let rope = self.doc.rope();
-            let len = self.doc.len_bytes();
-            // Content-space y of every open note's anchor (pre-scroll).
-            let mut ys: Vec<Pixels> = self
-                .doc
-                .notes()
-                .open()
-                .filter_map(|n| {
-                    let byte = rope
-                        .char_to_byte(n.range.start.min(rope.len_chars()))
-                        .min(len);
-                    frame.position_of(byte, false).map(|p| p.y)
-                })
-                .collect();
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            // The visible band in content space is [scroll, scroll + vp_h]. Land
-            // the target ~80px inside the near edge so it's clearly revealed.
-            let target = if below {
-                ys.into_iter().find(|y| *y > scroll + vp_h).map(|y| y - px(80.))
-            } else {
-                ys.into_iter().rev().find(|y| *y < scroll).map(|y| y - vp_h + px(80.))
-            };
-            target.map(|t| t.clamp(px(0.), frame.max_scroll()))
+    /// Clicking an off-screen pill ("N above" / "N below") reveals the NEAREST
+    /// hidden card in that direction. It reads the SAME `MarginLayout` the pill
+    /// counted — one source of truth, so the count and what the click can reach
+    /// can never diverge (the bug class that left pills dead, or scrolling to a
+    /// door-suppressed non-card). Two reveals, per how the card hid: an anchor
+    /// that scrolled off-screen → scroll JUST enough to bring it to the near edge
+    /// (one more card into view, never a full page); a card packing pushed out
+    /// while its anchor stays on-screen → SELECT it, so the packer's Pass 3
+    /// forces it fully into the lane (scrolling can't help — its anchor already
+    /// shows). Either way, the pill always does something.
+    fn reveal_offscreen(&mut self, below: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
         };
-        if let Some(t) = new_scroll
-            && t != self.scroll_top
-        {
-            self.scroll_top = t;
-            self.selection_popover = false;
+        let vp_h = f32::from(frame.bounds.size.height);
+        let max_scroll = f32::from(frame.max_scroll());
+        let layout = self.margin_cards(true);
+        let refs = if below { layout.below } else { layout.above };
+        // Nearest in the direction: smallest anchor_y for "below" (closest to the
+        // bottom edge), largest for "above" (closest to the top edge).
+        let target = if below {
+            refs.into_iter().min_by(|a, b| a.anchor_y.total_cmp(&b.anchor_y))
+        } else {
+            refs.into_iter().max_by(|a, b| a.anchor_y.total_cmp(&b.anchor_y))
+        };
+        let Some(target) = target else { return };
+        if target.anchor_culled {
+            let t = px(reveal_scroll(target.anchor_y, vp_h, max_scroll, below));
+            if t != self.scroll_top {
+                self.scroll_top = t;
+                self.selection_popover = false;
+                cx.notify();
+            }
+        } else {
+            // Anchor on-screen but packed off: select it so Pass 3 brings the
+            // (now active) card fully into the lane next frame.
+            self.select_card(target.id, window, cx);
             cx.notify();
         }
     }
@@ -5273,14 +5285,21 @@ impl Editor {
                     self.selection_origin = Some(ix..ix);
                     self.set_cursor(ix, affinity, cx);
                 }
-                // Bidirectional activation: clicking inside an anchor
-                // activates its margin card.
+                // Bidirectional activation: clicking inside an anchor activates
+                // its margin card. The click snaps to the nearest caret boundary,
+                // so a click on the trailing half of an anchor's last glyph lands
+                // at `c == end` — still on the visible mark; `note_at_char`
+                // accepts that trailing boundary (without double-claiming when
+                // another anchor starts there), so the whole highlight is live.
                 let c = self.doc.rope().byte_to_char(ix.min(self.doc.len_bytes()));
-                let hit = self
+                let ranges: Vec<(u64, usize, usize)> = self
                     .doc
                     .notes()
                     .open()
-                    .find(|n| n.range.start <= c && c < n.range.end);
+                    .map(|n| (n.id, n.range.start, n.range.end))
+                    .collect();
+                let hit_id = note_at_char(&ranges, c);
+                let hit = hit_id.and_then(|id| self.doc.notes().get(id));
                 // Reaching for a resting diagnosis opens the door (DESIGN
                 // §4.4), so the card it activates is actually on screen.
                 if self.drafting && hit.is_some_and(|n| n.kind == NoteKind::Diagnosis) {
@@ -5289,9 +5308,9 @@ impl Editor {
                 // Clicking the text selects the hit card (or clears selection);
                 // either way it commits and closes any composer first, so a
                 // click into the document never strands an open note editor.
-                match hit.map(|n| n.id) {
-                    Some(id) => self.select_card(id, cx),
-                    None => self.deselect_card(cx),
+                match hit_id {
+                    Some(id) => self.select_card(id, window, cx),
+                    None => self.deselect_card(window, cx),
                 }
             }
             2 => {
@@ -6156,7 +6175,14 @@ fn runs_for_paragraph(
                         });
                         continue;
                     }
-                    let tint = if *active {
+                    // The active band wears its layer's voice: a diagnosis lights
+                    // up cool blue (matching its card + squiggle — the machine is
+                    // pointing here), a writer note warm amber. A resting note
+                    // keeps its faint amber tint; a resting diagnosis took the
+                    // squiggle branch above and never reaches here.
+                    let tint = if *is_diagnosis {
+                        rgba(DIAGNOSIS_TINT_ACTIVE)
+                    } else if *active {
                         rgba(NOTE_TINT_ACTIVE)
                     } else {
                         rgba(NOTE_TINT)
@@ -6171,8 +6197,8 @@ fn runs_for_paragraph(
             for r in matches {
                 if r.start <= w[0] && w[1] <= r.end {
                     content_bg = Some(match content_bg {
-                        Some(bg) => blend_over(rgba(0x7FB8A455), bg),
-                        None => rgba(0x7FB8A455), // sage — distinct from wheat
+                        Some(bg) => blend_over(rgba(FIND_MATCH_BG), bg),
+                        None => rgba(FIND_MATCH_BG), // sage — distinct from wheat
                     });
                 }
             }
@@ -8829,17 +8855,37 @@ struct PreviewDoc {
 struct MarginLayout {
     /// Cards to render — packed and at least partly in view.
     cards: Vec<MarginCard>,
-    /// Open cards hidden above / below the viewport (anchor culled off-screen,
-    /// or pushed out by packing) — surfaced as honest edge counts so a card
-    /// never vanishes without a trace (DESIGN principle 2). Door-held cards are
-    /// NOT counted here; the rail (render_margin_rail) owns those.
-    above: usize,
-    below: usize,
+    /// Open cards hidden above / below the viewport — the SINGLE source of truth
+    /// for both the edge-count pills AND `reveal_offscreen` (so a pill can never
+    /// read "1 below" yet do nothing: the count is `below.len()` and clicking it
+    /// navigates to `below`'s nearest entry). Each carries enough to navigate
+    /// there. A card never vanishes without a trace (DESIGN principle 2).
+    /// Door-held cards are NOT here; the rail (render_margin_rail) owns those.
+    above: Vec<OffscreenRef>,
+    below: Vec<OffscreenRef>,
+}
+
+/// An open card hidden past a viewport edge — enough to NAVIGATE to it, not just
+/// tally it. `anchor_y` is the anchor's content-space y. `anchor_culled`
+/// distinguishes the two ways a card hides, which need different reveals:
+/// `true` = the anchor itself scrolled off-screen → reveal by SCROLLING to it;
+/// `false` = the anchor is on-screen but packing pushed the card out → reveal by
+/// SELECTING it (the packer's Pass 3 then forces the active card into view).
+/// Deriving both pills and reveal from these kills the "count vs. reach computed
+/// from different filters" bug class (the dead-pill + wrong-target findings).
+#[derive(Clone, Copy)]
+struct OffscreenRef {
+    id: u64,
+    anchor_y: f32,
+    anchor_culled: bool,
 }
 
 struct MarginCard {
     id: u64,
     top: f32,
+    /// The anchor's content-space y (scroll-independent) — kept so a card the
+    /// packer later pushes off-screen can still be navigated to by reveal.
+    anchor_y: f32,
     height: f32,
     body: String,
     active: bool,
@@ -8896,16 +8942,19 @@ struct PlaceItem {
 /// Place margin cards in ONE pass and return each card's top (viewport-space),
 /// in input order. Items come in document/anchor order. Three guarantees,
 /// pinned down by the packer proptests:
-///   1. no two cards overlap (`top[i+1] >= top[i] + height[i] + gap`);
+///   1. no two cards overlap, EXCEPT the active card may overlap the neighbour
+///      directly above it — it is painted last, so it sits on top (Pass 3);
 ///   2. every card sits at or below `floor` (never under the titlebar);
 ///   3. the ACTIVE card lies fully within `[floor, viewport_bottom]` whenever
-///      its height fits there and no pinned note occupies the slack above it.
+///      its height fits there — UNCONDITIONALLY, even when a pinned writer note
+///      competes for the slack above it: the focused card wins the lane.
 /// Mechanics: writer notes (Layer A) and the active card hold their anchors;
 /// inactive diagnoses (Layer B) yield around them. The active card's anchor is
 /// first clamped UP so the whole card fits the viewport (the "selected card ran
 /// off the bottom edge" bug). A floor+downward sweep gives the non-overlap
 /// guarantee; a pull-up then slides the rigid run of movable cards above each
-/// pin up into existing slack only — so the non-overlap guarantee survives.
+/// pin up into existing slack only. Pass 3 then re-clamps the active card into
+/// view if a competing pin still pushed it below — the one sanctioned overlap.
 fn place_margin_cards(items: &[PlaceItem], floor: f32, viewport_bottom: f32, gap: f32) -> Vec<f32> {
     let n = items.len();
     // Anchor targets (floored); the active card is clamped up to fit the lane.
@@ -8962,13 +9011,29 @@ fn place_margin_cards(items: &[PlaceItem], floor: f32, viewport_bottom: f32, gap
             limit = top[j];
         }
     }
+    // Pass 3 — the active card MUST be fully in view: it is what the writer is
+    // looking at right now. Passes 1-2 can still strand it below the fold when a
+    // pinned writer note above eats the slack (the old guarantee-3 carve-out).
+    // The focused card wins: re-clamp its top up into [floor, viewport_bottom -
+    // height]. It may now overlap the note above — fine, the active card is
+    // painted last and sits on top (the design's "offset" case, leader tick TBD).
+    if let Some(a) = items.iter().position(|it| it.active) {
+        let ceil = (viewport_bottom - items[a].height - CARD_BOTTOM_MARGIN).max(floor);
+        if top[a] > ceil {
+            top[a] = ceil;
+        }
+    }
     top
 }
 
 /// Where a packed card sits relative to the viewport: rendered (`Shown`), or
-/// rolled into the above/below edge count. The active card always shows (it's
-/// clamped to fit); any other card needs at least one line of itself in view —
-/// the rule that keeps the "N above / N below" counts honest (nothing vanishes).
+/// rolled into the above/below edge count. PURE GEOMETRY — a card shows iff at
+/// least one line of it overlaps the viewport. No `active` special case: the
+/// packer (Pass 3) guarantees the active card is in view, so it shows by
+/// geometry like everything else; and if it somehow can't fit (taller than the
+/// lane) this counts it honestly instead of lying "Shown" while it's off-screen.
+/// That honesty is what keeps the "N above / N below" counts trustworthy
+/// (nothing vanishes) and what reveal_offscreen relies on to find a card.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum CardSlot {
     Shown,
@@ -8976,14 +9041,45 @@ enum CardSlot {
     Below,
 }
 
-fn card_slot(top: f32, height: f32, vp_top: f32, vp_bottom: f32, active: bool) -> CardSlot {
-    if active || (top + height > vp_top + CARD_LINE_H && top < vp_bottom - CARD_LINE_H) {
+fn card_slot(top: f32, height: f32, vp_top: f32, vp_bottom: f32) -> CardSlot {
+    if top + height > vp_top + CARD_LINE_H && top < vp_bottom - CARD_LINE_H {
         CardSlot::Shown
     } else if top + height <= vp_top + CARD_LINE_H {
         CardSlot::Above
     } else {
         CardSlot::Below
     }
+}
+
+/// The scroll offset that brings a card anchored at content-y `anchor_y` to the
+/// NEAR edge of the viewport — just into view, not a page. `below` reveals it at
+/// the bottom edge (anchor lands `REVEAL_INSET` above the bottom, leaving room
+/// for the card), `above` at the top edge. Clamped to the scrollable range.
+/// Pure, so the "pill reveals one more card, never paginates" property is unit-
+/// testable: after a `below` reveal the anchor sits near the BOTTOM, not the top.
+fn reveal_scroll(anchor_y: f32, vp_h: f32, max_scroll: f32, below: bool) -> f32 {
+    let target = if below {
+        anchor_y - vp_h + REVEAL_INSET
+    } else {
+        anchor_y - REVEAL_INSET
+    };
+    target.clamp(0., max_scroll)
+}
+
+/// Which open annotation a click at char index `c` activates, given each open
+/// note's `(id, start, end)` (anchor covers `[start, end)`). A click snaps to
+/// the nearest caret boundary, so a click on the trailing half of the last glyph
+/// lands at `c == end` — still on the painted mark. So: prefer the anchor that
+/// strictly CONTAINS `c`; failing that, accept one that ENDS exactly at `c`. The
+/// containment check runs first, so a back-to-back `[..,c)[c,..)` pair resolves
+/// to the second (it contains `c`) and the trailing fallback never double-claims.
+/// Pure, so the half-glyph trailing-edge dead-zone is a unit test, not a surprise.
+fn note_at_char(ranges: &[(u64, usize, usize)], c: usize) -> Option<u64> {
+    ranges
+        .iter()
+        .find(|(_, s, e)| *s <= c && c < *e)
+        .or_else(|| ranges.iter().find(|(_, _, e)| *e == c))
+        .map(|(id, _, _)| *id)
 }
 
 /// The door (DESIGN §4.4): does this open note surface as a margin card right
@@ -8999,21 +9095,28 @@ impl Editor {
     /// height (the measurement that replaced the `chars/30` estimate). Embedded
     /// newlines and multi-row wraps are summed; empty text is zero.
     fn shape_text_height(window: &Window, text: &str) -> f32 {
-        Self::shape_text_height_w(window, text, CARD_INNER_W)
+        Self::shape_text_height_w(window, text, CARD_INNER_W, false)
     }
 
     /// Wrapped height of `text` at a given inner width, in PT Serif 13 / one
     /// shaped row per painted row. Committed body text wraps at `CARD_INNER_W`;
     /// the live composer wraps at the narrower `COMPOSER_INNER_W` (its box has
-    /// padding), so its reservation matches what it paints.
-    fn shape_text_height_w(window: &Window, text: &str, width: f32) -> f32 {
+    /// padding), so its reservation matches what it paints. `bold` MUST match the
+    /// paint weight: a diagnosis title is painted bold, and bold advances are
+    /// wider, so measuring it normal-weight under-reserves a row at the wrap
+    /// boundary and the next card overlaps it — measure exactly what we paint.
+    fn shape_text_height_w(window: &Window, text: &str, width: f32, bold: bool) -> f32 {
         if text.is_empty() {
             return 0.;
         }
         let s = SharedString::from(text.to_owned());
+        let mut font = gpui::font("PT Serif");
+        if bold {
+            font.weight = FontWeight::BOLD;
+        }
         let run = TextRun {
             len: s.len(),
-            font: gpui::font("PT Serif"),
+            font,
             color: rgb(TEXT_COLOR).into(),
             background_color: None,
             underline: None,
@@ -9035,7 +9138,9 @@ impl Editor {
     /// wrapped body, with at least `min_body_rows` of body/composer room.
     fn measure_card_height(window: &Window, title: &str, body: &str, min_body_rows: f32) -> f32 {
         let body_h = Self::shape_text_height(window, body).max(min_body_rows * CARD_LINE_H);
-        CARD_CHROME_H + Self::shape_text_height(window, title) + body_h
+        // The title is painted BOLD (diagnoses only) — measure it bold to match.
+        let title_h = Self::shape_text_height_w(window, title, CARD_INNER_W, true);
+        CARD_CHROME_H + title_h + body_h
     }
 
     /// Measure-and-cache every open card's height while the window's text system
@@ -9064,7 +9169,7 @@ impl Editor {
                 // the box's own vertical chrome; reserve exactly that so the
                 // growing field never clips or overlaps the card below.
                 let body = live.as_deref().unwrap_or("");
-                let body_h = Self::shape_text_height_w(window, body, COMPOSER_INNER_W)
+                let body_h = Self::shape_text_height_w(window, body, COMPOSER_INNER_W, false)
                     .max(2. * CARD_LINE_H);
                 self.active_card_height = Some(CARD_CHROME_H + body_h + COMPOSER_BOX_CHROME);
                 continue;
@@ -9088,16 +9193,17 @@ impl Editor {
         let Some(frame) = self.last_frame.as_ref() else {
             return MarginLayout {
                 cards: Vec::new(),
-                above: 0,
-                below: 0,
+                above: Vec::new(),
+                below: Vec::new(),
             };
         };
         let rope = self.doc.rope();
         let len = self.doc.len_bytes();
         let mut cards: Vec<MarginCard> = Vec::new();
-        // Open cards hidden above / below the viewport — surfaced as edge counts.
-        let mut above = 0usize;
-        let mut below = 0usize;
+        // Open cards hidden above / below the viewport — surfaced as edge pills
+        // AND navigated by reveal_offscreen (one source of truth).
+        let mut above: Vec<OffscreenRef> = Vec::new();
+        let mut below: Vec<OffscreenRef> = Vec::new();
         // The door (DESIGN §4.4): drafting hides the editor's cards (the
         // writer's own notes stay); reviewing shows them, but suppresses
         // copy-level cards while a developmental one is still open (the
@@ -9111,7 +9217,13 @@ impl Editor {
                 .open()
                 .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
         for n in self.doc.notes().open() {
-            if !note_surfaces(n.kind, &n.level, drafting, has_dev) {
+            // The SELECTED card is exempt from the door: clicking a diagnosis is
+            // an explicit attention act that overrides the altitude-order hold
+            // (and mirrors the anchor-cull exemption below) — otherwise the click
+            // would light the anchor while the card stayed suppressed, a
+            // highlight with no card (the reported "click shows no card" bug).
+            let active = self.focus.active_id() == Some(n.id);
+            if !active && !note_surfaces(n.kind, &n.level, drafting, has_dev) {
                 continue;
             }
             let byte = rope.char_to_byte(n.range.start.min(rope.len_chars())).min(len);
@@ -9121,7 +9233,6 @@ impl Editor {
             let desired =
                 f32::from(frame.bounds.origin.y) + f32::from(pos.y) - f32::from(frame.scroll_top);
             let is_diag = n.kind == NoteKind::Diagnosis;
-            let active = self.focus.active_id() == Some(n.id);
             // Cull to the viewport: a card whose ANCHOR is off-screen doesn't
             // belong in the lane — it would pile at the floor (the scroll-pileup
             // bug) and attribute to nothing visible. The active card is exempt:
@@ -9132,10 +9243,16 @@ impl Editor {
                 && !active
                 && (desired < vp_top - CARD_OVERSCAN || desired > vp_bot + CARD_OVERSCAN)
             {
+                // Anchor itself off-screen → reveal by scrolling to anchor_y.
+                let r = OffscreenRef {
+                    id: n.id,
+                    anchor_y: f32::from(pos.y),
+                    anchor_culled: true,
+                };
                 if desired < vp_top {
-                    above += 1;
+                    above.push(r);
                 } else {
-                    below += 1;
+                    below.push(r);
                 }
                 continue;
             }
@@ -9163,6 +9280,7 @@ impl Editor {
             cards.push(MarginCard {
                 id: n.id,
                 top: desired,
+                anchor_y: f32::from(pos.y),
                 height,
                 body: n.body.clone(),
                 active,
@@ -9198,17 +9316,23 @@ impl Editor {
             return MarginLayout { cards, above, below };
         }
         // Packing can shove an on-screen-anchored card off the bottom (e.g. the
-        // active card pins high and the run below it overflows). Count those too,
+        // active card pins high and the run below it overflows). Record those too,
         // never clip them silently: keep only cards with a real slice in view,
-        // tally the rest as above / below.
+        // and capture the rest as off-screen refs (anchor_culled = false → reveal
+        // by selecting, since their anchor is on-screen and scrolling won't help).
         let vp_top = f32::from(frame.bounds.origin.y);
         let vp_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
         let mut visible = Vec::with_capacity(cards.len());
         for card in cards {
-            match card_slot(card.top, card.height, vp_top, vp_bottom, card.active) {
+            let packed_off = OffscreenRef {
+                id: card.id,
+                anchor_y: card.anchor_y,
+                anchor_culled: false,
+            };
+            match card_slot(card.top, card.height, vp_top, vp_bottom) {
                 CardSlot::Shown => visible.push(card),
-                CardSlot::Above => above += 1,
-                CardSlot::Below => below += 1,
+                CardSlot::Above => above.push(packed_off),
+                CardSlot::Below => below.push(packed_off),
             }
         }
         MarginLayout {
@@ -9712,9 +9836,10 @@ impl Editor {
             above,
             below,
         } = self.margin_cards(true);
-        if cards.is_empty() && above == 0 && below == 0 {
+        if cards.is_empty() && above.is_empty() && below.is_empty() {
             return None;
         }
+        let (above_n, below_n) = (above.len(), below.len());
         let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
         // A quiet pill at a lane edge when cards are hidden past it — the honest
         // "there's more here, it didn't vanish" cue (DESIGN principle 2).
@@ -9751,25 +9876,25 @@ impl Editor {
         // The off-screen-count pills are clickable (issue 2): a click pages the
         // document toward the nearest hidden card that way. Built before the
         // container so each `cx.listener` borrow is its own statement.
-        let above_chip = (above > 0).then(|| {
-            edge_chip(format!("{above} above"), false)
+        let above_chip = (above_n > 0).then(|| {
+            edge_chip(format!("{above_n} above"), false)
                 .cursor(CursorStyle::PointingHand)
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        editor.reveal_offscreen(false, cx);
+                        editor.reveal_offscreen(false, window, cx);
                     }),
                 )
         });
-        let below_chip = (below > 0).then(|| {
-            edge_chip(format!("{below} below"), true)
+        let below_chip = (below_n > 0).then(|| {
+            edge_chip(format!("{below_n} below"), true)
                 .cursor(CursorStyle::PointingHand)
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        editor.reveal_offscreen(true, cx);
+                        editor.reveal_offscreen(true, window, cx);
                     }),
                 )
         });
@@ -9781,11 +9906,10 @@ impl Editor {
                 .bottom_0()
                 .left(px(lane_left))
                 .w(px(MARGIN_WIDTH))
-                // The margin lane is part of the document surface (issue 3):
-                // scrolling over it scrolls the document, like the prose column.
-                // Only the prose element caught the wheel before; the panels
-                // still stop_propagation, so they stay unaffected.
-                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                // Scroll is handled once at the document root (see `render`): a
+                // wheel anywhere over the document surface — prose, gutters, this
+                // lane, the whitespace beyond it — scrolls the one document. No
+                // per-element wheel handler here (it would double-fire via bubble).
                 .children(cards.into_iter().map(|card| {
                     let MarginCard {
                         id,
@@ -9866,7 +9990,7 @@ impl Editor {
                                     }
                                 } else if editor.focus.active_id() != Some(id) {
                                     // A diagnosis only ever gets selected.
-                                    editor.select_card(id, cx);
+                                    editor.select_card(id, window, cx);
                                     cx.notify();
                                 }
                             }),
@@ -9892,12 +10016,13 @@ impl Editor {
                                                     cx.listener(
                                                         move |editor,
                                                               _: &MouseDownEvent,
-                                                              _,
+                                                              window,
                                                               cx| {
                                                             cx.stop_propagation();
                                                             editor.set_note_status(
                                                                 id,
                                                                 NoteStatus::Done,
+                                                                window,
                                                                 cx,
                                                             );
                                                         },
@@ -9915,12 +10040,13 @@ impl Editor {
                                                     cx.listener(
                                                         move |editor,
                                                               _: &MouseDownEvent,
-                                                              _,
+                                                              window,
                                                               cx| {
                                                             cx.stop_propagation();
                                                             editor.set_note_status(
                                                                 id,
                                                                 NoteStatus::Dismissed,
+                                                                window,
                                                                 cx,
                                                             );
                                                         },
@@ -10226,9 +10352,9 @@ impl Editor {
                                     .hover(|d| d.text_color(rgb(TEXT_COLOR)))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
                                             cx.stop_propagation();
-                                            editor.set_note_status(id, NoteStatus::Done, cx);
+                                            editor.set_note_status(id, NoteStatus::Done, window, cx);
                                         }),
                                     )
                                     .child("done"),
@@ -10240,9 +10366,9 @@ impl Editor {
                                     .hover(|d| d.text_color(rgb(TEXT_COLOR)))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
                                             cx.stop_propagation();
-                                            editor.set_note_status(id, NoteStatus::Dismissed, cx);
+                                            editor.set_note_status(id, NoteStatus::Dismissed, window, cx);
                                         }),
                                     )
                                     .child("×"),
@@ -10350,6 +10476,14 @@ impl Render for Editor {
                     editor.light_dismiss(window, cx);
                 }),
             )
+            // One scroll handler for the WHOLE document surface (issue: scroll
+            // only worked over the prose). "Everything that isn't a panel is one
+            // scrollable document": prose, both gutters, the margin lane and the
+            // whitespace beyond it all live under this root, so a wheel anywhere
+            // bubbles here and scrolls. Panels (omnibox/settings/shortcuts/narrow
+            // notes) stop_propagation on their own wheel — and on_scroll_wheel
+            // early-returns while one is open — so they stay unaffected.
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(self.render_titlebar(cx))
             .child(
                 div()
@@ -10466,7 +10600,9 @@ impl Render for Editor {
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
-                    .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                    // Scroll lives on the root `content` (one handler for the
+                    // whole document surface — see below); not here, or it would
+                    // double-fire as the event bubbles up.
                     .on_drop(cx.listener(Self::on_file_drop))
                             // History recentres/rewraps in the remaining width;
                             // otherwise the column takes its width-only measure.
@@ -10718,7 +10854,10 @@ mod tests {
 
     proptest! {
         // INV1 (no overlap) + INV2 (every card at/below the floor): hold for ANY
-        // stack — notes, diagnoses, an active card, any mix.
+        // stack — notes, diagnoses, an active card, any mix. The ONE exception:
+        // the active card may overlap the neighbour directly above it (Pass 3
+        // pulls it up to win the lane; it is painted on top), so that single pair
+        // is excused — every other pair must still clear.
         #[test]
         fn packed_cards_never_overlap_and_clear_the_floor(
             raw in proptest::collection::vec((0f32..3000., 20f32..400., any::<bool>()), 0..12usize),
@@ -10740,7 +10879,9 @@ mod tests {
             let tops = place_margin_cards(&items, PACK_FLOOR, PACK_VP_BOTTOM, PACK_GAP);
             for i in 0..tops.len() {
                 prop_assert!(tops[i] >= PACK_FLOOR - 0.01, "card {i} above floor");
-                if i + 1 < tops.len() {
+                // Skip the pair whose LOWER card is the active one: it is allowed
+                // to overlap the card above (the sanctioned active-card overlap).
+                if i + 1 < tops.len() && !items[i + 1].active {
                     prop_assert!(
                         tops[i + 1] + 0.01 >= tops[i] + items[i].height + PACK_GAP,
                         "cards {i}/{} overlap", i + 1
@@ -10749,13 +10890,14 @@ mod tests {
             }
         }
 
-        // INV3: the SELECTED card is fully within the viewport in the realistic
-        // diagnosis-only case (no writer note pinned in the slack above it) when
-        // its height fits the lane. This is the bug Kirill caught by eye — a tall
-        // active card anchored to the last sentence ran off the bottom edge.
+        // INV3 (strengthened): the SELECTED card is ALWAYS fully within the
+        // viewport when its own height fits the lane — even when writer notes are
+        // pinned in the slack above it (the bug class: a tall low-anchored note
+        // above the chosen diagnosis used to shove it off the bottom, and the
+        // count lied "Shown"). `is_note` pins now compete; Pass 3 must still win.
         #[test]
         fn selected_card_stays_fully_in_view(
-            cards in proptest::collection::vec((0f32..3000., 20f32..100.), 1..5usize),
+            cards in proptest::collection::vec((0f32..3000., 20f32..100., any::<bool>()), 1..6usize),
             active_sel in 0usize..64,
         ) {
             let n = cards.len();
@@ -10763,21 +10905,19 @@ mod tests {
             let mut items: Vec<PlaceItem> = cards
                 .iter()
                 .enumerate()
-                .map(|(i, &(anchor, height))| PlaceItem {
+                .map(|(i, &(anchor, height, is_note))| PlaceItem {
                     anchor,
                     height,
-                    pin: i == active, // diagnosis-only: the only pin is the active card
+                    pin: is_note || i == active, // writer notes compete for the slack
                     active: i == active,
                 })
                 .collect();
             items.sort_by(|a, b| a.anchor.total_cmp(&b.anchor));
             let active = items.iter().position(|it| it.active).unwrap();
             let h = items[active].height;
-            // The selected card is guaranteed fully in view when the whole stack
-            // fits the lane (the design's target under the ≤7 visible cap);
-            // over-crowding past that is Phase 4/5 territory, not the packer's.
-            let total: f32 = items.iter().map(|it| it.height + PACK_GAP).sum();
-            prop_assume!(total <= PACK_VP_BOTTOM - PACK_FLOOR);
+            // The guarantee holds whenever the active card itself fits the lane —
+            // no "whole stack fits" / "no competing pin" caveat anymore.
+            prop_assume!(h <= PACK_VP_BOTTOM - PACK_FLOOR - CARD_BOTTOM_MARGIN);
             let tops = place_margin_cards(&items, PACK_FLOOR, PACK_VP_BOTTOM, PACK_GAP);
             prop_assert!(tops[active] >= PACK_FLOOR - 0.01, "active card under the floor");
             prop_assert!(
@@ -10786,29 +10926,75 @@ mod tests {
             );
         }
 
-        // Card visibility: the selected card always shows; any card counted in
-        // an edge bucket is genuinely off that edge — so "N above / N below"
-        // never hides an on-screen card nor claims an off-screen one (Exhibit B).
+        // Card visibility is PURE GEOMETRY and honest: a card counted Above/Below
+        // is genuinely off that edge; a Shown card genuinely overlaps the
+        // viewport — so "N above / N below" never hides an on-screen card nor
+        // claims an off-screen one. No active special case: the packer forces the
+        // active card into view, so geometry alone decides (see card_slot).
         #[test]
         fn card_visibility_is_honest(
             top in -1500f32..1500.,
             height in 10f32..300.,
-            active in any::<bool>(),
         ) {
             let (vp_top, vp_bottom) = (44f32, 800f32);
-            let slot = card_slot(top, height, vp_top, vp_bottom, active);
-            if active {
-                prop_assert_eq!(slot, CardSlot::Shown, "the selected card always shows");
-            }
-            match slot {
+            match card_slot(top, height, vp_top, vp_bottom) {
                 CardSlot::Shown => prop_assert!(
-                    active || (top + height > vp_top && top < vp_bottom),
+                    top + height > vp_top && top < vp_bottom,
                     "a Shown card overlaps the viewport"
                 ),
                 CardSlot::Above => prop_assert!(top + height <= vp_top + CARD_LINE_H),
                 CardSlot::Below => prop_assert!(top >= vp_bottom - CARD_LINE_H),
             }
         }
+
+        // reveal_scroll lands the revealed anchor at the NEAR edge, not a page
+        // away (the "pill paginates instead of bringing one more into view" bug).
+        // A below-reveal puts the anchor near the BOTTOM; an above-reveal near the
+        // TOP — REVEAL_INSET from the edge, never ~a viewport away.
+        #[test]
+        fn reveal_scroll_lands_at_the_near_edge(
+            anchor_y in 0f32..5000.,
+            vp_h in 200f32..1200.,
+            max_scroll in 0f32..5000.,
+            below in any::<bool>(),
+        ) {
+            let s = reveal_scroll(anchor_y, vp_h, max_scroll, below);
+            prop_assert!(s >= -0.01 && s <= max_scroll + 0.01, "scroll within range");
+            let unclamped = if below {
+                anchor_y - vp_h + REVEAL_INSET
+            } else {
+                anchor_y - REVEAL_INSET
+            };
+            // When the ideal target isn't clamped, the anchor lands exactly
+            // REVEAL_INSET from the near edge (bottom for below, top for above).
+            if unclamped >= 0. && unclamped <= max_scroll {
+                let anchor_vp = anchor_y - s; // anchor's y within the viewport
+                let want = if below { vp_h - REVEAL_INSET } else { REVEAL_INSET };
+                prop_assert!(
+                    (anchor_vp - want).abs() < 0.01,
+                    "revealed anchor at {anchor_vp}, wanted near-edge {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn note_at_char_accepts_the_trailing_boundary() {
+        // Anchor [2,6): inside hits, and so does the trailing boundary c==6 (a
+        // click on the right half of the last glyph snaps there) — the bug was
+        // the strict `< end` test missing it. Outside still misses.
+        let one = [(7u64, 2usize, 6usize)];
+        assert_eq!(note_at_char(&one, 2), Some(7)); // leading boundary
+        assert_eq!(note_at_char(&one, 4), Some(7)); // interior
+        assert_eq!(note_at_char(&one, 6), Some(7)); // trailing boundary (was a dead zone)
+        assert_eq!(note_at_char(&one, 7), None); // past the end
+        assert_eq!(note_at_char(&one, 1), None); // before the start
+        // Back-to-back anchors [2,6)[6,9): the shared boundary belongs to the
+        // SECOND (it contains 6), so the trailing fallback never double-claims.
+        let pair = [(7u64, 2, 6), (8u64, 6, 9)];
+        assert_eq!(note_at_char(&pair, 6), Some(8));
+        assert_eq!(note_at_char(&pair, 9), Some(8)); // the second's own trailing boundary
+        assert_eq!(note_at_char(&[], 0), None);
     }
 
     #[test]

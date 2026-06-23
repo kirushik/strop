@@ -37,8 +37,10 @@ confusion) and terracotta (collides with our amber; it's Claude's own brand).
 | Structure (rules, borders, secondary text) | **muted taupe** | `RULE_COLOR`, `MUTED_COLOR` |
 | Achieved goal | **sage** | `SAGE_COLOR` |
 | Error / destructive (only) | **red** | `ERROR` |
-| Text selection (prose) | blue *(mechanic, see tradeoff)* | `SELECTION_COLOR` |
-| Search-match | yellow *(mechanic)* | `HIGHLIGHT_COLOR` |
+| AI diagnosis, ACTIVE anchor | **cool blue** band | `DIAGNOSIS_TINT_ACTIVE` |
+| Text selection (prose & field) | **warm amber** *(the writer acting)* | `SELECTION_COLOR`, `FIELD_SELECTION_BG` |
+| Writer's `==highlight==` mark | yellow *(mechanic)* | `HIGHLIGHT_COLOR` |
+| Search-match / diff-insert | sage *(mechanic)* | `FIND_MATCH_BG` |
 | Hyperlink | cool blue + underline | `LINK_COLOR` |
 | Inline code | neutral chip | `CODE_BG_COLOR` |
 
@@ -76,13 +78,23 @@ test feedback now prefixes ✓ / ✗; the history voice-anomaly stopped using re
 (it's a descriptive flag, not an error — the "Nσ outside your range" text
 carries it).
 
-## One open tradeoff (decide later)
+## Resolved 2026-06-23: selection is warm, blue is the machine's alone
 
-The research recommends **amber text-selection** (so blue is *exclusively* the
-machine's), overriding the OS-blue selection habit. We kept prose
-`SELECTION_COLOR` blue for now — changing a universal selection color is a habit
-change worth deciding deliberately. The in-*field* selection is already amber
-(`FIELD_SELECTION_BG`), so the two diverge until this is resolved.
+The earlier-open tradeoff is decided. Prose `SELECTION_COLOR` is now **warm amber**
+(matching the in-field `FIELD_SELECTION_BG`): selecting text is *the writer acting
+on the page*, so it wears the human's warm hand. That frees **cool blue to mean
+exclusively "the machine"** — the AI card wash, the squiggle, and the new
+`DIAGNOSIS_TINT_ACTIVE` band that an AI-commented anchor now shows when selected
+(it used to fall through to the warm amber note tint — the bug that broke the
+warm/cool axis exactly when a diagnosis was engaged).
+
+**Why we could just decide it (the "is OS selection blue?" question).** Nothing
+reads an OS selection colour, and nothing can: the prose canvas is a fully
+self-drawn GPUI element, so its selection rectangle is *our* `SELECTION_COLOR`,
+not a native widget's. gpui exposes no system selection/accent colour either —
+its `Colors` palette is a hardcoded light/dark default (`selected = 0x2a63d9`),
+flipped only by appearance, never sampled from the OS. So there was never an OS
+blue to collide with or to read; we own the colour outright and chose warm.
 
 ## Deferred (incidental chrome, not yet promoted)
 

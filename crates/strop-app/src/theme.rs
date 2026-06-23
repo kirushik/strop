@@ -26,11 +26,24 @@
 //!   rules (`RULE_COLOR`). Habit: *greyed = not sure / not load-bearing.*
 //! - **Sage = achieved** (`SAGE_COLOR`); **red = error** (`ERROR`), nothing else.
 //!
-//! `SELECTION_COLOR` (blue) and `HIGHLIGHT_COLOR` (yellow) are plain editor
-//! mechanics in the prose canvas; `LINK`/`CODE_BG` are structural. Incidental
-//! chrome (panel fills, hover overlays) is not yet promoted here — see the doc's
-//! "deferred" list. When you reach for a new color, first ask which meaning it
+//! `SELECTION_COLOR` is warm amber (selecting text is the *writer* acting — see
+//! its note); `HIGHLIGHT_COLOR` (yellow) is the writer's `==highlight==` mark and
+//! `FIND_MATCH_BG` (sage) the search/diff preview; `LINK`/`CODE_BG` are
+//! structural. When you reach for a new color, first ask which meaning it
 //! belongs to; add a new meaning only deliberately.
+//!
+//! **What is NOT here (deliberately, 2026-06-23).** Incidental *chrome* colors —
+//! panel/drawer fills, hover/selected/modal overlays, pill and action-button
+//! fills — are left inline at their use sites, NOT promoted to tokens. They
+//! encode interaction *state* (a surface, a hover), not one of the four content
+//! meanings above, so pulling them here would dilute the vocabulary. Roster, so
+//! the next person knows where they live and why: panel fills `0xF4F1EA`/
+//! `0xFCFAF4`, pills `0xF7F5EF`, action buttons `0xE8DFC8`/`0xDFD3B0`, and the
+//! interactive overlays `rgba(0x1A1A18, 12/0A/30)` (selected / hover / modal
+//! scrim). Promote them to e.g. `PANEL_BG`/`HOVER_OVERLAY` only if a second
+//! regime forces a real choice. Also pending: `MUTED_COLOR` as *small text* is
+//! ~3.5:1 (below AA); a future `MUTED_TEXT` (~`0x6E6B61`) should split text from
+//! rules. Full rationale + contrast math: `docs/color-language.md`.
 //!
 //! Values are `0xRRGGBB` or `0xRRGGBBAA` (alpha when translucent), the form
 //! gpui's `rgb()` / `rgba()` take. Card tints are verified AAA against
@@ -74,6 +87,12 @@ pub const STALE_BG: u32 = 0xEFEEEA;
 /// text, 6.48:1 vs page / 6.06:1 on the AI wash). The legible "machine voice"
 /// against the writer's warm amber.
 pub const AI_ACCENT: u32 = 0x3D5C8C;
+/// The in-text highlight band of an ACTIVE diagnosis anchor: a translucent cool
+/// blue, the machine-voice counterpart to the writer's warm `NOTE_TINT_ACTIVE`.
+/// A resting diagnosis wears only the squiggle; selecting/activating it promotes
+/// to this blue band (matching its card + squiggle) — so blue is, consistently,
+/// "the AI is pointing here", never the warm amber the writer's own notes use.
+pub const DIAGNOSIS_TINT_ACTIVE: u32 = 0x86B0E64D;
 
 // --- Warm amber: the writer & active engagement --------------------------
 
@@ -103,10 +122,23 @@ pub const ERROR: u32 = 0xB23B2E;
 
 // --- Editor mechanics (not part of the semantic vocabulary) --------------
 
-/// Prose text selection (the OS-idiom blue), translucent.
-pub const SELECTION_COLOR: u32 = 0xB4D5FE88;
-/// Find / search match highlight (yellow), translucent.
+/// Prose text selection: warm amber, translucent — the SAME family as the
+/// in-field selection (`FIELD_SELECTION_BG`) and the active-note tint, because
+/// selecting text is *the writer acting on the page* (warm = human). This is a
+/// deliberate departure from the OS-idiom blue: it frees cool blue to mean
+/// *exclusively* "the machine" (AI cards, squiggles, `DIAGNOSIS_TINT_ACTIVE`).
+/// We can do this freely because nothing reads an OS selection color — the prose
+/// canvas is fully self-drawn and gpui exposes no system selection/accent color
+/// (its `Colors` is a hardcoded light/dark default, not OS-derived).
+pub const SELECTION_COLOR: u32 = 0xC8A95166;
+/// Markdown `==highlight==` inline-attribute background (yellow), translucent —
+/// the writer's own emphasis mark. NOT the find/search color (that's
+/// `FIND_MATCH_BG`); the two were conflated in an earlier docstring.
 pub const HIGHLIGHT_COLOR: u32 = 0xF9E29CAA;
+/// Find / search match (and history diff-insert) tint: a translucent sage,
+/// deliberately distinct from the warm wheat of selection/notes so a live search
+/// preview never reads as a selection or an annotation anchor.
+pub const FIND_MATCH_BG: u32 = 0x7FB8A455;
 /// Inline-code background tint.
 pub const CODE_BG_COLOR: u32 = 0x1A1A1814;
 /// Hyperlink ink (AA text, 6.80:1) — cool, shares the machine-voice family
