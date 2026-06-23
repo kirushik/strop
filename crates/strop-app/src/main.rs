@@ -267,6 +267,15 @@ fn main() {
                     // macOS it makes the system titlebar transparent so our
                     // chrome shows through. Linux/Wayland CSD ignores it.
                     appears_transparent: true,
+                    // macOS KEEPS its native traffic-light buttons (we hide our
+                    // own redundant controls there — see render_titlebar). With
+                    // `appears_transparent` + full-size content view the lights
+                    // otherwise sit at the very top-left and overlap our chrome.
+                    // Recentre them in the 36px bar: y=11 vertically centres the
+                    // ~14px buttons; render_titlebar insets the bar's left
+                    // content past them. (No-op on other platforms.)
+                    #[cfg(target_os = "macos")]
+                    traffic_light_position: Some(gpui::point(px(20.), px(11.))),
                     ..Default::default()
                 }),
                 focus: !smoke,
@@ -276,11 +285,22 @@ fn main() {
                 // window with neither (GNOME Wayland does no server-side
                 // decorations — the H2 "can't resize by dragging" bug).
                 window_decorations: Some(WindowDecorations::Client),
-                // Transparent surface so the CSD shadow gutter (editor.rs:
-                // render) shows through on the untiled edges. Opaque platforms
-                // (macOS/Windows/X11/SSD) ignore the gutter and the OS draws
-                // the shadow; this only affects the Wayland CSD path.
-                window_background: WindowBackgroundAppearance::Transparent,
+                // Transparent surface ONLY where the CSD shadow gutter
+                // (editor.rs: render) must show through — the Linux client-side-
+                // decoration path (GNOME/sway Wayland draw no server shadow).
+                // macOS and Windows draw their own (server-side) shadow and want
+                // an OPAQUE layer. This matters on macOS specifically: a
+                // transparent CAMetalLayer disables gpui's direct-to-display fast
+                // path and routes every frame through the window server's alpha
+                // compositor for no benefit (we cover the whole window with an
+                // opaque background quad anyway). The author's own note below
+                // already assumed these platforms were opaque — the code just
+                // never made it conditional.
+                window_background: if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                    WindowBackgroundAppearance::Transparent
+                } else {
+                    WindowBackgroundAppearance::Opaque
+                },
                 ..Default::default()
             },
             |window, cx| {
@@ -317,6 +337,17 @@ fn main() {
                     editor
                 });
                 window.focus(&editor.focus_handle(cx), cx);
+                // Single-window app: route every OS-driven close to quit, so
+                // `on_app_quit` (below) flushes the document + exit state. This
+                // matters on macOS, where the native traffic-light close is now
+                // the only window control (we hide our own there) and macOS does
+                // NOT terminate an app on last-window-close by default; it also
+                // covers Alt-F4 / window-manager closes elsewhere. Our own "×"
+                // (non-macOS) already calls cx.quit() directly.
+                window.on_window_should_close(cx, |_, cx| {
+                    cx.quit();
+                    true
+                });
                 editor
             },
         )
