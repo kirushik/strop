@@ -269,6 +269,21 @@ impl TextField {
         }
     }
 
+    /// Introspection for the smoke rig: the field's key context, and its caret +
+    /// selection as CHAR indices (so a test can assert selection rather than
+    /// eyeball it). Char indices, not bytes, so multibyte content reads cleanly.
+    pub(crate) fn debug_caret(&self) -> (&'static str, usize, [usize; 2]) {
+        let r = self.sel_range();
+        (
+            self.key_context,
+            byte_to_char_idx(&self.content, self.cursor),
+            [
+                byte_to_char_idx(&self.content, r.start),
+                byte_to_char_idx(&self.content, r.end),
+            ],
+        )
+    }
+
     /// The display string: real content, except a masked field shows dots for
     /// all but the last 4 chars. Shared by measurement and paint so they agree.
     fn display_content(&self) -> String {
