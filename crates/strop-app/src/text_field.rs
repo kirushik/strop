@@ -209,9 +209,69 @@ pub struct TextField {
 }
 
 /// What the field painted last frame, enough to map a point ↔ a caret index.
+/// The multiline composer is a STACK of hard lines (split on `\n`); each hard
+/// line soft-wraps within the box on its own. `Wrapped` carries one row per
+/// hard line so the caret, clicks, and vertical motion map across them — the
+/// single-line-only mapping was the "Shift+Enter jumps to line 0" bug.
 enum FieldGeometry {
     Single(gpui::ShapedLine),
-    Wrapped(Arc<gpui::WrappedLineLayout>),
+    Wrapped(Vec<WrappedRow>),
+}
+
+/// One hard line ("\n"-delimited) of the multiline composer, as painted.
+struct WrappedRow {
+    /// The shaped layout for this hard line (it may itself soft-wrap).
+    layout: Arc<gpui::WrappedLineLayout>,
+    /// Display-byte offset where this hard line begins in the content.
+    start: usize,
+    /// Y offset of this row's top within the field. (A point lands in the last
+    /// row whose `top` is at or above it — heights need not be stored.)
+    top: Pixels,
+}
+
+/// Byte offsets where each hard line ("\n"-delimited) begins. `len() ==
+/// number of `\n` + 1`, matching how `shape_text` splits — so the shaped
+/// lines align index-for-index with these starts.
+fn hard_line_starts(s: &str) -> Vec<usize> {
+    let mut v = vec![0];
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            v.push(i + 1);
+        }
+    }
+    v
+}
+
+/// Map a display-byte offset to its (x, y) within the wrapped composer.
+fn wrapped_position(rows: &[WrappedRow], disp_byte: usize, line_height: Pixels) -> Point<Pixels> {
+    if rows.is_empty() {
+        return point(px(0.), px(0.));
+    }
+    let i = rows.iter().rposition(|r| r.start <= disp_byte).unwrap_or(0);
+    let row = &rows[i];
+    let p = row
+        .layout
+        .position_for_index(disp_byte - row.start, line_height)
+        .unwrap_or_default();
+    point(p.x, row.top + p.y)
+}
+
+/// Map a field-local point to the nearest display-byte across the wrapped rows.
+fn wrapped_byte_at(rows: &[WrappedRow], pt: Point<Pixels>, line_height: Pixels) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let i = rows
+        .iter()
+        .rposition(|r| pt.y >= r.top)
+        .unwrap_or(0)
+        .min(rows.len() - 1);
+    let row = &rows[i];
+    let local = row
+        .layout
+        .closest_index_for_position(point(pt.x, pt.y - row.top), line_height)
+        .unwrap_or_else(|e| e);
+    row.start + local
 }
 
 pub enum TextFieldEvent {
@@ -391,16 +451,11 @@ impl TextField {
     fn move_vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
         let line_height = px(CARD_LINE_H);
         let target = match &self.geometry {
-            Some(FieldGeometry::Wrapped(layout)) => {
-                let disp_byte = self.cursor_display_byte();
-                let here = layout
-                    .position_for_index(disp_byte, line_height)
-                    .unwrap_or_default();
+            Some(FieldGeometry::Wrapped(rows)) if !rows.is_empty() => {
+                let here = wrapped_position(rows, self.cursor_display_byte(), line_height);
                 let dy = if down { line_height } else { -line_height };
                 let probe = point(here.x, (here.y + dy).max(px(0.)));
-                let disp = layout
-                    .closest_index_for_position(probe, line_height)
-                    .unwrap_or_else(|e| e);
+                let disp = wrapped_byte_at(rows, probe, line_height);
                 self.display_byte_to_cursor(disp)
             }
             // Single-line (or no geometry): up→start, down→end.
@@ -447,10 +502,10 @@ impl TextField {
     fn byte_at_local(&self, local: Point<Pixels>) -> Option<usize> {
         let disp = match &self.geometry {
             Some(FieldGeometry::Single(line)) => line.closest_index_for_x(local.x),
-            Some(FieldGeometry::Wrapped(layout)) => layout
-                .closest_index_for_position(local, px(CARD_LINE_H))
-                .unwrap_or_else(|e| e),
-            None => return None,
+            Some(FieldGeometry::Wrapped(rows)) if !rows.is_empty() => {
+                wrapped_byte_at(rows, local, px(CARD_LINE_H))
+            }
+            _ => return None,
         };
         Some(self.display_byte_to_cursor(disp))
     }
@@ -956,7 +1011,8 @@ impl TextFieldElement {
 /// soft-wrapped block that paints across rows (the note composer).
 enum ComposerLayout {
     Single(Option<gpui::ShapedLine>),
-    Wrapped(Option<WrappedLine>),
+    /// One shaped `WrappedLine` per hard line ("\n"-delimited), top to bottom.
+    Wrapped(Vec<WrappedLine>),
 }
 
 /// Paint the selection highlight across the wrapped rows it spans: one rect per
@@ -1094,8 +1150,10 @@ impl Element for TextFieldElement {
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
         if multiline {
-            // Soft-wrap at the box width: one WrappedLine that paints across rows.
-            let line = window
+            // Soft-wrap at the box width. `shape_text` returns ONE WrappedLine
+            // per hard line ("\n"-delimited) — keep them ALL (the old code took
+            // only the first, dropping every line after a Shift+Enter).
+            let lines = window
                 .text_system()
                 .shape_text(
                     SharedString::from(content),
@@ -1104,9 +1162,9 @@ impl Element for TextFieldElement {
                     Some(bounds.size.width),
                     None,
                 )
-                .ok()
-                .and_then(|mut lines| (!lines.is_empty()).then(|| lines.remove(0)));
-            ComposerLayout::Wrapped(line)
+                .map(|lines| lines.into_iter().collect())
+                .unwrap_or_default();
+            ComposerLayout::Wrapped(lines)
         } else {
             ComposerLayout::Single(Some(window.text_system().shape_line(
                 SharedString::from(content),
@@ -1138,13 +1196,14 @@ impl Element for TextFieldElement {
         let focused = focus_handle.is_focused(window);
         // Caret + selection are read from the field, mapped into the display
         // string (masked: dots ≠ real bytes).
-        let (cursor_db, sel_db, has_sel) = {
+        let (cursor_db, sel_db, has_sel, display) = {
             let input = self.input.read(cx);
             let r = input.sel_range();
             (
                 input.cursor_display_byte(),
                 input.real_to_display_byte(r.start)..input.real_to_display_byte(r.end),
                 input.has_selection(),
+                input.display_content(),
             )
         };
         let sel_color = rgba(FIELD_SELECTION_BG); // the active-card gold, translucent
@@ -1178,31 +1237,41 @@ impl Element for TextFieldElement {
                 self.store_geometry(FieldGeometry::Single(line), cx);
                 self.register_mouse(bounds, origin, window);
             }
-            ComposerLayout::Wrapped(line) => {
+            ComposerLayout::Wrapped(lines) => {
                 let origin = bounds.origin;
-                let Some(line) = line.take() else {
-                    // Empty field: caret at the box origin, store nothing usable.
-                    if focused {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                origin + point(px(0.), px(2.)),
-                                size(px(1.5), line_height - px(4.)),
-                            ),
-                            rgb(TEXT_COLOR),
-                        ));
+                // Stack the hard lines top to bottom, each soft-wrapping on its
+                // own. Build the row map as we paint so the caret, selection,
+                // clicks, and vertical motion all address the full stack.
+                let starts = hard_line_starts(&display);
+                let mut rows: Vec<WrappedRow> = Vec::with_capacity(lines.len());
+                let mut y = px(0.);
+                for (i, line) in lines.iter().enumerate() {
+                    let start = starts.get(i).copied().unwrap_or(0);
+                    let row_len = line.len();
+                    let h = line.size(line_height).height.max(line_height);
+                    let row_origin = origin + point(px(0.), y);
+                    if has_sel {
+                        // The slice of the selection that falls in this hard line.
+                        let s = sel_db.start.clamp(start, start + row_len);
+                        let e = sel_db.end.clamp(start, start + row_len);
+                        if e > s {
+                            paint_wrapped_selection(
+                                window,
+                                line,
+                                row_origin,
+                                line_height,
+                                &((s - start)..(e - start)),
+                                sel_color,
+                            );
+                        }
                     }
-                    self.register_mouse(bounds, origin, window);
-                    return;
-                };
-                let caret = line
-                    .position_for_index(cursor_db, line_height)
-                    .unwrap_or_default();
-                if has_sel {
-                    paint_wrapped_selection(window, &line, origin, line_height, &sel_db, sel_color);
+                    line.paint(row_origin, line_height, TextAlign::Left, None, window, cx)
+                        .ok();
+                    rows.push(WrappedRow { layout: Arc::clone(line), start, top: y });
+                    y += h;
                 }
-                line.paint(origin, line_height, TextAlign::Left, None, window, cx)
-                    .ok();
                 if focused {
+                    let caret = wrapped_position(&rows, cursor_db, line_height);
                     window.paint_quad(fill(
                         Bounds::new(
                             origin + caret + point(px(0.), px(2.)),
@@ -1211,7 +1280,7 @@ impl Element for TextFieldElement {
                         rgb(TEXT_COLOR),
                     ));
                 }
-                self.store_geometry(FieldGeometry::Wrapped(Arc::clone(&line)), cx);
+                self.store_geometry(FieldGeometry::Wrapped(rows), cx);
                 self.register_mouse(bounds, origin, window);
             }
         }
@@ -1277,6 +1346,21 @@ mod tests {
         assert_eq!(utf16_to_byte(s, 3), 5);
         assert_eq!(byte_to_char_idx(s, 5), 2); // 'a','🜂' = 2 chars before byte 5
         assert_eq!(char_idx_to_byte(s, 2), 5);
+    }
+
+    #[test]
+    fn hard_line_starts_align_with_split() {
+        // One start per "\n"-segment (matching how shape_text splits), each at
+        // the byte just after the preceding newline.
+        assert_eq!(hard_line_starts(""), vec![0]);
+        assert_eq!(hard_line_starts("abc"), vec![0]);
+        assert_eq!(hard_line_starts("ab\ncd"), vec![0, 3]);
+        // Trailing newline and an empty middle line each still get a start.
+        assert_eq!(hard_line_starts("a\n\nb\n"), vec![0, 2, 3, 5]);
+        // Count matches split('\n') exactly, so shaped lines align index-wise.
+        for s in ["", "x", "a\nb", "a\n\nb\n", "\n\n"] {
+            assert_eq!(hard_line_starts(s).len(), s.split('\n').count());
+        }
     }
 
     #[test]
