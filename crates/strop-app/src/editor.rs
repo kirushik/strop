@@ -5493,6 +5493,26 @@ impl Editor {
             self.doc.text().hash(&mut hasher);
             format!("{:016x}", hasher.finish())
         };
+        // Margin layout, so the rig can assert the invariants the proptests cover
+        // only in the pure layer — at the integration level, against a real frame:
+        // no two VISIBLE cards overlap (the never-overlap rule); a selected card
+        // is actually in the visible set (the displacement fix); and the pill
+        // counts are what the lane reports. `null` when there is no frame yet.
+        let margin = self.last_frame.as_ref().map(|_| {
+            let layout = self.margin_cards(true);
+            let mut spans: Vec<(f32, f32)> =
+                layout.cards.iter().map(|c| (c.top, c.height)).collect();
+            spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let overlap = spans.windows(2).any(|w| w[0].0 + w[0].1 > w[1].0 + 0.5);
+            serde_json::json!({
+                "visible": layout.cards.len(),
+                "above": layout.above.len(),
+                "below": layout.below.len(),
+                "overlap": overlap,
+                "has_active": self.focus.active_id().is_some(),
+                "active_visible": layout.cards.iter().any(|c| c.active),
+            })
+        });
         serde_json::json!({
             "overlays": overlays,
             "focused": focused,
@@ -5502,6 +5522,7 @@ impl Editor {
             "focused_input_text": focused_input_text,
             "field_cursor": field_cursor,
             "field_sel": field_sel,
+            "margin": margin,
         })
         .to_string()
     }

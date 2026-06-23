@@ -699,6 +699,66 @@ mod tests {
     }
 
     #[test]
+    fn asset_gc_gate_keeps_checkpoint_referenced_asset() {
+        use crate::document::BlockKind;
+        // The save-time GC gate short-circuits (skips the costly per-checkpoint
+        // `state_at` scan) only while EVERY stored asset is still referenced by
+        // the live doc or undo history. The data-loss regression it must never
+        // cause: once an image is deleted from the live doc, the gate has to fall
+        // THROUGH to the checkpoint scan and KEEP an asset some checkpoint still
+        // references (deleting it would corrupt that rewind) — while still
+        // dropping a genuine orphan referenced by nothing. This guards both arms
+        // of the fall-through, the half the keeps-reachable test never reaches.
+        let path = temp_path("gc-gate");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("картинка\n");
+        let cp_only = store.put_asset(vec![1, 2, 3], "png");
+        // Save with the image live, then checkpoint THAT state (so the only thing
+        // referencing the asset, after the next edit, is this checkpoint).
+        let live = BlockMap::from_kinds(vec![
+            BlockKind::Image {
+                src: cp_only.clone(),
+                alt: String::new(),
+                caption: String::new(),
+            },
+            BlockKind::Paragraph,
+        ]);
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &live,
+                &History::default(),
+                &Annotations::default(),
+            )
+            .unwrap();
+        store.add_checkpoint("with image", true);
+        // Delete the image from the LIVE doc and add a brand-new orphan; save with
+        // EMPTY history, so `cp_only` is reachable ONLY via the checkpoint. The
+        // gate must NOT short-circuit (an asset is missing from the live set), so
+        // it scans the checkpoint, keeps `cp_only`, and reclaims `orphan`.
+        let orphan = store.put_asset(vec![9, 9, 9], "png");
+        let no_image = BlockMap::from_kinds(vec![BlockKind::Paragraph, BlockKind::Paragraph]);
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &no_image,
+                &History::default(),
+                &Annotations::default(),
+            )
+            .unwrap();
+        assert!(
+            store.get_asset(&cp_only).is_some(),
+            "checkpoint-referenced asset must survive the live delete (rewind integrity)"
+        );
+        assert!(
+            store.get_asset(&orphan).is_none(),
+            "a true orphan is still collected through the gate's fall-through"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn block_kind_metadata_with_newline_survives_roundtrip() {
         use crate::document::BlockKind;
         // A '\n' inside CodeBlock.info used to become a token boundary,
