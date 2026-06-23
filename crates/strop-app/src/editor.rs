@@ -36,14 +36,14 @@ use crate::text_field::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-pub const BG_COLOR: u32 = 0xFBFAF8;
-pub const TEXT_COLOR: u32 = 0x1A1A18;
-const SELECTION_COLOR: u32 = 0xB4D5FE88;
-const HIGHLIGHT_COLOR: u32 = 0xF9E29CAA;
-const CODE_BG_COLOR: u32 = 0x1A1A1814;
-const LINK_COLOR: u32 = 0x1A56A0;
-const NOTE_TINT: u32 = 0xE3B84926; // wheat/amber ~15% — Docs-trained intuition
-const NOTE_TINT_ACTIVE: u32 = 0xE3B8494D; // ~30% when active
+// The semantic color language lives in `theme`; everything below is layout.
+pub use crate::theme::{BG_COLOR, TEXT_COLOR};
+use crate::theme::{
+    ACTIVE_BORDER, CARD_BG, CODE_BG_COLOR, DIAGNOSIS_CARD_BG, HIGHLIGHT_COLOR, LINK_COLOR,
+    MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR,
+    SELECTION_COLOR,
+};
+
 const MARGIN_WIDTH: f32 = 248.;
 const MARGIN_GAP: f32 = 16.;
 /// Margin-card box metrics, shared by the height MEASUREMENT
@@ -88,12 +88,8 @@ const HISTORY_PANEL_WIDTH: f32 = 320.;
 /// Outline rail (DESIGN §1.6): left, push — mirrors the history panel.
 const OUTLINE_PANEL_WIDTH: f32 = 200.;
 const DOC_MIN_WIDTH: f32 = 400.;
-/// Sage for the reached-goal dot (DESIGN §4.2): subtle, no celebration.
-const SAGE_COLOR: u32 = 0x7D8C66;
 const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
-const MUTED_COLOR: u32 = 0x8A8678;
-pub(crate) const RULE_COLOR: u32 = 0xE8E4DC;
 /// Client-side decorations (H2): thickness of the invisible resize band
 /// laid along each window edge/corner. GNOME Wayland grants no server-side
 /// borders, so without these strips Strop cannot be resized at all. Strips
@@ -9451,7 +9447,7 @@ impl Editor {
                     .into_any_element()
             }
             Some(AiStatus::NeedsSetup { local_model }) => {
-                let base = card(0xFFFDF6);
+                let base = card(CARD_BG);
                 match local_model.clone() {
                     // The cliff is gone: a local model answered the probe.
                     // Lead with the one-click, key-free, private path.
@@ -9530,7 +9526,7 @@ impl Editor {
                         .into_any_element(),
                 }
             }
-            Some(AiStatus::Running { label }) => card(0xFFFDF6)
+            Some(AiStatus::Running { label }) => card(CARD_BG)
                 .child(div().text_color(rgb(MUTED_COLOR)).child(format!("Running: {label}…")))
                 .child(
                     div().flex().child(action_button("ai-cancel", "Cancel").on_mouse_down(
@@ -9616,7 +9612,7 @@ impl Editor {
                 .px(px(8.))
                 .py(px(2.))
                 .rounded(px(10.))
-                .bg(rgb(0xFFFDF6))
+                .bg(rgb(CARD_BG))
                 .border_1()
                 .border_color(rgb(RULE_COLOR))
                 .text_size(px(10.))
@@ -9680,10 +9676,15 @@ impl Editor {
                         // crisper-cornered (formal editorial), reinforcing the
                         // bold-title cue. AI provenance, felt not labelled.
                         .rounded(px(if is_diagnosis { 3. } else { 9. }))
-                        .bg(rgb(0xFFFDF6))
+                        // Paper-tint differentiation (theme color language): a
+                        // warm cream wash for the writer's own note (ink on the
+                        // page), a cool neutral for an AI diagnosis (tool output
+                        // over the page). Reinforces the corner/title cues and
+                        // the lifecycle split (notes persist; AI cards gate).
+                        .bg(rgb(if is_diagnosis { DIAGNOSIS_CARD_BG } else { NOTE_CARD_BG }))
                         .border_1()
                         .border_color(if active {
-                            rgb(0xC8A951)
+                            rgb(ACTIVE_BORDER)
                         } else {
                             rgb(RULE_COLOR)
                         })
@@ -9908,7 +9909,7 @@ impl Editor {
                 .py(px(3.))
                 .rounded(px(6.))
                 .border_1()
-                .border_color(if open { rgb(0xC8A951) } else { rgb(RULE_COLOR) })
+                .border_color(if open { rgb(ACTIVE_BORDER) } else { rgb(RULE_COLOR) })
                 .bg(rgb(0xF7F5EF))
                 .cursor(CursorStyle::PointingHand)
                 .hover(|d| d.bg(rgb(0xEFEBE0)))
@@ -10040,7 +10041,7 @@ impl Editor {
             .id(("narrow-note", id as usize))
             .p(px(8.))
             .rounded(px(6.))
-            .bg(rgb(0xFFFDF6))
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
             .cursor(CursorStyle::PointingHand)

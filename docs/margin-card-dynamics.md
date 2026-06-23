@@ -360,3 +360,11 @@ band spans the selection. Pure core: 6 unit tests; suite 46 → 48.
 canvas has it; fields don't yet) and edge-hold autoscroll during drag (single-
 line fields autoscroll via the existing caret-follow; only a held drag past the
 edge is unserved). Both are additive on the same widget.
+
+## 10. Backlog (deferred from the 2026-06-23 field work)
+
+- **Per-field undo/redo** in `TextField` (coalesced, selection-restoring). The
+  prose canvas has it; the small fields do not yet.
+- **Edge-hold drag autoscroll** in `TextField`: single-line fields autoscroll
+  via caret-follow, but *holding* a drag past the edge without moving doesn't
+  scroll. Needs the prose canvas's `autoscroll_tick` timer pattern.

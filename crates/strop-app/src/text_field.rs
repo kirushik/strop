@@ -27,7 +27,8 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::draw_guard::DrawGuard;
-use crate::editor::{CARD_LINE_H, COMPOSER_INNER_W, RULE_COLOR, TEXT_COLOR};
+use crate::editor::{CARD_LINE_H, COMPOSER_INNER_W};
+use crate::theme::{FIELD_SELECTION_BG, RULE_COLOR, TEXT_COLOR};
 
 // === Pure text/caret helpers (unit-tested; no GPUI) ======================
 
@@ -1146,7 +1147,7 @@ impl Element for TextFieldElement {
                 input.has_selection(),
             )
         };
-        let sel_color = rgba(0xC8A95155); // the active-card gold, translucent
+        let sel_color = rgba(FIELD_SELECTION_BG); // the active-card gold, translucent
         match layout {
             ComposerLayout::Single(line) => {
                 let Some(line) = line.take() else { return };
