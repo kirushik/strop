@@ -389,13 +389,17 @@ abstraction that makes the whole class discoverable — per Kirill's standing ru
   `REVEAL_INSET` from the edge, never a page away — the "pagination feel" fix).
   Anchor on-screen but packing pushed the card out → SELECT it, so Pass 3 forces
   it in. Either way the pill always acts.
-- **The active card wins the lane (packer Pass 3).** A tall writer note pinned in
-  the slack above a selected diagnosis used to shove it off the bottom while
-  `card_slot` still reported it `Shown` — invisible AND uncounted (principle 2
-  violation). Pass 3 re-clamps the active card fully into view (overlapping the
-  note above; it paints last, on top). `card_slot` lost its `active` special case
-  — pure geometry now, so it can't lie. INV3 proptest strengthened to include
-  competing note pins; INV1 excuses the one sanctioned active-card overlap.
+- **The active card wins the lane (packer Pass 3) — by DISPLACING, not
+  overlapping.** A tall writer note pinned in the slack above a selected diagnosis
+  used to shove it off the bottom while `card_slot` still reported it `Shown` —
+  invisible AND uncounted (principle 2 violation). Pass 3 re-clamps the active
+  card fully into view, then shoves the run above it UP to stay clear; a card
+  pushed past the floor is culled into the honest `above` count (becomes "N
+  above") — never overlapped, never painted over the titlebar. (First shipped as
+  a sanctioned active-card *overlap*; Kirill flagged that it broke the
+  never-overlap rule, so it became displacement.) `card_slot` lost its `active`
+  special case — pure geometry now, so it can't lie. INV3 proptest strengthened
+  to include competing note pins; INV1 is back to no-overlap-EVER.
 - **The active card is door-exempt.** Selecting a copy-level diagnosis suppressed
   under an open developmental one lit the anchor but rendered no card.
   `margin_cards` now surfaces the active card regardless of the door (mirroring

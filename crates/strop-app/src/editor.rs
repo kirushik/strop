@@ -7219,15 +7219,31 @@ impl Editor {
         let (par_ix, line, x) =
             frame.cursor_position(self.selected_range.start.min(frame.doc_len()), false)?;
         let par = &frame.paragraphs[par_ix];
-        // Window-space top of the selection's first visual line.
+        // `frame.bounds` are WINDOW-global, but this popover is a child of the
+        // `content` surface, which the CSD shadow gutter insets by `CSD_GUTTER`
+        // on each untiled edge (Linux/Wayland floating windows; server-decorated
+        // platforms inset 0, tiled edges 0). Convert frame coords into content
+        // space by subtracting that inset — the column lane already works in
+        // content space (`column_frame`); the popover read window space and so
+        // landed a gutter too far right, over the text, when the left margin was
+        // tight (the Linux-only overlap). `content_width` is content space too.
+        let (l_inset, t_inset, b_inset) = match window.window_decorations() {
+            Decorations::Client { tiling } => (
+                if tiling.left { 0. } else { CSD_GUTTER },
+                if tiling.top { 0. } else { CSD_GUTTER },
+                if tiling.bottom { 0. } else { CSD_GUTTER },
+            ),
+            Decorations::Server => (0., 0., 0.),
+        };
+        // Content-space top of the selection's first visual line.
         let line_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
             + f32::from(par.line_height) * line as f32
-            - f32::from(frame.scroll_top);
+            - f32::from(frame.scroll_top)
+            - t_inset;
         let line_h = f32::from(par.line_height);
-        let viewport = window.viewport_size();
-        let vw = f32::from(viewport.width);
-        let vh = f32::from(viewport.height);
-        let col_left = f32::from(frame.bounds.origin.x);
+        let vw = self.content_width(window);
+        let vh = f32::from(window.viewport_size().height) - t_inset - b_inset;
+        let col_left = f32::from(frame.bounds.origin.x) - l_inset;
         let outline_w = self.outline_width(window);
 
         // Gutter-float: a vertical toolbar hugging the column's left edge, in
@@ -8942,9 +8958,10 @@ struct PlaceItem {
 /// Place margin cards in ONE pass and return each card's top (viewport-space),
 /// in input order. Items come in document/anchor order. Three guarantees,
 /// pinned down by the packer proptests:
-///   1. no two cards overlap, EXCEPT the active card may overlap the neighbour
-///      directly above it — it is painted last, so it sits on top (Pass 3);
-///   2. every card sits at or below `floor` (never under the titlebar);
+///   1. no two cards EVER overlap (the writer's never-overlap rule, no excuses);
+///   2. every card sits at/below `floor` (never under the titlebar) — EXCEPT a
+///      card the active card displaced upward off the top edge, which the caller
+///      culls into the `above` count (so it is never painted under the titlebar);
 ///   3. the ACTIVE card lies fully within `[floor, viewport_bottom]` whenever
 ///      its height fits there — UNCONDITIONALLY, even when a pinned writer note
 ///      competes for the slack above it: the focused card wins the lane.
@@ -8954,7 +8971,8 @@ struct PlaceItem {
 /// off the bottom edge" bug). A floor+downward sweep gives the non-overlap
 /// guarantee; a pull-up then slides the rigid run of movable cards above each
 /// pin up into existing slack only. Pass 3 then re-clamps the active card into
-/// view if a competing pin still pushed it below — the one sanctioned overlap.
+/// view if a competing pin pushed it below, and shoves the run above it UP to
+/// stay clear — displacing (and honestly counting) rather than overlapping.
 fn place_margin_cards(items: &[PlaceItem], floor: f32, viewport_bottom: f32, gap: f32) -> Vec<f32> {
     let n = items.len();
     // Anchor targets (floored); the active card is clamped up to fit the lane.
@@ -9014,13 +9032,26 @@ fn place_margin_cards(items: &[PlaceItem], floor: f32, viewport_bottom: f32, gap
     // Pass 3 — the active card MUST be fully in view: it is what the writer is
     // looking at right now. Passes 1-2 can still strand it below the fold when a
     // pinned writer note above eats the slack (the old guarantee-3 carve-out).
-    // The focused card wins: re-clamp its top up into [floor, viewport_bottom -
-    // height]. It may now overlap the note above — fine, the active card is
-    // painted last and sits on top (the design's "offset" case, leader tick TBD).
+    // The focused card wins WITHOUT overlapping anything (the never-overlap rule
+    // holds): re-clamp its top up into [floor, viewport_bottom - height], then
+    // shove the run directly above it UP to stay clear. A card shoved past the
+    // floor is off the top edge — the caller culls it into the honest `above`
+    // count (it becomes "N above", never overlapped, never over the titlebar).
     if let Some(a) = items.iter().position(|it| it.active) {
         let ceil = (viewport_bottom - items[a].height - CARD_BOTTOM_MARGIN).max(floor);
         if top[a] > ceil {
             top[a] = ceil;
+        }
+        // Cascade upward: each card above keeps clear of the one below it, the
+        // active card being the fixed lower bound. Cards run off the top as
+        // needed (they get culled + counted, not clipped or overlapped).
+        let mut limit = top[a];
+        for i in (0..a).rev() {
+            let cap = limit - items[i].height - gap;
+            if top[i] > cap {
+                top[i] = cap;
+            }
+            limit = top[i];
         }
     }
     top
@@ -9315,11 +9346,12 @@ impl Editor {
         if !cull {
             return MarginLayout { cards, above, below };
         }
-        // Packing can shove an on-screen-anchored card off the bottom (e.g. the
-        // active card pins high and the run below it overflows). Record those too,
-        // never clip them silently: keep only cards with a real slice in view,
-        // and capture the rest as off-screen refs (anchor_culled = false → reveal
-        // by selecting, since their anchor is on-screen and scrolling won't help).
+        // Packing can shove an on-screen-anchored card off an edge (the active
+        // card wins the bottom slot and displaces the run above it up; or a run
+        // below an active card overflows the bottom). Record those, never clip
+        // them silently: keep only cards with a real slice in view, capture the
+        // rest as off-screen refs (anchor_culled = false → reveal by selecting,
+        // since their anchor is on-screen and scrolling won't help).
         let vp_top = f32::from(frame.bounds.origin.y);
         let vp_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
         let mut visible = Vec::with_capacity(cards.len());
@@ -9329,6 +9361,13 @@ impl Editor {
                 anchor_y: card.anchor_y,
                 anchor_culled: false,
             };
+            // A card Pass 3 pushed above the floor (to clear the active card) is
+            // off the TOP — count it, don't paint it over the titlebar. (Pass 3
+            // only moves cards up, so `top < floor` uniquely marks the displaced.)
+            if card.top < floor - 0.5 {
+                above.push(packed_off);
+                continue;
+            }
             match card_slot(card.top, card.height, vp_top, vp_bottom) {
                 CardSlot::Shown => visible.push(card),
                 CardSlot::Above => above.push(packed_off),
@@ -10853,11 +10892,12 @@ mod tests {
     const PACK_GAP: f32 = 16.;
 
     proptest! {
-        // INV1 (no overlap) + INV2 (every card at/below the floor): hold for ANY
-        // stack — notes, diagnoses, an active card, any mix. The ONE exception:
-        // the active card may overlap the neighbour directly above it (Pass 3
-        // pulls it up to win the lane; it is painted on top), so that single pair
-        // is excused — every other pair must still clear.
+        // INV1 (no overlap, EVER — the never-overlap rule, no active-card excuse)
+        // + INV2 (every card at/below the floor) hold for ANY stack. The one
+        // relaxation: cards the active card displaced UP off the top edge may sit
+        // above the floor — they're culled into the `above` count by the caller,
+        // never painted under the titlebar. Those are exactly the cards ABOVE the
+        // active card's (sorted) index.
         #[test]
         fn packed_cards_never_overlap_and_clear_the_floor(
             raw in proptest::collection::vec((0f32..3000., 20f32..400., any::<bool>()), 0..12usize),
@@ -10876,12 +10916,18 @@ mod tests {
                 })
                 .collect();
             items.sort_by(|a, b| a.anchor.total_cmp(&b.anchor));
+            // The active card's index AFTER the sort (the pre-sort `active` is stale).
+            let active_idx = items.iter().position(|it| it.active);
             let tops = place_margin_cards(&items, PACK_FLOOR, PACK_VP_BOTTOM, PACK_GAP);
             for i in 0..tops.len() {
-                prop_assert!(tops[i] >= PACK_FLOOR - 0.01, "card {i} above floor");
-                // Skip the pair whose LOWER card is the active one: it is allowed
-                // to overlap the card above (the sanctioned active-card overlap).
-                if i + 1 < tops.len() && !items[i + 1].active {
+                // INV2: clears the floor — unless displaced UP above the active
+                // card (i < active_idx), which is culled, not painted.
+                if active_idx.is_none_or(|a| i >= a) {
+                    prop_assert!(tops[i] >= PACK_FLOOR - 0.01, "card {i} above floor");
+                }
+                // INV1: no two cards overlap. No exceptions — displacement, not
+                // overlap, is how the active card wins the lane.
+                if i + 1 < tops.len() {
                     prop_assert!(
                         tops[i + 1] + 0.01 >= tops[i] + items[i].height + PACK_GAP,
                         "cards {i}/{} overlap", i + 1
