@@ -304,3 +304,59 @@ not visually tuned.
 accessors for Idle/Selected; composing-implies-active over the id projection.
 The entity-bearing `Composing` variant is correct by construction; a full
 transition test would need gpui `test-support` (deliberately off).
+
+> Note (2026-06-23): the composer's field is now a `TextField`, not `NoteInput`
+> — `NoteInput` was extracted and deleted (see §9). `CardFocus::Composing` now
+> holds an `Entity<TextField>`; everything above about the FSM is unchanged.
+
+## 9. One text-field widget (`TextField`, 2026-06-23)
+
+**Why.** Every small box of letters in the app (margin-note composer, command
+palette, AI-settings fields, rename) had been the `NoteInput` entity — grown
+incrementally from an append-only field to a caret/selection field. It still
+fell short of what "a box you can type in" implies: mouse selection was
+click-to-place + shift-click only, so the reflex *double-click a word, then type
+to replace it* was busted; motion stepped char boundaries, not graphemes; the
+prose canvas (a separate, mature text element) had a full mouse model the fields
+didn't share. The fields were "almost a text field" in four different places.
+
+**What.** `NoteInput` is gone, replaced by one reusable `TextField`
+(`crates/strop-app/src/text_field.rs`). It is the full contract:
+
+- *Pure core* (unit-tested, no GPUI): grapheme-cluster motion (UAX#29 via
+  `unicode-segmentation`) so a caret never splits an emoji ZWJ run; word motion
+  with the SAME semantics as the prose canvas (`previous/next_word_boundary`);
+  `word_range_at` / `line_range_at` for click-unit selection; the utf16/char
+  conversions for the OS IME boundary.
+- *The widget*: caret + selection paint, the whole keyboard editing set, IME
+  preedit, clipboard (masked fields never copy out), single-line scroll vs
+  multi-line soft-wrap — all ported verbatim from `NoteInput`'s proven paint/IME
+  code, so the regression surface is the new parts only.
+- *Full mouse* (the gap that motivated this): click-to-place, drag-select,
+  double-click-word, triple-click-line, word/line-snapped drag-extend,
+  shift-click. `click_count` picks a `DragUnit`; `begin_select` fixes a
+  `selection_origin`; `drag_to` unions the unit under the pointer with it. This
+  mirrors the prose canvas's model rather than sharing state with it — the main
+  editor is Loro-backed and multi-block; coupling the two would re-introduce the
+  fragile shared-mutable-state class this whole subsystem keeps fighting.
+
+**Migration.** All nine field sites switched to `TextField::{single, multiline,
+palette, settings}`; the `note_input` action set became `text_field`'s `Field*`
+actions; the field-editing keybindings moved into the module. `content` and
+`focus_handle` are `pub(crate)` (the parent editor reads them back); a
+`debug_caret()` accessor feeds the rig instead of exposing internals.
+
+**Verification (rig, not eyeball).** Driven through real GPUI dispatch via
+`STROP_SMOKE` (`scripts/wrun.sh`), asserting `dump:ui`'s `field_sel` char range:
+- `f10 …type "selectme"… click:X,Y,2` → `field_sel [1,9]` (the word, excluding
+  the `>` command prefix); then typing `x` → `>x` (replace-on-type — the exact
+  workflow that was broken).
+- `…click:X,Y,3` → `[0,9]` (whole line).
+- `…click drag:` → a multi-char range tracks the drag.
+Selection *rendering* confirmed by screenshot (`scripts/wshot.sh`): the gold
+band spans the selection. Pure core: 6 unit tests; suite 46 → 48.
+
+**Deferred (explicitly cut, not forgotten):** per-field undo/redo (the prose
+canvas has it; fields don't yet) and edge-hold autoscroll during drag (single-
+line fields autoscroll via the existing caret-follow; only a held drag past the
+edge is unserved). Both are additive on the same widget.
