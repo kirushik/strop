@@ -71,6 +71,14 @@ const CARD_BOTTOM_MARGIN: f32 = 8.;
 /// enough to show the card, small enough that the pill reveals "one more card",
 /// not a whole page (the pagination-feel fix). See `reveal_scroll`.
 const REVEAL_INSET: f32 = 120.;
+/// The lane shows at most this many AI (Layer-B) cards at once; older passes
+/// rest behind the rail (the D3 notification-debt bound). FIVE, not seven —
+/// Miller's 7±2 is a RECALL span, not a limit on persistent on-screen items
+/// (Cowan's ~4 applies to un-chunkable items); ~5 is the researched resting
+/// count (docs/attention-motion.md §6). A/B between 4–7. The writer's OWN notes
+/// are never capped (working memory, not judgments), and a held card is never
+/// lost — its in-text squiggle stays, so clicking the passage reveals it.
+const VISIBLE_DIAGNOSIS_CAP: usize = 5;
 /// The prose column's capped width — everything else (centering, the note
 /// lane, the narrow-width left-shift) is measured against it.
 const COL_MAX_WIDTH: f32 = 660.;
@@ -2010,6 +2018,31 @@ impl Editor {
             .open()
             .filter(|n| n.kind == NoteKind::Diagnosis && n.level == "copy")
             .count()
+    }
+
+    /// Diagnoses held back by the visible budget (`VISIBLE_DIAGNOSIS_CAP`): of
+    /// the diagnoses that WOULD surface (door-passed, non-active), keep the
+    /// newest few and rest the older passes — they surface as a rail count, not
+    /// lost (their in-text squiggle still reveals them on click). One source of
+    /// truth shared by `margin_cards` (to skip them) and the rail (to count them).
+    fn cap_held_diagnoses(&self) -> std::collections::HashSet<u64> {
+        let active = self.focus.active_id();
+        let drafting = self.drafting;
+        let has_dev = !drafting
+            && self
+                .doc
+                .notes()
+                .open()
+                .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
+        let surfaced: Vec<(u64, u64)> = self
+            .doc
+            .notes()
+            .open()
+            .filter(|n| n.kind == NoteKind::Diagnosis && Some(n.id) != active)
+            .filter(|n| note_surfaces(n.kind, &n.level, drafting, has_dev))
+            .map(|n| (n.id, n.pass_id))
+            .collect();
+        held_beyond_cap(&surfaced, VISIBLE_DIAGNOSIS_CAP)
     }
 
     /// The effective levels-of-edit depth: session override, else config,
@@ -9118,6 +9151,18 @@ fn reveal_scroll(anchor_y: f32, vp_h: f32, max_scroll: f32, below: bool) -> f32 
     target.clamp(0., max_scroll)
 }
 
+/// Of the surfaced diagnoses `(id, pass_id)`, the ones held back by the visible
+/// budget: keep the newest `cap` (highest pass_id, then id) showing, the rest
+/// rest. Pure, so the cap policy is unit-testable without a frame.
+fn held_beyond_cap(surfaced: &[(u64, u64)], cap: usize) -> std::collections::HashSet<u64> {
+    if surfaced.len() <= cap {
+        return std::collections::HashSet::new();
+    }
+    let mut v = surfaced.to_vec();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    v.into_iter().skip(cap).map(|(id, _)| id).collect()
+}
+
 /// Which open annotation a click at char index `c` activates, given each open
 /// note's `(id, start, end)` (anchor covers `[start, end)`). A click snaps to
 /// the nearest caret boundary, so a click on the trailing half of the last glyph
@@ -9268,6 +9313,9 @@ impl Editor {
                 .notes()
                 .open()
                 .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
+        // Diagnoses beyond the visible budget rest behind the rail (older passes
+        // first). Computed once; the rail counts the same set (cap_held_diagnoses).
+        let cap_held = self.cap_held_diagnoses();
         for n in self.doc.notes().open() {
             // The SELECTED card is exempt from the door: clicking a diagnosis is
             // an explicit attention act that overrides the altitude-order hold
@@ -9276,6 +9324,11 @@ impl Editor {
             // highlight with no card (the reported "click shows no card" bug).
             let active = self.focus.active_id() == Some(n.id);
             if !active && !note_surfaces(n.kind, &n.level, drafting, has_dev) {
+                continue;
+            }
+            // Over the visible budget: rest behind the rail (the active card is
+            // never in cap_held, so selecting a held card always reveals it).
+            if cap_held.contains(&n.id) {
                 continue;
             }
             let byte = rope.char_to_byte(n.range.start.min(rope.len_chars())).min(len);
@@ -9429,15 +9482,16 @@ impl Editor {
         cw - (left + w) >= NOTE_LANE_TOTAL
     }
 
-    /// The door rail's count, when it has something to hold: drafting hides
-    /// the editor's diagnoses (shows "N resting"); reviewing suppresses
-    /// copy-level cards under an open developmental one ("N copy-level").
-    /// `None` means the rail stands down — a quiet margin.
+    /// The door rail's count, when it has something to hold: drafting hides the
+    /// editor's diagnoses ("N resting"); reviewing holds copy-level cards under
+    /// an open developmental one AND any cards over the visible budget ("N
+    /// resting"/"N copy-level"). `None` means the rail stands down — a quiet
+    /// margin. The label is chosen in `render_margin_rail`.
     fn margin_rail_count(&self) -> Option<usize> {
         let n = if self.drafting {
             self.resting_diagnoses()
         } else {
-            self.suppressed_copy()
+            self.suppressed_copy() + self.cap_held_diagnoses().len()
         };
         (n > 0).then_some(n)
     }
@@ -10160,8 +10214,13 @@ impl Editor {
         let n = self.margin_rail_count()?;
         let label = if drafting {
             format!("{n} resting · open")
-        } else {
+        } else if self.cap_held_diagnoses().is_empty() {
             format!("{n} copy-level · after structure")
+        } else {
+            // Over the visible budget (and/or copy-level held): older passes
+            // rest, reachable by clicking their flagged passage. "resting" reads
+            // as held-not-gone (the count-grammar bucket; see attention-motion.md).
+            format!("{n} resting · review")
         };
         let styled = |d: gpui::Div| {
             d.absolute()
@@ -11062,6 +11121,18 @@ mod tests {
         assert_eq!(note_at_char(&pair, 6), Some(8));
         assert_eq!(note_at_char(&pair, 9), Some(8)); // the second's own trailing boundary
         assert_eq!(note_at_char(&[], 0), None);
+    }
+
+    #[test]
+    fn held_beyond_cap_rests_the_oldest_passes() {
+        use std::collections::HashSet;
+        // At or under the cap: nothing is held.
+        assert!(held_beyond_cap(&[(1, 1), (2, 1), (3, 2)], 5).is_empty());
+        assert!(held_beyond_cap(&[(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)], 5).is_empty());
+        // Over the cap: the newest passes stay (highest pass_id), oldest rest.
+        // pass 3 = ids 5,6,7; pass 2 = 3,4; pass 1 = 1,2. cap 4 keeps {7,6,5,4}.
+        let held = held_beyond_cap(&[(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 3)], 4);
+        assert_eq!(held, HashSet::from([1u64, 2, 3]));
     }
 
     #[test]
