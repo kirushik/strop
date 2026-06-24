@@ -57,7 +57,7 @@ jobs:
     name: core engine — clippy + property tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -88,7 +88,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: cache cargo home (git deps + registry + advisory db)
         uses: actions/cache@v4
         with:
@@ -108,7 +108,7 @@ jobs:
     name: app shell — clippy + headless logic tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: gpui system dependencies (Zed Linux build reqs)
         run: |
           sudo apt-get update
@@ -144,7 +144,7 @@ jobs:
     name: macOS — build + launch smoke
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -196,7 +196,7 @@ jobs:
             try   { Add-MpPreference -ExclusionPath $p -ErrorAction Stop; Write-Host "excluded $p" }
             catch { Write-Host "::warning::could not exclude $p from Defender: $_" }
           }
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
