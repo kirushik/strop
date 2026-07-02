@@ -33,7 +33,11 @@ DOC2=$(mktemp --suffix=.md)
   done
   for i in $(seq 1 40); do echo "Ordinary padding paragraph number $i, plain and unremarked."; echo; done
 } > "$DOC2"
-trap 'rm -f "$DOC" "$DOC.strop" "$DOC2" "$DOC2.strop"' EXIT
+# A third fixture for the reveal-clock check (its own file: sidecars
+# accumulate, and this check needs a margin that starts empty).
+DOC3=$(mktemp --suffix=.md)
+head -4 "$DOC" > "$DOC3"
+trap 'rm -f "$DOC" "$DOC.strop" "$DOC2" "$DOC2.strop" "$DOC3" "$DOC3.strop"' EXIT
 
 fail=0
 field() { echo "$1" | grep -oE "\"$2\":[^,}]*" | head -1 | cut -d: -f2; }
@@ -65,6 +69,18 @@ M=$(WRUN_TAIL=40 scripts/wrun.sh "$DOC2" "seed:many click:1274,104 dump:ui" 2>/d
 expect "clicking a receded card selects it"  true "$(field "$M" active_visible)"
 expect "the selected card expanded (3 - 1)"  2    "$(field "$M" collapsed)"
 expect "expansion never overlaps"            false "$(field "$M" overlap)"
+
+echo "rig-check: a pass arriving mid-burst waits for the lull (the reveal clock)"
+# 'x' opens a typing burst; seed:deliver pushes the demo pass through the real
+# arrival gate ~80ms later — it must PARK (no squiggles/cards mid-thought),
+# then land by itself once the prose has been still past TYPING_LULL (1s).
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOC3" "x seed:deliver dump:ui wait:1600 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | head -1); D2=$(echo "$OUT" | tail -1)
+[ -n "$D1" ] || { echo "  FAIL no dump (rig didn't render?)"; exit 1; }
+expect "mid-burst the pass parks"          true  "$(field "$D1" ai_deferred)"
+expect "nothing surfaces mid-burst"        0     "$(field "$D1" visible)"
+expect "the lull lands the parked pass"    false "$(field "$D2" ai_deferred)"
+expect "all four cards surface after it"   4     "$(field "$D2" visible)"
 
 echo "rig-check: scroll works anywhere on the document surface"
 for x in 60 800 1500; do

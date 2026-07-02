@@ -71,6 +71,22 @@ const CARD_BOTTOM_MARGIN: f32 = 8.;
 /// enough to show the card, small enough that the pill reveals "one more card",
 /// not a whole page (the pagination-feel fix). See `reveal_scroll`.
 const REVEAL_INSET: f32 = 120.;
+/// The lull that ends a typing burst: once the prose has been still this long,
+/// a pass that completed mid-burst may land (deferred_pass). ~1s sits inside
+/// the natural pause a writer takes at a sentence boundary, so in practice the
+/// hold is a breath, not a wait — and the research's caveat applies: these are
+/// SELF-requested cards, so err eager, never build a longer artificial hold
+/// (attention-motion.md §2, the two-clock verdict pared to its one real rule).
+const TYPING_LULL: Duration = Duration::from_millis(1000);
+
+/// A completed pass parked until the typing lull (see `Editor::deferred_pass`).
+/// Carries the RAW diagnoses (quotes not yet anchored) and the generation that
+/// produced them — a cancel or a newer run bumps `ai_generation`, and a stale
+/// deferral is dropped at flush by that check alone (one place, by construction).
+struct DeferredPass {
+    diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+    generation: u64,
+}
 /// At most this many AI (Layer-B) cards render FULL-SIZE at once; past the
 /// budget, older passes RECEDE to a one-line card at their anchor — smaller,
 /// never hidden (dense marginalia shrink; they don't get filed in a drawer).
@@ -636,6 +652,18 @@ pub struct Editor {
     /// that *triggered* setup is the request that gets answered (no
     /// "now press ctrl-shift-d again" dead end).
     pending_pass: Option<bool>,
+    /// A completed pass whose results arrived MID-TYPING-BURST: integrating
+    /// would pop squiggles into the very sentence being typed and re-pack the
+    /// lane — an involuntary peripheral onset (attention-motion.md §2). Held
+    /// un-anchored (raw `Diagnosis` quotes, so anchoring runs against the
+    /// text as it stands at reveal, not at arrival) until the burst ends
+    /// (`TYPING_LULL`) or the writer turns away (scroll, door). This is the
+    /// WHOLE reveal clock: one rule, no gaze tracking, no idle timers.
+    deferred_pass: Option<DeferredPass>,
+    /// When the prose text last changed (set at the `sync_mutations`
+    /// chokepoint — real buffer ops only, not caret moves or card clicks).
+    /// `deferred_pass` reads it to tell a live typing burst from a lull.
+    last_text_edit: Option<Instant>,
     /// The door (DESIGN §4.4; core-loop research: separate GENERATE from
     /// EVALUATE). `true` = drafting, door closed: the editorial margin goes
     /// quiet so a writing burst is never pulled into evaluation by its own
@@ -970,6 +998,8 @@ impl Editor {
             focus: CardFocus::Idle,
             ai_status: None,
             pending_pass: None,
+            deferred_pass: None,
+            last_text_edit: None,
             // Door closed by default: every document opens to write, not to
             // be judged (protects re-entry — the warm-up re-read that slides
             // into line-editing). The tutorial opens it (main.rs); so does a
@@ -1064,6 +1094,9 @@ impl Editor {
         if ops.is_empty() {
             return;
         }
+        // Real buffer ops only — this stamp is what tells a live typing burst
+        // from a lull (deferred_pass), so caret moves must never touch it.
+        self.last_text_edit = Some(Instant::now());
         self.word_count = count_words(self.doc.rope().chunks());
         // Apply to the store and capture its path before releasing the borrow,
         // so the dirty-flag chokepoint (mark_dirty) can take &mut self.
@@ -1989,6 +2022,9 @@ impl Editor {
     /// research asks for — never inferred, never automatic in v1, so a
     /// drafting burst can never be interrupted by a wrong guess.
     fn toggle_review(&mut self, _: &ToggleReview, _: &mut Window, cx: &mut Context<Self>) {
+        // Touching the door is an explicit attention shift — a parked pass
+        // lands right now, mid-burst or not.
+        self.flush_deferred_pass(cx);
         self.drafting = !self.drafting;
         cx.notify();
     }
@@ -2063,7 +2099,10 @@ impl Editor {
         self.last_pass_believing = believing;
         // You asked to evaluate — open the door, so results land in a margin
         // the writer is actually looking at (and any earlier resting cards
-        // come back into view alongside them).
+        // come back into view alongside them). Asking again is also the most
+        // explicit attention shift there is: a still-parked earlier pass
+        // lands now rather than racing the run it just triggered.
+        self.flush_deferred_pass(cx);
         self.drafting = false;
         // Scope: the selection if there is one, else the whole document
         // (capped — a 24k-char window is plenty for an editorial pass).
@@ -2116,44 +2155,7 @@ impl Editor {
                     return; // cancelled or superseded — drop silently
                 }
                 match result {
-                    Ok(diagnoses) => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        let count = diagnoses.len();
-                        // Anchor against the text as it is NOW — quotes
-                        // that no longer match are dropped.
-                        editor.diagnosis_pass += 1;
-                        let pass_id = editor.diagnosis_pass;
-                        let annotations = strop_core::diagnose::to_annotations(
-                            &editor.doc.text(),
-                            diagnoses,
-                            editor.doc.notes(),
-                            now,
-                            pass_id,
-                        );
-                        let kept = annotations.len();
-                        editor.doc.add_diagnoses(annotations);
-                        editor.mark_dirty();
-                        // Silent success is the second invisibility bug:
-                        // 0 anchored must be said out loud.
-                        editor.ai_status = Some(AiStatus::Note {
-                            title: match kept {
-                                0 if count == 0 => {
-                                    "Pass complete — the editor found nothing to flag".to_owned()
-                                }
-                                0 => "Pass complete — no quote matched the current text".to_owned(),
-                                n => format!("{n} margin quer{} anchored", if n == 1 { "y" } else { "ies" }),
-                            },
-                            detail: if count > kept && kept > 0 {
-                                format!("{} dropped (stale quotes)", count - kept)
-                            } else {
-                                String::new()
-                            },
-                        });
-                        editor.schedule_status_fade(generation, cx);
-                    }
+                    Ok(diagnoses) => editor.deliver_pass(diagnoses, generation, cx),
                     Err(failure) => {
                         editor.ai_status =
                             Some(failure.into_status(&editor.config.ai.base_url, &editor.config.ai.model));
@@ -2188,10 +2190,133 @@ impl Editor {
     fn cancel_ai_run(&mut self, _: &CancelAiRun, _: &mut Window, cx: &mut Context<Self>) {
         // UI-level cancel: the response of the abandoned generation is
         // ignored when it lands (no need to abort the request itself).
+        // A parked deferral dies with its generation too (flush checks it),
+        // but drop it eagerly so nothing lingers.
         self.ai_generation += 1;
         self.ai_status = None;
         self.pending_pass = None;
+        self.deferred_pass = None;
         cx.notify();
+    }
+
+    /// Is the writer inside a live typing burst right now? True while the
+    /// last real buffer edit is younger than `TYPING_LULL`. This one predicate
+    /// is the entire "when may AI results land" model — no gaze tracking, no
+    /// idle timers, no modes: prose recently changed ⇒ hold; still ⇒ land.
+    fn typing_burst_live(&self) -> bool {
+        self.last_text_edit
+            .is_some_and(|t| t.elapsed() < TYPING_LULL)
+    }
+
+    /// Integrate a completed pass into the document NOW: anchor the quotes
+    /// against the current text, add the cards, and say out loud what stuck.
+    /// The single landing site for both the direct path (results arrive in a
+    /// lull) and the deferred path (flushed after a burst).
+    fn integrate_pass(
+        &mut self,
+        diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let count = diagnoses.len();
+        // Anchor against the text as it is NOW — quotes
+        // that no longer match are dropped.
+        self.diagnosis_pass += 1;
+        let pass_id = self.diagnosis_pass;
+        let annotations = strop_core::diagnose::to_annotations(
+            &self.doc.text(),
+            diagnoses,
+            self.doc.notes(),
+            now,
+            pass_id,
+        );
+        let kept = annotations.len();
+        self.doc.add_diagnoses(annotations);
+        self.mark_dirty();
+        // Silent success is the second invisibility bug:
+        // 0 anchored must be said out loud.
+        self.ai_status = Some(AiStatus::Note {
+            title: match kept {
+                0 if count == 0 => {
+                    "Pass complete — the editor found nothing to flag".to_owned()
+                }
+                0 => "Pass complete — no quote matched the current text".to_owned(),
+                n => format!("{n} margin quer{} anchored", if n == 1 { "y" } else { "ies" }),
+            },
+            detail: if count > kept && kept > 0 {
+                format!("{} dropped (stale quotes)", count - kept)
+            } else {
+                String::new()
+            },
+        });
+        self.schedule_status_fade(generation, cx);
+        cx.notify();
+    }
+
+    /// The arrival gate — the ONE decision of the reveal clock. Mid-typing-
+    /// burst, results WAIT: landing now would pop squiggles into the sentence
+    /// being typed and re-pack the lane under the writer's eyes. The lull
+    /// watcher integrates them the moment the burst ends; scroll or the door
+    /// flush sooner. Held UN-anchored on purpose — quotes anchor against the
+    /// text as it stands at reveal, not at arrival. In a lull (the common
+    /// case: the writer asked and is waiting), results land immediately.
+    fn deliver_pass(
+        &mut self,
+        diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.typing_burst_live() {
+            self.deferred_pass = Some(DeferredPass { diagnoses, generation });
+            self.watch_for_lull(cx);
+        } else {
+            self.integrate_pass(diagnoses, generation, cx);
+        }
+    }
+
+    /// Land the parked pass, if its generation still stands. Called by the
+    /// lull watcher and by the explicit attention shifts (scroll, the door) —
+    /// any of them may fire first; the `take()` makes the flush idempotent.
+    fn flush_deferred_pass(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.deferred_pass.take() else {
+            return;
+        };
+        if d.generation != self.ai_generation {
+            return; // cancelled or superseded while parked
+        }
+        self.integrate_pass(d.diagnoses, d.generation, cx);
+    }
+
+    /// Poll (4×/s) until the typing burst ends, then flush the parked pass.
+    /// Exits when the deferral is gone — flushed here, flushed by a scroll or
+    /// the door, or dropped by a cancel — so at most one watcher does work,
+    /// and a re-armed deferral just rides the loop that is already running.
+    fn watch_for_lull(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let done = this.update(cx, |editor: &mut Editor, cx| {
+                    if editor.deferred_pass.is_none() {
+                        return true;
+                    }
+                    if editor.typing_burst_live() {
+                        return false;
+                    }
+                    editor.flush_deferred_pass(cx);
+                    true
+                });
+                if done.unwrap_or(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Background probe for a local OpenAI-compatible model (Ollama's
@@ -5017,6 +5142,9 @@ impl Editor {
         if self.palette_input.is_some() || self.ai_settings.is_some() || self.shortcuts_open {
             return;
         }
+        // Scrolling is the writer looking around — a parked pass lands now
+        // (attention already moved; nothing can pop "under" it mid-thought).
+        self.flush_deferred_pass(cx);
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
@@ -5318,8 +5446,10 @@ impl Editor {
                 let hit_id = note_at_char(&ranges, c);
                 let hit = hit_id.and_then(|id| self.doc.notes().get(id));
                 // Reaching for a resting diagnosis opens the door (DESIGN
-                // §4.4), so the card it activates is actually on screen.
+                // §4.4), so the card it activates is actually on screen —
+                // and an attention shift this explicit lands a parked pass.
                 if self.drafting && hit.is_some_and(|n| n.kind == NoteKind::Diagnosis) {
+                    self.flush_deferred_pass(cx);
                     self.drafting = false;
                 }
                 // Clicking the text selects the hit card (or clears selection);
@@ -5543,6 +5673,9 @@ impl Editor {
             "field_cursor": field_cursor,
             "field_sel": field_sel,
             "margin": margin,
+            // A completed pass parked behind the reveal clock (mid-burst
+            // arrival) — the rig asserts park-then-land timing against this.
+            "ai_deferred": self.deferred_pass.is_some(),
         })
         .to_string()
     }
@@ -5555,8 +5688,24 @@ impl Editor {
     /// text; the middle card is activated. Driven by the `seed:diag` smoke
     /// token — never reached outside a STROP_SMOKE run.
     pub fn debug_seed_notes(&mut self, cx: &mut Context<Self>) {
-        use strop_core::diagnose::{Diagnosis, to_annotations};
-        let demos: Vec<Diagnosis> = [
+        use strop_core::diagnose::to_annotations;
+        let anns =
+            to_annotations(&self.doc.text(), Self::demo_diagnoses(), self.doc.notes(), 0, 0);
+        self.doc.add_diagnoses(anns);
+        self.drafting = false; // reviewing: the editor's cards are shown
+        if let Some(n) = self.doc.notes().open().nth(2) {
+            self.focus = CardFocus::Selected(n.id);
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// The four demo diagnoses the rig seeds deliver (anchored to the
+    /// tutorial/fixture quotes) — shared so every seed path flags the same
+    /// passages.
+    fn demo_diagnoses() -> Vec<strop_core::diagnose::Diagnosis> {
+        use strop_core::diagnose::Diagnosis;
+        [
             ("sold his shadow", "buried lede",
              "The strongest image of the piece opens it — do you want it spent in the first clause, or held?"),
             ("quiet thing", "ambiguous shorthand",
@@ -5573,14 +5722,18 @@ impl Editor {
             query: query.into(),
             level: "line".into(),
         })
-        .collect();
-        let anns = to_annotations(&self.doc.text(), demos, self.doc.notes(), 0, 0);
-        self.doc.add_diagnoses(anns);
-        self.drafting = false; // reviewing: the editor's cards are shown
-        if let Some(n) = self.doc.notes().open().nth(2) {
-            self.focus = CardFocus::Selected(n.id);
-        }
-        self.mark_dirty();
+        .collect()
+    }
+
+    /// Rig hook (`seed:deliver`): push the demo pass through the REAL arrival
+    /// gate (`deliver_pass`) — mid-typing-burst it parks behind the reveal
+    /// clock, in a lull it lands at once. rig-check.sh types a key first to
+    /// open a burst, asserts nothing surfaced, waits out TYPING_LULL, and
+    /// asserts the cards landed — the whole clock against a real window.
+    pub fn debug_deliver_pass(&mut self, cx: &mut Context<Self>) {
+        self.drafting = false; // a real pass opens the door at request time
+        let generation = self.ai_generation;
+        self.deliver_pass(Self::demo_diagnoses(), generation, cx);
         cx.notify();
     }
 
@@ -10323,6 +10476,7 @@ impl Editor {
                     MouseButton::Left,
                     cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
+                        editor.flush_deferred_pass(cx);
                         editor.drafting = false;
                         cx.notify();
                     }),
@@ -10465,6 +10619,7 @@ impl Editor {
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
+                            editor.flush_deferred_pass(cx);
                             editor.drafting = false;
                             cx.notify();
                         }),

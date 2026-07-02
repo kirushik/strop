@@ -125,6 +125,29 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:many: crowded lane seeded (8 diagnoses, 2 passes)");
                 continue;
             }
+            // `seed:deliver` pushes the demo pass through the REAL arrival
+            // gate (reveal clock): mid-typing-burst it parks, in a lull it
+            // lands — unlike seed:diag, which bypasses the gate on purpose.
+            if key == "seed:deliver" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_deliver_pass(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:deliver: demo pass sent through the arrival gate");
+                continue;
+            }
+            // `wait:MS` — idle the script (the reveal clock's lull, status
+            // fades, animations) without faking any input.
+            if let Some(ms) = key.strip_prefix("wait:") {
+                let ms: u64 = ms.parse().expect("bad wait ms in STROP_SMOKE");
+                cx.background_executor()
+                    .timer(Duration::from_millis(ms))
+                    .await;
+                eprintln!("SMOKE wait:{ms}");
+                continue;
+            }
             if key == "dump:ui" {
                 let dump = window
                     .update(cx, |editor, window, cx| editor.debug_ui_dump(window, cx))
