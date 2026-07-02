@@ -104,5 +104,17 @@ for x in 60 800 1500; do
     echo "  FAIL wheel at x=$x did not scroll (got $S)"; fail=1; fi
 done
 
+echo "rig-check: a resolved card exits with a brief ghost fade, model commits at once"
+# Re-seed on DOC (dedupes against its sidecar), resolve the first note through
+# the real set_note_status path: the note resolves IMMEDIATELY (visible 4 → 3)
+# while its ghost fades (departing 1 → 0 after the timer).
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOC" "seed:diag resolve:first dump:ui wait:300 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | head -1); D2=$(echo "$OUT" | tail -1)
+[ -n "$D1" ] || { echo "  FAIL no dump (rig didn't render?)"; exit 1; }
+expect "the model resolves instantly"      3 "$(field "$D1" visible)"
+expect "its ghost lingers for the fade"    1 "$(field "$D1" departing)"
+expect "the ghost is gone after the fade"  0 "$(field "$D2" departing)"
+expect "the lane stands re-packed"         3 "$(field "$D2" visible)"
+
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

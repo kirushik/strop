@@ -86,6 +86,10 @@ const TYPING_LULL: Duration = Duration::from_millis(1000);
 /// are genuinely NEW — a card scrolled back into view is old content and must
 /// never re-announce itself (motion = information, or it's noise).
 const CARD_APPEAR: Duration = Duration::from_millis(250);
+/// A resolved card's exit: a brief accelerating fade of its ghost (the model
+/// commits instantly; only the light lingers). Short and ease-in — leaving
+/// asks less attention than arriving (attention-motion.md §3, "exit" token).
+const CARD_RESOLVE: Duration = Duration::from_millis(150);
 
 /// A completed pass parked until the typing lull (see `Editor::deferred_pass`).
 /// Carries the RAW diagnoses (quotes not yet anchored) and the generation that
@@ -677,6 +681,12 @@ pub struct Editor {
     /// fade completes, so a later scroll-out/in can never replay the entrance.
     /// Writer notes never enter here — your own keystroke is instant.
     appearing: std::collections::HashSet<u64>,
+    /// Ghosts of just-resolved cards, mid exit-fade (`CARD_RESOLVE`): the
+    /// rendered snapshot + when it started. Painted UNDER the live lane,
+    /// non-interactive, dropped by a timer (and by any scroll — the snapshot
+    /// is viewport-frozen). The note itself resolved instantly; this is
+    /// presentation only, so nothing here can leak back into the model.
+    departing: Vec<(MarginCard, Instant)>,
     /// The door (DESIGN §4.4; core-loop research: separate GENERATE from
     /// EVALUATE). `true` = drafting, door closed: the editorial margin goes
     /// quiet so a writing burst is never pulled into evaluation by its own
@@ -1014,6 +1024,7 @@ impl Editor {
             deferred_pass: None,
             last_text_edit: None,
             appearing: std::collections::HashSet::new(),
+            departing: Vec::new(),
             // Door closed by default: every document opens to write, not to
             // be judged (protects re-entry — the warm-up re-read that slides
             // into line-editing). The tutorial opens it (main.rs); so does a
@@ -2012,6 +2023,30 @@ impl Editor {
         // Commit any open draft first (the click may be on this card's own
         // done/×, or on another card while this one composes).
         self.resolve_composer(window, cx);
+        // A resolved card leaves with a brief exit fade rather than blinking
+        // out: snapshot its rendered slot BEFORE the model change (afterwards
+        // it has no card to snapshot). The model itself commits immediately —
+        // only the light lingers (departing), never the data.
+        if matches!(status, NoteStatus::Done | NoteStatus::Dismissed) {
+            if let Some(card) =
+                self.margin_cards(true).cards.into_iter().find(|c| c.id == id)
+            {
+                self.departing.push((card, Instant::now()));
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(CARD_RESOLVE + Duration::from_millis(50))
+                        .await;
+                    this.update(cx, |editor: &mut Editor, cx| {
+                        editor
+                            .departing
+                            .retain(|(_, since)| since.elapsed() < CARD_RESOLVE);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
         self.doc.set_note_status(id, status);
         if self.focus.active_id() == Some(id) {
             self.focus = CardFocus::Idle;
@@ -5182,6 +5217,9 @@ impl Editor {
         // Scrolling is the writer looking around — a parked pass lands now
         // (attention already moved; nothing can pop "under" it mid-thought).
         self.flush_deferred_pass(cx);
+        // Exit-fade ghosts are viewport-frozen snapshots: once the text
+        // moves under them they'd hang mid-air, so a scroll just drops them.
+        self.departing.clear();
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
@@ -5716,6 +5754,8 @@ impl Editor {
             // Cards still inside their entrance fade — the rig asserts the
             // fade lifecycle (marked at landing, cleared right after).
             "appearing": self.appearing.len(),
+            // Exit-fade ghosts of just-resolved cards (same lifecycle checks).
+            "departing": self.departing.len(),
         })
         .to_string()
     }
@@ -5763,6 +5803,18 @@ impl Editor {
             level: "line".into(),
         })
         .collect()
+    }
+
+    /// Rig hook (`resolve:first`): resolve the first open note through the
+    /// real `set_note_status` path — instant model commit, exit-fade ghost —
+    /// without depending on the done-button's pixel position (the button's
+    /// hit-test is ordinary gpui listener machinery the click checks already
+    /// cover; the class under test here is the ghost lifecycle).
+    pub fn debug_resolve_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first = self.doc.notes().open().next().map(|n| n.id);
+        if let Some(id) = first {
+            self.set_note_status(id, NoteStatus::Done, window, cx);
+        }
     }
 
     /// Rig hook (`seed:deliver`): push the demo pass through the REAL arrival
@@ -9154,6 +9206,7 @@ struct OffscreenRef {
     anchor_culled: bool,
 }
 
+#[derive(Clone)]
 struct MarginCard {
     id: u64,
     top: f32,
@@ -10196,9 +10249,54 @@ impl Editor {
             above,
             below,
         } = self.margin_cards(true);
-        if cards.is_empty() && above.is_empty() && below.is_empty() {
+        if cards.is_empty() && above.is_empty() && below.is_empty() && self.departing.is_empty() {
             return None;
         }
+        // Ghosts of just-resolved cards (departing), painted FIRST so the live
+        // lane sits over them: a brief exit fade where the card was, non-
+        // interactive (no id, no listeners — a click lands on whatever is
+        // really there). In the common uncrowded lane nothing else moves, so
+        // the whole gesture is just the card taking its leave.
+        let ghosts: Vec<gpui::AnyElement> = self
+            .departing
+            .iter()
+            .map(|(card, _)| {
+                let is_diagnosis = card.kind == NoteKind::Diagnosis;
+                div()
+                    .absolute()
+                    .top(px(card.top.max(4.)))
+                    .left(px(8.))
+                    .w(px(MARGIN_WIDTH - 8.))
+                    .p(px(8.))
+                    .overflow_hidden()
+                    .rounded(px(if is_diagnosis { 3. } else { 9. }))
+                    .bg(rgb(if card.unverified {
+                        STALE_BG
+                    } else if is_diagnosis {
+                        DIAGNOSIS_CARD_BG
+                    } else {
+                        NOTE_CARD_BG
+                    }))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .font_family("PT Serif")
+                    .text_size(px(13.))
+                    .line_height(px(CARD_LINE_H))
+                    .text_color(rgb(MUTED_COLOR))
+                    .when(is_diagnosis && !card.title.is_empty(), |d| {
+                        d.child(
+                            div().font_weight(FontWeight::BOLD).child(card.title.clone()),
+                        )
+                    })
+                    .child(div().child(card.body.clone()))
+                    .with_animation(
+                        ("card-depart", card.id as usize),
+                        Animation::new(CARD_RESOLVE).with_easing(|t| t * t * t),
+                        |el, t| el.opacity(1. - t),
+                    )
+                    .into_any_element()
+            })
+            .collect();
         let (above_n, below_n) = (above.len(), below.len());
         let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
         // A quiet pill at a lane edge when cards are hidden past it — the honest
@@ -10270,6 +10368,7 @@ impl Editor {
                 // wheel anywhere over the document surface — prose, gutters, this
                 // lane, the whitespace beyond it — scrolls the one document. No
                 // per-element wheel handler here (it would double-fire via bubble).
+                .children(ghosts)
                 .children(cards.into_iter().map(|card| {
                     let MarginCard {
                         id,

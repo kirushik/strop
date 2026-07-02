@@ -138,6 +138,18 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:deliver: demo pass sent through the arrival gate");
                 continue;
             }
+            // `resolve:first` marks the first open note Done through the real
+            // set_note_status path (instant commit + exit-fade ghost).
+            if key == "resolve:first" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_resolve_first(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
+                eprintln!("SMOKE resolve:first: first open note resolved");
+                continue;
+            }
             // `wait:MS` — idle the script (the reveal clock's lull, status
             // fades, animations) without faking any input.
             if let Some(ms) = key.strip_prefix("wait:") {
