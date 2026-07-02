@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
+    Animation, AnimationExt,
     AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
     Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
@@ -78,6 +79,13 @@ const REVEAL_INSET: f32 = 120.;
 /// SELF-requested cards, so err eager, never build a longer artificial hold
 /// (attention-motion.md §2, the two-clock verdict pared to its one real rule).
 const TYPING_LULL: Duration = Duration::from_millis(1000);
+/// A freshly-landed card's entrance: one opacity fade, decelerating (the
+/// "enter" easing token, attention-motion.md §3) — the AI voice arrives
+/// gently instead of popping. Opacity ONLY (no slide/scale/spring), which is
+/// also exactly the prefers-reduced-motion-safe form, and only for cards that
+/// are genuinely NEW — a card scrolled back into view is old content and must
+/// never re-announce itself (motion = information, or it's noise).
+const CARD_APPEAR: Duration = Duration::from_millis(250);
 
 /// A completed pass parked until the typing lull (see `Editor::deferred_pass`).
 /// Carries the RAW diagnoses (quotes not yet anchored) and the generation that
@@ -664,6 +672,11 @@ pub struct Editor {
     /// chokepoint — real buffer ops only, not caret moves or card clicks).
     /// `deferred_pass` reads it to tell a live typing burst from a lull.
     last_text_edit: Option<Instant>,
+    /// Cards from the pass that JUST landed (`integrate_pass`), still inside
+    /// their entrance fade (`CARD_APPEAR`). Cleared by a timer right after the
+    /// fade completes, so a later scroll-out/in can never replay the entrance.
+    /// Writer notes never enter here — your own keystroke is instant.
+    appearing: std::collections::HashSet<u64>,
     /// The door (DESIGN §4.4; core-loop research: separate GENERATE from
     /// EVALUATE). `true` = drafting, door closed: the editorial margin goes
     /// quiet so a writing burst is never pulled into evaluation by its own
@@ -1000,6 +1013,7 @@ impl Editor {
             pending_pass: None,
             deferred_pass: None,
             last_text_edit: None,
+            appearing: std::collections::HashSet::new(),
             // Door closed by default: every document opens to write, not to
             // be judged (protects re-entry — the warm-up re-read that slides
             // into line-editing). The tutorial opens it (main.rs); so does a
@@ -2237,6 +2251,29 @@ impl Editor {
         let kept = annotations.len();
         self.doc.add_diagnoses(annotations);
         self.mark_dirty();
+        // The landed cards get one entrance fade (CARD_APPEAR); the marks
+        // clear right after it finishes so nothing ever re-fades. Their ids
+        // are exactly the open notes stamped with this pass.
+        if kept > 0 {
+            self.appearing = self
+                .doc
+                .notes()
+                .open()
+                .filter(|n| n.pass_id == pass_id)
+                .map(|n| n.id)
+                .collect();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(CARD_APPEAR + Duration::from_millis(150))
+                    .await;
+                this.update(cx, |editor: &mut Editor, cx| {
+                    editor.appearing.clear();
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         // Silent success is the second invisibility bug:
         // 0 anchored must be said out loud.
         self.ai_status = Some(AiStatus::Note {
@@ -5676,6 +5713,9 @@ impl Editor {
             // A completed pass parked behind the reveal clock (mid-burst
             // arrival) — the rig asserts park-then-land timing against this.
             "ai_deferred": self.deferred_pass.is_some(),
+            // Cards still inside their entrance fade — the rig asserts the
+            // fade lifecycle (marked at landing, cleared right after).
+            "appearing": self.appearing.len(),
         })
         .to_string()
     }
@@ -9334,6 +9374,23 @@ fn oldest_beyond_cap(surfaced: &[(u64, u64)], cap: usize) -> std::collections::H
     v.into_iter().skip(cap).map(|(id, _)| id).collect()
 }
 
+/// A freshly-landed card's entrance: one decelerating opacity fade over
+/// CARD_APPEAR (cubic ease-out ≈ the "enter" token, attention-motion.md §3).
+/// `is_new` holds only while the landing pass is inside its fade window
+/// (Editor::appearing), so a card scrolled out and back re-mounts WITHOUT
+/// replaying the entrance — old content never re-announces itself.
+fn appear_fade<E: Styled + IntoElement + 'static>(el: E, id: u64, is_new: bool) -> gpui::AnyElement {
+    if !is_new {
+        return el.into_any_element();
+    }
+    el.with_animation(
+        ("card-appear", id as usize),
+        Animation::new(CARD_APPEAR).with_easing(|t| 1. - (1. - t).powi(3)),
+        |el, t| el.opacity(t),
+    )
+    .into_any_element()
+}
+
 /// Which open annotation a click at char index `c` activates, given each open
 /// note's `(id, start, end)` (anchor covers `[start, end)`). A click snaps to
 /// the nearest caret boundary, so a click on the trailing half of the last glyph
@@ -10227,6 +10284,9 @@ impl Editor {
                         collapsed,
                         ..
                     } = card;
+                    // Inside its entrance fade? (One fade per landed pass;
+                    // never replayed — see appear_fade.)
+                    let is_new = self.appearing.contains(&id);
                     // Receded (over the full-size budget): one muted title line
                     // at the anchor — present and clickable, just smaller, the
                     // way dense marginalia shrink on paper. Clicking selects it,
@@ -10234,7 +10294,7 @@ impl Editor {
                     // place. Height is FORCED to COLLAPSED_CARD_H so the packer
                     // and the paint can never disagree (the overlap bug class).
                     if collapsed {
-                        return div()
+                        let compact = div()
                             .id(("note-card", id as usize))
                             .absolute()
                             .top(px(top.max(4.)))
@@ -10269,6 +10329,7 @@ impl Editor {
                             } else {
                                 title.clone()
                             }));
+                        return appear_fade(compact, id, is_new);
                     }
                     // The composer renders only on the note it is actually
                     // editing — never on a clicked AI card (the id comes from
@@ -10279,7 +10340,7 @@ impl Editor {
                         .flatten();
                     let is_diagnosis = kind == NoteKind::Diagnosis;
                     let label = note_card_label(is_diagnosis, &level, orphaned);
-                    div()
+                    let card = div()
                         .id(("note-card", id as usize))
                         .absolute()
                         .top(px(top.max(4.)))
@@ -10418,7 +10479,8 @@ impl Editor {
                                 div().text_color(rgb(MUTED_COLOR)).child("(empty note)")
                             }
                             CardBody::Text => div().child(body.clone()),
-                        })
+                        });
+                    appear_fade(card, id, is_new)
                 }))
                 .children(above_chip)
                 .children(below_chip),

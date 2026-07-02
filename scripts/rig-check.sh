@@ -33,11 +33,13 @@ DOC2=$(mktemp --suffix=.md)
   done
   for i in $(seq 1 40); do echo "Ordinary padding paragraph number $i, plain and unremarked."; echo; done
 } > "$DOC2"
-# A third fixture for the reveal-clock check (its own file: sidecars
-# accumulate, and this check needs a margin that starts empty).
+# Fixtures three and four: the reveal-clock and entrance-fade checks (each
+# its own file — sidecars accumulate, and both need a margin that starts empty).
 DOC3=$(mktemp --suffix=.md)
 head -4 "$DOC" > "$DOC3"
-trap 'rm -f "$DOC" "$DOC.strop" "$DOC2" "$DOC2.strop" "$DOC3" "$DOC3.strop"' EXIT
+DOC4=$(mktemp --suffix=.md)
+head -4 "$DOC" > "$DOC4"
+trap 'rm -f "$DOC" "$DOC.strop" "$DOC2" "$DOC2.strop" "$DOC3" "$DOC3.strop" "$DOC4" "$DOC4.strop"' EXIT
 
 fail=0
 field() { echo "$1" | grep -oE "\"$2\":[^,}]*" | head -1 | cut -d: -f2; }
@@ -81,6 +83,18 @@ expect "mid-burst the pass parks"          true  "$(field "$D1" ai_deferred)"
 expect "nothing surfaces mid-burst"        0     "$(field "$D1" visible)"
 expect "the lull lands the parked pass"    false "$(field "$D2" ai_deferred)"
 expect "all four cards surface after it"   4     "$(field "$D2" visible)"
+
+echo "rig-check: landed cards get ONE entrance fade, then the marks clear"
+# In a lull the pass lands at once: the dump right after shows all four cards
+# inside their fade window; ~700ms later the marks are gone (fade 250ms +
+# clear timer), so nothing can ever re-fade on a later scroll-out/in.
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOC4" "seed:deliver dump:ui wait:700 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | head -1); D2=$(echo "$OUT" | tail -1)
+[ -n "$D1" ] || { echo "  FAIL no dump (rig didn't render?)"; exit 1; }
+expect "a lull lands the pass at once"     4 "$(field "$D1" visible)"
+expect "landed cards are inside the fade"  4 "$(field "$D1" appearing)"
+expect "the fade marks clear after it"     0 "$(field "$D2" appearing)"
+expect "cards persist past the fade"       4 "$(field "$D2" visible)"
 
 echo "rig-check: scroll works anywhere on the document surface"
 for x in 60 800 1500; do
