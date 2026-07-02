@@ -105,11 +105,17 @@ Concrete spec if shipped:
 
 1. **Auto-reveal timing → announce-once at t=0 (<100 ms), reveal cards only at a coarse breakpoint** (margin gaze / scroll / door / ≥15 s idle, or sentence-end + ~1.5–2 s idle). **Supported** by interruption science; the win is reduced stress/annoyance, not speed.
 
+   *Implementation outcome (2026-07-02, pares this down):* shipped as ONE rule — results arriving mid-typing-burst park until a 1 s keystroke lull, or land immediately on scroll / any door action / a new pass request (margin-card-dynamics.md §13). The gaze and ≥15 s-idle triggers were **rejected**, not deferred: strop's door already is the writer-controlled breakpoint this verdict is approximating, and implicit-attention triggers make cards materialize for reasons the writer can't see. Announce = the title-bar note (no new channel).
+
 2. **Card motion → ANIMATE moves, never pop, never during a burst.** Appear 250 ms ease-out; re-pack 200 ms standard staggered 40–60 ms; resolve 150 ms ease-in; demote 240 ms standard. No loop, no spring, no scale/spin. Justified by object constancy (Heer & Robertson) — but keep it at UI scale (200–300 ms), *not* the data-viz ~1 s figure. reduced-motion → cross-fade.
+
+   *Implementation outcome (2026-07-02, partial):* appear (250 ms, genuinely-new cards only) and resolve (150 ms exit ghost, model commits instantly) shipped, both opacity-only — which is already the reduced-motion-safe form, so the setting waits for re-pack move-tweening (the first real translation), still ahead. "Demote" travel no longer exists as such — over-budget cards recede in place (§12 outcome below).
 
 3. **Honest indicators → brief discrete pre-attentive transient, then static.** 120 ms opacity cross-fade + 1-frame luminance tick on the count; *not* a slow ease (change blindness would hide it — defeating "must FEEL it"), *not* a positional slide. **Encode the rail's held-back debt as ambient density** (stack thickness / tick-marks proportional to count), because exact digits are reliable glance-reads only up to ~4 (subitizing); pair the digit with the density cue past that. Persistent visibility is doing real cognitive work — it lowers the cost of returning to deferred review (Iqbal & Horvitz H4), so keep deferred cards represented, never fully hidden.
 
 4. **The pip → YES, gentle single opacity fade, paired with persistent state, reduced-motion fallback, and A/B-gated.** This is the brief's genuine design bet; ship it behind a flag and measure intrusiveness.
+
+   *Implementation outcome (2026-07-02, overrides to NO for now):* shipped CUT rather than flag-gated — it was this brief's weakest-supported bet, and the release's tester guide asks the deciding question directly ("did you ever lose track of whether a pass was running?"). It earns its way in on that signal, not by default.
 
 5. **Visible cap → cap, yes; the number 7 is *not* grounded.** Capping concurrent demands and resting the rest behind a visible-but-quiet rail is sound (interruption-overload; visible-debt lowers return cost). But "7" is Miller's *recall* span, not a limit on persistent on-screen items — NN/g calls that application a myth, and Cowan's ~4 applies to un-chunkable items. **Recommend a comfortable resting count of ~5 (test 4–7), flexing with viewport height; chunk cards into themed groups if you want to push toward 7.** What matters more than the number: the demotion is a *visible travel into the rail*, not a delete.
 

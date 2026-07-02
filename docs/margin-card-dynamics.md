@@ -474,3 +474,44 @@ viewport has a card in the lane* — full or one-line, but present at its
 anchor's height. `seed:many` (8 diagnoses, 2 passes) drives it against a real
 frame in `rig-check.sh`: 8 visible, 3 receded, no overlap; click a receded
 card → it expands, 2 receded, still no overlap.
+
+## 13. Phase 4 shipped: one clock, two fades (2026-07-02)
+
+The Phase-4 plan of record (announce-loud-once + reveal-on-attention across
+four triggers + caret pip) was re-reviewed against the same first principle as
+§12 and built in a pared form. What shipped:
+
+**The reveal clock is one rule.** A completed pass arriving mid-typing-burst
+parks (`deferred_pass`) and lands the moment the prose has been still for
+`TYPING_LULL` (1s) — or immediately on any explicit attention shift: scroll,
+the door (shortcut, rail, narrow pill, squiggle-reach), or asking for another
+pass. That's the whole model. The four-trigger machinery (margin-gaze
+detection, a 15s idle timer, a "N ready · review" rail state) was cut before
+building: strop already HAS the writer-controlled attention gate — the door —
+and gaze/idle triggers are haunted-house UX (cards materialize because your
+mouse drifted). Parked results stay un-anchored so quotes anchor against the
+text as it stands at reveal; they carry their generation, so cancel/re-run
+staleness needs no new mechanism. The **caret pip is cut** (the research's own
+weakest-supported bet; the titlebar note is the announcement) — it returns
+only if testers report not knowing a pass finished (tester guide §3 asks).
+
+**Motion only when it means something.** Two fades, both opacity-only:
+- *Enter* (`CARD_APPEAR`, 250ms decelerate): only GENUINELY new cards — a card
+  scrolled back into view never re-announces itself, and the writer's own
+  notes never fade (your keystroke is instant; only the arriving voice eases
+  in). One fade per landed pass, marks cleared right after (`appearing`).
+- *Exit* (`CARD_RESOLVE`, 150ms accelerate): the model commits instantly; only
+  the card's ghost lingers, painted under the live lane, dropped on scroll.
+
+**Deliberately not built:** a `reduce_motion` flag — both animations are
+already the reduced-motion-safe form (short, run-once, opacity only). The flag
+lands together with re-pack move-tweening (Phase 5), the first real
+translation there'd be anything to reduce.
+
+**Harness (the §11 discipline, continued):** `deliver_pass` is the single
+arrival gate shared by the real LLM path and the `seed:deliver` rig hook, so
+rig-check.sh drives the actual clock end-to-end in a real window: type → pass
+parks, nothing surfaces; lull → lands; wheel → lands immediately. New smoke
+tokens `wait:MS` and `resolve:first`; the dump gains `ai_deferred`,
+`appearing`, `departing`, and both fade lifecycles are asserted (marked at the
+event, cleared right after — nothing can ever re-fade).

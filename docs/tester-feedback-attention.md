@@ -16,18 +16,22 @@ testers the numbers — it biases them. Ask about *experience*; we map experienc
 back to the knob.
 
 The bets this release puts in front of testers, and what we're really asking.
-**Build status as of this doc:** the **card budget** (older cards recede to
-one-liners, never hidden) is shipped + tested; the
-**reveal-timing / pip / eased-motion / reduced-motion** pieces are the next build
-increment (designed + grounded in `attention-motion.md`, landing before the
-release goes wide). Only run the sections below whose behaviour is actually in
-the build the tester has — mark each row's status before handing this out.
+**Build status as of this doc (2026-07-02):** SHIPPED + rig-tested — the
+**card budget** (older cards recede to one-liners, never hidden), the
+**reveal timing** (results wait out a typing burst, land at the pause or on
+scroll/door), and the **enter/exit motion** (opacity fades only). NOT built —
+the **completion pip** (cut: the title-bar note is the announcement; §3's
+questions now test whether that is *enough*) and the **reduced-motion
+setting** (the shipped fades are already the reduced-safe form; the setting
+arrives with re-pack motion). Only run the sections below whose behaviour is
+actually in the build the tester has — mark each row's status before handing
+this out.
 
 | Knob | Behaviour under test | The question this trial answers |
 |---|---|---|
 | **Reveal timing** | AI cards from a finished pass *announce* immediately (a quiet cue) but *appear* only when you turn to review (scroll/hover the margin, open the door, or a long pause) — never mid-typing | Does it ever feel like the AI interrupts mid-thought? Does deferring ever feel like the feedback is "lost" or late? |
 | **Pause threshold** | ~1.5 s of typing-stillness counts as a pause | Too eager (cards pop while still thinking) vs too sluggish (waiting after you've clearly stopped)? |
-| **Completion pip** | a brief, soft glow near the cursor when a pass finishes | Noticed at all? Reassuring vs naggy? Missed it entirely? |
+| **Completion cue** | *(pip CUT — not in build)* a pass announces itself via the title-bar note + the cards landing at your next pause | Is that enough — did you ever wonder whether a pass was still running? (If many say yes, the pip earns its way back.) |
 | **Card budget** | at most ~5 AI cards show *full-size* per screen; older ones shrink to a one-line card at their sentence (click to expand) — nothing is ever hidden | Does the margin ever feel cluttered/"wallpaper"? Do the small one-line cards read as "still there," or do they feel demoted/lost? |
 | **Motion** | cards fade/slide in; nothing pops, loops, or bounces | Calm vs distracting? Anything feel laggy/janky? |
 | **Reduced motion** | a setting that swaps movement for cross-fades | (For motion-sensitive testers) does the calm mode still feel coherent — nothing teleports? |
@@ -76,14 +80,15 @@ flow; you summon it.
 
 When you ask for a pass, it runs in the background and then signals it's done.
 
-- After requesting a pass, **how did you know it had finished?** (the glow near the
-  cursor / a count in the margin / the title bar / you just looked / didn't notice)
-- The brief glow near your cursor on completion: **noticed it? once you knew it was
-  there, was it reassuring or annoying?** (rate 1–5 each; "never saw it" is valid)
+- After requesting a pass, **how did you know it had finished?** (the title-bar
+  note / the cards appearing when you paused / you just looked / you didn't —
+  all answers useful)
+- Did you ever **wonder whether a pass was still running** — ask for it, type
+  on, and lose track of whether feedback was coming? How often, and did it
+  bother you? (This is the question that decides whether we add a small
+  completion glow near the cursor; we deliberately shipped without one.)
 - Did the completion signal ever feel like it **demanded** attention rather than
   *offered* it?
-- Open: if we removed the glow entirely and only updated a quiet count, would you
-  miss it?
 
 ## 4. The margin when there's a lot — clutter & "nothing vanishes"
 
@@ -116,15 +121,18 @@ without being pulled by it.
 
 ## 6. Reduced motion / accessibility (motion-sensitive testers especially)
 
-There's a setting to replace movement with gentle cross-fades.
+*(No setting in this build — deliberately: all shipped motion is already
+short, run-once, opacity-only fades, which is the reduced-motion-safe form.
+The setting arrives together with re-pack movement. Still ask:)*
 
-- Did you find/enable it? Was it discoverable?
-- With it on, did anything **teleport or jump** in a way that lost the thread (a
-  card vanishing with no trace, a count snapping)? It should cross-fade, not snap.
-- Did the reduced-motion mode still feel like a *finished* experience, or a
-  degraded one?
-- (If motion-sensitive) did the default motion cause any discomfort over a long
-  session?
+- (If motion-sensitive) did the default fades cause any discomfort over a long
+  session? Any at all is a finding — say where.
+- Did anything **teleport or jump** in a way that lost the thread (a card
+  vanishing with no trace, cards snapping to new spots when one resolved)?
+  That's the gap the coming re-pack motion + setting are meant to close — we
+  want to know how much it actually hurts today.
+- Would you have gone looking for a "reduce motion" setting? (Tells us how
+  discoverable it needs to be.)
 
 ## 7. Overall
 
@@ -142,9 +150,9 @@ There's a setting to replace movement with gentle cross-fades.
   raise the pause threshold. Map "felt late/hidden" reports → lower it. (The
   research says the affective cost of unsolicited interrupts likely *overstates*
   ours, so don't over-defer on weak signal.)
-- "Never noticed the pip" + "didn't miss it" from most testers → cut it (it's our
-  least-supported bet). "Reassuring" → keep, tune amplitude per intrusiveness
-  reports.
+- The pip shipped CUT. "Lost track of whether a pass was running" from several
+  testers → build it (gentle, opacity-only, paired with the count). Nobody
+  missing it → the cut stands, permanently.
 - "Felt lost" on a shrunken card → the one-line card isn't reading as "still
   here"; strengthen its affordance (hover, label) before touching the budget
   number.
