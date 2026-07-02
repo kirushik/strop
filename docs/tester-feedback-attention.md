@@ -16,7 +16,8 @@ testers the numbers — it biases them. Ask about *experience*; we map experienc
 back to the knob.
 
 The bets this release puts in front of testers, and what we're really asking.
-**Build status as of this doc:** the **card cap** is shipped + tested; the
+**Build status as of this doc:** the **card budget** (older cards recede to
+one-liners, never hidden) is shipped + tested; the
 **reveal-timing / pip / eased-motion / reduced-motion** pieces are the next build
 increment (designed + grounded in `attention-motion.md`, landing before the
 release goes wide). Only run the sections below whose behaviour is actually in
@@ -27,7 +28,7 @@ the build the tester has — mark each row's status before handing this out.
 | **Reveal timing** | AI cards from a finished pass *announce* immediately (a quiet cue) but *appear* only when you turn to review (scroll/hover the margin, open the door, or a long pause) — never mid-typing | Does it ever feel like the AI interrupts mid-thought? Does deferring ever feel like the feedback is "lost" or late? |
 | **Pause threshold** | ~1.5 s of typing-stillness counts as a pause | Too eager (cards pop while still thinking) vs too sluggish (waiting after you've clearly stopped)? |
 | **Completion pip** | a brief, soft glow near the cursor when a pass finishes | Noticed at all? Reassuring vs naggy? Missed it entirely? |
-| **Card cap** | at most ~5 AI cards show at once; older ones rest in the rail | Does the margin ever feel cluttered/"wallpaper"? Does resting older cards feel like losing them? |
+| **Card budget** | at most ~5 AI cards show *full-size* per screen; older ones shrink to a one-line card at their sentence (click to expand) — nothing is ever hidden | Does the margin ever feel cluttered/"wallpaper"? Do the small one-line cards read as "still there," or do they feel demoted/lost? |
 | **Motion** | cards fade/slide in; nothing pops, loops, or bounces | Calm vs distracting? Anything feel laggy/janky? |
 | **Reduced motion** | a setting that swaps movement for cross-fades | (For motion-sensitive testers) does the calm mode still feel coherent — nothing teleports? |
 
@@ -90,14 +91,14 @@ A long session can produce many notes and AI cards.
 
 - Did the margin ever feel **cluttered, busy, or like wallpaper you stopped
   reading**? (rate 1–5; when?)
-- When more than a handful of AI cards existed, the oldest rest in a small rail
-  rather than all showing. Did you **notice cards resting**? Did it ever feel like
-  a card was **lost** rather than tucked away? Could you get it back when you
-  wanted?
-- Your *own* margin notes are never capped or hidden — did that distinction (your
-  notes always present, AI cards budgeted) feel right, or did you not notice?
-- Open: what's the right number of AI cards to see at once before it's too many —
-  did ~a handful feel right, too few, too many?
+- When more than a handful of AI cards shared a screen, the older ones shrink to
+  a **one-line card** next to their sentence (a click opens them full). Did you
+  notice? Did a shrunken card ever feel **lost or demoted**, or did it read as
+  "still there, just quieter"? Was expanding one back obvious?
+- Your *own* margin notes never shrink or hide — did that distinction (your
+  notes always full, AI cards budgeted) feel right, or did you not notice?
+- Open: what's the right number of *full-size* AI cards to see at once before
+  it's too many — did ~a handful feel right, too few, too many?
 
 ## 5. Motion — calm or distracting?
 
@@ -144,8 +145,8 @@ There's a setting to replace movement with gentle cross-fades.
 - "Never noticed the pip" + "didn't miss it" from most testers → cut it (it's our
   least-supported bet). "Reassuring" → keep, tune amplitude per intrusiveness
   reports.
-- "Felt lost" on a rested card → the demotion-to-rail isn't reading as "still
-  here"; strengthen the visible-travel / rail affordance before touching the cap
+- "Felt lost" on a shrunken card → the one-line card isn't reading as "still
+  here"; strengthen its affordance (hover, label) before touching the budget
   number.
 - Any jank report on a low-power machine → revisit durations / frame budget before
   shipping wider.

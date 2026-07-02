@@ -71,14 +71,23 @@ const CARD_BOTTOM_MARGIN: f32 = 8.;
 /// enough to show the card, small enough that the pill reveals "one more card",
 /// not a whole page (the pagination-feel fix). See `reveal_scroll`.
 const REVEAL_INSET: f32 = 120.;
-/// The lane shows at most this many AI (Layer-B) cards at once; older passes
-/// rest behind the rail (the D3 notification-debt bound). FIVE, not seven —
-/// Miller's 7±2 is a RECALL span, not a limit on persistent on-screen items
-/// (Cowan's ~4 applies to un-chunkable items); ~5 is the researched resting
-/// count (docs/attention-motion.md §6). A/B between 4–7. The writer's OWN notes
-/// are never capped (working memory, not judgments), and a held card is never
-/// lost — its in-text squiggle stays, so clicking the passage reveals it.
-const VISIBLE_DIAGNOSIS_CAP: usize = 5;
+/// At most this many AI (Layer-B) cards render FULL-SIZE at once; past the
+/// budget, older passes RECEDE to a one-line card at their anchor — smaller,
+/// never hidden (dense marginalia shrink; they don't get filed in a drawer).
+/// The honesty invariant this preserves: every flagged passage you can see has
+/// a visible card in the margin — a squiggle with no card is indistinguishable
+/// from a bug (and was reported as one). FIVE, not seven — Miller's 7±2 is a
+/// RECALL span, not a limit on persistent on-screen items (Cowan's ~4 applies
+/// to un-chunkable items); ~5 is the researched resting count
+/// (docs/attention-motion.md §6). Counted LANE-LOCAL (among the cards actually
+/// in this viewport), so a crowded page elsewhere never empties this one. The
+/// writer's OWN notes are never budgeted (working memory, not judgments), and
+/// the selected card always renders full.
+const FULL_DIAGNOSIS_CAP: usize = 5;
+/// Fixed height of a receded (collapsed) diagnosis card: one 11px title row
+/// plus padding and border. The render forces exactly this height so the
+/// packer's no-overlap math and the painted card can never disagree.
+const COLLAPSED_CARD_H: f32 = 24.;
 /// The prose column's capped width — everything else (centering, the note
 /// lane, the narrow-width left-shift) is measured against it.
 const COL_MAX_WIDTH: f32 = 660.;
@@ -2018,31 +2027,6 @@ impl Editor {
             .open()
             .filter(|n| n.kind == NoteKind::Diagnosis && n.level == "copy")
             .count()
-    }
-
-    /// Diagnoses held back by the visible budget (`VISIBLE_DIAGNOSIS_CAP`): of
-    /// the diagnoses that WOULD surface (door-passed, non-active), keep the
-    /// newest few and rest the older passes — they surface as a rail count, not
-    /// lost (their in-text squiggle still reveals them on click). One source of
-    /// truth shared by `margin_cards` (to skip them) and the rail (to count them).
-    fn cap_held_diagnoses(&self) -> std::collections::HashSet<u64> {
-        let active = self.focus.active_id();
-        let drafting = self.drafting;
-        let has_dev = !drafting
-            && self
-                .doc
-                .notes()
-                .open()
-                .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
-        let surfaced: Vec<(u64, u64)> = self
-            .doc
-            .notes()
-            .open()
-            .filter(|n| n.kind == NoteKind::Diagnosis && Some(n.id) != active)
-            .filter(|n| note_surfaces(n.kind, &n.level, drafting, has_dev))
-            .map(|n| (n.id, n.pass_id))
-            .collect();
-        held_beyond_cap(&surfaced, VISIBLE_DIAGNOSIS_CAP)
     }
 
     /// The effective levels-of-edit depth: session override, else config,
@@ -5544,6 +5528,9 @@ impl Editor {
                 "overlap": overlap,
                 "has_active": self.focus.active_id().is_some(),
                 "active_visible": layout.cards.iter().any(|c| c.active),
+                // Receded one-line cards (over the full-size budget) — visible
+                // counts them too: they are IN the lane, just smaller.
+                "collapsed": layout.cards.iter().filter(|c| c.collapsed).count(),
             })
         });
         serde_json::json!({
@@ -5593,6 +5580,30 @@ impl Editor {
         if let Some(n) = self.doc.notes().open().nth(2) {
             self.focus = CardFocus::Selected(n.id);
         }
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Rig hook (`seed:many`): a CROWDED lane — eight diagnoses across two
+    /// passes, none selected, so the full-size budget (FULL_DIAGNOSIS_CAP)
+    /// visibly recedes the oldest pass to one-line cards while every flagged
+    /// passage keeps a card in the lane (the honesty invariant, asserted by
+    /// rig-check.sh against a real frame). Quotes must appear, in order, in
+    /// the open document — rig-check.sh writes a fixture that contains them.
+    pub fn debug_seed_many(&mut self, cx: &mut Context<Self>) {
+        use strop_core::diagnose::{Diagnosis, to_annotations};
+        let mk = |i: usize| Diagnosis {
+            quote: format!("crowded margin phrase number {i}"),
+            problem: format!("finding {i}"),
+            query: "Does this line carry its weight?".into(),
+            level: "line".into(),
+        };
+        for (pass, range) in [(1u64, 1..=4usize), (2, 5..=8)] {
+            let demos: Vec<Diagnosis> = range.map(mk).collect();
+            let anns = to_annotations(&self.doc.text(), demos, self.doc.notes(), 0, pass);
+            self.doc.add_diagnoses(anns);
+        }
+        self.drafting = false; // reviewing: the editor's cards are shown
         self.mark_dirty();
         cx.notify();
     }
@@ -8969,6 +8980,13 @@ struct MarginCard {
     /// A diagnosis whose flagged text was edited since it was raised — greyed
     /// as "unverified" (Annotation::unverified). Always false for writer notes.
     unverified: bool,
+    /// Which AI pass raised it (0 for writer notes) — the recency the full-size
+    /// budget sorts by when a crowded lane recedes older passes.
+    pass_id: u64,
+    /// Over the lane's full-size budget: render as a one-line card at the
+    /// anchor (title only, muted) instead of the full card. Never true for
+    /// writer notes or the selected card; `height` is COLLAPSED_CARD_H.
+    collapsed: bool,
 }
 
 /// A note card's header label: "Note" / a diagnosis level (or "Diagnosis"),
@@ -9151,10 +9169,10 @@ fn reveal_scroll(anchor_y: f32, vp_h: f32, max_scroll: f32, below: bool) -> f32 
     target.clamp(0., max_scroll)
 }
 
-/// Of the surfaced diagnoses `(id, pass_id)`, the ones held back by the visible
-/// budget: keep the newest `cap` (highest pass_id, then id) showing, the rest
-/// rest. Pure, so the cap policy is unit-testable without a frame.
-fn held_beyond_cap(surfaced: &[(u64, u64)], cap: usize) -> std::collections::HashSet<u64> {
+/// Of the lane's diagnoses `(id, pass_id)`, the ones past the full-size budget:
+/// keep the newest `cap` (highest pass_id, then id) full, the rest recede to
+/// one-line cards. Pure, so the budget policy is unit-testable without a frame.
+fn oldest_beyond_cap(surfaced: &[(u64, u64)], cap: usize) -> std::collections::HashSet<u64> {
     if surfaced.len() <= cap {
         return std::collections::HashSet::new();
     }
@@ -9313,9 +9331,6 @@ impl Editor {
                 .notes()
                 .open()
                 .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
-        // Diagnoses beyond the visible budget rest behind the rail (older passes
-        // first). Computed once; the rail counts the same set (cap_held_diagnoses).
-        let cap_held = self.cap_held_diagnoses();
         for n in self.doc.notes().open() {
             // The SELECTED card is exempt from the door: clicking a diagnosis is
             // an explicit attention act that overrides the altitude-order hold
@@ -9324,11 +9339,6 @@ impl Editor {
             // highlight with no card (the reported "click shows no card" bug).
             let active = self.focus.active_id() == Some(n.id);
             if !active && !note_surfaces(n.kind, &n.level, drafting, has_dev) {
-                continue;
-            }
-            // Over the visible budget: rest behind the rail (the active card is
-            // never in cap_held, so selecting a held card always reveals it).
-            if cap_held.contains(&n.id) {
                 continue;
             }
             let byte = rope.char_to_byte(n.range.start.min(rope.len_chars())).min(len);
@@ -9394,7 +9404,32 @@ impl Editor {
                 level: n.level.clone(),
                 orphaned: n.orphaned,
                 unverified: n.unverified,
+                pass_id: n.pass_id,
+                collapsed: false,
             });
+        }
+        // The full-size budget (FULL_DIAGNOSIS_CAP): among the diagnoses that
+        // made it into THIS lane, the newest few render full and older passes
+        // RECEDE to a one-line card at their anchor — present, clickable,
+        // smaller. Counted lane-local (after the anchor cull) so a crowded page
+        // elsewhere never shrinks this one, and never hidden: every flagged
+        // passage in view keeps a visible card (the honesty invariant; a
+        // squiggle with no card reads as a bug, and was reported as one). The
+        // selected card is exempt, so clicking a receded card expands it. Lane
+        // presentation only — the narrow drawer (cull=false) lists all cards.
+        if cull {
+            let surfaced: Vec<(u64, u64)> = cards
+                .iter()
+                .filter(|c| c.kind == NoteKind::Diagnosis && !c.active)
+                .map(|c| (c.id, c.pass_id))
+                .collect();
+            let receded = oldest_beyond_cap(&surfaced, FULL_DIAGNOSIS_CAP);
+            for card in &mut cards {
+                if receded.contains(&card.id) {
+                    card.collapsed = true;
+                    card.height = COLLAPSED_CARD_H;
+                }
+            }
         }
         // Place them in one pass (see `place_margin_cards`): writer notes and
         // the active card hold their anchors, inactive diagnoses yield around
@@ -9484,14 +9519,15 @@ impl Editor {
 
     /// The door rail's count, when it has something to hold: drafting hides the
     /// editor's diagnoses ("N resting"); reviewing holds copy-level cards under
-    /// an open developmental one AND any cards over the visible budget ("N
-    /// resting"/"N copy-level"). `None` means the rail stands down — a quiet
-    /// margin. The label is chosen in `render_margin_rail`.
+    /// an open developmental one ("N copy-level"). The DOOR is the only thing
+    /// the rail counts — the full-size budget never hides a card (over-budget
+    /// ones recede to one-line cards, still in the lane), so it owes the rail
+    /// nothing. `None` means the rail stands down — a quiet margin.
     fn margin_rail_count(&self) -> Option<usize> {
         let n = if self.drafting {
             self.resting_diagnoses()
         } else {
-            self.suppressed_copy() + self.cap_held_diagnoses().len()
+            self.suppressed_copy()
         };
         (n > 0).then_some(n)
     }
@@ -10035,8 +10071,52 @@ impl Editor {
                         level,
                         orphaned,
                         unverified,
+                        collapsed,
                         ..
                     } = card;
+                    // Receded (over the full-size budget): one muted title line
+                    // at the anchor — present and clickable, just smaller, the
+                    // way dense marginalia shrink on paper. Clicking selects it,
+                    // and the selected card is budget-exempt, so it expands in
+                    // place. Height is FORCED to COLLAPSED_CARD_H so the packer
+                    // and the paint can never disagree (the overlap bug class).
+                    if collapsed {
+                        return div()
+                            .id(("note-card", id as usize))
+                            .absolute()
+                            .top(px(top.max(4.)))
+                            .left(px(8.))
+                            .w(px(MARGIN_WIDTH - 8.))
+                            .h(px(COLLAPSED_CARD_H))
+                            .px(px(8.))
+                            .py(px(3.))
+                            .overflow_hidden()
+                            .rounded(px(3.))
+                            .bg(rgb(if unverified { STALE_BG } else { DIAGNOSIS_CARD_BG }))
+                            .border_1()
+                            .border_color(rgb(RULE_COLOR))
+                            .cursor(CursorStyle::PointingHand)
+                            .font_family("PT Serif")
+                            .text_size(px(11.))
+                            .line_height(px(COLLAPSED_CARD_H - 8.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    if editor.focus.active_id() != Some(id) {
+                                        editor.select_card(id, window, cx);
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(div().truncate().child(if title.is_empty() {
+                                level.clone()
+                            } else {
+                                title.clone()
+                            }));
+                    }
                     // The composer renders only on the note it is actually
                     // editing — never on a clicked AI card (the id comes from
                     // the same `Composing` variant as the input).
@@ -10214,13 +10294,8 @@ impl Editor {
         let n = self.margin_rail_count()?;
         let label = if drafting {
             format!("{n} resting · open")
-        } else if self.cap_held_diagnoses().is_empty() {
-            format!("{n} copy-level · after structure")
         } else {
-            // Over the visible budget (and/or copy-level held): older passes
-            // rest, reachable by clicking their flagged passage. "resting" reads
-            // as held-not-gone (the count-grammar bucket; see attention-motion.md).
-            format!("{n} resting · review")
+            format!("{n} copy-level · after structure")
         };
         let styled = |d: gpui::Div| {
             d.absolute()
@@ -11124,15 +11199,16 @@ mod tests {
     }
 
     #[test]
-    fn held_beyond_cap_rests_the_oldest_passes() {
+    fn oldest_beyond_cap_recedes_the_oldest_passes() {
         use std::collections::HashSet;
-        // At or under the cap: nothing is held.
-        assert!(held_beyond_cap(&[(1, 1), (2, 1), (3, 2)], 5).is_empty());
-        assert!(held_beyond_cap(&[(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)], 5).is_empty());
-        // Over the cap: the newest passes stay (highest pass_id), oldest rest.
+        // At or under the budget: everything renders full.
+        assert!(oldest_beyond_cap(&[(1, 1), (2, 1), (3, 2)], 5).is_empty());
+        assert!(oldest_beyond_cap(&[(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)], 5).is_empty());
+        // Over it: the newest passes stay full (highest pass_id), oldest recede.
         // pass 3 = ids 5,6,7; pass 2 = 3,4; pass 1 = 1,2. cap 4 keeps {7,6,5,4}.
-        let held = held_beyond_cap(&[(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 3)], 4);
-        assert_eq!(held, HashSet::from([1u64, 2, 3]));
+        let receded =
+            oldest_beyond_cap(&[(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 3)], 4);
+        assert_eq!(receded, HashSet::from([1u64, 2, 3]));
     }
 
     #[test]

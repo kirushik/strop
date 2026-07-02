@@ -432,3 +432,45 @@ exit, one scroll handler, masked read-path) where a value test would be brittle;
 visual rig (`wrun`/`wshot`) for the integration colours and scroll. Still on the
 Phase 6 list: GPUI headless integration tests for the height-measurement +
 culling paths (the bold-title and masked/hit-test fixes ride reasoning until then).
+
+## 12. The budget recedes, it never hides (2026-07-02)
+
+A design reversal, one release-candidate old. Commit `e40e215` shipped the
+Phase-4 "visible cap" as *hide*: over `VISIBLE_DIAGNOSIS_CAP`, the oldest
+passes were dropped from the lane entirely and tallied in the rail as
+"N resting · review". Reviewed against the product's first principle — *you
+just type and it works; nothing needs operating* — that shape was wrong three
+ways, one of them a plain bug:
+
+- **It institutionalized a reported bug.** A capped diagnosis kept its squiggle
+  in the text but had no card in the margin — exactly the "the sentence
+  highlights but no card shows" state reported as a bug (and fixed) earlier the
+  same week. A margin that disagrees with the text isn't calm, it's broken.
+- **It was document-global.** The held set was computed over every open
+  diagnosis in the file, then the lane culled to the viewport. A crowded page
+  three sections away could empty the margin *here* — squiggled sentences
+  beside an empty lane with plenty of room. The budget solved a per-viewport
+  problem (clutter) at per-document scope.
+- **It made the writer learn a policy.** "Why does THIS sentence have a card
+  and THAT one not?" had no answer visible on the page — the answer was an
+  internal sort by pass recency, surfaced only as a third rail-label grammar
+  ("resting · review") next to two other grammars. Invisible policy is the
+  opposite of a mental model.
+
+**The replacement — recede, don't hide.** On paper, dense marginalia get
+smaller; they don't get filed in a drawer. Over the full-size budget
+(`FULL_DIAGNOSIS_CAP`, still 5, still newest-passes-first via the same pure
+`oldest_beyond_cap`), older diagnoses now render as **one-line cards at their
+anchor** — title only, muted, `COLLAPSED_CARD_H` tall, clickable. Clicking
+selects, and the selected card is budget-exempt, so it expands in place. The
+budget is counted **lane-local** (among the cards that survived the anchor
+cull), so it answers the only question that matters: "is *this page's* margin
+too dense?" The rail returns to door-only semantics; the "resting · review"
+label is gone; nothing about the budget needs explaining, because everything
+it does is visible where it does it.
+
+**The invariant this buys** (new, rig-asserted): *every flagged passage in the
+viewport has a card in the lane* — full or one-line, but present at its
+anchor's height. `seed:many` (8 diagnoses, 2 passes) drives it against a real
+frame in `rig-check.sh`: 8 visible, 3 receded, no overlap; click a receded
+card → it expands, 2 receded, still no overlap.

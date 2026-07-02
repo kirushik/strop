@@ -22,7 +22,18 @@ DOC=$(mktemp --suffix=.md)
   # A long tail so the document is taller than the viewport (something to scroll to).
   for i in $(seq 1 60); do echo "Ordinary padding paragraph number $i, plain and unremarked."; echo; done
 } > "$DOC"
-trap 'rm -f "$DOC" "$DOC.strop"' EXIT
+
+# A second fixture for the crowded-lane check: eight flaggable phrases, all in
+# the first viewport, so seed:many overflows the full-size budget on screen.
+DOC2=$(mktemp --suffix=.md)
+{
+  for i in $(seq 1 8); do
+    echo "Here stands crowded margin phrase number $i, holding its place in the draft."
+    echo
+  done
+  for i in $(seq 1 40); do echo "Ordinary padding paragraph number $i, plain and unremarked."; echo; done
+} > "$DOC2"
+trap 'rm -f "$DOC" "$DOC.strop" "$DOC2" "$DOC2.strop"' EXIT
 
 fail=0
 field() { echo "$1" | grep -oE "\"$2\":[^,}]*" | head -1 | cut -d: -f2; }
@@ -36,6 +47,24 @@ M=$(WRUN_TAIL=40 scripts/wrun.sh "$DOC" "seed:diag dump:ui" 2>/dev/null | grep -
 expect "no two visible cards overlap" false "$(field "$M" overlap)"
 expect "the active card is visible"   true  "$(field "$M" active_visible)"
 expect "all four seeded cards fit"    4     "$(field "$M" visible)"
+
+echo "rig-check: crowded lane recedes, never hides (seed:many — 8 cards, budget 5)"
+M=$(WRUN_TAIL=40 scripts/wrun.sh "$DOC2" "seed:many dump:ui" 2>/dev/null | grep -oE '"margin":\{[^}]*\}')
+[ -n "$M" ] || { echo "  FAIL no margin dump (rig didn't render?)"; exit 1; }
+# The honesty invariant: every flagged passage in view keeps a card — the
+# budget shrinks the oldest pass to one-line cards, it never hides them.
+expect "every flagged passage keeps a card" 8     "$(field "$M" visible)"
+expect "the oldest pass receded (8 - 5)"    3     "$(field "$M" collapsed)"
+expect "receded cards still never overlap"  false "$(field "$M" overlap)"
+
+# And the interaction half: clicking a receded card selects it, and the
+# selected card is budget-exempt, so it expands in place (1274,104 is the
+# first receded card in this fixture at the rig's stable 1600x1200 window).
+M=$(WRUN_TAIL=40 scripts/wrun.sh "$DOC2" "seed:many click:1274,104 dump:ui" 2>/dev/null | grep -oE '"margin":\{[^}]*\}')
+[ -n "$M" ] || { echo "  FAIL no margin dump (rig didn't render?)"; exit 1; }
+expect "clicking a receded card selects it"  true "$(field "$M" active_visible)"
+expect "the selected card expanded (3 - 1)"  2    "$(field "$M" collapsed)"
+expect "expansion never overlaps"            false "$(field "$M" overlap)"
 
 echo "rig-check: scroll works anywhere on the document surface"
 for x in 60 800 1500; do

@@ -113,6 +113,8 @@ Concrete spec if shipped:
 
 5. **Visible cap → cap, yes; the number 7 is *not* grounded.** Capping concurrent demands and resting the rest behind a visible-but-quiet rail is sound (interruption-overload; visible-debt lowers return cost). But "7" is Miller's *recall* span, not a limit on persistent on-screen items — NN/g calls that application a myth, and Cowan's ~4 applies to un-chunkable items. **Recommend a comfortable resting count of ~5 (test 4–7), flexing with viewport height; chunk cards into themed groups if you want to push toward 7.** What matters more than the number: the demotion is a *visible travel into the rail*, not a delete.
 
+   *Implementation outcome (2026-07-02, supersedes "into the rail"):* the shipped form demotes **in place** — over-budget cards recede to a one-line card at their own anchor rather than travelling to a rail counter (margin-card-dynamics.md §12). This satisfies this verdict's own load-bearing clause more strongly: the debt stays spatially attributed to its passage (no squiggle without a card), the "visible-but-quiet" state is the card itself, and no count-grammar has to be learned. The rail remains door-only.
+
 ---
 
 ## 7. Tensions & gaps (settle by testing)
