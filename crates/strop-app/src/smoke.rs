@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyWindowHandle, App, AppContext as _, ClipboardItem, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
-    WindowHandle, point, px,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent,
+    TouchPhase, WindowHandle, point, px,
 };
 
 /// Clipboard TRANSPORT shim for the headless rig only: gpui's wayland
@@ -115,6 +115,72 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:diag: demo diagnosis cards seeded");
                 continue;
             }
+            if key == "seed:many" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_many(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:many: crowded lane seeded (8 diagnoses, 2 passes)");
+                continue;
+            }
+            // `seed:deliver` pushes the demo pass through the REAL arrival
+            // gate (reveal clock): mid-typing-burst it parks, in a lull it
+            // lands — unlike seed:diag, which bypasses the gate on purpose.
+            if key == "seed:deliver" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_deliver_pass(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:deliver: demo pass sent through the arrival gate");
+                continue;
+            }
+            // `reduce:motion` flips the config's motion-sensitivity switch
+            // for this run, so the rig can drive the cross-fade code path.
+            if key == "reduce:motion" {
+                window
+                    .update(cx, |editor, _, cx| {
+                        editor.config.reduce_motion = true;
+                        cx.notify();
+                    })
+                    .ok();
+                eprintln!("SMOKE reduce:motion: cross-fade mode on");
+                continue;
+            }
+            // `resolve:first` / `resolve:last` mark the oldest / newest open
+            // note Done through the real set_note_status path (instant commit
+            // + exit-fade ghost). `last` hits a full-size card in the seeded
+            // crowded lane — the deterministic re-pack for the motion checks.
+            if key == "resolve:first" || key == "resolve:last" {
+                let first = key == "resolve:first";
+                window
+                    .update(cx, |editor, window, cx| {
+                        if first {
+                            editor.debug_resolve_first(window, cx);
+                        } else {
+                            editor.debug_resolve_last(window, cx);
+                        }
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
+                eprintln!("SMOKE {key}: open note resolved");
+                continue;
+            }
+            // `wait:MS` — idle the script (the reveal clock's lull, status
+            // fades, animations) without faking any input.
+            if let Some(ms) = key.strip_prefix("wait:") {
+                let ms: u64 = ms.parse().expect("bad wait ms in STROP_SMOKE");
+                cx.background_executor()
+                    .timer(Duration::from_millis(ms))
+                    .await;
+                eprintln!("SMOKE wait:{ms}");
+                continue;
+            }
             if key == "dump:ui" {
                 let dump = window
                     .update(cx, |editor, window, cx| editor.debug_ui_dump(window, cx))
@@ -122,19 +188,21 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 println!("UI-DUMP: {dump}");
                 continue;
             }
-            if let Some(pos) = key.strip_prefix("click:") {
-                let (x, y) = pos.split_once(',').expect("bad click in STROP_SMOKE");
-                let position = point(
-                    px(x.parse::<f32>().expect("bad click x")),
-                    px(y.parse::<f32>().expect("bad click y")),
-                );
+            // `click:X,Y` or `click:X,Y,N` — a left click with click_count N
+            // (N=2 double, N=3 triple), through the real GPUI dispatch path.
+            if let Some(spec) = key.strip_prefix("click:") {
+                let mut it = spec.split(',');
+                let x = it.next().and_then(|v| v.parse::<f32>().ok()).expect("bad click x");
+                let y = it.next().and_then(|v| v.parse::<f32>().ok()).expect("bad click y");
+                let count = it.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+                let position = point(px(x), px(y));
                 cx.update_window(any, |_, window, cx| {
                     window.dispatch_event(
                         PlatformInput::MouseDown(MouseDownEvent {
                             button: MouseButton::Left,
                             position,
                             modifiers: Modifiers::default(),
-                            click_count: 1,
+                            click_count: count,
                             first_mouse: false,
                         }),
                         cx,
@@ -143,6 +211,63 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                         PlatformInput::MouseUp(MouseUpEvent {
                             button: MouseButton::Left,
                             position,
+                            modifiers: Modifiers::default(),
+                            click_count: count,
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                let state = window
+                    .update(cx, |editor, _, _| editor.debug_cursor())
+                    .unwrap_or_default();
+                eprintln!("SMOKE {key}: {state}");
+                continue;
+            }
+            // `drag:X1,Y1,X2,Y2` — press at the start, move in steps to the end,
+            // release: the canonical click-drag selection gesture. Each move
+            // carries the pressed button so drag-tracking sees a real drag.
+            if let Some(spec) = key.strip_prefix("drag:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .expect("bad drag in STROP_SMOKE")
+                };
+                let (x1, y1, x2, y2) = (next(), next(), next(), next());
+                let start = point(px(x1), px(y1));
+                let end = point(px(x2), px(y2));
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: start,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }),
+                        cx,
+                    );
+                    // A handful of intermediate moves so drag-extend tracks it.
+                    for i in 1..=4 {
+                        let t = i as f32 / 4.0;
+                        let pos = point(px(x1 + (x2 - x1) * t), px(y1 + (y2 - y1) * t));
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position: pos,
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: Modifiers::default(),
+                            }),
+                            cx,
+                        );
+                    }
+                    window.dispatch_event(
+                        PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: end,
                             modifiers: Modifiers::default(),
                             click_count: 1,
                         }),

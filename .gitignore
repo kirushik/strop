@@ -4,3 +4,7 @@
 .claude/worktrees/
 .claude/*.lock
 .claude/settings.local.json
+
+# Working documents (Loro snapshots) — never commit a user's file
+*.strop
+*.strop.tmp

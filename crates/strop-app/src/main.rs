@@ -19,6 +19,8 @@ mod files;
 mod paths;
 mod single_instance;
 mod smoke;
+mod text_field;
+mod theme;
 mod tutorial;
 
 use std::path::PathBuf;
@@ -206,8 +208,13 @@ fn main() {
             Some((store, existing)) => match existing {
                 Some(loaded) => {
                     // "Undo everything since I sat down" is always one
-                    // visible restore away.
-                    store.add_checkpoint_if_changed("Session start", false);
+                    // visible restore away. Seal with the state `open` just
+                    // produced — never re-derive it from the doc.
+                    store.seal_session_with(
+                        "Session start",
+                        false,
+                        (loaded.text.clone(), loaded.spans.clone(), loaded.blocks.clone()),
+                    );
                     (
                         loaded.text.clone(),
                         loaded.spans.clone(),

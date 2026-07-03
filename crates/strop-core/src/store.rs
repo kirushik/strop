@@ -8,7 +8,6 @@
 
 use std::fs;
 use std::io;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use loro::{
@@ -35,8 +34,7 @@ pub struct Loaded {
     pub annotations: Annotations,
 }
 
-/// A named version snapshot: a Loro frontier (version vector position) the
-/// document can be rewound to. Lives inside the .strop file — Google-Docs
+/// A named version snapshot. Lives inside the .strop file — Google-Docs
 /// version history, local-first and self-contained.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -46,6 +44,25 @@ pub struct Checkpoint {
     /// Named-by-the-author (vs automatic session markers).
     #[serde(default)]
     pub manual: bool,
+    /// The checkpoint's document state, MATERIALIZED at creation — when it is
+    /// one cheap read of the live doc. Rewind, previews, and asset GC read
+    /// this instead of time-travelling (`state_at`): a Loro historical
+    /// checkout replays the whole oplog and cost 5–7 s PER CHECKPOINT on a
+    /// long-lived file — the history-sidebar hang. `None` only on checkpoints
+    /// recorded by older builds; those are backfilled once, in the
+    /// background, and persisted (see `set_checkpoint_state`). Self-contained
+    /// states are also what make shallow-snapshot compaction safe: the
+    /// rewind feature no longer needs any oplog history at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<CheckpointState>,
+}
+
+/// A checkpoint's frozen document state (see `Checkpoint::state`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointState {
+    pub text: String,
+    pub spans: SpanSet,
+    pub blocks: BlockMap,
 }
 
 /// Legacy reader for the pre-JSON newline-joined token format. Kept so old
@@ -91,27 +108,124 @@ const STYLE_KEYS: [&str; 8] = [
     "footnote",
 ];
 
-fn attr_key(attr: &InlineAttr) -> &'static str {
-    match attr {
-        InlineAttr::Strong => "strong",
-        InlineAttr::Emphasis => "emphasis",
-        InlineAttr::Underline => "underline",
-        InlineAttr::Strikethrough => "strikethrough",
-        InlineAttr::Highlight => "highlight",
-        InlineAttr::Code => "code",
-        InlineAttr::Link(_) => "link",
-        InlineAttr::FootnoteRef(_) => "footnote",
-    }
+/// Text + formatting + block kinds at `doc`'s current version. Free of
+/// `Store` so the backfill can read a private background-thread doc.
+fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
+    let text = doc.get_text(TEXT_CONTAINER);
+    // Formatting: the spans JSON when present (one map read), else derive it
+    // from the legacy Peritext marks. The marks path is `to_delta()`, and on
+    // a file that lived through months of unmark-everything/remark-everything
+    // save cycles the text state carries THOUSANDS of dead style anchors —
+    // measured 4.7 s for a 5.7 KB text, the dominant cost of open, of every
+    // historical checkout, and of sealing a checkpoint. Spans persist as
+    // JSON now (save_with_state); marks are read-only legacy.
+    let spans = match doc.get_map(BLOCKS_CONTAINER).get("spans") {
+        Some(v) => match v.into_value() {
+            Ok(LoroValue::String(s)) => serde_json::from_str(&s).unwrap_or_default(),
+            _ => SpanSet::default(),
+        },
+        None => {
+            let mut spans = SpanSet::default();
+            let mut pos = 0usize;
+            for delta in text.to_delta() {
+                if let TextDelta::Insert { insert, attributes } = delta {
+                    let len = insert.chars().count();
+                    for (key, value) in attributes.iter().flatten() {
+                        if let Some(attr) = attr_from(key, value) {
+                            spans.add(pos..pos + len, attr);
+                        }
+                    }
+                    pos += len;
+                }
+            }
+            spans
+        }
+    };
+    let blocks = match doc.get_map(BLOCKS_CONTAINER).get("kinds") {
+        Some(v) => match v.into_value() {
+            // JSON first; fall back to the legacy newline-joined token
+            // format so pre-existing .strop files and older Loro frontiers
+            // (read by state_at) still load.
+            Ok(LoroValue::String(s)) => match serde_json::from_str::<Vec<BlockKind>>(&s) {
+                Ok(kinds) => BlockMap::from_kinds(kinds),
+                Err(_) => BlockMap::from_kinds(s.lines().map(kind_from_token).collect()),
+            },
+            _ => BlockMap::default(),
+        },
+        None => BlockMap::default(),
+    };
+    (text.to_string(), spans, blocks)
 }
 
-fn attr_value(attr: &InlineAttr) -> LoroValue {
-    match attr {
-        InlineAttr::Link(href) => LoroValue::String(href.clone().into()),
-        InlineAttr::FootnoteRef(id) => LoroValue::String(id.clone().into()),
-        _ => LoroValue::Bool(true),
+/// Compaction only makes sense once the oplog dwarfs the state; below this
+/// a file is healthy and the extra open-time work buys nothing.
+const COMPACT_MIN_BYTES: usize = 512 * 1024;
+
+/// Opportunistic oplog compaction, at open. A long-lived file accretes
+/// history the app no longer reads: with checkpoint states materialized
+/// (`Checkpoint::state`), NOTHING needs Loro time-travel — rewind, previews,
+/// restore, asset GC and the undo stacks are all plain state. The oplog was
+/// still making open take seconds and every rewrite permanent. So: when the
+/// file is big, every checkpoint is self-contained, and a shallow snapshot
+/// (current state + truncated history) is at least twice smaller, adopt it —
+/// after round-tripping it through a fresh doc and comparing the text, and
+/// after writing a one-time `*.pre-compact.bak` of the original bytes.
+/// Every failure path keeps the original doc: compaction is strictly
+/// opportunistic, never load-bearing.
+fn compact_on_open(doc: LoroDoc, original: &[u8], path: &Path) -> LoroDoc {
+    if original.len() < COMPACT_MIN_BYTES
+        || !checkpoints_of(&doc).iter().all(|cp| cp.state.is_some())
+    {
+        return doc;
     }
+    let frontiers = doc.oplog_frontiers();
+    let Ok(shallow) =
+        doc.export(ExportMode::ShallowSnapshot(std::borrow::Cow::Borrowed(&frontiers)))
+    else {
+        return doc;
+    };
+    if shallow.len().saturating_mul(2) > original.len() {
+        return doc;
+    }
+    // The shallow bytes must stand on their own before they touch disk.
+    let fresh = LoroDoc::new();
+    fresh.config_text_style(style_config());
+    if fresh.import(&shallow).is_err()
+        || fresh.get_text(TEXT_CONTAINER).to_string() != doc.get_text(TEXT_CONTAINER).to_string()
+    {
+        return doc;
+    }
+    let bak = path.with_extension("strop.pre-compact.bak");
+    if !bak.exists() && fs::write(&bak, original).is_err() {
+        return doc;
+    }
+    let tmp = path.with_extension("strop.tmp");
+    if fs::write(&tmp, &shallow).is_err() || fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return doc;
+    }
+    eprintln!(
+        "strop: compacted {} → {} bytes (original kept once at {})",
+        original.len(),
+        shallow.len(),
+        bak.display()
+    );
+    fresh
 }
 
+/// The checkpoint list of `doc` (see `Store::checkpoints`).
+fn checkpoints_of(doc: &LoroDoc) -> Vec<Checkpoint> {
+    let list = doc.get_list(CHECKPOINTS_CONTAINER);
+    (0..list.len())
+        .filter_map(|i| list.get(i))
+        .filter_map(|v| match v.into_value() {
+            Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Legacy-marks reader (spans persist as JSON now; see `read_state_of`).
 fn attr_from(key: &str, value: &LoroValue) -> Option<InlineAttr> {
     if matches!(value, LoroValue::Null | LoroValue::Bool(false)) {
         return None;
@@ -150,6 +264,32 @@ fn style_config() -> StyleConfigMap {
 pub struct Store {
     doc: LoroDoc,
     path: PathBuf,
+    /// Fingerprints of what the last save actually wrote (or what the file
+    /// held at open). `save_with_state` used to rewrite the annotations,
+    /// blocks and undo-history JSON — and unmark+remark every formatting
+    /// span — on EVERY idle save, unchanged or not; in an append-only CRDT
+    /// every rewrite is new oplog forever (the reporter's 4.8 MB file held
+    /// 5.7 KB of prose). Now each piece writes only when its content
+    /// actually changed.
+    saved: std::cell::RefCell<SavedHashes>,
+}
+
+/// See `Store::saved`. Zeroes mean "unknown" — the next save writes.
+#[derive(Default)]
+struct SavedHashes {
+    annotations: u64,
+    blocks: u64,
+    history: u64,
+    spans: u64,
+}
+
+/// Content fingerprint for the save guards (not cryptographic — this only
+/// ever compares a process's own serializations with each other).
+fn fingerprint(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 impl Store {
@@ -189,7 +329,8 @@ impl Store {
         match fs::read(&path) {
             Ok(bytes) => {
                 doc.import(&bytes).map_err(io::Error::other)?;
-                let store = Self { doc, path };
+                let doc = compact_on_open(doc, &bytes, &path);
+                let store = Self { doc, path, saved: Default::default() };
                 let (text, spans, blocks) = store.read_state();
                 let history = match store.doc.get_map(SESSION_CONTAINER).get("history") {
                     Some(v) => match v.into_value() {
@@ -207,6 +348,31 @@ impl Store {
                     },
                     None => Annotations::default(),
                 };
+                // Seed the save guards with what the file already holds, so
+                // the session's first unchanged save rewrites nothing.
+                *store.saved.borrow_mut() = SavedHashes {
+                    annotations: fingerprint(
+                        &serde_json::to_string(&annotations).unwrap_or_default(),
+                    ),
+                    blocks: fingerprint(
+                        &serde_json::to_string(blocks.kinds()).unwrap_or_default(),
+                    ),
+                    history: history
+                        .as_ref()
+                        .map(|h: &History| {
+                            fingerprint(&serde_json::to_string(h).unwrap_or_default())
+                        })
+                        .unwrap_or_default(),
+                    // Seed from the file's spans JSON when it has one. A
+                    // legacy MARKS file seeds 0 ("unknown") instead — its
+                    // loaded spans would re-serialize to the very hash we'd
+                    // seed, and the upgrade write must not be skipped.
+                    spans: if store.doc.get_map(BLOCKS_CONTAINER).get("spans").is_some() {
+                        fingerprint(&serde_json::to_string(&spans).unwrap_or_default())
+                    } else {
+                        0
+                    },
+                };
                 Ok((
                     store,
                     Some(Loaded {
@@ -218,7 +384,9 @@ impl Store {
                     }),
                 ))
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Self { doc, path }, None)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Ok((Self { doc, path, saved: Default::default() }, None))
+            }
             Err(e) => Err(e),
         }
     }
@@ -226,34 +394,7 @@ impl Store {
     /// Text + formatting + block kinds at the doc's *current* version
     /// (which `state_at` temporarily moves).
     fn read_state(&self) -> (String, SpanSet, BlockMap) {
-        let text = self.doc.get_text(TEXT_CONTAINER);
-        let mut spans = SpanSet::default();
-        let mut pos = 0usize;
-        for delta in text.to_delta() {
-            if let TextDelta::Insert { insert, attributes } = delta {
-                let len = insert.chars().count();
-                for (key, value) in attributes.iter().flatten() {
-                    if let Some(attr) = attr_from(key, value) {
-                        spans.add(pos..pos + len, attr);
-                    }
-                }
-                pos += len;
-            }
-        }
-        let blocks = match self.doc.get_map(BLOCKS_CONTAINER).get("kinds") {
-            Some(v) => match v.into_value() {
-                // JSON first; fall back to the legacy newline-joined token
-                // format so pre-existing .strop files and older Loro frontiers
-                // (read by state_at) still load.
-                Ok(LoroValue::String(s)) => match serde_json::from_str::<Vec<BlockKind>>(&s) {
-                    Ok(kinds) => BlockMap::from_kinds(kinds),
-                    Err(_) => BlockMap::from_kinds(s.lines().map(kind_from_token).collect()),
-                },
-                _ => BlockMap::default(),
-            },
-            None => BlockMap::default(),
-        };
-        (text.to_string(), spans, blocks)
+        read_state_of(&self.doc)
     }
 
     /// Store an image asset in-file; returns its id for Image{src}.
@@ -278,8 +419,22 @@ impl Store {
         }
     }
 
-    /// Record a named checkpoint at the current version.
+    /// Record a named checkpoint at the current version. The state is
+    /// materialized NOW — one cheap read of the live doc — so nothing ever
+    /// has to time-travel back here (Checkpoint::state).
     pub fn add_checkpoint(&self, name: &str, manual: bool) {
+        let state = self.read_state();
+        self.add_checkpoint_with_state(name, manual, state);
+    }
+
+    /// `add_checkpoint` with the state supplied by a caller that already
+    /// holds it (open-time sealing) — skips re-deriving it from the doc.
+    fn add_checkpoint_with_state(
+        &self,
+        name: &str,
+        manual: bool,
+        (text, spans, blocks): (String, SpanSet, BlockMap),
+    ) {
         self.doc.commit();
         let checkpoint = Checkpoint {
             name: name.to_owned(),
@@ -289,6 +444,7 @@ impl Store {
                 .unwrap_or(0),
             frontiers: self.doc.oplog_frontiers().encode(),
             manual,
+            state: Some(CheckpointState { text, spans, blocks }),
         };
         match serde_json::to_string(&checkpoint) {
             Ok(json) => {
@@ -317,10 +473,13 @@ impl Store {
         cp.manual = true;
         match serde_json::to_string(&cp) {
             Ok(json) => {
-                let _ = list.delete(ix, 1);
+                // Insert-before-delete (see `set_checkpoint_state`): a failed
+                // insert must not drop the checkpoint being renamed.
                 if let Err(e) = list.insert(ix, json) {
                     eprintln!("strop: rename checkpoint: {e}");
+                    return;
                 }
+                let _ = list.delete(ix + 1, 1);
                 self.doc.commit();
             }
             Err(e) => eprintln!("strop: encode checkpoint: {e}"),
@@ -331,28 +490,123 @@ impl Store {
     /// the most recent checkpoint — empty sessions never clutter the rail
     /// (the research's top Docs complaint).
     pub fn add_checkpoint_if_changed(&self, name: &str, manual: bool) {
-        if let Some(last) = self.checkpoints().last()
-            && let Some(at_last) = self.state_at(&last.frontiers)
-        {
+        let current = self.read_state();
+        self.seal_session_with(name, manual, current);
+    }
+
+    /// Open-time session sealing with the state `open` already produced —
+    /// no re-derivation. While the file is MID-MIGRATION (its last
+    /// checkpoint has no materialized state yet), sealing defers to the
+    /// next launch: the comparison would need a multi-second historical
+    /// checkout, and the background backfill is about to make it free.
+    pub fn seal_session_with(
+        &self,
+        name: &str,
+        manual: bool,
+        current: (String, SpanSet, BlockMap),
+    ) {
+        if let Some(last) = self.checkpoints().last() {
+            let Some(state) = &last.state else {
+                return; // legacy checkpoint mid-migration — seal next launch
+            };
             // Full (text, spans, blocks) comparison: a session that only
             // bolded or restructured headings still deserves a rewind
             // point — text-only comparison made such work unreachable.
-            if at_last == self.read_state() {
+            if (&state.text, &state.spans, &state.blocks)
+                == (&current.0, &current.1, &current.2)
+            {
                 return;
             }
         }
-        self.add_checkpoint(name, manual);
+        self.add_checkpoint_with_state(name, manual, current);
+    }
+
+    /// A checkpoint's document state: the materialized copy when it has one
+    /// (instant), else the legacy time-travel read (`state_at`, seconds on a
+    /// long oplog — exists only until the background backfill lands).
+    pub fn checkpoint_state(&self, cp: &Checkpoint) -> Option<(String, SpanSet, BlockMap)> {
+        match &cp.state {
+            Some(s) => Some((s.text.clone(), s.spans.clone(), s.blocks.clone())),
+            None => self.state_at(&cp.frontiers),
+        }
+    }
+
+    /// Do all checkpoints carry a materialized state? (True for every file
+    /// this build has checkpointed; false until a legacy file's backfill.)
+    pub fn checkpoints_materialized(&self) -> bool {
+        self.checkpoints().iter().all(|cp| cp.state.is_some())
+    }
+
+    /// Attach a materialized state to a legacy checkpoint (the backfill's
+    /// write-back). Refuses to overwrite an existing state — states are
+    /// immutable once recorded.
+    pub fn set_checkpoint_state(&self, ix: usize, state: CheckpointState) {
+        let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
+        let Some(v) = list.get(ix) else { return };
+        let Ok(LoroValue::String(json)) = v.into_value() else {
+            return;
+        };
+        let Ok(mut cp) = serde_json::from_str::<Checkpoint>(&json) else {
+            return;
+        };
+        if cp.state.is_some() {
+            return;
+        }
+        cp.state = Some(state);
+        match serde_json::to_string(&cp) {
+            Ok(json) => {
+                // Insert the updated copy BEFORE removing the old one: a failed
+                // insert then leaves the original intact at `ix` and commits
+                // nothing, so the checkpoint can never be lost outright.
+                if let Err(e) = list.insert(ix, json) {
+                    eprintln!("strop: backfill checkpoint state: {e}");
+                    return;
+                }
+                let _ = list.delete(ix + 1, 1);
+                self.doc.commit();
+            }
+            Err(e) => eprintln!("strop: encode checkpoint: {e}"),
+        }
+    }
+
+    /// Current full snapshot as bytes — the input `materialize_checkpoint_states`
+    /// chews through on a background thread (the live doc never blocks).
+    pub fn export_bytes(&self) -> io::Result<Vec<u8>> {
+        self.doc.export(ExportMode::Snapshot).map_err(io::Error::other)
+    }
+
+    /// Materialize the states of every checkpoint that lacks one, from a
+    /// snapshot's BYTES — self-contained (its own private LoroDoc), so it can
+    /// run on a background thread while the app keeps editing. Walks the
+    /// checkpoints oldest→newest WITHOUT returning to the latest version
+    /// between reads: each step is a short hop, where round-tripping from the
+    /// tip cost 5–7 s per checkpoint on a long-lived file (the hang).
+    /// Returns `(checkpoint index, state)` pairs for `set_checkpoint_state`.
+    pub fn materialize_checkpoint_states(bytes: &[u8]) -> Vec<(usize, CheckpointState)> {
+        let doc = LoroDoc::new();
+        doc.config_text_style(style_config());
+        if doc.import(bytes).is_err() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (ix, cp) in checkpoints_of(&doc).into_iter().enumerate() {
+            if cp.state.is_some() {
+                continue;
+            }
+            let Ok(frontiers) = Frontiers::decode(&cp.frontiers) else {
+                continue;
+            };
+            if doc.checkout(&frontiers).is_err() {
+                continue;
+            }
+            let (text, spans, blocks) = read_state_of(&doc);
+            out.push((ix, CheckpointState { text, spans, blocks }));
+        }
+        out
     }
 
     pub fn checkpoints(&self) -> Vec<Checkpoint> {
-        let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
-        (0..list.len())
-            .filter_map(|i| list.get(i))
-            .filter_map(|v| match v.into_value() {
-                Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
-                _ => None,
-            })
-            .collect()
+        checkpoints_of(&self.doc)
     }
 
     /// Document state as of a checkpoint: time-travel there, read, return
@@ -368,7 +622,10 @@ impl Store {
 
     /// Rebuild Peritext marks + block kinds from the authoritative state,
     /// then snapshot. Durability only matters at the disk boundary, so
-    /// neither is mirrored per-edit — this avoids expand-rule drift.
+    /// neither is mirrored per-edit — this avoids expand-rule drift. Every
+    /// channel is guarded by its `SavedHashes` fingerprint: an unchanged
+    /// piece writes NOTHING, because in an append-only CRDT each rewrite is
+    /// permanent oplog growth (the 4.8 MB-file bug class).
     pub fn save_with_state(
         &self,
         spans: &SpanSet,
@@ -376,15 +633,40 @@ impl Store {
         history: &History,
         annotations: &Annotations,
     ) -> io::Result<()> {
+        let mut saved = self.saved.borrow_mut();
         match serde_json::to_string(annotations) {
             Ok(json) => {
-                if let Err(e) = self.doc.get_map(ANNOTATIONS_CONTAINER).insert("list", json) {
-                    eprintln!("strop: persist annotations: {e}");
+                let h = fingerprint(&json);
+                if h != saved.annotations {
+                    if let Err(e) = self.doc.get_map(ANNOTATIONS_CONTAINER).insert("list", json) {
+                        eprintln!("strop: persist annotations: {e}");
+                    } else {
+                        saved.annotations = h;
+                    }
                 }
             }
             Err(e) => eprintln!("strop: encode annotations: {e}"),
         }
-        self.rebuild_marks(spans);
+        // Formatting persists as spans JSON. It used to persist as Peritext
+        // marks, rebuilt by unmark-everything/remark-everything on every
+        // save: each cycle left dead style anchors in the text state forever,
+        // until reading the marks back (to_delta) cost 4.7 s on 5.7 KB of
+        // prose — the slow-open/slow-checkout disease. Marks are now
+        // read-only legacy (read_state_of falls back to them once, for files
+        // saved before this).
+        match serde_json::to_string(spans) {
+            Ok(json) => {
+                let h = fingerprint(&json);
+                if h != saved.spans {
+                    if let Err(e) = self.doc.get_map(BLOCKS_CONTAINER).insert("spans", json) {
+                        eprintln!("strop: persist spans: {e}");
+                    } else {
+                        saved.spans = h;
+                    }
+                }
+            }
+            Err(e) => eprintln!("strop: encode spans: {e}"),
+        }
         // Block kinds persist as JSON (like history/annotations/checkpoints in
         // this file), not a newline-joined token stream: a '\n' or '\r' inside
         // a CodeBlock.info / Image.src (reachable via .md import of an
@@ -393,20 +675,31 @@ impl Store {
         // alt/caption, which the token format dropped.
         match serde_json::to_string(blocks.kinds()) {
             Ok(json) => {
-                if let Err(e) = self.doc.get_map(BLOCKS_CONTAINER).insert("kinds", json) {
-                    eprintln!("strop: persist blocks: {e}");
+                let h = fingerprint(&json);
+                if h != saved.blocks {
+                    if let Err(e) = self.doc.get_map(BLOCKS_CONTAINER).insert("kinds", json) {
+                        eprintln!("strop: persist blocks: {e}");
+                    } else {
+                        saved.blocks = h;
+                    }
                 }
             }
             Err(e) => eprintln!("strop: encode blocks: {e}"),
         }
         match serde_json::to_string(history) {
             Ok(json) => {
-                if let Err(e) = self.doc.get_map(SESSION_CONTAINER).insert("history", json) {
-                    eprintln!("strop: persist history: {e}");
+                let h = fingerprint(&json);
+                if h != saved.history {
+                    if let Err(e) = self.doc.get_map(SESSION_CONTAINER).insert("history", json) {
+                        eprintln!("strop: persist history: {e}");
+                    } else {
+                        saved.history = h;
+                    }
                 }
             }
             Err(e) => eprintln!("strop: encode history: {e}"),
         }
+        drop(saved);
         self.collect_unreachable_assets(blocks, history);
         self.doc.commit();
         self.save()
@@ -426,12 +719,25 @@ impl Store {
             .chain(history.asset_refs())
             .map(str::to_owned)
             .collect();
+        let stored: Vec<String> = assets.keys().map(|k| k.to_string()).collect();
+        // Cheap gate — the fix for multi-second idle-save stalls. If every stored
+        // asset is already referenced by the LIVE doc or undo history, nothing can
+        // be orphaned, so the delete loop below would delete nothing regardless of
+        // what the checkpoints reference. Skip the per-checkpoint historical
+        // checkout (`state_at`) — it costs ~1s each on a large oplog and was
+        // running on EVERY save just to re-confirm "still referenced". Only when a
+        // stored asset is MISSING from the live set (an image was deleted) do we
+        // pay to check whether some checkpoint still needs it before reclaiming.
+        if stored.iter().all(|id| reachable.contains(id)) {
+            return;
+        }
+        // Materialized checkpoint states read instantly; only a legacy
+        // checkpoint (pre-backfill) still pays the historical checkout.
         for cp in self.checkpoints() {
-            if let Some((_, _, cp_blocks)) = self.state_at(&cp.frontiers) {
+            if let Some((_, _, cp_blocks)) = self.checkpoint_state(&cp) {
                 reachable.extend(cp_blocks.asset_refs().map(str::to_owned));
             }
         }
-        let stored: Vec<String> = assets.keys().map(|k| k.to_string()).collect();
         for id in stored {
             if !reachable.contains(&id) {
                 if let Err(e) = assets.delete(&id) {
@@ -441,29 +747,6 @@ impl Store {
                 }
             }
         }
-    }
-
-    fn rebuild_marks(&self, spans: &SpanSet) {
-        let text = self.doc.get_text(TEXT_CONTAINER);
-        let len = text.len_unicode();
-        if len == 0 {
-            return;
-        }
-        for key in STYLE_KEYS {
-            if let Err(e) = text.unmark(0..len, key) {
-                eprintln!("strop: unmark {key}: {e}");
-            }
-        }
-        for span in spans.spans() {
-            let range: Range<usize> = span.range.start..span.range.end.min(len);
-            if range.start >= range.end {
-                continue;
-            }
-            if let Err(e) = text.mark(range, attr_key(&span.attr), attr_value(&span.attr)) {
-                eprintln!("strop: mark {}: {e}", attr_key(&span.attr));
-            }
-        }
-        self.doc.commit();
     }
 
     /// Seed a freshly created document with initial text.
@@ -536,6 +819,203 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("strop-test-{}-{tag}.strop", std::process::id()))
+    }
+
+    /// Simulate a LEGACY file: strip the materialized state off every
+    /// checkpoint record, leaving frontier-only checkpoints (what older
+    /// builds wrote). Test-only — production states are immutable.
+    fn strip_checkpoint_states(store: &Store) {
+        let list = store.doc.get_list(CHECKPOINTS_CONTAINER);
+        for ix in 0..list.len() {
+            let Some(v) = list.get(ix) else { continue };
+            let Ok(LoroValue::String(json)) = v.into_value() else {
+                continue;
+            };
+            let Ok(mut cp) = serde_json::from_str::<Checkpoint>(&json) else {
+                continue;
+            };
+            cp.state = None;
+            let _ = list.delete(ix, 1);
+            let _ = list.insert(ix, serde_json::to_string(&cp).unwrap());
+        }
+        store.doc.commit();
+    }
+
+    /// The oplog-bloat class: a save whose annotations/blocks/history/marks
+    /// did not change must append NOTHING (in an append-only CRDT every
+    /// rewrite is permanent growth — the 4.8 MB-file bug). And the guards
+    /// must seed from the OPENED file, so a fresh session's first unchanged
+    /// save is also a no-op. A real change still writes.
+    #[test]
+    fn unchanged_saves_append_nothing() {
+        let path = temp_path("save-guard");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("текст с примечанием");
+        let spans = SpanSet::default();
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Paragraph]);
+        let history = History::default();
+        let mut notes = Annotations::default();
+        notes.add(0..5, "заметка".into(), 0);
+
+        store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+        let first = fs::metadata(&path).unwrap().len();
+        for _ in 0..5 {
+            store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+        }
+        let after_idle = fs::metadata(&path).unwrap().len();
+        assert_eq!(after_idle, first, "unchanged saves must not grow the file");
+
+        // Guards persist across a reopen: the next session's first
+        // unchanged save is also a no-op.
+        drop(store);
+        let (store, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        store
+            .save_with_state(
+                &loaded.spans,
+                &loaded.blocks,
+                &loaded.history.clone().unwrap_or_default(),
+                &loaded.annotations,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            after_idle,
+            "reopened session's unchanged save must not grow the file"
+        );
+
+        // A real change still writes (and is readable after reopen).
+        let mut notes2 = loaded.annotations.clone();
+        notes2.add(6..7, "ещё".into(), 1);
+        store
+            .save_with_state(
+                &loaded.spans,
+                &loaded.blocks,
+                &loaded.history.unwrap_or_default(),
+                &notes2,
+            )
+            .unwrap();
+        let (_, reloaded) = Store::open(&path).unwrap();
+        assert_eq!(reloaded.unwrap().annotations.open().count(), 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The compaction class: a bloated oplog shrinks at open once every
+    /// checkpoint is self-contained — and nothing readable is lost: text,
+    /// annotations, checkpoint states and the block kinds survive, and a
+    /// one-time .bak keeps the original bytes.
+    #[test]
+    fn bloated_file_compacts_at_open_without_losing_state() {
+        let path = temp_path("compact");
+        let bak = path.with_extension("strop.pre-compact.bak");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("текст, который переживёт уплотнение");
+        store.add_checkpoint("v1", true);
+        // Inflate the oplog the way real sessions did — a fat JSON value
+        // rewritten with different content each save. Hash-chained hex so
+        // Loro's compression can't flatten the fixture.
+        let spans = SpanSet::default();
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Paragraph]);
+        let history = History::default();
+        for i in 0..24u8 {
+            let mut body = String::new();
+            let mut h = blake3::hash(&[i]);
+            for _ in 0..600 {
+                body.push_str(&h.to_hex());
+                h = blake3::hash(h.as_bytes());
+            }
+            let mut notes = Annotations::default();
+            notes.add(0..5, body, 0);
+            store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+        }
+        let mut notes = Annotations::default();
+        notes.add(0..5, "финальная заметка".into(), 0);
+        store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+        let bloated = fs::metadata(&path).unwrap().len() as usize;
+        assert!(bloated > COMPACT_MIN_BYTES, "fixture must be bloated (got {bloated})");
+        drop(store);
+
+        let (store2, loaded) = Store::open(&path).unwrap();
+        let compacted = fs::metadata(&path).unwrap().len() as usize;
+        assert!(
+            compacted * 2 < bloated,
+            "open should compact ({bloated} → {compacted})"
+        );
+        assert!(bak.exists(), "original bytes kept once");
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.text, "текст, который переживёт уплотнение");
+        assert_eq!(loaded.annotations.open().count(), 1);
+        assert!(store2.checkpoints_materialized());
+        assert_eq!(
+            store2
+                .checkpoint_state(&store2.checkpoints()[0])
+                .unwrap()
+                .0,
+            "текст, который переживёт уплотнение"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak);
+    }
+
+    /// The history-sidebar hang class: checkpoints must be readable WITHOUT
+    /// per-checkpoint historical checkouts. New checkpoints materialize their
+    /// state at creation; a legacy (stripped) file backfills from snapshot
+    /// bytes — off the live doc — and the write-back persists across reopen.
+    #[test]
+    fn checkpoint_states_materialize_and_backfill() {
+        let path = temp_path("materialize");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("первая версия");
+        store.add_checkpoint("v1", true);
+        store.apply(&[crate::buffer::TextOp {
+            pos: 0,
+            delete: 0,
+            insert: "правка: ".into(),
+        }]);
+        store.add_checkpoint("v2", true);
+
+        // New checkpoints carry their state from birth.
+        assert!(store.checkpoints_materialized());
+        let cps = store.checkpoints();
+        assert_eq!(cps[0].state.as_ref().unwrap().text, "первая версия");
+        assert_eq!(cps[1].state.as_ref().unwrap().text, "правка: первая версия");
+
+        // A legacy file (no states) backfills from snapshot bytes alone…
+        strip_checkpoint_states(&store);
+        assert!(!store.checkpoints_materialized());
+        let bytes = store.export_bytes().unwrap();
+        let states = Store::materialize_checkpoint_states(&bytes);
+        assert_eq!(states.len(), 2);
+        for (ix, state) in states {
+            store.set_checkpoint_state(ix, state);
+        }
+        assert!(store.checkpoints_materialized());
+        let cps = store.checkpoints();
+        assert_eq!(cps[0].state.as_ref().unwrap().text, "первая версия");
+        assert_eq!(cps[1].state.as_ref().unwrap().text, "правка: первая версия");
+
+        // …and the write-back persists: reopening still needs no checkout.
+        store.save().unwrap();
+        let (store2, _) = Store::open(&path).unwrap();
+        assert!(store2.checkpoints_materialized());
+        assert_eq!(
+            store2
+                .checkpoint_state(&store2.checkpoints()[0])
+                .unwrap()
+                .0,
+            "первая версия"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -684,6 +1164,66 @@ mod tests {
             .unwrap();
         assert!(store.get_asset(&kept_id).is_some(), "referenced asset kept");
         assert!(store.get_asset(&orphan_id).is_none(), "orphan collected");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn asset_gc_gate_keeps_checkpoint_referenced_asset() {
+        use crate::document::BlockKind;
+        // The save-time GC gate short-circuits (skips the costly per-checkpoint
+        // `state_at` scan) only while EVERY stored asset is still referenced by
+        // the live doc or undo history. The data-loss regression it must never
+        // cause: once an image is deleted from the live doc, the gate has to fall
+        // THROUGH to the checkpoint scan and KEEP an asset some checkpoint still
+        // references (deleting it would corrupt that rewind) — while still
+        // dropping a genuine orphan referenced by nothing. This guards both arms
+        // of the fall-through, the half the keeps-reachable test never reaches.
+        let path = temp_path("gc-gate");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("картинка\n");
+        let cp_only = store.put_asset(vec![1, 2, 3], "png");
+        // Save with the image live, then checkpoint THAT state (so the only thing
+        // referencing the asset, after the next edit, is this checkpoint).
+        let live = BlockMap::from_kinds(vec![
+            BlockKind::Image {
+                src: cp_only.clone(),
+                alt: String::new(),
+                caption: String::new(),
+            },
+            BlockKind::Paragraph,
+        ]);
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &live,
+                &History::default(),
+                &Annotations::default(),
+            )
+            .unwrap();
+        store.add_checkpoint("with image", true);
+        // Delete the image from the LIVE doc and add a brand-new orphan; save with
+        // EMPTY history, so `cp_only` is reachable ONLY via the checkpoint. The
+        // gate must NOT short-circuit (an asset is missing from the live set), so
+        // it scans the checkpoint, keeps `cp_only`, and reclaims `orphan`.
+        let orphan = store.put_asset(vec![9, 9, 9], "png");
+        let no_image = BlockMap::from_kinds(vec![BlockKind::Paragraph, BlockKind::Paragraph]);
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &no_image,
+                &History::default(),
+                &Annotations::default(),
+            )
+            .unwrap();
+        assert!(
+            store.get_asset(&cp_only).is_some(),
+            "checkpoint-referenced asset must survive the live delete (rewind integrity)"
+        );
+        assert!(
+            store.get_asset(&orphan).is_none(),
+            "a true orphan is still collected through the gate's fall-through"
+        );
         let _ = fs::remove_file(&path);
     }
 

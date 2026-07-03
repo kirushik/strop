@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
+    Animation, AnimationExt,
     AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
     Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
@@ -30,18 +31,142 @@ use strop_core::{Store, typograph};
 
 use crate::config::{Config, Language};
 use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
+use crate::text_field::{
+    FieldBackspace, FieldBackspaceWord, FieldCancel, FieldCommit, FieldPaste, FieldTab, TextField,
+    TextFieldEvent,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
-pub const BG_COLOR: u32 = 0xFBFAF8;
-pub const TEXT_COLOR: u32 = 0x1A1A18;
-const SELECTION_COLOR: u32 = 0xB4D5FE88;
-const HIGHLIGHT_COLOR: u32 = 0xF9E29CAA;
-const CODE_BG_COLOR: u32 = 0x1A1A1814;
-const LINK_COLOR: u32 = 0x1A56A0;
-const NOTE_TINT: u32 = 0xE3B84926; // wheat/amber ~15% — Docs-trained intuition
-const NOTE_TINT_ACTIVE: u32 = 0xE3B8494D; // ~30% when active
+// The semantic color language lives in `theme`; everything below is layout.
+pub use crate::theme::{BG_COLOR, TEXT_COLOR};
+use crate::theme::{
+    ACTIVE_BORDER, AI_ACCENT, CARD_BG, CODE_BG_COLOR, DIAGNOSIS_CARD_BG, DIAGNOSIS_TINT_ACTIVE,
+    ERROR, FIND_MATCH_BG, HIGHLIGHT_COLOR, LINK_COLOR, MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT,
+    NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR, SELECTION_COLOR, STALE_BG,
+};
+
 const MARGIN_WIDTH: f32 = 248.;
 const MARGIN_GAP: f32 = 16.;
+/// Margin-card box metrics, shared by the height MEASUREMENT
+/// (`refresh_card_heights`) and the RENDER (`render_margin`) so a card's packed
+/// extent equals its painted one. Text wraps at the card's inner width; the
+/// line-height is pinned so one shaped row equals one painted row.
+pub(crate) const CARD_LINE_H: f32 = 18.;
+const CARD_CHROME_H: f32 = 36.; // vertical padding (16) + border (2) + header row (18)
+const CARD_INNER_W: f32 = MARGIN_WIDTH - 8. - 16.; // card width (MARGIN_WIDTH−8) − p(8) both sides
+/// The composer's text wraps slightly narrower than committed body text: the
+/// in-card input box adds its own horizontal padding (6 each side) + border
+/// (1 each side). Measuring the live card at this width keeps the reserved
+/// extent equal to what the wrapped composer actually paints (no clipping, no
+/// overlap with the next card).
+pub(crate) const COMPOSER_INNER_W: f32 = CARD_INNER_W - 14.;
+/// The composer box's own vertical chrome: py(2) top+bottom + border(1) both.
+const COMPOSER_BOX_CHROME: f32 = 6.;
+/// Band kept around the viewport when culling cards to it: a card whose anchor
+/// sits within this many px of a visible edge still renders.
+const CARD_OVERSCAN: f32 = 120.;
+/// Gap kept below the selected card when it is clamped to fit the viewport, so
+/// it never sits flush against (or past) the bottom edge.
+const CARD_BOTTOM_MARGIN: f32 = 8.;
+/// How far inside the near edge `reveal_offscreen` lands a revealed anchor —
+/// enough to show the card, small enough that the pill reveals "one more card",
+/// not a whole page (the pagination-feel fix). See `reveal_scroll`.
+const REVEAL_INSET: f32 = 120.;
+/// The lull that ends a typing burst: once the prose has been still this long,
+/// a pass that completed mid-burst may land (deferred_pass). ~1s sits inside
+/// the natural pause a writer takes at a sentence boundary, so in practice the
+/// hold is a breath, not a wait — and the research's caveat applies: these are
+/// SELF-requested cards, so err eager, never build a longer artificial hold
+/// (attention-motion.md §2, the two-clock verdict pared to its one real rule).
+const TYPING_LULL: Duration = Duration::from_millis(1000);
+/// A freshly-landed card's entrance: one opacity fade, decelerating (the
+/// "enter" easing token, attention-motion.md §3) — the AI voice arrives
+/// gently instead of popping. Opacity ONLY (no slide/scale/spring), which is
+/// also exactly the prefers-reduced-motion-safe form, and only for cards that
+/// are genuinely NEW — a card scrolled back into view is old content and must
+/// never re-announce itself (motion = information, or it's noise).
+const CARD_APPEAR: Duration = Duration::from_millis(250);
+/// A resolved card's exit: a brief accelerating fade of its ghost (the model
+/// commits instantly; only the light lingers). Short and ease-in — leaving
+/// asks less attention than arriving (attention-motion.md §3, "exit" token).
+const CARD_RESOLVE: Duration = Duration::from_millis(150);
+/// A surviving card's slide when a re-pack moves it (a card resolves in a
+/// crowded lane, a pass lands, a selection expands): the "standard" in-place
+/// token — 200ms, cubic in-out (attention-motion.md §3). This is the ONE place
+/// motion buys object constancy: an instant jump makes the eye re-find every
+/// card; a short slide keeps each one the same object (Heer & Robertson).
+const CARD_MOVE: Duration = Duration::from_millis(200);
+/// Stagger between cards that start a shared re-pack move — staggering lowers
+/// tracking error vs. everything moving at once (attention-motion.md §3).
+/// Capped (`MOVE_STAGGER_CAP`) so a long train never turns into a slow wave.
+const MOVE_STAGGER: Duration = Duration::from_millis(40);
+const MOVE_STAGGER_CAP: u32 = 4;
+
+/// One card's re-pack move in flight (see `Editor::moving` and
+/// `update_lane_motion`). Offsets are CONTENT-SPACE (viewport top + scroll):
+/// the render applies `delta` to the CURRENT frame's target, so a scroll
+/// mid-tween moves the card 1:1 with the text — the slide never fights the
+/// writer's own navigation.
+#[derive(Clone)]
+struct CardMove {
+    /// Where the card came from, relative to where it is going: at t=0 the
+    /// card renders at `to + delta`, at t=1 at `to`.
+    delta: f32,
+    /// The content-space top this move heads to. A further re-pack mid-flight
+    /// compares against this and re-targets from the currently-displayed spot
+    /// (never a snap back to the start).
+    to: f32,
+    start: Instant,
+    /// This card's stagger share within its re-pack round.
+    delay: Duration,
+    /// Bumped on re-target: keys the element animation, so a new target gets
+    /// a fresh animation run instead of resuming the old one's clock.
+    generation: u32,
+    /// reduce_motion only: a snapshot of the card at its OLD slot, cross-faded
+    /// out while the live card fades in at the new one — travel becomes a fade
+    /// of the same duration, never a teleport ("reduced motion is not no
+    /// motion"; attention-motion.md §4). None in the sliding mode.
+    ghost: Option<MarginCard>,
+}
+
+impl CardMove {
+    fn total(&self) -> Duration {
+        self.delay + CARD_MOVE
+    }
+
+    /// Progress through the ease at `elapsed`, delay honoured (0 before it).
+    fn eased(&self, elapsed: Duration) -> f32 {
+        let total = self.total().as_secs_f32();
+        let d = self.delay.as_secs_f32() / total;
+        staggered_ease((elapsed.as_secs_f32() / total).min(1.), d)
+    }
+}
+
+/// A completed pass parked until the typing lull (see `Editor::deferred_pass`).
+/// Carries the RAW diagnoses (quotes not yet anchored) and the generation that
+/// produced them — a cancel or a newer run bumps `ai_generation`, and a stale
+/// deferral is dropped at flush by that check alone (one place, by construction).
+struct DeferredPass {
+    diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+    generation: u64,
+}
+/// At most this many AI (Layer-B) cards render FULL-SIZE at once; past the
+/// budget, older passes RECEDE to a one-line card at their anchor — smaller,
+/// never hidden (dense marginalia shrink; they don't get filed in a drawer).
+/// The honesty invariant this preserves: every flagged passage you can see has
+/// a visible card in the margin — a squiggle with no card is indistinguishable
+/// from a bug (and was reported as one). FIVE, not seven — Miller's 7±2 is a
+/// RECALL span, not a limit on persistent on-screen items (Cowan's ~4 applies
+/// to un-chunkable items); ~5 is the researched resting count
+/// (docs/attention-motion.md §6). Counted LANE-LOCAL (among the cards actually
+/// in this viewport), so a crowded page elsewhere never empties this one. The
+/// writer's OWN notes are never budgeted (working memory, not judgments), and
+/// the selected card always renders full.
+const FULL_DIAGNOSIS_CAP: usize = 5;
+/// Fixed height of a receded (collapsed) diagnosis card: one 11px title row
+/// plus padding and border. The render forces exactly this height so the
+/// packer's no-overlap math and the painted card can never disagree.
+const COLLAPSED_CARD_H: f32 = 24.;
 /// The prose column's capped width — everything else (centering, the note
 /// lane, the narrow-width left-shift) is measured against it.
 const COL_MAX_WIDTH: f32 = 660.;
@@ -63,12 +188,8 @@ const HISTORY_PANEL_WIDTH: f32 = 320.;
 /// Outline rail (DESIGN §1.6): left, push — mirrors the history panel.
 const OUTLINE_PANEL_WIDTH: f32 = 200.;
 const DOC_MIN_WIDTH: f32 = 400.;
-/// Sage for the reached-goal dot (DESIGN §4.2): subtle, no celebration.
-const SAGE_COLOR: u32 = 0x7D8C66;
 const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
-const MUTED_COLOR: u32 = 0x8A8678;
-const RULE_COLOR: u32 = 0xE8E4DC;
 /// Client-side decorations (H2): thickness of the invisible resize band
 /// laid along each window edge/corner. GNOME Wayland grants no server-side
 /// borders, so without these strips Strop cannot be resized at all. Strips
@@ -381,44 +502,146 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", EscapeMode, ctx),
         // GNOME's menu key opens the palette — it IS the menu.
         KeyBinding::new("f10", TogglePalette, ctx),
-        KeyBinding::new("enter", NoteCommit, Some("NoteInput")),
-        KeyBinding::new("escape", NoteCancel, Some("NoteInput")),
-        KeyBinding::new("backspace", NoteBackspace, Some("NoteInput")),
-        KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("NoteInput")),
-        KeyBinding::new("tab", NoteTab, Some("NoteInput")),
+        KeyBinding::new("enter", FieldCommit, Some("NoteInput")),
+        KeyBinding::new("escape", FieldCancel, Some("NoteInput")),
+        KeyBinding::new("backspace", FieldBackspace, Some("NoteInput")),
+        KeyBinding::new("ctrl-backspace", FieldBackspaceWord, Some("NoteInput")),
+        KeyBinding::new("tab", FieldTab, Some("NoteInput")),
         // DESIGN §0.6 law 1: the focused field owns the paste chord. The
         // deeper context outranks "Editor", so ctrl-v can no longer fall
         // through a field into the document behind it.
-        KeyBinding::new("ctrl-v", NotePaste, Some("NoteInput")),
-        KeyBinding::new("shift-insert", NotePaste, Some("NoteInput")),
+        KeyBinding::new("ctrl-v", FieldPaste, Some("NoteInput")),
+        KeyBinding::new("shift-insert", FieldPaste, Some("NoteInput")),
+        // The multi-line note composer: Enter commits (the fast jot gesture),
+        // shift/ctrl-enter add a line break, up/down walk caret rows. The base
+        // chords match NoteInput; the extras are bound below via the helper.
+        KeyBinding::new("enter", FieldCommit, Some("NoteComposer")),
+        KeyBinding::new("escape", FieldCancel, Some("NoteComposer")),
+        KeyBinding::new("backspace", FieldBackspace, Some("NoteComposer")),
+        KeyBinding::new("ctrl-backspace", FieldBackspaceWord, Some("NoteComposer")),
+        KeyBinding::new("tab", FieldTab, Some("NoteComposer")),
+        KeyBinding::new("ctrl-v", FieldPaste, Some("NoteComposer")),
+        KeyBinding::new("shift-insert", FieldPaste, Some("NoteComposer")),
         // The palette's query field: same editing actions, plus row motion.
-        KeyBinding::new("enter", NoteCommit, Some("PaletteInput")),
-        KeyBinding::new("escape", NoteCancel, Some("PaletteInput")),
-        KeyBinding::new("backspace", NoteBackspace, Some("PaletteInput")),
-        KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("PaletteInput")),
-        KeyBinding::new("ctrl-v", NotePaste, Some("PaletteInput")),
-        KeyBinding::new("shift-insert", NotePaste, Some("PaletteInput")),
+        KeyBinding::new("enter", FieldCommit, Some("PaletteInput")),
+        KeyBinding::new("escape", FieldCancel, Some("PaletteInput")),
+        KeyBinding::new("backspace", FieldBackspace, Some("PaletteInput")),
+        KeyBinding::new("ctrl-backspace", FieldBackspaceWord, Some("PaletteInput")),
+        KeyBinding::new("ctrl-v", FieldPaste, Some("PaletteInput")),
+        KeyBinding::new("shift-insert", FieldPaste, Some("PaletteInput")),
         KeyBinding::new("up", PaletteUp, Some("PaletteInput")),
         KeyBinding::new("down", PaletteDown, Some("PaletteInput")),
         // Find mode: tab hops to the replace field, ctrl-h summons it. Both
         // bubble to the root's on_action handlers (the omnibox lives outside
         // the Editor key context, like the bottom strips it replaced).
-        KeyBinding::new("tab", NoteTab, Some("PaletteInput")),
+        KeyBinding::new("tab", FieldTab, Some("PaletteInput")),
         KeyBinding::new("ctrl-h", Replace, Some("PaletteInput")),
         // The AI settings panel's fields (F4): tab cycles, enter commits
         // (test, or pick from the model list), up/down walk the list,
         // ctrl-enter saves, escape closes.
-        KeyBinding::new("enter", NoteCommit, Some("SettingsInput")),
-        KeyBinding::new("escape", NoteCancel, Some("SettingsInput")),
-        KeyBinding::new("backspace", NoteBackspace, Some("SettingsInput")),
-        KeyBinding::new("ctrl-backspace", NoteBackspaceWord, Some("SettingsInput")),
-        KeyBinding::new("ctrl-v", NotePaste, Some("SettingsInput")),
-        KeyBinding::new("shift-insert", NotePaste, Some("SettingsInput")),
-        KeyBinding::new("tab", NoteTab, Some("SettingsInput")),
+        KeyBinding::new("enter", FieldCommit, Some("SettingsInput")),
+        KeyBinding::new("escape", FieldCancel, Some("SettingsInput")),
+        KeyBinding::new("backspace", FieldBackspace, Some("SettingsInput")),
+        KeyBinding::new("ctrl-backspace", FieldBackspaceWord, Some("SettingsInput")),
+        KeyBinding::new("ctrl-v", FieldPaste, Some("SettingsInput")),
+        KeyBinding::new("shift-insert", FieldPaste, Some("SettingsInput")),
+        KeyBinding::new("tab", FieldTab, Some("SettingsInput")),
         KeyBinding::new("up", SettingsUp, Some("SettingsInput")),
         KeyBinding::new("down", SettingsDown, Some("SettingsInput")),
         KeyBinding::new("ctrl-enter", SaveAiSettings, Some("SettingsInput")),
     ]);
+    // Universal text-field editing (Kirill's rule — universal gestures stay
+    // universal): caret movement, selection, delete-forward, copy/cut, applied
+    // to EVERY field at once. Palette/Settings keep up/down for list-nav, so
+    // only the multi-line composer gets vertical caret rows + line breaks.
+    for ctx in ["NoteInput", "NoteComposer", "PaletteInput", "SettingsInput"] {
+        cx.bind_keys(crate::text_field::field_editing_bindings(ctx));
+    }
+    cx.bind_keys(crate::text_field::composer_only_bindings("NoteComposer"));
+}
+
+
+/// How the writer is engaging the margin right now. There is one keyboard
+/// focus and one composer, so a card can be in exactly one of these states at
+/// a time — and only ONE card can be selected or composed at once. Encoding
+/// that as a single enum (instead of the old `active_note` +
+/// `composing_note` + `note_input` trio) makes the desync states that caused
+/// real, persisted bugs **unrepresentable**:
+///
+/// - a composer floating on a card that is no longer selected,
+/// - a committed note rendering blank (composer gone, body still suppressed),
+/// - a draft leaking onto whatever card was clicked instead of the one being
+///   edited.
+///
+/// Every one of those was two booleans that drifted apart. Here they cannot:
+/// the composer's identity and its `NoteInput` live in the same variant, and
+/// the SINGLE exit from `Composing` (`resolve_composer`) persists the draft to
+/// the note it actually belongs to. New interaction states force every
+/// `match` below to be updated (exhaustiveness), so this class can't silently
+/// regrow. See `card_body` for the render-side counterpart.
+enum CardFocus {
+    /// No card selected.
+    Idle,
+    /// A card is highlighted and raised to the top, but not editable. AI
+    /// diagnoses only ever reach this (their bodies are immutable); a note
+    /// lands here after its composer resolves.
+    Selected(u64),
+    /// A note's body is open in the composer. The draft mirror and the
+    /// composer render read the target id from here, so neither can ever
+    /// address a different card.
+    Composing { id: u64, input: Entity<TextField> },
+}
+
+impl CardFocus {
+    /// The selected/composed card, if any — what gets the highlight and the
+    /// top z-order. (`active_note` of old.)
+    fn active_id(&self) -> Option<u64> {
+        match self {
+            CardFocus::Idle => None,
+            CardFocus::Selected(id) | CardFocus::Composing { id, .. } => Some(*id),
+        }
+    }
+
+    /// The note whose composer is open, if one is. (`composing_note` of old.)
+    fn composing_id(&self) -> Option<u64> {
+        match self {
+            CardFocus::Composing { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// The open composer's input entity, if composing. (`note_input` of old.)
+    fn input(&self) -> Option<&Entity<TextField>> {
+        match self {
+            CardFocus::Composing { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+}
+
+/// What a card paints in its body region: exactly one of a composer or the
+/// note's text — never both (the "double" bug), never neither (the "blank
+/// committed card" bug). A two-variant enum makes "exactly one" structural,
+/// where the old code used two independent `.when()` conditions that could
+/// both fire or both stay silent. Pure and total: see `card_body`.
+enum CardBody {
+    /// The note is being composed here — paint the input.
+    Composer,
+    /// Paint the committed text (or the empty-note placeholder for a blank
+    /// writer's note; diagnoses are never blank-placeheld).
+    Text,
+}
+
+/// Decide a single card's body region from whether its own composer is open.
+/// Trivial by construction — that is the point: the bug existed because the
+/// choice was spread across two booleans that could disagree. One input, one
+/// of two outputs, no way to render both or neither.
+fn card_body(composing_here: bool) -> CardBody {
+    if composing_here {
+        CardBody::Composer
+    } else {
+        CardBody::Text
+    }
 }
 
 pub struct Editor {
@@ -462,6 +685,9 @@ pub struct Editor {
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
+    /// A legacy-checkpoint backfill is in flight (one at a time; the result
+    /// persists, so it can never need to run twice for the same file).
+    history_backfill_running: bool,
     /// Edits since the last checkpoint — idle-gap session sealing.
     dirty_since_checkpoint: bool,
     /// Encoded image assets by id; Arc<gpui::Image> handles feed GPUI's
@@ -469,14 +695,20 @@ pub struct Editor {
     image_assets: HashMap<String, Arc<gpui::Image>>,
     /// User settings (config.toml), loaded at startup.
     pub config: Config,
-    /// Active (snapped/highlighted) margin note, if any.
-    active_note: Option<u64>,
+    /// The writer's current engagement with the margin: nothing, a selected
+    /// card, or a note open in the composer. One field for what used to be
+    /// `active_note` + `composing_note` + `note_input`, so they cannot drift
+    /// out of sync (see `CardFocus`).
+    focus: CardFocus,
     /// AI pass lifecycle, rendered as the margin's first card (PLAN.md
     /// E3): teaches setup, shows progress, names failures actionably.
     ai_status: Option<AiStatus>,
     /// Bumped on every run and on cancel: an in-flight response from an
     /// older generation is silently dropped.
     ai_generation: u64,
+    /// Monotonic review-pass counter; each successful diagnosis pass bumps it
+    /// and stamps its new cards' `pass_id`, so a later pass can rest older ones.
+    diagnosis_pass: u64,
     /// Session override of the levels-of-edit depth; None = config's
     /// [ai].mode (the thesis switch, editorial-foundations §2.2).
     diagnosis_mode: Option<String>,
@@ -488,6 +720,52 @@ pub struct Editor {
     /// that *triggered* setup is the request that gets answered (no
     /// "now press ctrl-shift-d again" dead end).
     pending_pass: Option<bool>,
+    /// A completed pass whose results arrived MID-TYPING-BURST: integrating
+    /// would pop squiggles into the very sentence being typed and re-pack the
+    /// lane — an involuntary peripheral onset (attention-motion.md §2). Held
+    /// un-anchored (raw `Diagnosis` quotes, so anchoring runs against the
+    /// text as it stands at reveal, not at arrival) until the burst ends
+    /// (`TYPING_LULL`) or the writer turns away (scroll, door). This is the
+    /// WHOLE reveal clock: one rule, no gaze tracking, no idle timers.
+    deferred_pass: Option<DeferredPass>,
+    /// When the prose text last changed (set at the `sync_mutations`
+    /// chokepoint — real buffer ops only, not caret moves or card clicks).
+    /// `deferred_pass` reads it to tell a live typing burst from a lull.
+    last_text_edit: Option<Instant>,
+    /// Cards from the pass that JUST landed (`integrate_pass`), still inside
+    /// their entrance fade (`CARD_APPEAR`). Cleared by a timer right after the
+    /// fade completes, so a later scroll-out/in can never replay the entrance.
+    /// Writer notes never enter here — your own keystroke is instant.
+    appearing: std::collections::HashSet<u64>,
+    /// Ghosts of just-resolved cards, mid exit-fade (`CARD_RESOLVE`): the
+    /// rendered snapshot + when it started. Painted UNDER the live lane,
+    /// non-interactive, dropped by a timer (and by any scroll — the snapshot
+    /// is viewport-frozen). The note itself resolved instantly; this is
+    /// presentation only, so nothing here can leak back into the model.
+    departing: Vec<(MarginCard, Instant)>,
+    /// Re-pack moves in flight, card id → its slide (`CardMove`). Fed by
+    /// `update_lane_motion` (the render pre-pass that diffs the lane between
+    /// frames); read by `render_margin`, which offsets each moving card from
+    /// its CURRENT target. Presentation only — the packer's output is always
+    /// the truth; this is just how the eye is walked from the old truth to
+    /// the new one. Cleared wholesale on any snap frame (scroll, composer
+    /// growth, typing burst): motion yields to the writer's own movement.
+    moving: std::collections::HashMap<u64, CardMove>,
+    /// Each visible card's last settled CONTENT-SPACE top (viewport top +
+    /// scroll) — what `update_lane_motion` diffs the current pack against to
+    /// tell a discrete re-pack (tween it) from scroll (already 1:1).
+    lane_tops: std::collections::HashMap<u64, f32>,
+    /// The scroll offset `lane_tops` was recorded at; a change marks the
+    /// frame as a scroll frame (snap, never tween).
+    lane_scroll: f32,
+    /// The viewport size ditto: a resize drag reflows the prose and re-clamps
+    /// the lane continuously — snap through it, never chase it with tweens.
+    lane_viewport: (f32, f32),
+    /// Session-monotonic count of re-pack slides ever started — the rig
+    /// asserts "a resolve moved the survivors" against this instead of racing
+    /// the 200ms window with a live `moving` snapshot (a cold first launch
+    /// made that dump miss the flight and flake).
+    moves_started: u64,
     /// The door (DESIGN §4.4; core-loop research: separate GENERATE from
     /// EVALUATE). `true` = drafting, door closed: the editorial margin goes
     /// quiet so a writing burst is never pulled into evaluation by its own
@@ -501,7 +779,7 @@ pub struct Editor {
     /// The omnibox (DESIGN §2-omnibox, PLAN.md E1): one summoned-not-mounted
     /// top-centre field that finds (plain), runs commands (`>`) or jumps to
     /// headings (`@`). `palette_*` is its backing state across all modes.
-    palette_input: Option<Entity<NoteInput>>,
+    palette_input: Option<Entity<TextField>>,
     palette_selected: usize,
     /// Mirror of the palette query (debug_cursor has no `cx` to read the
     /// input entity); maintained by the palette's observe hook.
@@ -518,7 +796,7 @@ pub struct Editor {
     chord_whisper_shown: bool,
     chord_whisper_generation: u64,
     /// In-titlebar document rename (PLAN.md E2).
-    doc_rename_input: Option<Entity<NoteInput>>,
+    doc_rename_input: Option<Entity<TextField>>,
     /// The keyboard-map overlay (PLAN.md E4, ctrl-?).
     shortcuts_open: bool,
     /// The AI settings panel (DESIGN §2-ai, F4): form + async test +
@@ -530,15 +808,13 @@ pub struct Editor {
     /// Replace field (ctrl-h adds it under the omnibox query): Enter on it
     /// replaces the current match; the All button replaces every match (one
     /// undo). The current-match index is `palette_selected` (find mode).
-    replace_input: Option<Entity<NoteInput>>,
+    replace_input: Option<Entity<TextField>>,
     /// Rename-in-place for a history row: (entry index, composer).
-    rename_input: Option<(usize, Entity<NoteInput>)>,
+    rename_input: Option<(usize, Entity<TextField>)>,
     /// Alt-text composer for an image block: (block index, composer).
-    alt_input: Option<(usize, Entity<NoteInput>)>,
+    alt_input: Option<(usize, Entity<TextField>)>,
     /// Self-baseline from the [voice] corpus (None until >=3 docs load).
     pub voice_baseline: Option<strop_core::voice::Baseline>,
-    /// In-card composer for the active note's body.
-    note_input: Option<Entity<NoteInput>>,
     /// Narrow-window notes drawer (DESIGN §narrow-margin): below ~932px even
     /// a left-shifted column can't host the 248px lane, so the cards would
     /// vanish. Instead a top-right pill shows the count (never silent) and
@@ -565,12 +841,12 @@ pub struct Editor {
     /// still NOTHING at quit — no dialog, ever. The ritual is pull-only.
     session_had_edits: bool,
     /// The "End Session…" composer (bottom strip, like find).
-    end_session_input: Option<Entity<NoteInput>>,
+    end_session_input: Option<Entity<TextField>>,
     /// Session word goal (DESIGN §4.2): (target, word_count at set time).
     /// Session-only — per-session progress, never lifetime totals.
     session_goal: Option<(usize, usize)>,
     /// The "Set Session Goal…" composer (bottom strip).
-    goal_input: Option<Entity<NoteInput>>,
+    goal_input: Option<Entity<TextField>>,
     /// Painted bounds of each footnote-zone row's text area (captured by a
     /// canvas child at paint time), so a click on the mirror maps to the
     /// same offset in the def line (DESIGN §2-footnotes, the Word
@@ -582,6 +858,17 @@ pub struct Editor {
     /// scheduling that tore the renderer's per-frame sprite bookkeeping —
     /// the cross-surface glyph corruption of 2026-06-12.
     zone_row_bounds: std::rc::Rc<std::cell::RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// Measured margin-card heights, keyed by content hash (see
+    /// `refresh_card_heights`). A diagnosis's content is immutable and a note's
+    /// changes only at a composer commit, so a card's real shaped height is
+    /// measured once at the lane width and cached — replacing the char-count
+    /// estimate that under-sized tall cards and let them overlap. Read by
+    /// `margin_cards`; refreshed in `render`, where the text system is in hand.
+    card_heights: HashMap<u64, f32>,
+    /// The actively-composed note's live height — its composer text changes
+    /// every keystroke, so it can't ride the content-hash cache. Measured each
+    /// frame in `refresh_card_heights`; `None` when no note is composing.
+    active_card_height: Option<f32>,
     last_frame: Option<TextFrame>,
 }
 
@@ -590,355 +877,6 @@ enum SelectGranularity {
     Char,
     Word,
     Paragraph,
-}
-
-/// Minimal single-line composer for note bodies: typing + backspace + IME;
-/// Enter commits, Escape cancels. Deliberately tiny — the main editor's
-/// machinery stays the only real text surface.
-pub struct NoteInput {
-    focus_handle: FocusHandle,
-    content: String,
-    marked: Option<Range<usize>>,
-    /// Keymap context: "NoteInput" everywhere except the palette ("up"/
-    /// "down" move its selection) and the AI settings panel (tab cycles
-    /// fields, ctrl-enter saves) — each gets its own binding set.
-    key_context: &'static str,
-    /// Secret-field display: dots except the last 4 chars (the API key).
-    /// The real content is untouched — typing and paste work normally.
-    masked: bool,
-}
-
-pub enum NoteInputEvent {
-    Commit(String),
-    Cancel,
-}
-
-impl gpui::EventEmitter<NoteInputEvent> for NoteInput {}
-
-/// Remove the trailing IME preedit (`marked_len` bytes) from `content`,
-/// snapping the cut down to a char boundary first. The raw
-/// `truncate(len - marked_len)` panics if a manual edit (backspace) left a
-/// stale `marked` length that no longer aligns with a boundary. A no-op on
-/// the common path where the cut already lands on a boundary.
-fn drop_marked_tail(content: &mut String, marked_len: usize) {
-    let mut start = content.len().saturating_sub(marked_len);
-    while start > 0 && !content.is_char_boundary(start) {
-        start -= 1;
-    }
-    content.truncate(start);
-}
-
-impl NoteInput {
-    fn new(cx: &mut Context<Self>, content: String) -> Self {
-        Self {
-            focus_handle: cx.focus_handle(),
-            content,
-            marked: None,
-            key_context: "NoteInput",
-            masked: false,
-        }
-    }
-
-    /// A field of the AI settings panel (F4): its own context so tab/
-    /// up/down/ctrl-enter can mean panel things; `masked` for the key.
-    fn for_settings(cx: &mut Context<Self>, content: String, masked: bool) -> Self {
-        Self {
-            key_context: "SettingsInput",
-            masked,
-            ..Self::new(cx, content)
-        }
-    }
-
-    fn commit(&mut self, _: &NoteCommit, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(NoteInputEvent::Commit(self.content.clone()));
-    }
-
-    fn cancel(&mut self, _: &NoteCancel, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(NoteInputEvent::Cancel);
-    }
-
-    fn backspace(&mut self, _: &NoteBackspace, _: &mut Window, cx: &mut Context<Self>) {
-        // A manual edit ends any active IME composition: leaving a stale
-        // `marked` (byte length) behind would make the next preedit truncate
-        // mid-char (panic) or eat committed text. No-op when not composing.
-        self.marked = None;
-        self.content.pop();
-        cx.notify();
-    }
-
-    /// ctrl-backspace: muscle memory holds in every field (Kirill's rule —
-    /// universal gestures stay universal). Append-only model, so "word
-    /// left of the caret" means the trailing word.
-    fn backspace_word(&mut self, _: &NoteBackspaceWord, _: &mut Window, cx: &mut Context<Self>) {
-        self.marked = None; // end any composition (see backspace)
-        let trimmed = self.content.trim_end();
-        let cut = trimmed
-            .char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        self.content.truncate(cut);
-        cx.notify();
-    }
-
-    /// ctrl-v in any field (DESIGN §0.6 law 1): paste lands in the focused
-    /// field, never in the document behind it — the API-key field was the
-    /// motivating bug. Fields are single-line, so newlines flatten to
-    /// spaces; masked fields paste normally (masking is display-only).
-    fn paste(&mut self, _: &NotePaste, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .or_else(crate::smoke::clipboard_override)
-        else {
-            return;
-        };
-        let text: String = text
-            .replace("\r\n", " ")
-            .replace(['\n', '\r'], " ");
-        // The existing insertion path: same place IME commits land.
-        self.replace_text_in_range(None, &text, window, cx);
-    }
-}
-
-actions!(
-    note_input,
-    [NoteCommit, NoteCancel, NoteBackspace, NoteBackspaceWord, NoteTab, NotePaste]
-);
-
-impl EntityInputHandler for NoteInput {
-    fn text_for_range(
-        &mut self,
-        _: Range<usize>,
-        _: &mut Option<Range<usize>>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<String> {
-        Some(self.content.clone())
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _: bool,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let end = self.content.chars().map(|c| c.len_utf16()).sum();
-        Some(UTF16Selection {
-            range: end..end,
-            reversed: false,
-        })
-    }
-
-    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked.clone()
-    }
-
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.marked = None;
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        _: Option<Range<usize>>,
-        text: &str,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(m) = self.marked.take() {
-            drop_marked_tail(&mut self.content, m.end - m.start);
-        }
-        self.content.push_str(text);
-        cx.notify();
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        _: Option<Range<usize>>,
-        text: &str,
-        _: Option<Range<usize>>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(m) = self.marked.take() {
-            drop_marked_tail(&mut self.content, m.end - m.start);
-        }
-        self.marked = Some(0..text.len());
-        self.content.push_str(text);
-        cx.notify();
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _: Range<usize>,
-        bounds: Bounds<Pixels>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        Some(bounds)
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        _: Point<Pixels>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<usize> {
-        None
-    }
-}
-
-impl Render for NoteInput {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .key_context(self.key_context)
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::commit))
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::backspace))
-            .on_action(cx.listener(Self::backspace_word))
-            .on_action(cx.listener(Self::paste))
-            .w_full()
-            .min_h(px(22.))
-            .px(px(6.))
-            .py(px(2.))
-            .rounded(px(4.))
-            .bg(rgb(0xFFFFFF))
-            .border_1()
-            .border_color(rgb(RULE_COLOR))
-            .text_size(px(13.))
-            .text_color(rgb(TEXT_COLOR))
-            // Single-line field: clip rather than let a long line escape the
-            // box; the element below scrolls itself to keep the caret in view.
-            .overflow_hidden()
-            .child(NoteInputElement { input: cx.entity() })
-    }
-}
-
-impl Focusable for NoteInput {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-/// Paints the composer text and registers the IME handler.
-struct NoteInputElement {
-    input: Entity<NoteInput>,
-}
-
-impl IntoElement for NoteInputElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for NoteInputElement {
-    type RequestLayoutState = ();
-    type PrepaintState = Option<gpui::ShapedLine>;
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let _guard = DrawGuard::enter();
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        let _guard = DrawGuard::enter();
-        let input = self.input.read(cx);
-        let content = if input.masked {
-            // Dots except the last 4 chars — enough to recognize which key
-            // this is without ever showing it whole (DESIGN §2-ai).
-            let chars: Vec<char> = input.content.chars().collect();
-            let visible_from = chars.len().saturating_sub(4);
-            chars
-                .iter()
-                .enumerate()
-                .map(|(i, c)| if i < visible_from { '•' } else { *c })
-                .collect()
-        } else {
-            input.content.clone()
-        };
-        let style = window.text_style();
-        let run = TextRun {
-            len: content.len(),
-            font: style.font(),
-            color: style.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        Some(window.text_system().shape_line(
-            SharedString::from(content),
-            style.font_size.to_pixels(window.rem_size()),
-            &[run],
-            None,
-        ))
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        line: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let _guard = DrawGuard::enter();
-        let focus_handle = self.input.read(cx).focus_handle.clone();
-        window.handle_input(
-            &focus_handle,
-            ElementInputHandler::new(bounds, self.input.clone()),
-            cx,
-        );
-        if let Some(line) = line.take() {
-            let cursor_x = line.width;
-            // Single-line field: when the text outgrows the box, scroll it
-            // left so the caret rides the right edge instead of spilling past
-            // the card (Image-1 bug). The parent clips the overflow.
-            let shift = (cursor_x - bounds.size.width + px(2.)).max(px(0.));
-            let origin = point(bounds.origin.x - shift, bounds.origin.y);
-            line.paint(origin, window.line_height(), TextAlign::Left, None, window, cx)
-                .ok();
-            if focus_handle.is_focused(window) {
-                window.paint_quad(fill(
-                    Bounds::new(
-                        origin + point(cursor_x, px(2.)),
-                        size(px(1.5), window.line_height() - px(4.)),
-                    ),
-                    rgb(TEXT_COLOR),
-                ));
-            }
-        }
-    }
 }
 
 /// Geometry of the last painted frame, for mouse, IME, and vertical-motion
@@ -1156,18 +1094,29 @@ impl Editor {
             store_dirty: false,
             history_view: None,
             history_preview: None,
+            history_backfill_running: false,
             dirty_since_checkpoint: false,
             image_assets: HashMap::new(),
             config: Config::default(),
-            active_note: None,
+            focus: CardFocus::Idle,
             ai_status: None,
             pending_pass: None,
+            deferred_pass: None,
+            last_text_edit: None,
+            appearing: std::collections::HashSet::new(),
+            departing: Vec::new(),
+            moving: std::collections::HashMap::new(),
+            lane_tops: std::collections::HashMap::new(),
+            lane_scroll: 0.,
+            lane_viewport: (0., 0.),
+            moves_started: 0,
             // Door closed by default: every document opens to write, not to
             // be judged (protects re-entry — the warm-up re-read that slides
             // into line-editing). The tutorial opens it (main.rs); so does a
             // pass.
             drafting: true,
             ai_generation: 0,
+            diagnosis_pass: 0,
             diagnosis_mode: None,
             last_pass_believing: false,
             palette_input: None,
@@ -1185,7 +1134,8 @@ impl Editor {
             rename_input: None,
             alt_input: None,
             voice_baseline: None,
-            note_input: None,
+            card_heights: HashMap::new(),
+            active_card_height: None,
             narrow_notes_open: false,
             selection_popover: false,
             outline_open: false,
@@ -1204,7 +1154,15 @@ impl Editor {
     /// mirror into Loro immediately, the snapshot hits disk once typing
     /// pauses for a second (and on quit, via `save_now`).
     pub fn attach_store(&mut self, store: Store, cx: &mut Context<Self>) {
+        let legacy = !store.checkpoints_materialized();
         self.store = Some(store);
+        // Heal a legacy file without waiting for the writer to open history:
+        // materialize its checkpoint states in the background now, so the
+        // sidebar is instant whenever it IS opened — and the next open of
+        // the file can compact the oplog (Store::open) it no longer needs.
+        if legacy {
+            self.backfill_checkpoint_states(cx);
+        }
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -1254,6 +1212,9 @@ impl Editor {
         if ops.is_empty() {
             return;
         }
+        // Real buffer ops only — this stamp is what tells a live typing burst
+        // from a lull (deferred_pass), so caret moves must never touch it.
+        self.last_text_edit = Some(Instant::now());
         self.word_count = count_words(self.doc.rope().chunks());
         // Apply to the store and capture its path before releasing the borrow,
         // so the dirty-flag chokepoint (mark_dirty) can take &mut self.
@@ -1279,11 +1240,14 @@ impl Editor {
     /// flag) while the body is unchanged, so an idle composer doesn't force a
     /// save every tick; undo boundaries stay on the Enter-commit path.
     fn sync_active_note_draft(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.active_note else { return };
-        let Some(input) = self.note_input.as_ref() else {
+        // Mirror the live composer onto the note IT edits — the id and the
+        // input come from the same `Composing` variant, so the draft can never
+        // follow a clicked AI card or another note's anchor (that once leaked
+        // the note's text onto AI cards and persisted it).
+        let CardFocus::Composing { id, input } = &self.focus else {
             return;
         };
-        let body = input.read(cx).content.clone();
+        let (id, body) = (*id, input.read(cx).content.clone());
         if self.doc.note_body(id).is_some_and(|cur| cur != body.as_str()) {
             self.doc.set_note_body_draft(id, body);
             self.mark_dirty();
@@ -1379,7 +1343,11 @@ impl Editor {
 
     /// Record a named version snapshot in the document file.
     fn add_checkpoint(&mut self, _: &AddCheckpoint, _: &mut Window, cx: &mut Context<Self>) {
-        self.sync_mutations();
+        // Save first: the checkpoint materializes its state from the store
+        // (Checkpoint::state), and the store's spans/blocks/annotations are
+        // only as fresh as the last save. Checkpointing implying durability
+        // is the right property anyway.
+        self.save_now();
         if let Some(store) = &self.store {
             let name = format!("Checkpoint {}", store.checkpoints().len() + 1);
             store.add_checkpoint(&name, true);
@@ -1390,17 +1358,21 @@ impl Editor {
         cx.notify();
     }
 
-    /// Build the rewind list: materialize every checkpoint once, compute
+    /// Build the rewind list from the checkpoints' MATERIALIZED states —
     /// word deltas between consecutive states and (when a self-baseline
-    /// exists) per-checkpoint voice drift.
-    fn enter_history(&mut self, cx: &mut Context<Self>) {
+    /// exists) per-checkpoint voice drift. Cheap (stored states + word
+    /// diffs, microseconds each), but only once every checkpoint carries a
+    /// state: a legacy one would fall back to a multi-second historical
+    /// checkout — the old sidebar hang (71 s measured for 13 checkpoints).
+    /// Callers gate on `checkpoints_materialized`.
+    fn build_history_entries(&self) -> Vec<HistoryEntry> {
         let Some(store) = &self.store else {
-            return;
+            return Vec::new();
         };
         let mut entries: Vec<HistoryEntry> = Vec::new();
         let mut prev_text = String::new();
         for cp in store.checkpoints() {
-            let Some((text, spans, blocks)) = store.state_at(&cp.frontiers) else {
+            let Some((text, spans, blocks)) = store.checkpoint_state(&cp) else {
                 continue;
             };
             let delta = strop_core::diff::word_delta(&strop_core::diff::prose_diff(
@@ -1423,7 +1395,6 @@ impl Editor {
                 name: cp.name.clone(),
                 created_unix: cp.created_unix,
                 manual: cp.manual,
-                frontiers: cp.frontiers.clone(),
                 text,
                 spans,
                 blocks,
@@ -1431,6 +1402,38 @@ impl Editor {
                 drift_sigma,
             });
         }
+        entries
+    }
+
+    /// Open the rewind list. With materialized checkpoint states this is
+    /// instant. A LEGACY file (checkpoints recorded before states were
+    /// stored) instead shows the shell immediately — names, dates,
+    /// structure — while a background pass materializes the states once,
+    /// persists them into the file, and then fills in texts, deltas and the
+    /// preview. The old behaviour materialized inline on the main thread.
+    fn enter_history(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let materializing = !store.checkpoints_materialized();
+        let entries: Vec<HistoryEntry> = if materializing {
+            store
+                .checkpoints()
+                .into_iter()
+                .map(|cp| HistoryEntry {
+                    name: cp.name,
+                    created_unix: cp.created_unix,
+                    manual: cp.manual,
+                    text: String::new(),
+                    spans: SpanSet::default(),
+                    blocks: BlockMap::default(),
+                    delta: (0, 0),
+                    drift_sigma: None,
+                })
+                .collect()
+        } else {
+            self.build_history_entries()
+        };
         if entries.is_empty() {
             return;
         }
@@ -1447,9 +1450,57 @@ impl Editor {
             named_only: false,
             compare_current: false,
             expanded,
+            materializing,
         });
         self.rebuild_preview();
+        if materializing {
+            self.backfill_checkpoint_states(cx);
+        }
         cx.notify();
+    }
+
+    /// Materialize legacy checkpoints' states OFF the main thread and write
+    /// them back — once per file, ever. Snapshot bytes go to a background
+    /// task with its own private doc (the live one never blocks); the states
+    /// come back, persist into the checkpoint records (so every later open
+    /// is instant), and the sidebar, if still open, fills in.
+    fn backfill_checkpoint_states(&mut self, cx: &mut Context<Self>) {
+        if self.history_backfill_running {
+            return;
+        }
+        let Some(store) = &self.store else { return };
+        let Ok(bytes) = store.export_bytes() else { return };
+        self.history_backfill_running = true;
+        let task = cx
+            .background_executor()
+            .spawn(async move { Store::materialize_checkpoint_states(&bytes) });
+        cx.spawn(async move |this, cx| {
+            let states = task.await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor.history_backfill_running = false;
+                {
+                    let Some(store) = &editor.store else { return };
+                    for (ix, state) in states {
+                        store.set_checkpoint_state(ix, state);
+                    }
+                }
+                editor.mark_dirty();
+                if editor.history_view.as_ref().is_some_and(|hv| hv.materializing) {
+                    let entries = editor.build_history_entries();
+                    if !entries.is_empty() {
+                        if let Some(hv) = &mut editor.history_view {
+                            hv.selected = hv.selected.min(entries.len() - 1);
+                            hv.entries = entries;
+                            hv.materializing = false;
+                        }
+                        editor.rebuild_preview();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn exit_history(&mut self, cx: &mut Context<Self>) {
@@ -1464,6 +1515,12 @@ impl Editor {
             self.history_preview = None;
             return;
         };
+        // States still assembling in the background: nothing to diff yet
+        // (the canvas keeps showing the live document until they land).
+        if hv.materializing {
+            self.history_preview = None;
+            return;
+        }
         let entry = &hv.entries[hv.selected];
         let empty_spans = SpanSet::default();
         let empty_blocks = BlockMap::default();
@@ -1582,17 +1639,45 @@ impl Editor {
         });
     }
 
+    /// Wire click-away-commits for a single-line field: the instant it loses
+    /// focus, emit `Commit` so the field's own subscriber saves and tears it
+    /// down — it becomes a label immediately, not at some later stray click
+    /// (the low-latency rule; matches the doc-rename field). `still` re-fetches
+    /// the live field, so a blur that races an Enter/Escape (already gone) is a
+    /// no-op. NOT for end-session, whose Commit quits — blur there must not.
+    fn commit_field_on_blur(
+        &self,
+        input: &Entity<TextField>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        still: impl Fn(&Editor) -> Option<Entity<TextField>> + 'static,
+    ) {
+        let handle = input.read(cx).focus_handle.clone();
+        let weak = cx.entity().downgrade();
+        window
+            .on_focus_out(&handle, cx, move |_, _window, cx| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.update_checked(cx, |editor, cx| {
+                    if let Some(field) = still(editor) {
+                        let text = field.read(cx).content.clone();
+                        field.update_checked(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
+                    }
+                });
+            })
+            .detach();
+    }
+
     fn edit_image_alt(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
         let BlockKind::Image { src, alt, caption } = self.doc.blocks().kind(block).clone()
         else {
             return;
         };
-        let input = cx.new(|cx| NoteInput::new(cx, alt));
+        let input = cx.new(|cx| TextField::single(cx, alt));
         cx.subscribe_in(
             &input,
             window,
-            move |editor, _, event: &NoteInputEvent, window, cx| {
-                if let NoteInputEvent::Commit(new_alt) = event {
+            move |editor, _, event: &TextFieldEvent, window, cx| {
+                if let TextFieldEvent::Commit(new_alt) = event {
                     editor.doc.set_block_kind(
                         block,
                         BlockKind::Image {
@@ -1609,6 +1694,12 @@ impl Editor {
             },
         )
         .detach();
+        self.commit_field_on_blur(&input, window, cx, move |e| {
+            e.alt_input
+                .as_ref()
+                .filter(|(b, _)| *b == block)
+                .map(|(_, f)| f.clone())
+        });
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.alt_input = Some((block, input));
@@ -1618,12 +1709,12 @@ impl Editor {
     fn start_rename(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(hv) = &self.history_view else { return };
         let seed = hv.entries[ix].name.clone();
-        let input = cx.new(|cx| NoteInput::new(cx, seed));
+        let input = cx.new(|cx| TextField::single(cx, seed));
         cx.subscribe_in(
             &input,
             window,
-            move |editor, _, event: &NoteInputEvent, window, cx| {
-                if let NoteInputEvent::Commit(name) = event
+            move |editor, _, event: &TextFieldEvent, window, cx| {
+                if let TextFieldEvent::Commit(name) = event
                     && !name.trim().is_empty()
                 {
                     if let Some(store) = &editor.store {
@@ -1643,6 +1734,12 @@ impl Editor {
             },
         )
         .detach();
+        self.commit_field_on_blur(&input, window, cx, move |e| {
+            e.rename_input
+                .as_ref()
+                .filter(|(i, _)| *i == ix)
+                .map(|(_, f)| f.clone())
+        });
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.rename_input = Some((ix, input));
@@ -1667,17 +1764,26 @@ impl Editor {
 
     /// Restore the selected checkpoint: auto-checkpoint the present first
     /// (the rail narrates what happened), restore as an undoable forward
-    /// edit, exit history.
+    /// edit, exit history. Reads the entry's own materialized state — the
+    /// old `state_at` re-fetch here was another multi-second historical
+    /// checkout for data the sidebar already held.
     fn restore_selected(&mut self, cx: &mut Context<Self>) {
         let Some(hv) = &self.history_view else { return };
+        if hv.materializing {
+            return; // states still assembling; the row can't restore yet
+        }
         let entry = &hv.entries[hv.selected];
-        let (name, frontiers) = (entry.name.clone(), entry.frontiers.clone());
+        let (name, text, spans, blocks) = (
+            entry.name.clone(),
+            entry.text.clone(),
+            entry.spans.clone(),
+            entry.blocks.clone(),
+        );
+        // Save first so the "Before restoring" checkpoint materializes the
+        // present exactly as it stands (see add_checkpoint).
+        self.save_now();
         let Some(store) = &self.store else { return };
         store.add_checkpoint(&format!("Before restoring “{name}”"), false);
-        let Some((text, spans, blocks)) = store.state_at(&frontiers) else {
-            eprintln!("strop: cannot read checkpoint state");
-            return;
-        };
         self.doc.restore_state(&text, spans, blocks);
         self.selected_range = 0..0;
         self.selection_reversed = false;
@@ -2014,6 +2120,52 @@ impl Editor {
         cx.notify();
     }
 
+    /// The SINGLE exit from `Composing`: persist the open composer's current
+    /// text onto the note it edits, then demote that card to `Selected`. Every
+    /// focus-changing action calls this first, so a composer is never stranded
+    /// on a deselected card and its draft is never committed to a card the
+    /// writer merely clicked. No-op unless a composer is actually open.
+    fn resolve_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (id, body) = match &self.focus {
+            CardFocus::Composing { id, input } => (*id, input.read(cx).content.clone()),
+            _ => return,
+        };
+        self.doc.set_note_body(id, body);
+        self.focus = CardFocus::Selected(id);
+        self.mark_dirty();
+        // The composer field just left the tree; hand keyboard control back to
+        // the document so the next keystroke edits prose, not nothing. This is
+        // the SINGLE place a composer exit restores focus — because EVERY exit
+        // funnels through here, a lane click (selecting another card, done/×)
+        // can no longer strand the keyboard the way it did when only
+        // finish_composing refocused. Callers that want a *different* target
+        // (open_composer focuses the new field) just re-focus after us.
+        window.focus(&self.focus_handle, cx);
+    }
+
+    /// Leave the composer (Enter, Escape, or any focus loss). The draft is
+    /// already the note's text and focus is restored by `resolve_composer`, so
+    /// the card just stays selected, now showing what was written.
+    fn finish_composing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_composer(window, cx);
+        cx.notify();
+    }
+
+    /// Highlight a card without editing it (AI diagnoses; a note clicked via
+    /// its anchor). Resolves any open composer first so the previous note's
+    /// draft is saved and its composer never lingers.
+    fn select_card(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_composer(window, cx);
+        self.focus = CardFocus::Selected(id);
+    }
+
+    /// Drop all card selection (a click that hits no anchor). Resolves any
+    /// open composer first.
+    fn deselect_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_composer(window, cx);
+        self.focus = CardFocus::Idle;
+    }
+
     fn open_composer(
         &mut self,
         id: u64,
@@ -2021,36 +2173,77 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active_note = Some(id);
-        let input = cx.new(|cx| NoteInput::new(cx, body));
+        // Switching composers: commit the one we're leaving before opening this.
+        self.resolve_composer(window, cx);
+        let input = cx.new(|cx| TextField::multiline(cx, body));
         cx.subscribe_in(
             &input,
             window,
-            move |editor, _, event: &NoteInputEvent, window, cx| {
-                match event {
-                    NoteInputEvent::Commit(body) => {
-                        editor.doc.set_note_body(id, body.clone());
-                        editor.mark_dirty();
-                    }
-                    NoteInputEvent::Cancel => {}
-                }
-                editor.note_input = None;
-                // Focus returns to the text — the composer's handle is gone.
-                window.focus(&editor.focus_handle, cx);
-                cx.notify();
+            // Enter and Escape both end composing through the one exit; the live
+            // text is already the note's body, so the event payload is moot.
+            move |editor, _, _event: &TextFieldEvent, window, cx| {
+                editor.finish_composing(window, cx);
             },
         )
         .detach();
+        // Click-away commits immediately (low-latency: the input becomes a label
+        // the instant focus leaves, not when some later click happens to resolve
+        // it). Guarded on THIS composer still being open — switching to another
+        // card or clicking the document already resolved it through its own path,
+        // so the stale handle must not double-commit.
+        let handle = input.read(cx).focus_handle.clone();
+        let weak = cx.entity().downgrade();
+        window
+            .on_focus_out(&handle, cx, move |_, window, cx| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.update_checked(cx, |editor, cx| {
+                    if editor.focus.composing_id() == Some(id) {
+                        editor.finish_composing(window, cx);
+                    }
+                });
+            })
+            .detach();
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
-        self.note_input = Some(input);
+        self.focus = CardFocus::Composing { id, input };
     }
 
-    fn set_note_status(&mut self, id: u64, status: NoteStatus, cx: &mut Context<Self>) {
+    fn set_note_status(
+        &mut self,
+        id: u64,
+        status: NoteStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Commit any open draft first (the click may be on this card's own
+        // done/×, or on another card while this one composes).
+        self.resolve_composer(window, cx);
+        // A resolved card leaves with a brief exit fade rather than blinking
+        // out: snapshot its rendered slot BEFORE the model change (afterwards
+        // it has no card to snapshot). The model itself commits immediately —
+        // only the light lingers (departing), never the data.
+        if matches!(status, NoteStatus::Done | NoteStatus::Dismissed)
+            && let Some(card) =
+                self.margin_cards(true).cards.into_iter().find(|c| c.id == id)
+        {
+            self.departing.push((card, Instant::now()));
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(CARD_RESOLVE + Duration::from_millis(50))
+                    .await;
+                this.update(cx, |editor: &mut Editor, cx| {
+                    editor
+                        .departing
+                        .retain(|(_, since)| since.elapsed() < CARD_RESOLVE);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         self.doc.set_note_status(id, status);
-        if self.active_note == Some(id) {
-            self.active_note = None;
-            self.note_input = None;
+        if self.focus.active_id() == Some(id) {
+            self.focus = CardFocus::Idle;
         }
         self.mark_dirty();
         self.bump_activity();
@@ -2072,6 +2265,9 @@ impl Editor {
     /// research asks for — never inferred, never automatic in v1, so a
     /// drafting burst can never be interrupted by a wrong guess.
     fn toggle_review(&mut self, _: &ToggleReview, _: &mut Window, cx: &mut Context<Self>) {
+        // Touching the door is an explicit attention shift — a parked pass
+        // lands right now, mid-burst or not.
+        self.flush_deferred_pass(cx);
         self.drafting = !self.drafting;
         cx.notify();
     }
@@ -2146,7 +2342,10 @@ impl Editor {
         self.last_pass_believing = believing;
         // You asked to evaluate — open the door, so results land in a margin
         // the writer is actually looking at (and any earlier resting cards
-        // come back into view alongside them).
+        // come back into view alongside them). Asking again is also the most
+        // explicit attention shift there is: a still-parked earlier pass
+        // lands now rather than racing the run it just triggered.
+        self.flush_deferred_pass(cx);
         self.drafting = false;
         // Scope: the selection if there is one, else the whole document
         // (capped — a 24k-char window is plenty for an editorial pass).
@@ -2199,41 +2398,7 @@ impl Editor {
                     return; // cancelled or superseded — drop silently
                 }
                 match result {
-                    Ok(diagnoses) => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        let count = diagnoses.len();
-                        // Anchor against the text as it is NOW — quotes
-                        // that no longer match are dropped.
-                        let annotations = strop_core::diagnose::to_annotations(
-                            &editor.doc.text(),
-                            diagnoses,
-                            editor.doc.notes(),
-                            now,
-                        );
-                        let kept = annotations.len();
-                        editor.doc.add_diagnoses(annotations);
-                        editor.mark_dirty();
-                        // Silent success is the second invisibility bug:
-                        // 0 anchored must be said out loud.
-                        editor.ai_status = Some(AiStatus::Note {
-                            title: match kept {
-                                0 if count == 0 => {
-                                    "Pass complete — the editor found nothing to flag".to_owned()
-                                }
-                                0 => "Pass complete — no quote matched the current text".to_owned(),
-                                n => format!("{n} margin quer{} anchored", if n == 1 { "y" } else { "ies" }),
-                            },
-                            detail: if count > kept && kept > 0 {
-                                format!("{} dropped (stale quotes)", count - kept)
-                            } else {
-                                String::new()
-                            },
-                        });
-                        editor.schedule_status_fade(generation, cx);
-                    }
+                    Ok(diagnoses) => editor.deliver_pass(diagnoses, generation, cx),
                     Err(failure) => {
                         editor.ai_status =
                             Some(failure.into_status(&editor.config.ai.base_url, &editor.config.ai.model));
@@ -2268,10 +2433,156 @@ impl Editor {
     fn cancel_ai_run(&mut self, _: &CancelAiRun, _: &mut Window, cx: &mut Context<Self>) {
         // UI-level cancel: the response of the abandoned generation is
         // ignored when it lands (no need to abort the request itself).
+        // A parked deferral dies with its generation too (flush checks it),
+        // but drop it eagerly so nothing lingers.
         self.ai_generation += 1;
         self.ai_status = None;
         self.pending_pass = None;
+        self.deferred_pass = None;
         cx.notify();
+    }
+
+    /// Is the writer inside a live typing burst right now? True while the
+    /// last real buffer edit is younger than `TYPING_LULL`. This one predicate
+    /// is the entire "when may AI results land" model — no gaze tracking, no
+    /// idle timers, no modes: prose recently changed ⇒ hold; still ⇒ land.
+    fn typing_burst_live(&self) -> bool {
+        self.last_text_edit
+            .is_some_and(|t| t.elapsed() < TYPING_LULL)
+    }
+
+    /// Integrate a completed pass into the document NOW: anchor the quotes
+    /// against the current text, add the cards, and say out loud what stuck.
+    /// The single landing site for both the direct path (results arrive in a
+    /// lull) and the deferred path (flushed after a burst).
+    fn integrate_pass(
+        &mut self,
+        diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let count = diagnoses.len();
+        // Anchor against the text as it is NOW — quotes
+        // that no longer match are dropped.
+        self.diagnosis_pass += 1;
+        let pass_id = self.diagnosis_pass;
+        let annotations = strop_core::diagnose::to_annotations(
+            &self.doc.text(),
+            diagnoses,
+            self.doc.notes(),
+            now,
+            pass_id,
+        );
+        let kept = annotations.len();
+        self.doc.add_diagnoses(annotations);
+        self.mark_dirty();
+        // The landed cards get one entrance fade (CARD_APPEAR); the marks
+        // clear right after it finishes so nothing ever re-fades. Their ids
+        // are exactly the open notes stamped with this pass.
+        if kept > 0 {
+            self.appearing = self
+                .doc
+                .notes()
+                .open()
+                .filter(|n| n.pass_id == pass_id)
+                .map(|n| n.id)
+                .collect();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(CARD_APPEAR + Duration::from_millis(150))
+                    .await;
+                this.update(cx, |editor: &mut Editor, cx| {
+                    editor.appearing.clear();
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        // Silent success is the second invisibility bug:
+        // 0 anchored must be said out loud.
+        self.ai_status = Some(AiStatus::Note {
+            title: match kept {
+                0 if count == 0 => {
+                    "Pass complete — the editor found nothing to flag".to_owned()
+                }
+                0 => "Pass complete — no quote matched the current text".to_owned(),
+                n => format!("{n} margin quer{} anchored", if n == 1 { "y" } else { "ies" }),
+            },
+            detail: if count > kept && kept > 0 {
+                format!("{} dropped (stale quotes)", count - kept)
+            } else {
+                String::new()
+            },
+        });
+        self.schedule_status_fade(generation, cx);
+        cx.notify();
+    }
+
+    /// The arrival gate — the ONE decision of the reveal clock. Mid-typing-
+    /// burst, results WAIT: landing now would pop squiggles into the sentence
+    /// being typed and re-pack the lane under the writer's eyes. The lull
+    /// watcher integrates them the moment the burst ends; scroll or the door
+    /// flush sooner. Held UN-anchored on purpose — quotes anchor against the
+    /// text as it stands at reveal, not at arrival. In a lull (the common
+    /// case: the writer asked and is waiting), results land immediately.
+    fn deliver_pass(
+        &mut self,
+        diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.typing_burst_live() {
+            self.deferred_pass = Some(DeferredPass { diagnoses, generation });
+            self.watch_for_lull(cx);
+        } else {
+            self.integrate_pass(diagnoses, generation, cx);
+        }
+    }
+
+    /// Land the parked pass, if its generation still stands. Called by the
+    /// lull watcher and by the explicit attention shifts (scroll, the door) —
+    /// any of them may fire first; the `take()` makes the flush idempotent.
+    fn flush_deferred_pass(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.deferred_pass.take() else {
+            return;
+        };
+        if d.generation != self.ai_generation {
+            return; // cancelled or superseded while parked
+        }
+        self.integrate_pass(d.diagnoses, d.generation, cx);
+    }
+
+    /// Poll (4×/s) until the typing burst ends, then flush the parked pass.
+    /// Exits when the deferral is gone — flushed here, flushed by a scroll or
+    /// the door, or dropped by a cancel — so at most one watcher does work,
+    /// and a re-armed deferral just rides the loop that is already running.
+    fn watch_for_lull(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let done = this.update(cx, |editor: &mut Editor, cx| {
+                    if editor.deferred_pass.is_none() {
+                        return true;
+                    }
+                    if editor.typing_burst_live() {
+                        return false;
+                    }
+                    editor.flush_deferred_pass(cx);
+                    true
+                });
+                if done.unwrap_or(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Background probe for a local OpenAI-compatible model (Ollama's
@@ -2435,16 +2746,16 @@ impl Editor {
             return;
         }
         let cfg = crate::config::load();
-        let base_url = cx.new(|cx| NoteInput::for_settings(cx, cfg.ai.base_url.clone(), false));
-        let api_key = cx.new(|cx| NoteInput::for_settings(cx, cfg.ai.api_key.clone(), true));
-        let model = cx.new(|cx| NoteInput::for_settings(cx, cfg.ai.model.clone(), false));
+        let base_url = cx.new(|cx| TextField::settings(cx, cfg.ai.base_url.clone(), false));
+        let api_key = cx.new(|cx| TextField::settings(cx, cfg.ai.api_key.clone(), true));
+        let model = cx.new(|cx| TextField::settings(cx, cfg.ai.model.clone(), false));
         for input in [&base_url, &api_key, &model] {
             cx.subscribe_in(
                 input,
                 window,
-                |editor, _, event: &NoteInputEvent, window, cx| match event {
-                    NoteInputEvent::Commit(_) => editor.ai_settings_commit(cx),
-                    NoteInputEvent::Cancel => editor.close_ai_settings(window, cx),
+                |editor, _, event: &TextFieldEvent, window, cx| match event {
+                    TextFieldEvent::Commit(_) => editor.ai_settings_commit(cx),
+                    TextFieldEvent::Cancel => editor.close_ai_settings(window, cx),
                 },
             )
             .detach();
@@ -2780,10 +3091,7 @@ impl Editor {
     fn open_omni(&mut self, initial: String, window: &mut Window, cx: &mut Context<Self>) {
         // A fresh field every open (the old entity drops); PaletteInput
         // context gives it up/down row motion and the editing chords.
-        let input = cx.new(|cx| NoteInput {
-            key_context: "PaletteInput",
-            ..NoteInput::new(cx, initial.clone())
-        });
+        let input = cx.new(|cx| TextField::palette(cx, initial.clone()));
         cx.observe(&input, |editor, input, cx| {
             let q = input.read(cx).content.clone();
             editor.palette_query = q.clone();
@@ -2800,8 +3108,8 @@ impl Editor {
         cx.subscribe_in(
             &input,
             window,
-            |editor, input, event: &NoteInputEvent, window, cx| match event {
-                NoteInputEvent::Commit(_) => {
+            |editor, input, event: &TextFieldEvent, window, cx| match event {
+                TextFieldEvent::Commit(_) => {
                     let q = input.read(cx).content.clone();
                     // Find: Enter cycles to the next match, bar stays open.
                     // Command/heading: Enter runs the selected row and closes.
@@ -2811,7 +3119,7 @@ impl Editor {
                         editor.execute_palette_entry(&q, editor.palette_selected, window, cx);
                     }
                 }
-                NoteInputEvent::Cancel => editor.close_palette(window, cx),
+                TextFieldEvent::Cancel => editor.close_palette(window, cx),
             },
         )
         .detach();
@@ -2880,7 +3188,7 @@ impl Editor {
     /// Tab hops between the omnibox query field and the replace field (the
     /// action bubbles up from the PaletteInput/NoteInput context to here),
     /// and cycles the AI settings panel's fields.
-    fn note_tab(&mut self, _: &NoteTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn note_tab(&mut self, _: &FieldTab, window: &mut Window, cx: &mut Context<Self>) {
         // AI settings panel: tab cycles base URL → key → model → base URL.
         if let Some(panel) = &self.ai_settings {
             let fields = [&panel.base_url, &panel.api_key, &panel.model];
@@ -2961,14 +3269,14 @@ impl Editor {
             .and_then(|s| s.to_str())
             .unwrap_or("Untitled")
             .to_owned();
-        let input = cx.new(|cx| NoteInput::new(cx, stem));
+        let input = cx.new(|cx| TextField::single(cx, stem));
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(
             &input,
             window,
-            |editor, _, event: &NoteInputEvent, window, cx| match event {
-                NoteInputEvent::Commit(title) => editor.finish_rename(title.clone(), window, cx),
-                NoteInputEvent::Cancel => {
+            |editor, _, event: &TextFieldEvent, window, cx| match event {
+                TextFieldEvent::Commit(title) => editor.finish_rename(title.clone(), window, cx),
+                TextFieldEvent::Cancel => {
                     editor.doc_rename_input = None;
                     window.focus(&editor.focus_handle, cx);
                     cx.notify();
@@ -2976,6 +3284,23 @@ impl Editor {
             },
         )
         .detach();
+        // Click-away commits the rename (the title is a real edit, like the
+        // note composer's body — losing focus should save it, not drop it).
+        // Guarded on the field still being open so an Enter-then-blur, which
+        // already finished, doesn't rename a second time.
+        let handle = input.read(cx).focus_handle.clone();
+        let weak = cx.entity().downgrade();
+        window
+            .on_focus_out(&handle, cx, move |_, window, cx| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.update_checked(cx, |editor, cx| {
+                    if let Some(field) = editor.doc_rename_input.clone() {
+                        let title = field.read(cx).content.clone();
+                        editor.finish_rename(title, window, cx);
+                    }
+                });
+            })
+            .detach();
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.doc_rename_input = Some(input);
@@ -3424,16 +3749,16 @@ impl Editor {
         if self.replace_input.is_some() {
             return;
         }
-        let input = cx.new(|cx| NoteInput::new(cx, String::new()));
+        let input = cx.new(|cx| TextField::single(cx, String::new()));
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(
             &input,
             window,
-            |editor, _, event: &NoteInputEvent, window, cx| match event {
-                NoteInputEvent::Commit(replacement) => {
+            |editor, _, event: &TextFieldEvent, window, cx| match event {
+                TextFieldEvent::Commit(replacement) => {
                     editor.replace_current(replacement.clone(), cx);
                 }
-                NoteInputEvent::Cancel => editor.close_palette(window, cx),
+                TextFieldEvent::Cancel => editor.close_palette(window, cx),
             },
         )
         .detach();
@@ -3577,7 +3902,13 @@ impl Editor {
             match store.save_with_state(
                 self.doc.spans(),
                 self.doc.blocks(),
-                &self.doc.export_history(200),
+                // 50, not 200: each persisted undo entry snapshots the FULL
+                // (SpanSet, BlockMap, Annotations) — measured 1.58 MB of JSON
+                // at 200 on a card-heavy document, rewritten into the
+                // append-only oplog on every editing save. Fifty cross-session
+                // undo steps is still deep (in-session undo is unaffected);
+                // the persisted tail is what must stay proportionate.
+                &self.doc.export_history(50),
                 self.doc.notes(),
             ) {
                 Ok(()) => self.store_dirty = false,
@@ -4049,12 +4380,12 @@ impl Editor {
         if self.end_session_input.is_some() {
             return;
         }
-        let input = cx.new(|cx| NoteInput::new(cx, String::new()));
+        let input = cx.new(|cx| TextField::single(cx, String::new()));
         cx.subscribe_in(
             &input,
             window,
-            |editor, _, event: &NoteInputEvent, window, cx| match event {
-                NoteInputEvent::Commit(text) => {
+            |editor, _, event: &TextFieldEvent, window, cx| match event {
+                TextFieldEvent::Commit(text) => {
                     let text = text.trim().to_owned();
                     if let Some(store) = &editor.store
                         && !text.is_empty()
@@ -4065,7 +4396,7 @@ impl Editor {
                     editor.save_now();
                     cx.quit();
                 }
-                NoteInputEvent::Cancel => {
+                TextFieldEvent::Cancel => {
                     editor.end_session_input = None;
                     window.focus(&editor.focus_handle, cx);
                     cx.notify();
@@ -4086,13 +4417,13 @@ impl Editor {
         if self.goal_input.is_some() {
             return;
         }
-        let input = cx.new(|cx| NoteInput::new(cx, String::new()));
+        let input = cx.new(|cx| TextField::single(cx, String::new()));
         cx.subscribe_in(
             &input,
             window,
-            |editor, _, event: &NoteInputEvent, window, cx| {
+            |editor, _, event: &TextFieldEvent, window, cx| {
                 match event {
-                    NoteInputEvent::Commit(text) => {
+                    TextFieldEvent::Commit(text) => {
                         // A number sets, 0 clears, anything else is
                         // ignored gracefully — the strip just closes.
                         match text.trim().replace([',', ' '], "").parse::<usize>() {
@@ -4103,7 +4434,7 @@ impl Editor {
                             Err(_) => {}
                         }
                     }
-                    NoteInputEvent::Cancel => {}
+                    TextFieldEvent::Cancel => {}
                 }
                 editor.goal_input = None;
                 window.focus(&editor.focus_handle, cx);
@@ -4112,6 +4443,7 @@ impl Editor {
         )
         .detach();
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        self.commit_field_on_blur(&input, window, cx, |e| e.goal_input.clone());
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.goal_input = Some(input);
@@ -4179,7 +4511,7 @@ impl Editor {
 
     /// DESIGN §0.6 law 2: Esc dismisses exactly the TOPMOST layer, one per
     /// press, regardless of where keyboard focus sits. This is the Editor-
-    /// context half; a focused field's own Esc goes through NoteCancel,
+    /// context half; a focused field's own Esc goes through FieldCancel,
     /// which closes the same layer. Order: AI settings → palette →
     /// shortcuts → selection popover → find/replace → history takeover.
     fn escape_mode(&mut self, _: &EscapeMode, window: &mut Window, cx: &mut Context<Self>) {
@@ -4385,17 +4717,19 @@ impl Editor {
                     .text_color(rgb(MUTED_COLOR))
                     .child("testing…"),
             ),
+            // ✓ / ✗ glyphs carry the pass/fail distinction without relying on
+            // color (WCAG 1.4.1); failure wears the reserved ERROR red.
             AiSettingsTest::Ok { ms } => Some(
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(0x4F7A4A))
-                    .child(format!("OK · {ms}ms")),
+                    .child(format!("✓ OK · {ms}ms")),
             ),
             AiSettingsTest::Failed { message } => Some(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(0xA3492F))
-                    .child(message.clone()),
+                    .text_color(rgb(ERROR))
+                    .child(format!("✗ {message}")),
             ),
         };
         let mut model_list = div()
@@ -5080,6 +5414,12 @@ impl Editor {
         if self.palette_input.is_some() || self.ai_settings.is_some() || self.shortcuts_open {
             return;
         }
+        // Scrolling is the writer looking around — a parked pass lands now
+        // (attention already moved; nothing can pop "under" it mid-thought).
+        self.flush_deferred_pass(cx);
+        // Exit-fade ghosts are viewport-frozen snapshots: once the text
+        // moves under them they'd hang mid-air, so a scroll just drops them.
+        self.departing.clear();
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
@@ -5089,6 +5429,47 @@ impl Editor {
             self.scroll_top = target;
             // Anchored to stale geometry once the text moves — dismiss.
             self.selection_popover = false;
+            cx.notify();
+        }
+    }
+
+    /// Clicking an off-screen pill ("N above" / "N below") reveals the NEAREST
+    /// hidden card in that direction. It reads the SAME `MarginLayout` the pill
+    /// counted — one source of truth, so the count and what the click can reach
+    /// can never diverge (the bug class that left pills dead, or scrolling to a
+    /// door-suppressed non-card). Two reveals, per how the card hid: an anchor
+    /// that scrolled off-screen → scroll JUST enough to bring it to the near edge
+    /// (one more card into view, never a full page); a card packing pushed out
+    /// while its anchor stays on-screen → SELECT it, so the packer's Pass 3
+    /// forces it fully into the lane (scrolling can't help — its anchor already
+    /// shows). Either way, the pill always does something.
+    fn reveal_offscreen(&mut self, below: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let vp_h = f32::from(frame.bounds.size.height);
+        let max_scroll = f32::from(frame.max_scroll());
+        let layout = self.margin_cards(true);
+        let refs = if below { layout.below } else { layout.above };
+        // Nearest in the direction: smallest anchor_y for "below" (closest to the
+        // bottom edge), largest for "above" (closest to the top edge).
+        let target = if below {
+            refs.into_iter().min_by(|a, b| a.anchor_y.total_cmp(&b.anchor_y))
+        } else {
+            refs.into_iter().max_by(|a, b| a.anchor_y.total_cmp(&b.anchor_y))
+        };
+        let Some(target) = target else { return };
+        if target.anchor_culled {
+            let t = px(reveal_scroll(target.anchor_y, vp_h, max_scroll, below));
+            if t != self.scroll_top {
+                self.scroll_top = t;
+                self.selection_popover = false;
+                cx.notify();
+            }
+        } else {
+            // Anchor on-screen but packed off: select it so Pass 3 brings the
+            // (now active) card fully into the lane next frame.
+            self.select_card(target.id, window, cx);
             cx.notify();
         }
     }
@@ -5271,6 +5652,14 @@ impl Editor {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A click in the right note lane is NOT a document click — the lane's
+        // own cards and pills handle it. The lane is a sibling element painted
+        // over this (full-width) column, so a card/pill's stop_propagation
+        // doesn't reach this handler; without this guard, clicking any margin
+        // card or off-screen pill also jumped the text caret.
+        if f32::from(ev.position.x) > self.column_right(window) + MARGIN_GAP {
+            return;
+        }
         // Footnote jumps (DESIGN §2-footnotes): a plain click on a ref's
         // mark goes to its def; a click on a def's "N." gutter goes back
         // to the ref. Never starts a drag selection.
@@ -5316,20 +5705,35 @@ impl Editor {
                     self.selection_origin = Some(ix..ix);
                     self.set_cursor(ix, affinity, cx);
                 }
-                // Bidirectional activation: clicking inside an anchor
-                // activates its margin card.
+                // Bidirectional activation: clicking inside an anchor activates
+                // its margin card. The click snaps to the nearest caret boundary,
+                // so a click on the trailing half of an anchor's last glyph lands
+                // at `c == end` — still on the visible mark; `note_at_char`
+                // accepts that trailing boundary (without double-claiming when
+                // another anchor starts there), so the whole highlight is live.
                 let c = self.doc.rope().byte_to_char(ix.min(self.doc.len_bytes()));
-                let hit = self
+                let ranges: Vec<(u64, usize, usize)> = self
                     .doc
                     .notes()
                     .open()
-                    .find(|n| n.range.start <= c && c < n.range.end);
+                    .map(|n| (n.id, n.range.start, n.range.end))
+                    .collect();
+                let hit_id = note_at_char(&ranges, c);
+                let hit = hit_id.and_then(|id| self.doc.notes().get(id));
                 // Reaching for a resting diagnosis opens the door (DESIGN
-                // §4.4), so the card it activates is actually on screen.
+                // §4.4), so the card it activates is actually on screen —
+                // and an attention shift this explicit lands a parked pass.
                 if self.drafting && hit.is_some_and(|n| n.kind == NoteKind::Diagnosis) {
+                    self.flush_deferred_pass(cx);
                     self.drafting = false;
                 }
-                self.active_note = hit.map(|n| n.id);
+                // Clicking the text selects the hit card (or clears selection);
+                // either way it commits and closes any composer first, so a
+                // click into the document never strands an open note editor.
+                match hit_id {
+                    Some(id) => self.select_card(id, window, cx),
+                    None => self.deselect_card(window, cx),
+                }
             }
             2 => {
                 // Double-click on an image block edits its alt text.
@@ -5476,7 +5880,7 @@ impl Editor {
             overlays.push("history");
         }
         // Every live single-line field, so "focused" can name its context.
-        let mut fields: Vec<Entity<NoteInput>> = Vec::new();
+        let mut fields: Vec<Entity<TextField>> = Vec::new();
         if let Some(panel) = &self.ai_settings {
             fields.extend([
                 panel.base_url.clone(),
@@ -5487,7 +5891,7 @@ impl Editor {
         fields.extend(self.palette_input.clone());
         fields.extend(self.replace_input.clone());
         fields.extend(self.doc_rename_input.clone());
-        fields.extend(self.note_input.clone());
+        fields.extend(self.focus.input().cloned());
         fields.extend(self.rename_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.alt_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.end_session_input.clone());
@@ -5495,14 +5899,45 @@ impl Editor {
         let focused_field = fields
             .iter()
             .find(|f| f.read(cx).focus_handle.is_focused(window));
-        let focused = focused_field.map_or("Editor", |f| f.read(cx).key_context);
+        let focused = focused_field.map_or("Editor", |f| f.read(cx).debug_caret().0);
         let focused_input_text = focused_field.map(|f| f.read(cx).content.clone());
+        // The focused field's caret + selection as CHAR indices, so the smoke
+        // rig can assert mouse/keyboard selection behavior (not just eyeball it).
+        let (field_cursor, field_sel) = focused_field
+            .map(|f| {
+                let (_, cursor, sel) = f.read(cx).debug_caret();
+                (Some(cursor), Some(sel))
+            })
+            .unwrap_or((None, None));
         let doc_hash = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             self.doc.text().hash(&mut hasher);
             format!("{:016x}", hasher.finish())
         };
+        // Margin layout, so the rig can assert the invariants the proptests cover
+        // only in the pure layer — at the integration level, against a real frame:
+        // no two VISIBLE cards overlap (the never-overlap rule); a selected card
+        // is actually in the visible set (the displacement fix); and the pill
+        // counts are what the lane reports. `null` when there is no frame yet.
+        let margin = self.last_frame.as_ref().map(|_| {
+            let layout = self.margin_cards(true);
+            let mut spans: Vec<(f32, f32)> =
+                layout.cards.iter().map(|c| (c.top, c.height)).collect();
+            spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let overlap = spans.windows(2).any(|w| w[0].0 + w[0].1 > w[1].0 + 0.5);
+            serde_json::json!({
+                "visible": layout.cards.len(),
+                "above": layout.above.len(),
+                "below": layout.below.len(),
+                "overlap": overlap,
+                "has_active": self.focus.active_id().is_some(),
+                "active_visible": layout.cards.iter().any(|c| c.active),
+                // Receded one-line cards (over the full-size budget) — visible
+                // counts them too: they are IN the lane, just smaller.
+                "collapsed": layout.cards.iter().filter(|c| c.collapsed).count(),
+            })
+        });
         serde_json::json!({
             "overlays": overlays,
             "focused": focused,
@@ -5510,6 +5945,25 @@ impl Editor {
             "doc_chars": self.doc.rope().len_chars(),
             "doc_hash": doc_hash,
             "focused_input_text": focused_input_text,
+            "field_cursor": field_cursor,
+            "field_sel": field_sel,
+            "margin": margin,
+            // A completed pass parked behind the reveal clock (mid-burst
+            // arrival) — the rig asserts park-then-land timing against this.
+            "ai_deferred": self.deferred_pass.is_some(),
+            // Cards still inside their entrance fade — the rig asserts the
+            // fade lifecycle (marked at landing, cleared right after).
+            "appearing": self.appearing.len(),
+            // Exit-fade ghosts of just-resolved cards (same lifecycle checks).
+            "departing": self.departing.len(),
+            // Re-pack slides in flight — the rig asserts a resolve in a
+            // crowded lane MOVES the survivors (then settles), and that a
+            // scroll clears all motion instantly. `moves_started` is the
+            // session-monotonic total, immune to the dump racing the 200ms
+            // flight on a cold launch.
+            "moving": self.moving.len(),
+            "moves_started": self.moves_started,
+            "reduce_motion": self.config.reduce_motion,
         })
         .to_string()
     }
@@ -5522,8 +5976,24 @@ impl Editor {
     /// text; the middle card is activated. Driven by the `seed:diag` smoke
     /// token — never reached outside a STROP_SMOKE run.
     pub fn debug_seed_notes(&mut self, cx: &mut Context<Self>) {
-        use strop_core::diagnose::{Diagnosis, to_annotations};
-        let demos: Vec<Diagnosis> = [
+        use strop_core::diagnose::to_annotations;
+        let anns =
+            to_annotations(&self.doc.text(), Self::demo_diagnoses(), self.doc.notes(), 0, 0);
+        self.doc.add_diagnoses(anns);
+        self.drafting = false; // reviewing: the editor's cards are shown
+        if let Some(n) = self.doc.notes().open().nth(2) {
+            self.focus = CardFocus::Selected(n.id);
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// The four demo diagnoses the rig seeds deliver (anchored to the
+    /// tutorial/fixture quotes) — shared so every seed path flags the same
+    /// passages.
+    fn demo_diagnoses() -> Vec<strop_core::diagnose::Diagnosis> {
+        use strop_core::diagnose::Diagnosis;
+        [
             ("sold his shadow", "buried lede",
              "The strongest image of the piece opens it — do you want it spent in the first clause, or held?"),
             ("quiet thing", "ambiguous shorthand",
@@ -5540,13 +6010,66 @@ impl Editor {
             query: query.into(),
             level: "line".into(),
         })
-        .collect();
-        let anns = to_annotations(&self.doc.text(), demos, self.doc.notes(), 0);
-        self.doc.add_diagnoses(anns);
-        self.drafting = false; // reviewing: the editor's cards are shown
-        if let Some(n) = self.doc.notes().open().nth(2) {
-            self.active_note = Some(n.id);
+        .collect()
+    }
+
+    /// Rig hook (`resolve:first`): resolve the first open note through the
+    /// real `set_note_status` path — instant model commit, exit-fade ghost —
+    /// without depending on the done-button's pixel position (the button's
+    /// hit-test is ordinary gpui listener machinery the click checks already
+    /// cover; the class under test here is the ghost lifecycle).
+    pub fn debug_resolve_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first = self.doc.notes().open().next().map(|n| n.id);
+        if let Some(id) = first {
+            self.set_note_status(id, NoteStatus::Done, window, cx);
         }
+    }
+
+    /// Rig hook (`resolve:last`): resolve the NEWEST open note. In a crowded
+    /// seeded lane that is the bottom full-size card — resolving it frees a
+    /// budget slot, a receded card expands, and the run below shifts: the
+    /// deterministic re-pack the motion checks need. (resolve:first hits the
+    /// oldest card, already receded to a one-liner at its own anchor — its
+    /// departure legitimately moves nothing.)
+    pub fn debug_resolve_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let last = self.doc.notes().open().last().map(|n| n.id);
+        if let Some(id) = last {
+            self.set_note_status(id, NoteStatus::Done, window, cx);
+        }
+    }
+
+    /// Rig hook (`seed:deliver`): push the demo pass through the REAL arrival
+    /// gate (`deliver_pass`) — mid-typing-burst it parks behind the reveal
+    /// clock, in a lull it lands at once. rig-check.sh types a key first to
+    /// open a burst, asserts nothing surfaced, waits out TYPING_LULL, and
+    /// asserts the cards landed — the whole clock against a real window.
+    pub fn debug_deliver_pass(&mut self, cx: &mut Context<Self>) {
+        self.drafting = false; // a real pass opens the door at request time
+        let generation = self.ai_generation;
+        self.deliver_pass(Self::demo_diagnoses(), generation, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`seed:many`): a CROWDED lane — eight diagnoses across two
+    /// passes, none selected, so the full-size budget (FULL_DIAGNOSIS_CAP)
+    /// visibly recedes the oldest pass to one-line cards while every flagged
+    /// passage keeps a card in the lane (the honesty invariant, asserted by
+    /// rig-check.sh against a real frame). Quotes must appear, in order, in
+    /// the open document — rig-check.sh writes a fixture that contains them.
+    pub fn debug_seed_many(&mut self, cx: &mut Context<Self>) {
+        use strop_core::diagnose::{Diagnosis, to_annotations};
+        let mk = |i: usize| Diagnosis {
+            quote: format!("crowded margin phrase number {i}"),
+            problem: format!("finding {i}"),
+            query: "Does this line carry its weight?".into(),
+            level: "line".into(),
+        };
+        for (pass, range) in [(1u64, 1..=4usize), (2, 5..=8)] {
+            let demos: Vec<Diagnosis> = range.map(mk).collect();
+            let anns = to_annotations(&self.doc.text(), demos, self.doc.notes(), 0, pass);
+            self.doc.add_diagnoses(anns);
+        }
+        self.drafting = false; // reviewing: the editor's cards are shown
         self.mark_dirty();
         cx.notify();
     }
@@ -6163,20 +6686,34 @@ fn runs_for_paragraph(
                 }
             }
 
-            // Note anchors tint (wheat); diagnosis anchors underline
-            // quietly in muted ink — never red, never wavy — promoting to
-            // a tint when active. Selection composites over everything.
+            // Note anchors tint (wheat); diagnosis anchors get a quiet WAVY
+            // squiggle in muted ink — the spellcheck idiom, so a tool mark
+            // never reads as the writer's own straight underline (ctrl-u; the
+            // one mark §2 keeps) — promoting to a tint when active. If a span
+            // carries the writer's underline already, that straight line wins
+            // (get_or_insert): their formatting outranks the tool's mark.
+            // Selection composites over everything.
             for (r, active, is_diagnosis) in notes {
                 if r.start <= w[0] && w[1] <= r.end {
                     if *is_diagnosis && !active {
+                        // The AI's anchor mark wears the cool machine-voice ink
+                        // (color language): a wavy blue squiggle, distinct from
+                        // the writer's warm amber note tint.
                         underline.get_or_insert(UnderlineStyle {
-                            color: Some(rgb(MUTED_COLOR).into()),
+                            color: Some(rgb(AI_ACCENT).into()),
                             thickness: px(1.),
-                            wavy: false,
+                            wavy: true,
                         });
                         continue;
                     }
-                    let tint = if *active {
+                    // The active band wears its layer's voice: a diagnosis lights
+                    // up cool blue (matching its card + squiggle — the machine is
+                    // pointing here), a writer note warm amber. A resting note
+                    // keeps its faint amber tint; a resting diagnosis took the
+                    // squiggle branch above and never reaches here.
+                    let tint = if *is_diagnosis {
+                        rgba(DIAGNOSIS_TINT_ACTIVE)
+                    } else if *active {
                         rgba(NOTE_TINT_ACTIVE)
                     } else {
                         rgba(NOTE_TINT)
@@ -6191,8 +6728,8 @@ fn runs_for_paragraph(
             for r in matches {
                 if r.start <= w[0] && w[1] <= r.end {
                     content_bg = Some(match content_bg {
-                        Some(bg) => blend_over(rgba(0x7FB8A455), bg),
-                        None => rgba(0x7FB8A455), // sage — distinct from wheat
+                        Some(bg) => blend_over(rgba(FIND_MATCH_BG), bg),
+                        None => rgba(FIND_MATCH_BG), // sage — distinct from wheat
                     });
                 }
             }
@@ -6348,7 +6885,7 @@ impl Element for EditorElement {
             } else {
                 None
             },
-            active_note: editor.active_note,
+            active_note: editor.focus.active_id(),
         };
         let can_reuse = !in_history
             && !editor
@@ -6519,7 +7056,7 @@ impl Element for EditorElement {
                 .map(|n| {
                     (
                         rope.char_to_byte(n.range.start)..rope.char_to_byte(n.range.end),
-                        editor.active_note == Some(n.id),
+                        editor.focus.active_id() == Some(n.id),
                         n.kind == NoteKind::Diagnosis,
                     )
                 })
@@ -7213,15 +7750,31 @@ impl Editor {
         let (par_ix, line, x) =
             frame.cursor_position(self.selected_range.start.min(frame.doc_len()), false)?;
         let par = &frame.paragraphs[par_ix];
-        // Window-space top of the selection's first visual line.
+        // `frame.bounds` are WINDOW-global, but this popover is a child of the
+        // `content` surface, which the CSD shadow gutter insets by `CSD_GUTTER`
+        // on each untiled edge (Linux/Wayland floating windows; server-decorated
+        // platforms inset 0, tiled edges 0). Convert frame coords into content
+        // space by subtracting that inset — the column lane already works in
+        // content space (`column_frame`); the popover read window space and so
+        // landed a gutter too far right, over the text, when the left margin was
+        // tight (the Linux-only overlap). `content_width` is content space too.
+        let (l_inset, t_inset, b_inset) = match window.window_decorations() {
+            Decorations::Client { tiling } => (
+                if tiling.left { 0. } else { CSD_GUTTER },
+                if tiling.top { 0. } else { CSD_GUTTER },
+                if tiling.bottom { 0. } else { CSD_GUTTER },
+            ),
+            Decorations::Server => (0., 0., 0.),
+        };
+        // Content-space top of the selection's first visual line.
         let line_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
             + f32::from(par.line_height) * line as f32
-            - f32::from(frame.scroll_top);
+            - f32::from(frame.scroll_top)
+            - t_inset;
         let line_h = f32::from(par.line_height);
-        let viewport = window.viewport_size();
-        let vw = f32::from(viewport.width);
-        let vh = f32::from(viewport.height);
-        let col_left = f32::from(frame.bounds.origin.x);
+        let vw = self.content_width(window);
+        let vh = f32::from(window.viewport_size().height) - t_inset - b_inset;
+        let col_left = f32::from(frame.bounds.origin.x) - l_inset;
         let outline_w = self.outline_width(window);
 
         // Gutter-float: a vertical toolbar hugging the column's left edge, in
@@ -7920,6 +8473,7 @@ impl Editor {
     fn render_history_panel(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let empty_expanded = HashSet::new();
         let hv = self.history_view.as_ref();
+        let materializing = hv.is_some_and(|h| h.materializing);
         let (entries, selected, named_only, compare_current, expanded) = match hv {
             Some(hv) => (
                 hv.entries.as_slice(),
@@ -8241,6 +8795,21 @@ impl Editor {
                          undoable, like everything here. Nothing is ever lost.",
                     ),
             )
+            // A legacy file's first history open: versions are being read out
+            // of the old format in the background (once, ever) — the rows are
+            // already here, previews land in a moment.
+            .when(materializing, |d| {
+                d.child(
+                    div()
+                        .px(px(14.))
+                        .py(px(7.))
+                        .border_b_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child("Assembling version previews — a moment…"),
+                )
+            })
             .child(
                 div()
                     .id("history-list")
@@ -8290,11 +8859,11 @@ impl Editor {
                                 .flex_col()
                                 .gap(px(1.))
                                 .text_size(px(11.))
-                                .text_color(if report.overall_sigma > 2. {
-                                    rgb(0xA04A3A)
-                                } else {
-                                    rgb(MUTED_COLOR)
-                                })
+                                // A voice anomaly is a descriptive flag, not an
+                                // error — red is reserved (color language). The
+                                // "Nσ outside your normal range" headline carries
+                                // the signal in text, so it stays muted.
+                                .text_color(rgb(MUTED_COLOR))
                                 .children(std::iter::once(headline).chain(report.flags)),
                         )
                     }
@@ -8573,7 +9142,6 @@ struct HistoryEntry {
     name: String,
     created_unix: i64,
     manual: bool,
-    frontiers: Vec<u8>,
     text: String,
     /// Formatting at this checkpoint — projected into the preview so the
     /// document doesn't strip to plain text while time-travelling.
@@ -8600,6 +9168,10 @@ struct HistoryView {
     /// Runs are collapsed by default (Figma's answer to autosave noise);
     /// arrow-stepping into one unfolds it.
     expanded: HashSet<usize>,
+    /// A legacy file's states are still being materialized in the background
+    /// (backfill_checkpoint_states): rows show names/dates only, the preview
+    /// and restore wait. Once per file, ever — the states persist.
+    materializing: bool,
 }
 
 /// First index of the run of consecutive auto checkpoints containing `ix`
@@ -8687,9 +9259,9 @@ enum AiFailure {
 /// file stays authoritative — Save writes through toml_edit so comments
 /// and hand edits survive, and hand editing keeps working forever.
 struct AiSettings {
-    base_url: Entity<NoteInput>,
-    api_key: Entity<NoteInput>,
-    model: Entity<NoteInput>,
+    base_url: Entity<TextField>,
+    api_key: Entity<TextField>,
+    model: Entity<TextField>,
     /// Inline test/save feedback ON the panel — never a margin card while
     /// the panel is open (the margin is covered by the backdrop anyway).
     test: AiSettingsTest,
@@ -8846,9 +9418,41 @@ struct PreviewDoc {
     kinds: Vec<BlockKind>,
 }
 
+struct MarginLayout {
+    /// Cards to render — packed and at least partly in view.
+    cards: Vec<MarginCard>,
+    /// Open cards hidden above / below the viewport — the SINGLE source of truth
+    /// for both the edge-count pills AND `reveal_offscreen` (so a pill can never
+    /// read "1 below" yet do nothing: the count is `below.len()` and clicking it
+    /// navigates to `below`'s nearest entry). Each carries enough to navigate
+    /// there. A card never vanishes without a trace (DESIGN principle 2).
+    /// Door-held cards are NOT here; the rail (render_margin_rail) owns those.
+    above: Vec<OffscreenRef>,
+    below: Vec<OffscreenRef>,
+}
+
+/// An open card hidden past a viewport edge — enough to NAVIGATE to it, not just
+/// tally it. `anchor_y` is the anchor's content-space y. `anchor_culled`
+/// distinguishes the two ways a card hides, which need different reveals:
+/// `true` = the anchor itself scrolled off-screen → reveal by SCROLLING to it;
+/// `false` = the anchor is on-screen but packing pushed the card out → reveal by
+/// SELECTING it (the packer's Pass 3 then forces the active card into view).
+/// Deriving both pills and reveal from these kills the "count vs. reach computed
+/// from different filters" bug class (the dead-pill + wrong-target findings).
+#[derive(Clone, Copy)]
+struct OffscreenRef {
+    id: u64,
+    anchor_y: f32,
+    anchor_culled: bool,
+}
+
+#[derive(Clone)]
 struct MarginCard {
     id: u64,
     top: f32,
+    /// The anchor's content-space y (scroll-independent) — kept so a card the
+    /// packer later pushes off-screen can still be navigated to by reveal.
+    anchor_y: f32,
     height: f32,
     body: String,
     active: bool,
@@ -8859,6 +9463,16 @@ struct MarginCard {
     /// label gains a quiet "· detached" so a card sitting at a best-effort
     /// offset never reads as confidently anchored.
     orphaned: bool,
+    /// A diagnosis whose flagged text was edited since it was raised — greyed
+    /// as "unverified" (Annotation::unverified). Always false for writer notes.
+    unverified: bool,
+    /// Which AI pass raised it (0 for writer notes) — the recency the full-size
+    /// budget sorts by when a crowded lane recedes older passes.
+    pass_id: u64,
+    /// Over the lane's full-size budget: render as a one-line card at the
+    /// anchor (title only, muted) instead of the full card. Never true for
+    /// writer notes or the selected card; `height` is COLLAPSED_CARD_H.
+    collapsed: bool,
 }
 
 /// A note card's header label: "Note" / a diagnosis level (or "Diagnosis"),
@@ -8876,17 +9490,456 @@ fn note_card_label(is_diagnosis: bool, level: &str, orphaned: bool) -> String {
     }
 }
 
+/// Hash a card's identity-for-height: kind + title + body. Immutable for a
+/// diagnosis; for a note it changes only at a composer commit — so a cache hit
+/// means the stored measured height is still exact.
+fn card_height_key(kind: NoteKind, title: &str, body: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    matches!(kind, NoteKind::Diagnosis).hash(&mut h);
+    title.hash(&mut h);
+    body.hash(&mut h);
+    h.finish()
+}
+
+/// A margin card's placement inputs: its anchor target (viewport-space top it
+/// wants), measured height, whether it's a hard PIN (a writer note or the
+/// active card — holds its anchor) and whether it's the ACTIVE/selected card.
+#[derive(Clone, Copy, Debug)]
+struct PlaceItem {
+    anchor: f32,
+    height: f32,
+    pin: bool,
+    active: bool,
+}
+
+/// Place margin cards in ONE pass and return each card's top (viewport-space),
+/// in input order. Items come in document/anchor order. Three guarantees,
+/// pinned down by the packer proptests:
+///
+/// 1. no two cards EVER overlap (the writer's never-overlap rule, no excuses);
+/// 2. every card sits at/below `floor` (never under the titlebar) — EXCEPT a
+///    card the active card displaced upward off the top edge, which the caller
+///    culls into the `above` count (so it is never painted under the titlebar);
+/// 3. the ACTIVE card lies fully within `[floor, viewport_bottom]` whenever
+///    its height fits there — UNCONDITIONALLY, even when a pinned writer note
+///    competes for the slack above it: the focused card wins the lane.
+///
+/// Mechanics: writer notes (Layer A) and the active card hold their anchors;
+/// inactive diagnoses (Layer B) yield around them. The active card's anchor is
+/// first clamped UP so the whole card fits the viewport (the "selected card ran
+/// off the bottom edge" bug). A floor+downward sweep gives the non-overlap
+/// guarantee; a pull-up then slides the rigid run of movable cards above each
+/// pin up into existing slack only. Pass 3 then re-clamps the active card into
+/// view if a competing pin pushed it below, and shoves the run above it UP to
+/// stay clear — displacing (and honestly counting) rather than overlapping.
+fn place_margin_cards(items: &[PlaceItem], floor: f32, viewport_bottom: f32, gap: f32) -> Vec<f32> {
+    let n = items.len();
+    // Anchor targets (floored); the active card is clamped up to fit the lane.
+    let anchor: Vec<f32> = items
+        .iter()
+        .map(|it| {
+            let a = it.anchor.max(floor);
+            if it.active {
+                (viewport_bottom - it.height - CARD_BOTTOM_MARGIN).min(a).max(floor)
+            } else {
+                a
+            }
+        })
+        .collect();
+    // Pass 1 — floor + downward no-overlap sweep.
+    let mut top = vec![floor; n];
+    let mut bottom = floor;
+    for i in 0..n {
+        top[i] = anchor[i].max(bottom);
+        bottom = top[i] + items[i].height + gap;
+    }
+    // Pass 2 — raise each pin toward its anchor, COMPRESSING the movable run
+    // directly above it into its internal slack (not a rigid slide — that left
+    // loose gaps between spread-out cards unused and stranded the selected card
+    // off the bottom edge). A pin never rises past the floor or a pinned note
+    // above it. Bottom-up so a lower pin makes room before a higher one runs.
+    for i in (0..n).rev() {
+        if !items[i].pin || top[i] <= anchor[i] {
+            continue;
+        }
+        // The movable run directly above pin i is [k, i); `base` is the floor or
+        // the bottom of the nearest pin above (which holds its own anchor).
+        let mut k = i;
+        while k > 0 && !items[k - 1].pin {
+            k -= 1;
+        }
+        let base = if k > 0 {
+            top[k - 1] + items[k - 1].height + gap
+        } else {
+            floor
+        };
+        let need: f32 = items[k..i].iter().map(|it| it.height + gap).sum();
+        // Highest pin i may sit: its anchor, unless the run above needs the room
+        // (then it sits just low enough that the run still clears the floor).
+        top[i] = anchor[i].max(base + need).min(top[i]);
+        // Pack the run beneath it: keep each card where it is when there's slack,
+        // push it up only as far as avoiding overlap demands.
+        let mut limit = top[i];
+        for j in (k..i).rev() {
+            let cap = limit - items[j].height - gap;
+            if top[j] > cap {
+                top[j] = cap;
+            }
+            limit = top[j];
+        }
+    }
+    // Pass 3 — the active card MUST be fully in view: it is what the writer is
+    // looking at right now. Passes 1-2 can still strand it below the fold when a
+    // pinned writer note above eats the slack (the old guarantee-3 carve-out).
+    // The focused card wins WITHOUT overlapping anything (the never-overlap rule
+    // holds): re-clamp its top up into [floor, viewport_bottom - height], then
+    // shove the run directly above it UP to stay clear. A card shoved past the
+    // floor is off the top edge — the caller culls it into the honest `above`
+    // count (it becomes "N above", never overlapped, never over the titlebar).
+    if let Some(a) = items.iter().position(|it| it.active) {
+        let ceil = (viewport_bottom - items[a].height - CARD_BOTTOM_MARGIN).max(floor);
+        if top[a] > ceil {
+            top[a] = ceil;
+        }
+        // Cascade upward: each card above keeps clear of the one below it, the
+        // active card being the fixed lower bound. Cards run off the top as
+        // needed (they get culled + counted, not clipped or overlapped).
+        let mut limit = top[a];
+        for i in (0..a).rev() {
+            let cap = limit - items[i].height - gap;
+            if top[i] > cap {
+                top[i] = cap;
+            }
+            limit = top[i];
+        }
+    }
+    top
+}
+
+/// Where a packed card sits relative to the viewport: rendered (`Shown`), or
+/// rolled into the above/below edge count. PURE GEOMETRY — a card shows iff at
+/// least one line of it overlaps the viewport. No `active` special case: the
+/// packer (Pass 3) guarantees the active card is in view, so it shows by
+/// geometry like everything else; and if it somehow can't fit (taller than the
+/// lane) this counts it honestly instead of lying "Shown" while it's off-screen.
+/// That honesty is what keeps the "N above / N below" counts trustworthy
+/// (nothing vanishes) and what reveal_offscreen relies on to find a card.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum CardSlot {
+    Shown,
+    Above,
+    Below,
+}
+
+fn card_slot(top: f32, height: f32, vp_top: f32, vp_bottom: f32) -> CardSlot {
+    if top + height > vp_top + CARD_LINE_H && top < vp_bottom - CARD_LINE_H {
+        CardSlot::Shown
+    } else if top + height <= vp_top + CARD_LINE_H {
+        CardSlot::Above
+    } else {
+        CardSlot::Below
+    }
+}
+
+/// The scroll offset that brings a card anchored at content-y `anchor_y` to the
+/// NEAR edge of the viewport — just into view, not a page. `below` reveals it at
+/// the bottom edge (anchor lands `REVEAL_INSET` above the bottom, leaving room
+/// for the card), `above` at the top edge. Clamped to the scrollable range.
+/// Pure, so the "pill reveals one more card, never paginates" property is unit-
+/// testable: after a `below` reveal the anchor sits near the BOTTOM, not the top.
+fn reveal_scroll(anchor_y: f32, vp_h: f32, max_scroll: f32, below: bool) -> f32 {
+    let target = if below {
+        anchor_y - vp_h + REVEAL_INSET
+    } else {
+        anchor_y - REVEAL_INSET
+    };
+    target.clamp(0., max_scroll)
+}
+
+/// Of the lane's diagnoses `(id, pass_id)`, the ones past the full-size budget:
+/// keep the newest `cap` (highest pass_id, then id) full, the rest recede to
+/// one-line cards. Pure, so the budget policy is unit-testable without a frame.
+fn oldest_beyond_cap(surfaced: &[(u64, u64)], cap: usize) -> std::collections::HashSet<u64> {
+    if surfaced.len() <= cap {
+        return std::collections::HashSet::new();
+    }
+    let mut v = surfaced.to_vec();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    v.into_iter().skip(cap).map(|(id, _)| id).collect()
+}
+
+/// A freshly-landed card's entrance: one decelerating opacity fade over
+/// CARD_APPEAR (cubic ease-out ≈ the "enter" token, attention-motion.md §3).
+/// `is_new` holds only while the landing pass is inside its fade window
+/// (Editor::appearing), so a card scrolled out and back re-mounts WITHOUT
+/// replaying the entrance — old content never re-announces itself.
+fn appear_fade<E: Styled + IntoElement + 'static>(el: E, id: u64, is_new: bool) -> gpui::AnyElement {
+    if !is_new {
+        return el.into_any_element();
+    }
+    el.with_animation(
+        ("card-appear", id as usize),
+        Animation::new(CARD_APPEAR).with_easing(|t| 1. - (1. - t).powi(3)),
+        |el, t| el.opacity(t),
+    )
+    .into_any_element()
+}
+
+/// One card's share of a staggered re-pack round: flat 0 through its delay
+/// (`delay_frac` of the whole run), then a cubic ease-in-out over the rest —
+/// the "standard" in-place token. Pure, so the timing contract (still during
+/// the delay, settled at 1, monotone between) is a unit test.
+fn staggered_ease(t: f32, delay_frac: f32) -> f32 {
+    if t <= delay_frac {
+        return 0.;
+    }
+    if t >= 1. {
+        return 1.;
+    }
+    let t = (t - delay_frac) / (1. - delay_frac);
+    if t < 0.5 {
+        4. * t * t * t
+    } else {
+        1. - (-2. * t + 2.).powi(3) / 2.
+    }
+}
+
+/// Diff the lane between two frames: which cards MOVED — present in both with
+/// a changed content-space top. `snap` (a scroll frame, a live composer, a
+/// typing burst — continuous causes, not discrete re-packs) reports nothing:
+/// those frames track 1:1 and must never animate. Newly-appeared ids are not
+/// moves (they get the entrance fade); departed ids just drop. Pure, so the
+/// tween-vs-snap policy is a unit test, not a feel regression.
+fn plan_lane_moves(
+    prev: &std::collections::HashMap<u64, f32>,
+    now: &[(u64, f32)],
+    snap: bool,
+) -> Vec<(u64, f32, f32)> {
+    if snap {
+        return Vec::new();
+    }
+    now.iter()
+        .filter_map(|&(id, top)| {
+            let from = *prev.get(&id)?;
+            ((from - top).abs() > 0.5).then_some((id, from, top))
+        })
+        .collect()
+}
+
+/// Wrap a mid-move card: the sliding mode animates its `top` from the old
+/// slot to the CURRENT target (so scroll under a live tween stays 1:1); the
+/// reduce_motion mode keeps the card AT the target and fades it in over the
+/// same duration instead (its old-slot ghost fades out in render_margin) —
+/// travel becomes a cross-fade, never a teleport. The animation is keyed by
+/// (id, generation) so a mid-flight re-target restarts the run; note ids stay
+/// far below 2^48, so the packed key can't collide.
+fn move_slide<E: Styled + IntoElement + 'static>(
+    el: E,
+    id: u64,
+    mv: &CardMove,
+    target_top: f32,
+    reduce_motion: bool,
+) -> gpui::AnyElement {
+    let key = ("card-move", (id as usize) | ((mv.generation as usize) << 48));
+    let total = mv.total();
+    let delay_frac = mv.delay.as_secs_f32() / total.as_secs_f32();
+    let delta = mv.delta;
+    let anim = Animation::new(total).with_easing(move |t| staggered_ease(t, delay_frac));
+    if reduce_motion {
+        el.with_animation(key, anim, |el, t| el.opacity(t)).into_any_element()
+    } else {
+        el.with_animation(key, anim, move |el, t| {
+            el.top(px((target_top + delta * (1. - t)).max(4.)))
+        })
+        .into_any_element()
+    }
+}
+
+/// A card's non-interactive ghost (no id, no listeners — a click lands on
+/// whatever is really there): the shared body for the exit fade (departing)
+/// and the reduce_motion cross-fade. Mirrors the live card's look — the
+/// receded one-liner included — so the fading light reads as the same object,
+/// and a collapsed card's ghost never sprawls over its neighbours.
+fn ghost_card(card: &MarginCard) -> gpui::Div {
+    let is_diagnosis = card.kind == NoteKind::Diagnosis;
+    let base = div()
+        .absolute()
+        .top(px(card.top.max(4.)))
+        .left(px(8.))
+        .w(px(MARGIN_WIDTH - 8.))
+        .overflow_hidden()
+        .rounded(px(if is_diagnosis { 3. } else { 9. }))
+        .bg(rgb(if card.unverified {
+            STALE_BG
+        } else if is_diagnosis {
+            DIAGNOSIS_CARD_BG
+        } else {
+            NOTE_CARD_BG
+        }))
+        .border_1()
+        .border_color(rgb(RULE_COLOR))
+        .font_family("PT Serif")
+        .text_color(rgb(MUTED_COLOR));
+    if card.collapsed {
+        return base
+            .h(px(COLLAPSED_CARD_H))
+            .px(px(8.))
+            .py(px(3.))
+            .text_size(px(11.))
+            .line_height(px(COLLAPSED_CARD_H - 8.))
+            .child(div().truncate().child(if card.title.is_empty() {
+                card.level.clone()
+            } else {
+                card.title.clone()
+            }));
+    }
+    base.p(px(8.))
+        .text_size(px(13.))
+        .line_height(px(CARD_LINE_H))
+        .when(is_diagnosis && !card.title.is_empty(), |d| {
+            d.child(div().font_weight(FontWeight::BOLD).child(card.title.clone()))
+        })
+        .child(div().child(card.body.clone()))
+}
+
+/// Which open annotation a click at char index `c` activates, given each open
+/// note's `(id, start, end)` (anchor covers `[start, end)`). A click snaps to
+/// the nearest caret boundary, so a click on the trailing half of the last glyph
+/// lands at `c == end` — still on the painted mark. So: prefer the anchor that
+/// strictly CONTAINS `c`; failing that, accept one that ENDS exactly at `c`. The
+/// containment check runs first, so a back-to-back `[..,c)[c,..)` pair resolves
+/// to the second (it contains `c`) and the trailing fallback never double-claims.
+/// Pure, so the half-glyph trailing-edge dead-zone is a unit test, not a surprise.
+fn note_at_char(ranges: &[(u64, usize, usize)], c: usize) -> Option<u64> {
+    ranges
+        .iter()
+        .find(|(_, s, e)| *s <= c && c < *e)
+        .or_else(|| ranges.iter().find(|(_, _, e)| *e == c))
+        .map(|(id, _, _)| *id)
+}
+
+/// The door (DESIGN §4.4): does this open note surface as a margin card right
+/// now? Writer notes always do; a diagnosis is hidden while drafting, and a
+/// copy-level one is held back while a developmental one is still open (the
+/// mandatory altitude order). The held-back ones surface as the rail's count.
+fn note_surfaces(kind: NoteKind, level: &str, drafting: bool, has_dev: bool) -> bool {
+    kind != NoteKind::Diagnosis || (!drafting && (!has_dev || level != "copy"))
+}
+
 impl Editor {
-    /// The Docs-style margin solver (via Liveblocks' AnchoredThreads):
-    /// downward sweep normally; with an active card, it snaps to its anchor,
-    /// later cards push down, earlier cards push up from it in reverse.
-    fn margin_cards(&self) -> Vec<MarginCard> {
+    /// Shape `text` at the card's inner width and return its REAL wrapped
+    /// height (the measurement that replaced the `chars/30` estimate). Embedded
+    /// newlines and multi-row wraps are summed; empty text is zero.
+    fn shape_text_height(window: &Window, text: &str) -> f32 {
+        Self::shape_text_height_w(window, text, CARD_INNER_W, false)
+    }
+
+    /// Wrapped height of `text` at a given inner width, in PT Serif 13 / one
+    /// shaped row per painted row. Committed body text wraps at `CARD_INNER_W`;
+    /// the live composer wraps at the narrower `COMPOSER_INNER_W` (its box has
+    /// padding), so its reservation matches what it paints. `bold` MUST match the
+    /// paint weight: a diagnosis title is painted bold, and bold advances are
+    /// wider, so measuring it normal-weight under-reserves a row at the wrap
+    /// boundary and the next card overlaps it — measure exactly what we paint.
+    fn shape_text_height_w(window: &Window, text: &str, width: f32, bold: bool) -> f32 {
+        if text.is_empty() {
+            return 0.;
+        }
+        let s = SharedString::from(text.to_owned());
+        let mut font = gpui::font("PT Serif");
+        if bold {
+            font.weight = FontWeight::BOLD;
+        }
+        let run = TextRun {
+            len: s.len(),
+            font,
+            color: rgb(TEXT_COLOR).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        match window
+            .text_system()
+            .shape_text(s, px(13.), &[run], Some(px(width)), None)
+        {
+            Ok(lines) => lines
+                .iter()
+                .map(|l| f32::from(l.size(px(CARD_LINE_H)).height))
+                .sum(),
+            Err(_) => CARD_LINE_H,
+        }
+    }
+
+    /// A card's painted height: chrome + a wrapped title (diagnoses only) + a
+    /// wrapped body, with at least `min_body_rows` of body/composer room.
+    fn measure_card_height(window: &Window, title: &str, body: &str, min_body_rows: f32) -> f32 {
+        let body_h = Self::shape_text_height(window, body).max(min_body_rows * CARD_LINE_H);
+        // The title is painted BOLD (diagnoses only) — measure it bold to match.
+        let title_h = Self::shape_text_height_w(window, title, CARD_INNER_W, true);
+        CARD_CHROME_H + title_h + body_h
+    }
+
+    /// Measure-and-cache every open card's height while the window's text system
+    /// is in hand (called from `render`), so `margin_cards`'s placement runs on
+    /// real extents, not estimates. Committed/immutable content is cached by
+    /// hash; the one actively-composed note is measured live each frame from its
+    /// composer (its text changes every keystroke, so it can't be cached).
+    fn refresh_card_heights(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // The live card is the one being COMPOSED (not merely selected): its id
+        // and its draft text come from the same `Composing` variant, so the
+        // live height can't be measured against the wrong card.
+        let composing_id = self.focus.composing_id();
+        let live = self.focus.input().map(|i| i.read(cx).content.clone());
+        // Collect specs first: can't hold a `doc` borrow while mutating the cache.
+        let specs: Vec<(u64, NoteKind, String, String)> = self
+            .doc
+            .notes()
+            .open()
+            .map(|n| (n.id, n.kind, n.title.clone(), n.body.clone()))
+            .collect();
+        self.active_card_height = None;
+        for (id, kind, title, body) in specs {
+            let is_diag = kind == NoteKind::Diagnosis;
+            if Some(id) == composing_id && !is_diag {
+                // The live composer wraps at its (narrower) box width and adds
+                // the box's own vertical chrome; reserve exactly that so the
+                // growing field never clips or overlaps the card below.
+                let body = live.as_deref().unwrap_or("");
+                let body_h = Self::shape_text_height_w(window, body, COMPOSER_INNER_W, false)
+                    .max(2. * CARD_LINE_H);
+                self.active_card_height = Some(CARD_CHROME_H + body_h + COMPOSER_BOX_CHROME);
+                continue;
+            }
+            let key = card_height_key(kind, &title, &body);
+            self.card_heights.entry(key).or_insert_with(|| {
+                let (t, min_rows) = if is_diag { (title.as_str(), 0.) } else { ("", 1.) };
+                Self::measure_card_height(window, t, &body, min_rows)
+            });
+        }
+    }
+
+    /// Build the margin cards: door-filter the open notes, measure + place them
+    /// (`place_margin_cards`), and — when `cull` is set (the wide lane) — drop
+    /// those whose anchor is off-screen or that packing pushed out of view,
+    /// reporting their counts as honest `above`/`below` edges so nothing
+    /// vanishes silently. `cull = false` (the narrow drawer) returns every open
+    /// card with no edge counts; the drawer ignores positions.
+    fn margin_cards(&self, cull: bool) -> MarginLayout {
         let Some(frame) = self.last_frame.as_ref() else {
-            return Vec::new();
+            return MarginLayout {
+                cards: Vec::new(),
+                above: Vec::new(),
+                below: Vec::new(),
+            };
         };
         let rope = self.doc.rope();
         let len = self.doc.len_bytes();
         let mut cards: Vec<MarginCard> = Vec::new();
+        // Open cards hidden above / below the viewport — surfaced as edge pills
+        // AND navigated by reveal_offscreen (one source of truth).
+        let mut above: Vec<OffscreenRef> = Vec::new();
+        let mut below: Vec<OffscreenRef> = Vec::new();
         // The door (DESIGN §4.4): drafting hides the editor's cards (the
         // writer's own notes stay); reviewing shows them, but suppresses
         // copy-level cards while a developmental one is still open (the
@@ -8900,13 +9953,14 @@ impl Editor {
                 .open()
                 .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
         for n in self.doc.notes().open() {
-            if n.kind == NoteKind::Diagnosis {
-                if drafting {
-                    continue;
-                }
-                if has_dev && n.level == "copy" {
-                    continue;
-                }
+            // The SELECTED card is exempt from the door: clicking a diagnosis is
+            // an explicit attention act that overrides the altitude-order hold
+            // (and mirrors the anchor-cull exemption below) — otherwise the click
+            // would light the anchor while the card stayed suppressed, a
+            // highlight with no card (the reported "click shows no card" bug).
+            let active = self.focus.active_id() == Some(n.id);
+            if !active && !note_surfaces(n.kind, &n.level, drafting, has_dev) {
+                continue;
             }
             let byte = rope.char_to_byte(n.range.start.min(rope.len_chars())).min(len);
             let Some(pos) = frame.position_of(byte, false) else {
@@ -8915,32 +9969,54 @@ impl Editor {
             let desired =
                 f32::from(frame.bounds.origin.y) + f32::from(pos.y) - f32::from(frame.scroll_top);
             let is_diag = n.kind == NoteKind::Diagnosis;
-            let active = self.active_note == Some(n.id);
-            // Estimate the rendered card height so the packer separates cards by
-            // their REAL extent, not a flat cap (the old `text_len/30` clamped to
-            // 4 lines under-measured tall cards → they overlapped). Bias toward
-            // OVER-estimating: an extra gap is invisible, an overlap is the bug.
-            // CPL = conservative chars-per-line at the ~222px inner width, 13px
-            // PT Serif. Components: padding+border, header row, wrapped title
-            // (diagnoses only), wrapped body — or composer room for an active note.
-            const CPL: f32 = 30.;
-            const LINE_H: f32 = 18.;
-            let wrap = |chars: usize| (chars as f32 / CPL).ceil().max(1.);
-            let mut height = 18. + 16.; // padding + border, header row
-            if is_diag && !n.title.is_empty() {
-                height += wrap(n.title.chars().count()) * LINE_H;
+            // Cull to the viewport: a card whose ANCHOR is off-screen doesn't
+            // belong in the lane — it would pile at the floor (the scroll-pileup
+            // bug) and attribute to nothing visible. The active card is exempt:
+            // you're working it, so it stays even if its anchor scrolled away.
+            let vp_top = f32::from(frame.bounds.origin.y);
+            let vp_bot = vp_top + f32::from(frame.bounds.size.height);
+            if cull
+                && !active
+                && (desired < vp_top - CARD_OVERSCAN || desired > vp_bot + CARD_OVERSCAN)
+            {
+                // Anchor itself off-screen → reveal by scrolling to anchor_y.
+                let r = OffscreenRef {
+                    id: n.id,
+                    anchor_y: f32::from(pos.y),
+                    anchor_culled: true,
+                };
+                if desired < vp_top {
+                    above.push(r);
+                } else {
+                    below.push(r);
+                }
+                continue;
             }
-            let body_chars = n.body.chars().count();
-            if active && !is_diag {
-                // The composer (a text input) stands in for the body; give it
-                // room to grow with what's already typed, min two lines.
-                height += wrap(body_chars).max(2.) * LINE_H + 10.;
-            } else if body_chars > 0 || !is_diag {
-                height += wrap(body_chars) * LINE_H;
-            }
+            // Real MEASURED height (refresh_card_heights), never an estimate.
+            // The active composer rides a live field; every other card reads the
+            // content-hash cache, with a one-frame char-count fallback for a
+            // brand-new card the refresh hasn't measured yet.
+            let height = if self.focus.composing_id() == Some(n.id) {
+                self.active_card_height
+                    .unwrap_or(CARD_CHROME_H + 2. * CARD_LINE_H)
+            } else {
+                let key = card_height_key(n.kind, &n.title, &n.body);
+                self.card_heights.get(&key).copied().unwrap_or_else(|| {
+                    let body_rows = (n.body.chars().count() as f32 / 30.)
+                        .ceil()
+                        .max(if is_diag { 0. } else { 1. });
+                    let title_rows = if is_diag && !n.title.is_empty() {
+                        (n.title.chars().count() as f32 / 30.).ceil()
+                    } else {
+                        0.
+                    };
+                    CARD_CHROME_H + (title_rows + body_rows) * CARD_LINE_H
+                })
+            };
             cards.push(MarginCard {
                 id: n.id,
                 top: desired,
+                anchor_y: f32::from(pos.y),
                 height,
                 body: n.body.clone(),
                 active,
@@ -8948,48 +10024,203 @@ impl Editor {
                 title: n.title.clone(),
                 level: n.level.clone(),
                 orphaned: n.orphaned,
+                unverified: n.unverified,
+                pass_id: n.pass_id,
+                collapsed: false,
             });
         }
-        // cards are in document order (notes are kept sorted by anchor).
-        let active_ix = cards.iter().position(|c| c.active);
-        match active_ix {
-            None => {
-                let mut bottom = f32::MIN;
-                for card in cards.iter_mut() {
-                    card.top = card.top.max(bottom);
-                    bottom = card.top + card.height + MARGIN_GAP;
-                }
-            }
-            Some(a) => {
-                // Ascending from the active card (which gets its anchor y).
-                let mut bottom = f32::MIN;
-                for card in cards[a..].iter_mut() {
-                    card.top = card.top.max(bottom);
-                    bottom = card.top + card.height + MARGIN_GAP;
-                }
-                // Descending above it, nearest first: push up out of the way.
-                let mut top_limit = cards[a].top;
-                for card in cards[..a].iter_mut().rev() {
-                    let max_top = top_limit - card.height - MARGIN_GAP;
-                    card.top = card.top.min(max_top);
-                    top_limit = card.top;
+        // The full-size budget (FULL_DIAGNOSIS_CAP): among the diagnoses that
+        // made it into THIS lane, the newest few render full and older passes
+        // RECEDE to a one-line card at their anchor — present, clickable,
+        // smaller. Counted lane-local (after the anchor cull) so a crowded page
+        // elsewhere never shrinks this one, and never hidden: every flagged
+        // passage in view keeps a visible card (the honesty invariant; a
+        // squiggle with no card reads as a bug, and was reported as one). The
+        // selected card is exempt, so clicking a receded card expands it. Lane
+        // presentation only — the narrow drawer (cull=false) lists all cards.
+        if cull {
+            let surfaced: Vec<(u64, u64)> = cards
+                .iter()
+                .filter(|c| c.kind == NoteKind::Diagnosis && !c.active)
+                .map(|c| (c.id, c.pass_id))
+                .collect();
+            let receded = oldest_beyond_cap(&surfaced, FULL_DIAGNOSIS_CAP);
+            for card in &mut cards {
+                if receded.contains(&card.id) {
+                    card.collapsed = true;
+                    card.height = COLLAPSED_CARD_H;
                 }
             }
         }
-        // Floor the lane: a card whose anchor scrolled up under the titlebar
-        // (or whose neighbours pushed it there) must never paint over the
-        // window controls or the intent banner. Push the stack down past that
-        // line, preserving order and gaps. Without this an active card near
-        // the top lands on the close button (Image-3 bug).
+        // Place them in one pass (see `place_margin_cards`): writer notes and
+        // the active card hold their anchors, inactive diagnoses yield around
+        // them, the selected card is kept fully in view, and no two overlap.
+        // `top` currently holds each card's anchor target.
         let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
-        let mut bottom = floor;
-        for card in cards.iter_mut() {
-            if card.top < bottom {
-                card.top = bottom;
-            }
-            bottom = card.top + card.height + MARGIN_GAP;
+        let viewport_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
+        let items: Vec<PlaceItem> = cards
+            .iter()
+            .map(|c| PlaceItem {
+                anchor: c.top,
+                height: c.height,
+                pin: c.kind == NoteKind::Note || c.active,
+                active: c.active,
+            })
+            .collect();
+        for (card, top) in cards
+            .iter_mut()
+            .zip(place_margin_cards(&items, floor, viewport_bottom, MARGIN_GAP))
+        {
+            card.top = top;
         }
-        cards
+        if !cull {
+            return MarginLayout { cards, above, below };
+        }
+        // Packing can shove an on-screen-anchored card off an edge (the active
+        // card wins the bottom slot and displaces the run above it up; or a run
+        // below an active card overflows the bottom). Record those, never clip
+        // them silently: keep only cards with a real slice in view, capture the
+        // rest as off-screen refs (anchor_culled = false → reveal by selecting,
+        // since their anchor is on-screen and scrolling won't help).
+        let vp_top = f32::from(frame.bounds.origin.y);
+        let vp_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
+        let mut visible = Vec::with_capacity(cards.len());
+        for card in cards {
+            let packed_off = OffscreenRef {
+                id: card.id,
+                anchor_y: card.anchor_y,
+                anchor_culled: false,
+            };
+            // A card Pass 3 pushed above the floor (to clear the active card) is
+            // off the TOP — count it, don't paint it over the titlebar. (Pass 3
+            // only moves cards up, so `top < floor` uniquely marks the displaced.)
+            if card.top < floor - 0.5 {
+                above.push(packed_off);
+                continue;
+            }
+            match card_slot(card.top, card.height, vp_top, vp_bottom) {
+                CardSlot::Shown => visible.push(card),
+                CardSlot::Above => above.push(packed_off),
+                CardSlot::Below => below.push(packed_off),
+            }
+        }
+        MarginLayout {
+            cards: visible,
+            above,
+            below,
+        }
+    }
+
+    /// Render pre-pass (once per frame, before `render_margin`): diff the
+    /// packed lane against the previous frame and start, re-target, or expire
+    /// the re-pack slides (`moving`). One rule decides tween vs. snap: a
+    /// DISCRETE re-pack in a still lane slides (a card resolved, a pass
+    /// landed, a selection expanded — object constancy pays); any CONTINUOUS
+    /// cause — scroll, a live composer growing, a typing burst reflowing
+    /// anchors — tracks 1:1 and clears all motion (never animate against the
+    /// writer's own movement, never mid-burst; attention-motion.md §2-3).
+    fn update_lane_motion(&mut self, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let scroll = f32::from(frame.scroll_top);
+        let scrolled = (scroll - self.lane_scroll).abs() > 0.5;
+        self.lane_scroll = scroll;
+        let viewport = (
+            f32::from(frame.bounds.size.width),
+            f32::from(frame.bounds.size.height),
+        );
+        let resized = (viewport.0 - self.lane_viewport.0).abs() > 0.5
+            || (viewport.1 - self.lane_viewport.1).abs() > 0.5;
+        self.lane_viewport = viewport;
+        let layout = self.margin_cards(true);
+        // Content-space tops (scroll added back), so a pure scroll diffs to
+        // zero and only real re-packs register.
+        let now_tops: Vec<(u64, f32)> =
+            layout.cards.iter().map(|c| (c.id, c.top + scroll)).collect();
+        // Finished slides settle; a card that left the lane drops its motion
+        // state (so a later return can never replay a stale move).
+        let present: std::collections::HashSet<u64> =
+            now_tops.iter().map(|&(id, _)| id).collect();
+        self.moving
+            .retain(|id, mv| present.contains(id) && mv.start.elapsed() < mv.total());
+        self.lane_tops.retain(|id, _| present.contains(id));
+        let snap =
+            scrolled || resized || self.focus.composing_id().is_some() || self.typing_burst_live();
+        if snap {
+            self.moving.clear();
+            self.lane_tops = now_tops.into_iter().collect();
+            return;
+        }
+        let mut moves = plan_lane_moves(&self.lane_tops, &now_tops, false);
+        // Stagger top-down by destination, capped so a long train stays one
+        // brisk gesture, not a slow wave.
+        moves.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let reduce = self.config.reduce_motion;
+        let mut started = false;
+        for (i, &(id, from, to)) in moves.iter().enumerate() {
+            started = true;
+            if let Some(mv) = self.moving.get_mut(&id) {
+                // Mid-flight and the pack moved again: head for the new
+                // target from the currently-DISPLAYED spot (no snap-back),
+                // on a fresh animation run. The old-slot ghost (reduce
+                // mode) is dropped — a churning lane earns less light.
+                let displayed = mv.to + mv.delta * (1. - mv.eased(mv.start.elapsed()));
+                mv.delta = displayed - to;
+                mv.to = to;
+                mv.start = Instant::now();
+                mv.delay = Duration::ZERO;
+                mv.generation += 1;
+                mv.ghost = None;
+                continue;
+            }
+            // reduce_motion: travel becomes a cross-fade — snapshot the card
+            // at its old slot (content-space top; render re-anchors it to the
+            // live scroll) to fade out under the live card fading in.
+            let ghost = reduce
+                .then(|| {
+                    layout.cards.iter().find(|c| c.id == id).map(|c| {
+                        let mut g = c.clone();
+                        g.top = from;
+                        g
+                    })
+                })
+                .flatten();
+            self.moves_started += 1;
+            self.moving.insert(
+                id,
+                CardMove {
+                    delta: from - to,
+                    to,
+                    start: Instant::now(),
+                    delay: MOVE_STAGGER * (i as u32).min(MOVE_STAGGER_CAP),
+                    generation: 0,
+                    ghost,
+                },
+            );
+        }
+        for (id, top) in now_tops {
+            self.lane_tops.insert(id, top);
+        }
+        // One nudge after the longest slide lands: with_animation stops
+        // requesting frames at t=1, so without this a finished entry would
+        // linger until the next natural frame (and could replay if its card
+        // re-mounts after a door toggle).
+        if started {
+            let wait = self.moving.values().map(CardMove::total).max().unwrap_or(CARD_MOVE)
+                + Duration::from_millis(60);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |editor: &mut Editor, cx| {
+                    editor
+                        .moving
+                        .retain(|_, mv| mv.start.elapsed() < mv.total());
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     /// Width the column and note lane actually have to live in: the viewport
@@ -9019,10 +10250,12 @@ impl Editor {
         cw - (left + w) >= NOTE_LANE_TOTAL
     }
 
-    /// The door rail's count, when it has something to hold: drafting hides
-    /// the editor's diagnoses (shows "N resting"); reviewing suppresses
-    /// copy-level cards under an open developmental one ("N copy-level").
-    /// `None` means the rail stands down — a quiet margin.
+    /// The door rail's count, when it has something to hold: drafting hides the
+    /// editor's diagnoses ("N resting"); reviewing holds copy-level cards under
+    /// an open developmental one ("N copy-level"). The DOOR is the only thing
+    /// the rail counts — the full-size budget never hides a card (over-budget
+    /// ones recede to one-line cards, still in the lane), so it owes the rail
+    /// nothing. `None` means the rail stands down — a quiet margin.
     fn margin_rail_count(&self) -> Option<usize> {
         let n = if self.drafting {
             self.resting_diagnoses()
@@ -9049,9 +10282,10 @@ impl Editor {
                 .notes()
                 .open()
                 .any(|n| n.kind == NoteKind::Diagnosis && n.level == "developmental");
-        self.doc.notes().open().any(|n| {
-            !(n.kind == NoteKind::Diagnosis && (drafting || (has_dev && n.level == "copy")))
-        })
+        self.doc
+            .notes()
+            .open()
+            .any(|n| note_surfaces(n.kind, &n.level, drafting, has_dev))
     }
 
     /// Does anything want the right-hand note lane right now? An empty lane
@@ -9110,7 +10344,7 @@ impl Editor {
     /// Narrow-window composer: the margin (and its in-card composer) is
     /// hidden, so the note body is edited in a bottom strip instead.
     fn render_composer_strip(&self) -> Option<impl IntoElement> {
-        let input = self.note_input.clone()?;
+        let input = self.focus.input().cloned()?;
         Some(
             div()
                 .absolute()
@@ -9336,7 +10570,7 @@ impl Editor {
                     .into_any_element()
             }
             Some(AiStatus::NeedsSetup { local_model }) => {
-                let base = card(0xFFFDF6);
+                let base = card(CARD_BG);
                 match local_model.clone() {
                     // The cliff is gone: a local model answered the probe.
                     // Lead with the one-click, key-free, private path.
@@ -9415,7 +10649,7 @@ impl Editor {
                         .into_any_element(),
                 }
             }
-            Some(AiStatus::Running { label }) => card(0xFFFDF6)
+            Some(AiStatus::Running { label }) => card(CARD_BG)
                 .child(div().text_color(rgb(MUTED_COLOR)).child(format!("Running: {label}…")))
                 .child(
                     div().flex().child(action_button("ai-cancel", "Cancel").on_mouse_down(
@@ -9480,10 +10714,91 @@ impl Editor {
             return None;
         }
         let col_right = self.column_right(window);
-        let mut cards = self.margin_cards();
-        if cards.is_empty() {
+        let MarginLayout {
+            mut cards,
+            above,
+            below,
+        } = self.margin_cards(true);
+        if cards.is_empty() && above.is_empty() && below.is_empty() && self.departing.is_empty() {
             return None;
         }
+        // Ghosts of just-resolved cards (departing), painted FIRST so the live
+        // lane sits over them: a brief exit fade where the card was, non-
+        // interactive (no id, no listeners — a click lands on whatever is
+        // really there). In the common uncrowded lane nothing else moves, so
+        // the whole gesture is just the card taking its leave.
+        let ghosts: Vec<gpui::AnyElement> = self
+            .departing
+            .iter()
+            .map(|(card, _)| {
+                ghost_card(card)
+                    .with_animation(
+                        ("card-depart", card.id as usize),
+                        Animation::new(CARD_RESOLVE).with_easing(|t| t * t * t),
+                        |el, t| el.opacity(1. - t),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        // reduce_motion cross-fades: a moving card's old-slot snapshot fades
+        // out under the live card fading in at its new slot — the same "the
+        // card went from here to there" information as the slide, with no
+        // travel. Snapshots carry CONTENT-SPACE tops; re-anchor to this
+        // frame's scroll so even the fading light tracks the text 1:1.
+        let scroll_now = self
+            .last_frame
+            .as_ref()
+            .map(|f| f32::from(f.scroll_top))
+            .unwrap_or(0.);
+        let crossfades: Vec<gpui::AnyElement> = self
+            .moving
+            .iter()
+            .filter_map(|(&id, mv)| {
+                let snapshot = mv.ghost.as_ref()?;
+                let mut old = snapshot.clone();
+                old.top = snapshot.top - scroll_now;
+                let key =
+                    ("card-move-out", (id as usize) | ((mv.generation as usize) << 48));
+                let delay_frac = mv.delay.as_secs_f32() / mv.total().as_secs_f32();
+                Some(
+                    ghost_card(&old)
+                        .with_animation(
+                            key,
+                            Animation::new(mv.total())
+                                .with_easing(move |t| staggered_ease(t, delay_frac)),
+                            |el, t| el.opacity(1. - t),
+                        )
+                        .into_any_element(),
+                )
+            })
+            .collect();
+        let (above_n, below_n) = (above.len(), below.len());
+        let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
+        // A quiet pill at a lane edge when cards are hidden past it — the honest
+        // "there's more here, it didn't vanish" cue (DESIGN principle 2).
+        let edge_chip = move |label: String, at_bottom: bool| {
+            let chip = div()
+                .absolute()
+                .left(px((MARGIN_WIDTH - 88.) / 2.))
+                .w(px(88.))
+                .flex()
+                .justify_center()
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(10.))
+                .bg(rgb(CARD_BG))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .text_size(px(10.))
+                .text_color(rgb(MUTED_COLOR))
+                .font_family("PT Serif")
+                .child(label);
+            if at_bottom {
+                chip.bottom(px(6.))
+            } else {
+                chip.top(px(floor))
+            }
+        };
         // Paint the active card LAST so it sits ON TOP of any neighbour it
         // overlaps (GPUI paints siblings in tree order). Tops are unchanged —
         // this is purely z-order: "the selected annotation is always on top."
@@ -9491,6 +10806,32 @@ impl Editor {
             let active = cards.remove(i);
             cards.push(active);
         }
+        // The off-screen-count pills are clickable (issue 2): a click pages the
+        // document toward the nearest hidden card that way. Built before the
+        // container so each `cx.listener` borrow is its own statement.
+        let above_chip = (above_n > 0).then(|| {
+            edge_chip(format!("{above_n} above"), false)
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        editor.reveal_offscreen(false, window, cx);
+                    }),
+                )
+        });
+        let below_chip = (below_n > 0).then(|| {
+            edge_chip(format!("{below_n} below"), true)
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        editor.reveal_offscreen(true, window, cx);
+                    }),
+                )
+        });
+        let reduce_motion = self.config.reduce_motion;
         let lane_left = col_right + MARGIN_GAP;
         Some(
             div()
@@ -9499,6 +10840,12 @@ impl Editor {
                 .bottom_0()
                 .left(px(lane_left))
                 .w(px(MARGIN_WIDTH))
+                // Scroll is handled once at the document root (see `render`): a
+                // wheel anywhere over the document surface — prose, gutters, this
+                // lane, the whitespace beyond it — scrolls the one document. No
+                // per-element wheel handler here (it would double-fire via bubble).
+                .children(ghosts)
+                .children(crossfades)
                 .children(cards.into_iter().map(|card| {
                     let MarginCard {
                         id,
@@ -9509,12 +10856,82 @@ impl Editor {
                         title,
                         level,
                         orphaned,
+                        unverified,
+                        collapsed,
                         ..
                     } = card;
-                    let composer = if active { self.note_input.clone() } else { None };
+                    // Inside its entrance fade? (One fade per landed pass;
+                    // never replayed — see appear_fade.)
+                    let is_new = self.appearing.contains(&id);
+                    // Receded (over the full-size budget): one muted title line
+                    // at the anchor — present and clickable, just smaller, the
+                    // way dense marginalia shrink on paper. Clicking selects it,
+                    // and the selected card is budget-exempt, so it expands in
+                    // place. Height is FORCED to COLLAPSED_CARD_H so the packer
+                    // and the paint can never disagree (the overlap bug class).
+                    if collapsed {
+                        let compact = div()
+                            .id(("note-card", id as usize))
+                            .absolute()
+                            .top(px(top.max(4.)))
+                            .left(px(8.))
+                            .w(px(MARGIN_WIDTH - 8.))
+                            .h(px(COLLAPSED_CARD_H))
+                            .px(px(8.))
+                            .py(px(3.))
+                            .overflow_hidden()
+                            .rounded(px(3.))
+                            .bg(rgb(if unverified { STALE_BG } else { DIAGNOSIS_CARD_BG }))
+                            .border_1()
+                            .border_color(rgb(RULE_COLOR))
+                            .cursor(CursorStyle::PointingHand)
+                            .font_family("PT Serif")
+                            .text_size(px(11.))
+                            .line_height(px(COLLAPSED_CARD_H - 8.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    if editor.focus.active_id() != Some(id) {
+                                        editor.select_card(id, window, cx);
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(div().truncate().child({
+                                let line = if title.is_empty() {
+                                    level.clone()
+                                } else {
+                                    title.clone()
+                                };
+                                // The detached marker survives receding — an
+                                // orphaned card at a best-effort anchor must
+                                // never read as confidently anchored, however
+                                // small it renders (the count-grammar rule:
+                                // detached outranks every other treatment).
+                                if orphaned {
+                                    format!("{line} · detached")
+                                } else {
+                                    line
+                                }
+                            }));
+                        if let Some(mv) = self.moving.get(&id) {
+                            return move_slide(compact, id, mv, top, reduce_motion);
+                        }
+                        return appear_fade(compact, id, is_new);
+                    }
+                    // The composer renders only on the note it is actually
+                    // editing — never on a clicked AI card (the id comes from
+                    // the same `Composing` variant as the input).
+                    let composing_here = self.focus.composing_id() == Some(id);
+                    let composer = composing_here
+                        .then(|| self.focus.input().cloned())
+                        .flatten();
                     let is_diagnosis = kind == NoteKind::Diagnosis;
                     let label = note_card_label(is_diagnosis, &level, orphaned);
-                    div()
+                    let card = div()
                         .id(("note-card", id as usize))
                         .absolute()
                         .top(px(top.max(4.)))
@@ -9522,33 +10939,57 @@ impl Editor {
                         .w(px(MARGIN_WIDTH - 8.))
                         .p(px(8.))
                         .overflow_hidden()
-                        .rounded(px(6.))
-                        .bg(rgb(0xFFFDF6))
+                        // Two kinds of object, two shapes (no text tag, no
+                        // colour wash): the writer's own notes are softly
+                        // rounded (personal marginalia); AI diagnoses are
+                        // crisper-cornered (formal editorial), reinforcing the
+                        // bold-title cue. AI provenance, felt not labelled.
+                        .rounded(px(if is_diagnosis { 3. } else { 9. }))
+                        // Paper-tint differentiation (theme color language): a
+                        // warm cream wash for the writer's own note (ink on the
+                        // page), a cool blue wash for a live AI diagnosis (the
+                        // machine voice, over the page). An unverified diagnosis
+                        // DRAINS to neutral — doubt = desaturation, fading back
+                        // into the page (never red; that's reserved for errors).
+                        .bg(rgb(if unverified {
+                            STALE_BG
+                        } else if is_diagnosis {
+                            DIAGNOSIS_CARD_BG
+                        } else {
+                            NOTE_CARD_BG
+                        }))
                         .border_1()
                         .border_color(if active {
-                            rgb(0xC8A951)
+                            rgb(ACTIVE_BORDER)
                         } else {
                             rgb(RULE_COLOR)
                         })
                         .cursor(CursorStyle::PointingHand)
                         .font_family("PT Serif")
                         .text_size(px(13.))
-                        .text_color(rgb(TEXT_COLOR))
+                        .line_height(px(CARD_LINE_H))
+                        // Unverified (flagged text edited since): greyed — the
+                        // claim may no longer hold, so it recedes until the
+                        // writer judges it. Never auto-dismissed.
+                        .text_color(rgb(if unverified { MUTED_COLOR } else { TEXT_COLOR }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
-                                if editor.active_note != Some(id) {
-                                    let note = editor.doc.notes().get(id);
-                                    let is_note =
-                                        note.is_some_and(|n| n.kind == NoteKind::Note);
-                                    let body =
-                                        note.map(|n| n.body.clone()).unwrap_or_default();
-                                    if is_note {
+                                let note = editor.doc.notes().get(id);
+                                let is_note = note.is_some_and(|n| n.kind == NoteKind::Note);
+                                let body = note.map(|n| n.body.clone()).unwrap_or_default();
+                                if is_note {
+                                    // Clicking a note opens (or re-opens) its
+                                    // composer; clicking the one already being
+                                    // composed is a no-op so the caret doesn't jump.
+                                    if editor.focus.composing_id() != Some(id) {
                                         editor.open_composer(id, body, window, cx);
-                                    } else {
-                                        editor.active_note = Some(id);
+                                        cx.notify();
                                     }
+                                } else if editor.focus.active_id() != Some(id) {
+                                    // A diagnosis only ever gets selected.
+                                    editor.select_card(id, window, cx);
                                     cx.notify();
                                 }
                             }),
@@ -9574,12 +11015,13 @@ impl Editor {
                                                     cx.listener(
                                                         move |editor,
                                                               _: &MouseDownEvent,
-                                                              _,
+                                                              window,
                                                               cx| {
                                                             cx.stop_propagation();
                                                             editor.set_note_status(
                                                                 id,
                                                                 NoteStatus::Done,
+                                                                window,
                                                                 cx,
                                                             );
                                                         },
@@ -9597,12 +11039,13 @@ impl Editor {
                                                     cx.listener(
                                                         move |editor,
                                                               _: &MouseDownEvent,
-                                                              _,
+                                                              window,
                                                               cx| {
                                                             cx.stop_propagation();
                                                             editor.set_note_status(
                                                                 id,
                                                                 NoteStatus::Dismissed,
+                                                                window,
                                                                 cx,
                                                             );
                                                         },
@@ -9615,15 +11058,29 @@ impl Editor {
                         .when(is_diagnosis && !title.is_empty(), |d| {
                             d.child(div().font_weight(FontWeight::BOLD).child(title.clone()))
                         })
-                        .when_some(composer, |d, input| d.child(input))
-                        .when(!active || is_diagnosis, |d| {
-                            d.child(if body.is_empty() && !is_diagnosis {
+                        // The body region is EXACTLY ONE of composer-or-text —
+                        // a single match, never both (the "double" bug) and
+                        // never neither (the "blank committed card" bug). The
+                        // old two-`when` form let those conditions disagree.
+                        .child(match card_body(composing_here) {
+                            CardBody::Composer => composer
+                                .map(|input| div().child(input))
+                                .unwrap_or_else(div),
+                            CardBody::Text if body.is_empty() && !is_diagnosis => {
                                 div().text_color(rgb(MUTED_COLOR)).child("(empty note)")
-                            } else {
-                                div().child(body.clone())
-                            })
-                        })
-                })),
+                            }
+                            CardBody::Text => div().child(body.clone()),
+                        });
+                    // A mid-move card slides (or cross-fades) to its new slot;
+                    // entrance fades are for genuinely new cards only — the
+                    // two never overlap (a new card has no old slot to leave).
+                    if let Some(mv) = self.moving.get(&id) {
+                        return move_slide(card, id, mv, top, reduce_motion);
+                    }
+                    appear_fade(card, id, is_new)
+                }))
+                .children(above_chip)
+                .children(below_chip),
         )
     }
 
@@ -9678,6 +11135,7 @@ impl Editor {
                     MouseButton::Left,
                     cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
+                        editor.flush_deferred_pass(cx);
                         editor.drafting = false;
                         cx.notify();
                     }),
@@ -9711,7 +11169,7 @@ impl Editor {
         if self.margin_fits(window) || self.history_view.is_some() {
             return None;
         }
-        let count = self.narrow_notes_count(&self.margin_cards());
+        let count = self.narrow_notes_count(&self.margin_cards(false).cards);
         if count == 0 {
             return None;
         }
@@ -9733,7 +11191,7 @@ impl Editor {
                 .py(px(3.))
                 .rounded(px(6.))
                 .border_1()
-                .border_color(if open { rgb(0xC8A951) } else { rgb(RULE_COLOR) })
+                .border_color(if open { rgb(ACTIVE_BORDER) } else { rgb(RULE_COLOR) })
                 .bg(rgb(0xF7F5EF))
                 .cursor(CursorStyle::PointingHand)
                 .hover(|d| d.bg(rgb(0xEFEBE0)))
@@ -9782,7 +11240,7 @@ impl Editor {
         if !self.narrow_notes_open || self.margin_fits(window) || self.history_view.is_some() {
             return None;
         }
-        let cards = self.margin_cards();
+        let cards = self.margin_cards(false).cards;
         if self.narrow_notes_count(&cards) == 0 {
             return None;
         }
@@ -9820,6 +11278,7 @@ impl Editor {
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
+                            editor.flush_deferred_pass(cx);
                             editor.drafting = false;
                             cx.notify();
                         }),
@@ -9865,7 +11324,7 @@ impl Editor {
             .id(("narrow-note", id as usize))
             .p(px(8.))
             .rounded(px(6.))
-            .bg(rgb(0xFFFDF6))
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
             .cursor(CursorStyle::PointingHand)
@@ -9901,9 +11360,9 @@ impl Editor {
                                     .hover(|d| d.text_color(rgb(TEXT_COLOR)))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
                                             cx.stop_propagation();
-                                            editor.set_note_status(id, NoteStatus::Done, cx);
+                                            editor.set_note_status(id, NoteStatus::Done, window, cx);
                                         }),
                                     )
                                     .child("done"),
@@ -9915,9 +11374,9 @@ impl Editor {
                                     .hover(|d| d.text_color(rgb(TEXT_COLOR)))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
                                             cx.stop_propagation();
-                                            editor.set_note_status(id, NoteStatus::Dismissed, cx);
+                                            editor.set_note_status(id, NoteStatus::Dismissed, window, cx);
                                         }),
                                     )
                                     .child("×"),
@@ -9938,6 +11397,12 @@ impl Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Measure-and-cache margin-card heights up front (the window's text
+        // system is in hand here) so margin_cards places on real extents.
+        self.refresh_card_heights(window, cx);
+        // Then diff the packed lane against last frame: a discrete re-pack
+        // starts the card slides; scroll/composer/burst frames snap instead.
+        self.update_lane_motion(cx);
         // History mode pushes the document aside (DESIGN §2-history: push,
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
@@ -10022,6 +11487,14 @@ impl Render for Editor {
                     editor.light_dismiss(window, cx);
                 }),
             )
+            // One scroll handler for the WHOLE document surface (issue: scroll
+            // only worked over the prose). "Everything that isn't a panel is one
+            // scrollable document": prose, both gutters, the margin lane and the
+            // whitespace beyond it all live under this root, so a wheel anywhere
+            // bubbles here and scrolls. Panels (omnibox/settings/shortcuts/narrow
+            // notes) stop_propagation on their own wheel — and on_scroll_wheel
+            // early-returns while one is open — so they stay unaffected.
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(self.render_titlebar(cx))
             .child(
                 div()
@@ -10138,7 +11611,9 @@ impl Render for Editor {
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
-                    .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                    // Scroll lives on the root `content` (one handler for the
+                    // whole document surface — see below); not here, or it would
+                    // double-fire as the event bubbles up.
                     .on_drop(cx.listener(Self::on_file_drop))
                             // History recentres/rewraps in the remaining width;
                             // otherwise the column takes its width-only measure.
@@ -10380,6 +11855,227 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // Margin packer invariants, against random card stacks. Floor and viewport
+    // are fixed; cards are sorted by anchor (the order margin_cards feeds).
+    const PACK_FLOOR: f32 = 44.;
+    const PACK_VP_BOTTOM: f32 = 800.;
+    const PACK_GAP: f32 = 16.;
+
+    proptest! {
+        // INV1 (no overlap, EVER — the never-overlap rule, no active-card excuse)
+        // + INV2 (every card at/below the floor) hold for ANY stack. The one
+        // relaxation: cards the active card displaced UP off the top edge may sit
+        // above the floor — they're culled into the `above` count by the caller,
+        // never painted under the titlebar. Those are exactly the cards ABOVE the
+        // active card's (sorted) index.
+        #[test]
+        fn packed_cards_never_overlap_and_clear_the_floor(
+            raw in proptest::collection::vec((0f32..3000., 20f32..400., any::<bool>()), 0..12usize),
+            active_sel in 0usize..64,
+        ) {
+            let n = raw.len();
+            let active = if n == 0 { usize::MAX } else { active_sel % n };
+            let mut items: Vec<PlaceItem> = raw
+                .iter()
+                .enumerate()
+                .map(|(i, &(anchor, height, is_note))| PlaceItem {
+                    anchor,
+                    height,
+                    pin: is_note || i == active,
+                    active: i == active,
+                })
+                .collect();
+            items.sort_by(|a, b| a.anchor.total_cmp(&b.anchor));
+            // The active card's index AFTER the sort (the pre-sort `active` is stale).
+            let active_idx = items.iter().position(|it| it.active);
+            let tops = place_margin_cards(&items, PACK_FLOOR, PACK_VP_BOTTOM, PACK_GAP);
+            for i in 0..tops.len() {
+                // INV2: clears the floor — unless displaced UP above the active
+                // card (i < active_idx), which is culled, not painted.
+                if active_idx.is_none_or(|a| i >= a) {
+                    prop_assert!(tops[i] >= PACK_FLOOR - 0.01, "card {i} above floor");
+                }
+                // INV1: no two cards overlap. No exceptions — displacement, not
+                // overlap, is how the active card wins the lane.
+                if i + 1 < tops.len() {
+                    prop_assert!(
+                        tops[i + 1] + 0.01 >= tops[i] + items[i].height + PACK_GAP,
+                        "cards {i}/{} overlap", i + 1
+                    );
+                }
+            }
+        }
+
+        // INV3 (strengthened): the SELECTED card is ALWAYS fully within the
+        // viewport when its own height fits the lane — even when writer notes are
+        // pinned in the slack above it (the bug class: a tall low-anchored note
+        // above the chosen diagnosis used to shove it off the bottom, and the
+        // count lied "Shown"). `is_note` pins now compete; Pass 3 must still win.
+        #[test]
+        fn selected_card_stays_fully_in_view(
+            cards in proptest::collection::vec((0f32..3000., 20f32..100., any::<bool>()), 1..6usize),
+            active_sel in 0usize..64,
+        ) {
+            let n = cards.len();
+            let active = active_sel % n;
+            let mut items: Vec<PlaceItem> = cards
+                .iter()
+                .enumerate()
+                .map(|(i, &(anchor, height, is_note))| PlaceItem {
+                    anchor,
+                    height,
+                    pin: is_note || i == active, // writer notes compete for the slack
+                    active: i == active,
+                })
+                .collect();
+            items.sort_by(|a, b| a.anchor.total_cmp(&b.anchor));
+            let active = items.iter().position(|it| it.active).unwrap();
+            let h = items[active].height;
+            // The guarantee holds whenever the active card itself fits the lane —
+            // no "whole stack fits" / "no competing pin" caveat anymore.
+            prop_assume!(h <= PACK_VP_BOTTOM - PACK_FLOOR - CARD_BOTTOM_MARGIN);
+            let tops = place_margin_cards(&items, PACK_FLOOR, PACK_VP_BOTTOM, PACK_GAP);
+            prop_assert!(tops[active] >= PACK_FLOOR - 0.01, "active card under the floor");
+            prop_assert!(
+                tops[active] + h <= PACK_VP_BOTTOM + 0.01,
+                "active card {} + {h} overruns viewport {PACK_VP_BOTTOM}", tops[active]
+            );
+        }
+
+        // Card visibility is PURE GEOMETRY and honest: a card counted Above/Below
+        // is genuinely off that edge; a Shown card genuinely overlaps the
+        // viewport — so "N above / N below" never hides an on-screen card nor
+        // claims an off-screen one. No active special case: the packer forces the
+        // active card into view, so geometry alone decides (see card_slot).
+        #[test]
+        fn card_visibility_is_honest(
+            top in -1500f32..1500.,
+            height in 10f32..300.,
+        ) {
+            let (vp_top, vp_bottom) = (44f32, 800f32);
+            match card_slot(top, height, vp_top, vp_bottom) {
+                CardSlot::Shown => prop_assert!(
+                    top + height > vp_top && top < vp_bottom,
+                    "a Shown card overlaps the viewport"
+                ),
+                CardSlot::Above => prop_assert!(top + height <= vp_top + CARD_LINE_H),
+                CardSlot::Below => prop_assert!(top >= vp_bottom - CARD_LINE_H),
+            }
+        }
+
+        // reveal_scroll lands the revealed anchor at the NEAR edge, not a page
+        // away (the "pill paginates instead of bringing one more into view" bug).
+        // A below-reveal puts the anchor near the BOTTOM; an above-reveal near the
+        // TOP — REVEAL_INSET from the edge, never ~a viewport away.
+        #[test]
+        fn reveal_scroll_lands_at_the_near_edge(
+            anchor_y in 0f32..5000.,
+            vp_h in 200f32..1200.,
+            max_scroll in 0f32..5000.,
+            below in any::<bool>(),
+        ) {
+            let s = reveal_scroll(anchor_y, vp_h, max_scroll, below);
+            prop_assert!(s >= -0.01 && s <= max_scroll + 0.01, "scroll within range");
+            let unclamped = if below {
+                anchor_y - vp_h + REVEAL_INSET
+            } else {
+                anchor_y - REVEAL_INSET
+            };
+            // When the ideal target isn't clamped, the anchor lands exactly
+            // REVEAL_INSET from the near edge (bottom for below, top for above).
+            if unclamped >= 0. && unclamped <= max_scroll {
+                let anchor_vp = anchor_y - s; // anchor's y within the viewport
+                let want = if below { vp_h - REVEAL_INSET } else { REVEAL_INSET };
+                prop_assert!(
+                    (anchor_vp - want).abs() < 0.01,
+                    "revealed anchor at {anchor_vp}, wanted near-edge {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn note_at_char_accepts_the_trailing_boundary() {
+        // Anchor [2,6): inside hits, and so does the trailing boundary c==6 (a
+        // click on the right half of the last glyph snaps there) — the bug was
+        // the strict `< end` test missing it. Outside still misses.
+        let one = [(7u64, 2usize, 6usize)];
+        assert_eq!(note_at_char(&one, 2), Some(7)); // leading boundary
+        assert_eq!(note_at_char(&one, 4), Some(7)); // interior
+        assert_eq!(note_at_char(&one, 6), Some(7)); // trailing boundary (was a dead zone)
+        assert_eq!(note_at_char(&one, 7), None); // past the end
+        assert_eq!(note_at_char(&one, 1), None); // before the start
+        // Back-to-back anchors [2,6)[6,9): the shared boundary belongs to the
+        // SECOND (it contains 6), so the trailing fallback never double-claims.
+        let pair = [(7u64, 2, 6), (8u64, 6, 9)];
+        assert_eq!(note_at_char(&pair, 6), Some(8));
+        assert_eq!(note_at_char(&pair, 9), Some(8)); // the second's own trailing boundary
+        assert_eq!(note_at_char(&[], 0), None);
+    }
+
+    #[test]
+    fn oldest_beyond_cap_recedes_the_oldest_passes() {
+        use std::collections::HashSet;
+        // At or under the budget: everything renders full.
+        assert!(oldest_beyond_cap(&[(1, 1), (2, 1), (3, 2)], 5).is_empty());
+        assert!(oldest_beyond_cap(&[(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)], 5).is_empty());
+        // Over it: the newest passes stay full (highest pass_id), oldest recede.
+        // pass 3 = ids 5,6,7; pass 2 = 3,4; pass 1 = 1,2. cap 4 keeps {7,6,5,4}.
+        let receded =
+            oldest_beyond_cap(&[(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 3)], 4);
+        assert_eq!(receded, HashSet::from([1u64, 2, 3]));
+    }
+
+    #[test]
+    fn staggered_ease_honours_delay_and_settles() {
+        // Still through the whole delay window; settled at the end.
+        assert_eq!(staggered_ease(0., 0.3), 0.);
+        assert_eq!(staggered_ease(0.3, 0.3), 0.);
+        assert_eq!(staggered_ease(1., 0.3), 1.);
+        assert_eq!(staggered_ease(1.2, 0.3), 1.);
+        // No delay = the plain in-out curve, symmetric around the midpoint.
+        assert!((staggered_ease(0.5, 0.) - 0.5).abs() < 1e-6);
+        // Monotone non-decreasing across the run (no overshoot, no rebound —
+        // an overshooting margin card would "bounce", pure distraction).
+        let mut prev = 0.;
+        for i in 0..=100 {
+            let e = staggered_ease(i as f32 / 100., 0.25);
+            assert!(e >= prev - 1e-6, "dip at t={i}");
+            assert!((0. ..=1.).contains(&e));
+            prev = e;
+        }
+    }
+
+    #[test]
+    fn plan_lane_moves_tweens_only_discrete_repacks() {
+        use std::collections::HashMap;
+        let prev: HashMap<u64, f32> = [(1, 100.), (2, 300.)].into();
+        // A moved card reports (id, from, to); a settled one stays quiet.
+        let moves = plan_lane_moves(&prev, &[(1, 100.), (2, 240.)], false);
+        assert_eq!(moves, vec![(2, 300., 240.)]);
+        // Snap frames (scroll / composer / typing burst) never animate.
+        assert!(plan_lane_moves(&prev, &[(1, 100.), (2, 240.)], true).is_empty());
+        // A NEW id is an entrance (fade), never a move; a departed id drops.
+        assert!(plan_lane_moves(&prev, &[(3, 50.)], false).is_empty());
+        // Sub-pixel jitter is not a move.
+        assert!(plan_lane_moves(&prev, &[(1, 100.4), (2, 300.)], false).is_empty());
+    }
+
+    #[test]
+    fn door_filter_note_surfaces() {
+        // Writer notes always surface, in either mode.
+        assert!(note_surfaces(NoteKind::Note, "", true, true));
+        assert!(note_surfaces(NoteKind::Note, "", false, false));
+        // Diagnoses are hidden while drafting.
+        assert!(!note_surfaces(NoteKind::Diagnosis, "developmental", true, false));
+        // Reviewing: developmental shows; copy is held back iff a developmental
+        // one is still open (the altitude order), else it shows.
+        assert!(note_surfaces(NoteKind::Diagnosis, "developmental", false, true));
+        assert!(!note_surfaces(NoteKind::Diagnosis, "copy", false, true));
+        assert!(note_surfaces(NoteKind::Diagnosis, "copy", false, false));
+    }
 
     #[test]
     fn thousands_separator() {
@@ -10487,7 +12183,6 @@ mod tests {
             name: String::new(),
             created_unix: 0,
             manual,
-            frontiers: Vec::new(),
             text: String::new(),
             spans: SpanSet::default(),
             blocks: BlockMap::default(),
@@ -10571,24 +12266,61 @@ mod tests {
         assert_eq!(next_word_boundary(&doc2, 4), len); // blank run -> doc end
     }
 
+    // --- Margin-card interaction FSM (CardFocus) -------------------------
+    // The class of bugs these guard: a committed note rendering blank, a
+    // composer lingering on a deselected card, a draft leaking onto the wrong
+    // card. They were all "two booleans disagreed." The enum + these decisions
+    // make "disagree" unrepresentable; the tests pin the decisions.
+
     #[test]
-    fn drop_marked_tail_never_splits_a_char() {
-        // The exact IME panic sequence: a committed multibyte char with a now-
-        // stale marked length left over after a manual backspace.
-        let mut s = String::from("ね"); // 3 bytes
-        drop_marked_tail(&mut s, 2); // pre-fix: truncate(1) panics inside 'ね'
-        assert!(s.is_char_boundary(s.len()));
-        assert_eq!(s, "");
+    fn card_body_renders_exactly_one_thing() {
+        // The render decision is total and exclusive: composing → composer,
+        // otherwise → text. There is no input that yields both or neither (that
+        // was the "input AND label, same contents" bug, and the blank-card bug).
+        assert!(matches!(card_body(true), CardBody::Composer));
+        assert!(matches!(card_body(false), CardBody::Text));
+    }
 
-        // A marked length longer than content saturates to empty, never panics.
-        let mut t = String::from("é");
-        drop_marked_tail(&mut t, 9);
-        assert_eq!(t, "");
+    #[test]
+    fn idle_focus_addresses_no_card() {
+        let f = CardFocus::Idle;
+        assert_eq!(f.active_id(), None);
+        assert_eq!(f.composing_id(), None);
+        assert!(f.input().is_none());
+    }
 
-        // Common path preserved: committed prefix + a whole preedit; dropping
-        // exactly the preedit length leaves the prefix, the snap is a no-op.
-        let mut u = String::from("Helloねこ");
-        drop_marked_tail(&mut u, "ねこ".len());
-        assert_eq!(u, "Hello");
+    #[test]
+    fn selected_focus_is_active_but_never_composing() {
+        // A selected card (an AI diagnosis, or a note whose composer resolved)
+        // is highlighted but has no open composer — so the body label shows
+        // (card_body(false) == Text), which is exactly the fix for the
+        // committed-note-renders-blank bug.
+        let f = CardFocus::Selected(7);
+        assert_eq!(f.active_id(), Some(7));
+        assert_eq!(f.composing_id(), None);
+        assert!(f.input().is_none());
+        assert!(matches!(card_body(f.composing_id() == Some(7)), CardBody::Text));
+    }
+
+    #[test]
+    fn composing_implies_active_on_the_same_card() {
+        // The corruption-class invariant, made structural: whatever is being
+        // composed is also what's active, and the id is single-valued. The
+        // composer and the note id share one variant, so the draft mirror and
+        // the composer render (both read `composing_id`) can never address a
+        // card other than `active_id`. Asserted here over the id projection;
+        // the `input` field is non-None by the variant's shape (it cannot be
+        // constructed without an `Entity<TextField>`).
+        for f in [CardFocus::Idle, CardFocus::Selected(3), CardFocus::Selected(9)] {
+            if let Some(cid) = f.composing_id() {
+                assert_eq!(f.active_id(), Some(cid), "composing must be active");
+            }
+        }
+        // The only state carrying a composer is `Composing`, and its `id` and
+        // `input` are one variant's two fields — there is no way to hold an
+        // input without the id it edits, nor to point them at different notes.
+        // That is the structural guarantee that retired the draft-leak bug; it
+        // needs no test because it cannot be constructed wrong (the entity-
+        // bearing variant would take gpui `test-support`, deliberately not on).
     }
 }
