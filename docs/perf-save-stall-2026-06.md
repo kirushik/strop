@@ -77,3 +77,44 @@ load-path testing, so they're deferred to a decision, not done unattended.
   one is still reclaimed via the slow path) — slot into Phase 6.
 - Cold-open ~1.3 s is the Loro import of the full oplog; option 1/3 would shrink
   it too. Lower priority than the bloat itself.
+
+## Resolution (2026-07-03) — all of it landed
+
+The deferred decision resolved itself when the same disease resurfaced as a
+NEW hang: toggling the history sidebar froze the app on the reporter's file
+(now 4.77 MB / 5.7 KB of prose). `enter_history` ran `state_at` per
+checkpoint on the main thread — 71 s measured for 13 checkpoints. Profiling
+overturned one June assumption: the dominant cost was never the checkout
+itself but **`to_delta()` reading the marks back** (4.68 s on the *current*
+state) — months of unmark/remark cycles had left thousands of dead style
+anchors in the text state, taxing open, every checkout, and checkpoint
+sealing alike.
+
+Shipped, in order (branch `better_card_placement`):
+
+1. **`025a1e0` — checkpoints materialize their state at creation**
+   (`Checkpoint::state`); rewind/preview/restore/asset-GC never time-travel.
+   Legacy checkpoints backfill once, in the background, persisted (+14 KB).
+   History toggle: 71 s → 190 µs.
+2. **`d7609ee` — save guards + undo trim.** `SavedHashes` fingerprints per
+   channel (annotations/blocks/history/spans): unchanged saves append ZERO
+   bytes (test-asserted). Persisted undo tail 200 → 50 entries (the 1.58 MB
+   JSON was ~all of the live bloat).
+3. **`1cef5fd` — option 1 AND option 3, made safe.** Spans persist as JSON
+   (marks = read-only legacy; `rebuild_marks` deleted — no more churn, no
+   more `to_delta` after the first open). And `Store::open` compacts
+   opportunistically — the June "DESTRUCTIVE" caveat died with materialized
+   checkpoints, since nothing readable needs the oplog: shallow snapshot,
+   round-trip-verified, original kept once as `*.pre-compact.bak`, atomic
+   swap, every failure path non-destructive.
+
+Measured on the real file: **history 71 s → 190 µs; file 4.77 MB → 82 KB;
+cold open 5.8 s → 4.9 ms.** A legacy file heals in two launches: first open
+reads marks once and backfills in the background (~9 s, release), first save
+writes the spans JSON; the next open compacts.
+
+Cost honestly stated: single-user-first. CRDT mark merging across peers is
+given up (spans are latest-wins JSON, like blocks/annotations already were),
+and oplog history older than the compaction horizon is no longer
+time-travellable — checkpoints carry their own states instead. Both match
+the product's local-first, single-writer reality; revisit at sync time.
