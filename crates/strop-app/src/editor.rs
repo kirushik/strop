@@ -90,6 +90,57 @@ const CARD_APPEAR: Duration = Duration::from_millis(250);
 /// commits instantly; only the light lingers). Short and ease-in — leaving
 /// asks less attention than arriving (attention-motion.md §3, "exit" token).
 const CARD_RESOLVE: Duration = Duration::from_millis(150);
+/// A surviving card's slide when a re-pack moves it (a card resolves in a
+/// crowded lane, a pass lands, a selection expands): the "standard" in-place
+/// token — 200ms, cubic in-out (attention-motion.md §3). This is the ONE place
+/// motion buys object constancy: an instant jump makes the eye re-find every
+/// card; a short slide keeps each one the same object (Heer & Robertson).
+const CARD_MOVE: Duration = Duration::from_millis(200);
+/// Stagger between cards that start a shared re-pack move — staggering lowers
+/// tracking error vs. everything moving at once (attention-motion.md §3).
+/// Capped (`MOVE_STAGGER_CAP`) so a long train never turns into a slow wave.
+const MOVE_STAGGER: Duration = Duration::from_millis(40);
+const MOVE_STAGGER_CAP: u32 = 4;
+
+/// One card's re-pack move in flight (see `Editor::moving` and
+/// `update_lane_motion`). Offsets are CONTENT-SPACE (viewport top + scroll):
+/// the render applies `delta` to the CURRENT frame's target, so a scroll
+/// mid-tween moves the card 1:1 with the text — the slide never fights the
+/// writer's own navigation.
+#[derive(Clone)]
+struct CardMove {
+    /// Where the card came from, relative to where it is going: at t=0 the
+    /// card renders at `to + delta`, at t=1 at `to`.
+    delta: f32,
+    /// The content-space top this move heads to. A further re-pack mid-flight
+    /// compares against this and re-targets from the currently-displayed spot
+    /// (never a snap back to the start).
+    to: f32,
+    start: Instant,
+    /// This card's stagger share within its re-pack round.
+    delay: Duration,
+    /// Bumped on re-target: keys the element animation, so a new target gets
+    /// a fresh animation run instead of resuming the old one's clock.
+    generation: u32,
+    /// reduce_motion only: a snapshot of the card at its OLD slot, cross-faded
+    /// out while the live card fades in at the new one — travel becomes a fade
+    /// of the same duration, never a teleport ("reduced motion is not no
+    /// motion"; attention-motion.md §4). None in the sliding mode.
+    ghost: Option<MarginCard>,
+}
+
+impl CardMove {
+    fn total(&self) -> Duration {
+        self.delay + CARD_MOVE
+    }
+
+    /// Progress through the ease at `elapsed`, delay honoured (0 before it).
+    fn eased(&self, elapsed: Duration) -> f32 {
+        let total = self.total().as_secs_f32();
+        let d = self.delay.as_secs_f32() / total;
+        staggered_ease((elapsed.as_secs_f32() / total).min(1.), d)
+    }
+}
 
 /// A completed pass parked until the typing lull (see `Editor::deferred_pass`).
 /// Carries the RAW diagnoses (quotes not yet anchored) and the generation that
@@ -690,6 +741,29 @@ pub struct Editor {
     /// is viewport-frozen). The note itself resolved instantly; this is
     /// presentation only, so nothing here can leak back into the model.
     departing: Vec<(MarginCard, Instant)>,
+    /// Re-pack moves in flight, card id → its slide (`CardMove`). Fed by
+    /// `update_lane_motion` (the render pre-pass that diffs the lane between
+    /// frames); read by `render_margin`, which offsets each moving card from
+    /// its CURRENT target. Presentation only — the packer's output is always
+    /// the truth; this is just how the eye is walked from the old truth to
+    /// the new one. Cleared wholesale on any snap frame (scroll, composer
+    /// growth, typing burst): motion yields to the writer's own movement.
+    moving: std::collections::HashMap<u64, CardMove>,
+    /// Each visible card's last settled CONTENT-SPACE top (viewport top +
+    /// scroll) — what `update_lane_motion` diffs the current pack against to
+    /// tell a discrete re-pack (tween it) from scroll (already 1:1).
+    lane_tops: std::collections::HashMap<u64, f32>,
+    /// The scroll offset `lane_tops` was recorded at; a change marks the
+    /// frame as a scroll frame (snap, never tween).
+    lane_scroll: f32,
+    /// The viewport size ditto: a resize drag reflows the prose and re-clamps
+    /// the lane continuously — snap through it, never chase it with tweens.
+    lane_viewport: (f32, f32),
+    /// Session-monotonic count of re-pack slides ever started — the rig
+    /// asserts "a resolve moved the survivors" against this instead of racing
+    /// the 200ms window with a live `moving` snapshot (a cold first launch
+    /// made that dump miss the flight and flake).
+    moves_started: u64,
     /// The door (DESIGN §4.4; core-loop research: separate GENERATE from
     /// EVALUATE). `true` = drafting, door closed: the editorial margin goes
     /// quiet so a writing burst is never pulled into evaluation by its own
@@ -1029,6 +1103,11 @@ impl Editor {
             last_text_edit: None,
             appearing: std::collections::HashSet::new(),
             departing: Vec::new(),
+            moving: std::collections::HashMap::new(),
+            lane_tops: std::collections::HashMap::new(),
+            lane_scroll: 0.,
+            lane_viewport: (0., 0.),
+            moves_started: 0,
             // Door closed by default: every document opens to write, not to
             // be judged (protects re-entry — the warm-up re-read that slides
             // into line-editing). The tutorial opens it (main.rs); so does a
@@ -5876,6 +5955,14 @@ impl Editor {
             "appearing": self.appearing.len(),
             // Exit-fade ghosts of just-resolved cards (same lifecycle checks).
             "departing": self.departing.len(),
+            // Re-pack slides in flight — the rig asserts a resolve in a
+            // crowded lane MOVES the survivors (then settles), and that a
+            // scroll clears all motion instantly. `moves_started` is the
+            // session-monotonic total, immune to the dump racing the 200ms
+            // flight on a cold launch.
+            "moving": self.moving.len(),
+            "moves_started": self.moves_started,
+            "reduce_motion": self.config.reduce_motion,
         })
         .to_string()
     }
@@ -5933,6 +6020,19 @@ impl Editor {
     pub fn debug_resolve_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let first = self.doc.notes().open().next().map(|n| n.id);
         if let Some(id) = first {
+            self.set_note_status(id, NoteStatus::Done, window, cx);
+        }
+    }
+
+    /// Rig hook (`resolve:last`): resolve the NEWEST open note. In a crowded
+    /// seeded lane that is the bottom full-size card — resolving it frees a
+    /// budget slot, a receded card expands, and the run below shifts: the
+    /// deterministic re-pack the motion checks need. (resolve:first hits the
+    /// oldest card, already receded to a one-liner at its own anchor — its
+    /// departure legitimately moves nothing.)
+    pub fn debug_resolve_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let last = self.doc.notes().open().last().map(|n| n.id);
+        if let Some(id) = last {
             self.set_note_status(id, NoteStatus::Done, window, cx);
         }
     }
@@ -9583,6 +9683,123 @@ fn appear_fade<E: Styled + IntoElement + 'static>(el: E, id: u64, is_new: bool) 
     .into_any_element()
 }
 
+/// One card's share of a staggered re-pack round: flat 0 through its delay
+/// (`delay_frac` of the whole run), then a cubic ease-in-out over the rest —
+/// the "standard" in-place token. Pure, so the timing contract (still during
+/// the delay, settled at 1, monotone between) is a unit test.
+fn staggered_ease(t: f32, delay_frac: f32) -> f32 {
+    if t <= delay_frac {
+        return 0.;
+    }
+    if t >= 1. {
+        return 1.;
+    }
+    let t = (t - delay_frac) / (1. - delay_frac);
+    if t < 0.5 {
+        4. * t * t * t
+    } else {
+        1. - (-2. * t + 2.).powi(3) / 2.
+    }
+}
+
+/// Diff the lane between two frames: which cards MOVED — present in both with
+/// a changed content-space top. `snap` (a scroll frame, a live composer, a
+/// typing burst — continuous causes, not discrete re-packs) reports nothing:
+/// those frames track 1:1 and must never animate. Newly-appeared ids are not
+/// moves (they get the entrance fade); departed ids just drop. Pure, so the
+/// tween-vs-snap policy is a unit test, not a feel regression.
+fn plan_lane_moves(
+    prev: &std::collections::HashMap<u64, f32>,
+    now: &[(u64, f32)],
+    snap: bool,
+) -> Vec<(u64, f32, f32)> {
+    if snap {
+        return Vec::new();
+    }
+    now.iter()
+        .filter_map(|&(id, top)| {
+            let from = *prev.get(&id)?;
+            ((from - top).abs() > 0.5).then_some((id, from, top))
+        })
+        .collect()
+}
+
+/// Wrap a mid-move card: the sliding mode animates its `top` from the old
+/// slot to the CURRENT target (so scroll under a live tween stays 1:1); the
+/// reduce_motion mode keeps the card AT the target and fades it in over the
+/// same duration instead (its old-slot ghost fades out in render_margin) —
+/// travel becomes a cross-fade, never a teleport. The animation is keyed by
+/// (id, generation) so a mid-flight re-target restarts the run; note ids stay
+/// far below 2^48, so the packed key can't collide.
+fn move_slide<E: Styled + IntoElement + 'static>(
+    el: E,
+    id: u64,
+    mv: &CardMove,
+    target_top: f32,
+    reduce_motion: bool,
+) -> gpui::AnyElement {
+    let key = ("card-move", (id as usize) | ((mv.generation as usize) << 48));
+    let total = mv.total();
+    let delay_frac = mv.delay.as_secs_f32() / total.as_secs_f32();
+    let delta = mv.delta;
+    let anim = Animation::new(total).with_easing(move |t| staggered_ease(t, delay_frac));
+    if reduce_motion {
+        el.with_animation(key, anim, |el, t| el.opacity(t)).into_any_element()
+    } else {
+        el.with_animation(key, anim, move |el, t| {
+            el.top(px((target_top + delta * (1. - t)).max(4.)))
+        })
+        .into_any_element()
+    }
+}
+
+/// A card's non-interactive ghost (no id, no listeners — a click lands on
+/// whatever is really there): the shared body for the exit fade (departing)
+/// and the reduce_motion cross-fade. Mirrors the live card's look — the
+/// receded one-liner included — so the fading light reads as the same object,
+/// and a collapsed card's ghost never sprawls over its neighbours.
+fn ghost_card(card: &MarginCard) -> gpui::Div {
+    let is_diagnosis = card.kind == NoteKind::Diagnosis;
+    let base = div()
+        .absolute()
+        .top(px(card.top.max(4.)))
+        .left(px(8.))
+        .w(px(MARGIN_WIDTH - 8.))
+        .overflow_hidden()
+        .rounded(px(if is_diagnosis { 3. } else { 9. }))
+        .bg(rgb(if card.unverified {
+            STALE_BG
+        } else if is_diagnosis {
+            DIAGNOSIS_CARD_BG
+        } else {
+            NOTE_CARD_BG
+        }))
+        .border_1()
+        .border_color(rgb(RULE_COLOR))
+        .font_family("PT Serif")
+        .text_color(rgb(MUTED_COLOR));
+    if card.collapsed {
+        return base
+            .h(px(COLLAPSED_CARD_H))
+            .px(px(8.))
+            .py(px(3.))
+            .text_size(px(11.))
+            .line_height(px(COLLAPSED_CARD_H - 8.))
+            .child(div().truncate().child(if card.title.is_empty() {
+                card.level.clone()
+            } else {
+                card.title.clone()
+            }));
+    }
+    base.p(px(8.))
+        .text_size(px(13.))
+        .line_height(px(CARD_LINE_H))
+        .when(is_diagnosis && !card.title.is_empty(), |d| {
+            d.child(div().font_weight(FontWeight::BOLD).child(card.title.clone()))
+        })
+        .child(div().child(card.body.clone()))
+}
+
 /// Which open annotation a click at char index `c` activates, given each open
 /// note's `(id, start, end)` (anchor covers `[start, end)`). A click snaps to
 /// the nearest caret boundary, so a click on the trailing half of the last glyph
@@ -9889,6 +10106,118 @@ impl Editor {
             cards: visible,
             above,
             below,
+        }
+    }
+
+    /// Render pre-pass (once per frame, before `render_margin`): diff the
+    /// packed lane against the previous frame and start, re-target, or expire
+    /// the re-pack slides (`moving`). One rule decides tween vs. snap: a
+    /// DISCRETE re-pack in a still lane slides (a card resolved, a pass
+    /// landed, a selection expanded — object constancy pays); any CONTINUOUS
+    /// cause — scroll, a live composer growing, a typing burst reflowing
+    /// anchors — tracks 1:1 and clears all motion (never animate against the
+    /// writer's own movement, never mid-burst; attention-motion.md §2-3).
+    fn update_lane_motion(&mut self, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let scroll = f32::from(frame.scroll_top);
+        let scrolled = (scroll - self.lane_scroll).abs() > 0.5;
+        self.lane_scroll = scroll;
+        let viewport = (
+            f32::from(frame.bounds.size.width),
+            f32::from(frame.bounds.size.height),
+        );
+        let resized = (viewport.0 - self.lane_viewport.0).abs() > 0.5
+            || (viewport.1 - self.lane_viewport.1).abs() > 0.5;
+        self.lane_viewport = viewport;
+        let layout = self.margin_cards(true);
+        // Content-space tops (scroll added back), so a pure scroll diffs to
+        // zero and only real re-packs register.
+        let now_tops: Vec<(u64, f32)> =
+            layout.cards.iter().map(|c| (c.id, c.top + scroll)).collect();
+        // Finished slides settle; a card that left the lane drops its motion
+        // state (so a later return can never replay a stale move).
+        let present: std::collections::HashSet<u64> =
+            now_tops.iter().map(|&(id, _)| id).collect();
+        self.moving
+            .retain(|id, mv| present.contains(id) && mv.start.elapsed() < mv.total());
+        self.lane_tops.retain(|id, _| present.contains(id));
+        let snap =
+            scrolled || resized || self.focus.composing_id().is_some() || self.typing_burst_live();
+        if snap {
+            self.moving.clear();
+            self.lane_tops = now_tops.into_iter().collect();
+            return;
+        }
+        let mut moves = plan_lane_moves(&self.lane_tops, &now_tops, false);
+        // Stagger top-down by destination, capped so a long train stays one
+        // brisk gesture, not a slow wave.
+        moves.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let reduce = self.config.reduce_motion;
+        let mut started = false;
+        for (i, &(id, from, to)) in moves.iter().enumerate() {
+            started = true;
+            if let Some(mv) = self.moving.get_mut(&id) {
+                // Mid-flight and the pack moved again: head for the new
+                // target from the currently-DISPLAYED spot (no snap-back),
+                // on a fresh animation run. The old-slot ghost (reduce
+                // mode) is dropped — a churning lane earns less light.
+                let displayed = mv.to + mv.delta * (1. - mv.eased(mv.start.elapsed()));
+                mv.delta = displayed - to;
+                mv.to = to;
+                mv.start = Instant::now();
+                mv.delay = Duration::ZERO;
+                mv.generation += 1;
+                mv.ghost = None;
+                continue;
+            }
+            // reduce_motion: travel becomes a cross-fade — snapshot the card
+            // at its old slot (content-space top; render re-anchors it to the
+            // live scroll) to fade out under the live card fading in.
+            let ghost = reduce
+                .then(|| {
+                    layout.cards.iter().find(|c| c.id == id).map(|c| {
+                        let mut g = c.clone();
+                        g.top = from;
+                        g
+                    })
+                })
+                .flatten();
+            self.moves_started += 1;
+            self.moving.insert(
+                id,
+                CardMove {
+                    delta: from - to,
+                    to,
+                    start: Instant::now(),
+                    delay: MOVE_STAGGER * (i as u32).min(MOVE_STAGGER_CAP),
+                    generation: 0,
+                    ghost,
+                },
+            );
+        }
+        for (id, top) in now_tops {
+            self.lane_tops.insert(id, top);
+        }
+        // One nudge after the longest slide lands: with_animation stops
+        // requesting frames at t=1, so without this a finished entry would
+        // linger until the next natural frame (and could replay if its card
+        // re-mounts after a door toggle).
+        if started {
+            let wait = self.moving.values().map(CardMove::total).max().unwrap_or(CARD_MOVE)
+                + Duration::from_millis(60);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |editor: &mut Editor, cx| {
+                    editor
+                        .moving
+                        .retain(|_, mv| mv.start.elapsed() < mv.total());
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
         }
     }
 
@@ -10400,40 +10729,45 @@ impl Editor {
             .departing
             .iter()
             .map(|(card, _)| {
-                let is_diagnosis = card.kind == NoteKind::Diagnosis;
-                div()
-                    .absolute()
-                    .top(px(card.top.max(4.)))
-                    .left(px(8.))
-                    .w(px(MARGIN_WIDTH - 8.))
-                    .p(px(8.))
-                    .overflow_hidden()
-                    .rounded(px(if is_diagnosis { 3. } else { 9. }))
-                    .bg(rgb(if card.unverified {
-                        STALE_BG
-                    } else if is_diagnosis {
-                        DIAGNOSIS_CARD_BG
-                    } else {
-                        NOTE_CARD_BG
-                    }))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .font_family("PT Serif")
-                    .text_size(px(13.))
-                    .line_height(px(CARD_LINE_H))
-                    .text_color(rgb(MUTED_COLOR))
-                    .when(is_diagnosis && !card.title.is_empty(), |d| {
-                        d.child(
-                            div().font_weight(FontWeight::BOLD).child(card.title.clone()),
-                        )
-                    })
-                    .child(div().child(card.body.clone()))
+                ghost_card(card)
                     .with_animation(
                         ("card-depart", card.id as usize),
                         Animation::new(CARD_RESOLVE).with_easing(|t| t * t * t),
                         |el, t| el.opacity(1. - t),
                     )
                     .into_any_element()
+            })
+            .collect();
+        // reduce_motion cross-fades: a moving card's old-slot snapshot fades
+        // out under the live card fading in at its new slot — the same "the
+        // card went from here to there" information as the slide, with no
+        // travel. Snapshots carry CONTENT-SPACE tops; re-anchor to this
+        // frame's scroll so even the fading light tracks the text 1:1.
+        let scroll_now = self
+            .last_frame
+            .as_ref()
+            .map(|f| f32::from(f.scroll_top))
+            .unwrap_or(0.);
+        let crossfades: Vec<gpui::AnyElement> = self
+            .moving
+            .iter()
+            .filter_map(|(&id, mv)| {
+                let snapshot = mv.ghost.as_ref()?;
+                let mut old = snapshot.clone();
+                old.top = snapshot.top - scroll_now;
+                let key =
+                    ("card-move-out", (id as usize) | ((mv.generation as usize) << 48));
+                let delay_frac = mv.delay.as_secs_f32() / mv.total().as_secs_f32();
+                Some(
+                    ghost_card(&old)
+                        .with_animation(
+                            key,
+                            Animation::new(mv.total())
+                                .with_easing(move |t| staggered_ease(t, delay_frac)),
+                            |el, t| el.opacity(1. - t),
+                        )
+                        .into_any_element(),
+                )
             })
             .collect();
         let (above_n, below_n) = (above.len(), below.len());
@@ -10495,6 +10829,7 @@ impl Editor {
                     }),
                 )
         });
+        let reduce_motion = self.config.reduce_motion;
         let lane_left = col_right + MARGIN_GAP;
         Some(
             div()
@@ -10508,6 +10843,7 @@ impl Editor {
                 // lane, the whitespace beyond it — scrolls the one document. No
                 // per-element wheel handler here (it would double-fire via bubble).
                 .children(ghosts)
+                .children(crossfades)
                 .children(cards.into_iter().map(|card| {
                     let MarginCard {
                         id,
@@ -10562,11 +10898,26 @@ impl Editor {
                                     }
                                 }),
                             )
-                            .child(div().truncate().child(if title.is_empty() {
-                                level.clone()
-                            } else {
-                                title.clone()
+                            .child(div().truncate().child({
+                                let line = if title.is_empty() {
+                                    level.clone()
+                                } else {
+                                    title.clone()
+                                };
+                                // The detached marker survives receding — an
+                                // orphaned card at a best-effort anchor must
+                                // never read as confidently anchored, however
+                                // small it renders (the count-grammar rule:
+                                // detached outranks every other treatment).
+                                if orphaned {
+                                    format!("{line} · detached")
+                                } else {
+                                    line
+                                }
                             }));
+                        if let Some(mv) = self.moving.get(&id) {
+                            return move_slide(compact, id, mv, top, reduce_motion);
+                        }
                         return appear_fade(compact, id, is_new);
                     }
                     // The composer renders only on the note it is actually
@@ -10718,6 +11069,12 @@ impl Editor {
                             }
                             CardBody::Text => div().child(body.clone()),
                         });
+                    // A mid-move card slides (or cross-fades) to its new slot;
+                    // entrance fades are for genuinely new cards only — the
+                    // two never overlap (a new card has no old slot to leave).
+                    if let Some(mv) = self.moving.get(&id) {
+                        return move_slide(card, id, mv, top, reduce_motion);
+                    }
                     appear_fade(card, id, is_new)
                 }))
                 .children(above_chip)
@@ -11041,6 +11398,9 @@ impl Render for Editor {
         // Measure-and-cache margin-card heights up front (the window's text
         // system is in hand here) so margin_cards places on real extents.
         self.refresh_card_heights(window, cx);
+        // Then diff the packed lane against last frame: a discrete re-pack
+        // starts the card slides; scroll/composer/burst frames snap instead.
+        self.update_lane_motion(cx);
         // History mode pushes the document aside (DESIGN §2-history: push,
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
@@ -11664,6 +12024,41 @@ mod tests {
         let receded =
             oldest_beyond_cap(&[(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 3)], 4);
         assert_eq!(receded, HashSet::from([1u64, 2, 3]));
+    }
+
+    #[test]
+    fn staggered_ease_honours_delay_and_settles() {
+        // Still through the whole delay window; settled at the end.
+        assert_eq!(staggered_ease(0., 0.3), 0.);
+        assert_eq!(staggered_ease(0.3, 0.3), 0.);
+        assert_eq!(staggered_ease(1., 0.3), 1.);
+        assert_eq!(staggered_ease(1.2, 0.3), 1.);
+        // No delay = the plain in-out curve, symmetric around the midpoint.
+        assert!((staggered_ease(0.5, 0.) - 0.5).abs() < 1e-6);
+        // Monotone non-decreasing across the run (no overshoot, no rebound —
+        // an overshooting margin card would "bounce", pure distraction).
+        let mut prev = 0.;
+        for i in 0..=100 {
+            let e = staggered_ease(i as f32 / 100., 0.25);
+            assert!(e >= prev - 1e-6, "dip at t={i}");
+            assert!((0. ..=1.).contains(&e));
+            prev = e;
+        }
+    }
+
+    #[test]
+    fn plan_lane_moves_tweens_only_discrete_repacks() {
+        use std::collections::HashMap;
+        let prev: HashMap<u64, f32> = [(1, 100.), (2, 300.)].into();
+        // A moved card reports (id, from, to); a settled one stays quiet.
+        let moves = plan_lane_moves(&prev, &[(1, 100.), (2, 240.)], false);
+        assert_eq!(moves, vec![(2, 300., 240.)]);
+        // Snap frames (scroll / composer / typing burst) never animate.
+        assert!(plan_lane_moves(&prev, &[(1, 100.), (2, 240.)], true).is_empty());
+        // A NEW id is an entrance (fade), never a move; a departed id drops.
+        assert!(plan_lane_moves(&prev, &[(3, 50.)], false).is_empty());
+        // Sub-pixel jitter is not a move.
+        assert!(plan_lane_moves(&prev, &[(1, 100.4), (2, 300.)], false).is_empty());
     }
 
     #[test]

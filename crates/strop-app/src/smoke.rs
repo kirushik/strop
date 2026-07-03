@@ -138,16 +138,37 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:deliver: demo pass sent through the arrival gate");
                 continue;
             }
-            // `resolve:first` marks the first open note Done through the real
-            // set_note_status path (instant commit + exit-fade ghost).
-            if key == "resolve:first" {
+            // `reduce:motion` flips the config's motion-sensitivity switch
+            // for this run, so the rig can drive the cross-fade code path.
+            if key == "reduce:motion" {
                 window
-                    .update(cx, |editor, window, cx| editor.debug_resolve_first(window, cx))
+                    .update(cx, |editor, _, cx| {
+                        editor.config.reduce_motion = true;
+                        cx.notify();
+                    })
+                    .ok();
+                eprintln!("SMOKE reduce:motion: cross-fade mode on");
+                continue;
+            }
+            // `resolve:first` / `resolve:last` mark the oldest / newest open
+            // note Done through the real set_note_status path (instant commit
+            // + exit-fade ghost). `last` hits a full-size card in the seeded
+            // crowded lane — the deterministic re-pack for the motion checks.
+            if key == "resolve:first" || key == "resolve:last" {
+                let first = key == "resolve:first";
+                window
+                    .update(cx, |editor, window, cx| {
+                        if first {
+                            editor.debug_resolve_first(window, cx);
+                        } else {
+                            editor.debug_resolve_last(window, cx);
+                        }
+                    })
                     .ok();
                 cx.background_executor()
                     .timer(Duration::from_millis(30))
                     .await;
-                eprintln!("SMOKE resolve:first: first open note resolved");
+                eprintln!("SMOKE {key}: open note resolved");
                 continue;
             }
             // `wait:MS` — idle the script (the reveal clock's lull, status

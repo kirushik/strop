@@ -17,6 +17,12 @@ pub struct Config {
     pub language: Language,
     /// Body text size in px (line height scales at 1.4, rhythm-rounded).
     pub font_size: Option<f32>,
+    /// Motion-sensitivity accommodation: margin-card travel becomes an
+    /// opacity cross-fade of the same duration (never an instant teleport —
+    /// "reduced motion is not no motion"). The entrance/exit fades are
+    /// already opacity-only and stay. GPUI exposes no OS reduce-motion
+    /// query, so this is the writer's own switch.
+    pub reduce_motion: bool,
     pub ai: AiConfig,
     pub voice: VoiceConfig,
 }
@@ -68,6 +74,9 @@ impl AiConfig {
 /// touched again (comments survive because Strop only ever reads it).
 const TEMPLATE: &str = r#"# Strop configuration. Edit and save — Strop re-reads this file before
 # every AI pass, so no restart is needed.
+
+# Replace margin-card movement with gentle cross-fades (motion sensitivity).
+# reduce_motion = true
 
 [ai]
 # Any OpenAI-compatible chat-completions endpoint works. Examples:

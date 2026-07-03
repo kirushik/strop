@@ -39,7 +39,13 @@ DOC3=$(mktemp --suffix=.md)
 head -4 "$DOC" > "$DOC3"
 DOC4=$(mktemp --suffix=.md)
 head -4 "$DOC" > "$DOC4"
-trap 'rm -f "$DOC" "$DOC.strop" "$DOC2" "$DOC2.strop" "$DOC3" "$DOC3.strop" "$DOC4" "$DOC4.strop"' EXIT
+# Five and six: the bucket-exclusivity and re-pack-motion checks (again their
+# own files — both need sidecars unpolluted by the earlier resolves).
+DOC5=$(mktemp --suffix=.md)
+cp "$DOC" "$DOC5"
+DOC6=$(mktemp --suffix=.md)
+cp "$DOC2" "$DOC6"
+trap 'rm -f "$DOC" "$DOC.strop" "$DOC2" "$DOC2.strop" "$DOC3" "$DOC3.strop" "$DOC4" "$DOC4.strop" "$DOC5" "$DOC5.strop" "$DOC6" "$DOC6.strop"' EXIT
 
 fail=0
 field() { echo "$1" | grep -oE "\"$2\":[^,}]*" | head -1 | cut -d: -f2; }
@@ -115,6 +121,55 @@ expect "the model resolves instantly"      3 "$(field "$D1" visible)"
 expect "its ghost lingers for the fade"    1 "$(field "$D1" departing)"
 expect "the ghost is gone after the fade"  0 "$(field "$D2" departing)"
 expect "the lane stands re-packed"         3 "$(field "$D2" visible)"
+
+echo "rig-check: off-screen cards land in exactly one honest bucket"
+# Scroll the anchors far off the top: culled cards count as 'above' — EXCEPT
+# the selected card, which is exempt from the cull (you're working it) and
+# stays in the lane. Every seeded card is thus in exactly one bucket
+# (visible=1 + above=3 = the 4 seeded), the count-grammar exclusivity rule.
+M=$(WRUN_TAIL=40 scripts/wrun.sh "$DOC5" "seed:diag wheel:800,600,-800 dump:ui" 2>/dev/null | grep -oE '"margin":\{[^}]*\}')
+[ -n "$M" ] || { echo "  FAIL no margin dump (rig didn't render?)"; exit 1; }
+expect "culled cards count as above"        3    "$(field "$M" above)"
+expect "only the exempt active card stays"  1    "$(field "$M" visible)"
+expect "and it is genuinely visible"        true "$(field "$M" active_visible)"
+
+echo "rig-check: a re-pack SLIDES the survivors; scroll snaps all motion"
+# Resolving the bottom full-size card frees a budget slot: a receded card
+# expands and the run below shifts — the survivors SLIDE to their new slots
+# (200ms, staggered) instead of teleporting, then settle. Two rig traps
+# encoded here: wait:1100 first, because a FRESH sidecar imports the .md at
+# open, which stamps a text edit — and a live burst rightly snaps, never
+# slides; and resolve:LAST, because the oldest card is already a one-liner
+# at its own anchor whose departure legitimately moves nothing.
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOC6" "seed:many wait:1100 resolve:last wait:60 dump:ui wait:600 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | head -1); D2=$(echo "$OUT" | tail -1)
+[ -n "$D1" ] || { echo "  FAIL no dump (rig didn't render?)"; exit 1; }
+# moves_started is session-monotonic: it proves the slide happened even when
+# a cold launch makes the dump miss the 200ms flight itself.
+MV=$(field "$D1" moves_started)
+if [ "${MV:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   survivors slide (moves_started=$MV)"; else
+  echo "  FAIL no re-pack motion (moves_started=$MV)"; fail=1; fi
+expect "the lane settles after the slide"   0 "$(field "$D2" moving)"
+# A scroll mid-slide clears ALL motion at once — the lane never animates
+# against the writer's own navigation.
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOC6" "seed:many wait:1100 resolve:last wheel:800,600,-200 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | head -1)
+[ -n "$D1" ] || { echo "  FAIL no dump (rig didn't render?)"; exit 1; }
+MV=$(field "$D1" moves_started)
+if [ "${MV:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the resolve did start motion (moves_started=$MV)"; else
+  echo "  FAIL no motion for the scroll to snap (moves_started=$MV)"; fail=1; fi
+expect "scroll snaps the motion instantly"  0 "$(field "$D1" moving)"
+
+echo "rig-check: reduce_motion turns the same re-pack into a cross-fade"
+# Same resolve, same clock — but the travel renders as an opacity cross-fade
+# (reduce:motion flips the config switch for the run).
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOC6" "reduce:motion seed:many wait:1100 resolve:last wait:60 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | head -1)
+[ -n "$D1" ] || { echo "  FAIL no dump (rig didn't render?)"; exit 1; }
+expect "cross-fade mode is on"              true "$(field "$D1" reduce_motion)"
+MV=$(field "$D1" moves_started)
+if [ "${MV:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the move still registers (moves_started=$MV)"; else
+  echo "  FAIL no cross-fade motion (moves_started=$MV)"; fail=1; fi
 
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

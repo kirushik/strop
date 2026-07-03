@@ -506,7 +506,7 @@ only if testers report not knowing a pass finished (tester guide §3 asks).
 **Deliberately not built:** a `reduce_motion` flag — both animations are
 already the reduced-motion-safe form (short, run-once, opacity only). The flag
 lands together with re-pack move-tweening (Phase 5), the first real
-translation there'd be anything to reduce.
+translation there'd be anything to reduce. *(It did — §14.)*
 
 **Harness (the §11 discipline, continued):** `deliver_pass` is the single
 arrival gate shared by the real LLM path and the `seed:deliver` rig hook, so
@@ -515,3 +515,64 @@ parks, nothing surfaces; lull → lands; wheel → lands immediately. New smoke
 tokens `wait:MS` and `resolve:first`; the dump gains `ai_deferred`,
 `appearing`, `departing`, and both fade lifecycles are asserted (marked at the
 event, cleared right after — nothing can ever re-fade).
+
+## 14. Phase 5 shipped: the slide, its off-switch, one honest bucket (2026-07-03)
+
+The last phase of this arc closes the motion story and the count grammar.
+
+**Re-pack slides (`CARD_MOVE`, 200ms standard, 40ms stagger capped at 4).**
+When a discrete re-pack moves surviving cards — a card resolves in a crowded
+lane, a landed pass displaces neighbours, a selection expands a receded card —
+each survivor now SLIDES from its old slot to its new one instead of
+teleporting. This is the one place motion buys object constancy (Heer &
+Robertson; attention-motion.md verdict 2): an instant jump makes the eye
+re-find every card, a short slide keeps each one the same object. Mechanics
+worth recording:
+- *One rule decides tween vs. snap* (`update_lane_motion`, a render pre-pass
+  that diffs the packed lane between frames): a discrete re-pack in a still
+  lane slides; any CONTINUOUS cause — scroll, the live composer growing, a
+  typing burst reflowing anchors — tracks 1:1 and clears all motion. The lane
+  never animates against the writer's own movement, and never mid-burst.
+- *Content-space deltas*: a move stores its offset in content space and the
+  render applies it to the CURRENT frame's target, so a scroll landing
+  mid-slide still moves every card exactly 1:1 with the text.
+- *Re-target, never snap back*: a further re-pack mid-flight redirects the
+  card from its currently-displayed position toward the new slot.
+- The open-time import of a .md file stamps a text edit, so the first second
+  after opening a fresh file rightly snaps — a rig trap encoded in
+  rig-check.sh (`wait:1100`), not a bug.
+
+**`reduce_motion` (config.toml).** Travel becomes an opacity cross-fade of the
+same duration: the live card fades in at its new slot while a non-interactive
+ghost of it fades out at the old one — "reduced motion is not no motion", a
+teleport breaks felt continuity as badly as a violent slide (attention-motion
+§4). The entrance/exit fades were already reduced-safe and are unchanged. GPUI
+exposes no OS reduce-motion query, so this is the writer's own switch; the
+`reduce:motion` smoke token flips it for a rig run.
+
+**Count grammar closed (the §6 precedence, audited).** With the detached
+*holder* cut (orphans pin in place at best-effort anchors) and cluster badges
+cut (D4 never materialised), the mutually-exclusive buckets reduce to: the
+lane, the ▲/▼ edge counts, and the rail — and the audit confirms each open
+note lands in exactly one (door-held cards never reach the lane; the active
+card is exempt from door AND cull, so it can't double-count; rig-asserted:
+4 seeded cards scroll away → 1 active visible + 3 above). One real drift
+found and fixed: a receded one-liner LOST its "· detached" marker — an
+orphaned card must never read as confidently anchored, however small it
+renders. The pill contract survives orphans as-is: an off-screen detached
+card counts in ▲/▼ honestly because its card really is at the best-effort
+anchor the pill scrolls to.
+
+**Not built, still:** the per-pass aging tab (§6 cut list) — waits for testers
+to actually report batch confusion, per the tester guide.
+
+**Harness:** smoke gains `resolve:last` (resolve the newest note — the bottom
+full-size card in the seeded lane, whose departure deterministically expands a
+receded card and shifts the run below; `resolve:first` hits an already-receded
+one-liner whose departure legitimately moves nothing — the check that taught
+us that is in rig-check.sh) and `reduce:motion`; the dump gains `moving` and
+`reduce_motion`. rig-check asserts: survivors slide then settle, scroll snaps
+all motion instantly, cross-fade mode registers the same moves, and the
+one-bucket exclusivity above. The tween-vs-snap policy and the staggered
+easing are pure functions (`plan_lane_moves`, `staggered_ease`) with unit
+tests — the timing contract is code, not feel.

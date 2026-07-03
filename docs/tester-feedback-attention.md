@@ -16,16 +16,16 @@ testers the numbers — it biases them. Ask about *experience*; we map experienc
 back to the knob.
 
 The bets this release puts in front of testers, and what we're really asking.
-**Build status as of this doc (2026-07-02):** SHIPPED + rig-tested — the
+**Build status as of this doc (2026-07-03):** SHIPPED + rig-tested — the
 **card budget** (older cards recede to one-liners, never hidden), the
 **reveal timing** (results wait out a typing burst, land at the pause or on
-scroll/door), and the **enter/exit motion** (opacity fades only). NOT built —
-the **completion pip** (cut: the title-bar note is the announcement; §3's
-questions now test whether that is *enough*) and the **reduced-motion
-setting** (the shipped fades are already the reduced-safe form; the setting
-arrives with re-pack motion). Only run the sections below whose behaviour is
-actually in the build the tester has — mark each row's status before handing
-this out.
+scroll/door), the **enter/exit motion** (opacity fades), the **re-pack
+motion** (surviving cards slide 200 ms to their new slots; scroll always
+snaps), and the **reduced-motion setting** (`reduce_motion` in config.toml:
+slides become equal-length cross-fades). NOT built — the **completion pip**
+(cut: the title-bar note is the announcement; §3's questions now test whether
+that is *enough*). Only run the sections below whose behaviour is actually in
+the build the tester has — mark each row's status before handing this out.
 
 | Knob | Behaviour under test | The question this trial answers |
 |---|---|---|
@@ -121,18 +121,21 @@ without being pulled by it.
 
 ## 6. Reduced motion / accessibility (motion-sensitive testers especially)
 
-*(No setting in this build — deliberately: all shipped motion is already
-short, run-once, opacity-only fades, which is the reduced-motion-safe form.
-The setting arrives together with re-pack movement. Still ask:)*
+*(In this build: `reduce_motion = true` in config.toml swaps the card slides
+for equal-length cross-fades; the enter/exit fades are unchanged — they were
+already the reduced-safe form. Have the motion-sensitive tester run a session
+each way.)*
 
-- (If motion-sensitive) did the default fades cause any discomfort over a long
-  session? Any at all is a finding — say where.
+- (If motion-sensitive) did the default slides/fades cause any discomfort over
+  a long session? Any at all is a finding — say where.
+- With `reduce_motion` on: does the calm mode still feel coherent — could you
+  always tell a card *went somewhere* rather than teleported?
 - Did anything **teleport or jump** in a way that lost the thread (a card
   vanishing with no trace, cards snapping to new spots when one resolved)?
-  That's the gap the coming re-pack motion + setting are meant to close — we
-  want to know how much it actually hurts today.
-- Would you have gone looking for a "reduce motion" setting? (Tells us how
-  discoverable it needs to be.)
+  In default mode that's now supposed to be impossible — a report here is a
+  bug, not a preference.
+- Would you have gone looking for a "reduce motion" setting, and would you
+  look for it in a config file? (Tells us how discoverable it needs to be.)
 
 ## 7. Overall
 
