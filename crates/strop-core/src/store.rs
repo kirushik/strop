@@ -35,8 +35,7 @@ pub struct Loaded {
     pub annotations: Annotations,
 }
 
-/// A named version snapshot: a Loro frontier (version vector position) the
-/// document can be rewound to. Lives inside the .strop file — Google-Docs
+/// A named version snapshot. Lives inside the .strop file — Google-Docs
 /// version history, local-first and self-contained.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -46,6 +45,25 @@ pub struct Checkpoint {
     /// Named-by-the-author (vs automatic session markers).
     #[serde(default)]
     pub manual: bool,
+    /// The checkpoint's document state, MATERIALIZED at creation — when it is
+    /// one cheap read of the live doc. Rewind, previews, and asset GC read
+    /// this instead of time-travelling (`state_at`): a Loro historical
+    /// checkout replays the whole oplog and cost 5–7 s PER CHECKPOINT on a
+    /// long-lived file — the history-sidebar hang. `None` only on checkpoints
+    /// recorded by older builds; those are backfilled once, in the
+    /// background, and persisted (see `set_checkpoint_state`). Self-contained
+    /// states are also what make shallow-snapshot compaction safe: the
+    /// rewind feature no longer needs any oplog history at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<CheckpointState>,
+}
+
+/// A checkpoint's frozen document state (see `Checkpoint::state`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointState {
+    pub text: String,
+    pub spans: SpanSet,
+    pub blocks: BlockMap,
 }
 
 /// Legacy reader for the pre-JSON newline-joined token format. Kept so old
@@ -90,6 +108,51 @@ const STYLE_KEYS: [&str; 8] = [
     "link",
     "footnote",
 ];
+
+/// Text + formatting + block kinds at `doc`'s current version. Free of
+/// `Store` so the backfill can read a private background-thread doc.
+fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
+    let text = doc.get_text(TEXT_CONTAINER);
+    let mut spans = SpanSet::default();
+    let mut pos = 0usize;
+    for delta in text.to_delta() {
+        if let TextDelta::Insert { insert, attributes } = delta {
+            let len = insert.chars().count();
+            for (key, value) in attributes.iter().flatten() {
+                if let Some(attr) = attr_from(key, value) {
+                    spans.add(pos..pos + len, attr);
+                }
+            }
+            pos += len;
+        }
+    }
+    let blocks = match doc.get_map(BLOCKS_CONTAINER).get("kinds") {
+        Some(v) => match v.into_value() {
+            // JSON first; fall back to the legacy newline-joined token
+            // format so pre-existing .strop files and older Loro frontiers
+            // (read by state_at) still load.
+            Ok(LoroValue::String(s)) => match serde_json::from_str::<Vec<BlockKind>>(&s) {
+                Ok(kinds) => BlockMap::from_kinds(kinds),
+                Err(_) => BlockMap::from_kinds(s.lines().map(kind_from_token).collect()),
+            },
+            _ => BlockMap::default(),
+        },
+        None => BlockMap::default(),
+    };
+    (text.to_string(), spans, blocks)
+}
+
+/// The checkpoint list of `doc` (see `Store::checkpoints`).
+fn checkpoints_of(doc: &LoroDoc) -> Vec<Checkpoint> {
+    let list = doc.get_list(CHECKPOINTS_CONTAINER);
+    (0..list.len())
+        .filter_map(|i| list.get(i))
+        .filter_map(|v| match v.into_value() {
+            Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
+            _ => None,
+        })
+        .collect()
+}
 
 fn attr_key(attr: &InlineAttr) -> &'static str {
     match attr {
@@ -226,34 +289,7 @@ impl Store {
     /// Text + formatting + block kinds at the doc's *current* version
     /// (which `state_at` temporarily moves).
     fn read_state(&self) -> (String, SpanSet, BlockMap) {
-        let text = self.doc.get_text(TEXT_CONTAINER);
-        let mut spans = SpanSet::default();
-        let mut pos = 0usize;
-        for delta in text.to_delta() {
-            if let TextDelta::Insert { insert, attributes } = delta {
-                let len = insert.chars().count();
-                for (key, value) in attributes.iter().flatten() {
-                    if let Some(attr) = attr_from(key, value) {
-                        spans.add(pos..pos + len, attr);
-                    }
-                }
-                pos += len;
-            }
-        }
-        let blocks = match self.doc.get_map(BLOCKS_CONTAINER).get("kinds") {
-            Some(v) => match v.into_value() {
-                // JSON first; fall back to the legacy newline-joined token
-                // format so pre-existing .strop files and older Loro frontiers
-                // (read by state_at) still load.
-                Ok(LoroValue::String(s)) => match serde_json::from_str::<Vec<BlockKind>>(&s) {
-                    Ok(kinds) => BlockMap::from_kinds(kinds),
-                    Err(_) => BlockMap::from_kinds(s.lines().map(kind_from_token).collect()),
-                },
-                _ => BlockMap::default(),
-            },
-            None => BlockMap::default(),
-        };
-        (text.to_string(), spans, blocks)
+        read_state_of(&self.doc)
     }
 
     /// Store an image asset in-file; returns its id for Image{src}.
@@ -278,9 +314,12 @@ impl Store {
         }
     }
 
-    /// Record a named checkpoint at the current version.
+    /// Record a named checkpoint at the current version. The state is
+    /// materialized NOW — one cheap read of the live doc — so nothing ever
+    /// has to time-travel back here (Checkpoint::state).
     pub fn add_checkpoint(&self, name: &str, manual: bool) {
         self.doc.commit();
+        let (text, spans, blocks) = self.read_state();
         let checkpoint = Checkpoint {
             name: name.to_owned(),
             created_unix: std::time::SystemTime::now()
@@ -289,6 +328,7 @@ impl Store {
                 .unwrap_or(0),
             frontiers: self.doc.oplog_frontiers().encode(),
             manual,
+            state: Some(CheckpointState { text, spans, blocks }),
         };
         match serde_json::to_string(&checkpoint) {
             Ok(json) => {
@@ -332,7 +372,7 @@ impl Store {
     /// (the research's top Docs complaint).
     pub fn add_checkpoint_if_changed(&self, name: &str, manual: bool) {
         if let Some(last) = self.checkpoints().last()
-            && let Some(at_last) = self.state_at(&last.frontiers)
+            && let Some(at_last) = self.checkpoint_state(last)
         {
             // Full (text, spans, blocks) comparison: a session that only
             // bolded or restructured headings still deserves a rewind
@@ -344,15 +384,88 @@ impl Store {
         self.add_checkpoint(name, manual);
     }
 
-    pub fn checkpoints(&self) -> Vec<Checkpoint> {
+    /// A checkpoint's document state: the materialized copy when it has one
+    /// (instant), else the legacy time-travel read (`state_at`, seconds on a
+    /// long oplog — exists only until the background backfill lands).
+    pub fn checkpoint_state(&self, cp: &Checkpoint) -> Option<(String, SpanSet, BlockMap)> {
+        match &cp.state {
+            Some(s) => Some((s.text.clone(), s.spans.clone(), s.blocks.clone())),
+            None => self.state_at(&cp.frontiers),
+        }
+    }
+
+    /// Do all checkpoints carry a materialized state? (True for every file
+    /// this build has checkpointed; false until a legacy file's backfill.)
+    pub fn checkpoints_materialized(&self) -> bool {
+        self.checkpoints().iter().all(|cp| cp.state.is_some())
+    }
+
+    /// Attach a materialized state to a legacy checkpoint (the backfill's
+    /// write-back). Refuses to overwrite an existing state — states are
+    /// immutable once recorded.
+    pub fn set_checkpoint_state(&self, ix: usize, state: CheckpointState) {
         let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
-        (0..list.len())
-            .filter_map(|i| list.get(i))
-            .filter_map(|v| match v.into_value() {
-                Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
-                _ => None,
-            })
-            .collect()
+        let Some(v) = list.get(ix) else { return };
+        let Ok(LoroValue::String(json)) = v.into_value() else {
+            return;
+        };
+        let Ok(mut cp) = serde_json::from_str::<Checkpoint>(&json) else {
+            return;
+        };
+        if cp.state.is_some() {
+            return;
+        }
+        cp.state = Some(state);
+        match serde_json::to_string(&cp) {
+            Ok(json) => {
+                let _ = list.delete(ix, 1);
+                if let Err(e) = list.insert(ix, json) {
+                    eprintln!("strop: backfill checkpoint state: {e}");
+                }
+                self.doc.commit();
+            }
+            Err(e) => eprintln!("strop: encode checkpoint: {e}"),
+        }
+    }
+
+    /// Current full snapshot as bytes — the input `materialize_checkpoint_states`
+    /// chews through on a background thread (the live doc never blocks).
+    pub fn export_bytes(&self) -> io::Result<Vec<u8>> {
+        self.doc.export(ExportMode::Snapshot).map_err(io::Error::other)
+    }
+
+    /// Materialize the states of every checkpoint that lacks one, from a
+    /// snapshot's BYTES — self-contained (its own private LoroDoc), so it can
+    /// run on a background thread while the app keeps editing. Walks the
+    /// checkpoints oldest→newest WITHOUT returning to the latest version
+    /// between reads: each step is a short hop, where round-tripping from the
+    /// tip cost 5–7 s per checkpoint on a long-lived file (the hang).
+    /// Returns `(checkpoint index, state)` pairs for `set_checkpoint_state`.
+    pub fn materialize_checkpoint_states(bytes: &[u8]) -> Vec<(usize, CheckpointState)> {
+        let doc = LoroDoc::new();
+        doc.config_text_style(style_config());
+        if doc.import(bytes).is_err() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (ix, cp) in checkpoints_of(&doc).into_iter().enumerate() {
+            if cp.state.is_some() {
+                continue;
+            }
+            let Ok(frontiers) = Frontiers::decode(&cp.frontiers) else {
+                continue;
+            };
+            if doc.checkout(&frontiers).is_err() {
+                continue;
+            }
+            let (text, spans, blocks) = read_state_of(&doc);
+            out.push((ix, CheckpointState { text, spans, blocks }));
+        }
+        out
+    }
+
+    pub fn checkpoints(&self) -> Vec<Checkpoint> {
+        checkpoints_of(&self.doc)
     }
 
     /// Document state as of a checkpoint: time-travel there, read, return
@@ -438,8 +551,10 @@ impl Store {
         if stored.iter().all(|id| reachable.contains(id)) {
             return;
         }
+        // Materialized checkpoint states read instantly; only a legacy
+        // checkpoint (pre-backfill) still pays the historical checkout.
         for cp in self.checkpoints() {
-            if let Some((_, _, cp_blocks)) = self.state_at(&cp.frontiers) {
+            if let Some((_, _, cp_blocks)) = self.checkpoint_state(&cp) {
                 reachable.extend(cp_blocks.asset_refs().map(str::to_owned));
             }
         }
@@ -547,6 +662,80 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("strop-test-{}-{tag}.strop", std::process::id()))
+    }
+
+    /// Simulate a LEGACY file: strip the materialized state off every
+    /// checkpoint record, leaving frontier-only checkpoints (what older
+    /// builds wrote). Test-only — production states are immutable.
+    fn strip_checkpoint_states(store: &Store) {
+        let list = store.doc.get_list(CHECKPOINTS_CONTAINER);
+        for ix in 0..list.len() {
+            let Some(v) = list.get(ix) else { continue };
+            let Ok(LoroValue::String(json)) = v.into_value() else {
+                continue;
+            };
+            let Ok(mut cp) = serde_json::from_str::<Checkpoint>(&json) else {
+                continue;
+            };
+            cp.state = None;
+            let _ = list.delete(ix, 1);
+            let _ = list.insert(ix, serde_json::to_string(&cp).unwrap());
+        }
+        store.doc.commit();
+    }
+
+    /// The history-sidebar hang class: checkpoints must be readable WITHOUT
+    /// per-checkpoint historical checkouts. New checkpoints materialize their
+    /// state at creation; a legacy (stripped) file backfills from snapshot
+    /// bytes — off the live doc — and the write-back persists across reopen.
+    #[test]
+    fn checkpoint_states_materialize_and_backfill() {
+        let path = temp_path("materialize");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("первая версия");
+        store.add_checkpoint("v1", true);
+        store.apply(&[crate::buffer::TextOp {
+            pos: 0,
+            delete: 0,
+            insert: "правка: ".into(),
+        }]);
+        store.add_checkpoint("v2", true);
+
+        // New checkpoints carry their state from birth.
+        assert!(store.checkpoints_materialized());
+        let cps = store.checkpoints();
+        assert_eq!(cps[0].state.as_ref().unwrap().text, "первая версия");
+        assert_eq!(cps[1].state.as_ref().unwrap().text, "правка: первая версия");
+
+        // A legacy file (no states) backfills from snapshot bytes alone…
+        strip_checkpoint_states(&store);
+        assert!(!store.checkpoints_materialized());
+        let bytes = store.export_bytes().unwrap();
+        let states = Store::materialize_checkpoint_states(&bytes);
+        assert_eq!(states.len(), 2);
+        for (ix, state) in states {
+            store.set_checkpoint_state(ix, state);
+        }
+        assert!(store.checkpoints_materialized());
+        let cps = store.checkpoints();
+        assert_eq!(cps[0].state.as_ref().unwrap().text, "первая версия");
+        assert_eq!(cps[1].state.as_ref().unwrap().text, "правка: первая версия");
+
+        // …and the write-back persists: reopening still needs no checkout.
+        store.save().unwrap();
+        let (store2, _) = Store::open(&path).unwrap();
+        assert!(store2.checkpoints_materialized());
+        assert_eq!(
+            store2
+                .checkpoint_state(&store2.checkpoints()[0])
+                .unwrap()
+                .0,
+            "первая версия"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

@@ -632,6 +632,9 @@ pub struct Editor {
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
+    /// A legacy-checkpoint backfill is in flight (one at a time; the result
+    /// persists, so it can never need to run twice for the same file).
+    history_backfill_running: bool,
     /// Edits since the last checkpoint — idle-gap session sealing.
     dirty_since_checkpoint: bool,
     /// Encoded image assets by id; Arc<gpui::Image> handles feed GPUI's
@@ -1015,6 +1018,7 @@ impl Editor {
             store_dirty: false,
             history_view: None,
             history_preview: None,
+            history_backfill_running: false,
             dirty_since_checkpoint: false,
             image_assets: HashMap::new(),
             config: Config::default(),
@@ -1261,17 +1265,21 @@ impl Editor {
         cx.notify();
     }
 
-    /// Build the rewind list: materialize every checkpoint once, compute
+    /// Build the rewind list from the checkpoints' MATERIALIZED states —
     /// word deltas between consecutive states and (when a self-baseline
-    /// exists) per-checkpoint voice drift.
-    fn enter_history(&mut self, cx: &mut Context<Self>) {
+    /// exists) per-checkpoint voice drift. Cheap (stored states + word
+    /// diffs, microseconds each), but only once every checkpoint carries a
+    /// state: a legacy one would fall back to a multi-second historical
+    /// checkout — the old sidebar hang (71 s measured for 13 checkpoints).
+    /// Callers gate on `checkpoints_materialized`.
+    fn build_history_entries(&self) -> Vec<HistoryEntry> {
         let Some(store) = &self.store else {
-            return;
+            return Vec::new();
         };
         let mut entries: Vec<HistoryEntry> = Vec::new();
         let mut prev_text = String::new();
         for cp in store.checkpoints() {
-            let Some((text, spans, blocks)) = store.state_at(&cp.frontiers) else {
+            let Some((text, spans, blocks)) = store.checkpoint_state(&cp) else {
                 continue;
             };
             let delta = strop_core::diff::word_delta(&strop_core::diff::prose_diff(
@@ -1294,7 +1302,6 @@ impl Editor {
                 name: cp.name.clone(),
                 created_unix: cp.created_unix,
                 manual: cp.manual,
-                frontiers: cp.frontiers.clone(),
                 text,
                 spans,
                 blocks,
@@ -1302,6 +1309,38 @@ impl Editor {
                 drift_sigma,
             });
         }
+        entries
+    }
+
+    /// Open the rewind list. With materialized checkpoint states this is
+    /// instant. A LEGACY file (checkpoints recorded before states were
+    /// stored) instead shows the shell immediately — names, dates,
+    /// structure — while a background pass materializes the states once,
+    /// persists them into the file, and then fills in texts, deltas and the
+    /// preview. The old behaviour materialized inline on the main thread.
+    fn enter_history(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let materializing = !store.checkpoints_materialized();
+        let entries: Vec<HistoryEntry> = if materializing {
+            store
+                .checkpoints()
+                .into_iter()
+                .map(|cp| HistoryEntry {
+                    name: cp.name,
+                    created_unix: cp.created_unix,
+                    manual: cp.manual,
+                    text: String::new(),
+                    spans: SpanSet::default(),
+                    blocks: BlockMap::default(),
+                    delta: (0, 0),
+                    drift_sigma: None,
+                })
+                .collect()
+        } else {
+            self.build_history_entries()
+        };
         if entries.is_empty() {
             return;
         }
@@ -1318,9 +1357,57 @@ impl Editor {
             named_only: false,
             compare_current: false,
             expanded,
+            materializing,
         });
         self.rebuild_preview();
+        if materializing {
+            self.backfill_checkpoint_states(cx);
+        }
         cx.notify();
+    }
+
+    /// Materialize legacy checkpoints' states OFF the main thread and write
+    /// them back — once per file, ever. Snapshot bytes go to a background
+    /// task with its own private doc (the live one never blocks); the states
+    /// come back, persist into the checkpoint records (so every later open
+    /// is instant), and the sidebar, if still open, fills in.
+    fn backfill_checkpoint_states(&mut self, cx: &mut Context<Self>) {
+        if self.history_backfill_running {
+            return;
+        }
+        let Some(store) = &self.store else { return };
+        let Ok(bytes) = store.export_bytes() else { return };
+        self.history_backfill_running = true;
+        let task = cx
+            .background_executor()
+            .spawn(async move { Store::materialize_checkpoint_states(&bytes) });
+        cx.spawn(async move |this, cx| {
+            let states = task.await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor.history_backfill_running = false;
+                {
+                    let Some(store) = &editor.store else { return };
+                    for (ix, state) in states {
+                        store.set_checkpoint_state(ix, state);
+                    }
+                }
+                editor.mark_dirty();
+                if editor.history_view.as_ref().is_some_and(|hv| hv.materializing) {
+                    let entries = editor.build_history_entries();
+                    if !entries.is_empty() {
+                        if let Some(hv) = &mut editor.history_view {
+                            hv.selected = hv.selected.min(entries.len() - 1);
+                            hv.entries = entries;
+                            hv.materializing = false;
+                        }
+                        editor.rebuild_preview();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn exit_history(&mut self, cx: &mut Context<Self>) {
@@ -1335,6 +1422,12 @@ impl Editor {
             self.history_preview = None;
             return;
         };
+        // States still assembling in the background: nothing to diff yet
+        // (the canvas keeps showing the live document until they land).
+        if hv.materializing {
+            self.history_preview = None;
+            return;
+        }
         let entry = &hv.entries[hv.selected];
         let empty_spans = SpanSet::default();
         let empty_blocks = BlockMap::default();
@@ -1578,17 +1671,23 @@ impl Editor {
 
     /// Restore the selected checkpoint: auto-checkpoint the present first
     /// (the rail narrates what happened), restore as an undoable forward
-    /// edit, exit history.
+    /// edit, exit history. Reads the entry's own materialized state — the
+    /// old `state_at` re-fetch here was another multi-second historical
+    /// checkout for data the sidebar already held.
     fn restore_selected(&mut self, cx: &mut Context<Self>) {
         let Some(hv) = &self.history_view else { return };
+        if hv.materializing {
+            return; // states still assembling; the row can't restore yet
+        }
         let entry = &hv.entries[hv.selected];
-        let (name, frontiers) = (entry.name.clone(), entry.frontiers.clone());
+        let (name, text, spans, blocks) = (
+            entry.name.clone(),
+            entry.text.clone(),
+            entry.spans.clone(),
+            entry.blocks.clone(),
+        );
         let Some(store) = &self.store else { return };
         store.add_checkpoint(&format!("Before restoring “{name}”"), false);
-        let Some((text, spans, blocks)) = store.state_at(&frontiers) else {
-            eprintln!("strop: cannot read checkpoint state");
-            return;
-        };
         self.doc.restore_state(&text, spans, blocks);
         self.selected_range = 0..0;
         self.selection_reversed = false;
@@ -8252,6 +8351,7 @@ impl Editor {
     fn render_history_panel(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let empty_expanded = HashSet::new();
         let hv = self.history_view.as_ref();
+        let materializing = hv.is_some_and(|h| h.materializing);
         let (entries, selected, named_only, compare_current, expanded) = match hv {
             Some(hv) => (
                 hv.entries.as_slice(),
@@ -8573,6 +8673,21 @@ impl Editor {
                          undoable, like everything here. Nothing is ever lost.",
                     ),
             )
+            // A legacy file's first history open: versions are being read out
+            // of the old format in the background (once, ever) — the rows are
+            // already here, previews land in a moment.
+            .when(materializing, |d| {
+                d.child(
+                    div()
+                        .px(px(14.))
+                        .py(px(7.))
+                        .border_b_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child("Assembling version previews — a moment…"),
+                )
+            })
             .child(
                 div()
                     .id("history-list")
@@ -8905,7 +9020,6 @@ struct HistoryEntry {
     name: String,
     created_unix: i64,
     manual: bool,
-    frontiers: Vec<u8>,
     text: String,
     /// Formatting at this checkpoint — projected into the preview so the
     /// document doesn't strip to plain text while time-travelling.
@@ -8932,6 +9046,10 @@ struct HistoryView {
     /// Runs are collapsed by default (Figma's answer to autosave noise);
     /// arrow-stepping into one unfolds it.
     expanded: HashSet<usize>,
+    /// A legacy file's states are still being materialized in the background
+    /// (backfill_checkpoint_states): rows show names/dates only, the preview
+    /// and restore wait. Once per file, ever — the states persist.
+    materializing: bool,
 }
 
 /// First index of the run of consecutive auto checkpoints containing `ix`
@@ -11647,7 +11765,6 @@ mod tests {
             name: String::new(),
             created_unix: 0,
             manual,
-            frontiers: Vec::new(),
             text: String::new(),
             spans: SpanSet::default(),
             blocks: BlockMap::default(),
