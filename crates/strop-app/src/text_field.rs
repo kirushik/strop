@@ -26,7 +26,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::draw_guard::DrawGuard;
+use crate::draw_guard::{DrawGuard, EntityUpdateExt as _};
 use crate::editor::{CARD_LINE_H, COMPOSER_INNER_W};
 use crate::theme::{FIELD_SELECTION_BG, RULE_COLOR, TEXT_COLOR};
 
@@ -1002,7 +1002,9 @@ impl TextFieldElement {
     fn store_geometry(&self, geom: FieldGeometry, text_origin: Point<Pixels>, cx: &mut App) {
         // Stash the window-relative text origin alongside the geometry, so the OS
         // hit-test path can localize its window point exactly as the mouse does.
-        self.input.update(cx, |input, _| {
+        // This runs INSIDE paint (under DrawGuard), so it must use the draw-safe
+        // write — no Context, so no mid-frame notify (draw_guard module docs).
+        self.input.update_in_draw(cx, |input| {
             input.geometry = Some(geom);
             input.text_origin = text_origin;
         });
@@ -1027,7 +1029,7 @@ impl TextFieldElement {
                 return;
             }
             let local = ev.position - text_origin;
-            input.update(cx, |input, cx| {
+            input.update_checked(cx, |input, cx| {
                 window.focus(&input.focus_handle, cx);
                 input.begin_select(local, ev.click_count, ev.modifiers.shift, cx);
             });
@@ -1040,7 +1042,7 @@ impl TextFieldElement {
                 return;
             }
             let local = ev.position - text_origin;
-            input.update(cx, |input, cx| input.drag_to(local, cx));
+            input.update_checked(cx, |input, cx| input.drag_to(local, cx));
         });
         let input = self.input.clone();
         window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
@@ -1048,7 +1050,7 @@ impl TextFieldElement {
                 return;
             }
             if input.read(cx).is_selecting {
-                input.update(cx, |input, cx| input.end_select(cx));
+                input.update_checked(cx, |input, cx| input.end_select(cx));
             }
         });
     }

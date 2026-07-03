@@ -1655,10 +1655,10 @@ impl Editor {
         window
             .on_focus_out(&handle, cx, move |_, _window, cx| {
                 let Some(editor) = weak.upgrade() else { return };
-                editor.update(cx, |editor, cx| {
+                editor.update_checked(cx, |editor, cx| {
                     if let Some(field) = still(editor) {
                         let text = field.read(cx).content.clone();
-                        field.update(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
+                        field.update_checked(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
                     }
                 });
             })
@@ -2194,7 +2194,7 @@ impl Editor {
         window
             .on_focus_out(&handle, cx, move |_, window, cx| {
                 let Some(editor) = weak.upgrade() else { return };
-                editor.update(cx, |editor, cx| {
+                editor.update_checked(cx, |editor, cx| {
                     if editor.focus.composing_id() == Some(id) {
                         editor.finish_composing(window, cx);
                     }
@@ -3292,7 +3292,7 @@ impl Editor {
         window
             .on_focus_out(&handle, cx, move |_, window, cx| {
                 let Some(editor) = weak.upgrade() else { return };
-                editor.update(cx, |editor, cx| {
+                editor.update_checked(cx, |editor, cx| {
                     if let Some(field) = editor.doc_rename_input.clone() {
                         let title = field.read(cx).content.clone();
                         editor.finish_rename(title, window, cx);
