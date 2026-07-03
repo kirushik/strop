@@ -14,8 +14,9 @@ fn bench_history_new_flow() {
         return;
     };
     let t0 = Instant::now();
-    let (store, _) = strop_core::Store::open(&path).expect("open sidecar");
+    let (store, loaded) = strop_core::Store::open(&path).expect("open sidecar");
     eprintln!("open: {:?}", t0.elapsed());
+    let loaded = loaded.expect("existing file");
     eprintln!("materialized already: {}", store.checkpoints_materialized());
 
     // The one-time backfill (runs in the background in the app).
@@ -45,11 +46,20 @@ fn bench_history_new_flow() {
         total_chars
     );
 
-    store.save().unwrap();
+    // Save the way the app does (save_with_state) — this also writes the
+    // spans JSON, upgrading the file off the legacy marks read path.
+    store
+        .save_with_state(
+            &loaded.spans,
+            &loaded.blocks,
+            &loaded.history.clone().unwrap_or_default(),
+            &loaded.annotations,
+        )
+        .unwrap();
     let after = std::fs::metadata(&path).unwrap().len();
     eprintln!("file after backfill+save: {} bytes", after);
 
-    // Reopen: still instant?
+    // Reopen: with states materialized, open may now COMPACT the oplog.
     let t = Instant::now();
     let (store2, _) = strop_core::Store::open(&path).expect("reopen");
     let open2 = t.elapsed();
@@ -58,4 +68,23 @@ fn bench_history_new_flow() {
         store2.checkpoint_state(&cp).expect("state");
     }
     eprintln!("reopen: {:?}; reads: {:?}", open2, t.elapsed());
+    eprintln!(
+        "file after reopen: {} bytes",
+        std::fs::metadata(&path).unwrap().len()
+    );
+    drop(store2);
+
+    // Third open: the compacted file.
+    let t = Instant::now();
+    let (store3, loaded) = strop_core::Store::open(&path).expect("open compacted");
+    eprintln!(
+        "compacted open: {:?} (text {} bytes, {} checkpoints readable)",
+        t.elapsed(),
+        loaded.map(|l| l.text.len()).unwrap_or(0),
+        store3
+            .checkpoints()
+            .iter()
+            .filter(|cp| store3.checkpoint_state(cp).is_some())
+            .count()
+    );
 }

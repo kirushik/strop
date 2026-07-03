@@ -1073,7 +1073,15 @@ impl Editor {
     /// mirror into Loro immediately, the snapshot hits disk once typing
     /// pauses for a second (and on quit, via `save_now`).
     pub fn attach_store(&mut self, store: Store, cx: &mut Context<Self>) {
+        let legacy = !store.checkpoints_materialized();
         self.store = Some(store);
+        // Heal a legacy file without waiting for the writer to open history:
+        // materialize its checkpoint states in the background now, so the
+        // sidebar is instant whenever it IS opened — and the next open of
+        // the file can compact the oplog (Store::open) it no longer needs.
+        if legacy {
+            self.backfill_checkpoint_states(cx);
+        }
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -1254,7 +1262,11 @@ impl Editor {
 
     /// Record a named version snapshot in the document file.
     fn add_checkpoint(&mut self, _: &AddCheckpoint, _: &mut Window, cx: &mut Context<Self>) {
-        self.sync_mutations();
+        // Save first: the checkpoint materializes its state from the store
+        // (Checkpoint::state), and the store's spans/blocks/annotations are
+        // only as fresh as the last save. Checkpointing implying durability
+        // is the right property anyway.
+        self.save_now();
         if let Some(store) = &self.store {
             let name = format!("Checkpoint {}", store.checkpoints().len() + 1);
             store.add_checkpoint(&name, true);
@@ -1686,6 +1698,9 @@ impl Editor {
             entry.spans.clone(),
             entry.blocks.clone(),
         );
+        // Save first so the "Before restoring" checkpoint materializes the
+        // present exactly as it stands (see add_checkpoint).
+        self.save_now();
         let Some(store) = &self.store else { return };
         store.add_checkpoint(&format!("Before restoring “{name}”"), false);
         self.doc.restore_state(&text, spans, blocks);
