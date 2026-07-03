@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Strop UX Lab — golden-path mechanics</title>
+<style>
+/* ============ lab chrome (deliberately NOT Strop: dark, utilitarian) ============ */
+:root{
+  --bg:#FBFAF8; --text:#1A1A18; --muted:#8A8678; --rule:#E8E4DC;
+  --card:#FFFDF6; --note:#FAF4E2; --diag:#EEF3FB; --stale:#EFEEEA;
+  --ai:#3D5C8C; --active:#C8A951; --sage:#7D8C66; --error:#B23B2E;
+  --notetint:rgba(227,184,73,.15); --seltint:rgba(200,169,81,.33);
+  --labbg:#23221F; --labtext:#C9C5BA;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--labbg);color:var(--labtext);font:13px/1.5 system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column}
+.labbar{display:flex;align-items:center;gap:6px;padding:8px 14px;border-bottom:1px solid #3a382f;flex-wrap:wrap}
+.labbar .t{font-weight:600;color:#EAE6D8;margin-right:10px}
+.tab{background:none;border:1px solid #4a4840;color:var(--labtext);padding:4px 12px;border-radius:14px;cursor:pointer;font:12px system-ui}
+.tab.on{background:#EAE6D8;color:#23221F;border-color:#EAE6D8}
+.vars{margin-left:auto;display:flex;gap:12px;align-items:center;font-size:12px}
+.vars label{display:flex;gap:5px;align-items:center;cursor:pointer;white-space:nowrap}
+main{flex:1;display:flex;gap:0;min-height:0}
+.stage{flex:1;display:flex;align-items:flex-start;justify-content:center;padding:22px;overflow:auto}
+.labnotes{width:270px;border-left:1px solid #3a382f;padding:16px 14px;font-size:12px;overflow:auto}
+.labnotes h3{color:#EAE6D8;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+.labnotes li{margin:0 0 9px 14px}
+.labnotes em{color:#DFC98A;font-style:normal}
+.scene{display:none;width:100%;justify-content:center}
+.scene.on{display:flex}
+
+/* ============ the Strop window ============ */
+.win{width:1080px;background:var(--bg);color:var(--text);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.5);overflow:hidden;flex-shrink:0}
+.tbar{display:flex;align-items:center;gap:14px;padding:9px 16px;border-bottom:1px solid var(--rule);font:13px system-ui;color:var(--muted);background:var(--bg)}
+.tbar .doc{color:var(--text);font-weight:600}
+.tbar .grow{flex:1}
+.tbar .ic{cursor:pointer;padding:2px 7px;border-radius:5px;user-select:none}
+.tbar .ic:hover{background:var(--rule)}
+.serif{font-family:Georgia,'PT Serif',serif}
+.body{position:relative;min-height:640px}
+
+/* editor column + margin lane */
+.edwrap{display:flex;min-height:640px}
+.col{width:640px;margin:0 auto;padding:44px 0 60px;font-family:Georgia,'PT Serif',serif;font-size:17px;line-height:1.62}
+.col p{margin:0 0 1.1em}
+.lane{width:250px;padding:44px 14px 0 6px;flex-shrink:0}
+.mcard{border:1px solid var(--rule);padding:9px 10px;margin-bottom:10px;font:13px/1.45 Georgia,serif;position:relative}
+.mcard .hd{display:flex;justify-content:space-between;font:10.5px system-ui;color:var(--muted);margin-bottom:3px}
+.mcard.diag{background:var(--diag);border-radius:3px}
+.mcard.note{background:var(--note);border-radius:9px}
+.mcard b{font-size:12.5px}
+.mcard .prov{position:absolute;right:8px;bottom:5px;font:10px system-ui;color:var(--muted);opacity:0;transition:opacity .2s}
+.mcard:hover .prov{opacity:1}
+.squig{text-decoration:underline wavy rgba(61,92,140,.55) 1px;text-underline-offset:3px}
+
+/* ============ scene 1: cold read ============ */
+.cr-banner{display:flex;gap:10px;align-items:center;justify-content:center;padding:7px;font:12px system-ui;color:var(--muted);border-bottom:1px solid var(--rule);background:var(--stale)}
+.cr-banner b{color:var(--text);font-weight:600}
+.cr-stage{display:flex;justify-content:center;gap:18px;padding:26px 0 30px;background:#E4E6E9}
+.cr-gutter{display:none!important}
+.pheat{position:absolute;left:26px;width:4px;border-radius:2px;background:var(--active)}
+.page{position:relative;width:520px;min-height:600px;background:#FEFEFC;box-shadow:0 2px 4px rgba(26,30,38,.14),0 12px 30px rgba(26,30,38,.16);padding:54px 58px 48px;font-family:'Palatino Linotype','P052','Book Antiqua',Palatino,serif;font-size:16.5px;line-height:1.66;cursor:default}
+.page.textured{background-image:radial-gradient(rgba(26,26,24,.022) 1px,transparent 1.4px),radial-gradient(rgba(26,26,24,.014) 1px,transparent 1.6px);background-size:11px 11px,7px 7px;background-position:0 0,4px 6px}
+.page p{margin:0 0 1em;text-align:left}
+.page .running{position:absolute;top:22px;right:58px;font:italic 11px Georgia,serif;color:var(--muted)}
+.page .pnum{position:absolute;bottom:20px;left:0;right:0;text-align:center;font:12px Georgia,serif;color:var(--muted)}
+.flip{position:absolute;top:0;bottom:0;width:26%;cursor:pointer}
+.flip.l{left:0}.flip.r{right:0}
+.flip:hover{background:linear-gradient(to right,rgba(26,26,24,.03),transparent)}
+.flip.r:hover{background:linear-gradient(to left,rgba(26,26,24,.03),transparent)}
+.cr-lane{width:230px;padding-top:54px}
+.rnote{background:var(--note);border:1px solid var(--rule);border-radius:9px;padding:8px 10px;margin-bottom:10px;font:13px/1.4 Georgia,serif}
+.rnote .q{font:10.5px system-ui;color:var(--muted);display:block;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rinput{position:absolute;z-index:5;background:var(--card);border:1px solid var(--active);border-radius:7px;padding:6px 8px;box-shadow:0 4px 14px rgba(26,26,24,.18);display:none;width:240px}
+.rinput input{border:none;outline:none;background:none;font:13px Georgia,serif;width:100%;color:var(--text)}
+.rinput .hint{font:10px system-ui;color:var(--muted)}
+.qmarks{display:flex;gap:6px;margin-bottom:5px}
+.qmarks span{font:11.5px system-ui;border:1px solid var(--rule);border-radius:10px;padding:2px 9px;cursor:pointer;background:var(--note)}
+.qmarks span:hover{border-color:var(--active)}
+.toast{position:absolute;left:50%;transform:translateX(-50%);bottom:14px;background:var(--text);color:var(--bg);font:12px system-ui;padding:5px 14px;border-radius:14px;opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.on{opacity:.92}
+
+/* ============ scene 2: asides ============ */
+.aside-blk{border-left:3px solid #C9C5BA;background:var(--stale);color:#5d5a50;padding:12px 16px;margin:0 0 22px;font-size:15px;line-height:1.5;border-radius:0 6px 6px 0}
+.aside-blk p{margin:0 0 .7em}
+.aside-blk .items label{display:flex;gap:7px;align-items:baseline;margin:0 0 .35em;cursor:pointer}
+.grave{border-left:3px solid #C9C5BA;background:var(--stale);color:#5d5a50;padding:12px 16px;margin:26px 0 0;font-size:15px;line-height:1.5;border-radius:0 6px 6px 0}
+.grave .entry{margin-bottom:14px}
+.grave .whisper,.aside-hd{font:11px system-ui;color:var(--muted);display:flex;gap:10px;align-items:center;margin-bottom:4px}
+.grave .whisper .act{cursor:pointer;text-decoration:underline dotted}
+.foldchip{display:inline-flex;gap:6px;align-items:center;font:12px system-ui;color:var(--muted);background:var(--stale);border:1px solid var(--rule);border-radius:12px;padding:3px 12px;cursor:pointer;margin-bottom:22px}
+.selpara{background:var(--seltint);position:relative}
+.selpop{position:absolute;top:-40px;left:120px;background:var(--card);border:1px solid var(--rule);border-radius:8px;box-shadow:0 5px 16px rgba(26,26,24,.15);font:12.5px system-ui;display:flex;overflow:hidden}
+.selpop span{padding:7px 13px;cursor:pointer;white-space:nowrap}
+.selpop span:hover{background:var(--note)}
+.selpop .cut:hover{background:var(--stale)}
+.sidepanel{width:270px;flex-shrink:0;border-left:1px solid var(--rule);background:var(--stale);padding:38px 16px;font-size:14px;line-height:1.5}
+.sidepanel h4{font:11px system-ui;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
+
+/* ============ scene 3: passes ============ */
+.passmenu{position:absolute;top:40px;right:190px;width:360px;background:var(--card);border:1px solid var(--rule);border-radius:10px;box-shadow:0 10px 30px rgba(26,26,24,.16);font:13px system-ui;z-index:6;overflow:hidden}
+.passmenu .prom{padding:12px 15px;border-left:3px solid var(--active);cursor:pointer}
+.passmenu .prom:hover{background:var(--note)}
+.passmenu .why{font-size:11.5px;color:var(--muted);margin-top:3px;font-family:Georgia,serif;font-style:italic}
+.passmenu .vq{font-weight:600}
+.passmenu .vq small{font-weight:400;color:var(--muted)}
+.morep{border-top:1px solid var(--rule);padding:8px 15px;color:var(--muted);cursor:pointer;font-size:12px}
+.passrow{padding:9px 15px 9px 18px;cursor:pointer;display:none}
+.passmenu.open .passrow{display:block}
+.passrow:hover{background:var(--diag)}
+.passrow.held{opacity:.5;cursor:default}
+.passrow.held:hover{background:none}
+.passrow .when{font-size:11px;color:var(--muted)}
+
+/* ============ scene 4: ctrl+s ============ */
+.ack{transition:opacity .25s;white-space:nowrap}
+.ack.sage{color:var(--sage)}
+.bstrip{position:absolute;bottom:0;left:0;right:0;background:var(--note);border-top:1px solid var(--rule);padding:8px 18px;font:12.5px system-ui;color:var(--text);display:none}
+.bstrip.on{display:block}
+.pulse{animation:pk 1s ease-out 1}
+@keyframes pk{0%{background:var(--seltint)}100%{background:none}}
+.kbd{border:1px solid #4a4840;border-radius:4px;padding:1px 6px;font:11px ui-monospace,monospace}
+
+/* ============ scene 5: re-entry ============ */
+.banner{margin:26px auto 6px;width:640px;background:var(--note);border:1px solid var(--rule);border-radius:9px;padding:10px 16px;font:14px Georgia,serif;display:flex;align-items:baseline;gap:12px}
+.banner .k{font:10.5px system-ui;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;flex-shrink:0}
+.banner .act{font:12px system-ui;color:var(--ai);cursor:pointer;white-space:nowrap;margin-left:auto}
+.mini-menu{width:640px;margin:8px auto 0;font:12px system-ui;color:var(--muted)}
+.mini-menu b{color:var(--text)}
+.stateradio{display:flex;gap:10px;justify-content:center;padding:14px;font:12px system-ui;background:var(--stale);border-bottom:1px solid var(--rule)}
+.stateradio label{cursor:pointer;display:flex;gap:5px;color:var(--text)}
+</style>
+</head>
+<body>
+<div class="labbar">
+  <span class="t">Strop UX Lab</span>
+  <button class="tab on" data-s="coldread">1 · Cold read</button>
+  <button class="tab" data-s="asides">2 · Asides</button>
+  <button class="tab" data-s="passes">3 · Passes</button>
+  <button class="tab" data-s="save">4 · Ctrl+S</button>
+  <button class="tab" data-s="reentry">5 · Re-entry</button>
+  <div class="vars" id="vars"></div>
+</div>
+<main>
+<div class="stage">
+
+<!-- ================= SCENE 1 : COLD READ ================= -->
+<section class="scene on" id="scene-coldread">
+  <div class="win" style="width:1120px">
+    <div class="tbar"><span class="doc">The Crossing</span><span id="cr-mode-label">— reading</span><span class="grow"></span><span class="ic">⌕</span><span class="ic">↺</span><span class="ic">≡</span></div>
+    <div class="cr-banner" id="cr-banner"><b>Reading</b><span>· sealed draft — day 8 · 4,120 words</span><span>·</span><span>reactions become margin notes — the text can’t be edited here</span><span>·</span><span>Esc returns to the desk</span></div>
+    <div class="body cr-stage">
+      
+      <div class="page textured" id="cr-page">
+        <span class="running">The Crossing — draft</span>
+        <div id="cr-content"></div>
+        <div class="pnum" id="cr-pnum">— 2 of 9 —</div><div id="cr-heat-host"></div>
+        <div class="flip l" title="previous page"></div>
+        <div class="flip r" title="next page"></div>
+      </div>
+      <div class="cr-lane" id="cr-lane">
+        <div class="rnote"><span class="q">“the ferry had made the crossing…”</span>drags here — cut the schedule talk?</div>
+      </div>
+      <div class="rinput" id="cr-rinput"><div class="qmarks"><span data-m="?">?&nbsp;doubt</span><span data-m="!">!&nbsp;alive</span><span data-m="~">~&nbsp;drags</span></div><input placeholder="…or a few words"><div class="hint">a mark or a note — never an edit · Esc drops</div></div>
+      <div class="toast" id="cr-toast"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SCENE 2 : ASIDES ================= -->
+<section class="scene" id="scene-asides">
+  <div class="win">
+    <div class="tbar"><span class="doc">The Crossing</span><span id="as-count">3,412 words <span style="opacity:.75">· aside 486</span></span><span class="grow"></span><span class="ic">⌕</span><span class="ic">↺</span><span class="ic">≡</span></div>
+    <div class="body edwrap" id="as-wrap">
+      <div class="col serif" style="padding-top:34px" id="as-col">
+        <div id="as-compost-slot">
+          <div class="foldchip" id="as-fold">▸ compost · 214 words — kept out of the story, the count, the passes, the export</div>
+          <div class="aside-blk" id="as-compost" style="display:none">
+            <div class="aside-hd">compost — yours, unread by the editor</div>
+            <p>Premise B (dead): generation ship, mutiny in cold storage. Everyone has this one.</p>
+            <p><b>ENDING — she stays. The ferry leaves without her, and the light on the water is the last line.</b></p>
+            <p>Voice line to keep somewhere: “Salt on the railing like the river had been chewing it.”</p>
+            <div class="items">
+              <label><input type="checkbox" checked> beat — Mara takes the night shift</label>
+              <label><input type="checkbox" checked> beat — the stowaway’s shadow is wrong</label>
+              <label><input type="checkbox"> beat — confrontation at the airlock</label>
+              <label><input type="checkbox"> beat — the choice at the far dock</label>
+            </div>
+          </div>
+        </div>
+        <p>Mara took the night crossing because the day boats were full of people who still believed the far shore existed. The ferry’s old reactor hummed under the deck plates like a hive gone drowsy with cold.</p>
+        <p>The stowaway appeared on the third night, standing at the rail where no passenger was supposed to stand, casting two shadows in the single running light.</p>
+        <p class="selpara" id="as-victim">The customs officer had a theory about the fog, and he told it to anyone who would listen: that it wasn’t weather at all, but the river forgetting its banks, one memory at a time. He had charts. He had dates. Nobody would listen.
+          <span class="selpop"><span>✎ note</span><span class="cut" id="as-exile">✂ exile to the graveyard</span></span>
+        </p>
+        <p>“You’re not on the manifest,” Mara said. The stowaway looked down at his two shadows as if counting them. “Neither is the river,” he said.</p>
+        <div class="grave" id="as-grave">
+          <div class="aside-hd">graveyard — cut, not gone · out of the count, the passes, the export</div>
+          <div class="entry"><div class="whisper">cut from “The far dock” · day 11 · <span class="act">put back</span> · <span class="act">show origin</span></div>
+          The dockmaster’s daughter kept a ledger of everything the river had taken: four hats, a violin, the summer of ’31, her mother’s good opinion of her father.</div>
+        </div>
+      </div>
+      <div class="sidepanel" id="as-panel" style="display:none">
+        <h4>compost — panel variant</h4>
+        <p style="font-size:13px;color:#5d5a50">Same content, beside the prose instead of above it. No scrolling — but a second surface, always on, fighting the margin lane for width.</p>
+      </div>
+      <div class="lane" id="as-lane">
+        <div class="mcard note"><div class="hd"><span>Note</span><span>×</span></div>check: does the shuttle have windows?</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SCENE 3 : PASSES ================= -->
+<section class="scene" id="scene-passes">
+  <div class="win">
+    <div class="tbar"><span class="doc">The Crossing</span><span>4,430 words · cap 4,000</span><span class="grow"></span>
+      <span class="ic" id="pm-open" style="border:1px solid var(--rule);border-radius:6px">Ask the editor ▾</span><span class="ic">↺</span><span class="ic">≡</span></div>
+    <div class="body edwrap">
+      <div class="passmenu" id="passmenu">
+        <div class="prom">
+          <div class="vq">Believing read <small>— what’s alive here, what it’s secretly about</small></div>
+          <div class="why">the draft sealed yesterday — hear its center of gravity before doubting it</div>
+        </div>
+        <div class="morep" id="pm-more">more passes ▸</div>
+        <div class="passrow"><div class="vq">Developmental <small>— does the structure hold?</small></div><div class="when">the big questions: stakes, turns, the ending’s landing · usually after a cold read</div></div>
+        <div class="passrow"><div class="vq">Line <small>— do the sentences carry?</small></div><div class="when">rhythm, imagery, dialogue · once the structure stops moving</div></div>
+        <div class="passrow held"><div class="vq">Copy <small>— slips, typos, repetitions</small></div><div class="when">held while 2 structural queries are open — polish waits for surgery</div></div>
+        <div class="passrow"><div class="vq">Doubting read <small>— who will disagree, and where do you answer them?</small></div><div class="when">for arguments · the believing read’s mirror</div></div>
+        <div class="passrow"><div class="vq">Cut to fit <small>— what can die without the story collapsing?</small></div><div class="when">a cap looms: 4,430 of 4,000 · structural cuts before line trims</div></div>
+      </div>
+      <div class="col serif" style="padding-top:34px">
+        <p>Mara took the night crossing because the day boats were full of people who still believed the far shore existed. <span class="squig">The ferry’s old reactor hummed under the deck plates like a hive gone drowsy with cold.</span></p>
+        <p>The stowaway appeared on the third night, standing at the rail where no passenger was supposed to stand, <span class="squig">casting two shadows in the single running light.</span></p>
+        <p>“You’re not on the manifest,” Mara said. The stowaway looked down at his two shadows as if counting them. “Neither is the river,” he said.</p>
+      </div>
+      <div class="lane" style="padding-top:34px">
+        <div class="mcard diag"><div class="hd"><span>developmental</span><span>done&nbsp;&nbsp;×</span></div><b>The reactor is set dressing</b><br>It hums twice and decides nothing. Does the crossing need a cost?<div class="prov">pass 2 · developmental · today</div></div>
+        <div class="mcard diag"><div class="hd"><span>developmental</span><span>done&nbsp;&nbsp;×</span></div><b>Two shadows, one rule</b><br>The image recurs but the rule behind it never lands. What does the second shadow obey?<div class="prov">pass 2 · developmental · today</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SCENE 4 : CTRL+S ================= -->
+<section class="scene" id="scene-save">
+  <div class="win">
+    <div class="tbar"><span class="doc">The Crossing</span><span class="ack" id="sv-ack">3,412 words</span><span class="grow"></span><span class="ic">⌕</span><span class="ic" id="sv-hist">↺</span><span class="ic">≡</span></div>
+    <div class="body">
+      <div class="col serif" style="padding-top:44px">
+        <p>Mara took the night crossing because the day boats were full of people who still believed the far shore existed.</p>
+        <p style="color:var(--muted);font:13px system-ui">Press <span class="kbd" style="border-color:var(--rule)">Ctrl+S</span> (works in this mockup) — or <span id="sv-btn" style="text-decoration:underline;cursor:pointer">click to simulate</span>. Press it twice: the second press finds nothing changed.</p>
+      </div>
+      <div class="bstrip" id="sv-strip">Strop saves every keystroke, always — nothing here is ever unsaved. <b>Ctrl+S also keeps a checkpoint</b>, so this moment is easy to find in History.&nbsp;&nbsp;<span style="cursor:pointer;color:var(--muted)">got it ×</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SCENE 5 : RE-ENTRY ================= -->
+<section class="scene" id="scene-reentry">
+  <div class="win">
+    <div class="stateradio">
+      <label><input type="radio" name="re" value="draft" checked> mid-draft (day 5)</label>
+      <label><input type="radio" name="re" value="rest"> the morning after the seal (day 9)</label>
+      <label><input type="radio" name="re" value="descent"> mid-descent (day 11)</label>
+    </div>
+    <div class="body">
+      <div class="banner" id="re-banner"></div>
+      <div class="mini-menu" id="re-menu"></div>
+      <div class="col serif" style="padding-top:18px">
+        <p>Mara took the night crossing because the day boats were full of people who still believed the far shore existed. The ferry’s old reactor hummed under the deck plates like a hive gone drowsy with cold.</p>
+        <p style="color:var(--muted)">▌</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+</div>
+<aside class="labnotes" id="labnotes"></aside>
+</main>
+
+<script>
+/* ---------- scene router + per-scene variant toggles + lab notes ---------- */
+const NOTES = {
+ coldread:`<h3>Cold read — D3/G1</h3><ul>
+  <li><em>Tested:</em> pages as estrangement — different face, ragged-right (justify without perfect hyphenation = the Kindle sin), discrete flips (click edges / ← → / Space), numbered.</li>
+  <li><em>Toggle texture</em>: is the grain a mode-signal or kitsch?</li>
+  <li><em>Toggle churn heat</em>: D7's least-invasive home — amber ticks in the page margin where editing ran hot, visible only while READING. Hover them.</li>
+  <li><em>Toggle history variant</em>: the same viewer reading a checkpoint ("read this version"), restore language loud.</li>
+  <li>Select text → quick MARKS (?&nbsp;!&nbsp;~) or a short note (Marshall: real margin reactions are telegraphic). Typing at the page never silently fails — it nudges.</li><li>The whole field goes literally COLD (cool white page, cool surround): the material change IS the mode signal. AI cards are suppressed here — the stranger's read is private.</li>
+  <li>Pagination is mocked (pre-chunked); real impl reflows.</li></ul>`,
+ asides:`<h3>Asides — D5/G4</h3><ul>
+  <li><em>Compost</em>: folded chip by default (top). Unfold: DRAINED block — deliberately less comfortable than the manuscript (the worldbuilder's-disease guard). Beats tick off (the outline rail's real destiny).</li>
+  <li><em>Graveyard</em> (bottom): same primitive, same look, different label + position (Fountain's boneyard precedent). Each cut keeps a return address — visible insurance for writers who don't trust invisible history (the commented-out-code pattern, dignified).</li>
+  <li>The highlighted paragraph shows the selection popover — try <em>✂ exile</em>: it moves to the graveyard, count updates, no residue chip in prose.</li>
+  <li><em>Toggle panel variant</em>: compost as a side panel instead — feel what a second surface costs.</li>
+  <li>Titlebar counts the manuscript; asides counted separately.</li></ul>`,
+ passes:`<h3>Passes — D4/D6</h3><ul>
+  <li>Open <em>“Ask the editor”</em>. ONE pass is promoted, with a why-line in prose. The state machine lives in these sentences, not a diagram.</li>
+  <li><em>more passes ▸</em>: verb-question names + when-lines. Copy is <em>held</em> — the altitude order made legible, not enforced silently.</li>
+  <li>“Cut to fit” knows the cap (titlebar: 4,430 of 4,000).</li>
+  <li>Hover a margin card: provenance whisper (pass · altitude · when).</li></ul>`,
+ save:`<h3>Ctrl+S — D9</h3><ul>
+  <li>Press Ctrl+S: the word count briefly becomes an acknowledgment, History (↺) pulses once. Subtle but certain.</li>
+  <li>Second press with no changes: “already safe” — honest, quieter.</li>
+  <li><em>Toggle first-time strip</em>: the one-time teach line (bottom), never repeated.</li>
+  <li><em>Toggle placement A/B</em>: titlebar swap vs bottom whisper.</li></ul>`,
+ reentry:`<h3>Re-entry — D8</h3><ul>
+  <li>Three record-driven states of the SAME banner. No new surface — only what the sentence says and which pass leads the menu.</li>
+  <li>mid-draft: your own intent, verbatim (shipped behavior).</li>
+  <li>after the seal: the draft's state + one quiet verb (“Read it cold”).</li>
+  <li>mid-descent: orientation to the kind of work (“structural”), not advice.</li></ul>`};
+
+const VARS = {
+ coldread:[
+  {id:'v-texture',label:'paper texture',on:true},
+  {id:'v-heat',label:'churn heat',on:false},
+  {id:'v-hist',label:'history-preview variant',on:false}],
+ asides:[
+  {id:'v-panel',label:'compost as side panel',on:false},
+  {id:'v-unfold',label:'compost unfolded',on:false}],
+ passes:[],
+ save:[
+  {id:'v-strip',label:'first-time teach strip',on:true},
+  {id:'v-place',label:'ack in bottom whisper (A/B)',on:false}],
+ reentry:[]};
+
+const stage={cur:'coldread'};
+function show(s){
+  stage.cur=s;
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.dataset.s===s));
+  document.querySelectorAll('.scene').forEach(x=>x.classList.toggle('on',x.id==='scene-'+s));
+  document.getElementById('labnotes').innerHTML=NOTES[s];
+  const v=document.getElementById('vars');v.innerHTML='';
+  (VARS[s]||[]).forEach(o=>{
+    const l=document.createElement('label');
+    l.innerHTML=`<input type="checkbox" id="${o.id}" ${o.on?'checked':''}> ${o.label}`;
+    v.appendChild(l);
+    l.querySelector('input').addEventListener('change',applyVars);
+  });
+  applyVars();
+}
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>show(t.dataset.s));
+
+function applyVars(){
+  const g=id=>{const e=document.getElementById(id);return e?e.checked:VARS[stage.cur]?.find(v=>v.id===id)?.on};
+  if(stage.cur==='coldread'){
+    document.getElementById('cr-page').classList.toggle('textured',!!g('v-texture'));
+    crRender();
+    const h=!!g('v-hist');
+    document.getElementById('cr-banner').innerHTML=h
+      ?`<b>Viewing a checkpoint</b><span>· “Draft complete” — day 8 · 4,120 words</span><span>·</span><span style="color:var(--text)">Restore brings it back as a NEW version — everything since stays in History</span><span>·</span><span>Esc returns</span>`
+      :`<b>Reading</b><span>· sealed draft — day 8 · 4,120 words</span><span>·</span><span>reactions become margin notes — the text can’t be edited here</span><span>·</span><span>Esc returns to the desk</span>`;
+    document.getElementById('cr-mode-label').textContent=h?'— viewing “Draft complete”':'— reading';
+  }
+  if(stage.cur==='asides'){
+    const p=!!g('v-panel');
+    document.getElementById('as-panel').style.display=p?'block':'none';
+    document.getElementById('as-compost-slot').style.display=p?'none':'block';
+    const u=!!g('v-unfold');
+    if(!p){document.getElementById('as-compost').style.display=u?'block':'none';
+      document.getElementById('as-fold').textContent=(u?'▾':'▸')+' compost · 214 words — kept out of the story, the count, the passes, the export';}
+  }
+  if(stage.cur==='save'){
+    document.getElementById('sv-strip').classList.toggle('on',!!g('v-strip')&&svTaught===false);
+  }
+}
+
+/* ---------- scene 1: cold read ---------- */
+const PAGES=[
+ [`Mara took the night crossing because the day boats were full of people who still believed the far shore existed. The ferry’s old reactor hummed under the deck plates like a hive gone drowsy with cold, and the river ran black and patient under a sky with no working stars.`,
+  `She had made the run eleven times. She told the manifest clerk it was for the pay, and the clerk wrote it down, because clerks write down what they are told.`],
+ [`The stowaway appeared on the third night, standing at the rail where no passenger was supposed to stand, casting two shadows in the single running light.`,
+  `The ferry had made the crossing on the hour, every hour, for as long as the schedule board could remember, and the schedule board remembered longer than most of the crew. Departures in white. Cancellations in a red that had faded to the color of an old scar.`,
+  `“You’re not on the manifest,” Mara said. The stowaway looked down at his two shadows as if counting them. “Neither is the river,” he said.`],
+ [`Later she would try to remember whether the fog had come up before the engines changed pitch, or after. It mattered, in the way that the order of two small betrayals matters.`,
+  `Salt on the railing like the river had been chewing it. She wiped her hand on her coat and did not look at what the light was doing on the water.`],
+];
+let crPage=1;
+const HEAT=[[0,0],[3,1,2],[1,4]]; // per page, per para: edits-since-seal weight
+function crRender(){
+  const c=document.getElementById('cr-content');
+  c.innerHTML=PAGES[crPage].map(p=>`<p>${p}</p>`).join('');
+  document.getElementById('cr-pnum').textContent=`— ${crPage+1} of 9 —`;
+  const g=document.getElementById('cr-heat-host');
+  if(document.getElementById('v-heat')&&document.getElementById('v-heat').checked){
+    const ps=[...c.querySelectorAll('p')];
+    g.innerHTML=HEAT[crPage].map((w,i)=>{
+      if(!ps[i]||!w)return '';
+      const top=ps[i].offsetTop;const h=Math.min(ps[i].offsetHeight,w*22);
+      return `<div class="pheat" style="top:${top}px;height:${h}px;opacity:${0.2+w*0.16}" title="edited ×${w*4} since the seal"></div>`;
+    }).join('');
+  } else g.innerHTML='';
+}
+function crFlip(d){crPage=Math.max(0,Math.min(PAGES.length-1,crPage+d));crRender();}
+document.querySelector('#cr-page .flip.l').onclick=()=>crFlip(-1);
+document.querySelector('#cr-page .flip.r').onclick=()=>crFlip(1);
+crRender();
+
+/* reaction capture: select text on the page -> input near it */
+const ri=document.getElementById('cr-rinput');
+document.getElementById('cr-page').addEventListener('mouseup',e=>{
+  if(stage.cur!=='coldread')return;
+  const sel=window.getSelection();
+  if(!sel||sel.isCollapsed||!sel.toString().trim())return;
+  ri.dataset.q=sel.toString().slice(0,42);
+  const r=sel.getRangeAt(0).getBoundingClientRect();
+  const host=document.querySelector('#scene-coldread .body').getBoundingClientRect();
+  ri.style.left=Math.min(r.left-host.left,700)+'px';
+  ri.style.top=(r.bottom-host.top+8)+'px';
+  ri.style.display='block';ri.querySelector('input').focus();
+});
+ri.querySelectorAll('.qmarks span').forEach(q=>q.onclick=()=>{
+  const n=document.createElement('div');n.className='rnote';
+  n.innerHTML=`<span class="q">“${ri.dataset.q}…”</span><b>${q.dataset.m}</b> ${q.textContent.split(' ')[1]||''}`;
+  document.getElementById('cr-lane').appendChild(n);
+  ri.style.display='none';window.getSelection().removeAllRanges();
+  crToast('marked — telegraphic beats prose while reading');
+});
+ri.querySelector('input').addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&e.target.value.trim()){
+    const n=document.createElement('div');n.className='rnote';
+    n.innerHTML=`<span class="q">“${ri.dataset.q}…”</span>${e.target.value}`;
+    document.getElementById('cr-lane').appendChild(n);
+    e.target.value='';ri.style.display='none';window.getSelection().removeAllRanges();
+    crToast('kept as a margin note — it’ll be waiting at the desk');
+  }
+  if(e.key==='Escape'){e.target.value='';ri.style.display='none';}
+  e.stopPropagation();
+});
+function crToast(m){const t=document.getElementById('cr-toast');t.textContent=m;t.classList.add('on');setTimeout(()=>t.classList.remove('on'),1900);}
+document.addEventListener('keydown',e=>{
+  if(stage.cur==='coldread'&&ri.style.display!=='block'){
+    if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown'){crFlip(1);e.preventDefault();}
+    if(e.key==='ArrowLeft'||e.key==='PageUp'){crFlip(-1);e.preventDefault();}
+    if(e.key==='Escape'){crToast('…would return to the editing desk (Esc always leaves)');}
+    else if(e.key.length===1&&!e.ctrlKey&&!e.metaKey){crToast('you’re reading — select a passage to react; Esc returns to writing');}
+  }
+});
+
+/* ---------- scene 2: asides ---------- */
+document.getElementById('as-fold').onclick=()=>{
+  const u=document.getElementById('v-unfold');if(u){u.checked=!u.checked;}applyVars();
+};
+document.getElementById('as-exile').onclick=()=>{
+  const v=document.getElementById('as-victim');
+  const g=document.getElementById('as-grave');
+  const e=document.createElement('div');e.className='entry';
+  e.innerHTML=`<div class="whisper">cut from “The fog theory” · just now · <span class="act">put back</span> · <span class="act">show origin</span></div>${v.textContent.trim()}`;
+  g.appendChild(e);e.classList.add('pulse');
+  v.remove();
+  document.getElementById('as-count').innerHTML=`3,340 words <span style="opacity:.75">· aside 558</span>`;
+};
+
+/* ---------- scene 3: passes ---------- */
+document.getElementById('pm-open').onclick=()=>{
+  const m=document.getElementById('passmenu');m.style.display=(m.style.display==='block')?'none':'block';
+};
+document.getElementById('passmenu').style.display='none';
+document.getElementById('pm-more').onclick=e=>{
+  const m=document.getElementById('passmenu');m.classList.toggle('open');
+  e.target.textContent=m.classList.contains('open')?'fewer passes ▾':'more passes ▸';
+};
+
+/* ---------- scene 4: ctrl+s ---------- */
+let svDirty=true,svTaught=false;
+function svSave(){
+  const a=document.getElementById('sv-ack');
+  const place=document.getElementById('v-place')?.checked;
+  const msg=svDirty?'✓ checkpoint kept':'already safe — nothing changed since';
+  const cls=svDirty?'sage':'';
+  if(place){ /* bottom whisper A/B */
+    const s=document.getElementById('sv-strip');
+    s.innerHTML=svDirty?'✓ checkpoint kept — findable in History':'already safe — nothing changed since the last one';
+    s.classList.add('on');setTimeout(()=>{s.classList.remove('on');},1600);
+  }else{
+    const old=a.textContent;a.textContent=msg;a.className='ack '+cls;
+    setTimeout(()=>{a.textContent='3,412 words';a.className='ack';},1600);
+  }
+  if(svDirty){const h=document.getElementById('sv-hist');h.classList.remove('pulse');void h.offsetWidth;h.classList.add('pulse');}
+  if(!svTaught&&document.getElementById('v-strip')?.checked&&!place){
+    document.getElementById('sv-strip').classList.add('on');svTaught=true;
+    setTimeout(()=>document.getElementById('sv-strip').classList.remove('on'),5200);
+  }
+  svDirty=false;
+}
+document.getElementById('sv-btn').onclick=svSave;
+document.addEventListener('keydown',e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();if(stage.cur==='save')svSave();}
+});
+
+/* ---------- scene 5: re-entry ---------- */
+const RE={
+ draft:{k:'next',t:'Write the confrontation at the airlock.',act:'',menu:'door closed · the editor is quiet · <b>Believing read</b> waits behind “Ask the editor”, unpromoted'},
+ rest:{k:'resting',t:'The draft is resting — sealed yesterday · 4,120 words.',act:'Read it cold ›',menu:'promoted: <b>Read it cold</b> · then: Believing read — what’s alive here'},
+ descent:{k:'in progress',t:'Structural work in progress — 3 developmental queries open.',act:'Show them ›',menu:'promoted: <b>return to the open queries</b> · line &amp; copy wait for structure'}};
+function reRender(){
+  const v=document.querySelector('input[name=re]:checked').value,s=RE[v];
+  document.getElementById('re-banner').innerHTML=`<span class="k">${s.k}</span><span>${s.t}</span>${s.act?`<span class="act">${s.act}</span>`:''}`;
+  document.getElementById('re-menu').innerHTML=s.menu;
+}
+document.querySelectorAll('input[name=re]').forEach(r=>r.onchange=reRender);
+reRender();
+
+show('coldread');
+</script>
+</body>
+</html>

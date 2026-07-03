@@ -402,7 +402,88 @@ craft consensus into "research shows" (§0) — including in our own marketing.
   Wertenbroch): failed its preregistered replication [D]. The *demand* for
   deadlines is real; never cite the performance claim.
 
-## 9. Method note
+## 9. First review round (Kirill, 2026-07-03) — verdicts and amendments
+
+**D3 (cold read): endorsed, extended.** Static *numbered* flippable pages,
+different face and measure, possibly the subtlest paper texture. Two
+unifications adopted: the same paged viewer serves as the **history
+checkpoint preview** ("read this version" — in-window takeover, not a popup:
+window management is clutter, and the read-only takeover pattern already
+exists); and **entering a cold read quietly checkpoints first** (unnamed,
+fingerprint-guarded — every cold read starts from a recorded state, which
+also gives the churn mirror its reference point). The SEAL stays a separate,
+explicit writer act — declaring a draft complete and wanting to read are
+different things.
+
+**D2 (runway): SHELVED.** Possibly useful, net-goodness unproven. G3 leaves
+the build sequence; the deadline stays a fact the writer keeps outside the
+tool until testing says otherwise.
+
+**D5 (asides): direction accepted, UX genuinely open → mockup round.** The
+open questions: in-flow marked region (above/below a marked line, foldable)
+vs any side-by-side presentation (fights the no-panels instinct; might fight
+scroll fatigue better); whether the natural CUT gesture should feed the
+graveyard directly; and the trust framing — the graveyard is the *visible*
+insurance for writers who don't trust invisible history (the commented-out-
+code pattern among devs who don't trust git, dignified instead of shamed).
+No existing UX preconditioning for either region (Word's page-area segments
+are the anti-precedent).
+
+**D4 (pass menu): the passes must explain themselves.** The names
+(developmental/line/copy/believing) don't carry intent in menu space.
+Direction: verb-question entries with one-line "when" explanations and a
+why-line on the recommended one — the state machine lives in the
+recommendation TEXT, never in a diagram or a new surface.
+
+**D7 (churn mirror): accepted; the surface is the question.** Candidate
+homes to mock: a margin heat line (ambient — risks being a permanent
+judgment strip), the history rows (drift-vs-seal per checkpoint), the pass
+menu's why-line ("copy ran twice today; nothing new"), and — most promising
+— heat marks in the COLD READ margin only: the mirror shows where evaluation
+already lives, never while writing. Mirrors are pull-surfaces; there is no
+active intervention.
+
+**D8 (re-entry): was unclear; the concrete form.** No new surface. The
+intent banner (which already greets every open) gains record-driven text
+variants, and the pass menu order follows: (1) mid-draft → today's behavior
+("Next: write the airlock scene"); (2) after a seal → "The draft is resting
+— sealed yesterday, 4,120 words. Read it cold?"; (3) mid-descent → "
+Structural pass in progress — 3 developmental queries open." Three
+sentences, driven by CheckpointMeta. That is the entire feature; the
+evidence (8 minutes of reframing changes revision behavior) rides on what
+those sentences SAY.
+
+**D9 (checkpoints): two additions adopted.** (1) **The Ctrl+S reflex is
+honored, never retrained**: Ctrl+S = fingerprint-guarded unnamed checkpoint
+(no change → no checkpoint) + a subtle-but-certain acknowledgment. (2)
+**Export auto-checkpoints** (kind: Exported), and the label derives from the
+export filename's non-document-name part — "ferry-story-contest-final.md" →
+label "contest-final": the writer names the version in the save dialog
+without knowing they're naming a version. **Open sizing question** (flagged,
+not resolved): reflex checkpoints × materialized states = real bytes; the
+candidate policy is disclosed age-thinning of unnamed checkpoints (named/
+seal/submitted never thin), but the arithmetic and the "nothing is lost"
+guarantee need an engineering round together.
+
+**New lifecycle fact honored:** the director's cut. Pieces get re-opened
+months after submission and re-edited to different editorial requirements
+(online → print). The record already supports it (the "as submitted" label
+is the anchor; a re-target is just new work after it) — no new feature, but
+walkthrough II's boundary section should not read as "the file goes dormant
+forever."
+
+**Feature audit (his question "what never appeared on the path?"):** the
+outline rail never earned a scene in either walkthrough — short forms often
+have no headings at all; its DESIGN §4.3 destiny (the beat list that ticks
+off) folds naturally into COMPOST (a plotter's beats are compost items;
+ticking one is resolving it), so the rail stays as cheap long-document
+navigation and stops pretending to be the structure-holder. Voice-drift's
+σ-glyph remains an instrument-orphan (correctly deferred); highlight,
+underline, auto_copy_selection are harmless substrate. Footnotes appeared
+only as the column's evidence parking — consistent with their import-
+fidelity origin.
+
+## 10. Method note
 
 This document was produced the way Strop says writing works: a believing
 draft of the whole path was written first, blind, with falsifiable
