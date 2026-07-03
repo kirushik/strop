@@ -274,6 +274,15 @@ fn main() {
                     // macOS it makes the system titlebar transparent so our
                     // chrome shows through. Linux/Wayland CSD ignores it.
                     appears_transparent: true,
+                    // macOS KEEPS its native traffic-light buttons (we hide our
+                    // own redundant controls there — see render_titlebar). With
+                    // `appears_transparent` + full-size content view the lights
+                    // otherwise sit at the very top-left and overlap our chrome.
+                    // Recentre them in the 36px bar: y=11 vertically centres the
+                    // ~14px buttons; render_titlebar insets the bar's left
+                    // content past them. (No-op on other platforms.)
+                    #[cfg(target_os = "macos")]
+                    traffic_light_position: Some(gpui::point(px(20.), px(11.))),
                     ..Default::default()
                 }),
                 focus: !smoke,
@@ -283,11 +292,22 @@ fn main() {
                 // window with neither (GNOME Wayland does no server-side
                 // decorations — the H2 "can't resize by dragging" bug).
                 window_decorations: Some(WindowDecorations::Client),
-                // Transparent surface so the CSD shadow gutter (editor.rs:
-                // render) shows through on the untiled edges. Opaque platforms
-                // (macOS/Windows/X11/SSD) ignore the gutter and the OS draws
-                // the shadow; this only affects the Wayland CSD path.
-                window_background: WindowBackgroundAppearance::Transparent,
+                // Transparent surface ONLY where the CSD shadow gutter
+                // (editor.rs: render) must show through — the Linux client-side-
+                // decoration path (GNOME/sway Wayland draw no server shadow).
+                // macOS and Windows draw their own (server-side) shadow and want
+                // an OPAQUE layer. This matters on macOS specifically: a
+                // transparent CAMetalLayer disables gpui's direct-to-display fast
+                // path and routes every frame through the window server's alpha
+                // compositor for no benefit (we cover the whole window with an
+                // opaque background quad anyway). The author's own note below
+                // already assumed these platforms were opaque — the code just
+                // never made it conditional.
+                window_background: if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                    WindowBackgroundAppearance::Transparent
+                } else {
+                    WindowBackgroundAppearance::Opaque
+                },
                 ..Default::default()
             },
             |window, cx| {
@@ -324,6 +344,33 @@ fn main() {
                     editor
                 });
                 window.focus(&editor.focus_handle(cx), cx);
+                // Single-window app: route an OS-driven close request (the macOS
+                // traffic-light close — now our only window control there since we
+                // hide our own; or a compositor/WM close on Linux/Windows) to
+                // quit, so `on_app_quit` (below) flushes the document + exit state.
+                // macOS does NOT terminate on last-window-close by default, so
+                // without this the native close would just hide the window. Our own
+                // "×" (shown off-macOS) calls cx.quit() directly.
+                //
+                // Return `false` to VETO the platform's synchronous window close
+                // and let cx.quit() be the sole teardown driver — mirroring Zed's
+                // own handler (crates/zed/src/zed.rs). Returning `true` would let
+                // the platform close and DROP the Editor entity *before* quit's
+                // shutdown() runs `on_app_quit`, turning its save_now()/
+                // record_exit_state() into a silent no-op (the handler below uses
+                // update_checked). shutdown() runs on_app_quit *before* clearing
+                // windows, so vetoing keeps the Editor alive until it's saved.
+                //
+                // Calling cx.quit() synchronously here is fine — a clean close of a
+                // normal document exits in ~0.1s. A *slow* close is a separate
+                // problem: the `on_app_quit` save below is synchronous, so a large
+                // document (a multi-MB Loro doc with mark churn) can block teardown
+                // for several seconds and trip the compositor's not-responding
+                // watchdog. That's an engine save-perf issue, not a quit-path one.
+                window.on_window_should_close(cx, |_, cx| {
+                    cx.quit();
+                    false
+                });
                 editor
             },
         )

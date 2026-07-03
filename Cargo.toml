@@ -47,8 +47,17 @@ glob = "0.3"
 # zed-industries/zed once they land. Apps need both the `gpui` facade and
 # `gpui_platform` (selects gpui_linux/gpui_wgpu on Linux):
 # `gpui_platform::application()`. X11 kept on for distribution packaging.
+#
+# `font-kit` must be enabled on BOTH `gpui` AND `gpui_platform`. On macOS the
+# text system lives in `gpui_macos`, gated on `gpui_macos/font-kit`, which ONLY
+# `gpui_platform/font-kit` forwards to. Enabling it on the `gpui` facade alone
+# leaves `gpui_macos` compiling `NoopTextSystem` — which still shapes/lays out
+# text (caret + selection rects land correctly) but paints no glyphs, so the
+# whole UI renders invisible. That was issue #10 (github.com/kirushik/strop/
+# issues/10); the flag is a no-op on the Linux build (gpui_macos is a
+# cfg(target_os = "macos") dep, so nothing forwards there).
 gpui = { git = "https://github.com/kirushik/zed", rev = "c0a1cafaef4e8d8060fa62e0a66c530433b353ba", default-features = false, features = ["font-kit", "wayland", "x11"] }
-gpui_platform = { git = "https://github.com/kirushik/zed", rev = "c0a1cafaef4e8d8060fa62e0a66c530433b353ba", default-features = false, features = ["wayland", "x11"] }
+gpui_platform = { git = "https://github.com/kirushik/zed", rev = "c0a1cafaef4e8d8060fa62e0a66c530433b353ba", default-features = false, features = ["font-kit", "wayland", "x11"] }
 
 [profile.dev]
 # gpui is a huge dep tree; keep its codegen optimized even in dev builds
