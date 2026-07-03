@@ -1,8 +1,16 @@
-# The writing–editing–checkpointing flow: an assembly brief
+# The checkpoint flow: the golden path's mechanism layer
 
-*(2026-07-03, draft for Kirill's reaction — nothing here is built. Companion
-to DESIGN.md §6 Round 2 and the versioning dossier in
-`docs/research/writer-core-loop-2026-06-14.md` §4a; citations live there.)*
+*(2026-07-03, draft — nothing here is built. This is the MECHANISM under
+`docs/golden-path.md`: that document decides what the lifecycle is (phases as
+writer-performed rituals plus a derived record — its D1/D9); this one
+specifies the record. Kirill's review of the first draft: right as a feature,
+too narrow as a frame — the golden-path doc is the frame. Companion to
+DESIGN.md §6 Round 2 and the versioning dossier in
+`docs/research/writer-core-loop-2026-06-14.md` §4a; citations live there.
+Two additions from the golden-path round: checkpoint kinds gain the two
+project-scale rituals — the draft-complete SEAL and the submitted record —
+and a writer-stamped label-as-vocabulary field with zero behavioral
+consequences.)*
 
 ## 0. The defect, stated against ourselves
 
