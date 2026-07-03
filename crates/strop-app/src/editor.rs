@@ -3807,7 +3807,13 @@ impl Editor {
             match store.save_with_state(
                 self.doc.spans(),
                 self.doc.blocks(),
-                &self.doc.export_history(200),
+                // 50, not 200: each persisted undo entry snapshots the FULL
+                // (SpanSet, BlockMap, Annotations) — measured 1.58 MB of JSON
+                // at 200 on a card-heavy document, rewritten into the
+                // append-only oplog on every editing save. Fifty cross-session
+                // undo steps is still deep (in-session undo is unaffected);
+                // the persisted tail is what must stay proportionate.
+                &self.doc.export_history(50),
                 self.doc.notes(),
             ) {
                 Ok(()) => self.store_dirty = false,

@@ -213,6 +213,44 @@ fn style_config() -> StyleConfigMap {
 pub struct Store {
     doc: LoroDoc,
     path: PathBuf,
+    /// Fingerprints of what the last save actually wrote (or what the file
+    /// held at open). `save_with_state` used to rewrite the annotations,
+    /// blocks and undo-history JSON — and unmark+remark every formatting
+    /// span — on EVERY idle save, unchanged or not; in an append-only CRDT
+    /// every rewrite is new oplog forever (the reporter's 4.8 MB file held
+    /// 5.7 KB of prose). Now each piece writes only when its content
+    /// actually changed.
+    saved: std::cell::RefCell<SavedHashes>,
+}
+
+/// See `Store::saved`. Zeroes mean "unknown" — the next save writes.
+#[derive(Default)]
+struct SavedHashes {
+    annotations: u64,
+    blocks: u64,
+    history: u64,
+    /// Over (text, spans) together: Loro's live marks drift from the
+    /// SpanSet only when one of the two changed since the last rebuild.
+    marks: u64,
+}
+
+/// Content fingerprint for the save guards (not cryptographic — this only
+/// ever compares a process's own serializations with each other).
+fn fingerprint(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// The marks-channel fingerprint: text and spans hashed together (see
+/// `SavedHashes::marks`).
+fn marks_fingerprint(text: &str, spans: &SpanSet) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    serde_json::to_string(spans).unwrap_or_default().hash(&mut h);
+    h.finish()
 }
 
 impl Store {
@@ -252,7 +290,7 @@ impl Store {
         match fs::read(&path) {
             Ok(bytes) => {
                 doc.import(&bytes).map_err(io::Error::other)?;
-                let store = Self { doc, path };
+                let store = Self { doc, path, saved: Default::default() };
                 let (text, spans, blocks) = store.read_state();
                 let history = match store.doc.get_map(SESSION_CONTAINER).get("history") {
                     Some(v) => match v.into_value() {
@@ -270,6 +308,23 @@ impl Store {
                     },
                     None => Annotations::default(),
                 };
+                // Seed the save guards with what the file already holds, so
+                // the session's first unchanged save rewrites nothing.
+                *store.saved.borrow_mut() = SavedHashes {
+                    annotations: fingerprint(
+                        &serde_json::to_string(&annotations).unwrap_or_default(),
+                    ),
+                    blocks: fingerprint(
+                        &serde_json::to_string(blocks.kinds()).unwrap_or_default(),
+                    ),
+                    history: history
+                        .as_ref()
+                        .map(|h: &History| {
+                            fingerprint(&serde_json::to_string(h).unwrap_or_default())
+                        })
+                        .unwrap_or_default(),
+                    marks: marks_fingerprint(&text, &spans),
+                };
                 Ok((
                     store,
                     Some(Loaded {
@@ -281,7 +336,9 @@ impl Store {
                     }),
                 ))
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Self { doc, path }, None)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Ok((Self { doc, path, saved: Default::default() }, None))
+            }
             Err(e) => Err(e),
         }
     }
@@ -481,7 +538,10 @@ impl Store {
 
     /// Rebuild Peritext marks + block kinds from the authoritative state,
     /// then snapshot. Durability only matters at the disk boundary, so
-    /// neither is mirrored per-edit — this avoids expand-rule drift.
+    /// neither is mirrored per-edit — this avoids expand-rule drift. Every
+    /// channel is guarded by its `SavedHashes` fingerprint: an unchanged
+    /// piece writes NOTHING, because in an append-only CRDT each rewrite is
+    /// permanent oplog growth (the 4.8 MB-file bug class).
     pub fn save_with_state(
         &self,
         spans: &SpanSet,
@@ -489,15 +549,27 @@ impl Store {
         history: &History,
         annotations: &Annotations,
     ) -> io::Result<()> {
+        let mut saved = self.saved.borrow_mut();
         match serde_json::to_string(annotations) {
             Ok(json) => {
-                if let Err(e) = self.doc.get_map(ANNOTATIONS_CONTAINER).insert("list", json) {
-                    eprintln!("strop: persist annotations: {e}");
+                let h = fingerprint(&json);
+                if h != saved.annotations {
+                    if let Err(e) = self.doc.get_map(ANNOTATIONS_CONTAINER).insert("list", json) {
+                        eprintln!("strop: persist annotations: {e}");
+                    } else {
+                        saved.annotations = h;
+                    }
                 }
             }
             Err(e) => eprintln!("strop: encode annotations: {e}"),
         }
-        self.rebuild_marks(spans);
+        // Marks drift from the SpanSet only when the text or the spans
+        // changed since the last rebuild (Loro's expand rules vs ours).
+        let marks = marks_fingerprint(&self.text(), spans);
+        if marks != saved.marks {
+            self.rebuild_marks(spans);
+            saved.marks = marks;
+        }
         // Block kinds persist as JSON (like history/annotations/checkpoints in
         // this file), not a newline-joined token stream: a '\n' or '\r' inside
         // a CodeBlock.info / Image.src (reachable via .md import of an
@@ -506,20 +578,31 @@ impl Store {
         // alt/caption, which the token format dropped.
         match serde_json::to_string(blocks.kinds()) {
             Ok(json) => {
-                if let Err(e) = self.doc.get_map(BLOCKS_CONTAINER).insert("kinds", json) {
-                    eprintln!("strop: persist blocks: {e}");
+                let h = fingerprint(&json);
+                if h != saved.blocks {
+                    if let Err(e) = self.doc.get_map(BLOCKS_CONTAINER).insert("kinds", json) {
+                        eprintln!("strop: persist blocks: {e}");
+                    } else {
+                        saved.blocks = h;
+                    }
                 }
             }
             Err(e) => eprintln!("strop: encode blocks: {e}"),
         }
         match serde_json::to_string(history) {
             Ok(json) => {
-                if let Err(e) = self.doc.get_map(SESSION_CONTAINER).insert("history", json) {
-                    eprintln!("strop: persist history: {e}");
+                let h = fingerprint(&json);
+                if h != saved.history {
+                    if let Err(e) = self.doc.get_map(SESSION_CONTAINER).insert("history", json) {
+                        eprintln!("strop: persist history: {e}");
+                    } else {
+                        saved.history = h;
+                    }
                 }
             }
             Err(e) => eprintln!("strop: encode history: {e}"),
         }
+        drop(saved);
         self.collect_unreachable_assets(blocks, history);
         self.doc.commit();
         self.save()
@@ -682,6 +765,68 @@ mod tests {
             let _ = list.insert(ix, serde_json::to_string(&cp).unwrap());
         }
         store.doc.commit();
+    }
+
+    /// The oplog-bloat class: a save whose annotations/blocks/history/marks
+    /// did not change must append NOTHING (in an append-only CRDT every
+    /// rewrite is permanent growth — the 4.8 MB-file bug). And the guards
+    /// must seed from the OPENED file, so a fresh session's first unchanged
+    /// save is also a no-op. A real change still writes.
+    #[test]
+    fn unchanged_saves_append_nothing() {
+        let path = temp_path("save-guard");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("текст с примечанием");
+        let spans = SpanSet::default();
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Paragraph]);
+        let history = History::default();
+        let mut notes = Annotations::default();
+        notes.add(0..5, "заметка".into(), 0);
+
+        store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+        let first = fs::metadata(&path).unwrap().len();
+        for _ in 0..5 {
+            store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+        }
+        let after_idle = fs::metadata(&path).unwrap().len();
+        assert_eq!(after_idle, first, "unchanged saves must not grow the file");
+
+        // Guards persist across a reopen: the next session's first
+        // unchanged save is also a no-op.
+        drop(store);
+        let (store, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        store
+            .save_with_state(
+                &loaded.spans,
+                &loaded.blocks,
+                &loaded.history.clone().unwrap_or_default(),
+                &loaded.annotations,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            after_idle,
+            "reopened session's unchanged save must not grow the file"
+        );
+
+        // A real change still writes (and is readable after reopen).
+        let mut notes2 = loaded.annotations.clone();
+        notes2.add(6..7, "ещё".into(), 1);
+        store
+            .save_with_state(
+                &loaded.spans,
+                &loaded.blocks,
+                &loaded.history.unwrap_or_default(),
+                &notes2,
+            )
+            .unwrap();
+        let (_, reloaded) = Store::open(&path).unwrap();
+        assert_eq!(reloaded.unwrap().annotations.open().count(), 2);
+
+        let _ = fs::remove_file(&path);
     }
 
     /// The history-sidebar hang class: checkpoints must be readable WITHOUT
