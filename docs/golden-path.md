@@ -483,6 +483,95 @@ underline, auto_copy_selection are harmless substrate. Footnotes appeared
 only as the column's evidence parking — consistent with their import-
 fidelity origin.
 
+## 9.1 Second review round (Kirill on UX-lab v1, 2026-07-04) — verdicts
+
+**Cold read.** Page numbers + flip-zone shading: endorsed. Corrections
+adopted: (1) the typeface shift (Palatino-class vs the editor's Georgia-class)
+is probably NOT a strong enough estrangement stimulus on its own — v2 offers
+graded strengths (mild serif shift / slab / typewriter) to taste-test;
+(2) the "justified + hyphenated" claim was a stale lab note — the build
+deliberately went ragged-right after the Kindle-sin research; the real
+editor owns its hyphenation, so justified+hyphenated stays open for the GPUI
+implementation; (3) mock page breaks read as arbitrary because they were —
+real pagination reflows; (4) texture concept liked, execution rejected: the
+dot-grid's REGULARITY is the problem — v2 uses irregular noise
+(feTurbulence-class); (5) typing-attempt feedback: no toast — PULSE THE
+EXISTING BANNER phrase instead (no overlapping surfaces, ever);
+(6) **churn heat is EVICTED from the cold read**: reading mode cultivates the
+reader's eyes, and "you edited this ×14" yanks the writer back into writer
+stance, contaminating the estrangement. It moves to writer-stance surfaces:
+a summonable editor LENS (find-match-style tint, palette-invoked, P4) and/or
+history rows; (7) history-preview banner: emphasis flipped — the checkpoint's
+NAME (+ date) is the payload, "viewing a checkpoint" is chrome and goes muted.
+
+**Asides.** (1) The side-panel compost variant as mocked was broken and fairly
+lost — but the variant question stays open with a better candidate: the LEFT
+rail (structure territory, where the outline rail lives); (2) checkboxes in
+compost REJECTED — they break the equality of editing mechanics and drift
+toward grocery-list tooling; struck-through text is the beat-done idiom (the
+strikethrough format exists); prose must never grow native clickable
+checkboxes; (3) the fold chip must BECOME the expanded block's header (the
+mock read as "two composts"); (4) compost scroll behavior must be explicit:
+it is in-flow and scrolls away with the document; (5) the blank-page moment
+needs its own empathy round — where compost is explained the first time a
+NEW document opens (without violating the zero-questions-at-open law);
+(6) graveyard: natural, and READ-ONLY — put-back and delete are its only
+verbs (compost is a workbench; the graveyard is an archive); (7) the
+selection popover OVER text is rejected on principle — selection actions move
+to a right-margin anchored menu at selection height (annotation territory),
+which also naturally hosts "ask the editor about this selection" (a flow
+Kirill already finds useful); (8) origin labels can't assume headings —
+derive: nearest heading, else a quote of the preceding sentence, else a
+paragraph ordinal; "show origin" = jump + flash the cut site (to demo);
+(9) graveyard overflow: entries recede to one-line headers as they age (the
+margin lane's recede idiom, reused); find works on it — it's document text.
+
+**Passes.** "Ask the editor" endorsed strongly — and PROMOTED to the
+subsystem's single home: it should carry the door state (toggle), the
+open/resolved counts, the in-flight "editor is cooking" indicator, and the
+pass menu. The popup anchors UNDER the button (never detached, never over
+the column). Selection-scoped passes join the right-margin selection menu.
+**Cut-to-fit demoted from a pass to a prompt inflection**: the need is niche,
+trust in an LLM's cut-list is low, and the useful form ("the scene where she
+enters can be simplified") is what a developmental/line pass already says
+when a cap exists — the cap becomes context, not a feature. The cap itself
+joins the existing goal surface (one "Set a goal…" home; no field zoo — the
+deadline stayed shelved for the same reason). Margin cards: the
+label/provenance anatomy gets a redesign round (no duplicated "developmental",
+provenance always visible at low contrast, not hover-only).
+
+**Ctrl+S / history.** The acknowledgment placement is settled
+(titlebar + history-icon pulse >> bottom whisper). The ↺ icon FAILS — read
+twice as refresh; needs a history-true glyph. And the big opening: history
+navigation itself gets reimagined around "saves every keystroke" — a
+pseudo-playback scrubber, inspiration from NLE/DAW timelines, bottom panel,
+color-coded edit kinds against the plain black-on-white text ("the history
+rewind is an explosion of color-coded technical abstraction, still
+navigable"). A dedicated UX-lab round with several takes; research
+commissioned (Etherpad time-slider, Docs' old revision slider, History Flow,
+video/DAW scrubbing conventions).
+
+**Re-entry: REJECTED as mocked; redo from fundamentals.** The named defects:
+(A) the banner puts software voice INSIDE the writer's text territory — the
+only surface where Strop fails to keep its opinions in the margins;
+(B) "NEXT" and friends were tool-invented kickers — only the writer writes
+in that space; (C) the state labels ("mid-descent", "in progress") task the
+writer with our idiosyncratic bookkeeping, or worse, assert software
+assumptions as states. Plus the grammar failure: one surface mixed a noun
+phrase ("Believing read"), a suggestion ("Read it cold"), and a command
+("Return to the open queries") — **"UI is grammar"** enters the fundamental
+principles (research commissioned on menu-grammar guidance). The v2
+direction: prose territory carries ONLY writer-authored words (the shipped
+intent sentence, attributed as theirs); derived facts live in machine
+territory (titlebar, the editor button, menu ordering) phrased as FACTS;
+the confidence rule — the less certain the software's inference, the less
+the UI may differ between states. Also "Copy — held while structural queries
+are open" read as veiled critique of the writing; held-states must point at
+the QUERIES, not the prose (e.g., "after the structural queries settle").
+
+**Meta.** Mockups must simulate the living editor (caret, realistic text) on
+every desk scene — a dead page reads wrong even as a sketch.
+
 ## 10. Method note
 
 This document was produced the way Strop says writing works: a believing
