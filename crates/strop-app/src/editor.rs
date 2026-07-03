@@ -564,13 +564,15 @@ pub fn bind_keys(cx: &mut App) {
 /// How the writer is engaging the margin right now. There is one keyboard
 /// focus and one composer, so a card can be in exactly one of these states at
 /// a time — and only ONE card can be selected or composed at once. Encoding
-/// that as a single enum (instead of the old `active_note` + `composing_note`
-/// + `note_input` trio) makes the desync states that caused real, persisted
-/// bugs **unrepresentable**:
-///   - a composer floating on a card that is no longer selected,
-///   - a committed note rendering blank (composer gone, body still suppressed),
-///   - a draft leaking onto whatever card was clicked instead of the one being
-///     edited.
+/// that as a single enum (instead of the old `active_note` +
+/// `composing_note` + `note_input` trio) makes the desync states that caused
+/// real, persisted bugs **unrepresentable**:
+///
+/// - a composer floating on a card that is no longer selected,
+/// - a committed note rendering blank (composer gone, body still suppressed),
+/// - a draft leaking onto whatever card was clicked instead of the one being
+///   edited.
+///
 /// Every one of those was two booleans that drifted apart. Here they cannot:
 /// the composer's identity and its `NoteInput` live in the same variant, and
 /// the SINGLE exit from `Composing` (`resolve_composer`) persists the draft to
@@ -2220,25 +2222,24 @@ impl Editor {
         // out: snapshot its rendered slot BEFORE the model change (afterwards
         // it has no card to snapshot). The model itself commits immediately —
         // only the light lingers (departing), never the data.
-        if matches!(status, NoteStatus::Done | NoteStatus::Dismissed) {
-            if let Some(card) =
+        if matches!(status, NoteStatus::Done | NoteStatus::Dismissed)
+            && let Some(card) =
                 self.margin_cards(true).cards.into_iter().find(|c| c.id == id)
-            {
-                self.departing.push((card, Instant::now()));
-                cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(CARD_RESOLVE + Duration::from_millis(50))
-                        .await;
-                    this.update(cx, |editor: &mut Editor, cx| {
-                        editor
-                            .departing
-                            .retain(|(_, since)| since.elapsed() < CARD_RESOLVE);
-                        cx.notify();
-                    })
-                    .ok();
+        {
+            self.departing.push((card, Instant::now()));
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(CARD_RESOLVE + Duration::from_millis(50))
+                    .await;
+                this.update(cx, |editor: &mut Editor, cx| {
+                    editor
+                        .departing
+                        .retain(|(_, since)| since.elapsed() < CARD_RESOLVE);
+                    cx.notify();
                 })
-                .detach();
-            }
+                .ok();
+            })
+            .detach();
         }
         self.doc.set_note_status(id, status);
         if self.focus.active_id() == Some(id) {
@@ -9515,13 +9516,15 @@ struct PlaceItem {
 /// Place margin cards in ONE pass and return each card's top (viewport-space),
 /// in input order. Items come in document/anchor order. Three guarantees,
 /// pinned down by the packer proptests:
-///   1. no two cards EVER overlap (the writer's never-overlap rule, no excuses);
-///   2. every card sits at/below `floor` (never under the titlebar) — EXCEPT a
-///      card the active card displaced upward off the top edge, which the caller
-///      culls into the `above` count (so it is never painted under the titlebar);
-///   3. the ACTIVE card lies fully within `[floor, viewport_bottom]` whenever
-///      its height fits there — UNCONDITIONALLY, even when a pinned writer note
-///      competes for the slack above it: the focused card wins the lane.
+///
+/// 1. no two cards EVER overlap (the writer's never-overlap rule, no excuses);
+/// 2. every card sits at/below `floor` (never under the titlebar) — EXCEPT a
+///    card the active card displaced upward off the top edge, which the caller
+///    culls into the `above` count (so it is never painted under the titlebar);
+/// 3. the ACTIVE card lies fully within `[floor, viewport_bottom]` whenever
+///    its height fits there — UNCONDITIONALLY, even when a pinned writer note
+///    competes for the slack above it: the focused card wins the lane.
+///
 /// Mechanics: writer notes (Layer A) and the active card hold their anchors;
 /// inactive diagnoses (Layer B) yield around them. The active card's anchor is
 /// first clamped UP so the whole card fits the viewport (the "selected card ran
@@ -9821,7 +9824,7 @@ fn note_at_char(ranges: &[(u64, usize, usize)], c: usize) -> Option<u64> {
 /// copy-level one is held back while a developmental one is still open (the
 /// mandatory altitude order). The held-back ones surface as the rail's count.
 fn note_surfaces(kind: NoteKind, level: &str, drafting: bool, has_dev: bool) -> bool {
-    kind != NoteKind::Diagnosis || (!drafting && !(has_dev && level == "copy"))
+    kind != NoteKind::Diagnosis || (!drafting && (!has_dev || level != "copy"))
 }
 
 impl Editor {
@@ -9909,11 +9912,10 @@ impl Editor {
                 continue;
             }
             let key = card_height_key(kind, &title, &body);
-            if !self.card_heights.contains_key(&key) {
+            self.card_heights.entry(key).or_insert_with(|| {
                 let (t, min_rows) = if is_diag { (title.as_str(), 0.) } else { ("", 1.) };
-                let h = Self::measure_card_height(window, t, &body, min_rows);
-                self.card_heights.insert(key, h);
-            }
+                Self::measure_card_height(window, t, &body, min_rows)
+            });
         }
     }
 

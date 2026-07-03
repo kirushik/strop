@@ -231,6 +231,11 @@ pub struct TextField {
 /// line soft-wraps within the box on its own. `Wrapped` carries one row per
 /// hard line so the caret, clicks, and vertical motion map across them — the
 /// single-line-only mapping was the "Shift+Enter jumps to line 0" bug.
+// The large variant (`Single`, a whole `ShapedLine`) is the COMMON single-line
+// case; boxing it to appease `large_enum_variant` would push that hot path onto
+// the heap for a per-field layout-size win that never matters (one value, held
+// across frames in `Option<FieldGeometry>`).
+#[allow(clippy::large_enum_variant)]
 enum FieldGeometry {
     Single(gpui::ShapedLine),
     Wrapped(Vec<WrappedRow>),
@@ -1058,6 +1063,9 @@ impl TextFieldElement {
 
 /// What `prepaint` shaped for `paint`: a single horizontally-scrolled line, or a
 /// soft-wrapped block that paints across rows (the note composer).
+// Same call as `FieldGeometry`: the large `Single` arm is the common case and
+// this value is transient per-paint, so boxing buys nothing worth an alloc.
+#[allow(clippy::large_enum_variant)]
 enum ComposerLayout {
     Single(Option<gpui::ShapedLine>),
     /// One shaped `WrappedLine` per hard line ("\n"-delimited), top to bottom.
