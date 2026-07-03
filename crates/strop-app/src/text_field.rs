@@ -899,12 +899,18 @@ impl EntityInputHandler for TextField {
             .map(|r| utf16_to_byte(&self.content, r.start)..utf16_to_byte(&self.content, r.end))
             .or_else(|| self.marked.clone())
             .unwrap_or_else(|| self.sel_range());
+        // Enforce the newline policy on the preedit too: `replace()`'s guard is
+        // bypassed on this IME/dictation path, so without this a single-line
+        // field could take a \n/\r via composition. Offsets are measured on the
+        // SANITIZED text so the marked range and cursor never desync from what
+        // was actually spliced in.
+        let text = sanitize_for_field(text, self.multiline);
         // Splice the preedit in and keep it marked so the next compose step
         // replaces it cleanly (the byte range is exact).
-        self.content.replace_range(range.clone(), text);
+        self.content.replace_range(range.clone(), &text);
         let marked = range.start..range.start + text.len();
         self.cursor = new_selected_utf16
-            .map(|s| marked.start + utf16_to_byte(text, s.end))
+            .map(|s| marked.start + utf16_to_byte(&text, s.end))
             .unwrap_or(marked.end);
         self.anchor = None;
         self.marked = Some(marked);

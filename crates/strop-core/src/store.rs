@@ -473,10 +473,13 @@ impl Store {
         cp.manual = true;
         match serde_json::to_string(&cp) {
             Ok(json) => {
-                let _ = list.delete(ix, 1);
+                // Insert-before-delete (see `set_checkpoint_state`): a failed
+                // insert must not drop the checkpoint being renamed.
                 if let Err(e) = list.insert(ix, json) {
                     eprintln!("strop: rename checkpoint: {e}");
+                    return;
                 }
+                let _ = list.delete(ix + 1, 1);
                 self.doc.commit();
             }
             Err(e) => eprintln!("strop: encode checkpoint: {e}"),
@@ -552,10 +555,14 @@ impl Store {
         cp.state = Some(state);
         match serde_json::to_string(&cp) {
             Ok(json) => {
-                let _ = list.delete(ix, 1);
+                // Insert the updated copy BEFORE removing the old one: a failed
+                // insert then leaves the original intact at `ix` and commits
+                // nothing, so the checkpoint can never be lost outright.
                 if let Err(e) = list.insert(ix, json) {
                     eprintln!("strop: backfill checkpoint state: {e}");
+                    return;
                 }
+                let _ = list.delete(ix + 1, 1);
                 self.doc.commit();
             }
             Err(e) => eprintln!("strop: encode checkpoint: {e}"),

@@ -30,7 +30,7 @@ the build the tester has — mark each row's status before handing this out.
 | Knob | Behaviour under test | The question this trial answers |
 |---|---|---|
 | **Reveal timing** | AI cards from a finished pass *announce* immediately (a quiet cue) but *appear* only when you turn to review (scroll/hover the margin, open the door, or a long pause) — never mid-typing | Does it ever feel like the AI interrupts mid-thought? Does deferring ever feel like the feedback is "lost" or late? |
-| **Pause threshold** | ~1.5 s of typing-stillness counts as a pause | Too eager (cards pop while still thinking) vs too sluggish (waiting after you've clearly stopped)? |
+| **Pause threshold** | ~1 s of typing-stillness counts as a pause (`TYPING_LULL`) | Too eager (cards pop while still thinking) vs too sluggish (waiting after you've clearly stopped)? |
 | **Completion cue** | *(pip CUT — not in build)* a pass announces itself via the title-bar note + the cards landing at your next pause | Is that enough — did you ever wonder whether a pass was still running? (If many say yes, the pip earns its way back.) |
 | **Card budget** | at most ~5 AI cards show *full-size* per screen; older ones shrink to a one-line card at their sentence (click to expand) — nothing is ever hidden | Does the margin ever feel cluttered/"wallpaper"? Do the small one-line cards read as "still there," or do they feel demoted/lost? |
 | **Motion** | cards fade/slide in; nothing pops, loops, or bounces | Calm vs distracting? Anything feel laggy/janky? |
