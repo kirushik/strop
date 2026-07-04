@@ -572,6 +572,102 @@ the QUERIES, not the prose (e.g., "after the structural queries settle").
 **Meta.** Mockups must simulate the living editor (caret, realistic text) on
 every desk scene — a dead page reads wrong even as a sketch.
 
+## 9.2 Third review round (Kirill on UX-lab v2, 2026-07-04) — verdicts
+
+**Two new fundamental principles, named by Kirill, adopted:**
+- **The screenshot test.** Every frame of an in-transition animation must
+  make sense if captured as a still. (Extends attention-motion's "animate
+  moves, not pops" — it constrains what may exist MID-move.)
+- **Widget contracts: extend, never subvert.** A control that looks like a
+  common widget must behave like one; enriching its content is fine, faking
+  its nature is not. Logged as a SHIPPED bug under this principle: the
+  titlebar search/palette control is a fake button that spawns a separate
+  popup field instead of becoming the field with the dropdown glued to it.
+  Same sin at small scale in lab v2: the editor-button menu rendered
+  detached from its control. Both fix directions: the control IS the field/
+  anchor; attached, flush, aligned.
+- Corollary reaffirmed: **hover may only EXPAND visible data** (relative →
+  absolute dates), never carry sole semantics — no orientation without a
+  mouse, no comparing two hover-values.
+
+**Cold read.** The BOOKISH face (Bookman-class) wins. And the fake dies:
+if the page imitates a book, it hyphenates like one — the cold read goes
+**justified + real hyphenation** (we own the layout engine; Knuth-Liang
+pattern crates exist in Rust; ragged-right was the mock's browser-limitation
+compromise, not a design). Texture, banner-pulse, checkpoint-name-led
+history banner: accepted. Two openings noted: **footnote placement on
+pages** is nontrivial (the classic pagination/float problem — its own
+research item inside G1), and margin reactions need visible anchor links in
+the real implementation.
+
+**Asides.** The right-margin selection menu: accepted — next markup
+iteration should RHYME it with the left-side formatting affordance (one
+screen showing both flanks of a selection). Responsive behavior: textual
+spec suffices for now. **Compost pivots from prose to CARDS** in a left
+rail: "weird ideas, clippings, elements and todos" — the wall-of-text
+metaphor was wrong for it, and narrowness stops hurting once items are
+cards. The two-card-families cognitive-load worry gets this candidate
+resolution: the split is ANCHORED vs UNANCHORED, not left vs right — a card
+is one grammar; anchored cards live in the margin at their anchors (notes +
+queries), unanchored material lives in the left rail (compost); the
+graveyard entry is a card whose anchor is a PAST position. Text supremacy
+stands: the prose column concedes nothing.
+
+**The graveyard footer (Kirill's design, adopted whole).** A long document
+can't rely on a tail section alone: a quiet sticky FOOTER chip carries the
+graveyard's presence — click scrolls to the section; an exile blinks it,
+ticks its counter, and offers an immediate undo; "show origin" RETAINS the
+segment in the footer (small/truncated) while the main text scrolls to the
+cut site; and when the actual graveyard scrolls into view the footer
+UNSTICKS and becomes the section's own header — smoothly, passing the
+screenshot test at every frame.
+
+**The editor button.** v2's lane showed AI cards in drafting/cooking states
+— a mockup error; the door's law stands (cards rest behind the rail).
+Wording: "1 read waiting" is jargon — "**a read is ready**" / "2 reads
+ready"; never "5 new" (no read-state exists, by design). Cards: "done"
+gains the dotted-underline affordance of an in-text action; done (=
+addressed) and × (= dismissed, teaches suppression) must stop looking like
+accidental siblings — the card-anatomy round owns this.
+
+**Re-entry, third pass — the intent may not deserve to be an ENTITY.**
+Kirill's challenge: there is no polite UX moment to force/prompt a
+note-to-future-self (popup-on-close = rage-uninstall), the entity's
+lifecycle is murky (reappear after dismissal?), and a writer could just
+TYPE the note and highlight it — caret+scroll restore (shipped) already
+delivers the re-entry. Direction v3: **the intent becomes text** — the
+End-Session verb (or plain habit) writes the writer's line INTO the
+document (highlighted, at the caret) or as a compost card; no separate
+entity, no banner, no lifecycle; the tutorial teaches the practice; the
+evidence (implementation intentions d=0.65) backs the PRACTICE, not the
+storage mechanism. Open: discoverability without any nudge (Kirill: "no
+consistent answer" — candidate: the tutorial + the palette verb).
+
+**The history strip: "the main not-there-yet." Full redesign round.**
+v2 critiques, recorded as requirements: bar-height semantics were a mystery
+(kill unexplained encodings); rollback-to-any-moment vs snapshots was
+ambiguous (answer: ANY moment — the scrub is continuous; stop forcing the
+near-continuous stream into discrete chunks); station labels must be
+VISIBLE (with a collision policy), not hover-gated; sessions are COMPOSITE
+(writing and cutting interleave in one sitting — a single-kind bar is a
+lie); density was far too low (test at 3× events, longer text); the
+Fingerprint dots were same-size unexplained marks, and localizing "an
+editor's pass" to one y-position is semantically false (a pass reads the
+whole document); Strata as drawn was nonsense (bands accumulated instead of
+interleaving; the vertical axis wasn't position; a restore was
+unrepresentable). Tufte's data-ink verdict: underused information density
+throughout. KEPT: machine-room dark; live rewind in the main window.
+**Method for v3 (Kirill's mandate): the Data Laboratory / infotanka
+approach — pick the individual DATA ATOM and build the full picture from
+it** (Misyutina's visualization course; 404fest-2013 lecture), plus a
+design-icon persona panel (Tufte, Victor, Raskin, Engelbart, Birman) to
+ideate and critique. The atom model to build from: text ops {t, pos, ±len}
+in one linear stream, plus card events {raised/resolved/dismissed, anchor},
+pass events {kind, span}, checkpoint events {kind, name}, restores
+{from} — sessions and bursts are DERIVED (gaps in the stream), never
+imposed. The strip could be the killer feature riding "we save every
+keystroke"; it must be earned, not decorated.
+
 ## 10. Method note
 
 This document was produced the way Strop says writing works: a believing
