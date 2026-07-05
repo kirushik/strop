@@ -308,6 +308,35 @@ expect "the preview walks the selection"     '[1,2]' "$(echo "$O2" | grep -oE '"
 expect "Esc returns focus to the prose"      '"Editor"' "$(field "$O3" focused)"
 expect "Esc walks the selection home"        '[6,6]' "$(echo "$O3" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')"
 
+echo "rig-check: keyboard nav past the fold scrolls the omni-list; wheel still works (palette-scroll)"
+# f10 opens the omnibox straight into command mode (bare `>`) — the grouped
+# Frequent/File/Edit/… browsing view, comfortably longer than the 420px
+# list, so 20 downs walks the highlight well past the visible window. The
+# bug: palette_up/down moved `palette_selected` but never scrolled, so the
+# writer navigated blind. The fix nudges a tracked ScrollHandle on every
+# selection change; a manual wheel scroll afterwards must still work AND
+# must not get snapped back by an unrelated redraw (the wait:200 with no
+# input in between).
+DOCP=$(mktemp --suffix=.md); : > "$DOCP"
+KEYS="f10"
+for _ in $(seq 1 20); do KEYS="$KEYS down"; done
+KEYS="$KEYS dump:ui wheel:800,300,300 dump:ui wait:200 dump:ui"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCP" "$KEYS" 2>/dev/null | grep -oE '"omni":\{[^}]*\}')
+P1=$(echo "$OUT" | sed -n 1p); P2=$(echo "$OUT" | sed -n 2p); P3=$(echo "$OUT" | sed -n 3p)
+[ -n "$P3" ] || { echo "  FAIL no omni dump"; exit 1; }
+rm -f "$DOCP" "$DOCP.strop"
+expect "20 downs select row 20" 20 "$(field "$P1" selected)"
+S1=$(field "$P1" scroll_y); S2=$(field "$P2" scroll_y); S3=$(field "$P3" scroll_y)
+if awk "BEGIN{exit !($S1 < -1)}" 2>/dev/null; then
+  echo "  ok   the list scrolled to keep row 20 visible (scroll_y=$S1)"
+else
+  echo "  FAIL row 20 selected but scroll_y=$S1 — navigation walked off-screen blind"; fail=1
+fi
+if [ "$S2" != "$S1" ]; then echo "  ok   the wheel still moves the list ($S1 -> $S2)"; else
+  echo "  FAIL wheel did not move scroll_y ($S1)"; fail=1; fi
+expect "selection is untouched by the wheel"            20  "$(field "$P2" selected)"
+expect "an unrelated redraw doesn't snap the wheel back" "$S2" "$S3"
+
 echo "rig-check: set-aside shows compliance — the rail opens on first birth and never self-closes"
 DOCR=$(mktemp --suffix=.md); : > "$DOCR"
 OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCR" "onexx enter enter twoxx ctrl-home select:para aside:selection wait:80 dump:ui ctrl-end select:para aside:selection wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
