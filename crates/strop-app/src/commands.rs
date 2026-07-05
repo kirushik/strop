@@ -213,7 +213,7 @@ pub fn all() -> &'static [Command] {
         cmd!(
             "Send to the Graveyard",
             "Asides",
-            None,
+            Some("ctrl-shift-g"),
             SendToGraveyard,
             ["cut", "delete to graveyard", "в могилу", "вырезать"]
         ),

@@ -9564,8 +9564,10 @@ impl Editor {
                     div()
                         .absolute()
                         .top(px(top))
-                        .left(px(8.))
-                        .w(px(MARGIN_WIDTH - 8.))
+                        // Borrow half the margin gap: the chord chips need the
+                        // room, and the extra 8px stays off the prose.
+                        .left(px(0.))
+                        .w(px(MARGIN_WIDTH))
                         // Rows stack top-down (GPUI defaults to flex-row): the
                         // carrier sentences are a column, one verb per line.
                         .flex()
@@ -9575,44 +9577,31 @@ impl Editor {
                         .border_color(rgb(RULE_COLOR))
                         .rounded(px(9.))
                         .shadow_md()
-                        // Idle translucent, waking on hover (the selmenu idiom):
-                        // a resting affordance that doesn't shout over the prose.
-                        .opacity(0.72)
-                        .hover(|d| d.opacity(1.))
+                        // Fully opaque: the menu shares the lane with margin
+                        // cards, and the old resting translucency (0.72) let a
+                        // card bleed through the rows — an unreadable double
+                        // exposure whenever the two overlapped.
                         .font_family("PT Sans")
                         .text_size(px(12.5))
                         .py(px(2.))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(self.selection_menu_row(
-                            "sel-note",
-                            SelVerb::Note,
-                            rgb(ACTIVE_BORDER),
-                            "Add a note",
-                            false,
-                            cx,
-                        ))
+                        .child(self.selection_menu_row("sel-note", SelVerb::Note, "Add a note", cx))
                         .child(self.selection_menu_row(
                             "sel-aside",
                             SelVerb::Aside,
-                            rgb(MUTED_COLOR),
                             "Set aside, out of the story",
-                            false,
                             cx,
                         ))
                         .child(self.selection_menu_row(
                             "sel-grave",
                             SelVerb::Graveyard,
-                            rgb(0xC9C5BAu32),
                             "Send to the graveyard",
-                            true,
                             cx,
                         ))
                         .child(self.selection_menu_row(
                             "sel-ask",
                             SelVerb::Ask,
-                            rgb(AI_ACCENT),
                             "Ask the editor about this…",
-                            false,
                             cx,
                         )),
                 ),
@@ -9630,22 +9619,45 @@ impl Editor {
         &self,
         id: &'static str,
         verb: SelVerb,
-        dot: gpui::Rgba,
         label: &'static str,
-        destructive: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // Each verb's dress derives from the verb itself: the colour-language
+        // dot (warm = the writer's note, drained = the graveyard, cool = the
+        // machine ask), the chord it teaches, and whether the hover wash warns.
+        let (dot, chord, destructive) = match verb {
+            SelVerb::Note => (rgb(ACTIVE_BORDER), "ctrl-m", false),
+            SelVerb::Aside => (rgb(MUTED_COLOR), "ctrl-shift-a", false),
+            SelVerb::Graveyard => (rgb(0xC9C5BAu32), "ctrl-shift-g", true),
+            SelVerb::Ask => (rgb(AI_ACCENT), "ctrl-shift-d", false),
+        };
         div()
             .id(id)
             .flex()
             .items_center()
             .gap(px(8.))
-            .px(px(12.))
+            .px(px(11.))
             .py(px(7.))
             .cursor(CursorStyle::PointingHand)
             .hover(|d| d.bg(rgb(if destructive { STALE_BG } else { NOTE_CARD_BG })))
             .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(dot))
             .child(div().text_color(rgb(TEXT_COLOR)).child(label))
+            // The chord chip (the lab's `.k` keycap): the menu teaches its own
+            // shortcuts in place, instead of a manual teaching them in prose.
+            .child(
+                div()
+                    .ml_auto()
+                    .flex_shrink_0()
+                    .px(px(3.))
+                    .font_family(CODE_FONT)
+                    .text_size(px(9.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .rounded(px(4.))
+                    .bg(rgb(BG_COLOR))
+                    .child(chord),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
@@ -9724,401 +9736,406 @@ impl Editor {
             .border_color(rgb(RULE_COLOR))
             .font_family("PT Serif")
             .text_size(px(13.))
-            // macOS draws its native traffic-light buttons over the top-left of
-            // our (full-size-content) titlebar — recentred by `traffic_light_
-            // position` in main.rs. Reserve their width so the outline toggle and
-            // document name start to their right instead of underneath them.
-            .when(cfg!(target_os = "macos"), |bar| {
-                bar.child(div().w(px(76.)).h_full())
-            })
-            // The outline opens the LEFT rail, so its control lives at the
-            // far left — spatial honesty (the H2 papercut: it was on the
-            // right). Three stacked bars, drawn like every titlebar glyph.
+            // Left third. This and the controls third below are symmetric
+            // flex_1 spans, so the Search button between them stays truly
+            // centred no matter how the editor button's label breathes
+            // (the jumping-Search bug).
             .child(
                 div()
-                    .id("outline-toggle")
-                    .occlude()
-                    .px(px(8.))
-                    .py(px(2.))
-                    .ml(px(8.))
-                    .rounded(px(5.))
-                    .cursor(CursorStyle::PointingHand)
-                    .when(self.outline_open, |d| d.bg(rgba(0x1A1A1812u32)))
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("Outline", Some("ctrl-shift-o")))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            editor.toggle_outline(&ToggleOutline, window, cx);
-                        }),
-                    )
-                    .child({
-                        let bar_color = if self.outline_open {
-                            rgb(TEXT_COLOR)
-                        } else {
-                            rgb(MUTED_COLOR)
-                        };
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_start()
-                            .gap(px(2.))
-                            .children(
-                                [11., 8., 5.]
-                                    .into_iter()
-                                    .map(|w| div().w(px(w)).h(px(1.5)).bg(bar_color)),
-                            )
-                    }),
-            )
-            // Document name — click or F2 to rename in place, file and all.
-            .child(match (&self.doc_rename_input, &self.store) {
-                (Some(input), _) => div()
-                    .occlude()
-                    .ml(px(8.))
-                    .w(px(220.))
-                    .child(input.clone())
-                    .into_any_element(),
-                (None, Some(store)) => {
-                    let stem = store
-                        .path()
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Untitled")
-                        .to_owned();
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                // macOS draws its native traffic-light buttons over the top-left of
+                // our (full-size-content) titlebar — recentred by `traffic_light_
+                // position` in main.rs. Reserve their width so the outline toggle and
+                // document name start to their right instead of underneath them.
+                .when(cfg!(target_os = "macos"), |bar| {
+                    bar.child(div().w(px(76.)).h_full())
+                })
+                // The outline opens the LEFT rail, so its control lives at the
+                // far left — spatial honesty (the H2 papercut: it was on the
+                // right). Three stacked bars, drawn like every titlebar glyph.
+                .child(
                     div()
-                        .id("doc-title")
+                        .id("outline-toggle")
                         .occlude()
+                        .px(px(8.))
+                        .py(px(2.))
                         .ml(px(8.))
-                        .px(px(4.))
-                        .rounded(px(4.))
-                        .text_color(rgb(MUTED_COLOR))
+                        .rounded(px(5.))
                         .cursor(CursorStyle::PointingHand)
+                        .when(self.outline_open, |d| d.bg(rgba(0x1A1A1812u32)))
                         .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("Rename", Some("f2")))
+                        .tooltip(tip("Outline", Some("ctrl-shift-o")))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
-                                editor.rename_document(&RenameDocument, window, cx);
+                                editor.toggle_outline(&ToggleOutline, window, cx);
                             }),
                         )
-                        .child(stem)
-                        .into_any_element()
-                }
-                (None, None) => div()
-                    .ml(px(8.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .child("Strop")
-                    .into_any_element(),
-            })
-            // Word count + the session goal's live delta (DESIGN §4.2).
-            // Clickable: sets or changes the goal for this sitting.
-            .child(
-                div()
-                    .id("word-count")
-                    .occlude()
-                    .ml(px(12.))
-                    .px(px(4.))
-                    .rounded(px(4.))
-                    .cursor(CursorStyle::PointingHand)
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("Set session goal", None))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            editor.set_session_goal(&SetSessionGoal, window, cx);
+                        .child({
+                            let bar_color = if self.outline_open {
+                                rgb(TEXT_COLOR)
+                            } else {
+                                rgb(MUTED_COLOR)
+                            };
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap(px(2.))
+                                .children(
+                                    [11., 8., 5.]
+                                        .into_iter()
+                                        .map(|w| div().w(px(w)).h(px(1.5)).bg(bar_color)),
+                                )
                         }),
-                    )
-                    .child({
-                        let count = format_thousands(self.word_count);
-                        match self.session_goal {
-                            None => div()
-                                .text_color(rgb(MUTED_COLOR))
-                                .child(format!("{count} words"))
-                                .into_any_element(),
-                            Some((goal, start)) => {
-                                let delta = self.word_count as i64 - start as i64;
-                                let reached = delta >= goal as i64;
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child(format!("{count} words"))
-                                    .child(if reached {
-                                        // Goal met: the separator quietly fills
-                                        // in sage. No banner (§4b tension 3).
-                                        div()
-                                            .size(px(5.))
-                                            .rounded_full()
-                                            .bg(rgb(SAGE_COLOR))
-                                            .into_any_element()
-                                    } else {
-                                        div().child("·").into_any_element()
-                                    })
-                                    .child(format!("{delta:+}/{goal}"))
-                                    .into_any_element()
-                            }
-                        }
-                    }),
-            )
-            // The centre holds the omnibox pill (DESIGN §2-omnibox): a
-            // search-field-shaped button, not a live field — "text is sacred",
-            // so the chrome only ever opens the real thing. The space around
-            // it stays the window-drag handle.
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .px(px(12.))
-                    .child(
+                )
+                // Document name — click or F2 to rename in place, file and all.
+                .child(match (&self.doc_rename_input, &self.store) {
+                    (Some(input), _) => div()
+                        .occlude()
+                        .ml(px(8.))
+                        .w(px(220.))
+                        .child(input.clone())
+                        .into_any_element(),
+                    (None, Some(store)) => {
+                        let stem = store
+                            .path()
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Untitled")
+                            .to_owned();
                         div()
-                            .id("omni-pill")
+                            .id("doc-title")
                             .occlude()
-                            .flex_1()
-                            .max_w(px(320.))
-                            .px(px(10.))
-                            .py(px(3.))
-                            .rounded(px(6.))
-                            .border_1()
-                            .border_color(rgb(RULE_COLOR))
-                            .bg(rgb(0xFCFAF4))
+                            .ml(px(8.))
+                            .px(px(4.))
+                            .rounded(px(4.))
+                            .text_color(rgb(MUTED_COLOR))
                             .cursor(CursorStyle::PointingHand)
-                            .when(self.palette_input.is_some(), |d| d.bg(rgb(0xF2EFE6)))
-                            .hover(|d| d.bg(rgb(0xF2EFE6)))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .tooltip(tip("Search · > commands · @ headings", Some("ctrl-f")))
+                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                            .tooltip(tip("Rename", Some("f2")))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                     cx.stop_propagation();
-                                    editor.find(&Find, window, cx);
+                                    editor.rename_document(&RenameDocument, window, cx);
                                 }),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
+                            .child(stem)
+                            .into_any_element()
+                    }
+                    (None, None) => div()
+                        .ml(px(8.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child("Strop")
+                        .into_any_element(),
+                })
+                // Word count + the session goal's live delta (DESIGN §4.2).
+                // Clickable: sets or changes the goal for this sitting.
+                .child(
+                    div()
+                        .id("word-count")
+                        .occlude()
+                        .ml(px(12.))
+                        .px(px(4.))
+                        .rounded(px(4.))
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Set session goal", None))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.set_session_goal(&SetSessionGoal, window, cx);
+                            }),
+                        )
+                        .child({
+                            let count = format_thousands(self.word_count);
+                            match self.session_goal {
+                                None => div()
                                     .text_color(rgb(MUTED_COLOR))
-                                    .child("Search"),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child("Ctrl F"),
-                            ),
-                    ),
-            )
-            // The editor button (impl 04 §0): the AI subsystem's single home,
-            // where its results live — just left of the margin side. The old
-            // drawn mini-card is gone; the control now WEARS its state (a
-            // priority face) and opens the dropdown that names the reads.
-            .child({
-                let face = self.editor_face();
-                let open = self.editor_menu_open;
-                let n = self.open_query_count();
-                // The face's label. "Reading" is the glossary presence word,
-                // never the internal "Reviewing" (review H31).
-                let label: String = match face {
-                    EditorFace::NeedsSetup => "Ask the editor · needs setup".to_owned(),
-                    EditorFace::Cooking | EditorFace::Error | EditorFace::Idle => {
-                        "Ask the editor".to_owned()
-                    }
-                    EditorFace::Ready => "Ask the editor · a read is ready".to_owned(),
-                    EditorFace::Reading if n > 0 => {
-                        format!("Reading · {n} open · Ask the editor")
-                    }
-                    EditorFace::Reading => "Reading · Ask the editor".to_owned(),
-                };
-                // A colour cue only where the words don't carry it: cool = the
-                // machine is at work, red = it failed (color-language.md axis).
-                let dot = match face {
-                    EditorFace::Cooking => Some(AI_ACCENT),
-                    EditorFace::Error => Some(ERROR),
-                    _ => None,
-                };
-                // Hover names the read while cooking, carries the message on a
-                // failure (the full card still lives on render_ai_status), and
-                // teaches the chord in every state.
-                let tip_label: SharedString = match (face, self.ai_status.as_ref()) {
-                    (EditorFace::Cooking, Some(AiStatus::Running { label })) => {
-                        format!("Running: {label}").into()
-                    }
-                    (EditorFace::Error, Some(AiStatus::Error { title, .. })) => title.clone().into(),
-                    (EditorFace::NeedsSetup, _) => "Ask the editor — set up a provider".into(),
-                    _ => "Ask the editor".into(),
-                };
-                div()
-                    .id("editor-btn")
-                    .occlude()
-                    .flex_shrink_0()
-                    .ml(px(4.))
-                    .px(px(8.))
-                    .py(px(2.))
-                    .rounded(px(5.))
-                    .cursor(CursorStyle::PointingHand)
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .when(open, |d| d.bg(rgba(0x1A1A1812u32)))
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .text_color(rgb(if face == EditorFace::Reading {
-                        TEXT_COLOR
-                    } else {
-                        MUTED_COLOR
-                    }))
-                    .tooltip(tip(tip_label, Some("ctrl-shift-d")))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            editor.toggle_editor_menu(cx);
+                                    .child(format!("{count} words"))
+                                    .into_any_element(),
+                                Some((goal, start)) => {
+                                    let delta = self.word_count as i64 - start as i64;
+                                    let reached = delta >= goal as i64;
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .text_color(rgb(MUTED_COLOR))
+                                        .child(format!("{count} words"))
+                                        .child(if reached {
+                                            // Goal met: the separator quietly fills
+                                            // in sage. No banner (§4b tension 3).
+                                            div()
+                                                .size(px(5.))
+                                                .rounded_full()
+                                                .bg(rgb(SAGE_COLOR))
+                                                .into_any_element()
+                                        } else {
+                                            div().child("·").into_any_element()
+                                        })
+                                        .child(format!("{delta:+}/{goal}"))
+                                        .into_any_element()
+                                }
+                            }
                         }),
-                    )
-                    .when_some(dot, |d, color| {
-                        d.child(div().size(px(6.)).rounded_full().bg(rgb(color)))
-                    })
-                    .child(div().child(label))
-                    // The dropdown wedge — three centred, decreasing bars (the
-                    // app's own drawn-glyph idiom; "▾" isn't in the PT fonts).
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(px(1.))
-                            .children(
-                                [6., 4., 2.]
-                                    .into_iter()
-                                    .map(|w| div().w(px(w)).h(px(1.)).bg(rgb(MUTED_COLOR))),
-                            ),
-                    )
-            })
-            // The day-zero affordance: a user who knows nothing clicks the
-            // one unexplained button and lands in a searchable list of every
-            // capability (GNOME primary-menu position).
+                )
+            )
+            // The centre holds the search button (DESIGN §2-omnibox). A
+            // button, dressed as one — never a fake input field: "text is
+            // sacred", so the chrome only ever opens the real thing (the
+            // palette carries the live field). The space around it stays
+            // the window-drag handle.
             .child(
                 div()
-                    .id("palette-toggle")
+                    .id("omni-pill")
                     .occlude()
-                    .px(px(8.))
+                    .flex_shrink_0()
+                    .px(px(10.))
                     .py(px(2.))
                     .rounded(px(5.))
                     .cursor(CursorStyle::PointingHand)
                     .when(self.palette_input.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("Command Palette", Some("ctrl-shift-p")))
+                    .text_color(rgb(MUTED_COLOR))
+                    .tooltip(tip("Search · > commands · @ headings", Some("ctrl-f")))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            editor.toggle_palette(&TogglePalette, window, cx);
+                            editor.find(&Find, window, cx);
                         }),
                     )
-                    .child(
-                        // Drawn hamburger (no PT-covered menu glyph).
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .children((0..3).map(|_| {
-                                div().w(px(11.)).h(px(1.5)).bg(rgb(MUTED_COLOR))
-                            })),
-                    ),
+                    .child("Search"),
             )
+            // Right third — mirrors the left (equal claims keep the centre
+            // still): the editor button, palette, history, window controls.
             .child(
                 div()
-                    .id("history-toggle")
-                    .occlude()
-                    .px(px(8.))
-                    .py(px(2.))
-                    .ml(px(4.))
-                    .rounded(px(5.))
-                    .cursor(CursorStyle::PointingHand)
-                    .text_color(if self.strip.open {
-                        rgb(TEXT_COLOR)
-                    } else {
-                        rgb(MUTED_COLOR)
-                    })
-                    .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("History", Some("ctrl-alt-h")))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        // The clock toggles the STRIP (the new first history
-                        // surface); the right-side panel lives on in the palette
-                        // ("History panel"). The two never open together.
-                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            editor.toggle_strip(&ToggleStrip, window, cx);
-                        }),
-                    )
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                // The editor button (impl 04 §0): the AI subsystem's single home,
+                // where its results live — just left of the margin side. The old
+                // drawn mini-card is gone; the control now WEARS its state (a
+                // priority face) and opens the dropdown that names the reads.
+                .child({
+                    let face = self.editor_face();
+                    let open = self.editor_menu_open;
+                    let n = self.open_query_count();
+                    // The face's label. "Reading" is the glossary presence word,
+                    // never the internal "Reviewing" (review H31).
+                    let label: String = match face {
+                        EditorFace::NeedsSetup => "Ask the editor · needs setup".to_owned(),
+                        EditorFace::Cooking | EditorFace::Error | EditorFace::Idle => {
+                            "Ask the editor".to_owned()
+                        }
+                        EditorFace::Ready => "Ask the editor · a read is ready".to_owned(),
+                        EditorFace::Reading if n > 0 => {
+                            format!("Reading · {n} open · Ask the editor")
+                        }
+                        EditorFace::Reading => "Reading · Ask the editor".to_owned(),
+                    };
+                    // A colour cue only where the words don't carry it: cool = the
+                    // machine is at work, red = it failed (color-language.md axis).
+                    let dot = match face {
+                        EditorFace::Cooking => Some(AI_ACCENT),
+                        EditorFace::Error => Some(ERROR),
+                        _ => None,
+                    };
+                    // Hover names the read while cooking, carries the message on a
+                    // failure (the full card still lives on render_ai_status), and
+                    // teaches the chord in every state.
+                    let tip_label: SharedString = match (face, self.ai_status.as_ref()) {
+                        (EditorFace::Cooking, Some(AiStatus::Running { label })) => {
+                            format!("Running: {label}").into()
+                        }
+                        (EditorFace::Error, Some(AiStatus::Error { title, .. })) => title.clone().into(),
+                        (EditorFace::NeedsSetup, _) => "Ask the editor — set up a provider".into(),
+                        _ => "Ask the editor".into(),
+                    };
+                    div()
+                        .id("editor-btn")
+                        .occlude()
+                        .flex_shrink_0()
+                        .ml(px(4.))
+                        // Dressed as a control (the lab's .ebtn): border, shape,
+                        // an arrow — the one dropdown in the bar must read as
+                        // one at rest, not only on hover.
+                        .px(px(10.))
+                        .py(px(3.))
+                        .rounded(px(7.))
+                        .border_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .cursor(CursorStyle::PointingHand)
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .when(open, |d| d.bg(rgba(0x1A1A1812u32)))
+                        .hover(|d| d.bg(rgb(CARD_BG)))
+                        .text_color(rgb(if face == EditorFace::Reading {
+                            TEXT_COLOR
+                        } else {
+                            MUTED_COLOR
+                        }))
+                        .tooltip(tip(tip_label, Some("ctrl-shift-d")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                editor.toggle_editor_menu(cx);
+                            }),
+                        )
+                        .when_some(dot, |d, color| {
+                            d.child(div().size(px(6.)).rounded_full().bg(rgb(color)))
+                        })
+                        .child(div().child(label))
+                        // The dropdown wedge — contiguous decreasing bars fuse
+                        // into a solid ▾ (the app's own drawn-glyph idiom; the
+                        // real "▾" isn't in the PT fonts). It wears the label's
+                        // ink, not a second colour.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .children([7., 5., 3., 1.].into_iter().map(|w| {
+                                    div().w(px(w)).h(px(1.)).bg(rgb(
+                                        if face == EditorFace::Reading {
+                                            TEXT_COLOR
+                                        } else {
+                                            MUTED_COLOR
+                                        },
+                                    ))
+                                })),
+                        )
+                })
+                // The day-zero affordance: a user who knows nothing clicks the
+                // one unexplained button and lands in a searchable list of every
+                // capability (GNOME primary-menu position).
+                .child(
+                    div()
+                        .id("palette-toggle")
+                        .occlude()
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .cursor(CursorStyle::PointingHand)
+                        .when(self.palette_input.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Command Palette", Some("ctrl-shift-p")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.toggle_palette(&TogglePalette, window, cx);
+                            }),
+                        )
+                        .child(
+                            // Drawn hamburger (no PT-covered menu glyph).
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .children((0..3).map(|_| {
+                                    div().w(px(11.)).h(px(1.5)).bg(rgb(MUTED_COLOR))
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("history-toggle")
+                        .occlude()
+                        .px(px(8.))
+                        .py(px(2.))
+                        .ml(px(4.))
+                        .rounded(px(5.))
+                        .cursor(CursorStyle::PointingHand)
+                        .text_color(if self.strip.open {
+                            rgb(TEXT_COLOR)
+                        } else {
+                            rgb(MUTED_COLOR)
+                        })
+                        .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("History", Some("ctrl-alt-h")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            // The clock toggles the STRIP (the new first history
+                            // surface); the right-side panel lives on in the palette
+                            // ("History panel"). The two never open together.
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.toggle_strip(&ToggleStrip, window, cx);
+                            }),
+                        )
+                        .child(
+                            // History: drawn clock-face stand-in (↺ isn't in PT).
+                            div()
+                                .size(px(11.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(if self.strip.open {
+                                    rgb(TEXT_COLOR)
+                                } else {
+                                    rgb(MUTED_COLOR)
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(div().size(px(3.)).rounded_full().bg(if self.strip.open {
+                                    rgb(TEXT_COLOR)
+                                } else {
+                                    rgb(MUTED_COLOR)
+                                })),
+                        ),
+                )
+                // Windows/Linux get our own drawn window controls. macOS keeps its
+                // native traffic lights (top-left) instead, so we omit these here —
+                // which also retires the macOS papercut that our "×" quit the whole
+                // app, and sidesteps the fact that the "–"/"×" glyph labels are the
+                // very thing the macOS glyph bug hides (issue #10).
+                .when(!cfg!(target_os = "macos"), |bar| {
+                    bar.child(self.window_button("–", "Minimize", None, |window, _| {
+                        window.minimize_window()
+                    }))
                     .child(
-                        // History: drawn clock-face stand-in (↺ isn't in PT).
+                        // Zoom: drawn square (U+25A1 isn't in PT).
                         div()
-                            .size(px(11.))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(if self.strip.open {
-                                rgb(TEXT_COLOR)
-                            } else {
-                                rgb(MUTED_COLOR)
-                            })
+                            .id("win-zoom")
+                            .occlude()
+                            .w(px(34.))
+                            .h_full()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(div().size(px(3.)).rounded_full().bg(if self.strip.open {
-                                rgb(TEXT_COLOR)
-                            } else {
-                                rgb(MUTED_COLOR)
-                            })),
-                    ),
+                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                            .tooltip(tip("Maximize", None))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                cx.stop_propagation();
+                                window.zoom_window();
+                            })
+                            .child(
+                                div()
+                                    .size(px(9.))
+                                    .border_1()
+                                    .border_color(rgb(MUTED_COLOR))
+                                    .rounded(px(1.)),
+                            ),
+                    )
+                    .child(self.window_button("×", "Close", Some("ctrl-q"), |_, cx| cx.quit()))
+                })
             )
-            // Windows/Linux get our own drawn window controls. macOS keeps its
-            // native traffic lights (top-left) instead, so we omit these here —
-            // which also retires the macOS papercut that our "×" quit the whole
-            // app, and sidesteps the fact that the "–"/"×" glyph labels are the
-            // very thing the macOS glyph bug hides (issue #10).
-            .when(!cfg!(target_os = "macos"), |bar| {
-                bar.child(self.window_button("–", "Minimize", None, |window, _| {
-                    window.minimize_window()
-                }))
-                .child(
-                    // Zoom: drawn square (U+25A1 isn't in PT).
-                    div()
-                        .id("win-zoom")
-                        .occlude()
-                        .w(px(34.))
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("Maximize", None))
-                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                            cx.stop_propagation();
-                            window.zoom_window();
-                        })
-                        .child(
-                            div()
-                                .size(px(9.))
-                                .border_1()
-                                .border_color(rgb(MUTED_COLOR))
-                                .rounded(px(1.)),
-                        ),
-                )
-                .child(self.window_button("×", "Close", Some("ctrl-q"), |_, cx| cx.quit()))
-            })
     }
 }
 
