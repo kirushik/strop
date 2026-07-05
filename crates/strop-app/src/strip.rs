@@ -110,10 +110,20 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    /// Walk the runs in order, folding >15 min gaps, extending to `now_ms`.
+    /// Walk the journal's ACTIVITY in order — runs and event instants both —
+    /// folding >15 min gaps, extending to `now_ms`. Events count as activity
+    /// because a pass typically lands a lull AFTER the last keystroke: built
+    /// from runs alone, its veil would fall inside the folded gap and paint
+    /// collapsed onto the seam (found on the first real screenshot).
     pub fn build(journal: &Journal, now_ms: i64) -> Self {
-        let runs = &journal.runs;
-        let Some(first) = runs.first() else {
+        let mut activity: Vec<(i64, i64, bool)> = journal
+            .runs
+            .iter()
+            .map(|r| (r.t0, r.t1.max(r.t0 + 1), true))
+            .collect();
+        activity.extend(journal.events.iter().map(|e| (e.t(), e.t(), false)));
+        activity.sort_by_key(|a| a.0);
+        let Some(first) = activity.first().copied() else {
             return Self {
                 segs: Vec::new(),
                 total_work: 0.,
@@ -121,8 +131,8 @@ impl Timeline {
                 end_ms: now_ms,
             };
         };
-        let mut segs: Vec<Seg> = Vec::with_capacity(runs.len() * 2);
-        let start_ms = first.t0;
+        let mut segs: Vec<Seg> = Vec::with_capacity(activity.len() * 2);
+        let start_ms = first.0;
         let mut work = 0.;
         let mut prev = start_ms;
         let mut push = |wall0: i64, wall1: i64, work_start: &mut f32, folded: bool, min: f32| {
@@ -143,15 +153,19 @@ impl Timeline {
             });
             *work_start += span;
         };
-        for run in runs {
-            if run.t0 > prev {
-                let folded = run.t0 - prev > GAP_FOLD_MS;
-                push(prev, run.t0, &mut work, folded, 0.);
+        for (t0, t1, is_run) in activity {
+            if t0 > prev {
+                let folded = t0 - prev > GAP_FOLD_MS;
+                push(prev, t0, &mut work, folded, 0.);
             }
-            // The run's own span — floored so even a one-op run has an x-home.
-            let end = run.t1.max(run.t0 + 1);
-            push(run.t0, end, &mut work, false, MIN_RUN_PX);
-            prev = end;
+            // A run's own span is floored so even a one-op run has an x-home;
+            // an event instant contributes no width of its own (the paint side
+            // gives veils their 4px), it only keeps its neighborhood unfolded.
+            if t1 > prev || is_run {
+                let end = t1.max(prev);
+                push(t0.max(prev), end.max(t0.max(prev)), &mut work, false, if is_run { MIN_RUN_PX } else { 0. });
+                prev = end.max(prev);
+            }
         }
         // Extend to the present so the rail's right end is "now".
         let end_ms = now_ms.max(prev);

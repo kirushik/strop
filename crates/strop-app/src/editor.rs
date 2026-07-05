@@ -7127,41 +7127,65 @@ impl Editor {
     }
 
     /// Rig hook (`seed:journal`): install a deterministic synthetic fortnight —
-    /// four sittings of coalesced-length runs across two weeks, each with a
-    /// pass and a card closure — so the strip has real fabric to bake and
-    /// scrub without a live editing session. Appends only (pos = running
-    /// length), so a scrub reconstruction on the empty doc reproduces cleanly.
+    /// six sittings of ~100 minutes' WORKING time across two weeks (drafting
+    /// early, reworking late, one big mid-arc cut), each closed by a pass —
+    /// so the strip has a screen-filling fabric to bake and scrub without a
+    /// live session. The first fixture's sittings were 20 SECONDS long and
+    /// the fixed quant honestly rendered the whole fortnight one sliver wide.
     pub fn debug_seed_journal(&mut self, cx: &mut Context<Self>) {
         use strop_core::journal::{EditRun, Journal, JournalEvent};
         let now = strop_core::journal::now_ms();
         let day = 86_400_000i64;
         let mut runs: Vec<EditRun> = Vec::new();
         let mut events: Vec<JournalEvent> = Vec::new();
-        let mut pos = 0usize;
-        for (s, start) in [now - 13 * day, now - 9 * day, now - 4 * day, now - day]
-            .into_iter()
-            .enumerate()
-        {
-            for k in 0..16i64 {
-                let t0 = start + k * 1200;
-                let ins = "the quiet word ";
-                runs.push(EditRun {
-                    t0,
-                    t1: t0 + 800,
-                    pos,
-                    del_chars: 0,
-                    ins: ins.into(),
-                });
-                pos += ins.chars().count();
+        let mut len = 0usize;
+        for (s, days_ago) in [13i64, 11, 8, 5, 2, 0].into_iter().enumerate() {
+            let start = now - days_ago * day - 4 * 3_600_000;
+            let drafting = s < 3; // early sittings grow; late ones rework
+            for k in 0..150i64 {
+                let t0 = start + k * 40_000; // a run every ~40s of work
+                if !drafting && k % 5 == 2 {
+                    // Rework: cut a stretch from the middle (burnt flecks, the
+                    // envelope dips). One big cut mid-arc.
+                    let big = s == 4 && k == 60;
+                    let del = if big { 1400 } else { 90 + (k as usize % 7) * 22 };
+                    runs.push(EditRun {
+                        t0,
+                        t1: t0 + 9_000,
+                        pos: (len / 3).min(len),
+                        del_chars: del.min(len),
+                        ins: String::new(),
+                    });
+                    len = len.saturating_sub(del).max(200);
+                } else {
+                    // Prose arrives in ~5-14 word gusts near the leading edge.
+                    let words = 5 + (k as usize % 10);
+                    let ins = "the ferry held its line against the dark water "
+                        .split_whitespace()
+                        .cycle()
+                        .take(words)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        + " ";
+                    runs.push(EditRun {
+                        t0,
+                        t1: t0 + 12_000,
+                        pos: len.saturating_sub(k as usize % 40),
+                        del_chars: 0,
+                        ins: ins.clone(),
+                    });
+                    len += ins.chars().count();
+                }
             }
+            let sit_end = start + 150 * 40_000;
             events.push(JournalEvent::Pass {
-                t: start + 20_000,
-                mode: "developmental".into(),
-                cards: 3,
+                t: sit_end + 60_000,
+                mode: if s == 3 { "believing".into() } else { "developmental".into() },
+                cards: 2 + (s as u32 % 3),
             });
             if s.is_multiple_of(2) {
                 events.push(JournalEvent::CardClosed {
-                    t: start + 40_000,
+                    t: sit_end + 300_000,
                     id: s as u64 + 1,
                     resolved: true,
                 });
