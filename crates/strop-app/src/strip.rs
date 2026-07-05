@@ -52,6 +52,19 @@ pub const SEAM_PX: f32 = 10.;
 /// moot here because the run's own x-extent is already sub-pixel).
 pub const MIN_RUN_PX: f32 = 0.6;
 
+/// Working px per word of |Δwords| across a checkpoint-only span (Bug A). The
+/// legacy era has no keystroke record — no working time to scale by — so its
+/// width is derived from the word delta between materialized states. Chosen so
+/// a multi-thousand-word fortnight of checkpoints reads as a scannable
+/// landscape (~one to two fabric widths), not a run-era-style solid stroke:
+/// checkpoints are sparse anchors, so each word of delta earns more x than a
+/// keystroke run's word (whose density comes from adjacency, not per-word px).
+pub const CKPT_WORD_PX: f32 = 0.28;
+/// A checkpoint-only span never narrower than this, so a zero-Δwords span (a
+/// formatting-only or same-second twin checkpoint) still separates its ticks
+/// instead of overprinting — the label lane needs the gap to place two names.
+pub const CKPT_MIN_PX: f32 = 16.;
+
 /// Fleck edge (a 2 px amber grain, design §1). Ins amber / del burnt amber, the
 /// value-contrast pair that stays legible colorblind (docs/color-language.md).
 pub const FLECK: f32 = 2.;
@@ -110,18 +123,43 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    /// Walk the journal's ACTIVITY in order — runs and event instants both —
-    /// folding >15 min gaps, extending to `now_ms`. Events count as activity
-    /// because a pass typically lands a lull AFTER the last keystroke: built
-    /// from runs alone, its veil would fall inside the folded gap and paint
-    /// collapsed onto the seam (found on the first real screenshot).
-    pub fn build(journal: &Journal, now_ms: i64) -> Self {
-        let mut activity: Vec<(i64, i64, bool)> = journal
+    /// Walk the merged ACTIVITY in order — runs, event instants, AND checkpoint
+    /// instants — folding >15 min gaps, extending to `now_ms`. Events count as
+    /// activity because a pass typically lands a lull AFTER the last keystroke:
+    /// built from runs alone, its veil would fall inside the folded gap and
+    /// paint collapsed onto the seam (found on the first real screenshot).
+    ///
+    /// Checkpoints (Bug A) are the axis for a LEGACY era — a document whose
+    /// journal is empty or sparse but whose history lives in the checkpoint
+    /// states. A span bracketed by two checkpoints with no runs between them
+    /// (`Ckpt → Ckpt`) sizes itself from |Δwords|, not wall time: the legacy
+    /// era has no keystroke record to scale by, and folding its multi-day
+    /// wall-clock gap to a seam would collapse every tick onto the left edge
+    /// (the reported bug). |Δwords| is the era's only honest measure of work,
+    /// and keeps the word-quant law honest. Any OTHER long gap — checkpoint→run
+    /// (the seam between the legacy era and today's session), run→run overnight,
+    /// or a pass falling between two checkpoints — folds exactly as before.
+    pub fn build(journal: &Journal, stations: &[StationSnap], now_ms: i64) -> Self {
+        // `Ckpt(words)` carries the state's word count so a checkpoint-only
+        // span can size itself; `Run` has a real extent; `Instant` (pass,
+        // restore, card-close) only keeps its neighborhood unfolded.
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Run,
+            Instant,
+            Ckpt(usize),
+        }
+        let mut activity: Vec<(i64, i64, Kind)> = journal
             .runs
             .iter()
-            .map(|r| (r.t0, r.t1.max(r.t0 + 1), true))
+            .map(|r| (r.t0, r.t1.max(r.t0 + 1), Kind::Run))
             .collect();
-        activity.extend(journal.events.iter().map(|e| (e.t(), e.t(), false)));
+        activity.extend(journal.events.iter().map(|e| (e.t(), e.t(), Kind::Instant)));
+        activity.extend(
+            stations
+                .iter()
+                .map(|s| (s.created_ms, s.created_ms, Kind::Ckpt(s.words))),
+        );
         activity.sort_by_key(|a| a.0);
         let Some(first) = activity.first().copied() else {
             return Self {
@@ -135,12 +173,10 @@ impl Timeline {
         let start_ms = first.0;
         let mut work = 0.;
         let mut prev = start_ms;
-        let mut push = |wall0: i64, wall1: i64, work_start: &mut f32, folded: bool, min: f32| {
-            let span = if folded {
-                SEAM_PX
-            } else {
-                ((wall1 - wall0) as f32 * PX_PER_MS).max(min)
-            };
+        // `push` owns the only mutable borrow of `segs`, so every segment —
+        // gap, run, checkpoint span, tail — goes through it; the span is
+        // computed at the call site (time-, seam-, or word-derived).
+        let mut push = |wall0: i64, wall1: i64, work_start: &mut f32, span: f32, folded: bool| {
             if span <= 0. {
                 return;
             }
@@ -153,25 +189,57 @@ impl Timeline {
             });
             *work_start += span;
         };
-        for (t0, t1, is_run) in activity {
+        // The immediately-preceding item's checkpoint words, or None if it was
+        // a run/instant — a `Ckpt → Ckpt` adjacency is a checkpoint-only span.
+        // The first item has no gap before it (t0 == prev), so its initial
+        // value is immaterial to any span; it is set as each item is consumed.
+        let mut prev_ckpt: Option<usize> = None;
+        for (t0, t1, kind) in activity {
             if t0 > prev {
-                let folded = t0 - prev > GAP_FOLD_MS;
-                push(prev, t0, &mut work, folded, 0.);
+                match (prev_ckpt, kind) {
+                    (Some(pw), Kind::Ckpt(cw)) => {
+                        // Checkpoint-only span: |Δwords| working px, floored so
+                        // a zero-Δ twin still separates its ticks. Active (not
+                        // folded) — it carries the envelope step and real shape.
+                        let dw = (pw as i64 - cw as i64).unsigned_abs() as f32;
+                        push(prev, t0, &mut work, (dw * CKPT_WORD_PX).max(CKPT_MIN_PX), false);
+                    }
+                    _ => {
+                        let folded = t0 - prev > GAP_FOLD_MS;
+                        let span = if folded {
+                            SEAM_PX
+                        } else {
+                            (t0 - prev) as f32 * PX_PER_MS
+                        };
+                        push(prev, t0, &mut work, span, folded);
+                    }
+                }
             }
             // A run's own span is floored so even a one-op run has an x-home;
-            // an event instant contributes no width of its own (the paint side
-            // gives veils their 4px), it only keeps its neighborhood unfolded.
-            if t1 > prev || is_run {
+            // a checkpoint/event instant contributes no width of its own.
+            if let Kind::Run = kind {
                 let end = t1.max(prev);
-                push(t0.max(prev), end.max(t0.max(prev)), &mut work, false, if is_run { MIN_RUN_PX } else { 0. });
+                let start = t0.max(prev);
+                push(start, end.max(start), &mut work, ((end - start) as f32 * PX_PER_MS).max(MIN_RUN_PX), false);
                 prev = end.max(prev);
+            } else {
+                prev = prev.max(t0);
             }
+            prev_ckpt = match kind {
+                Kind::Ckpt(w) => Some(w),
+                _ => None,
+            };
         }
         // Extend to the present so the rail's right end is "now".
         let end_ms = now_ms.max(prev);
         if end_ms > prev {
             let folded = end_ms - prev > GAP_FOLD_MS;
-            push(prev, end_ms, &mut work, folded, 0.);
+            let span = if folded {
+                SEAM_PX
+            } else {
+                (end_ms - prev) as f32 * PX_PER_MS
+            };
+            push(prev, end_ms, &mut work, span, folded);
         }
         Self {
             segs,
@@ -237,6 +305,17 @@ pub struct StationSnap {
     /// anchor (avoids the truncation-to-empty lie of anchoring on a stateless
     /// checkpoint; review mid).
     pub has_state: bool,
+    /// The materialized state's word count (0 when stateless). A checkpoint-only
+    /// span's axis EXTENT is the |Δwords| between its two ends — the legacy era
+    /// (empty journal, no keystroke record) still gets a real, work-proportional
+    /// width instead of collapsing every tick onto the left edge (Bug A). Keeps
+    /// the word-quant law honest: width is words, as the fabric's flecks are.
+    pub words: usize,
+    /// The materialized state's CHAR count (0 when stateless). The envelope's
+    /// y-height is char-based (its scale, and the run era, are chars); feeding
+    /// checkpoint char counts in keeps ONE continuous envelope across the merged
+    /// axis — a step at each checkpoint, no discontinuity at the era seam.
+    pub chars: usize,
 }
 
 /// A margin card's lifespan, for the thread it draws (design §1: a cool thread
@@ -352,7 +431,7 @@ impl StripBake {
         seed_len: usize,
         now_ms: i64,
     ) -> Self {
-        let timeline = Timeline::build(journal, now_ms);
+        let timeline = Timeline::build(journal, stations, now_ms);
 
         // --- Envelope y-scale, fixed ONCE (design §1) ------------------------
         // Cumulative length, seeded at the journal-start anchor length so the
@@ -362,6 +441,15 @@ impl StripBake {
         for run in &journal.runs {
             len = (len + run.delta_chars()).max(0);
             max_len = max_len.max(len);
+        }
+        // The legacy era's lengths live in the checkpoint states, not the runs
+        // (Bug A): fold them into the scale so the y-axis fits the WHOLE
+        // history, not just today's churn — else a legacy doc's tall envelope
+        // would clip through the band floor.
+        for st in stations {
+            if st.has_state {
+                max_len = max_len.max(st.chars as i64);
+            }
         }
         let scale = max_len as f32 * 1.1; // headroom for a restore past now-length
         let depth_y = |chars: i64| -> f32 { FAB_Y0 + (chars as f32 / scale) * FABRIC_H };
@@ -402,6 +490,21 @@ impl StripBake {
                 y: depth_y(len),
             });
         }
+        // Checkpoint steps: the legacy era's envelope (Bug A). Each materialized
+        // checkpoint is a step to its state's char length; merged with the run
+        // steps and sorted by x, the merged axis carries ONE continuous
+        // document-length envelope — a step at each checkpoint, no flecks (there
+        // is no keystroke record to fabricate quanta from). Stateless
+        // checkpoints draw a tick but no step (no state to measure).
+        for st in stations {
+            if st.has_state {
+                envelope.push(EnvPoint {
+                    x: timeline.work_at(st.created_ms),
+                    y: depth_y(st.chars as i64),
+                });
+            }
+        }
+        envelope.sort_by(|a, b| a.x.total_cmp(&b.x));
 
         // --- Veils (Pass events) & seams -------------------------------------
         let mut veils: Vec<Veil> = Vec::new();
@@ -493,7 +596,7 @@ impl StripBake {
         layout_labels(&mut baked, timeline.total_work);
 
         // --- Date lane (session-start days, thinned once) --------------------
-        let dates = build_dates(&journal.runs, &timeline, now_ms);
+        let dates = build_dates(&journal.runs, stations, &timeline, now_ms);
 
         let anchor_ms: Vec<i64> = {
             // ONLY materialized checkpoints are anchors — a stateless one can't
@@ -522,23 +625,38 @@ impl StripBake {
     }
 }
 
-/// Session-start dates for the bottom lane, one per >15 min gap (a new sitting)
-/// plus the first, de-duplicated to one label per calendar day.
-fn build_dates(runs: &[EditRun], timeline: &Timeline, now_ms: i64) -> Vec<DateTick> {
-    let mut dates: Vec<DateTick> = Vec::new();
-    let mut last_day = i64::MIN;
+/// Dates for the bottom lane, one label per calendar day, placed at that day's
+/// earliest anchor along the axis. Anchors are run session-starts (the first
+/// run, and each after a >15 min gap — a new sitting) AND every checkpoint: a
+/// LEGACY era carries no runs, so its checkpoints are the only time record the
+/// lane has to date (Bug A).
+fn build_dates(
+    runs: &[EditRun],
+    stations: &[StationSnap],
+    timeline: &Timeline,
+    now_ms: i64,
+) -> Vec<DateTick> {
+    let mut anchors: Vec<i64> = Vec::new();
     let mut prev_t1 = i64::MIN;
     for run in runs {
-        let new_session = prev_t1 == i64::MIN || run.t0 - prev_t1 > GAP_FOLD_MS;
-        let day = run.t0.div_euclid(86_400_000);
-        if new_session && day != last_day {
+        if prev_t1 == i64::MIN || run.t0 - prev_t1 > GAP_FOLD_MS {
+            anchors.push(run.t0);
+        }
+        prev_t1 = run.t1;
+    }
+    anchors.extend(stations.iter().map(|s| s.created_ms));
+    anchors.sort_unstable();
+    let mut dates: Vec<DateTick> = Vec::new();
+    let mut last_day = i64::MIN;
+    for t in anchors {
+        let day = t.div_euclid(86_400_000);
+        if day != last_day {
             dates.push(DateTick {
-                x: timeline.work_at(run.t0),
-                label: date_label(run.t0 / 1000, now_ms / 1000),
+                x: timeline.work_at(t),
+                label: date_label(t / 1000, now_ms / 1000),
             });
             last_day = day;
         }
-        prev_t1 = run.t1;
     }
     dates
 }
@@ -695,19 +813,28 @@ fn civil(secs: i64) -> (i64, u32, u32, u32, u32, usize) {
     )
 }
 
-/// The readout chip's text (spec §2): `{date} · {n} words`, tabular, NEVER a
-/// sentence and NEVER a station name (P8's template ban). The year shows only
-/// when it isn't the current one (design §2 — histories never expire).
-pub fn format_readout(wall_ms: i64, words: usize, now_ms: i64) -> String {
+/// Just the date/time half of the readout (spec §2): "Sun 5 Jul, 10:41" — the
+/// year only when it isn't the current one (histories never expire). The
+/// parked banner (Bug B) shows this as the moment label between stations.
+pub fn format_moment(wall_ms: i64, now_ms: i64) -> String {
     let (y, m, d, hh, mm, wd) = civil(wall_ms / 1000);
     let (cur_y, ..) = civil(now_ms / 1000);
     let mon = MONTHS[(m - 1) as usize];
-    let date = if y == cur_y {
+    if y == cur_y {
         format!("{} {d} {mon}, {hh:02}:{mm:02}", WEEKDAYS[wd])
     } else {
         format!("{} {d} {mon} {y}, {hh:02}:{mm:02}", WEEKDAYS[wd])
-    };
-    format!("{date} · {} words", group_thousands(words))
+    }
+}
+
+/// The readout chip's text (spec §2): `{date} · {n} words`, tabular, NEVER a
+/// sentence and NEVER a station name (P8's template ban).
+pub fn format_readout(wall_ms: i64, words: usize, now_ms: i64) -> String {
+    format!(
+        "{} · {} words",
+        format_moment(wall_ms, now_ms),
+        group_thousands(words)
+    )
 }
 
 /// A session-start date for the bottom lane (spec §1): "Today" / "Yesterday" /
@@ -829,8 +956,8 @@ impl Default for Strip {
 }
 
 impl Strip {
-    /// Parked in the past (previewing) — the gate for Restore/Now styling and
-    /// for the restore-then-type notch.
+    /// Parked in the past (previewing) — the gate for Restore/Now styling, the
+    /// banner, and the uniform read-only refusal (Bug B).
     pub fn is_parked(&self) -> bool {
         self.open && self.parked
     }
@@ -873,7 +1000,7 @@ mod tests {
     fn timeline_folds_long_gaps_into_seams() {
         let j = fixture();
         let now = j.runs.last().unwrap().t1 + 1000;
-        let tl = Timeline::build(&j, now);
+        let tl = Timeline::build(&j, &[], now);
         // Three day-apart sittings ⇒ at least two folded seams.
         let seams = tl.segs.iter().filter(|s| s.folded).count();
         assert!(seams >= 2, "day gaps fold to seams, got {seams}");
@@ -889,7 +1016,7 @@ mod tests {
     fn work_and_wall_maps_are_inverse_within_active_segments() {
         let j = fixture();
         let now = j.runs.last().unwrap().t1 + 1000;
-        let tl = Timeline::build(&j, now);
+        let tl = Timeline::build(&j, &[], now);
         // A point inside a run round-trips (folding makes it non-exact across
         // seams, but an active point is stable).
         let t = j.runs[1].t0;
@@ -986,5 +1113,104 @@ mod tests {
         assert!(bake.flecks.is_empty());
         assert!(bake.envelope.is_empty());
         assert_eq!(bake.timeline.total_work, 0.);
+    }
+
+    // A materialized checkpoint snapshot for the merged-axis tests (Bug A).
+    fn station(created_ms: i64, name: &str, words: usize, chars: usize) -> StationSnap {
+        StationSnap {
+            created_ms,
+            name: name.into(),
+            manual: true,
+            has_state: true,
+            words,
+            chars,
+        }
+    }
+
+    #[test]
+    fn checkpoint_only_history_builds_a_real_axis() {
+        // Six checkpoints two days apart, EMPTY journal — the legacy shape.
+        // Before Bug A `total_work` was 0 and every tick landed at x=0.
+        let day = 86_400_000i64;
+        let base = 1_700_000_000_000i64;
+        // Growing, with a dip at index 3 (a mid-arc cut).
+        let counts = [90usize, 340, 720, 610, 1500, 2100];
+        let stations: Vec<StationSnap> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| station(base + i as i64 * 2 * day, &format!("cp {i}"), w, w * 6))
+            .collect();
+        let j = Journal::default();
+        let now = base + 13 * day;
+        let bake = StripBake::build(&j, &stations, &[], 0, now);
+
+        // A real axis, sized from |Δwords| — not the degenerate zero.
+        assert!(bake.timeline.total_work > 0., "the checkpoint era has width");
+        // No flecks: there is no keystroke record to fabricate quanta from.
+        assert!(bake.flecks.is_empty(), "the legacy era lays no flecks");
+        // Ticks spread monotonically along x, not stacked at the left edge.
+        let xs: Vec<f32> = bake.stations.iter().map(|s| s.x).collect();
+        assert!(xs.windows(2).all(|w| w[1] >= w[0]), "ticks spread in order: {xs:?}");
+        assert!(*xs.last().unwrap() > 1., "the last tick is well right of x=0");
+        assert!(
+            xs.iter().filter(|&&x| x > 1.).count() >= 4,
+            "ticks are genuinely spread, not overprinted: {xs:?}"
+        );
+        // The wider |Δwords| span earns more x than the narrow one — width is
+        // work-proportional. |1500-610|=890 words vs |610-720|=110.
+        let span_big = xs[4] - xs[3];
+        let span_small = xs[3] - xs[2];
+        assert!(span_big > span_small, "more words → more x: {span_big} vs {span_small}");
+
+        // One envelope step per checkpoint, ordered along x, and its depth
+        // tracks the state's length: the deepest step is the largest state,
+        // and the mid-arc cut steps the envelope back up (shallower).
+        assert_eq!(bake.envelope.len(), stations.len(), "one step per checkpoint");
+        let ys: Vec<f32> = bake.envelope.iter().map(|p| p.y).collect();
+        assert!(ys[2] > ys[0], "the story grew (deeper)");
+        assert!(ys[3] < ys[2], "the mid-arc cut steps the envelope back up");
+        assert_eq!(
+            ys.last().copied(),
+            ys.iter().copied().reduce(f32::max),
+            "the final, largest draft is the deepest step"
+        );
+    }
+
+    #[test]
+    fn mixed_era_keeps_both_spans_and_runs_unchanged() {
+        // A legacy checkpoint era, THEN today's journal runs (the fortnight
+        // fixture sits around `base`; the checkpoints are a week earlier).
+        let j = fixture();
+        let day = 86_400_000i64;
+        let base = 1_700_000_000_000i64;
+        let stations = vec![
+            station(base - 10 * day, "start", 100, 600),
+            station(base - 6 * day, "half", 500, 3000),
+            station(base - 3 * day, "most", 900, 5400),
+        ];
+        let now = j.runs.last().unwrap().t1 + 1000;
+        let with = StripBake::build(&j, &stations, &[], 3000, now);
+        let without = StripBake::build(&j, &[], &[], 3000, now);
+
+        // The legacy span is ADDED in front of the runs era.
+        assert!(
+            with.timeline.total_work > without.timeline.total_work,
+            "the checkpoint era adds width"
+        );
+        // The runs era is unchanged: the fleck walk never sees stations, so the
+        // grain count is identical (positions shift by the era offset — fine).
+        assert_eq!(with.flecks.len(), without.flecks.len(), "runs-era flecks unchanged");
+        assert!(!with.flecks.is_empty(), "the runs era still lays flecks");
+        // Both eras are present: a checkpoint tick sits left of the first run.
+        let first_run_x = with.timeline.work_at(j.runs[0].t0);
+        assert!(
+            with.stations.iter().any(|s| s.x < first_run_x - 1.),
+            "a checkpoint sits left of the runs era"
+        );
+        // The envelope carries steps from BOTH eras (3 checkpoints + the runs).
+        assert!(
+            with.envelope.len() > without.envelope.len(),
+            "checkpoint steps join the run steps"
+        );
     }
 }
