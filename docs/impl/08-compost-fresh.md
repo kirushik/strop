@@ -115,8 +115,7 @@ clock governs machine deliveries only).
 
 **Undo is the reflex inverse.** Park and jot are single history atoms:
 immediate ctrl-Z restores the text verbatim and evaporates a just-born
-seam; a jot in transit can never land in a checkpoint state as
-manuscript. This is also the recovery for the stale-selection misfire
+seam. This is also the recovery for the stale-selection misfire
 (intended jot, forgotten selection → a park you *watch happen* and undo
 with one key).
 
@@ -194,8 +193,11 @@ no cool card anchors below it, visible by the lane simply ending.
 **Parking a diagnosed passage retires its card; Move to the manuscript
 re-arms it for the next pass** (margin graft — machine artifacts never
 follow writer text out of the machine's scope). Below the seam the
-flank swaps Set aside for Move to the manuscript; Exile works (a
-deleted scrap falls one level, into the record).
+flank swaps Set aside for Move to the manuscript; Exile works.
+The record's capture law is one law on both sides of the seam
+(adjudicated): substantial deletions file to the record under the
+manuscript's own capture threshold; Exile files any size,
+deliberately; small deletions are history-only, everywhere.
 
 **Chips — two, rhymed** (07 B3/N5 stands; the blind design's one-chip
 merge was its worst sentence — exile feedback must name the dead
