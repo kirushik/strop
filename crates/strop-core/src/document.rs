@@ -1239,6 +1239,53 @@ impl Document {
         }
     }
 
+    /// Set (or, with `url` empty/`None`, clear) a hyperlink over `range`, as one
+    /// undoable transaction. Unlike `toggle_format`, this REPLACES: any existing
+    /// link over the range is dropped first regardless of its target, so editing
+    /// a link never strands a stale overlapping span (`SpanSet::remove` is
+    /// URL-exact, so the old targets are gathered first). The selection flank's
+    /// link cell is the only caller (docs/impl/03-flanks.md §0.1, review 88).
+    pub fn set_link(&mut self, range: Range<usize>, url: Option<String>) {
+        if range.start >= range.end {
+            return;
+        }
+        self.revision += 1;
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        let mut olds: Vec<String> = self
+            .spans
+            .spans()
+            .iter()
+            .filter(|s| s.range.start < range.end && range.start < s.range.end)
+            .filter_map(|s| match &s.attr {
+                InlineAttr::Link(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        olds.sort();
+        olds.dedup();
+        for u in olds {
+            self.spans.remove(range.clone(), &InlineAttr::Link(u));
+        }
+        if let Some(url) = url.filter(|u| !u.is_empty()) {
+            self.spans.add(range, InlineAttr::Link(url));
+        }
+    }
+
+    /// The hyperlink target covering `range`, if any — the first overlapping
+    /// `Link` span. The flank pre-fills its URL field from this so editing an
+    /// existing link shows its current target (docs/impl/03-flanks.md §0.1).
+    pub fn link_over(&self, range: Range<usize>) -> Option<String> {
+        self.spans.spans().iter().find_map(|s| match &s.attr {
+            InlineAttr::Link(u) if s.range.start < range.end && range.start < s.range.end => {
+                Some(u.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// Set a block's kind as its own undoable transaction.
     pub fn set_block_kind(&mut self, block: usize, kind: BlockKind) {
         self.revision += 1;
@@ -1528,6 +1575,33 @@ mod tests {
 
         doc.undo();
         assert!(doc.revision() > r4, "undo must bump revision");
+    }
+
+    #[test]
+    fn set_link_replaces_the_target_and_empty_clears_it() {
+        let mut doc = Document::new("hello world", SpanSet::default(), BlockMap::default());
+        // Set a link over "hello".
+        doc.set_link(0..5, Some("https://a.example".into()));
+        assert_eq!(doc.link_over(0..5).as_deref(), Some("https://a.example"));
+        // Re-setting with a NEW url replaces (never leaves the old one alongside):
+        // exactly one Link span survives over the range, and it carries the new
+        // target — the editing-a-link case remove()'s URL-exactness would miss.
+        doc.set_link(0..5, Some("https://b.example".into()));
+        assert_eq!(doc.link_over(0..5).as_deref(), Some("https://b.example"));
+        let links = doc
+            .spans()
+            .spans()
+            .iter()
+            .filter(|s| matches!(&s.attr, InlineAttr::Link(_)))
+            .count();
+        assert_eq!(links, 1, "editing a link must not strand the old target");
+        // An empty commit removes the link.
+        doc.set_link(0..5, None);
+        assert_eq!(doc.link_over(0..5), None);
+        assert!(
+            !doc.spans().spans().iter().any(|s| matches!(&s.attr, InlineAttr::Link(_))),
+            "empty commit clears the link"
+        );
     }
 
     #[test]

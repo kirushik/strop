@@ -139,6 +139,18 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE aside:selection: selection moved to compost");
                 continue;
             }
+            // Flanks (docs/impl/03-flanks.md §3): select the caret paragraph and
+            // raise the popover so `dump:ui`'s `flanks` object is observable.
+            if key == "select:para" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_select_para(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE select:para: caret paragraph selected + flanks raised");
+                continue;
+            }
             if key == "exile:selection" {
                 window
                     .update(cx, |editor, window, cx| editor.debug_exile_selection(window, cx))
