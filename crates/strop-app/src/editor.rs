@@ -20,8 +20,8 @@ use gpui::{
     Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ResizeEdge, ScrollWheelEvent, SharedString, StrikethroughStyle, Style,
-    TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
+    Pixels, Point, ResizeEdge, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
+    Style, TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
     WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
@@ -1015,6 +1015,14 @@ pub struct Editor {
     /// headings (`@`). `palette_*` is its backing state across all modes.
     palette_input: Option<Entity<TextField>>,
     palette_selected: usize,
+    /// The omni-list's scroll state (`render_omni`'s "omni-list" div),
+    /// persisted across frames so it survives the per-frame rebuild. Mouse
+    /// wheel scrolling drives it directly (GPUI's normal `track_scroll`
+    /// wiring); keyboard navigation additionally nudges it via
+    /// `omni_scroll_into_view` so the selected row can't wander past the
+    /// visible window — a `scroll_to_item` request is a no-op when the row
+    /// is already on-screen, so it never fights a manual wheel scroll.
+    omni_scroll: ScrollHandle,
     /// Mirror of the palette query (debug_cursor has no `cx` to read the
     /// input entity); maintained by the palette's observe hook.
     palette_query: String,
@@ -1512,6 +1520,7 @@ impl Editor {
             last_pass: PassKind::Diagnostic("line".to_owned()),
             palette_input: None,
             palette_selected: 0,
+            omni_scroll: ScrollHandle::new(),
             palette_query: String::new(),
             omni_return: None,
             palette_freq: HashMap::new(),
@@ -4123,15 +4132,21 @@ impl Editor {
             // "match hidden under the find field" bug).
             if matches!(omni_mode(&q).0, OmniMode::Find) {
                 editor.omni_apply_match(0, cx);
-            } else if let Some(sel) = editor.omni_return.clone() {
-                // Leaving find mode (a `>` or `@` prefix) would park the
-                // preview selection on the last match — and a command
-                // executed next would act on it (the cross-mode selection
-                // leak, extraction audit #23). Walk it home; deleting the
-                // prefix re-enters find and re-previews.
-                let max = editor.doc.len_bytes();
-                editor.selected_range = sel.start.min(max)..sel.end.min(max);
-                editor.selection_reversed = false;
+            } else {
+                // Selection restarted at row 0 (above): the list should
+                // follow it back to the top, not stay scrolled wherever the
+                // previous query's browsing left it.
+                editor.omni_scroll_into_view(0);
+                if let Some(sel) = editor.omni_return.clone() {
+                    // Leaving find mode (a `>` or `@` prefix) would park the
+                    // preview selection on the last match — and a command
+                    // executed next would act on it (the cross-mode selection
+                    // leak, extraction audit #23). Walk it home; deleting the
+                    // prefix re-enters find and re-previews.
+                    let max = editor.doc.len_bytes();
+                    editor.selected_range = sel.start.min(max)..sel.end.min(max);
+                    editor.selection_reversed = false;
+                }
             }
             cx.notify();
         })
@@ -4172,6 +4187,10 @@ impl Editor {
         self.replace_input = None;
         self.palette_selected = 0;
         self.palette_query = initial.clone();
+        // The handle outlives any one open/close cycle (it lives on the
+        // Editor); a fresh open must not inherit wherever the last session
+        // left the list scrolled.
+        self.omni_scroll_into_view(0);
         // Read once per open, not per keystroke; executions write through to
         // disk AND to this copy, so the session stays self-consistent.
         self.palette_freq = crate::files::load_palette_freq();
@@ -4212,6 +4231,7 @@ impl Editor {
         }
         let ix = ix.min(matches.len() - 1);
         self.palette_selected = ix;
+        self.omni_scroll_into_view(ix);
         self.selected_range = matches[ix].clone();
         self.selection_reversed = false;
         self.bump_activity();
@@ -4533,6 +4553,7 @@ impl Editor {
             self.omni_apply_match(sel, cx);
         } else {
             self.palette_selected = sel;
+            self.omni_scroll_into_view(sel);
             cx.notify();
         }
     }
@@ -4550,8 +4571,39 @@ impl Editor {
             self.omni_apply_match(sel, cx);
         } else {
             self.palette_selected = sel;
+            self.omni_scroll_into_view(sel);
             cx.notify();
         }
+    }
+
+    /// Nudge the omni-list to keep row `ix` visible (the fold bug this
+    /// closes: keyboard `palette_up`/`palette_down` used to move the
+    /// highlight past the visible window without scrolling — the writer
+    /// navigated blind). `ScrollHandle::scroll_to_item` requests the
+    /// *minimal* correction and is a no-op when `ix` is already on-screen,
+    /// so this never fights a manual mouse-wheel scroll that hasn't been
+    /// invalidated by a fresh selection.
+    fn omni_scroll_into_view(&self, ix: usize) {
+        let rows = self.omni_rows(&self.palette_query);
+        if rows.is_empty() {
+            return;
+        }
+        let ix = ix.min(rows.len() - 1);
+        if ix == 0 {
+            // A direct reset, not an item-based scroll: on the very first
+            // frame the omnibox ever opens, GPUI hasn't measured this div's
+            // own viewport bounds yet (`ScrollHandle::bounds` lags a frame
+            // behind the child bounds `scroll_to_item` math needs), so it
+            // can undershoot by a row on a cold open. Setting the offset
+            // straight to zero sidesteps that — and also reaches row 0's
+            // section header in grouped mode (bare `>`), which `scroll_to_
+            // item(0)` alone would only promise is "somewhere visible".
+            self.omni_scroll.set_offset(point(px(0.), px(0.)));
+            return;
+        }
+        let (mode, rest) = omni_mode(&self.palette_query);
+        let grouped = mode == OmniMode::Command && rest.trim().is_empty();
+        self.omni_scroll.scroll_to_item(omni_child_index(&rows, grouped, ix));
     }
 
     fn render_omni(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
@@ -4567,6 +4619,7 @@ impl Editor {
         let home = crate::paths::home_dir().to_string_lossy().into_owned();
         let mut list = div()
             .id("omni-list")
+            .track_scroll(&self.omni_scroll)
             .max_h(px(420.))
             .overflow_y_scroll()
             .flex()
@@ -4575,12 +4628,7 @@ impl Editor {
         let mut last_section = "";
         for (ix, row) in rows.iter().enumerate() {
             if grouped {
-                let section = match row {
-                    OmniRow::Cmd(cmd) => cmd.section,
-                    OmniRow::Frequent(_) => "Frequent",
-                    OmniRow::Recent(_) => "Recent Documents",
-                    _ => "",
-                };
+                let section = omni_row_section(row);
                 if section != last_section {
                     last_section = section;
                     list = list.child(
@@ -4823,6 +4871,7 @@ impl Editor {
         let matches = self.find_matches(&query);
         if !matches.is_empty() {
             self.palette_selected = ix % matches.len();
+            self.omni_scroll_into_view(self.palette_selected);
             self.selected_range = matches[self.palette_selected].clone();
         }
         self.bump_activity();
@@ -4856,6 +4905,7 @@ impl Editor {
         self.sync_mutations();
         self.mark_dirty();
         self.palette_selected = 0;
+        self.omni_scroll_into_view(0);
         eprintln!("strop: replaced {count} matches");
         self.bump_activity();
         cx.notify();
@@ -7587,6 +7637,17 @@ impl Editor {
             "field_cursor": field_cursor,
             "field_sel": field_sel,
             "margin": margin,
+            // The omnibox results list (palette-scroll): `selected` is the
+            // highlighted row, `rows` the list length, `scroll_y`/`max_scroll_y`
+            // the list's own scroll (not the document's) — the rig asserts
+            // keyboard nav past the fold actually moves this, and that mouse
+            // wheel still does too. `null` when the omnibox is closed.
+            "omni": self.palette_input.as_ref().map(|_| serde_json::json!({
+                "selected": self.palette_selected,
+                "rows": self.omni_rows(&self.palette_query).len(),
+                "scroll_y": f32::from(self.omni_scroll.offset().y),
+                "max_scroll_y": f32::from(self.omni_scroll.max_offset().y),
+            })),
             // A completed pass parked behind the reveal clock (mid-burst
             // arrival) — the rig asserts park-then-land timing against this.
             "ai_deferred": self.deferred_pass.is_some(),
@@ -12381,6 +12442,45 @@ enum OmniRow {
         level: u8,
         text: String,
     },
+}
+
+/// The section a grouped-mode (bare `>`) row falls under — "" for rows that
+/// never group (find/heading/command-with-query). Shared by `render_omni`
+/// (to know when to insert a header) and `omni_child_index` (to know it did)
+/// so the two can't drift apart.
+fn omni_row_section(row: &OmniRow) -> &'static str {
+    match row {
+        OmniRow::Cmd(cmd) => cmd.section,
+        OmniRow::Frequent(_) => "Frequent",
+        OmniRow::Recent(_) => "Recent Documents",
+        _ => "",
+    }
+}
+
+/// Where row `ix` lands among the omni-list's direct children. Outside
+/// grouped mode this is just `ix`; grouped mode (the bare `>` browsing view)
+/// interleaves a section-header div ahead of each new section, so every row
+/// after the first section boundary sits one or more children further along
+/// than its index in `rows` — `render_omni` and `omni_scroll_into_view` both
+/// need this mapping to agree, since one lays the headers out and the other
+/// scrolls to a row assuming they're there.
+fn omni_child_index(rows: &[OmniRow], grouped: bool, ix: usize) -> usize {
+    let mut child = 0;
+    let mut last_section = "";
+    for (row_ix, row) in rows.iter().enumerate() {
+        if grouped {
+            let section = omni_row_section(row);
+            if section != last_section {
+                last_section = section;
+                child += 1;
+            }
+        }
+        if row_ix == ix {
+            return child;
+        }
+        child += 1;
+    }
+    child
 }
 
 /// The AI surface's state machine (PLAN.md E3). Status lives where the
