@@ -9,7 +9,7 @@ use gpui::Action;
 
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
-    DiagnosisModeDevelopmental, DiagnosisModeLine, EndSession, ExportMarkdown, Find, Heading1,
+    DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1,
     Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode,
@@ -285,22 +285,15 @@ pub fn all() -> &'static [Command] {
             AddCheckpoint,
             ["snapshot", "version", "чекпоинт"]
         ),
-        // The finish-your-story layer (DESIGN §4): per-session progress
-        // and the close-time if-then ritual. Scaffolds prompt at CLOSE,
-        // never at open (§4b tension 6) — both are pull-only.
+        // The finish-your-story layer (DESIGN §4): per-session progress.
+        // Scaffolds prompt at CLOSE, never at open (§4b tension 6) — pull-only.
+        // (The re-entry intent question / End Session was retired: impl 04 §1.)
         cmd!(
             "Set Session Goal…",
             "Session",
             None,
             SetSessionGoal,
             ["words", "target", "progress", "цель", "норма слов"]
-        ),
-        cmd!(
-            "End Session…",
-            "Session",
-            None,
-            EndSession,
-            ["quit", "next session", "intent", "закончить сессию", "намерение"]
         ),
         cmd!(
             "Open Command Palette",
@@ -533,7 +526,7 @@ mod tests {
             "Toggle Outline",
             "Set Up AI Provider…",
             "New Document",
-            "End Session…",
+            "Set Session Goal…",
         ] {
             assert!(by_label(l).global(), "{l} should be global");
         }

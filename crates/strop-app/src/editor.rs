@@ -410,7 +410,7 @@ actions!(
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
-        ToggleOutline, EndSession, SetSessionGoal, ToggleReview,
+        ToggleOutline, SetSessionGoal, ToggleReview,
     ]
 );
 
@@ -644,6 +644,119 @@ fn card_body(composing_here: bool) -> CardBody {
     }
 }
 
+/// Which read a pass runs (impl 04 §0, review H27). The old `run_pass(bool)`
+/// could name only believing-vs-diagnosis; the doubting read is neither, and a
+/// `"doubting"` *mode string* silently produced the LINE prompt (`system_prompt`
+/// maps every unknown mode to line). A bool also can't survive the
+/// deferred/pending round-trips — `pending_pass`/`last_pass` collapse doubting
+/// onto believing. So the pass identity is an enum, threaded end to end.
+///
+/// `Diagnostic` carries its levels-of-edit mode WITH it, which is the fix for
+/// the sticky-mode trap (review mid): a menu row pins its depth into the run
+/// itself rather than mutating the persistent `diagnosis_mode` session override
+/// (which would silently re-aim the next ctrl-shift-d).
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum PassKind {
+    /// Elbow's believing game — strengths named as mechanisms.
+    Believing,
+    /// The believing read's mirror — the strongest case against it.
+    Doubting,
+    /// The Perkins diagnosis at a levels-of-edit depth
+    /// (developmental / line / copy — the string `effective_mode` yields).
+    Diagnostic(String),
+}
+
+impl PassKind {
+    /// The journal Pass event's mode string ("believing" / "doubting" / mode).
+    /// The journal itself is a parallel package (P0) not present in this
+    /// worktree base, so nothing records it here yet; this is the one place
+    /// the integrator wires when P0 lands (`integrate_pass` → `JournalEvent::
+    /// Pass { mode: self.last_pass.mode_str() }`), so the mapping lives with the
+    /// enum. `allow(dead_code)` until that call site exists.
+    #[allow(dead_code)]
+    fn mode_str(&self) -> &str {
+        match self {
+            PassKind::Believing => "believing",
+            PassKind::Doubting => "doubting",
+            PassKind::Diagnostic(mode) => mode,
+        }
+    }
+
+    /// The Running-card label stem: "{} · {model}" is completed by `run_pass`.
+    fn run_label(&self) -> String {
+        match self {
+            PassKind::Believing => "believing pass".to_owned(),
+            PassKind::Doubting => "doubting pass".to_owned(),
+            PassKind::Diagnostic(mode) => format!("{mode} diagnosis"),
+        }
+    }
+}
+
+/// The editor button's face (impl 04 §0, review H31/H32). The real state is
+/// multi-dimensional — AI lifecycle × a parked read × the door — so the face is
+/// a PRIORITY over it, not four exclusive states: a cooking pass while the door
+/// is open must resolve to ONE face, and Error/NeedsSetup can't fall through to
+/// a bare idle button while `render_ai_status` shows the failure. The door word
+/// is the glossary's presence pair (`Reading`), never the internal "Reviewing".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditorFace {
+    /// No provider configured — routes to setup (the card lives on render_ai_status).
+    NeedsSetup,
+    /// The last read failed — hover carries the message; the card stays too.
+    Error,
+    /// A read is cooking — pulse dot; hover names the read.
+    Cooking,
+    /// A completed read is parked behind the reveal clock ("a read is ready").
+    Ready,
+    /// The door is open — "Reading · {n} open".
+    Reading,
+    /// Drafting, nothing pending — the bare "Ask the editor ▾".
+    Idle,
+}
+
+impl EditorFace {
+    /// The rig token (dump `editor_btn.face`), so a smoke test can assert the
+    /// priority transitions without eyeballing the pixels.
+    fn token(self) -> &'static str {
+        match self {
+            EditorFace::NeedsSetup => "needs_setup",
+            EditorFace::Error => "error",
+            EditorFace::Cooking => "cooking",
+            EditorFace::Ready => "ready",
+            EditorFace::Reading => "reading",
+            EditorFace::Idle => "idle",
+        }
+    }
+}
+
+/// The inputs the face is a pure function of. `count` shapes only the Reading
+/// LABEL, never the priority, so it is not an input here.
+struct FaceInputs {
+    needs_setup: bool,
+    error: bool,
+    cooking: bool,
+    ready: bool,
+    door_open: bool,
+}
+
+/// The priority function itself, pure and table-tested. Order is the spec's:
+/// NeedsSetup > Error > cooking > read-ready > Reading·N > idle.
+fn face_for(i: &FaceInputs) -> EditorFace {
+    if i.needs_setup {
+        EditorFace::NeedsSetup
+    } else if i.error {
+        EditorFace::Error
+    } else if i.cooking {
+        EditorFace::Cooking
+    } else if i.ready {
+        EditorFace::Ready
+    } else if i.door_open {
+        EditorFace::Reading
+    } else {
+        EditorFace::Idle
+    }
+}
+
 pub struct Editor {
     focus_handle: FocusHandle,
     /// Text + formatting with unified transaction history. Marks persist
@@ -712,14 +825,15 @@ pub struct Editor {
     /// Session override of the levels-of-edit depth; None = config's
     /// [ai].mode (the thesis switch, editorial-foundations §2.2).
     diagnosis_mode: Option<String>,
-    /// What the last pass was, so an error card's Retry can repeat it.
-    last_pass_believing: bool,
-    /// A pass the writer asked for before a provider existed (Some =
-    /// believing?). Finishing setup — the panel's Save, or the one-click
-    /// local-model path — consumes it and runs the pass, so the request
-    /// that *triggered* setup is the request that gets answered (no
-    /// "now press ctrl-shift-d again" dead end).
-    pending_pass: Option<bool>,
+    /// What the last pass was, so an error card's Retry can repeat it exactly
+    /// (believing / doubting / a diagnosis at its pinned depth).
+    last_pass: PassKind,
+    /// A pass the writer asked for before a provider existed. Finishing setup —
+    /// the panel's Save, or the one-click local-model path — consumes it and
+    /// runs THIS pass, so the request that *triggered* setup is the request
+    /// that gets answered (no "now press ctrl-shift-d again" dead end). Carries
+    /// the full `PassKind`, so a doubting/menu request survives the detour.
+    pending_pass: Option<PassKind>,
     /// A completed pass whose results arrived MID-TYPING-BURST: integrating
     /// would pop squiggles into the very sentence being typed and re-pack the
     /// lane — an involuntary peripheral onset (attention-motion.md §2). Held
@@ -820,6 +934,10 @@ pub struct Editor {
     /// vanish. Instead a top-right pill shows the count (never silent) and
     /// this toggles the drop-down panel that lists them.
     narrow_notes_open: bool,
+    /// The editor button's dropdown (impl 04 §0): the subsystem's single home,
+    /// glued flush under the titlebar control. A bool-toggled overlay, light-
+    /// dismissed like the narrow-notes panel it borrows its anchoring from.
+    editor_menu_open: bool,
     /// Selection popover (DESIGN §2-toolbar): formatting rides the
     /// selection. Shown on mouse-up over a selection or via ctrl-.;
     /// dismissed by mousedown, typing, scrolling, or escape.
@@ -829,19 +947,10 @@ pub struct Editor {
     /// Outline rail (DESIGN §1.6): toggleable left rail of headings,
     /// session-only — externalized structure at the point of performance.
     outline_open: bool,
-    /// "Next session I will ___" recorded at the previous close (DESIGN
-    /// §4.1), shown as a dismissible banner; auto-clears on first edit.
-    /// Deliberately NOT ai_status — the AI never speaks first.
-    next_intent: Option<String>,
-    /// End Session recorded an intent this run; quit then skips the
-    /// caret-only rewrite (the entry is already complete).
-    intent_recorded: bool,
-    /// store_dirty was set at least once this session. The close-time
-    /// decision it feeds (DESIGN §4b tension 6): edits + no intent =
-    /// still NOTHING at quit — no dialog, ever. The ritual is pull-only.
+    /// store_dirty was set at least once this session — a plain "did the writer
+    /// touch this document" flag (the rig's `edits=` tag). Re-entry via the
+    /// intent question was retired (impl 04 §1); this now only reports activity.
     session_had_edits: bool,
-    /// The "End Session…" composer (bottom strip, like find).
-    end_session_input: Option<Entity<TextField>>,
     /// Session word goal (DESIGN §4.2): (target, word_count at set time).
     /// Session-only — per-session progress, never lifetime totals.
     session_goal: Option<(usize, usize)>,
@@ -1118,7 +1227,9 @@ impl Editor {
             ai_generation: 0,
             diagnosis_pass: 0,
             diagnosis_mode: None,
-            last_pass_believing: false,
+            // Never read before the first pass sets it (Retry only exists after
+            // a pass ran); a plain line diagnosis is the sensible default.
+            last_pass: PassKind::Diagnostic("line".to_owned()),
             palette_input: None,
             palette_selected: 0,
             palette_query: String::new(),
@@ -1137,12 +1248,10 @@ impl Editor {
             card_heights: HashMap::new(),
             active_card_height: None,
             narrow_notes_open: false,
+            editor_menu_open: false,
             selection_popover: false,
             outline_open: false,
-            next_intent: None,
-            intent_recorded: false,
             session_had_edits: false,
-            end_session_input: None,
             session_goal: None,
             goal_input: None,
             zone_row_bounds: std::rc::Rc::default(),
@@ -1216,23 +1325,15 @@ impl Editor {
         // from a lull (deferred_pass), so caret moves must never touch it.
         self.last_text_edit = Some(Instant::now());
         self.word_count = count_words(self.doc.rope().chunks());
-        // Apply to the store and capture its path before releasing the borrow,
-        // so the dirty-flag chokepoint (mark_dirty) can take &mut self.
-        let intent_path = match &self.store {
-            Some(store) => {
-                store.apply(&ops);
-                store.path().to_path_buf()
-            }
+        // Apply to the store before releasing the borrow, so the dirty-flag
+        // chokepoint (mark_dirty) can take &mut self.
+        match &self.store {
+            Some(store) => store.apply(&ops),
             None => return,
-        };
+        }
         self.mark_dirty();
         self.dirty_since_checkpoint = true;
         self.session_had_edits = true;
-        // The first edit honors the open-time intent: the banner has done its
-        // job and clears itself (DESIGN §4.1).
-        if self.next_intent.take().is_some() {
-            crate::files::clear_intent(&intent_path);
-        }
     }
 
     /// Mirror the open note composer's draft onto the note so the idle-save
@@ -1255,9 +1356,10 @@ impl Editor {
     }
 
     /// Re-enter the document where the last session left it (DESIGN §4
-    /// invariant: caret restored, zero questions asked, within a second)
-    /// and surface the recorded next-session intent as a banner.
-    pub fn restore_session(&mut self, entry: crate::files::IntentEntry) {
+    /// invariant: caret restored, zero questions asked, within a second). The
+    /// re-entry intent question was retired (impl 04 §1); the caret-resume half
+    /// of the ritual stays — it is the only thing the sidecar now carries.
+    pub fn restore_session(&mut self, entry: crate::files::SessionEntry) {
         if let Some(caret) = entry.caret {
             // Clamp to the document and snap to a char boundary (the doc
             // may have changed under us since the caret was recorded).
@@ -1267,20 +1369,13 @@ impl Editor {
             self.selected_range = byte..byte;
             self.autoscroll_request = true;
         }
-        if let Some(intent) = entry.intent.filter(|i| !i.trim().is_empty()) {
-            self.next_intent = Some(intent);
-        }
     }
 
     /// Quit-time bookkeeping: remember the caret so the next open resumes
-    /// mid-sentence. The intent itself is only ever written by End
-    /// Session — a quit with edits and no intent stays a plain quit
-    /// (DESIGN §4b tension 6: prompts at close are offered, never owed).
+    /// mid-sentence. The only thing quit records now — the intent question
+    /// (and its End Session verb) is gone (impl 04 §1).
     pub fn record_exit_state(&self) {
         let Some(store) = &self.store else { return };
-        if self.intent_recorded {
-            return; // End Session already wrote the full entry.
-        }
         crate::files::record_caret(store.path(), self.cursor_offset());
     }
 
@@ -2253,11 +2348,14 @@ impl Editor {
     /// The thesis, running: an editorial pass that names problems as
     /// queries in the margin and never rewrites a word.
     fn run_diagnosis(&mut self, _: &RunDiagnosis, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_pass(false, cx);
+        // ctrl-shift-d honours the session depth (`diagnosis_mode`, else config);
+        // the mode is resolved HERE and pinned into the run, so a later menu row
+        // can pin a different depth without disturbing this default.
+        self.run_pass(PassKind::Diagnostic(self.effective_mode()), cx);
     }
 
     fn run_believing(&mut self, _: &RunBelieving, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_pass(true, cx);
+        self.run_pass(PassKind::Believing, cx);
     }
 
     /// The door (DESIGN §4.4): flip between drafting (margin quiet) and
@@ -2265,8 +2363,14 @@ impl Editor {
     /// research asks for — never inferred, never automatic in v1, so a
     /// drafting burst can never be interrupted by a wrong guess.
     fn toggle_review(&mut self, _: &ToggleReview, _: &mut Window, cx: &mut Context<Self>) {
-        // Touching the door is an explicit attention shift — a parked pass
-        // lands right now, mid-burst or not.
+        self.toggle_door(cx);
+    }
+
+    /// The door's flush-and-flip, shared by the ctrl-shift-r action, the editor
+    /// menu's presence verb (`Reading ⇄ Away`), and the rig hook. Touching the
+    /// door is an explicit attention shift — a parked pass lands right now,
+    /// mid-burst or not.
+    fn toggle_door(&mut self, cx: &mut Context<Self>) {
         self.flush_deferred_pass(cx);
         self.drafting = !self.drafting;
         cx.notify();
@@ -2321,7 +2425,72 @@ impl Editor {
         }
     }
 
-    fn run_pass(&mut self, believing: bool, cx: &mut Context<Self>) {
+    /// The editor button's live face inputs (impl 04 §0). `configured` gates
+    /// NeedsSetup even before any pass runs (ai_status is None until one does),
+    /// so an unconfigured provider is announced on the button, not just when a
+    /// pass is attempted.
+    fn face_inputs(&self) -> FaceInputs {
+        FaceInputs {
+            needs_setup: !self.config.ai.configured()
+                || matches!(self.ai_status, Some(AiStatus::NeedsSetup { .. })),
+            error: matches!(self.ai_status, Some(AiStatus::Error { .. })),
+            cooking: matches!(self.ai_status, Some(AiStatus::Running { .. })),
+            ready: self.deferred_pass.is_some(),
+            door_open: !self.drafting,
+        }
+    }
+
+    fn editor_face(&self) -> EditorFace {
+        face_for(&self.face_inputs())
+    }
+
+    /// Open editorial queries (open diagnosis cards) — the button's "{n} open"
+    /// and the footer's "{open} queries open". `resting_diagnoses` already
+    /// counts exactly these, regardless of the door.
+    fn open_query_count(&self) -> usize {
+        self.resting_diagnoses()
+    }
+
+    /// Queries the writer RESOLVED (marked Done) in this document — the footer's
+    /// "{resolved} resolved". Deliberately Done-ONLY: Dismissed cards are
+    /// permanent suppression tombstones (`is_suppressed` leans on them), not work
+    /// done, so counting them would inflate the tally with silenced nags (review
+    /// mid). Bounded by the document's real annotation set.
+    fn resolved_query_count(&self) -> usize {
+        self.doc
+            .notes()
+            .notes()
+            .iter()
+            .filter(|n| n.kind == NoteKind::Diagnosis && n.status == NoteStatus::Done)
+            .count()
+    }
+
+    /// The copy row's gate (impl 04 §0): while any developmental query is open,
+    /// polishing prose the structural edit may cut is premature (the altitude
+    /// order — Reedsy, Sommers). This is the REQUEST-side complement of
+    /// `suppressed_copy`'s RESULT-hold — both key off the same signal (an open
+    /// developmental diagnosis), so the button and the lane never disagree. It
+    /// releases the moment the last developmental query closes, no pass re-run.
+    fn copy_gated(&self) -> bool {
+        copy_gate_active(self.doc.notes().open().map(|n| (n.kind, n.level.as_str())))
+    }
+
+    /// Toggle the editor button's dropdown (impl 04 §0). A pass in flight leaves
+    /// the rows inert (see the menu render), but the button still opens so the
+    /// pulse and the door verb stay reachable.
+    fn toggle_editor_menu(&mut self, cx: &mut Context<Self>) {
+        self.editor_menu_open = !self.editor_menu_open;
+        cx.notify();
+    }
+
+    fn close_editor_menu(&mut self, cx: &mut Context<Self>) {
+        if self.editor_menu_open {
+            self.editor_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    fn run_pass(&mut self, kind: PassKind, cx: &mut Context<Self>) {
         if matches!(self.ai_status, Some(AiStatus::Running { .. })) {
             return;
         }
@@ -2330,16 +2499,16 @@ impl Editor {
         self.config = crate::config::load();
         let ai = self.config.ai.clone();
         if !ai.configured() {
-            // Remember what was asked: once a provider exists, this exact
-            // pass runs without the writer re-issuing it.
-            self.pending_pass = Some(believing);
+            // Remember what was asked: once a provider exists, THIS exact
+            // pass (believing/doubting/depth) runs without the writer re-issuing.
+            self.pending_pass = Some(kind);
             self.ai_generation += 1;
             self.ai_status = Some(AiStatus::NeedsSetup { local_model: None });
             self.probe_local_model(self.ai_generation, cx);
             cx.notify();
             return;
         }
-        self.last_pass_believing = believing;
+        self.last_pass = kind.clone();
         // You asked to evaluate — open the door, so results land in a margin
         // the writer is actually looking at (and any earlier resting cards
         // come back into view alongside them). Asking again is also the most
@@ -2355,19 +2524,10 @@ impl Editor {
             self.doc.slice_bytes(self.selected_range.clone())
         };
         let scope: String = scope.chars().take(24_000).collect();
-        let mode = self.effective_mode();
         self.ai_generation += 1;
         let generation = self.ai_generation;
         self.ai_status = Some(AiStatus::Running {
-            label: format!(
-                "{} · {}",
-                if believing {
-                    "believing pass".to_owned()
-                } else {
-                    format!("{mode} diagnosis")
-                },
-                ai.model
-            ),
+            label: format!("{} · {}", kind.run_label(), ai.model),
         });
         cx.notify();
 
@@ -2379,10 +2539,12 @@ impl Editor {
                 .background_executor()
                 .spawn(async move {
                     let client = strop_core::llm::LlmClient::new(&base_url, &api_key, &model);
-                    let system = if believing {
-                        strop_core::diagnose::believing_system_prompt()
-                    } else {
-                        strop_core::diagnose::system_prompt(&mode)
+                    // The pinned kind picks the prompt; a Diagnostic carries its
+                    // own depth (so `system_prompt` never falls through to line).
+                    let system = match &kind {
+                        PassKind::Believing => strop_core::diagnose::believing_system_prompt(),
+                        PassKind::Doubting => strop_core::diagnose::doubting_system_prompt(),
+                        PassKind::Diagnostic(mode) => strop_core::diagnose::system_prompt(mode),
                     };
                     let user = strop_core::diagnose::user_prompt(&scope);
                     client
@@ -2641,8 +2803,11 @@ impl Editor {
     /// defaults to a diagnosis if the queue is empty (the writer reached
     /// setup some other way — running the core feature is the right guess).
     fn run_pending_pass(&mut self, cx: &mut Context<Self>) {
-        let believing = self.pending_pass.take().unwrap_or(false);
-        self.run_pass(believing, cx);
+        let kind = self
+            .pending_pass
+            .take()
+            .unwrap_or_else(|| PassKind::Diagnostic(self.effective_mode()));
+        self.run_pass(kind, cx);
     }
 
     /// Guided config-file flow: ensure the commented template exists,
@@ -4372,45 +4537,6 @@ impl Editor {
         cx.notify();
     }
 
-    /// "End Session…" (DESIGN §4.1 — the strongest evidence card, d=0.65):
-    /// one line, "Next session I will ___", saved per-document; enter
-    /// saves AND quits (it IS end-session), escape stays. The ritual
-    /// lives at close and only on request — ctrl-q never blocks.
-    fn end_session(&mut self, _: &EndSession, window: &mut Window, cx: &mut Context<Self>) {
-        if self.end_session_input.is_some() {
-            return;
-        }
-        let input = cx.new(|cx| TextField::single(cx, String::new()));
-        cx.subscribe_in(
-            &input,
-            window,
-            |editor, _, event: &TextFieldEvent, window, cx| match event {
-                TextFieldEvent::Commit(text) => {
-                    let text = text.trim().to_owned();
-                    if let Some(store) = &editor.store
-                        && !text.is_empty()
-                    {
-                        crate::files::set_intent(store.path(), &text, editor.cursor_offset());
-                        editor.intent_recorded = true;
-                    }
-                    editor.save_now();
-                    cx.quit();
-                }
-                TextFieldEvent::Cancel => {
-                    editor.end_session_input = None;
-                    window.focus(&editor.focus_handle, cx);
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
-        cx.observe(&input, |_, _, cx| cx.notify()).detach();
-        let input_focus = input.read(cx).focus_handle.clone();
-        window.focus(&input_focus, cx);
-        self.end_session_input = Some(input);
-        cx.notify();
-    }
-
     /// "Set Session Goal…" (DESIGN §4.2): a number, a live delta in the
     /// titlebar, a quiet sage dot at the finish line. Session-only.
     fn set_session_goal(&mut self, _: &SetSessionGoal, window: &mut Window, cx: &mut Context<Self>) {
@@ -4448,36 +4574,6 @@ impl Editor {
         window.focus(&input_focus, cx);
         self.goal_input = Some(input);
         cx.notify();
-    }
-
-    /// "Next session I will" — the bottom strip, find-bar pattern.
-    fn render_end_session_strip(&self) -> Option<impl IntoElement> {
-        let input = self.end_session_input.clone()?;
-        Some(
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .bg(rgb(0xF4F1EA))
-                .border_t_1()
-                .border_color(rgb(RULE_COLOR))
-                .px(px(28.))
-                .py(px(8.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .font_family("PT Serif")
-                .text_size(px(13.))
-                .child(div().text_color(rgb(MUTED_COLOR)).child("Next session I will"))
-                .child(div().flex_1().child(input))
-                .child(
-                    div()
-                        .text_color(rgb(MUTED_COLOR))
-                        .text_size(px(11.))
-                        .child("enter saves & quits · esc stays"),
-                ),
-        )
     }
 
     fn render_goal_strip(&self) -> Option<impl IntoElement> {
@@ -4528,6 +4624,11 @@ impl Editor {
         if self.shortcuts_open {
             self.shortcuts_open = false;
             window.focus(&self.focus_handle, cx);
+            cx.notify();
+            return;
+        }
+        if self.editor_menu_open {
+            self.editor_menu_open = false;
             cx.notify();
             return;
         }
@@ -5649,6 +5750,10 @@ impl Editor {
             self.narrow_notes_open = false;
             cx.notify();
         }
+        if self.editor_menu_open {
+            self.editor_menu_open = false;
+            cx.notify();
+        }
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -5894,7 +5999,6 @@ impl Editor {
         fields.extend(self.focus.input().cloned());
         fields.extend(self.rename_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.alt_input.as_ref().map(|(_, i)| i.clone()));
-        fields.extend(self.end_session_input.clone());
         fields.extend(self.goal_input.clone());
         let focused_field = fields
             .iter()
@@ -5964,6 +6068,16 @@ impl Editor {
             "moving": self.moving.len(),
             "moves_started": self.moves_started,
             "reduce_motion": self.config.reduce_motion,
+            // The editor button's face + the state it's a priority over, so the
+            // rig can assert the transitions (seed:deliver → cooking → ready →
+            // reading) and the door law (open menu while drafting rests cards).
+            "editor_btn": {
+                "face": self.editor_face().token(),
+                "open": !self.drafting,
+                "cooking": matches!(self.ai_status, Some(AiStatus::Running { .. })),
+                "ready": self.deferred_pass.is_some(),
+                "open_count": self.open_query_count(),
+            },
         })
         .to_string()
     }
@@ -6048,6 +6162,19 @@ impl Editor {
         let generation = self.ai_generation;
         self.deliver_pass(Self::demo_diagnoses(), generation, cx);
         cx.notify();
+    }
+
+    /// Rig hook (`ebtn:open`): open the editor button's dropdown. The door law
+    /// then holds even with the menu up — cards rest while drafting.
+    pub fn debug_open_editor_menu(&mut self, cx: &mut Context<Self>) {
+        self.editor_menu_open = true;
+        cx.notify();
+    }
+
+    /// Rig hook (`ebtn:door`): the menu footer's presence verb — flush a parked
+    /// pass and flip the door, exactly the path a click on it takes.
+    pub fn debug_toggle_door(&mut self, cx: &mut Context<Self>) {
+        self.toggle_door(cx);
     }
 
     /// Rig hook (`seed:many`): a CROWDED lane — eight diagnoses across two
@@ -6146,9 +6273,6 @@ impl Editor {
         }
         if let Some((goal, start)) = self.session_goal {
             session += &format!(" goal={:+}/{goal}", self.word_count as i64 - start as i64);
-        }
-        if self.next_intent.is_some() {
-            session += " intent=banner";
         }
         if self.session_had_edits {
             session += " edits=1";
@@ -8100,46 +8224,89 @@ impl Editor {
                             ),
                     ),
             )
-            // The core feature earns a seat in the chrome (E3-research's
-            // deferred "titlebar diagnosis button — buttons teach chords").
-            // It lives where its results live: just left of the margin side.
-            // Drawn as a little margin card (the shape a diagnosis takes), so
-            // it rhymes with the feature instead of borrowing a stock glyph.
+            // The editor button (impl 04 §0): the AI subsystem's single home,
+            // where its results live — just left of the margin side. The old
+            // drawn mini-card is gone; the control now WEARS its state (a
+            // priority face) and opens the dropdown that names the reads.
             .child({
-                let running = matches!(self.ai_status, Some(AiStatus::Running { .. }));
-                let mark = if running { rgb(SAGE_COLOR) } else { rgb(MUTED_COLOR) };
+                let face = self.editor_face();
+                let open = self.editor_menu_open;
+                let n = self.open_query_count();
+                // The face's label. "Reading" is the glossary presence word,
+                // never the internal "Reviewing" (review H31).
+                let label: String = match face {
+                    EditorFace::NeedsSetup => "Ask the editor · needs setup".to_owned(),
+                    EditorFace::Cooking | EditorFace::Error | EditorFace::Idle => {
+                        "Ask the editor".to_owned()
+                    }
+                    EditorFace::Ready => "Ask the editor · a read is ready".to_owned(),
+                    EditorFace::Reading if n > 0 => {
+                        format!("Reading · {n} open · Ask the editor")
+                    }
+                    EditorFace::Reading => "Reading · Ask the editor".to_owned(),
+                };
+                // A colour cue only where the words don't carry it: cool = the
+                // machine is at work, red = it failed (color-language.md axis).
+                let dot = match face {
+                    EditorFace::Cooking => Some(AI_ACCENT),
+                    EditorFace::Error => Some(ERROR),
+                    _ => None,
+                };
+                // Hover names the read while cooking, carries the message on a
+                // failure (the full card still lives on render_ai_status), and
+                // teaches the chord in every state.
+                let tip_label: SharedString = match (face, self.ai_status.as_ref()) {
+                    (EditorFace::Cooking, Some(AiStatus::Running { label })) => {
+                        format!("Running: {label}").into()
+                    }
+                    (EditorFace::Error, Some(AiStatus::Error { title, .. })) => title.clone().into(),
+                    (EditorFace::NeedsSetup, _) => "Ask the editor — set up a provider".into(),
+                    _ => "Ask the editor".into(),
+                };
                 div()
-                    .id("diagnose-toggle")
+                    .id("editor-btn")
                     .occlude()
+                    .flex_shrink_0()
+                    .ml(px(4.))
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(5.))
                     .cursor(CursorStyle::PointingHand)
-                    .when(running, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .when(open, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("Run Editorial Diagnosis", Some("ctrl-shift-d")))
+                    .text_color(rgb(if face == EditorFace::Reading {
+                        TEXT_COLOR
+                    } else {
+                        MUTED_COLOR
+                    }))
+                    .tooltip(tip(tip_label, Some("ctrl-shift-d")))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            editor.run_diagnosis(&RunDiagnosis, window, cx);
+                            editor.toggle_editor_menu(cx);
                         }),
                     )
+                    .when_some(dot, |d, color| {
+                        d.child(div().size(px(6.)).rounded_full().bg(rgb(color)))
+                    })
+                    .child(div().child(label))
+                    // The dropdown wedge — three centred, decreasing bars (the
+                    // app's own drawn-glyph idiom; "▾" isn't in the PT fonts).
                     .child(
-                        // A 14×11 card outline with two short text lines.
                         div()
-                            .w(px(14.))
-                            .h(px(11.))
-                            .rounded(px(2.))
-                            .border_1()
-                            .border_color(mark)
                             .flex()
                             .flex_col()
-                            .justify_center()
-                            .gap(px(2.))
-                            .px(px(2.5))
-                            .child(div().w(px(7.)).h(px(1.)).bg(mark))
-                            .child(div().w(px(5.)).h(px(1.)).bg(mark)),
+                            .items_center()
+                            .gap(px(1.))
+                            .children(
+                                [6., 4., 2.]
+                                    .into_iter()
+                                    .map(|w| div().w(px(w)).h(px(1.)).bg(rgb(MUTED_COLOR))),
+                            ),
                     )
             })
             // The day-zero affordance: a user who knows nothing clicks the
@@ -9841,6 +10008,15 @@ fn note_surfaces(kind: NoteKind, level: &str, drafting: bool, has_dev: bool) -> 
     kind != NoteKind::Diagnosis || (!drafting && (!has_dev || level != "copy"))
 }
 
+/// The editor menu's copy-row gate (impl 04 §0), pure so its RELEASE is unit-
+/// tested: gated iff any OPEN diagnosis sits at the developmental level. Keyed
+/// off the same signal as `note_surfaces`'s copy-hold, so the request gate and
+/// the result hold can never disagree. Releases the instant the last
+/// developmental query closes — no pass re-run.
+fn copy_gate_active<'a>(open_notes: impl Iterator<Item = (NoteKind, &'a str)>) -> bool {
+    open_notes.filter(|(k, _)| *k == NoteKind::Diagnosis).any(|(_, level)| level == "developmental")
+}
+
 impl Editor {
     /// Shape `text` at the card's inner width and return its REAL wrapped
     /// height (the measurement that replaced the `chars/30` estimate). Embedded
@@ -10070,7 +10246,7 @@ impl Editor {
         // the active card hold their anchors, inactive diagnoses yield around
         // them, the selected card is kept fully in view, and no two overlap.
         // `top` currently holds each card's anchor target.
-        let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
+        let floor = BAR_HEIGHT + 8.;
         let viewport_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
         let items: Vec<PlaceItem> = cards
             .iter()
@@ -10309,7 +10485,6 @@ impl Editor {
         self.has_margin_cards()
             || self.margin_rail_count().is_some()
             || self.ai_status.is_some()
-            || self.next_intent.is_some()
     }
 
     /// The prose column's geometry — (left inset, width) — as a function of
@@ -10406,99 +10581,12 @@ impl Editor {
         )
     }
 
-    /// Estimated height of the intent banner at the margin-lane top, so
-    /// the AI status card mounts below it instead of on top of it.
-    fn intent_banner_height(&self) -> f32 {
-        match &self.next_intent {
-            None => 0.,
-            Some(intent) => {
-                let lines = (intent.chars().count() / 28 + 1).clamp(1, 4) as f32;
-                16. + 17. * lines + 8.
-            }
-        }
-    }
-
-    /// "Next: <intent>" (DESIGN §4.1, the open half of the ritual): the
-    /// sentence recorded at close, shown at the top of the margin lane
-    /// (a bottom strip in narrow windows — status never covers prose),
-    /// dismissible, auto-cleared by the first edit. Its own field, not
-    /// ai_status — this is the writer's voice, not the model's.
-    fn render_intent_banner(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let intent = self.next_intent.clone()?;
-        let fits = self.margin_fits(window);
-        let dismiss = div()
-            .id("intent-dismiss")
-            .flex_shrink_0()
-            .cursor(CursorStyle::PointingHand)
-            .text_color(rgb(MUTED_COLOR))
-            .hover(|d| d.text_color(rgb(TEXT_COLOR)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    editor.next_intent = None;
-                    if let Some(store) = &editor.store {
-                        crate::files::clear_intent(store.path());
-                    }
-                    cx.notify();
-                }),
-            )
-            .child("×");
-        let body = |d: gpui::Div| {
-            d.font_family("PT Serif")
-                .text_size(px(12.))
-                .text_color(rgb(TEXT_COLOR))
-                .flex()
-                .items_start()
-                .gap(px(6.))
-                .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Next:"))
-                .child(div().flex_1().min_w(px(0.)).child(intent))
-                .child(dismiss)
-        };
-        Some(if fits {
-            let col_right = self.column_right(window);
-            body(
-                div()
-                    .absolute()
-                    .top(px(BAR_HEIGHT + 8.))
-                    .left(px(col_right + MARGIN_GAP + 8.))
-                    .w(px(MARGIN_WIDTH - 8.))
-                    .p(px(8.))
-                    .rounded(px(6.))
-                    .bg(rgb(0xF2F4EC))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR)),
-            )
-            .into_any_element()
-        } else {
-            body(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .bg(rgb(0xF2F4EC))
-                    .border_t_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .px(px(28.))
-                    .py(px(8.)),
-            )
-            .into_any_element()
-        })
-    }
-
     /// The AI surface (PLAN.md E3), pinned where results land: top of the
     /// margin lane when it fits, a floating top-right card otherwise.
     /// With no status and an empty margin, a one-line hint teaches the
     /// chord — the AI must be visible before the chord is known.
     fn render_ai_status(&self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let fits = self.margin_fits(window);
-        // The intent banner holds the lane's top slot while it lives.
-        let banner_h = self.intent_banner_height();
         let (left, width) = if fits {
             let col_right = self.column_right(window);
             (col_right + MARGIN_GAP + 8., MARGIN_WIDTH - 8.)
@@ -10512,7 +10600,7 @@ impl Editor {
             if fits {
                 div()
                     .absolute()
-                    .top(px(BAR_HEIGHT + 8. + banner_h))
+                    .top(px(BAR_HEIGHT + 8.))
                     .left(px(left))
                     .w(px(width))
                     .rounded(px(6.))
@@ -10551,14 +10639,12 @@ impl Editor {
         let mode = self.effective_mode();
         Some(match self.ai_status.as_ref() {
             None => {
-                // Idle hint, only in the wide margin and only when the
-                // margin is otherwise empty (the intent banner counts —
-                // that one sentence should open the session alone).
-                // The door rail (render_margin_rail) claims the same top-of-
-                // lane slot whenever it's holding something back; in drafting
-                // that happens with zero visible cards, so margin_cards being
-                // empty isn't enough — check the rail's own condition too, or
-                // the hint paints straight over it (Image-4 bug).
+                // Idle hint, only in the wide margin and only when the margin
+                // is otherwise empty. The door rail (render_margin_rail) claims
+                // the same top-of-lane slot whenever it's holding something
+                // back; in drafting that happens with zero visible cards, so
+                // margin_cards being empty isn't enough — check the rail's own
+                // condition too, or the hint paints straight over it (Image-4).
                 let rail_showing = if self.drafting {
                     self.resting_diagnoses() > 0
                 } else {
@@ -10568,7 +10654,6 @@ impl Editor {
                     || self.has_margin_cards()
                     || rail_showing
                     || self.doc.len_bytes() == 0
-                    || self.next_intent.is_some()
                 {
                     return None;
                 }
@@ -10707,8 +10792,8 @@ impl Editor {
                             cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
                                 editor.ai_status = None;
-                                let believing = editor.last_pass_believing;
-                                editor.run_pass(believing, cx);
+                                let kind = editor.last_pass.clone();
+                                editor.run_pass(kind, cx);
                             }),
                         ))
                         .child(action_button("ai-err-dismiss", "Dismiss").on_mouse_down(
@@ -10787,7 +10872,7 @@ impl Editor {
             })
             .collect();
         let (above_n, below_n) = (above.len(), below.len());
-        let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
+        let floor = BAR_HEIGHT + 8.;
         // A quiet pill at a lane edge when cards are hidden past it — the honest
         // "there's more here, it didn't vanish" cue (DESIGN principle 2).
         let edge_chip = move |label: String, at_bottom: bool| {
@@ -11115,7 +11200,7 @@ impl Editor {
         }
         let col_right = self.column_right(window);
         let lane_left = col_right + MARGIN_GAP + 8.;
-        let top = BAR_HEIGHT + 8. + self.intent_banner_height();
+        let top = BAR_HEIGHT + 8.;
         let drafting = self.drafting;
         let n = self.margin_rail_count()?;
         let label = if drafting {
@@ -11168,6 +11253,210 @@ impl Editor {
         } else {
             cards.len()
         }
+    }
+
+    /// One menu row (impl 04 §0): a carrier sentence ("A believing read — …")
+    /// that teaches the craft word in place. Its `kind` is pinned into the run
+    /// directly, so choosing a depth never mutates the persistent
+    /// `diagnosis_mode` (the sticky-mode trap). Inert rows stay VISIBLE but
+    /// unclickable (review H33: cooking or a history preview must not dispatch);
+    /// a `gate` reason livens the copy row's `when` line — the only row that
+    /// explains, because the gate is data (no "usually after…" advice anywhere).
+    fn editor_menu_row(
+        &self,
+        id: &'static str,
+        text: &'static str,
+        kind: PassKind,
+        inert: bool,
+        gate: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let disabled = inert || gate.is_some();
+        let base = div()
+            .id(id)
+            .px(px(12.))
+            .py(px(6.))
+            .rounded(px(5.))
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_family("PT Serif")
+                    .text_color(rgb(if disabled { MUTED_COLOR } else { TEXT_COLOR }))
+                    .child(text),
+            );
+        let base = match gate {
+            Some(reason) => base.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child(reason),
+            ),
+            None => base,
+        };
+        if disabled {
+            base.into_any_element()
+        } else {
+            base.cursor(CursorStyle::PointingHand)
+                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        // Selecting a row closes the menu, then runs the pinned
+                        // read (single-flight guard in run_pass handles the rest).
+                        editor.close_editor_menu(cx);
+                        editor.run_pass(kind.clone(), cx);
+                    }),
+                )
+                .into_any_element()
+        }
+    }
+
+    /// The editor button's dropdown (impl 04 §0): the AI subsystem's single
+    /// home, glued flush under the titlebar control (right edges aligned — the
+    /// lab's fix for the detached-dropdown sin), borrowing the narrow-notes
+    /// panel's anchoring idiom (a bool-toggled overlay, light-dismissed + Esc).
+    fn render_editor_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.editor_menu_open {
+            return None;
+        }
+        // Rows go inert while a pass cooks (single-flight — no queueing in v1)
+        // or the past is on screen (review H33: a pass must never diagnose a
+        // document the screen isn't showing). An UNCONFIGURED provider does NOT
+        // disable them — clicking routes through run_pass's pending-pass path,
+        // so the request that triggers setup is the one that gets answered.
+        let inert = self.history_preview.is_some()
+            || matches!(self.ai_status, Some(AiStatus::Running { .. }));
+        // The copy gate is DATA: while a developmental query is open, the copy
+        // row wears its reason as a `when` line and stands down (the altitude
+        // order). Releases with no pass re-run when the last one closes.
+        let copy_gate = self
+            .copy_gated()
+            .then_some("after the structural queries settle");
+        // Anchored flush under the button, right edges aligned. Everything to
+        // the button's right is fixed-width chrome: palette-toggle (27) +
+        // history-toggle (31) [+ the three drawn window controls, 3×34, on
+        // non-macOS — macOS keeps its traffic lights top-LEFT]. So the button's
+        // right edge — and thus the menu's — sits this far from the content edge.
+        let menu_right = if cfg!(target_os = "macos") { 58. } else { 160. };
+        let door_open = !self.drafting;
+        let footer = div()
+            .pt(px(6.))
+            .px(px(12.))
+            .pb(px(2.))
+            .border_t_1()
+            .border_color(rgb(RULE_COLOR))
+            .flex()
+            .items_center()
+            .justify_between()
+            .text_size(px(11.))
+            .child(div().text_color(rgb(MUTED_COLOR)).child(format!(
+                "{} queries open · {} resolved",
+                self.open_query_count(),
+                self.resolved_query_count(),
+            )))
+            .child(
+                // The presence pair (glossary): Reading (door open) / Away
+                // (drafting). A drawn toggle — the current pole is emphasized, a
+                // click flips it through toggle_door's flush semantics. No "⇄"
+                // glyph (not in the bundled PT fonts); a dot divides the poles.
+                div()
+                    .id("editor-menu-door")
+                    .cursor(CursorStyle::PointingHand)
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .px(px(4.))
+                    .py(px(1.))
+                    .rounded(px(4.))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .tooltip(tip("Show or quiet the editor's notes", Some("ctrl-shift-r")))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.toggle_door(cx);
+                        }),
+                    )
+                    .child(div().text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR })).child("Reading"))
+                    .child(div().size(px(3.)).rounded_full().bg(rgb(MUTED_COLOR)))
+                    .child(div().text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR })).child("Away")),
+            );
+        Some(
+            div()
+                .id("editor-menu")
+                .absolute()
+                .top(px(BAR_HEIGHT + 4.))
+                .right(px(menu_right))
+                .w(px(292.))
+                .bg(rgb(0xFCFAF4))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .rounded(px(8.))
+                .shadow_lg()
+                .py(px(6.))
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .font_family("PT Sans")
+                .text_color(rgb(TEXT_COLOR))
+                // Contained like the palette/narrow panel: clicks/scroll stay in.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .px(px(12.))
+                        .py(px(4.))
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child("Ask the editor for…"),
+                )
+                .child(self.editor_menu_row(
+                    "er-believing",
+                    "A believing read — what's alive here, what it's secretly about",
+                    PassKind::Believing,
+                    inert,
+                    None,
+                    cx,
+                ))
+                .child(self.editor_menu_row(
+                    "er-developmental",
+                    "A developmental read — the structure: stakes, turns, the ending",
+                    PassKind::Diagnostic("developmental".to_owned()),
+                    inert,
+                    None,
+                    cx,
+                ))
+                .child(self.editor_menu_row(
+                    "er-line",
+                    "A line read — rhythm, imagery, dialogue",
+                    PassKind::Diagnostic("line".to_owned()),
+                    inert,
+                    None,
+                    cx,
+                ))
+                .child(self.editor_menu_row(
+                    "er-copy",
+                    "A copy read — slips, typos, repetitions",
+                    PassKind::Diagnostic("copy".to_owned()),
+                    inert,
+                    copy_gate,
+                    cx,
+                ))
+                .child(self.editor_menu_row(
+                    "er-doubting",
+                    "A doubting read — the strongest case against it",
+                    PassKind::Doubting,
+                    inert,
+                    None,
+                    cx,
+                ))
+                .child(footer)
+                .into_any_element(),
+        )
     }
 
     /// The always-visible feedback that notes EXIST when the window is too
@@ -11489,7 +11778,6 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_history))
             .on_action(cx.listener(Self::add_checkpoint))
             .on_action(cx.listener(Self::set_session_goal))
-            .on_action(cx.listener(Self::end_session))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::show_shortcuts))
             .on_action(cx.listener(Self::open_welcome))
@@ -11618,7 +11906,6 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::open_welcome))
                     .on_action(cx.listener(Self::toggle_outline))
-                    .on_action(cx.listener(Self::end_session))
                     .on_action(cx.listener(Self::set_session_goal))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
@@ -11688,12 +11975,8 @@ impl Render for Editor {
                     Some(rail) => d.child(rail),
                     None => d,
                 };
-                let d = match self.render_ai_status(window, cx) {
+                match self.render_ai_status(window, cx) {
                     Some(status) => d.child(status),
-                    None => d,
-                };
-                match self.render_intent_banner(window, cx) {
-                    Some(banner) => d.child(banner),
                     None => d,
                 }
             })
@@ -11708,10 +11991,6 @@ impl Render for Editor {
                 }
             })
             .map(|d| match self.render_alt_strip() {
-                Some(strip) => d.child(strip),
-                None => d,
-            })
-            .map(|d| match self.render_end_session_strip() {
                 Some(strip) => d.child(strip),
                 None => d,
             })
@@ -11735,6 +12014,11 @@ impl Render for Editor {
             })
             .map(|d| match self.render_narrow_notes_panel(window, cx) {
                 Some(panel) => d.child(panel),
+                None => d,
+            })
+            // The editor button's dropdown, glued under its titlebar control.
+            .map(|d| match self.render_editor_menu(cx) {
+                Some(menu) => d.child(menu),
                 None => d,
             })
             // Last children = topmost: the omnibox, the keyboard map and
@@ -12089,6 +12373,79 @@ mod tests {
         assert!(note_surfaces(NoteKind::Diagnosis, "developmental", false, true));
         assert!(!note_surfaces(NoteKind::Diagnosis, "copy", false, true));
         assert!(note_surfaces(NoteKind::Diagnosis, "copy", false, false));
+    }
+
+    #[test]
+    fn editor_face_is_a_priority_not_exclusive_states() {
+        use EditorFace::*;
+        let mk = |needs_setup, error, cooking, ready, door_open| {
+            face_for(&FaceInputs { needs_setup, error, cooking, ready, door_open })
+        };
+        // The spec's order, top-down: NeedsSetup > Error > cooking > ready >
+        // Reading·N > idle. Each row lights SEVERAL inputs and asserts the
+        // winner, so the priority is what's tested, not a lucky single input.
+        assert_eq!(mk(true, true, true, true, true), NeedsSetup, "setup outranks all");
+        assert_eq!(mk(false, true, true, true, true), Error, "error outranks cooking");
+        assert_eq!(mk(false, false, true, true, true), Cooking, "cooking outranks a parked read");
+        assert_eq!(mk(false, false, false, true, true), Ready, "a parked read outranks the door");
+        assert_eq!(mk(false, false, false, false, true), Reading, "door open, nothing pending");
+        assert_eq!(mk(false, false, false, false, false), Idle, "drafting, quiet");
+        // The two combinations the review named (H32): door open × cooking, and
+        // door open × a parked read, each resolve to exactly ONE face.
+        assert_eq!(mk(false, false, true, false, true), Cooking);
+        assert_eq!(mk(false, false, false, true, true), Ready);
+        // Every face round-trips to its rig token.
+        for f in [NeedsSetup, Error, Cooking, Ready, Reading, Idle] {
+            assert_eq!(
+                face_for(&FaceInputs {
+                    needs_setup: f == NeedsSetup,
+                    error: f == Error,
+                    cooking: f == Cooking,
+                    ready: f == Ready,
+                    door_open: f == Reading,
+                }),
+                f,
+                "{}",
+                f.token()
+            );
+        }
+    }
+
+    #[test]
+    fn pass_kind_threads_its_identity_end_to_end() {
+        // The journal mode string and the Running label both derive from the
+        // kind, so doubting can never collapse onto believing (review H27) and
+        // a "doubting" string can never fall through to the line prompt.
+        assert_eq!(PassKind::Believing.mode_str(), "believing");
+        assert_eq!(PassKind::Doubting.mode_str(), "doubting");
+        assert_eq!(PassKind::Diagnostic("copy".into()).mode_str(), "copy");
+        assert_eq!(PassKind::Believing.run_label(), "believing pass");
+        assert_eq!(PassKind::Doubting.run_label(), "doubting pass");
+        assert_eq!(
+            PassKind::Diagnostic("developmental".into()).run_label(),
+            "developmental diagnosis"
+        );
+        // The three kinds are distinct, and a pinned depth is carried by value
+        // (the fix for the sticky-mode trap — no diagnosis_mode mutation).
+        assert_ne!(PassKind::Doubting, PassKind::Believing);
+        assert_ne!(PassKind::Diagnostic("line".into()), PassKind::Diagnostic("copy".into()));
+    }
+
+    #[test]
+    fn copy_gate_releases_when_the_last_developmental_closes() {
+        use NoteKind::{Diagnosis, Note};
+        // Gated while an open developmental query stands (line/copy alongside
+        // don't matter — the developmental one is the gate).
+        assert!(copy_gate_active(
+            [(Diagnosis, "developmental"), (Diagnosis, "line")].into_iter()
+        ));
+        // Released the moment none is open: copy/line/believing-level cards
+        // never gate, so closing the last developmental livens the row with no
+        // pass re-run.
+        assert!(!copy_gate_active([(Diagnosis, "copy"), (Diagnosis, "line")].into_iter()));
+        // A writer note is not a diagnosis and never gates; empty never gates.
+        assert!(!copy_gate_active([(Note, "developmental")].into_iter()));
+        assert!(!copy_gate_active(std::iter::empty()));
     }
 
     #[test]

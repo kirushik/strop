@@ -138,6 +138,30 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:deliver: demo pass sent through the arrival gate");
                 continue;
             }
+            // `ebtn:open` opens the editor button's dropdown; `ebtn:door`
+            // flips the door through the menu footer's presence verb. Together
+            // they let the rig assert the door law (cards rest while drafting
+            // even with the menu open) and the face's transitions.
+            if key == "ebtn:open" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_open_editor_menu(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ebtn:open: editor menu opened");
+                continue;
+            }
+            if key == "ebtn:door" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_toggle_door(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ebtn:door: door toggled");
+                continue;
+            }
             // `reduce:motion` flips the config's motion-sensitivity switch
             // for this run, so the rig can drive the cross-fade code path.
             if key == "reduce:motion" {
