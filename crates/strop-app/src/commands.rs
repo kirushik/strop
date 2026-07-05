@@ -12,9 +12,9 @@ use crate::editor::{
     DiagnosisModeDevelopmental, DiagnosisModeLine, EndSession, ExportMarkdown, Find, Heading1,
     Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
-    SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode,
-    ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList,
-    ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview,
+    SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
+    ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleGraveyard, ToggleHighlight, ToggleHistory,
+    ToggleOrderedList, ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview,
     ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
 };
 
@@ -41,7 +41,10 @@ impl Command {
     /// the "App" and "Editor" key contexts respectively.
     pub fn global(&self) -> bool {
         match self.section {
-            "Format" | "Structure" => false,
+            // Asides' "Set aside" / "Send to the graveyard" act on the document
+            // selection, so they stay editor-scoped like Format/Structure —
+            // a chord typed into a field never reaches the document behind it.
+            "Format" | "Structure" | "Asides" => false,
             "Edit" => matches!(self.label, "Find in Document" | "Find and Replace"),
             "Margin & AI" => self.label != "Add Margin Note",
             // File, View, History, Session, Help.
@@ -197,6 +200,29 @@ pub fn all() -> &'static [Command] {
             Some("ctrl-shift-o"),
             ToggleOutline,
             ["headings", "beats", "оглавление", "план", "структура"]
+        ),
+        // Asides (docs/asides.md): the compost is the writer's deliberate scrap
+        // box; the graveyard is the automatic record of cuts.
+        cmd!(
+            "Set Aside",
+            "Asides",
+            Some("ctrl-shift-a"),
+            SetAside,
+            ["compost", "park", "shelf", "отложить", "компост"]
+        ),
+        cmd!(
+            "Send to the Graveyard",
+            "Asides",
+            None,
+            SendToGraveyard,
+            ["cut", "delete to graveyard", "в могилу", "вырезать"]
+        ),
+        cmd!(
+            "Toggle Graveyard",
+            "View",
+            Some("ctrl-alt-g"),
+            ToggleGraveyard,
+            ["cuts", "restore cut", "put back", "кладбище", "могила"]
         ),
         cmd!(
             "Run Editorial Diagnosis",

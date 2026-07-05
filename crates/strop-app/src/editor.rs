@@ -211,6 +211,12 @@ const RESIZE_INSET: f32 = 8.;
 /// from above). Values below are restrained, GNOME/libadwaita-scale.
 const CSD_GUTTER: f32 = 22.;
 const CSD_ROUNDING: f32 = 10.;
+/// Auto-cut threshold (docs/impl/02-asides.md §4): a single SELECTION-deletion
+/// op removing at least this many chars of manuscript prose files itself in the
+/// graveyard automatically — deterministic, and the editor still holds the
+/// deleted text at that point. A backspace RUN (many one-char deletes) never
+/// reaches this in one op, so it never auto-files (reviews H24 + H43).
+const AUTO_CUT_MIN_CHARS: usize = 80;
 
 /// A small hover tooltip: a control's name and, optionally, its chord in a
 /// mono chip (DESIGN §0 — every titlebar control should teach its shortcut).
@@ -410,7 +416,8 @@ actions!(
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
-        ToggleOutline, EndSession, SetSessionGoal, ToggleReview,
+        ToggleOutline, EndSession, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
+        ToggleGraveyard,
     ]
 );
 
@@ -829,6 +836,19 @@ pub struct Editor {
     /// Outline rail (DESIGN §1.6): toggleable left rail of headings,
     /// session-only — externalized structure at the point of performance.
     outline_open: bool,
+    /// The graveyard section (docs/impl/02-asides.md §4): the sticky footer
+    /// bar is always shown when entries exist; this toggles the read-only
+    /// entry list open. Session-only.
+    graveyard_open: bool,
+    /// The last caret byte offset while it was in the MANUSCRIPT — so Esc from
+    /// a compost-rail caret returns exactly there (review B3; asides.md §2.1).
+    last_manuscript_caret: usize,
+    /// One-shot blink of the compost rail edge on an arrival (aside / orphan
+    /// migration) — the same "something arrived over there" grammar the
+    /// graveyard bar uses. `None` at rest.
+    rail_flash: Option<Instant>,
+    /// One-shot blink of the graveyard bar on an exile (a fresh cut filed).
+    grave_flash: Option<Instant>,
     /// "Next session I will ___" recorded at the previous close (DESIGN
     /// §4.1), shown as a dismissible banner; auto-clears on first edit.
     /// Deliberately NOT ai_status — the AI never speaks first.
@@ -1051,6 +1071,40 @@ fn format_thousands(n: usize) -> String {
     out
 }
 
+/// The auto-cut predicate (docs/impl/02-asides.md §4): a single
+/// SELECTION-deletion op — an EMPTY replacement over a non-empty selection —
+/// of at least `AUTO_CUT_MIN_CHARS` chars, entirely inside the manuscript
+/// (`start_char >= manuscript_base`). Pure, so both sides of the threshold and
+/// the move-vs-cut distinction are unit-tested.
+fn auto_cut_qualifies(
+    new_text: &str,
+    range_chars: usize,
+    start_char: usize,
+    manuscript_base: usize,
+) -> bool {
+    new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS && start_char >= manuscript_base
+}
+
+/// A drawn headstone for the graveyard bar: a small muted slab with rounded
+/// top corners. The ⚰/⚱ glyphs are outside the bundled PT fonts, so the icon
+/// is divs, never a glyph (the garbled-glyph bug class, editor comment at the
+/// titlebar-controls note).
+fn tombstone_icon() -> impl IntoElement {
+    div()
+        .w(px(9.))
+        .h(px(12.))
+        .rounded_t(px(4.5))
+        .bg(rgb(MUTED_COLOR))
+}
+
+/// Wall clock in unix seconds (matching checkpoints and card raise-times).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Whitespace-delimited word count over text chunks (rope chunks may split
 /// mid-word, so track the in-word state across them).
 fn count_words<'a>(chunks: impl Iterator<Item = &'a str>) -> usize {
@@ -1139,6 +1193,10 @@ impl Editor {
             narrow_notes_open: false,
             selection_popover: false,
             outline_open: false,
+            graveyard_open: false,
+            last_manuscript_caret: 0,
+            rail_flash: None,
+            grave_flash: None,
             next_intent: None,
             intent_recorded: false,
             session_had_edits: false,
@@ -1207,6 +1265,14 @@ impl Editor {
 
     /// Fan buffer changes out to every offset-tracking consumer (formatting
     /// spans, durable store). Must run after every mutation.
+    /// Words in the MANUSCRIPT only — the compost rail is excluded (asides.md
+    /// §1: "the accounting does not bleed"). Slicing by char range avoids
+    /// cloning the text; `manuscript_char_range` is the whole doc when there is
+    /// no rail.
+    fn manuscript_word_count(&self) -> usize {
+        count_words(self.doc.rope().slice(self.doc.manuscript_char_range()).chunks())
+    }
+
     fn sync_mutations(&mut self) {
         let ops = self.doc.take_ops();
         if ops.is_empty() {
@@ -1215,7 +1281,7 @@ impl Editor {
         // Real buffer ops only — this stamp is what tells a live typing burst
         // from a lull (deferred_pass), so caret moves must never touch it.
         self.last_text_edit = Some(Instant::now());
-        self.word_count = count_words(self.doc.rope().chunks());
+        self.word_count = self.manuscript_word_count();
         // Apply to the store and capture its path before releasing the borrow,
         // so the dirty-flag chokepoint (mark_dirty) can take &mut self.
         let intent_path = match &self.store {
@@ -1349,6 +1415,13 @@ impl Editor {
     /// Install the persisted edit-run journal at load.
     pub fn restore_journal(&mut self, journal: strop_core::journal::Journal) {
         self.doc.set_journal(journal);
+    }
+
+    /// Install the persisted graveyard at load, then recompute the manuscript
+    /// word count (a loaded doc may carry a compost boundary that scopes it).
+    pub fn restore_graveyard(&mut self, graveyard: strop_core::document::Graveyard) {
+        self.doc.set_graveyard(graveyard);
+        self.word_count = self.manuscript_word_count();
     }
 
     /// Record a named version snapshot in the document file.
@@ -1804,6 +1877,9 @@ impl Editor {
         self.caret_attrs.clear();
         self.exit_history(cx);
         self.sync_mutations();
+        // A restore can orphan writer notes (reanchor sets `orphaned` when a
+        // passage vanished): migrate their text to the compost (spec §3).
+        self.migrate_orphans_after_restore(cx);
         // The restore's own record: the journal suppressed the wholesale
         // swap (it would be one document-sized run), so the honest event
         // carries the fact — and a POST-restore checkpoint materializes the
@@ -1832,11 +1908,11 @@ impl Editor {
             eprintln!("strop: no document file to export next to");
             return;
         };
-        let mut md = strop_core::markdown::to_markdown(
-            &self.doc.text(),
-            self.doc.spans(),
-            self.doc.blocks(),
-        );
+        // Export the MANUSCRIPT only — the compost rail is the writer's private
+        // scrap box, never part of the exported document (asides.md §1). The
+        // slice rebases span/block offsets to 0 (review H40, TRAP 14).
+        let (mtext, mspans, mblocks) = self.doc.manuscript_slice();
+        let mut md = strop_core::markdown::to_markdown(&mtext, &mspans, &mblocks);
         let path = store.path().with_extension("md");
         // Materialize in-file assets as a sidecar dir with relative links
         // (document-model §6).
@@ -2394,10 +2470,11 @@ impl Editor {
         // lands now rather than racing the run it just triggered.
         self.flush_deferred_pass(cx);
         self.drafting = false;
-        // Scope: the selection if there is one, else the whole document
-        // (capped — a 24k-char window is plenty for an editorial pass).
+        // Scope: the selection if there is one, else the MANUSCRIPT (never the
+        // compost — the rail is the writer's private scrap box, asides.md §1).
+        // Capped — a 24k-char window is plenty for an editorial pass.
         let scope = if self.selected_range.is_empty() {
-            self.doc.text()
+            self.doc.manuscript_slice().0
         } else {
             self.doc.slice_bytes(self.selected_range.clone())
         };
@@ -2517,13 +2594,28 @@ impl Editor {
         // that no longer match are dropped.
         self.diagnosis_pass += 1;
         let pass_id = self.diagnosis_pass;
-        let annotations = strop_core::diagnose::to_annotations(
-            &self.doc.text(),
-            diagnoses,
-            self.doc.notes(),
-            now,
-            pass_id,
-        );
+        // Anchor within the MANUSCRIPT slice, then rebase every range back by
+        // the manuscript base — so a card can never land in the compost, even
+        // when the writer set aside an earlier draft of the very sentence
+        // (review H40, TRAP 4). Existing notes are rebased into the slice too,
+        // so suppression still matches. When there is no rail the base is 0 and
+        // this is identical to anchoring against the whole document.
+        let base = self.doc.manuscript_base_char();
+        let mtext = self.doc.manuscript_slice().0;
+        let mut existing = Annotations::default();
+        for n in self.doc.notes().notes() {
+            if n.range.start >= base {
+                let mut n = n.clone();
+                n.range = (n.range.start - base)..(n.range.end - base);
+                existing.push(n);
+            }
+        }
+        let mut annotations =
+            strop_core::diagnose::to_annotations(&mtext, diagnoses, &existing, now, pass_id);
+        for a in &mut annotations {
+            a.range.start += base;
+            a.range.end += base;
+        }
         let kept = annotations.len();
         self.doc.add_diagnoses(annotations);
         // The strip's veil: which read landed, when, how many queries.
@@ -3975,6 +4067,7 @@ impl Editor {
                 &self.doc.export_history(50),
                 self.doc.notes(),
                 self.doc.journal(),
+                self.doc.graveyard(),
             ) {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
@@ -4098,12 +4191,25 @@ impl Editor {
         self.selection_reversed = false;
         self.cursor_affinity_down = affinity_down;
         self.caret_attrs.clear();
+        // Remember the manuscript caret so Esc from a compost caret returns
+        // exactly here (review B3). A no-rail doc is all manuscript.
+        if offset >= self.doc.char_to_byte(self.doc.manuscript_base_char()) {
+            self.last_manuscript_caret = offset;
+        }
         self.bump_activity();
         cx.notify();
     }
 
     /// Extend the selection's moving end to `offset`. Keeps `goal_x`.
     fn extend_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
+        // Never let a selection straddle the boundary (review B4): clamp the
+        // moving end into the fixed anchor's region.
+        let anchor = if self.selection_reversed {
+            self.selected_range.end
+        } else {
+            self.selected_range.start
+        };
+        let offset = self.clamp_to_region(anchor, offset);
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -4340,6 +4446,11 @@ impl Editor {
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            // The boundary line is removed only via the aside machinery:
+            // backspace at manuscript start is a no-op, like backspace at 0.
+            if self.at_manuscript_start(self.cursor_offset()) {
+                return;
+            }
             // At the start of a styled block, the first backspace strips
             // the block kind instead of merging (Notion/Docs convention).
             let cursor = self.cursor_offset();
@@ -4358,22 +4469,32 @@ impl Editor {
             self.select_to(prev, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.migrate_orphaned_writer_notes(window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            // Forward-delete at the compost tail must not merge the boundary.
+            if self.at_compost_tail(self.cursor_offset()) {
+                return;
+            }
             let next = self.next_boundary(self.cursor_offset());
             self.select_to(next, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.migrate_orphaned_writer_notes(window, cx);
     }
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            if self.at_manuscript_start(self.cursor_offset()) {
+                return;
+            }
             let prev = self.previous_word_boundary(self.cursor_offset());
             self.select_to(prev, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.migrate_orphaned_writer_notes(window, cx);
     }
 
     fn delete_word_right(
@@ -4383,10 +4504,14 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if self.selected_range.is_empty() {
+            if self.at_compost_tail(self.cursor_offset()) {
+                return;
+            }
             let next = self.next_word_boundary(self.cursor_offset());
             self.select_to(next, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.migrate_orphaned_writer_notes(window, cx);
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -4433,8 +4558,272 @@ impl Editor {
 
     /// The outline rail (DESIGN §1.6): session-only, no config.
     pub(crate) fn toggle_outline(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
+        // Outline and the compost rail share the left column and are mutually
+        // exclusive (review H26): the rail render checks `!outline_open`, so
+        // simply toggling the outline hides/reveals the rail beneath it.
         self.outline_open = !self.outline_open;
         cx.notify();
+    }
+
+    // -- Asides: the compost rail and the graveyard -------------------------
+
+    /// `Set aside` (docs/impl/02-asides.md §2): move the selection — or, with
+    /// an empty selection, the caret's paragraph (review H25) — into the
+    /// compost rail. A MOVE, never a cut: `file_cut` is the only path that
+    /// files, so the graveyard is suppressed by construction (review H41).
+    /// Births the rail on first use, closes the outline (shared left column),
+    /// blinks the rail edge, and leaves the caret at the collapse point — the
+    /// writer parked a thought, she did not travel.
+    fn set_aside(&mut self, _: &SetAside, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            return;
+        }
+        let range = if self.selected_range.is_empty() {
+            let (start, end) = self.paragraph_bounds(self.cursor_offset());
+            start..end
+        } else {
+            self.selected_range.clone()
+        };
+        let Some(caret_char) = self.doc.set_aside(range) else {
+            return; // empty, or the range is compost already
+        };
+        self.outline_open = false; // the new rail takes the left column
+        self.rail_flash = Some(Instant::now());
+        self.sync_mutations();
+        let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
+        self.set_cursor(caret, false, cx);
+        self.schedule_flash_clear(cx);
+    }
+
+    /// `Send to the graveyard` (selection menu / palette): file the selection
+    /// as a cut, any size. Only a manuscript selection is a cut — a compost
+    /// selection would be a move, and the boundary clamp keeps selections
+    /// single-region anyway.
+    fn send_to_graveyard(&mut self, _: &SendToGraveyard, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() || self.selected_range.is_empty() {
+            return;
+        }
+        let start_char = self.doc.rope().byte_to_char(self.selected_range.start);
+        if start_char < self.doc.manuscript_base_char() {
+            return; // compost selection — not a cut
+        }
+        let range = self.selected_range.clone();
+        self.file_cut(range, cx);
+    }
+
+    /// File `byte_range` in the graveyard and collapse the caret to the cut
+    /// point. Shared by the auto-cut trigger and the explicit verb — the one
+    /// site that ever files a corpse.
+    fn file_cut(&mut self, byte_range: Range<usize>, cx: &mut Context<Self>) {
+        let quote = self.origin_quote_before(byte_range.start);
+        self.doc.cut_to_graveyard(byte_range.clone(), quote, now_unix());
+        self.selected_range = byte_range.start..byte_range.start;
+        self.selection_reversed = false;
+        self.cursor_affinity_down = false;
+        self.goal_x = None;
+        self.marked_range = None;
+        self.grave_flash = Some(Instant::now());
+        self.sync_mutations();
+        self.bump_activity();
+        self.schedule_flash_clear(cx);
+        cx.notify();
+    }
+
+    /// A trailing fragment of the paragraph immediately before `byte_pos` — the
+    /// entry's origin quote (never the whole context). Stops at a line break.
+    fn origin_quote_before(&self, byte_pos: usize) -> String {
+        let rope = self.doc.rope();
+        let at = rope.byte_to_char(byte_pos.min(self.doc.len_bytes()));
+        let mut from = at;
+        let mut taken = 0;
+        while from > 0 && taken < 48 {
+            if rope.char(from - 1) == '\n' {
+                break;
+            }
+            from -= 1;
+            taken += 1;
+        }
+        rope.slice(from..at).to_string().trim().to_owned()
+    }
+
+    fn toggle_graveyard(&mut self, _: &ToggleGraveyard, _: &mut Window, cx: &mut Context<Self>) {
+        self.graveyard_open = !self.graveyard_open && !self.doc.graveyard().is_empty();
+        cx.notify();
+    }
+
+    /// Put an entry back into the manuscript (one verb everywhere — the entry
+    /// button and the post-cut footer affordance). Re-anchored and clamped into
+    /// the manuscript by the core; here we place the caret and flash nothing
+    /// fancier than moving it there.
+    fn put_back_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(caret_char) = self.doc.put_back(id) else {
+            return;
+        };
+        self.sync_mutations();
+        let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
+        if self.doc.graveyard().is_empty() {
+            self.graveyard_open = false;
+        }
+        self.set_cursor(caret, false, cx);
+    }
+
+    /// Move the caret to an entry's re-anchored origin (clamped into the
+    /// manuscript), so "show origin" reveals where the cut came from without
+    /// re-inserting anything.
+    fn show_grave_origin(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(e) = self.doc.graveyard().get(id) else {
+            return;
+        };
+        let base = self.doc.manuscript_base_char();
+        let at = e.origin_pos.clamp(base, self.doc.rope().len_chars());
+        let byte = self.doc.char_to_byte(at);
+        self.set_cursor(byte, false, cx);
+    }
+
+    /// Delete an entry (the journal still holds the record). Undoable in core.
+    fn delete_grave_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.doc.grave_delete(id);
+        if self.doc.graveyard().is_empty() {
+            self.graveyard_open = false;
+        }
+        self.mark_dirty();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// Has this WRITER note lost its anchor? Either `Annotations::reanchor`
+    /// flagged it `orphaned` on a restore, or an ordinary edit collapsed the
+    /// anchor to a zero-width point. Diagnoses never qualify — machine cards
+    /// are not writer material and stay in the card lifecycle.
+    fn note_is_doomed(&self, id: u64) -> bool {
+        self.doc.notes().get(id).is_some_and(|n| {
+            n.kind == NoteKind::Note
+                && n.status == NoteStatus::Open
+                && (n.orphaned || n.range.start == n.range.end)
+        })
+    }
+
+    /// The ordinary-edit path (spec §3): after a deletion, migrate any writer
+    /// note whose anchor collapsed. Has a Window, so an active doomed card is
+    /// resolved-and-deselected properly first (review B5).
+    fn migrate_orphaned_writer_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus.active_id().is_some_and(|id| self.note_is_doomed(id)) {
+            self.deselect_card(window, cx);
+        }
+        self.perform_orphan_migrations(cx);
+    }
+
+    /// The restore path (spec §3): `reanchor` set `orphaned`. No Window here
+    /// (history mode has no live composer), so a stray active card is simply
+    /// cleared — there is no in-progress draft to commit.
+    fn migrate_orphans_after_restore(&mut self, cx: &mut Context<Self>) {
+        if self.focus.active_id().is_some_and(|id| self.note_is_doomed(id)) {
+            self.focus = CardFocus::Idle;
+        }
+        self.perform_orphan_migrations(cx);
+    }
+
+    /// Move every doomed writer note's text to the compost tail. The caller has
+    /// already resolved focus for any active doomed card.
+    fn perform_orphan_migrations(&mut self, cx: &mut Context<Self>) {
+        let doomed: Vec<u64> = self
+            .doc
+            .notes()
+            .notes()
+            .iter()
+            .filter(|n| self.note_is_doomed(n.id))
+            .map(|n| n.id)
+            .collect();
+        if doomed.is_empty() {
+            return;
+        }
+        for id in doomed {
+            let anchor = self
+                .doc
+                .notes()
+                .get(id)
+                .map(|n| self.doc.char_to_byte(n.range.start.min(self.doc.rope().len_chars())))
+                .unwrap_or(0);
+            let quote = self.origin_quote_before(anchor);
+            if self.doc.migrate_note_to_compost(id, &quote) {
+                self.outline_open = false;
+                self.rail_flash = Some(Instant::now());
+            }
+        }
+        self.sync_mutations();
+        self.schedule_flash_clear(cx);
+        cx.notify();
+    }
+
+    /// Clear the one-shot rail/graveyard arrival blinks after a beat.
+    fn schedule_flash_clear(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(420))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor.rail_flash = None;
+                editor.grave_flash = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // -- Region geometry (byte offsets) -------------------------------------
+
+    /// Byte bounds of the region the caret is in: the manuscript, the compost,
+    /// or the whole document when there is no rail. Ctrl+A scopes to this so a
+    /// select-all in prose never nukes the compost (spec §1, review #110).
+    fn caret_region_bytes(&self) -> (usize, usize) {
+        let len = self.doc.len_bytes();
+        let Some(b) = self.doc.aside_boundary() else {
+            return (0, len);
+        };
+        let compost_edge = self.doc.rope().line_to_byte(b);
+        let manuscript_base = self.doc.char_to_byte(self.doc.manuscript_base_char());
+        if self.cursor_offset() >= manuscript_base {
+            (manuscript_base, len)
+        } else {
+            (0, compost_edge)
+        }
+    }
+
+    /// Clamp a selection's moving end so it never crosses the boundary from the
+    /// anchor's region (review B4): every verb's input is single-region by
+    /// construction. Applies to keyboard AND drag selection (both go through
+    /// `extend_cursor`).
+    fn clamp_to_region(&self, anchor: usize, target: usize) -> usize {
+        let Some(b) = self.doc.aside_boundary() else {
+            return target;
+        };
+        let compost_edge = self.doc.rope().line_to_byte(b);
+        let manuscript_base = self.doc.char_to_byte(self.doc.manuscript_base_char());
+        if anchor >= manuscript_base {
+            target.max(manuscript_base)
+        } else if anchor < compost_edge {
+            target.min(compost_edge)
+        } else {
+            target
+        }
+    }
+
+    /// Is `byte` the first manuscript position (just after the boundary line)?
+    /// Backspace there must be a no-op (the boundary is removed only via the
+    /// aside machinery — spec §1 guard).
+    fn at_manuscript_start(&self, byte: usize) -> bool {
+        self.doc.aside_boundary().is_some()
+            && byte == self.doc.char_to_byte(self.doc.manuscript_base_char())
+    }
+
+    /// Is `byte` the end of the last compost line (the newline before the
+    /// boundary line)? Forward-delete there would merge the boundary away.
+    fn at_compost_tail(&self, byte: usize) -> bool {
+        match self.doc.aside_boundary() {
+            Some(b) => byte == self.doc.rope().line_to_byte(b).saturating_sub(1),
+            None => false,
+        }
     }
 
     /// "End Session…" (DESIGN §4.1 — the strongest evidence card, d=0.65):
@@ -4600,6 +4989,21 @@ impl Editor {
             self.selection_popover = false;
             cx.notify();
             return;
+        }
+        if self.graveyard_open {
+            self.graveyard_open = false;
+            cx.notify();
+            return;
+        }
+        // Esc from a compost caret returns to the last manuscript caret (review
+        // B3): the rail is a hard edge to drift INTO, soft to leave.
+        if let Some(b) = self.doc.aside_boundary() {
+            let compost_edge = self.doc.rope().line_to_byte(b);
+            if self.cursor_offset() < compost_edge {
+                let target = self.last_manuscript_caret.min(self.doc.len_bytes());
+                self.move_to(target, cx);
+                return;
+            }
         }
         if self.palette_input.is_some() {
             self.close_palette(window, cx);
@@ -5157,8 +5561,11 @@ impl Editor {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(0, cx);
-        self.select_to(self.doc.len_bytes(), cx);
+        // Scope to the caret's REGION (spec §1): the writer selecting-all in the
+        // manuscript must not sweep up the private compost, and vice versa.
+        let (start, end) = self.caret_region_bytes();
+        self.move_to(start, cx);
+        self.select_to(end, cx);
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
@@ -6029,6 +6436,13 @@ impl Editor {
             "moving": self.moving.len(),
             "moves_started": self.moves_started,
             "reduce_motion": self.config.reduce_motion,
+            // Asides (docs/impl/02-asides.md §6): the rail's compost block
+            // count (0 = no rail), the graveyard entry count, and the
+            // MANUSCRIPT-only word count (compost excluded — asides.md §1).
+            "compost_blocks": self.doc.aside_boundary().unwrap_or(0),
+            "grave_entries": self.doc.graveyard().len(),
+            "graveyard_open": self.graveyard_open,
+            "manuscript_words": self.manuscript_word_count(),
         })
         .to_string()
     }
@@ -6101,6 +6515,51 @@ impl Editor {
         if let Some(id) = last {
             self.set_note_status(id, NoteStatus::Done, window, cx);
         }
+    }
+
+    /// Rig hook (`seed:aside`): a fixture with BOTH piles — a compost rail
+    /// (one asided item) and a graveyard (one filed cut). Replaces the doc so
+    /// the geometry is deterministic, then drives the real verbs.
+    pub fn debug_seed_aside(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "A compost note to keep for later.\nThe manuscript opens here with its real first line.\nAnd a second manuscript sentence long enough — comfortably over the eighty-character graveyard cut threshold — to file automatically.",
+        );
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        // Aside the first paragraph → births the rail.
+        let end0 = self.doc.rope().line_to_byte(1).saturating_sub(1);
+        self.selected_range = 0..end0;
+        self.set_aside(&SetAside, window, cx);
+        // Send the last paragraph (well over the threshold) → a graveyard entry.
+        let lines = self.doc.rope().len_lines();
+        let start = self.doc.rope().line_to_byte(lines.saturating_sub(1));
+        let end = self.doc.len_bytes();
+        self.selected_range = start..end;
+        self.send_to_graveyard(&SendToGraveyard, window, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`aside:selection`): run `Set aside` on the current selection.
+    pub fn debug_aside_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_aside(&SetAside, window, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`exile:selection`): run `Send to the graveyard` on the
+    /// current selection (any size — the explicit verb).
+    pub fn debug_exile_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_to_graveyard(&SendToGraveyard, window, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`putback:last`): put the newest graveyard entry back.
+    pub fn debug_putback_last(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.doc.graveyard().entries().last().map(|e| e.id) {
+            self.put_back_entry(id, cx);
+        }
+        cx.notify();
     }
 
     /// Rig hook (`seed:deliver`): push the demo pass through the REAL arrival
@@ -6285,6 +6744,27 @@ impl Editor {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+
+        // The auto-cut trigger (docs/impl/02-asides.md §4): a SINGLE
+        // selection-deletion op of a manuscript passage ≥ AUTO_CUT_MIN_CHARS
+        // files itself in the graveyard. Only a real deletion of a real
+        // selection — a replace-by-typing keeps its text and never files; a
+        // backspace run is many one-char ops, none reaching the threshold
+        // (H24 + H43). The cut never straddles the boundary (selections are
+        // clamped, review B4). See `auto_cut_qualifies` for the pure predicate.
+        if !range.is_empty() {
+            let start_char = self.doc.rope().byte_to_char(range.start);
+            let end_char = self.doc.rope().byte_to_char(range.end);
+            if auto_cut_qualifies(
+                new_text,
+                end_char - start_char,
+                start_char,
+                self.doc.manuscript_base_char(),
+            ) {
+                self.file_cut(range, cx);
+                return;
+            }
+        }
 
         self.doc.edit_bytes_coalescing(range.clone(), new_text);
         let mut cursor = range.start + new_text.len();
@@ -8476,6 +8956,153 @@ impl Editor {
                     .child("Outline"),
             )
             .child(list)
+    }
+
+    /// The sticky graveyard footer bar (docs/impl/02-asides.md §4; asides.md
+    /// §3): a "Graveyard · N" bar that blinks on an exile and toggles the
+    /// read-only entry list. A bottom overlay, like the composer strip. Shown
+    /// only when a cut is on record (an empty pile has no bar). The ⚰ glyph is
+    /// outside the PT fonts, so the coffin is drawn with a div (never a non-PT
+    /// glyph — the garbled-glyph bug class).
+    fn render_graveyard_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let n = self.doc.graveyard().len();
+        if n == 0 || self.history_view.is_some() {
+            return None;
+        }
+        let flashing = self.grave_flash.is_some();
+        Some(
+            div()
+                .id("graveyard-bar")
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(16.))
+                .bg(rgb(if flashing { 0xEFE6D0 } else { 0xF4F1EA }))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .font_family("PT Sans")
+                .text_size(px(12.))
+                .text_color(rgb(if flashing { TEXT_COLOR } else { MUTED_COLOR }))
+                .cursor(CursorStyle::PointingHand)
+                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.graveyard_open = !editor.graveyard_open;
+                        cx.notify();
+                    }),
+                )
+                .child(tombstone_icon())
+                .child(format!("Graveyard · {n}")),
+        )
+    }
+
+    /// The read-only graveyard section (asides.md §3): entries newest-first,
+    /// dimmed, each with its origin whisper and the two verbs — Put back (one
+    /// verb everywhere) and Delete. A bottom panel above the bar, mirroring the
+    /// narrow-notes drop-down idiom.
+    fn render_graveyard_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.graveyard_open || self.doc.graveyard().is_empty() {
+            return None;
+        }
+        let mut list = div()
+            .id("graveyard-list")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for e in self.doc.graveyard().entries().iter().rev() {
+            let id = e.id;
+            let preview: String = e.text.chars().take(90).collect();
+            let whisper = if e.origin_quote.is_empty() {
+                format_unix(e.cut_unix)
+            } else {
+                format!("…{} · {}", e.origin_quote, format_unix(e.cut_unix))
+            };
+            let action = |label: &'static str,
+                          key: usize,
+                          f: fn(&mut Editor, u64, &mut Context<Editor>)| {
+                div()
+                    .id(("grave-act", key))
+                    .cursor(CursorStyle::PointingHand)
+                    .text_color(rgb(MUTED_COLOR))
+                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            f(editor, id, cx);
+                        }),
+                    )
+                    .child(label)
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .px(px(14.))
+                    .py(px(8.))
+                    .border_b_1()
+                    .border_color(rgb(RULE_COLOR))
+                    // The cut prose, dimmed (read-only record).
+                    .child(div().text_color(rgb(MUTED_COLOR)).child(preview))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(14.))
+                            .text_size(px(11.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child(whisper),
+                            )
+                            .child(action("show origin", id as usize * 3, Editor::show_grave_origin))
+                            .child(action("put back", id as usize * 3 + 1, Editor::put_back_entry))
+                            .child(action("delete", id as usize * 3 + 2, Editor::delete_grave_entry)),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .id("graveyard-panel")
+                .absolute()
+                .bottom(px(28.))
+                .left_0()
+                .right_0()
+                .max_h(px(260.))
+                .bg(rgb(0xFCFAF4))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .font_family("PT Sans")
+                .text_size(px(12.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .px(px(14.))
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child("Graveyard — cut prose, kept"),
+                )
+                .child(list),
+        )
     }
 
     /// The mode banner (DESIGN §2-history, principle 5 — no hidden modes):
@@ -11541,6 +12168,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::export_markdown))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::toggle_outline))
+            .on_action(cx.listener(Self::toggle_graveyard))
             .on_action(cx.listener(Self::run_diagnosis))
             .on_action(cx.listener(Self::run_believing))
             .on_action(cx.listener(Self::toggle_review))
@@ -11685,6 +12313,8 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_outline))
                     .on_action(cx.listener(Self::end_session))
                     .on_action(cx.listener(Self::set_session_goal))
+                    .on_action(cx.listener(Self::set_aside))
+                    .on_action(cx.listener(Self::send_to_graveyard))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -11786,6 +12416,17 @@ impl Render for Editor {
             })
             .map(|d| match self.render_chord_whisper() {
                 Some(whisper) => d.child(whisper),
+                None => d,
+            })
+            // The graveyard's sticky footer bar and, when toggled open, its
+            // read-only entry list (asides.md §3). The bar is a bottom overlay;
+            // the panel sits just above it.
+            .map(|d| match self.render_graveyard_bar(cx) {
+                Some(bar) => d.child(bar),
+                None => d,
+            })
+            .map(|d| match self.render_graveyard_panel(cx) {
+                Some(panel) => d.child(panel),
                 None => d,
             })
             // Narrow-window notes: the count pill (low — just feedback) and,
@@ -12092,6 +12733,21 @@ mod tests {
         assert_eq!(note_at_char(&pair, 6), Some(8));
         assert_eq!(note_at_char(&pair, 9), Some(8)); // the second's own trailing boundary
         assert_eq!(note_at_char(&[], 0), None);
+    }
+
+    #[test]
+    fn auto_cut_fires_only_on_a_big_manuscript_deletion() {
+        // At/over the threshold, a pure deletion inside the manuscript fires.
+        assert!(auto_cut_qualifies("", AUTO_CUT_MIN_CHARS, 100, 0));
+        assert!(auto_cut_qualifies("", 500, 100, 40));
+        // Just under the threshold does NOT (both sides of the boundary case).
+        assert!(!auto_cut_qualifies("", AUTO_CUT_MIN_CHARS - 1, 100, 0));
+        // A replace-by-typing never files, however large the deleted run.
+        assert!(!auto_cut_qualifies("x", 500, 100, 0));
+        // A compost deletion (before the manuscript base) is a move, not a cut.
+        assert!(!auto_cut_qualifies("", 200, 5, 40));
+        // An empty selection never fires.
+        assert!(!auto_cut_qualifies("", 0, 100, 0));
     }
 
     #[test]
