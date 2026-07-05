@@ -330,11 +330,11 @@ fn main() {
                         // are visible on first run, not collapsed to the rail.
                         editor.enter_reviewing();
                     }
-                    // The if-then ritual's open half (DESIGN §4.1): caret
-                    // restored, last close's intent surfaced — and nothing
-                    // is ever asked at open (the §4 invariant).
+                    // Re-entry (DESIGN §4): the caret is restored where the last
+                    // session left it — nothing is ever asked at open (the §4
+                    // invariant). The intent question was retired (impl 04 §1).
                     if let Some((store, _)) = &store
-                        && let Some(entry) = files::load_intent(store.path())
+                        && let Some(entry) = files::load_session(store.path())
                     {
                         editor.restore_session(entry);
                     }
