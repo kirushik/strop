@@ -1072,6 +1072,14 @@ pub struct Editor {
     /// glued flush under the titlebar control. A bool-toggled overlay, light-
     /// dismissed like the narrow-notes panel it borrows its anchoring from.
     editor_menu_open: bool,
+    /// The editor button's PAINTED right edge (window coords), written by a
+    /// bounds canvas inside the control each frame (the zone_row_bounds
+    /// idiom — a plain shared cell, never an entity write mid-draw). The
+    /// dropdown reads it to stay glued right-edge-to-right-edge with its
+    /// button: the fixed-width estimate it replaced assumed the chrome right
+    /// of the button never changes, but those controls flex-shrink in a
+    /// narrow bar, which left the menu floating ~75px off its control.
+    editor_btn_right: std::rc::Rc<std::cell::Cell<Option<Pixels>>>,
     /// Selection popover (DESIGN §2-toolbar): formatting rides the
     /// selection. Shown on mouse-up over a selection or via ctrl-.;
     /// dismissed by mousedown, typing, scrolling, or escape.
@@ -1539,6 +1547,7 @@ impl Editor {
             active_card_height: None,
             narrow_notes_open: false,
             editor_menu_open: false,
+            editor_btn_right: std::rc::Rc::default(),
             selection_popover: false,
             link_input: None,
             rail_open: false,
@@ -10467,10 +10476,14 @@ impl Editor {
             .left(px(left))
             .top(px(top))
             .w(px(FLANK_GRID_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (the lab's .fmt/.selmenu:
+            // card fill, RULE hairline, 9px rounding): both flanks rise
+            // together, so they must wear one dress (P8) — this one wore the
+            // panel fill at a different radius than its right-hand partner.
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(8.))
+            .rounded(px(9.))
             .shadow_md()
             .py(px(5.))
             .px(px(3.))
@@ -10503,10 +10516,11 @@ impl Editor {
             .left(px(left))
             .top(px(top))
             .w(px(POPOVER_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (see render_flank_grid).
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(6.))
+            .rounded(px(9.))
             .shadow_md()
             .px(px(4.))
             .py(px(3.))
@@ -10541,10 +10555,11 @@ impl Editor {
             .left(px(left))
             .top(px(top))
             .w(px(LINK_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (see render_flank_grid).
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(6.))
+            .rounded(px(9.))
             .shadow_md()
             .px(px(8.))
             .py(px(4.))
@@ -11129,6 +11144,34 @@ impl Editor {
                                 editor.toggle_editor_menu(cx);
                             }),
                         )
+                        // The glue probe: the dropdown must sit right-edge-to-
+                        // right-edge with THIS control, so record where the
+                        // control actually painted (see editor_btn_right).
+                        // Plain shared-cell write, never an entity update
+                        // mid-draw. The menu renders BEFORE this runs, so when
+                        // the edge moved this frame (resize, a label change)
+                        // and the menu is up, schedule ONE follow-up frame —
+                        // the EditorElement's geometry-changed idiom; it
+                        // converges as soon as the edge holds still.
+                        .child({
+                            let cell = self.editor_btn_right.clone();
+                            capture_canvas(
+                                move |bounds, window, _| {
+                                    // inset_0 spans the button's PADDING box;
+                                    // add its border back, so the cell holds
+                                    // the control's true painted edge.
+                                    let edge = bounds.right() + px(1.);
+                                    let stale = cell.get() != Some(edge);
+                                    cell.set(Some(edge));
+                                    if stale && open {
+                                        window.request_animation_frame();
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0()
+                        })
                         .when_some(dot, |d, color| {
                             d.child(div().size(px(6.)).rounded_full().bg(rgb(color)))
                         })
@@ -14340,30 +14383,96 @@ impl Editor {
     /// unclickable (review H33: cooking or a history preview must not dispatch);
     /// a `gate` reason livens the copy row's `when` line — the only row that
     /// explains, because the gate is data (no "usually after…" advice anywhere).
+    ///
+    /// The dress is the lab's `.erow`/`.vq`: the read's VERB in a bold face,
+    /// its qualifier in small muted ink on the SAME line (never the wrapped
+    /// serif paragraph this replaced), a full-bleed cool hover wash (this is
+    /// the MACHINE's menu; the selection menu's writer verbs wash warm). P12
+    /// accents — the control is the indicator: the row whose read the machine
+    /// holds right now (cooking, or parked behind the reveal clock) wears the
+    /// same cool dot the button pulses, and the row ctrl-shift-d currently
+    /// aims at teaches its chord as a keycap chip (the chip FOLLOWS the
+    /// session depth, so the default read is always marked).
     fn editor_menu_row(
         &self,
         id: &'static str,
-        text: &'static str,
+        (verb, qualifier): (&'static str, &'static str),
         kind: PassKind,
         inert: bool,
         gate: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let disabled = inert || gate.is_some();
+        let held = self.last_pass == kind
+            && (matches!(self.ai_status, Some(AiStatus::Running { .. }))
+                || self.deferred_pass.is_some());
+        let chord = match &kind {
+            PassKind::Believing => Some("ctrl-shift-b"),
+            PassKind::Diagnostic(mode) if *mode == self.effective_mode() => Some("ctrl-shift-d"),
+            _ => None,
+        };
         let base = div()
             .id(id)
+            .relative()
             .px(px(12.))
-            .py(px(6.))
-            .rounded(px(5.))
+            .py(px(7.))
             .flex()
             .flex_col()
-            .gap(px(1.))
+            .gap(px(2.))
+            // The held dot rides the padding band as an overlay, so the verb
+            // column never shifts when a read starts or parks.
+            .when(held, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(px(3.))
+                        .top_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .child(div().size(px(6.)).rounded_full().bg(rgb(AI_ACCENT))),
+                )
+            })
             .child(
                 div()
-                    .text_size(px(13.))
-                    .font_family("PT Serif")
-                    .text_color(rgb(if disabled { MUTED_COLOR } else { TEXT_COLOR }))
-                    .child(text),
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(13.))
+                            .text_color(rgb(if disabled { MUTED_COLOR } else { TEXT_COLOR }))
+                            .child(verb),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(qualifier),
+                    )
+                    // The chord chip (the lab's `.k` keycap, the selection
+                    // menu's exact dress): the menu teaches its own shortcuts
+                    // in place, instead of a manual teaching them in prose.
+                    .when_some(chord, |d, chord| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .px(px(3.))
+                                .font_family(CODE_FONT)
+                                .text_size(px(9.))
+                                .text_color(rgb(MUTED_COLOR))
+                                .border_1()
+                                .border_color(rgb(RULE_COLOR))
+                                .rounded(px(4.))
+                                .bg(rgb(BG_COLOR))
+                                .child(chord),
+                        )
+                    }),
             );
         let base = match gate {
             Some(reason) => base.child(
@@ -14378,7 +14487,7 @@ impl Editor {
             base.into_any_element()
         } else {
             base.cursor(CursorStyle::PointingHand)
-                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                .hover(|d| d.bg(rgb(DIAGNOSIS_CARD_BG)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
@@ -14394,10 +14503,17 @@ impl Editor {
     }
 
     /// The editor button's dropdown (impl 04 §0): the AI subsystem's single
-    /// home, glued flush under the titlebar control (right edges aligned — the
-    /// lab's fix for the detached-dropdown sin), borrowing the narrow-notes
-    /// panel's anchoring idiom (a bool-toggled overlay, light-dismissed + Esc).
-    fn render_editor_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// home, glued flush under the titlebar control (right edges aligned, top
+    /// corners squared into the bar — the lab's fix for the detached-dropdown
+    /// sin), borrowing the narrow-notes panel's anchoring idiom (a bool-toggled
+    /// overlay, light-dismissed + Esc). Surface dress is the selection menu's
+    /// shipped values (CARD_BG, RULE hairline, 9px rounding), so the two verb
+    /// menus read as one family.
+    fn render_editor_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         if !self.editor_menu_open {
             return None;
         }
@@ -14414,17 +14530,27 @@ impl Editor {
         let copy_gate = self
             .copy_gated()
             .then_some("after the structural queries settle");
-        // Anchored flush under the button, right edges aligned. Everything to
-        // the button's right is fixed-width chrome: palette-toggle (27) +
-        // history-toggle (31) [+ the three drawn window controls, 3×34, on
-        // non-macOS — macOS keeps its traffic lights top-LEFT]. So the button's
-        // right edge — and thus the menu's — sits this far from the content edge.
-        let menu_right = if cfg!(target_os = "macos") { 58. } else { 160. };
+        // Anchored flush under the button, right edges aligned — against the
+        // button's PAINTED edge (the capture canvas inside the control), not
+        // a fixed-width estimate of the chrome right of it: those controls
+        // flex-shrink in a narrow bar, which left the estimate ~75px off its
+        // control. The estimate survives only as the first-frame fallback
+        // (palette-toggle 27 + history-toggle 4+31 [+ 3×34 drawn window
+        // controls off macOS — its traffic lights sit top-LEFT]).
+        let vw = f32::from(window.viewport_size().width);
+        let est = vw - if cfg!(target_os = "macos") { 62. } else { 164. };
+        let btn_right = self.editor_btn_right.get().map_or(est, f32::from);
+        let menu_right = (vw - btn_right).max(8.);
+        // The lab's one-line law (392 there, chipless): verb + qualifier +
+        // the keycap chip hold ONE line — 430 clears the longest row (the
+        // believing read's qualifier beside its ctrl-shift-b chip). A window
+        // too narrow for that cedes width, never the button's edge.
+        let menu_w = 430f32.min(vw - menu_right - 8.);
         let door_open = !self.drafting;
         let footer = div()
-            .pt(px(6.))
+            .pt(px(7.))
             .px(px(12.))
-            .pb(px(2.))
+            .pb(px(8.))
             .border_t_1()
             .border_color(rgb(RULE_COLOR))
             .flex()
@@ -14438,8 +14564,9 @@ impl Editor {
             )))
             .child(
                 // The presence pair (glossary): Reading (door open) / Away
-                // (drafting). A drawn toggle — the current pole is emphasized, a
-                // click flips it through toggle_door's flush semantics. No "⇄"
+                // (drafting). A drawn toggle — the current pole wears the ink
+                // AND the weight (never color alone, WCAG 1.4.1); a click
+                // flips it through toggle_door's flush semantics. No "⇄"
                 // glyph (not in the bundled PT fonts); a dot divides the poles.
                 div()
                     .id("editor-menu-door")
@@ -14459,26 +14586,37 @@ impl Editor {
                             editor.toggle_door(cx);
                         }),
                     )
-                    .child(div().text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR })).child("Reading"))
+                    .child(
+                        div()
+                            .text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR }))
+                            .when(door_open, |d| d.font_weight(FontWeight::BOLD))
+                            .child("Reading"),
+                    )
                     .child(div().size(px(3.)).rounded_full().bg(rgb(MUTED_COLOR)))
-                    .child(div().text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR })).child("Away")),
+                    .child(
+                        div()
+                            .text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR }))
+                            .when(!door_open, |d| d.font_weight(FontWeight::BOLD))
+                            .child("Away"),
+                    ),
             );
         Some(
             div()
                 .id("editor-menu")
                 .absolute()
-                .top(px(BAR_HEIGHT + 4.))
+                // Overlap the bar's own hairline by 1px: the menu's top border
+                // paints over it in the same RULE ink, so control and menu
+                // share ONE hairline — glued, with the top corners squared.
+                .top(px(BAR_HEIGHT - 1.))
                 .right(px(menu_right))
-                .w(px(292.))
-                .bg(rgb(0xFCFAF4))
+                .w(px(menu_w))
+                .bg(rgb(CARD_BG))
                 .border_1()
                 .border_color(rgb(RULE_COLOR))
-                .rounded(px(8.))
+                .rounded_b(px(9.))
                 .shadow_lg()
-                .py(px(6.))
                 .flex()
                 .flex_col()
-                .gap(px(1.))
                 .font_family("PT Sans")
                 .text_color(rgb(TEXT_COLOR))
                 // Contained like the palette/narrow panel: clicks/scroll stay in.
@@ -14487,14 +14625,15 @@ impl Editor {
                 .child(
                     div()
                         .px(px(12.))
-                        .py(px(4.))
+                        .pt(px(8.))
+                        .pb(px(3.))
                         .text_size(px(11.))
                         .text_color(rgb(MUTED_COLOR))
                         .child("Ask the editor for…"),
                 )
                 .child(self.editor_menu_row(
                     "er-believing",
-                    "A believing read — what's alive here, what it's secretly about",
+                    ("A believing read", "— what's alive here, what it's secretly about"),
                     PassKind::Believing,
                     inert,
                     None,
@@ -14502,7 +14641,7 @@ impl Editor {
                 ))
                 .child(self.editor_menu_row(
                     "er-developmental",
-                    "A developmental read — the structure: stakes, turns, the ending",
+                    ("A developmental read", "— the structure: stakes, turns, the ending"),
                     PassKind::Diagnostic("developmental".to_owned()),
                     inert,
                     None,
@@ -14510,7 +14649,7 @@ impl Editor {
                 ))
                 .child(self.editor_menu_row(
                     "er-line",
-                    "A line read — rhythm, imagery, dialogue",
+                    ("A line read", "— rhythm, imagery, dialogue"),
                     PassKind::Diagnostic("line".to_owned()),
                     inert,
                     None,
@@ -14518,7 +14657,7 @@ impl Editor {
                 ))
                 .child(self.editor_menu_row(
                     "er-copy",
-                    "A copy read — slips, typos, repetitions",
+                    ("A copy read", "— slips, typos, repetitions"),
                     PassKind::Diagnostic("copy".to_owned()),
                     inert,
                     copy_gate,
@@ -14526,7 +14665,7 @@ impl Editor {
                 ))
                 .child(self.editor_menu_row(
                     "er-doubting",
-                    "A doubting read — the strongest case against it",
+                    ("A doubting read", "— the strongest case against it"),
                     PassKind::Doubting,
                     inert,
                     None,
@@ -15139,7 +15278,7 @@ impl Render for Editor {
                 None => d,
             })
             // The editor button's dropdown, glued under its titlebar control.
-            .map(|d| match self.render_editor_menu(cx) {
+            .map(|d| match self.render_editor_menu(window, cx) {
                 Some(menu) => d.child(menu),
                 None => d,
             })
