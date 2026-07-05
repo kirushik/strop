@@ -191,6 +191,11 @@ const OUTLINE_PANEL_WIDTH: f32 = 200.;
 const DOC_MIN_WIDTH: f32 = 400.;
 const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
+/// The parked-banner refusal pulse (Bug B): the moment label flashes seltint
+/// and fades out over this window (the mockup's `.pulseme.hot`, ~900ms). A
+/// handful of re-notify frames make the decay visible without a render loop.
+const STRIP_PULSE_MS: u64 = 900;
+const STRIP_PULSE_FRAMES: u64 = 9;
 /// Client-side decorations (H2): thickness of the invisible resize band
 /// laid along each window edge/corner. GNOME Wayland grants no server-side
 /// borders, so without these strips Strop cannot be resized at all. Strips
@@ -1069,6 +1074,12 @@ pub struct Editor {
     rail_flash: Option<Instant>,
     /// One-shot blink of the graveyard bar on an exile (a fresh cut filed).
     grave_flash: Option<Instant>,
+    /// One-shot pulse of the parked history banner's moment label (Bug B): an
+    /// edit attempt while previewing the past does NOTHING to the text and
+    /// flashes this instead — the mockup's `.pulseme.hot` (seltint, ~900ms
+    /// fade-out). The read-only mode is visible and its refusal is legible
+    /// (P2/P4). `None` at rest; the fade alpha is a pure function of elapsed.
+    strip_pulse: Option<Instant>,
     /// store_dirty was set at least once this session — a plain "did the writer
     /// touch this document" flag (the rig's `edits=` tag). Re-entry via the
     /// intent question was retired (impl 04 §1); this now only reports activity.
@@ -1346,6 +1357,27 @@ fn count_words<'a>(chunks: impl Iterator<Item = &'a str>) -> usize {
     words
 }
 
+/// `seed:legacy` prose: exactly `words` words of placeholder text, broken into
+/// ~40-word paragraphs so a checkpoint state reads like a real draft. Its word
+/// count is `words` and its char count is deterministic — the strip's legacy
+/// axis (extent = |Δwords|, envelope = chars) is reproducible in the rig.
+fn seed_prose(words: usize) -> String {
+    const POOL: [&str; 13] = [
+        "the", "ferry", "held", "its", "line", "against", "the", "dark", "water", "and", "the",
+        "far", "shore",
+    ];
+    let mut out = String::new();
+    for i in 0..words {
+        out.push_str(POOL[i % POOL.len()]);
+        if (i + 1) % 40 == 0 && i + 1 < words {
+            out.push_str("\n\n");
+        } else if i + 1 < words {
+            out.push(' ');
+        }
+    }
+    out
+}
+
 impl Editor {
     pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
@@ -1424,6 +1456,7 @@ impl Editor {
             last_manuscript_caret: 0,
             rail_flash: None,
             grave_flash: None,
+            strip_pulse: None,
             session_had_edits: false,
             session_goal: None,
             goal_input: None,
@@ -2184,6 +2217,7 @@ impl Editor {
         self.strip.pin_ms = None;
         self.strip.scratch = None;
         self.strip.bake = None;
+        self.strip_pulse = None;
         // Drop any preview so the live document returns.
         self.history_preview = None;
         *self.strip_rail.borrow_mut() = None;
@@ -2205,7 +2239,9 @@ impl Editor {
     }
 
     /// Checkpoints reduced to draw/anchor metadata (created_unix SECONDS ×1000
-    /// at the boundary — the unit law).
+    /// at the boundary — the unit law). Word/char counts come from the ALREADY
+    /// materialized state (a cheap in-memory read — no time-travel; a stateless
+    /// legacy checkpoint reports 0/0 and sizes no span, per Bug A).
     fn strip_stations(&self) -> Vec<strip::StationSnap> {
         let Some(store) = &self.store else {
             return Vec::new();
@@ -2213,11 +2249,20 @@ impl Editor {
         store
             .checkpoints()
             .into_iter()
-            .map(|cp| strip::StationSnap {
-                created_ms: cp.created_unix * 1000,
-                name: cp.name,
-                manual: cp.manual,
-                has_state: cp.state.is_some(),
+            .map(|cp| {
+                let (words, chars) = cp
+                    .state
+                    .as_ref()
+                    .map(|s| (count_words(std::iter::once(s.text.as_str())), s.text.chars().count()))
+                    .unwrap_or((0, 0));
+                strip::StationSnap {
+                    created_ms: cp.created_unix * 1000,
+                    name: cp.name,
+                    manual: cp.manual,
+                    has_state: cp.state.is_some(),
+                    words,
+                    chars,
+                }
             })
             .collect()
     }
@@ -2290,10 +2335,26 @@ impl Editor {
 
     /// Park the playhead at a rail x (window coords) and begin a continuous
     /// scrub; `pin` (shift-click) drops/clears the Compare playhead instead.
+    /// Is there any PAST to view? False for a document with no journal and no
+    /// checkpoints beyond the present (a zero-width axis) — parking there would
+    /// preview "now" and needlessly enter read-only mode (P13: no view without
+    /// content). `total_work == 0` captures both the truly-empty doc and the
+    /// only-a-now-checkpoint one (its extend-to-now span has no width).
+    fn strip_has_past(&self) -> bool {
+        self.strip
+            .bake
+            .as_ref()
+            .is_some_and(|b| b.timeline.total_work > 0.)
+    }
+
     fn strip_park_at_x(&mut self, x: f32, pin: bool, cx: &mut Context<Self>) {
         let Some(pos) = self.strip_pos_at_x(x) else {
             return;
         };
+        // No history → never park (the reported guard).
+        if !self.strip_has_past() {
+            return;
+        }
         if pin {
             self.strip_toggle_pin(pos, cx);
             return;
@@ -2438,6 +2499,40 @@ impl Editor {
         self.strip.scratch = None;
         self.history_preview = None;
         cx.notify();
+    }
+
+    /// An edit gesture arrived while parked in the past (Bug B): the past is
+    /// read-only, so the text is untouched and the banner's moment label
+    /// pulses instead — the ONE uniform refusal for every mutation (insert,
+    /// delete, format, block, undo, redo, link, paste, cut). No restore is
+    /// ever committed by a keystroke (P2: the tool never wants). The fade
+    /// alpha is a pure function of `Instant`; a short spawn loop re-notifies
+    /// across the ~900ms so the flash actually decays on screen.
+    fn pulse_strip(&mut self, cx: &mut Context<Self>) {
+        self.strip_pulse = Some(Instant::now());
+        cx.spawn(async move |this, cx| {
+            for _ in 0..STRIP_PULSE_FRAMES {
+                cx.background_executor()
+                    .timer(Duration::from_millis(STRIP_PULSE_MS / STRIP_PULSE_FRAMES))
+                    .await;
+                let cont = this.update(cx, |editor: &mut Editor, cx| {
+                    let done = editor
+                        .strip_pulse
+                        .is_none_or(|t| t.elapsed() >= Duration::from_millis(STRIP_PULSE_MS));
+                    if done {
+                        editor.strip_pulse = None;
+                    }
+                    cx.notify();
+                    done
+                });
+                // Stop once the fade finished (Ok(true)) or the entity is gone
+                // (Err); keep re-notifying only while Ok(false).
+                if !matches!(cont, Ok(false)) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Compare (shift-click): a second faint playhead whose delta folds into
@@ -4806,9 +4901,14 @@ impl Editor {
     /// and anything less applies; at a bare caret, sets a sticky attr for
     /// the next typed text (the universal rich-editor convention).
     fn toggle_span(&mut self, attr: InlineAttr, cx: &mut Context<Self>) {
-        // Read-only while previewing the past (panel or strip): formatting the
-        // past is undefined; only typing restores (see apply_replace).
-        if self.history_view.is_some() || self.strip.is_parked() {
+        // Read-only while previewing the past: formatting the past is
+        // undefined. The strip pulses its banner (the uniform refusal, Bug B);
+        // the panel just no-ops.
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return;
+        }
+        if self.history_view.is_some() {
             return;
         }
         if self.selected_range.is_empty() {
@@ -4834,7 +4934,11 @@ impl Editor {
     /// click-away blur commits (`commit_field_on_blur`).
     fn open_link_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Read-only while previewing the past (mirrors toggle_span).
-        if self.history_view.is_some() || self.strip.is_parked() || self.selected_range.is_empty() {
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return;
+        }
+        if self.history_view.is_some() || self.selected_range.is_empty() {
             return;
         }
         let rope = self.doc.rope();
@@ -6391,7 +6495,11 @@ impl Editor {
 
     /// Toggle a block kind over the selected block range, one transaction.
     fn toggle_block(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
-        if self.history_view.is_some() || self.strip.is_parked() {
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return;
+        }
+        if self.history_view.is_some() {
             return;
         }
         let start_block = self.doc.block_of_byte(self.selected_range.start);
@@ -6473,13 +6581,33 @@ impl Editor {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            let text = self.doc.slice_bytes(self.selected_range.clone());
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if self.selected_range.is_empty() {
+            return;
         }
+        // Copy MUST work while parked (Bug B): the writer wants to lift text out
+        // of a past revision. The selection's byte offsets index the laid-out
+        // text — which IS the preview while previewing — so the slice comes from
+        // the preview string, not the live doc (`index_for_mouse` clamps to the
+        // same source). Selection highlight is suppressed in preview, but the
+        // range is honest, so ctrl-c carries the past's words.
+        let text = match &self.history_preview {
+            Some(p) => {
+                let r = self.selected_range.start.min(p.text.len())
+                    ..self.selected_range.end.min(p.text.len());
+                p.text.get(r).unwrap_or("").to_owned()
+            }
+            None => self.doc.slice_bytes(self.selected_range.clone()),
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        // A cut is a mutation — refused (pulsed) while parked, not a silent
+        // copy-then-nothing (Bug B). Use Copy to lift text out of the past.
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return;
+        }
         if !self.selected_range.is_empty() {
             let text = self.doc.slice_bytes(self.selected_range.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -6573,7 +6701,11 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.history_view.is_some() || self.strip.is_parked() {
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return;
+        }
+        if self.history_view.is_some() {
             return;
         }
         if let Some(cursor_char) = self.doc.undo() {
@@ -6593,7 +6725,11 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.history_view.is_some() || self.strip.is_parked() {
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return;
+        }
+        if self.history_view.is_some() {
             return;
         }
         if let Some(cursor_char) = self.doc.redo() {
@@ -6713,8 +6849,15 @@ impl Editor {
             return (0, false);
         };
         let (ix, aff) = frame.index_for_point(frame.doc_point(position));
-        // Stale-frame guard: never hand out offsets beyond the live rope.
-        (ix.min(self.doc.len_bytes()), aff)
+        // Stale-frame guard: never hand out offsets beyond the text the frame
+        // laid out. While parked that text is the PREVIEW (a past revision that
+        // may be longer or shorter than the live doc), so the selection clamps
+        // to the preview's length — that's what Copy slices from (Bug B).
+        let max = self
+            .history_preview
+            .as_ref()
+            .map_or_else(|| self.doc.len_bytes(), |p| p.text.len());
+        (ix.min(max), aff)
     }
 
     /// Footnote click routing (DESIGN §2-footnotes): a point on an in-text
@@ -7213,6 +7356,13 @@ impl Editor {
                 "stations": b.stations.len(),
                 "words_at": self.strip.words_at,
                 "bakes": self.strip.bakes,
+                // Axis width in working px — non-zero even for a LEGACY era
+                // (checkpoints only), the merged-axis assertion (Bug A).
+                "work": b.timeline.total_work,
+                // The parked banner is up (mode indicator) and, when a refused
+                // edit is mid-flash, the pulse is live — both MODEL bits (Bug B).
+                "banner": self.strip.parked,
+                "pulse": self.strip_pulse.is_some(),
             })),
             // Presentation gate: the margin lane + rail render only when no
             // history surface is previewing (review H36) — the model above is
@@ -7465,6 +7615,48 @@ impl Editor {
         cx.notify();
     }
 
+    /// Rig hook (`seed:legacy`): the legacy litmus shape (Bug A) — a store with
+    /// six materialized checkpoints spread across two weeks (growing word
+    /// counts, one mid-arc cut) and an EMPTY journal. Before Bug A this
+    /// rendered as an empty strip: `Timeline::build` read only the journal, so
+    /// every checkpoint tick landed at `work_at = 0` and overprinted the left
+    /// edge. Now the checkpoint states ARE the axis — stations spread, the
+    /// envelope steps, the whole pre-journal history is scannable.
+    pub fn debug_seed_legacy(&mut self, cx: &mut Context<Self>) {
+        use strop_core::journal::Journal;
+        use strop_core::store::CheckpointState;
+        let Some(store) = self.store.as_ref() else {
+            eprintln!("strop: seed:legacy needs a document file");
+            return;
+        };
+        let now_secs = strop_core::journal::now_ms() / 1000;
+        let day = 86_400i64;
+        // (days_ago, name, words, manual). Growing, with a dip at the rework —
+        // the envelope steps up at a cut, as a real draft's does.
+        let plan: [(i64, &str, usize, bool); 6] = [
+            (13, "Started", 90, false),
+            (11, "First scenes", 340, true),
+            (8, "Middle drafted", 720, true),
+            (5, "Rework the arc", 610, true),
+            (2, "Full draft", 1500, true),
+            (0, "Draft complete", 2100, false),
+        ];
+        for (days_ago, name, words, manual) in plan {
+            let text = seed_prose(words);
+            let lines = text.lines().count().max(1);
+            let state = CheckpointState {
+                text,
+                spans: SpanSet::default(),
+                blocks: BlockMap::new(lines),
+            };
+            store.debug_push_checkpoint(name, now_secs - days_ago * day - 4 * 3600, manual, state);
+        }
+        // The litmus is checkpoints WITHOUT a journal (no keystroke record).
+        self.doc.set_journal(Journal::default());
+        self.mark_dirty();
+        cx.notify();
+    }
+
     /// Rig hook (`strip:open`): open the strip surface.
     pub fn debug_strip_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_strip(window, cx);
@@ -7473,6 +7665,11 @@ impl Editor {
     /// Rig hook (`strip:scrub:<0..1>`): park at a fraction of the whole history
     /// (via the timeline, not the rail geometry — deterministic headless).
     pub fn debug_strip_scrub(&mut self, frac: f32, cx: &mut Context<Self>) {
+        // Mirror the click path's no-history guard (a zero-width axis never
+        // parks) so the rig can assert it.
+        if !self.strip_has_past() {
+            return;
+        }
         let pos = self
             .strip
             .bake
@@ -7666,17 +7863,15 @@ impl Editor {
         typograph: bool,
         cx: &mut Context<Self>,
     ) {
-        // Typing while parked in the strip's past = restore-then-type (spec §2,
-        // Raskin's law): a text INSERT first performs the Restore (which drops
-        // the preview and returns to the now-live restored doc), then falls
-        // through to insert. A pure deletion (empty new_text) of the past stays
-        // read-only — there is no "type" gesture to justify restoring.
+        // The past is READ-ONLY (Bug B): every edit gesture while parked —
+        // insert, delete, paste alike — leaves the text untouched and pulses
+        // the banner instead. The old restore-then-type path is gone: a
+        // keystroke must never silently commit a restore (P2, the writer's own
+        // terror — "even I was scared we'd broken everything"). Restore is the
+        // explicit chip; Esc returns to now.
         if self.strip.is_parked() {
-            if new_text.is_empty() {
-                return;
-            }
-            self.strip_restore(cx);
-            // strip_restore left the doc live and the strip at now; fall through.
+            self.pulse_strip(cx);
+            return;
         }
         if self.history_view.is_some() {
             return; // history preview is read-only
@@ -10500,6 +10695,98 @@ impl Editor {
                     .text_color(rgb(MUTED_COLOR))
                     .child("Esc to exit"),
             )
+    }
+
+    /// The parked-mode banner (Bug B): a stale strip directly under the
+    /// titlebar that IS the mode indicator for the text area while previewing
+    /// the past — the mockup's history-preview variant (scene 1). **bold
+    /// moment label** · "N words" · a dark [Restore] chip · "·" · "Esc
+    /// returns". No lecture (P4). The moment label is the checkpoint's name
+    /// (curly-quoted) when the playhead sits on a tick, else the bare date/
+    /// time; it flashes seltint on a REFUSED edit (`pulse_strip`), fading over
+    /// ~900ms — the read-only mode made visible, its refusal legible.
+    fn render_strip_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.strip.is_parked() {
+            return None;
+        }
+        let now_ms = self
+            .strip
+            .bake
+            .as_ref()
+            .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
+        // On a station tick → its name, curly-quoted; else the date/time.
+        let at_station = self.strip.bake.as_ref().and_then(|b| {
+            let play = b.timeline.work_at(self.strip.pos_ms);
+            b.stations
+                .iter()
+                .filter(|s| !s.label.is_empty())
+                .find(|s| (s.x - play).abs() < 5.)
+                .map(|s| format!("\u{201c}{}\u{201d}", s.label))
+        });
+        let moment = at_station.unwrap_or_else(|| strip::format_moment(self.strip.pos_ms, now_ms));
+        let words = format!("{} words", format_thousands(self.strip.words_at));
+        // The refusal pulse: seltint (0xC8A951 @ .33) decaying to 0 across the
+        // pulse window — a pure function of the stored Instant.
+        let pulse_a = self.strip_pulse.map_or(0., |t| {
+            let e = t.elapsed().as_millis() as f32 / STRIP_PULSE_MS as f32;
+            (0.33 * (1. - e)).clamp(0., 0.33)
+        });
+
+        let restore_chip = div()
+            .id("strip-banner-restore")
+            .occlude()
+            .px(px(12.))
+            .py(px(2.))
+            .rounded(px(11.))
+            .bg(rgb(TEXT_COLOR))
+            .text_color(rgb(BG_COLOR))
+            .font_family("PT Sans")
+            .text_size(px(11.5))
+            .cursor(CursorStyle::PointingHand)
+            .hover(|d| d.bg(rgb(0x33322D)))
+            .child("Restore")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.strip_restore(cx);
+                }),
+            );
+
+        Some(
+            div()
+                .absolute()
+                .top(px(BAR_HEIGHT))
+                .left_0()
+                .right_0()
+                .h(px(30.))
+                .bg(rgb(0xEFEEEA))
+                .border_b_1()
+                .border_color(rgb(RULE_COLOR))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(9.))
+                .font_family("PT Sans")
+                .text_size(px(12.))
+                .text_color(rgb(MUTED_COLOR))
+                // A click on the banner is not a document click.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .px(px(5.))
+                        .py(px(1.))
+                        .rounded(px(4.))
+                        .bg(tint(0xC8A951, pulse_a))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(TEXT_COLOR))
+                        .child(moment),
+                )
+                .child(div().child(format!("\u{b7} {words}")))
+                .child(restore_chip)
+                .child(div().text_color(rgb(0xB8B4A8)).child("\u{b7}"))
+                .child(div().child("Esc returns")),
+        )
     }
 
     /// The history side panel (DESIGN §2-history): full-height, right,
@@ -13869,6 +14156,12 @@ impl Render for Editor {
                 Some(strip) => d.child(strip),
                 None => d,
             })
+            // The parked-mode banner (Bug B): a top overlay under the titlebar,
+            // over the past preview — the text area's mode indicator.
+            .map(|d| match self.render_strip_banner(cx) {
+                Some(banner) => d.child(banner),
+                None => d,
+            })
             .map(|d| match self.render_chord_whisper() {
                 Some(whisper) => d.child(whisper),
                 None => d,
@@ -14159,6 +14452,27 @@ impl Editor {
                 }),
             );
 
+        // Close affordance (Bug C): a small '×' in the strip's top-right, the
+        // note-dismiss idiom (muted → bright on hover, pointing hand). Closes
+        // the strip from ANY state; click-away deliberately still does not.
+        let close_x = div()
+            .id("strip-close")
+            .occlude()
+            .px(px(4.))
+            .cursor(CursorStyle::PointingHand)
+            .font_family("PT Sans")
+            .text_size(px(14.))
+            .text_color(rgb(0x8F8A7C))
+            .hover(|d| d.text_color(rgb(0xE7E1D0)))
+            .child("\u{d7}")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.close_strip(cx);
+                }),
+            );
+
         Some(
             div()
                 .absolute()
@@ -14220,13 +14534,17 @@ impl Editor {
                         .child(readout_chip)
                         .when(parked, |d| d.child(restore_btn)),
                 )
-                // Now, fixed at the far right.
+                // Now + close, fixed at the far right.
                 .child(
                     div()
                         .absolute()
-                        .right(px(strip::SIDE_PAD - 8.))
+                        .right(px(8.))
                         .top(px(4.))
-                        .child(now_chip),
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(now_chip)
+                        .child(close_x),
                 ),
         )
     }

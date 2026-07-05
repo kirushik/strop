@@ -232,6 +232,19 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:journal: synthetic fortnight installed");
                 continue;
             }
+            // `seed:legacy` — the legacy litmus (Bug A): six materialized
+            // checkpoints across two weeks, EMPTY journal. The strip's axis must
+            // come from the checkpoint states, not the (absent) journal.
+            if key == "seed:legacy" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_legacy(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE seed:legacy: legacy checkpoint history installed");
+                continue;
+            }
             if key == "strip:open" {
                 window
                     .update(cx, |editor, window, cx| editor.debug_strip_open(window, cx))

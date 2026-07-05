@@ -213,6 +213,46 @@ expect "two scrubs later it has NOT re-baked" 1   "$(field "$S3" bakes)"
 expect "parked hides the live margin"       true  "$(field "$D2" margin_hidden)"
 expect "Now brings the margin back"         false "$(field "$D4" margin_hidden)"
 
+echo "rig-check: legacy history renders a real axis + a visible parked banner (Bug A/B)"
+# A legacy file — six materialized checkpoints across two weeks, EMPTY journal.
+# Before the fix the axis read only the journal, so every tick landed at x=0 and
+# the whole pre-journal history was invisible. Fresh doc per run (the .strop
+# sidecar persists across wrun launches within one rig run).
+DOCL1=$(mktemp --suffix=.md); cp "$DOC" "$DOCL1"
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCL1" "seed:legacy strip:open dump:ui strip:scrub:0.5 dump:ui ctrl-b dump:ui strip:now dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
+S1=$(echo "$D1" | grep -oE '"strip":\{[^}]*\}'); S2=$(echo "$D2" | grep -oE '"strip":\{[^}]*\}'); S3=$(echo "$D3" | grep -oE '"strip":\{[^}]*\}')
+[ -n "$S1" ] || { echo "  FAIL no strip dump (legacy)"; exit 1; }
+ST=$(field "$S1" stations)
+if [ "${ST:-0}" -ge 6 ] 2>/dev/null; then echo "  ok   the checkpoint era has stations ($ST)"; else
+  echo "  FAIL stations=$ST (checkpoints not on the axis?)"; fail=1; fi
+WK=$(field "$S1" work); WKI=${WK%.*}
+if [ "${WKI:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the axis is non-degenerate (work=$WK)"; else
+  echo "  FAIL work=$WK (axis collapsed to zero?)"; fail=1; fi
+expect "a scrub parks in the legacy past"   true  "$(field "$S2" parked)"
+expect "the parked banner is up"            true  "$(field "$S2" banner)"
+WL=$(field "$S2" words_at)
+if [ "${WL:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   words_at reports the era ($WL words)"; else
+  echo "  FAIL words_at=$WL (checkpoint-only reconstruction empty?)"; fail=1; fi
+expect "parked hides the live margin"       true  "$(field "$D2" margin_hidden)"
+# An edit gesture (ctrl-b) while parked is REFUSED: the banner pulses, the doc
+# is untouched, and we stay parked (no silent restore — the terror Bug B fixes).
+expect "a refused edit pulses the banner"   true  "$(field "$S3" pulse)"
+expect "the refusal keeps us parked"        true  "$(field "$S3" parked)"
+expect "the past is untouched (same chars)" "$(field "$D2" doc_chars)" "$(field "$D3" doc_chars)"
+expect "Now returns the margin"             false "$(field "$D4" margin_hidden)"
+
+echo "rig-check: no-history guard — an empty doc's strip never parks"
+# No checkpoints, no journal (truly nothing): scrubbing the strip must NOT park.
+DOCL2=$(mktemp --suffix=.md); : > "$DOCL2"
+OUT=$(WRUN_TAIL=40 scripts/wrun.sh "$DOCL2" "strip:open strip:scrub:0.5 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+DN=$(echo "$OUT" | tail -1); SN=$(echo "$DN" | grep -oE '"strip":\{[^}]*\}')
+if [ -n "$SN" ]; then
+  expect "an empty-history scrub does not park" false "$(field "$SN" parked)"
+else
+  echo "  ok   an empty-history strip has no bake to park (degraded, fine)"
+fi
+
 echo "rig-check: asides file honestly — compost is text, the graveyard gives back"
 # seed:aside asides one paragraph (births the rail) and exiles another (over
 # the cut threshold). putback:last is the graveyard's single verb: the entry
