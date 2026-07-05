@@ -152,7 +152,9 @@ if [ "${MV:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   survivors slide (moves_st
 expect "the lane settles after the slide"   0 "$(field "$D2" moving)"
 # A scroll mid-slide clears ALL motion at once — the lane never animates
 # against the writer's own navigation.
-OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOC6" "seed:many wait:1100 resolve:last wheel:800,600,-200 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+# wait:80 after the wheel: the snap happens in the render pre-pass, and under
+# load the dump can beat the next frame — one frame's grace kills the flake.
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOC6" "seed:many wait:1100 resolve:last wheel:800,600,-200 wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
 D1=$(echo "$OUT" | head -1)
 [ -n "$D1" ] || { echo "  FAIL no dump (rig didn't render?)"; exit 1; }
 MV=$(field "$D1" moves_started)
