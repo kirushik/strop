@@ -686,11 +686,14 @@ impl PassKind {
     }
 
     /// The Running-card label stem: "{} · {model}" is completed by `run_pass`.
+    /// Speaks the MENU's grammar ("a read") — the writer clicked "A line
+    /// read", so the running card names the same thing; "pass"/"diagnosis"
+    /// are internal registers (ux-glossary) and never print.
     fn run_label(&self) -> String {
         match self {
-            PassKind::Believing => "believing pass".to_owned(),
-            PassKind::Doubting => "doubting pass".to_owned(),
-            PassKind::Diagnostic(mode) => format!("{mode} diagnosis"),
+            PassKind::Believing => "believing read".to_owned(),
+            PassKind::Doubting => "doubting read".to_owned(),
+            PassKind::Diagnostic(mode) => format!("{mode} read"),
         }
     }
 }
@@ -2069,14 +2072,13 @@ impl Editor {
             return; // states still assembling; the row can't restore yet
         }
         let entry = &hv.entries[hv.selected];
-        let (name, text, spans, blocks) = (
-            entry.name.clone(),
+        let (text, spans, blocks) = (
             entry.text.clone(),
             entry.spans.clone(),
             entry.blocks.clone(),
         );
         let from_unix = entry.created_unix;
-        self.restore_to_state(&name, text, spans, blocks, from_unix, cx);
+        self.restore_to_state(text, spans, blocks, from_unix, cx);
         cx.notify();
     }
 
@@ -2094,18 +2096,21 @@ impl Editor {
     /// notifies.
     fn restore_to_state(
         &mut self,
-        name: &str,
         text: String,
         spans: SpanSet,
         blocks: BlockMap,
         from_unix: i64,
         cx: &mut Context<Self>,
     ) {
-        // Save first so the "Before restoring" checkpoint materializes the
-        // present exactly as it stands (see add_checkpoint).
+        // Save first so the "Before restore" checkpoint materializes the
+        // present exactly as it stands (see add_checkpoint). Its name is a
+        // bare automatic: inlining the source version's title composed
+        // writer text into a system label — P8's born-from bug class. The
+        // sage arc already points at the source (P10: words don't repeat
+        // what the arc says).
         self.save_now();
         let Some(store) = &self.store else { return };
-        store.add_checkpoint(&format!("Before restoring “{name}”"), false);
+        store.add_checkpoint("Before restore", false);
         self.doc.restore_state(&text, spans, blocks);
         self.selected_range = 0..0;
         self.selection_reversed = false;
@@ -2272,8 +2277,13 @@ impl Editor {
     fn checkpoint_state_at_ms(&self, ms: i64) -> Option<(String, SpanSet, BlockMap)> {
         let store = self.store.as_ref()?;
         let cps = store.checkpoints();
+        // .rev(): same-second neighbors exist by design — "Before restore"
+        // and "Restored" are written moments apart, and the LATER one is the
+        // truthful anchor (wave-1 review: anchoring on the earlier twin
+        // rebuilt the pre-restore text right after a restore).
         let cp = cps
             .iter()
+            .rev()
             .find(|cp| cp.created_unix * 1000 == ms && cp.state.is_some())?;
         store.checkpoint_state(cp)
     }
@@ -2348,22 +2358,39 @@ impl Editor {
             .as_ref()
             .is_some_and(|s| s.anchor_ms == anchor_key && runs_until >= s.replay.applied);
         if !reuse {
-            let (text, spans, blocks) = match anchor_ms {
+            // A leftward drag within the SAME anchor rebuilds from the
+            // scratch's own cached state; only a genuinely new anchor reads
+            // the store (whose checkpoint list parse is per-call).
+            let cached = self
+                .strip
+                .scratch
+                .as_ref()
+                .filter(|s| s.anchor_ms == anchor_key)
+                .map(|s| s.anchor_state.clone());
+            let (text, spans, blocks) = cached.unwrap_or_else(|| match anchor_ms {
                 Some(a) => self
                     .checkpoint_state_at_ms(a)
                     .unwrap_or_else(|| (String::new(), SpanSet::default(), BlockMap::default())),
                 None => (String::new(), SpanSet::default(), BlockMap::default()),
-            };
+            });
             let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
-            let replay = strop_core::journal::ReplayDoc::new(&text, spans, blocks, applied);
+            let replay =
+                strop_core::journal::ReplayDoc::new(&text, spans.clone(), blocks.clone(), applied);
             self.strip.scratch = Some(strip::ScrubDoc {
                 replay,
                 anchor_ms: anchor_key,
+                anchor_state: (text, spans, blocks),
             });
         }
         // Advance forward to pos_ms (disjoint field borrows: scratch vs doc).
+        // Unchanged replay on a reused scratch = the projection below would
+        // rebuild an identical PreviewDoc — skip the O(doc) work per frame.
+        let mut advanced = false;
         if let Some(scratch) = self.strip.scratch.as_mut() {
-            scratch.replay.advance(self.doc.journal(), pos_ms);
+            advanced = scratch.replay.advance(self.doc.journal(), pos_ms);
+        }
+        if reuse && !advanced {
+            return;
         }
         // Project the reconstructed rope + spans + blocks into a PreviewDoc.
         let Some(scratch) = self.strip.scratch.as_ref() else {
@@ -2469,7 +2496,7 @@ impl Editor {
         let spans = scratch.replay.spans.clone();
         let blocks = scratch.replay.blocks.clone();
         let from_unix = self.strip.pos_ms / 1000;
-        self.restore_to_state("an earlier version", text, spans, blocks, from_unix, cx);
+        self.restore_to_state(text, spans, blocks, from_unix, cx);
         // Data changed — refresh the bake, snap the playhead to the new present
         // (the restore IS the new now; the fabric never re-scales under the eye
         // mid-view, only here — design §1).
@@ -5212,7 +5239,9 @@ impl Editor {
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             // Forward-delete at the compost tail must not merge the boundary.
-            if self.at_compost_tail(self.cursor_offset()) {
+            if self.at_compost_tail(self.cursor_offset())
+                || self.at_separator_start(self.cursor_offset())
+            {
                 return;
             }
             let next = self.next_boundary(self.cursor_offset());
@@ -5241,7 +5270,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if self.selected_range.is_empty() {
-            if self.at_compost_tail(self.cursor_offset()) {
+            if self.at_compost_tail(self.cursor_offset())
+                || self.at_separator_start(self.cursor_offset())
+            {
                 return;
             }
             let next = self.next_word_boundary(self.cursor_offset());
@@ -5559,6 +5590,20 @@ impl Editor {
     fn at_compost_tail(&self, byte: usize) -> bool {
         match self.doc.aside_boundary() {
             Some(b) => byte == self.doc.rope().line_to_byte(b).saturating_sub(1),
+            None => false,
+        }
+    }
+
+    /// Caret at the START of the boundary's own empty line. Forward-delete
+    /// here would eat the separator's newline and merge block b into b+1 —
+    /// the boundary index stays pinned at b, so the first MANUSCRIPT
+    /// paragraph silently becomes compost (excluded from export, the count,
+    /// and passes) with no visible change to the text. Wave-1 review,
+    /// correctness/high: the separator's newline is removable only by the
+    /// aside machinery, like the other two edges.
+    fn at_separator_start(&self, byte: usize) -> bool {
+        match self.doc.aside_boundary() {
+            Some(b) => byte == self.doc.rope().line_to_byte(b),
             None => false,
         }
     }
@@ -9477,7 +9522,6 @@ impl Editor {
                 div()
                     .text_color(rgb(MUTED_COLOR))
                     .text_size(px(10.))
-                    .child("enter · empty removes · esc"),
             )
     }
 
@@ -10369,7 +10413,7 @@ impl Editor {
                         .border_b_1()
                         .border_color(rgb(RULE_COLOR))
                         .text_color(rgb(MUTED_COLOR))
-                        .child("Graveyard — cut prose, kept"),
+                        .child("Graveyard"),
                 )
                 .child(list),
         )
@@ -12460,7 +12504,7 @@ impl Editor {
                     .font_family("PT Serif")
                     .text_size(px(11.))
                     .text_color(rgb(MUTED_COLOR))
-                    .child(format!("Margin: ctrl-shift-d — {mode} diagnosis"))
+                    .child(format!("Margin: ctrl-shift-d — {mode} read"))
                     .into_any_element()
             }
             Some(AiStatus::NeedsSetup { local_model }) => {
@@ -13168,7 +13212,7 @@ impl Editor {
                     .py(px(1.))
                     .rounded(px(4.))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("Show or quiet the editor's notes", Some("ctrl-shift-r")))
+                    .tooltip(tip("The door", Some("ctrl-shift-r")))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
@@ -14403,12 +14447,19 @@ impl Element for StripElement {
             rect(window, x, fab_top, 1., strip::FABRIC_H, tint(strip::GREY, 0.35));
         }
 
-        // --- Flecks: the fabric (2×2 amber grains; thousands = one batch) ----
-        for f in &bake.flecks {
-            let x = fab_x(f.x);
-            if x < rail_x0 || x > rail_x1 {
-                continue;
+        // --- Flecks: the fabric (2×2 amber grains; thousands = one batch).
+        // Windowed: flecks are baked in time order (x non-decreasing), so the
+        // visible range is one partition_point + an early break — paint cost
+        // is O(visible), not O(journal) (wave-1 review, perf/mid; a year of
+        // history would otherwise walk every grain per frame).
+        let lo = view;
+        let hi = view + (rail_x1 - rail_x0);
+        let start = bake.flecks.partition_point(|f| f.x < lo);
+        for f in &bake.flecks[start..] {
+            if f.x > hi {
+                break;
             }
+            let x = fab_x(f.x);
             let color = if f.del {
                 tint(strip::FLECK_DEL, strip::FLECK_DEL_ALPHA)
             } else {
@@ -14827,11 +14878,11 @@ mod tests {
         assert_eq!(PassKind::Believing.mode_str(), "believing");
         assert_eq!(PassKind::Doubting.mode_str(), "doubting");
         assert_eq!(PassKind::Diagnostic("copy".into()).mode_str(), "copy");
-        assert_eq!(PassKind::Believing.run_label(), "believing pass");
-        assert_eq!(PassKind::Doubting.run_label(), "doubting pass");
+        assert_eq!(PassKind::Believing.run_label(), "believing read");
+        assert_eq!(PassKind::Doubting.run_label(), "doubting read");
         assert_eq!(
             PassKind::Diagnostic("developmental".into()).run_label(),
-            "developmental diagnosis"
+            "developmental read"
         );
         // The three kinds are distinct, and a pinned depth is carried by value
         // (the fix for the sticky-mode trap — no diagnosis_mode mutation).

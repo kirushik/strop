@@ -155,7 +155,7 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
             spans
         }
     };
-    let blocks = match doc.get_map(BLOCKS_CONTAINER).get("kinds") {
+    let mut blocks = match doc.get_map(BLOCKS_CONTAINER).get("kinds") {
         Some(v) => match v.into_value() {
             // JSON first; fall back to the legacy newline-joined token
             // format so pre-existing .strop files and older Loro frontiers
@@ -168,6 +168,17 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
         },
         None => BlockMap::default(),
     };
+    // The aside boundary rides the SAME versioned map, so a checkpoint state
+    // (materialized through this reader) reproduces the rail of ITS moment.
+    // Without this, restoring any version silently merged the compost into
+    // the manuscript — exported, counted, and sent to the AI (wave-1 review,
+    // correctness/high) — and the next save persisted the loss.
+    if let Some(v) = doc.get_map(BLOCKS_CONTAINER).get("boundary")
+        && let Ok(LoroValue::String(s)) = v.into_value()
+        && let Ok(boundary) = serde_json::from_str::<Option<usize>>(&s)
+    {
+        blocks.set_aside_boundary(boundary);
+    }
     (text.to_string(), spans, blocks)
 }
 
@@ -394,17 +405,12 @@ impl Store {
                     saved: Default::default(),
                     journal_saved: Default::default(),
                 };
-                let (text, spans, mut blocks) = store.read_state();
                 // The aside boundary persists as its OWN key beside "kinds"
                 // (review B13/H42): an older build reads only "kinds" and so
                 // ignores it — compost folds into the manuscript, nothing
-                // resets. Clamped by `set_aside_boundary`.
-                if let Some(v) = store.doc.get_map(BLOCKS_CONTAINER).get("boundary")
-                    && let Ok(LoroValue::String(json)) = v.into_value()
-                {
-                    let boundary = serde_json::from_str::<Option<usize>>(&json).ok().flatten();
-                    blocks.set_aside_boundary(boundary);
-                }
+                // resets. `read_state_of` applies it, HERE and for every
+                // materialized checkpoint state alike.
+                let (text, spans, blocks) = store.read_state();
                 let journal = journal_of(&store.doc);
                 *store.journal_saved.borrow_mut() =
                     (journal.runs.len(), journal.events.len());
@@ -1127,6 +1133,47 @@ mod tests {
         let journal = reloaded.unwrap().journal;
         assert_eq!(journal.runs.len(), 2, "the tail landed once, not twice");
         assert_eq!(journal.runs[1].ins, " идёт");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The wave-1 review's biggest catch: checkpoint states are materialized
+    /// through `read_state_of`, which used to build boundary-None BlockMaps —
+    /// so ANY restore silently merged the compost into the manuscript
+    /// (exported, counted, AI-scoped) and the next save persisted the loss.
+    /// The boundary must ride every materialized state.
+    #[test]
+    fn checkpoint_states_carry_the_aside_boundary() {
+        let path = temp_path("boundary-cp");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("compost line
+
+manuscript opens here");
+        let spans = SpanSet::default();
+        let mut blocks =
+            BlockMap::from_kinds(vec![BlockKind::Paragraph; 3]);
+        blocks.set_aside_boundary(Some(1));
+        store
+            .save_with_state(
+                &spans,
+                &blocks,
+                &History::default(),
+                &Annotations::default(),
+                &Journal::default(),
+                &Graveyard::default(),
+            )
+            .unwrap();
+
+        store.add_checkpoint("with rail", true);
+        let cp = store.checkpoints().pop().unwrap();
+        let (_, _, cp_blocks) = store.checkpoint_state(&cp).unwrap();
+        assert_eq!(
+            cp_blocks.aside_boundary(),
+            Some(1),
+            "a restored version must reproduce its rail"
+        );
 
         let _ = fs::remove_file(&path);
     }

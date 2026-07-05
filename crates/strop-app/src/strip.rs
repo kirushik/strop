@@ -182,36 +182,41 @@ impl Timeline {
     }
 
     /// Working-px for a wall-clock instant (clamped to the timeline's extent).
+    /// Binary search: `segs` is sorted, and the bake calls this once per run —
+    /// a linear scan made the whole bake O(runs²), measurable at a year of
+    /// history (wave-1 review, perf/high).
     pub fn work_at(&self, wall: i64) -> f32 {
         if self.segs.is_empty() {
             return 0.;
         }
         let wall = wall.clamp(self.start_ms, self.end_ms);
-        for s in &self.segs {
-            if wall <= s.wall1 {
+        let ix = self.segs.partition_point(|s| s.wall1 < wall);
+        match self.segs.get(ix) {
+            Some(s) => {
                 let span = (s.wall1 - s.wall0).max(1) as f32;
-                return s.work0 + (wall - s.wall0) as f32 / span * (s.work1 - s.work0);
+                s.work0 + (wall - s.wall0).max(0) as f32 / span * (s.work1 - s.work0)
             }
+            None => self.total_work,
         }
-        self.total_work
     }
 
     /// The inverse: wall-clock instant for a working-px position (clamped).
     /// Scrubbing across a folded seam jumps wall time fast — the folded gap by
-    /// design.
+    /// design. Binary search, same reasoning as `work_at`.
     pub fn wall_at(&self, work: f32) -> i64 {
         if self.segs.is_empty() {
             return self.start_ms;
         }
         let work = work.clamp(0., self.total_work);
-        for s in &self.segs {
-            if work <= s.work1 {
+        let ix = self.segs.partition_point(|s| s.work1 < work);
+        match self.segs.get(ix) {
+            Some(s) => {
                 let span = (s.work1 - s.work0).max(f32::EPSILON);
-                let frac = (work - s.work0) / span;
-                return s.wall0 + (frac * (s.wall1 - s.wall0) as f32) as i64;
+                let frac = ((work - s.work0) / span).clamp(0., 1.);
+                s.wall0 + (frac * (s.wall1 - s.wall0) as f32) as i64
             }
+            None => self.end_ms,
         }
-        self.end_ms
     }
 }
 
@@ -554,7 +559,7 @@ const RANK_REFLEX: u8 = 6;
 /// The automatic checkpoint names Strop writes — everything else that is
 /// `manual` is a writer's own title (the highest-ranked label).
 fn station_rank(name: &str, manual: bool) -> u8 {
-    if name.starts_with("Before restoring") {
+    if name == "Before restore" || name.starts_with("Before restoring") {
         RANK_BEFORE_RESTORE
     } else if name == "Restored" {
         RANK_RESTORE
@@ -766,6 +771,11 @@ pub struct ScrubDoc {
     pub replay: strop_core::journal::ReplayDoc,
     /// The anchor this replay is based on (ms) — a change re-anchors.
     pub anchor_ms: i64,
+    /// The anchor's state, kept so a LEFTWARD drag within the same anchor
+    /// rebuilds from this clone instead of re-reading (and re-parsing) the
+    /// store's whole checkpoint list per mouse-move (wave-1 review,
+    /// perf/high).
+    pub anchor_state: (String, strop_core::document::SpanSet, strop_core::document::BlockMap),
 }
 
 /// The mutable half (spec §2). Separate from the bake by the stability law: a
