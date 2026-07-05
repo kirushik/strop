@@ -667,13 +667,8 @@ enum PassKind {
 }
 
 impl PassKind {
-    /// The journal Pass event's mode string ("believing" / "doubting" / mode).
-    /// The journal itself is a parallel package (P0) not present in this
-    /// worktree base, so nothing records it here yet; this is the one place
-    /// the integrator wires when P0 lands (`integrate_pass` → `JournalEvent::
-    /// Pass { mode: self.last_pass.mode_str() }`), so the mapping lives with the
-    /// enum. `allow(dead_code)` until that call site exists.
-    #[allow(dead_code)]
+    /// The journal Pass event's mode string ("believing" / "doubting" /
+    /// mode) — recorded by `integrate_pass`, drawn as the strip's veil label.
     fn mode_str(&self) -> &str {
         match self {
             PassKind::Believing => "believing",
@@ -2689,16 +2684,11 @@ impl Editor {
         let kept = annotations.len();
         self.doc.add_diagnoses(annotations);
         // The strip's veil: which read landed, when, how many queries.
-        let mode = if self.last_pass_believing {
-            "believing".to_owned()
-        } else {
-            self.diagnosis_mode.clone().unwrap_or_default()
-        };
         self.doc
             .journal_mut()
             .record_event(strop_core::journal::JournalEvent::Pass {
                 t: strop_core::journal::now_ms(),
-                mode,
+                mode: self.last_pass.mode_str().to_owned(),
                 cards: kept as u32,
             });
         self.mark_dirty();
