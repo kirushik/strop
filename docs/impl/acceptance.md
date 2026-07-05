@@ -71,3 +71,27 @@ input or hides UI (parked history, drafting door, cold read):
   silent swallow), and the exits are named on screen.
 - The rig asserts: enter state → dump bit set; leave state → the
   hidden surfaces come back (e.g. `margin_hidden` false again).
+
+## 4 · The extraction audit (per papercut-heavy area)
+
+Piloted 2026-07-05 on the titlebar/omnibox; it found every papercut
+the writer had reported that day, independently, from code alone —
+plus twenty more. The procedure, for any area that has accumulated
+papercuts:
+
+1. **Extract**: an agent with access to the SOURCE ONLY (no docs, no
+   decision logs, no mockups) writes the area's spec twice over —
+   how it behaves (states, keys, focus, dismissals, dead ends) and
+   how it looks (the actual numbers: widths, alignments, who draws a
+   frame, which "same-kind" things have different metrics). What the
+   code actually says always beats what anyone remembers intending.
+2. **Reason about desired visual properties** before comparing: what
+   should share a width, an edge, a centre line, a frame, a grammar.
+   Stating the property is the step that catches "different widths,
+   one centered and one not" — defects invisible to a feature-works
+   checklist.
+3. **Critique** the extracted spec against the intended one (specs,
+   mockups, principles): every divergence is either a bug, a silent
+   design drift to arbitrate, or a documented deviation.
+4. **Triage** the papercut list: cheap fixes now, the rest as a NAMED
+   parked list — silence is the failure mode, not deferral.
