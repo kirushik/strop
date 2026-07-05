@@ -115,6 +115,50 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:diag: demo diagnosis cards seeded");
                 continue;
             }
+            // Asides (docs/impl/02-asides.md §6). `seed:aside` builds a doc
+            // with a compost rail and a graveyard entry; `aside:selection` /
+            // `exile:selection` run the verbs on the current selection;
+            // `putback:last` restores the newest cut.
+            if key == "seed:aside" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_seed_aside(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:aside: compost rail + graveyard entry seeded");
+                continue;
+            }
+            if key == "aside:selection" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_aside_selection(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE aside:selection: selection moved to compost");
+                continue;
+            }
+            if key == "exile:selection" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_exile_selection(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE exile:selection: selection filed in the graveyard");
+                continue;
+            }
+            if key == "putback:last" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_putback_last(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE putback:last: newest cut put back");
+                continue;
+            }
             if key == "seed:many" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_seed_many(cx))

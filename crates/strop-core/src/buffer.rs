@@ -130,6 +130,35 @@ impl Buffer {
         self.undo_stack.push(Transaction { edits: Vec::new() });
     }
 
+    /// Apply one edit as part of the currently-open transaction, without
+    /// starting a new undo boundary. The caller must have opened a transaction
+    /// first (e.g. `push_empty_transaction`) — this groups several primitive
+    /// edits into ONE undoable step, which the aside "move" needs (delete the
+    /// prose here, insert it into the rail there, one ctrl-z reverses both).
+    /// Undo replays a transaction's edits in reverse, so grouped edits restore
+    /// exactly like a coalesced typing run.
+    pub fn edit_bytes_grouped(&mut self, byte_range: Range<usize>, text: &str) {
+        let char_range = self.byte_range_to_chars(byte_range);
+        let edit = Edit {
+            start: char_range.start,
+            old: self.rope.slice(char_range.clone()).to_string(),
+            new: text.to_owned(),
+        };
+        self.ops.push(TextOp {
+            pos: char_range.start,
+            delete: char_range.end - char_range.start,
+            insert: text.to_owned(),
+        });
+        self.rope.remove(char_range.clone());
+        self.rope.insert(char_range.start, text);
+        self.version += 1;
+        self.group_open = false;
+        match self.undo_stack.last_mut() {
+            Some(tx) => tx.edits.push(edit),
+            None => self.undo_stack.push(Transaction { edits: vec![edit] }),
+        }
+    }
+
     fn byte_range_to_chars(&self, byte_range: Range<usize>) -> Range<usize> {
         self.rope.byte_to_char(byte_range.start)..self.rope.byte_to_char(byte_range.end)
     }

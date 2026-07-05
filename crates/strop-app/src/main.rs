@@ -323,6 +323,7 @@ fn main() {
                     if let Some((_, Some(loaded))) = &store {
                         editor.restore_annotations(loaded.annotations.clone());
                         editor.restore_journal(loaded.journal.clone());
+                        editor.restore_graveyard(loaded.graveyard.clone());
                     }
                     if let Some(notes) = tutorial_notes {
                         editor.restore_annotations(notes);

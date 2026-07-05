@@ -55,6 +55,7 @@ fn bench_history_new_flow() {
             &loaded.history.clone().unwrap_or_default(),
             &loaded.annotations,
                 &strop_core::journal::Journal::default(),
+                &loaded.graveyard,
             )
         .unwrap();
     let after = std::fs::metadata(&path).unwrap().len();
