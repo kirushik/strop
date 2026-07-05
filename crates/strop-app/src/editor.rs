@@ -10476,10 +10476,14 @@ impl Editor {
             .left(px(left))
             .top(px(top))
             .w(px(FLANK_GRID_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (the lab's .fmt/.selmenu:
+            // card fill, RULE hairline, 9px rounding): both flanks rise
+            // together, so they must wear one dress (P8) — this one wore the
+            // panel fill at a different radius than its right-hand partner.
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(8.))
+            .rounded(px(9.))
             .shadow_md()
             .py(px(5.))
             .px(px(3.))
@@ -10512,10 +10516,11 @@ impl Editor {
             .left(px(left))
             .top(px(top))
             .w(px(POPOVER_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (see render_flank_grid).
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(6.))
+            .rounded(px(9.))
             .shadow_md()
             .px(px(4.))
             .py(px(3.))
@@ -10550,10 +10555,11 @@ impl Editor {
             .left(px(left))
             .top(px(top))
             .w(px(LINK_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (see render_flank_grid).
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(6.))
+            .rounded(px(9.))
             .shadow_md()
             .px(px(8.))
             .py(px(4.))
