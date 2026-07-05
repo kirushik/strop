@@ -1338,7 +1338,17 @@ impl Editor {
     }
 
     pub fn restore_annotations(&mut self, annotations: Annotations) {
+        // The pass counter is transient but pass_id values persist on cards:
+        // without re-seeding, a new session's pass 1 would collide with a
+        // loaded card's pass_id and rest the wrong cards behind the rail.
+        let max_pass = annotations.notes().iter().map(|n| n.pass_id).max();
+        self.diagnosis_pass = self.diagnosis_pass.max(max_pass.unwrap_or(0));
         self.doc.set_notes(annotations);
+    }
+
+    /// Install the persisted edit-run journal at load.
+    pub fn restore_journal(&mut self, journal: strop_core::journal::Journal) {
+        self.doc.set_journal(journal);
     }
 
     /// Record a named version snapshot in the document file.
@@ -1779,6 +1789,7 @@ impl Editor {
             entry.spans.clone(),
             entry.blocks.clone(),
         );
+        let from_unix = entry.created_unix;
         // Save first so the "Before restoring" checkpoint materializes the
         // present exactly as it stands (see add_checkpoint).
         self.save_now();
@@ -1793,6 +1804,23 @@ impl Editor {
         self.caret_attrs.clear();
         self.exit_history(cx);
         self.sync_mutations();
+        // The restore's own record: the journal suppressed the wholesale
+        // swap (it would be one document-sized run), so the honest event
+        // carries the fact — and a POST-restore checkpoint materializes the
+        // restored state as the reconstruction anchor (review B6: without
+        // it, text_at(now) would rebuild the PRE-restore document).
+        let len_chars = self.doc.rope().len_chars();
+        self.doc
+            .journal_mut()
+            .record_event(strop_core::journal::JournalEvent::Restore {
+                t: strop_core::journal::now_ms(),
+                from_unix,
+                len_chars,
+            });
+        self.save_now();
+        if let Some(store) = &self.store {
+            store.add_checkpoint("Restored", false);
+        }
         self.mark_dirty();
         self.bump_activity();
         cx.notify();
@@ -1840,7 +1868,16 @@ impl Editor {
             }
         }
         match std::fs::write(&path, md) {
-            Ok(()) => eprintln!("strop: exported {}", path.display()),
+            Ok(()) => {
+                eprintln!("strop: exported {}", path.display());
+                // A ship-shaped moment — the strip marks it.
+                self.doc
+                    .journal_mut()
+                    .record_event(strop_core::journal::JournalEvent::Export {
+                        t: strop_core::journal::now_ms(),
+                    });
+                self.mark_dirty();
+            }
             Err(e) => eprintln!("strop: export failed: {e}"),
         }
         cx.notify();
@@ -2242,6 +2279,16 @@ impl Editor {
             .detach();
         }
         self.doc.set_note_status(id, status);
+        // Thread terminals on the strip: when a card left and by which door.
+        if matches!(status, NoteStatus::Done | NoteStatus::Dismissed) {
+            self.doc
+                .journal_mut()
+                .record_event(strop_core::journal::JournalEvent::CardClosed {
+                    t: strop_core::journal::now_ms(),
+                    id,
+                    resolved: status == NoteStatus::Done,
+                });
+        }
         if self.focus.active_id() == Some(id) {
             self.focus = CardFocus::Idle;
         }
@@ -2479,6 +2526,19 @@ impl Editor {
         );
         let kept = annotations.len();
         self.doc.add_diagnoses(annotations);
+        // The strip's veil: which read landed, when, how many queries.
+        let mode = if self.last_pass_believing {
+            "believing".to_owned()
+        } else {
+            self.diagnosis_mode.clone().unwrap_or_default()
+        };
+        self.doc
+            .journal_mut()
+            .record_event(strop_core::journal::JournalEvent::Pass {
+                t: strop_core::journal::now_ms(),
+                mode,
+                cards: kept as u32,
+            });
         self.mark_dirty();
         // The landed cards get one entrance fade (CARD_APPEAR); the marks
         // clear right after it finishes so nothing ever re-fades. Their ids
@@ -3898,6 +3958,10 @@ impl Editor {
     pub fn save_now(&mut self) {
         let perf = std::env::var_os("STROP_PERF").map(|_| std::time::Instant::now());
         self.sync_mutations();
+        // Settle the journal's tail run: persisted runs are immutable once
+        // written, so the store only ever pushes finished items. Saves fire
+        // at ≥1s idle, a natural run boundary anyway.
+        self.doc.journal_mut().settle();
         if let Some(store) = &self.store {
             match store.save_with_state(
                 self.doc.spans(),
@@ -3910,6 +3974,7 @@ impl Editor {
                 // the persisted tail is what must stay proportionate.
                 &self.doc.export_history(50),
                 self.doc.notes(),
+                self.doc.journal(),
             ) {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),

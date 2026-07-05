@@ -54,7 +54,8 @@ fn bench_history_new_flow() {
             &loaded.blocks,
             &loaded.history.clone().unwrap_or_default(),
             &loaded.annotations,
-        )
+                &strop_core::journal::Journal::default(),
+            )
         .unwrap();
     let after = std::fs::metadata(&path).unwrap().len();
     eprintln!("file after backfill+save: {} bytes", after);
