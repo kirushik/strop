@@ -8863,7 +8863,14 @@ fn shape_grave_section(
     top += px(GRAVE_HEADER_H) + px(10.);
 
     for e in entries {
-        let date = format_unix(e.cut_unix);
+        // The whisper speaks the strip's own date grammar ("Today",
+        // "Fri 19 Jun") — one calendar voice per app (P8), never the machine's
+        // ISO stamp. STROP_TEST_STILL keeps the frozen form for byte-compares.
+        let date = if std::env::var("STROP_TEST_STILL").is_ok() {
+            format_unix(e.cut_unix)
+        } else {
+            strip::date_label(e.cut_unix, strop_core::journal::now_ms() / 1000)
+        };
         if e.full {
             // The whisper row: prefix + optional italic origin quote + verbs.
             let mut segments: Vec<(Pixels, gpui::ShapedLine)> = Vec::new();
@@ -11126,7 +11133,12 @@ impl Editor {
         for (ix, line) in self.doc.rope().lines().enumerate() {
             if let Some(BlockKind::Heading(level)) = kinds.get(ix) {
                 let text: String = line.chars().take(120).collect();
-                items.push((ix, *level, text.trim().to_owned(), byte));
+                let text = text.trim().to_owned();
+                // A blank line wearing a heading kind (e.g. the seam a
+                // set-aside heading leaves behind) is not an outline entry.
+                if !text.is_empty() {
+                    items.push((ix, *level, text, byte));
+                }
             }
             byte += line.len_bytes();
         }
