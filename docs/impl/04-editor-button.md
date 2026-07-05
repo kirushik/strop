@@ -9,13 +9,16 @@ One titlebar control replaces the bare diagnose-toggle as the
 subsystem's single home (`window_button` idiom for the control,
 `render_narrow_notes_panel` idiom for the attached menu):
 
-**Button faces** (state lives on the control, P12):
-- idle/drafting: `Ask the editor ▾`
-- cooking: pulse dot + `Ask the editor ▾` (dot = the existing
-  `AiStatus::Running`; hover names the read)
-- parked results: `Ask the editor · a read is ready ▾` (sentence form,
-  never "1 read waiting")
-- reviewing: `Reviewing · {n} open · Ask the editor ▾`
+**Button faces** — a PRIORITY FUNCTION over (ai_status, parked, door,
+count), not four exclusive states (review H32), and the door word is
+the glossary's presence pair, never "Reviewing" (review H31):
+1. NeedsSetup: `Ask the editor · needs setup ▾` (routes to settings)
+2. Error: error-tinted dot + `Ask the editor ▾` (hover carries the
+   message; render_ai_status keeps the full card)
+3. cooking: pulse dot + `Ask the editor ▾` (hover names the read)
+4. parked results: `Ask the editor · a read is ready ▾`
+5. door open: `Reading · {n} open · Ask the editor ▾`
+6. idle/drafting: `Ask the editor ▾`
 
 **The menu**, glued flush under the button (right edges aligned, the
 lab's fix for the detached-dropdown sin):
@@ -28,24 +31,33 @@ lab's fix for the detached-dropdown sin):
   (`after the structural queries settle`) — the only row that
   explains, because the gate is data. No "usually after…" advice
   anywhere (P2).
-- `A doubting read — the strongest case against the argument` (new
-  prompt in diagnose.rs: the believing read's mirror; same parser)
+- `A doubting read — the strongest case against it` (new prompt in
+  diagnose.rs: the believing read's mirror; same parser; copy is
+  form-neutral — review H34, no form primitive exists yet)
 - footer: `{open} queries open · {resolved} resolved` + the presence
   verb `Reading ⇄ Away` (= the door: Away ⇔ `drafting`; toggling
   routes through the existing `toggle_review` flush semantics).
 
-Menu rows dispatch through the existing `run_pass` machinery with the
-mode pinned per row (believing / mode strings). Selecting a row closes
-the menu. Light-dismiss + Esc per the panel idiom.
+Menu rows dispatch through `run_pass` REFACTORED from its bool to a
+`PassKind` enum — Believing | Doubting | Diagnostic(mode) — threaded
+through `pending_pass`/`deferred_pass`/`last_pass_believing` and the
+Running-label formatter (review H27: a "doubting" mode string would
+silently produce the line-read prompt today). Selecting a row closes
+the menu. Light-dismiss + Esc per the panel idiom. **All rows disable
+while a history preview is up** (review H33: the pass must not
+diagnose a document the screen isn't showing).
 
 ## 1. What this retires
 
 - The old diagnose-toggle mini-card icon (the button replaces it).
 - **The intent banner and `next_intent`** — re-entry is SHELVED
   (golden-path §9.3); the banner render, the field, and the
-  End-Session intent question are removed. End Session keeps its
-  sealing role only. (`end_session_input` survives where it names the
-  session checkpoint.)
+  End-Session intent question are removed. Review H28 corrected the
+  scope: the current End Session's ONLY job is the intent question,
+  so **End Session retires wholesale** — sealing already lives in the
+  existing checkpoint verbs (naming a version) and the idle session
+  seal. The `end_session_input`/`session_goal` survivors are
+  re-audited in this package; the goal surface stays.
 
 ## 2. Corner cases
 

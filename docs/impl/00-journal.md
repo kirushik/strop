@@ -92,14 +92,25 @@ complete; card status changes in `Annotations::set_status` callers;
 `Store::add_checkpoint` records `Station`; export path records
 `Export`.
 
-## 3. Persistence
+## 3. Persistence (as built — reviewed against the bloat class)
 
-The `Journal` serializes with serde exactly like `History` and
-`Annotations`, saved in `save_with_state` and loaded into `Loaded`.
-Absent on older files → `Journal::default()` (see §5 degradation).
-The save fingerprint guard already means unchanged docs write zero
-bytes; the journal only grows when edits happened, so the guard's
-contract is preserved.
+Two dedicated append-only **Loro list containers** (`journal.runs`,
+`journal.events`), one JSON item per settled run/event, pushed at save
+time past an append-only counter (`Store::journal_saved`). NEVER a
+re-inserted JSON blob: a monotonically growing blob misses its
+fingerprint on every edit-containing save and rewrites whole into the
+append-only oplog — the 4.8 MB class. Lists append only the tail and
+their current value survives shallow compaction as state, exactly like
+checkpoints. Saves settle the journal first, so pushed items are
+final. Absent on older files → `Journal::default()` (§5).
+Tests: `journal_persists_appends_only_the_tail` (roundtrip, unchanged
+saves append nothing, tails land once).
+
+**The unit law:** every journal time is unix MILLISECONDS.
+`Checkpoint.created_unix` is SECONDS and is multiplied by 1000 at
+every comparison boundary — a mixed comparison silently anchors every
+reconstruction at the newest checkpoint (review B11). Field doc
+comments carry their unit.
 
 **Size budget** (the bloat saga must not restart): a fortnight story's
 churn ≈ 45k chars of `ins` text + ~60 bytes/run overhead × ~4k runs ≈
@@ -117,23 +128,29 @@ anchor). The lever is DESIGNED but not built in v1.
 pub fn text_at(&self, t: i64, checkpoints: &[Checkpoint]) -> String
 ```
 
-1. Anchor: the latest checkpoint with `created_unix ≤ t` **and** a
-   materialized `state` (they all have one after backfill); its
-   `Station` event locates the journal index. No checkpoint ≤ t →
-   anchor = empty doc at journal start.
-2. Forward-replay runs with `anchor_t < t1 ≤ t` into a rope. A run
-   straddling t (t0 ≤ t < t1) applies whole — runs are seconds long,
-   below the scrub's perceptual grain.
-3. **Scrub cache:** the strip holds the last `(t, rope)`; dragging
-   right replays only the delta runs; dragging left re-anchors. Worst
-   case = one session of runs (~hundreds of rope edits) per frame —
-   well inside a 60fps budget, and the cache makes the common case
-   incremental.
+1. Anchor: the latest checkpoint with `created_unix × 1000 ≤ t` and a
+   materialized `state`. No checkpoint ≤ t → anchor = empty doc at
+   journal start. **Anchors are guaranteed correct by two rules the
+   editor enforces:** the journal SETTLES at every checkpoint creation
+   (no run ever straddles an anchor — review H44), and every restore
+   materializes an automatic post-restore checkpoint ("Restored") so
+   reconstruction after a suppressed wholesale swap re-anchors
+   correctly (review B6/H37).
+2. Forward-replay runs with `anchor_ms < t0 ≤ t` through `ReplayDoc`
+   (char-indexed rope ops + `SpanSet::apply_op` + `BlockMap::on_edit`
+   — the same invariant machinery as live editing). A run straddling
+   t applies whole — runs are seconds long, below the scrub's
+   perceptual grain.
+3. **Scrub cache:** `ReplayDoc.applied` makes rightward drags
+   incremental; leftward drags re-anchor. Worst case = one session of
+   runs (~hundreds of rope edits) per frame — inside a 60fps budget.
 
-Fidelity: reconstruction is TEXT ONLY — the scrub preview renders
-plain paragraphs. Full formatting fidelity exists exactly at stations
-(checkpoint states carry spans+blocks); between stations the past is
-plain. This is v1's honest cut, stated in the strip UI spec.
+Fidelity: reconstruction carries text + spans + blocks evolved from
+the anchor's materialized state. Explicit formatting TOGGLES between
+anchors are not journaled and therefore not replayed — mid-window
+states carry the anchor's formatting evolved through the edits; full
+explicit fidelity exists exactly at stations. (Review H29/H39: specs
+00 and 01 now agree on this.)
 
 Envelope derivation: cumulative `ins.chars() − del_chars` per run,
 seeded from each anchor's length — the strip never recomputes text to

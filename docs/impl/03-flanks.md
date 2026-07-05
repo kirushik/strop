@@ -19,15 +19,19 @@ vertical toolbar (`format_tools`). The upgrade:
    input-grammar (P8).
 2. **Right flank** is new: the selection MENU in the right margin at
    the selection's height (the lane side — where its results land),
-   idle at α≈0.72, waking on hover; rows as carrier sentences with
-   key-cap hints:
-   - `✎ Add a note` (m) → existing margin-note composer path
-   - `☰ Set aside, out of the story` (a) → spec 02 §2
-   - `✂ Send to the graveyard` (x) → spec 02 §4
-   - `❋ Ask the editor about this…` (e) → selection-scoped ask (the
+   idle at α≈0.72, waking on hover; rows as carrier sentences,
+   **mouse-only in v1** (reviews B2/B9: bare-letter hints would type
+   over the live selection — no letter bindings, no key caps, matching
+   the editor-button menu):
+   - `✎ Add a note` → existing margin-note composer path
+   - `☰ Set aside, out of the story` → spec 02 §2
+   - `✂ Send to the graveyard` → spec 02 §4
+   - `❋ Ask the editor about this…` → selection-scoped ask (the
      existing scoped-prompt machinery; v1 runs the default read over
      the selection span)
-   Icons drawn as divs (no non-PT glyphs).
+   Icons drawn as divs (no non-PT glyphs). Acting on ANY row first
+   dismisses both flanks (review H20), so only one pinned object ever
+   sits at that lane y.
 3. Both flanks rise together on selection (mouse-up path already
    raises the popover) and share material, elevation, motion, and the
    same vertical origin — balance, not mirror-symmetry.
@@ -38,13 +42,15 @@ vertical toolbar (`format_tools`). The upgrade:
   (asides.md §4): when the rail is open, the gutter is the space
   `rail_right..col_left`; flank never overlays the rail (P1). When the
   window is too narrow for the gutter (existing `left_gutter >= 58`
-  check), fall back to the existing horizontal popover — both flanks
-  merge into it (the narrow-mode fallback already exists; extend its
-  row with the menu verbs).
-- Right flank shares the margin lane with cards: it takes lane
-  priority at the selection's y; cards yield via the existing packer
-  floor mechanism (the menu is a `PlaceItem` pin, same as the active
-  card — no overlap by construction).
+  check), fall back to the existing horizontal popover with the
+  FORMATTING SET ONLY — the verb rows stay reachable via the palette
+  (review H21: four carrier sentences don't fit precisely where the
+  window is too narrow).
+- Right flank renders as an independent overlay that OCCLUDES cards at
+  its y — it is transient, and the packer is untouched in wave 1
+  (review B8: the pin-injection claim was unbacked by the code).
+- Neither flank rises while any history surface (strip, panel,
+  preview) is up (review H22).
 - Selection inside the COMPOST rail raises the left flank at the
   rail's right edge (same gutter), and the right menu shows only
   `Add a note`-free rows that make sense there (no aside-from-aside;

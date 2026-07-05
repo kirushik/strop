@@ -58,30 +58,40 @@ struct Strip { open: bool, pos_ms: i64, pin_ms: Option<i64>,
 - Mousedown on the strip = park there; drag = continuous scrub (the
   drag pattern from the existing selection drag; strip stops wheel
   propagation like every panel).
-- Per pointer-move: `text_at(t)` via the scrub cache (spec 00 §4):
-  scratch `Document` anchored at the nearest checkpoint ≤ t, evolved
-  forward by `edit_bytes` replay — spans/blocks ride the SAME
-  invariant machinery as live editing, so mid-session states carry
-  formatting evolved from the anchor (explicit mid-session toggles are
-  the accepted v1 gap). Rightward drags replay only the delta runs;
+- Per pointer-move: reconstruction via `ReplayDoc` (spec 00 §4 —
+  CHAR-indexed replay, never `edit_bytes`; spans/blocks ride the same
+  invariant machinery). Rightward drags replay only the delta runs;
   leftward re-anchor.
 - The preview renders through the EXISTING `history_preview:
   PreviewDoc` path (checkpoint preview machinery) — the main column
-  shows the past read-only; the strip's dim overlay covers x > playhead.
-- **Stability law in code:** the paint pass may vary ONLY: playhead x,
-  thumb x, dim rect, readout string, station-label brightness
-  (proximity <14px), Restore/Now visibility. Everything else comes
-  from the bake. (Test: two dumps mid-scrub differ only in those.)
+  shows the past read-only; the strip's dim overlay covers x >
+  playhead. **The margin lane and rail hide while previewing** (verify
+  the checkpoint-preview path already does this; gate on
+  `history_preview` if not) — cards anchored to the live document must
+  not float over past text (review H36).
+- **Stability law in code — bake vs view:** the BAKE (fleck quads,
+  envelope, veils, threads, label layout, y-scale) is immutable while
+  the strip is open; it does NOT re-bake on background pass arrivals
+  or reflex checkpoints (review H35) — the one lawful in-session
+  re-bake is the explicit Restore. The paint pass may additionally
+  vary only: playhead/thumb x, the fabric VIEW OFFSET (auto-scroll
+  keeping the playhead in view at novel scale, wheel pan — review B7),
+  dim rect, readout string, station-label brightness, Restore/Now
+  visibility. The rig asserts the `bakes` counter, not fleck geometry.
+- The readout's word count tokenizes the reconstructed rope (cheap,
+  exact); per-run word counts are fabric texture only (review H30).
 - Readout: fixed-width chip, tabular numerals, `{date} · {n} words`;
   never a sentence, never a station name (P8 template ban).
 - **Now** chip rightmost: dim at now, bright when parked; click or Esc
   returns to now (drops preview, keeps strip open).
 - **Restore** appears beside the readout when parked: builds a
-  `CheckpointState`-shaped value from the scratch doc and routes
+  `CheckpointState`-shaped value from the replay doc and routes
   through the EXISTING `restore_state` path (undoable forward edit,
-  notes reanchor by content, orphaning rules apply). Journal records
-  `Restore{t, from_unix, new_len}`; the bake refreshes (data changed —
-  the one lawful re-layout).
+  notes reanchor by content, orphaning rules apply). The restore path
+  then materializes an automatic post-restore checkpoint ("Restored")
+  — the reconstruction anchor (review B6) — and records
+  `Restore{t, from_unix, len_chars}`; the bake refreshes (data
+  changed — the one lawful re-layout).
 - **Typing while parked** = restore-then-type: a text-insert keystroke
   while previewing performs the Restore first, then inserts. No
   confirmation dialog anywhere.
