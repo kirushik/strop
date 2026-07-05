@@ -668,6 +668,118 @@ pass events {kind, span}, checkpoint events {kind, name}, restores
 imposed. The strip could be the killer feature riding "we save every
 keystroke"; it must be earned, not decorated.
 
+## 9.3 Fourth review round (Kirill on UX-lab v3, 2026-07-05) — verdicts
+
+**The constitution round.** Two rants in this review outweigh every
+scene-level note, and both became principles. They now live — with all
+previously scattered fundamentals — in **`design-principles.md`**, the
+constitution this document defers to. New this round:
+
+- **P2 — The tool never wants anything from you.** Kirill's drill/
+  microwave argument, verbatim in the principle: Strop is a well-built,
+  dignified tool; its methods wait at intuitive locations; it never
+  jumps out of its way to impose the correct pattern. "No amount of
+  p-confidence that it helps excuses being annoying or mentoring."
+  We are not the creative-writing-methods police.
+- **P4 — Show, don't explain.** The chattiness audit: UI text is data
+  or an actionable label, never a description of an affordance
+  ("read-only — put back or delete" printed beside the Put back and
+  Delete buttons was the type specimen). A legend is a design failure
+  with a caption. We had built "a cryptic D&D manual which requires you
+  to read it, and only in the right sequence" — the purge is now a
+  standing review gate.
+- **P5 — The corridor floor and the notch gradient** (from the strip's
+  corridor-test failure, below).
+
+**Re-entry: SHELVED (D8 amended).** Third redesign, third rejection —
+and P2 explains why every version failed: each was the software wanting
+something. v3's intent-as-text was worse than wanting: it took the
+writer's own line and returned it wearing chrome ("someone changed my
+text… I feel violated" → P1). Verdict: no re-entry feature at all. The
+practice is real; writers who keep it type their note and highlight it
+themselves. What ships is the one respectful default that already
+exists — reopen where you left off, caret intact, nothing drawn.
+"Seal", flagged in the same breath, went to the glossary as
+internal-only vocabulary.
+
+**Cold read: settled.** No further feedback; face, justification,
+texture, banner as in v3. The hyphenation question got its real
+answer (`ux-glossary.md` appendix): the `hyphenation` crate, 80
+languages, Russian first-class (Lebedev's ruhyphen patterns, the
+20-year TeX standard), runtime dictionaries for the LPPL/GPL nuance;
+CJK/Thai/Arabic are different line-breaking problems, not gaps.
+
+**Compost: text, not cards — §9.2 superseded, and D5 sharpened.**
+Kirill's instinct ("things on the left are not the cards; probably
+just paragraphs") taken to its conclusion in **`asides.md`**: the rail
+holds one continuous text; a blank line separates items; hairline+air
+renders the boundary. Add = type, edit = caret, format = the same
+flank (wherever the writer's text is, the writer's tools are — P3),
+reorder = text mechanics, todos = strikethrough. History and
+checkpoints cover it for free because it IS document text. Orphaned
+margin notes append there quietly with a quoted anchor line — and the
+words "unanchored/orphaned" are forbidden in chrome. The graveyard
+kept its round-3 body and lost its captions; "undo" became "Put back"
+(one action, one verb).
+
+**The flank geometry: a principled call, as demanded.** *Closed sets
+pack into grids; open sets stack into sentences.* The formatting set is
+closed at exactly eight inline attributes → a 2×4 glyph grid on the
+left; the ask-menu is an open set of sentence verbs → one column of
+phrases on the right. The rhyme is placement, material, and motion —
+never column-count symmetry (asides.md §4).
+
+**The editor button: good enough.** Opened instead: the jargon ledger
+— **`ux-glossary.md`**, three registers (internal / carried / plain),
+every term audited against a Russian-blogger persona; "door" and
+"seal" stay home, "a read" survives only inside carrier sentences,
+localization translates function, not metaphor.
+
+**The history strip: corridor-tested, and the pedagogy died.** A
+sample-of-one stranger refused v3 outright ("would never even try to
+understand and learn this") — while praising nothing and wanting a
+media-player slider. The fabric was right; the floor was missing.
+**`history-strip.md` rewritten as v2**: at first sight a seek bar
+(rail, thumb, readout, **Now** rightmost); the fabric demoted to
+texture; **no zoom ever** (one fixed quant, horizontal scroll);
+**y flipped top-down** (text grows downward); **the quant is the word**
+(1 fleck = 1 word — Kirill: "absolutely spot-on", it rhymes with every
+word-count in the product); density is emergent (bursts fuse into
+strokes, deliberation stays grain); the legend and every caption
+deleted (P4); the readout never embeds a station name (the "after
+Before the line read" bug is now P8's template-composition ban); a
+**scrub stability law** (nothing re-ranks or re-flows mid-drag — the
+jumpiness was "the opposite of habit-forming"); "carry this forward" →
+**Restore**; the pin demoted to an unadvertised notch. Threads (card
+lifespans) kept — the one v3 element praised as-is.
+
+**Meta, adopted into the lab's method:** mockup commentary must be
+visually unmistakable from product text — the v4 lab's convention is
+absolute: everything inside the mock window is product; everything on
+the lab's dark ground is lab. Half the round's confusion ("which of
+these words would actually ship?") was self-inflicted by violating
+this.
+
+**The Birman-persona audit** (commissioned per Kirill's round-4 ask,
+run against all four fresh specs) produced 27 findings; the load-
+bearing ones, all integrated: the empty compost rail was a false
+non-affordance — the floor entry is the aside verb, direct typing is
+the notch; the separator is exactly one empty paragraph, caret-
+placeable, never collapsed (the render must not lie about the text);
+the aside verb was double-filing into compost *and* graveyard — the
+graveyard's trigger is now *deletion, not departure*; orphaned notes
+keep the margin note's own anchor-fragment typography (durable
+provenance, not a blink); the flank rises in a reserved gutter, never
+over the rail; manuscript-only accounting; a full-extent rail over the
+fixed-quant fabric so the seek-bar contract survives novel scale;
+"Saved" deleted from station automatics (it taught that unsaved states
+exist); the door pair became presence grammar ("Reading"/"Away" —
+«Читает»/«Не смотрит», gender-free). The constitution gained **P11
+one-anchor-object**, **P12 the-control-is-the-indicator**, **P13
+every-verb-has-an-inverse**, P1 lost its intent-hinge (record/relocate
+allowed, decorate/quote-rhetorically/wear-as-chrome forbidden), and P4
+got a carrier-sentence budget.
+
 ## 10. Method note
 
 This document was produced the way Strop says writing works: a believing

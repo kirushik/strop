@@ -1,117 +1,187 @@
-# The History Strip — design spec (synthesis of the 2026-07-04 panel)
+# The History Strip, v2 — a seek bar that happens to be true
 
-*(Companion to golden-path.md §9.2. Method: the Data Laboratory Δλ algorithm
-applied to Strop's atoms, then a six-voice panel — Δλ/Misyutina, Tufte,
-Victor, Raskin, Engelbart, Birman — each responding to the same brief and
-Kirill's v2 critique. Full persona texts:
-`docs/research/history-strip-panel-2026-07.md`. The panel converged on one
-design; the decisions below mark where I chose among its variants.)*
+*(Supersedes v1 ("the Envelope", 2026-07-04 panel synthesis) after a
+corridor test killed its pedagogy: a first-time viewer refused to learn
+it. The fabric survives; the teaching inverted. Governed by
+`design-principles.md` — P4 show-don't-explain, P5 corridor floor,
+P8 grammar, P10 color-speaks-once. Panel texts:
+`docs/research/history-strip-panel-2026-07.md`.)*
 
-## 0. The particle, first
+## 0. The corridor floor
 
-Δλ discipline: no picture before the particle. Strop's history particle is
-**the coalesced op-run** — one stretch of continuous writer activity of one
-kind: `{time-interval, char-span, insert|delete}`. Everything else is event
-particles over the same clock: passes `{interval, kind, span}`, cards
-`{raised-t, anchor, altitude → resolved|dismissed-t}`, checkpoints
-`{t, kind, name}`, restores `{t, from}`. Sessions and bursts are DERIVED
-(gaps in the stream), never imposed — v2's central sin, named by all six.
+At first sight the strip is a **seek bar**. A thin rail across the top
+of a dark band; a round thumb riding it; a time-and-words readout on
+the left; a **Now** control at the far right. Drag the thumb and the
+document above scrubs — like every video player the viewer has ever
+touched. That is the entire floor, and it must survive a five-second
+corridor test with a stranger who reads nothing.
 
-## 1. The frame (one caption, printed on the strip)
+Everything else in the band is *texture* until curiosity arrives. The
+thumb and rail carry the highest contrast in the strip; the fabric
+(runs, veils, threads, envelope) sits low-mid. Nothing on the strip
+explains anything: there is no legend, no axis label, no caption. A
+surface that must be read before it can be touched is a failed surface
+(P4) — the strip teaches by being scrubbed, not by being studied.
 
-> **Across — your working time, breaks folded. Up — the story's length;
-> anything drawn at a height sits at that place in the text.**
+## 1. The fabric — one fixed quant, never zoomed
 
-- **x = working time.** Linear within sessions; gaps >15 min fold into thin
-  labeled seams ("2 d") — compression declared, never smuggled (all six).
-- **y = character position**, document start at the bottom, so the
-  **envelope** — the derived length-over-time line — rises like a skyline.
-- **The envelope is the strip's ONE bold object** (Birman's anchor law;
-  Tufte's hero; Victor's coastline): cream `#FBFAF8` — literally the color
-  of the page above — stepwise, never smoothed ("the steps are the truth").
-  Collapsed to word-size it is the titlebar's sparkline (Tufte), inflating
-  into the strip on open.
+**The quant: one fleck = one word.** A ~2 px grain of amber. Words the
+writer added are amber `#C8A951`; words the writer cut are the darker
+burnt amber `#8A6D35` (value contrast — legible colorblind, P10; both
+warm — the writer did both, and the fabric's warmth is the standing
+proof the machine never writes). The quant rhymes with everything else
+in Strop that counts: targets are words, session summaries are words,
+the readout is words.
 
-## 2. The marks (each with its printed sentence)
+**x = working time, one fixed scale** (on the order of 1 px ≈ 30 s;
+the constant is chosen once, product-wide, after measurement — never
+per-document). Gaps over ~15 min fold into thin seams; session starts
+carry real dates ("Tue 1 Jul") in a quiet lane — dates are data, so
+they may be words (P4). **There is no zoom.** One scale means the
+texture is *learnable*: a glance's worth of amber always means the
+same amount of work.
 
-| Particle | Mark | Channels |
-|---|---|---|
-| op-run, insert | **solid warm-amber stroke** | x=when+duration · y=exact span touched · area=characters (Δλ additivity) · opacity composes → rework glows |
-| op-run, delete | **hollow/hatched burnt-amber stroke** (`~#8A6D35`) | same channels; both kinds WARM — the writer did both, and the fabric's color proves the AI never writes (Δλ). Fill-state + value disambiguate without hue (colorblind-safe) |
-| AI pass | **full-height translucent cool-blue veil** (selection-scoped: its span only), width = real duration, kind named in small type inside at rest | repairs v2's category error: the machine read everything, so the mark spans everything (unanimous) |
-| card | **1-px cool-blue thread** from (raised-t, anchor-y) forward, meandering as the text around its anchor grows and cuts (Victor: "true and quietly beautiful"); lightness step = altitude; terminal: sage dot = resolved, hollow grey = dismissed; open threads run to now | open-duration becomes visible length — the writer's responsiveness, free of charge (Tufte) |
-| checkpoint | **full-height hairline tick** + name in a dedicated **label lane above the field**, set at rest | see §3 wording & collision |
-| restore | **sage tick; the envelope visibly steps; a thin sage arc rides the label lane back to the source station; everything left stays fully inked** | the anti-fear argument made without a single word (unanimous); caption: *"sage means something came back; nothing was destroyed"* |
+**The rail and the fabric split their jobs at scale.** A seek bar's
+contract is *the whole duration, always visible* — so the rail with
+the thumb is always full-extent: thumb x = position in the whole
+history, at a fortnight or at a novel. The fabric band below keeps the
+fixed quant and, when the history outgrows the viewport (an 80k-word
+novel is ~fifteen screenfuls), auto-scrolls to keep the playhead's
+neighborhood in view; the playhead line passes through both, binding
+them. At fitting scale the two coincide 1:1 and the split is
+invisible. This keeps the corridor contract honest at any length (P7)
+without ever re-scaling the texture.
 
-## 3. Words (Birman's law)
+**y = position in the document, start at the top** — the text grows
+downward, as text does. The cream **envelope** — document length over
+time — hangs from the top edge and steps downward as the story grows,
+upward at cuts, visibly at restores. The y-scale is set when the strip
+opens (current length fills the band, with ~10% headroom) and does not
+change while it is open: nothing re-scales under the viewer's eyes.
+The headroom exists because a restore can make *now* longer than the
+open-time length; if a restore exceeds even that, the re-scale happens
+at the restore — a data change, the one lawful re-layout — never
+during viewing.
 
-Writer-named stations in the writer's own words ("Draft complete"), never
-"checkpoint-7". Automatic ones speak human: **"Started", "Break", "Saved"**
-— never "idle-gap", never "ctrl+s". Dates are real: **"Today",
-"Yesterday", "Tue 12 Jul"** — never "day 12" (the writer does not number
-her days). **Collision policy: ranked omission, never truncation** —
-writer-named > seal > before-restore > export > manual > session-start >
-save; a label that doesn't fit is omitted whole, its tick stays; zoom
-readmits by rank, the way a city map reveals street names. Hover may only
-EXPAND the visible ("Tue 12 Jul" → "Tue 12 Jul, 19:02–23:14").
+**Density is emergent, not modal.** Real numbers, the contest story:
+a 4,188-word final draft at typical drafting churn (~1.8× total
+insertions) is roughly 7,500 words in and 3,300 out — call it eleven
+thousand flecks over maybe twenty working hours, which at this scale is
+~2,400 px of strip: two viewport-widths, a shallow scroll. Flow-state
+drafting lays down ~6 words per pixel-column, so flecks alpha-fuse into
+solid strokes; slow line-editing leaves distinct grains. The texture
+becomes readable without any encoding switch: **stroke = flow, grain =
+deliberation, a dark column = a big cut.** Nothing aggregates, nothing
+re-encodes; fusing is what eleven thousand honest marks do at a fixed
+scale.
 
-## 4. The scrub (Victor's loop, Raskin's safety)
+**The rest of the fabric**, unchanged from v1 and subordinate in
+contrast: AI passes are full-height translucent cool veils (the machine
+read everything, so the mark spans everything); cards are 1-px cool
+threads from raised to resolved (sage endcap) or dismissed (grey) —
+their visible length is how long a question stayed open; checkpoints
+are hairline ticks with their names in a label lane above the band;
+restores are a sage tick, a visible envelope step, and a thin sage arc
+riding the label lane back to the source station. All of it says what
+it says in color and form only — no words repeat it (P10).
 
-- The playhead is a cream hairline with a **permanent readout**: "Tue 12
-  Jul, 21:40 · 8,214 words · after 'Draft complete'" — the control is the
-  indicator (Birman). It stops ANYWHERE; the stream is continuous.
-- Dragging live-renders the document above at frame rate, viewport locked
-  to the edit locus. **"Scrub at frame rate or don't ship the strip"**
-  (Victor). Right of the playhead the field dims one alpha step — a static
-  encoding of position, so every frame is a legal still (screenshot test
-  by construction).
-- **Pin a second playhead** (`,`): the readout becomes a delta ledger
-  ("+1,204 words · 2d 3h · 2 questions answered") and the document can
-  show the interval diff. Two moments, comparable side by side
-  (Victor/Engelbart/Δλ).
-- **The history key is a quasimode** (Raskin): hold — the strip rises and
-  arrows scrub (Shift = station to station); release — back to now,
-  nothing changed; blind firing is always safe. Enter parks to read.
-- **Typing means one thing everywhere** (Raskin's Law applied): typing
-  while parked in the past first appends the restore (the sage arc draws
-  itself), then the insertion. No confirmation dialog exists anywhere in
-  the strip — a warning is a confession.
-- **LEAP on the time axis** (Raskin): type a phrase while holding the
-  history key → jump to the moment it was born; again → its next change or
-  its death. Writers remember sentences, not timestamps.
+## 2. Words on the strip
 
-## 5. Zoom (one geometry, three altitudes)
+Exactly three kinds of text exist:
 
-Continuous x-dilation anchored at the playhead with three landmark rungs —
-**Project / Session / Burst**. The marks never re-encode; zoom RESOLVES
-(Victor: "it never translates"). At Project scale strokes fuse into heat
-(opacity ∝ ops per pixel-column — merge rule stated once: *marks merge,
-counts survive*, Engelbart); at Burst scale a run's slope is typing speed —
-Marey's trains, exactly (Tufte). Engelbart's addition, adopted: at Project
-level **every session gets a derived first line** ("Tue 14 · 47 min ·
-+1,204 −310 · 1 pass · 3 answered") — the campaign reads as an outline; and
-kind-toggles/jumps as single letters (`t/p/c/k/r`; `j s` next station,
-`j c` next unresolved question) with the active view echoed in the corner —
-the strip is a pure function of (record, viewspec, playhead).
+1. **Station names** — the writer's own words ("Draft complete"), plus
+   the honest automatics ("Started", "Restored", "Exported") — never
+   "Saved": the product saves every keystroke, and a station named
+   Saved would teach that unsaved states exist. Reflex checkpoints
+   (Ctrl+S) are deliberately unnamed — bare ticks, lowest rank. Ranked
+   omission on collision (writer-named > seal > before-restore > export
+   > manual > session-start > reflex); a label that doesn't fit is
+   omitted whole, its tick stays. Hover expands, never reveals (P9).
+2. **Dates** — real ones. "Today", "Tue 1 Jul". Never "day 12". The
+   year appears whenever it isn't the current one — histories never
+   expire.
+3. **The readout** — one chip, fixed position at the left end, fixed
+   width, tabular numerals: `Tue 12 Jul, 21:40 · 3,412 words`. The
+   width is reserved *per locale* («Вт, 12 июл, 21:40 · 3 412 слов»
+   has different metrics, space-thousands, 24h); the Compare notch's
+   delta folds into the same single line. The readout never forms a
+   sentence and **never embeds a station name** (P8's template ban:
+   "after Before the line read" must be unconstructible). When the
+   playhead is near a station, that station's tick and label
+   *brighten* — association by light, not by grammar.
 
-## 6. Refusals (the panel's unanimous floor)
+## 3. The controls
 
-Hover-only meaning. Mystery heights — any channel that can't earn one
-printed sentence gets deleted, not documented. Single-kind session bars
-(averaging is information destruction). Whole-document events drawn as
-dots. Snap-to-chunk scrubbing. Confirmation dialogs. Smoothed envelopes.
-Play-button-as-hero (Wave's grave). A "simple mode" that amputates the
-grammar. Animation frames that depict states that never existed. And any
-view that elides the deletions — a history that flatters is not a history.
+- **The thumb.** Click the rail = park there; drag = scrub, anywhere,
+  continuously (both, because the borrowed widget does both — P7); the
+  document above live-renders at frame rate (Victor's bar: scrub at
+  frame rate or don't ship). Wheel/trackpad gestures pan the fabric
+  only, never move the thumb. **Scrub stability law:** while the
+  thumb moves, the only things that change are the thumb's x, the
+  readout numerals, the document above, the dimmed not-yet region right
+  of the thumb, and label brightening. No label re-ranks, re-flows, or
+  changes length mid-drag — layout is computed when data changes, never
+  while the viewer holds the thumb.
+- **Now** — the rightmost control, always. Click: back to the present.
+  Esc does the same. At now the chip rests dim; **when parked it
+  brightens in the same beat Restore appears** — the two exits from
+  the past (keep this / leave) announce themselves as the pair they
+  are (P8), from their fixed ends.
+- **Restore** — appears beside the readout only when parked in the
+  past. One word; the common word (P7: we honor the widget's face and
+  *extend* its contract — our restore appends, destroys nothing; the
+  envelope visibly steps and everything stays inked). And the restore
+  is itself one Restore away from undone — the pre-restore now is just
+  another moment on the strip, recovered by the same grammar (P13). No
+  confirmation dialog exists anywhere in the strip — the safety is
+  structural, so a warning would be a confession.
 
-## 7. Why this can be the killer feature
+## 4. The notches (P5 — depth that never taxes the floor)
 
-It rides the promise no competitor makes ("we save every keystroke") on
-machinery we already shipped (materialized states → microsecond any-state
-recompute → frame-rate scrubbing that collapsed Etherpad at 10k changesets
-is ~free here), it repudiates the two fears writers actually have (silent
-loss; destructive restore) *graphically* rather than verbally, and it gives
-the writer what Engelbart called process literacy: the fabric of their own
-fortnight, readable at a glance, explorable to the keystroke — the
-golden path's whole arc (sessions, seal, cold read, passes, cuts, restore,
-export) legible in one still image.
+Unadvertised, resting where a curious hand falls, each one a *but of
+course* when found:
+
+- **Typing while parked restores.** Typing means one thing in this
+  product: it appends to the document as shown. So typing in the past
+  first appends the restore (the sage arc draws itself), then the
+  insertion. (Raskin's law, kept whole from v1.)
+- **Hold the history key** — quasimode: strip rises, arrows scrub,
+  Shift+arrows step station to station, release returns to now with
+  nothing changed. Blind firing is always safe.
+- **LEAP by phrase**: type a phrase while holding the history key —
+  jump to the moment it was born; again, to its next change or death.
+  Writers remember sentences, not timestamps.
+- **Compare** (shift-click parks a second, faint playhead; the readout
+  gains a delta line). No chrome advertises it; if no one ever finds
+  it, it dies quietly in a later round.
+
+## 5. What died in v2, and why
+
+- **Zoom** (three altitudes, viewspec letters, session first-lines) —
+  killed by the fixed quant. One scale, horizontal scroll. Stability
+  beats altitude; Engelbart's per-session summary lines may return
+  someday *outside* the strip (a sessions list is not a strip concern).
+- **The legend and every caption** — P4. The v1 spec's
+  one-sentence-per-mark discipline remains a *design gate* (a mark you
+  can't caption in one sentence is a mark you can't ship) but the
+  sentence lives in this document, never on the chrome.
+- **The pin as visible chrome** — "why would I want to pin a second
+  moment?" is a question a floor element must never raise. Demoted to
+  a notch.
+- **"Carry this forward"** → **Restore.** Concise, universal,
+  contract-honoring-plus.
+- **"Words arriving / words leaving"** — the strip does not
+  editorialize; the words were cut by the writer, they didn't leave.
+- **Composed readout sentences** ("after ⟨station⟩") — P8 template ban.
+- **Any re-layout during scrub** — the jumpiness that made v1 feel
+  unreliable; opposite of habit-forming.
+
+## 6. Why this can still be the killer feature
+
+Unchanged from v1, and stronger for the floor: it rides "we save every
+keystroke" on machinery already shipped (materialized states →
+microsecond any-state recompute → frame-rate scrubbing is ~free), it
+repudiates the two fears writers actually have — silent loss and
+destructive restore — *graphically*, and it now does so while looking,
+to a stranger in a corridor, like the one history control every human
+already knows how to hold.
