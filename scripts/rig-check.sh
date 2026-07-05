@@ -213,6 +213,46 @@ expect "two scrubs later it has NOT re-baked" 1   "$(field "$S3" bakes)"
 expect "parked hides the live margin"       true  "$(field "$D2" margin_hidden)"
 expect "Now brings the margin back"         false "$(field "$D4" margin_hidden)"
 
+echo "rig-check: legacy history renders a real axis + a visible parked banner (Bug A/B)"
+# A legacy file — six materialized checkpoints across two weeks, EMPTY journal.
+# Before the fix the axis read only the journal, so every tick landed at x=0 and
+# the whole pre-journal history was invisible. Fresh doc per run (the .strop
+# sidecar persists across wrun launches within one rig run).
+DOCL1=$(mktemp --suffix=.md); cp "$DOC" "$DOCL1"
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCL1" "seed:legacy strip:open dump:ui strip:scrub:0.5 dump:ui ctrl-b dump:ui strip:now dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
+S1=$(echo "$D1" | grep -oE '"strip":\{[^}]*\}'); S2=$(echo "$D2" | grep -oE '"strip":\{[^}]*\}'); S3=$(echo "$D3" | grep -oE '"strip":\{[^}]*\}')
+[ -n "$S1" ] || { echo "  FAIL no strip dump (legacy)"; exit 1; }
+ST=$(field "$S1" stations)
+if [ "${ST:-0}" -ge 6 ] 2>/dev/null; then echo "  ok   the checkpoint era has stations ($ST)"; else
+  echo "  FAIL stations=$ST (checkpoints not on the axis?)"; fail=1; fi
+WK=$(field "$S1" work); WKI=${WK%.*}
+if [ "${WKI:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the axis is non-degenerate (work=$WK)"; else
+  echo "  FAIL work=$WK (axis collapsed to zero?)"; fail=1; fi
+expect "a scrub parks in the legacy past"   true  "$(field "$S2" parked)"
+expect "the parked banner is up"            true  "$(field "$S2" banner)"
+WL=$(field "$S2" words_at)
+if [ "${WL:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   words_at reports the era ($WL words)"; else
+  echo "  FAIL words_at=$WL (checkpoint-only reconstruction empty?)"; fail=1; fi
+expect "parked hides the live margin"       true  "$(field "$D2" margin_hidden)"
+# An edit gesture (ctrl-b) while parked is REFUSED: the banner pulses, the doc
+# is untouched, and we stay parked (no silent restore — the terror Bug B fixes).
+expect "a refused edit pulses the banner"   true  "$(field "$S3" pulse)"
+expect "the refusal keeps us parked"        true  "$(field "$S3" parked)"
+expect "the past is untouched (same chars)" "$(field "$D2" doc_chars)" "$(field "$D3" doc_chars)"
+expect "Now returns the margin"             false "$(field "$D4" margin_hidden)"
+
+echo "rig-check: no-history guard — an empty doc's strip never parks"
+# No checkpoints, no journal (truly nothing): scrubbing the strip must NOT park.
+DOCL2=$(mktemp --suffix=.md); : > "$DOCL2"
+OUT=$(WRUN_TAIL=40 scripts/wrun.sh "$DOCL2" "strip:open strip:scrub:0.5 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+DN=$(echo "$OUT" | tail -1); SN=$(echo "$DN" | grep -oE '"strip":\{[^}]*\}')
+if [ -n "$SN" ]; then
+  expect "an empty-history scrub does not park" false "$(field "$SN" parked)"
+else
+  echo "  ok   an empty-history strip has no bake to park (degraded, fine)"
+fi
+
 echo "rig-check: asides file honestly — compost is text, the graveyard gives back"
 # seed:aside asides one paragraph (births the rail) and exiles another (over
 # the cut threshold). putback:last is the graveyard's single verb: the entry
@@ -226,9 +266,59 @@ if [ "${CB:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the aside birthed the rai
   echo "  FAIL compost_blocks=$CB"; fail=1; fi
 expect "the exile filed one entry"          1 "$(field "$D1" grave_entries)"
 expect "put back empties the graveyard"     0 "$(field "$D2" grave_entries)"
+# The graveyard record renders at the document TAIL in the scroll flow (Bug B):
+# with this short fixture the whole doc + section fit, so the section header is
+# on screen and the sticky footer bar unsticks (hides) into it (asides.md §3).
+expect "the footer bar unsticks when the tail is on screen" true "$(field "$D1" grave_bar_hidden)"
 MW=$(field "$D1" manuscript_words)
 if [ "${MW:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the count is manuscript-only ($MW words)"; else
   echo "  FAIL manuscript_words=$MW"; fail=1; fi
+
+echo "rig-check: a cut annotated paragraph leaves no dangling note (Bug C)"
+# seed:annotated selects a paragraph carrying BOTH a writer note and a machine
+# diagnosis; exile:selection cuts it. The writer note must change address to the
+# compost (its own words are never lost); the diagnosis must close (a machine
+# card never lingers pointing at nothing).
+DOCC=$(mktemp --suffix=.md); cp "$DOC" "$DOCC"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCC" "seed:annotated dump:ui exile:selection dump:ui" 2>/dev/null | grep 'UI-DUMP')
+C1=$(echo "$OUT" | head -1); C2=$(echo "$OUT" | tail -1)
+[ -n "$C1" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCC" "$DOCC.strop"
+expect "the writer note starts open"          1 "$(field "$C1" open_notes)"
+expect "the diagnosis starts open"            1 "$(field "$C1" open_diagnoses)"
+expect "no compost before the cut"            0 "$(field "$C1" compost_blocks)"
+expect "the cut files one grave entry"        1 "$(field "$C2" grave_entries)"
+expect "the writer note left the margin"      0 "$(field "$C2" open_notes)"
+expect "the dead-anchored diagnosis closed"   0 "$(field "$C2" open_diagnoses)"
+CB2=$(field "$C2" compost_blocks)
+if [ "${CB2:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the note migrated to the compost (compost_blocks=$CB2)"; else
+  echo "  FAIL compost_blocks=$CB2 — the note did not migrate"; fail=1; fi
+
+echo "rig-check: the omnibar is a field, and Esc walks the selection home (06 §1)"
+# Typing "abcdef", parking the caret at the end, then ctrl-f + "b": the find
+# preview WALKS selected_range onto the match [1,2). Esc must restore the
+# pre-find state (S3/P13) and hand focus back to the prose.
+DOCO=$(mktemp --suffix=.md); : > "$DOCO"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCO" "abcdef ctrl-f wait:80 dump:ui b wait:80 dump:ui escape wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+O1=$(echo "$OUT" | sed -n 1p); O2=$(echo "$OUT" | sed -n 2p); O3=$(echo "$OUT" | sed -n 3p)
+[ -n "$O3" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCO" "$DOCO.strop"
+expect "ctrl-f focuses the omnibar field"    '"PaletteInput"' "$(field "$O1" focused)"
+expect "the preview walks the selection"     '[1,2]' "$(echo "$O2" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')"
+expect "Esc returns focus to the prose"      '"Editor"' "$(field "$O3" focused)"
+expect "Esc walks the selection home"        '[6,6]' "$(echo "$O3" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')"
+
+echo "rig-check: set-aside shows compliance — the rail opens on first birth and never self-closes"
+DOCR=$(mktemp --suffix=.md); : > "$DOCR"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCR" "onexx enter enter twoxx ctrl-home select:para aside:selection wait:80 dump:ui ctrl-end select:para aside:selection wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+R1=$(echo "$OUT" | sed -n 1p); R2=$(echo "$OUT" | sed -n 2p)
+[ -n "$R2" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCR" "$DOCR.strop"
+expect "the first aside opens the rail"      true "$(field "$R1" rail)"
+expect "the second aside keeps it open"      true "$(field "$R2" rail)"
+CBR=$(field "$R2" compost_blocks)
+if [ "${CBR:-0}" -gt 1 ] 2>/dev/null; then echo "  ok   both passages landed in the compost (compost_blocks=$CBR)"; else
+  echo "  FAIL compost_blocks=$CBR"; fail=1; fi
 
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

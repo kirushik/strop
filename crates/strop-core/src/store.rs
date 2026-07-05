@@ -558,6 +558,38 @@ impl Store {
         }
     }
 
+    /// Rig hook (`seed:legacy`): push a checkpoint at an EXPLICIT past
+    /// timestamp with a materialized state — synthesizes a legacy file's
+    /// history (checkpoints only, empty journal) without a fortnight of real
+    /// editing. The public API always stamps `now`; only this test seam can
+    /// backdate. Never called outside the smoke rig.
+    pub fn debug_push_checkpoint(
+        &self,
+        name: &str,
+        created_unix: i64,
+        manual: bool,
+        state: CheckpointState,
+    ) {
+        self.doc.commit();
+        let checkpoint = Checkpoint {
+            name: name.to_owned(),
+            created_unix,
+            frontiers: self.doc.oplog_frontiers().encode(),
+            manual,
+            state: Some(state),
+        };
+        match serde_json::to_string(&checkpoint) {
+            Ok(json) => {
+                let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
+                if let Err(e) = list.push(json) {
+                    eprintln!("strop: seed checkpoint: {e}");
+                }
+                self.doc.commit();
+            }
+            Err(e) => eprintln!("strop: encode seed checkpoint: {e}"),
+        }
+    }
+
     /// Rename a checkpoint; renaming an automatic entry makes it named
     /// (manual), per the rewind research.
     pub fn rename_checkpoint(&self, ix: usize, name: &str) {
@@ -1763,7 +1795,7 @@ manuscript opens here");
         let history = History::default();
         let notes = Annotations::default();
         let mut graveyard = Graveyard::default();
-        graveyard.file("a cut sentence".into(), "origin".into(), 6, 111);
+        graveyard.file("a cut sentence".into(), "origin".into(), 6, 111, SpanSet::default(), Vec::new());
 
         store
             .save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &graveyard)
