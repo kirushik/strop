@@ -13518,8 +13518,10 @@ impl Editor {
             );
 
         // Now: dim at the present, bright when parked (it and Restore announce
-        // themselves as the pair they are — design §3). Click / Esc return.
+        // themselves as the pair they are — design §3, review H4: the two
+        // exits from the past light up in the same beat). Click / Esc return.
         let now_chip = chip("Now".into(), parked)
+            .when(parked, |d| d.bg(rgb(0xEAE6D8)).text_color(rgb(0x23221F)))
             .id("strip-now")
             .occlude()
             .cursor(CursorStyle::PointingHand)
@@ -13876,6 +13878,21 @@ impl Element for StripElement {
                     dash += 6.;
                 }
             }
+        }
+
+        // --- The not-yet: everything right of a parked playhead dims one
+        // alpha step — a STATIC encoding of position, so any paused frame
+        // reads correctly (design §0's screenshot test; the corridor tester's
+        // safety signal is seeing today still ON the strip, dimmed not gone).
+        if editor.strip.parked && play_x < rail_x1 {
+            rect(
+                window,
+                play_x,
+                band_top,
+                rail_x1 - play_x,
+                strip::TOP_ROW_H + strip::LABEL_LANE_H + strip::FABRIC_H,
+                tint(strip::GROUND, 0.55),
+            );
         }
 
         // --- The rail, the thumb, the playhead, and the Compare pin ----------
