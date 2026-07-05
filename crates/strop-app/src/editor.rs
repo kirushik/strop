@@ -13612,7 +13612,10 @@ impl Editor {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        if self.margin_fits(window) || self.history_view.is_some() {
+        // Parked = previewing the past: the pill counts cards anchored to the
+        // LIVE document, and its panel would float them over past text — the
+        // same law that hides the wide margin while parked (H36).
+        if self.margin_fits(window) || self.history_view.is_some() || self.strip.is_parked() {
             return None;
         }
         let count = self.narrow_notes_count(&self.margin_cards(false).cards);
@@ -13683,7 +13686,11 @@ impl Editor {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        if !self.narrow_notes_open || self.margin_fits(window) || self.history_view.is_some() {
+        if !self.narrow_notes_open
+            || self.margin_fits(window)
+            || self.history_view.is_some()
+            || self.strip.is_parked()
+        {
             return None;
         }
         let cards = self.margin_cards(false).cards;
@@ -14664,14 +14671,30 @@ impl Element for StripElement {
                 line,
             });
         }
-        // Date lane.
-        let mut dates = Vec::new();
-        for dt in &bake.dates {
+        // Date lane — thinned by real shaped width: a checkpoint-dense era
+        // packs several day-firsts into a few px, and overprinted labels read
+        // as one smear ("Tue 23 JulToday"). The LAST date always survives a
+        // collision (it is Today far more often than not): it sheds the
+        // neighbours it would overprint instead of being shed.
+        let mut dates: Vec<StripText> = Vec::new();
+        let mut last_right = f32::NEG_INFINITY;
+        for (i, dt) in bake.dates.iter().enumerate() {
             let wx = fab_x(dt.x);
             if wx < rail_x0 - 40. || wx > rail_x1 + 40. {
                 continue;
             }
             let line = shape(&dt.label, 10., 0x87826F, window);
+            if wx < last_right + 14. {
+                if i + 1 != bake.dates.len() {
+                    continue;
+                }
+                while dates.last().is_some_and(|d| {
+                    f32::from(d.origin.x) + f32::from(d.line.width) + 14. > wx
+                }) {
+                    dates.pop();
+                }
+            }
+            last_right = wx + f32::from(line.width);
             dates.push(StripText {
                 origin: point(px(wx + 2.), px(band_top + strip::STRIP_H - strip::DATE_LANE_H)),
                 line,
