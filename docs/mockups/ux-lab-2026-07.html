@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Strop UX Lab v2 — golden-path mechanics</title>
+<title>Strop UX Lab v4 — the de-chattified round</title>
 <style>
 :root{
   --bg:#FBFAF8; --text:#1A1A18; --muted:#8A8678; --rule:#E8E4DC;
@@ -24,8 +24,11 @@ main{flex:1;display:flex;min-height:0}
 .labnotes h3{color:#EAE6D8;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
 .labnotes li{margin:0 0 9px 14px}
 .labnotes em{color:#DFC98A;font-style:normal}
-.scene{display:none;width:100%;justify-content:center}
+.labnotes .conv{border:1px dashed #4a4840;border-radius:6px;padding:6px 8px;margin-bottom:10px;color:#8f8b7e;font-size:11px}
+.scene{display:none;width:100%;flex-direction:column;align-items:center;gap:10px}
 .scene.on{display:flex}
+.labrow{display:flex;gap:14px;font:12px system-ui;color:var(--labtext)}
+.labrow label{cursor:pointer;display:flex;gap:5px;align-items:center}
 
 /* ============ the Strop window ============ */
 .win{width:1100px;background:var(--bg);color:var(--text);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.5);overflow:hidden;flex-shrink:0;position:relative}
@@ -37,7 +40,7 @@ main{flex:1;display:flex;min-height:0}
 .tbar .ic svg{display:block}
 .body{position:relative;min-height:620px}
 .edwrap{display:flex;min-height:620px}
-.col{width:620px;margin:0 auto;padding:40px 0 60px;font-family:Georgia,'PT Serif',serif;font-size:17px;line-height:1.62}
+.col{width:620px;margin:0 auto;padding:40px 0 60px;font-family:Georgia,'PT Serif',serif;font-size:17px;line-height:1.62;position:relative}
 .col p{margin:0 0 1.1em;position:relative}
 .lane{width:260px;padding:40px 16px 0 4px;flex-shrink:0;position:relative}
 .caret{display:inline-block;width:1.5px;height:1.05em;background:var(--text);vertical-align:-0.15em;animation:blink 1.06s steps(1) infinite}
@@ -48,6 +51,7 @@ main{flex:1;display:flex;min-height:0}
 .mcard .acts{display:flex;gap:8px;font:10.5px system-ui;color:var(--muted);margin-top:5px;justify-content:flex-end}
 .mcard .acts span{cursor:pointer}
 .mcard .acts span:hover{color:var(--text)}
+.mcard .acts .do{text-decoration:underline dotted;text-underline-offset:2px}
 .mcard.diag{background:var(--diag);border-radius:3px}
 .mcard.note{background:var(--note);border-radius:9px}
 .mcard b{font-size:12.5px}
@@ -58,6 +62,7 @@ main{flex:1;display:flex;min-height:0}
 .cr-banner b{color:var(--text);font-weight:600}
 .cr-banner .pulseme{transition:background .18s;padding:1px 5px;border-radius:4px}
 .cr-banner .pulseme.hot{background:var(--seltint);color:var(--text)}
+.cr-banner .restore{background:var(--text);color:var(--bg);border:none;border-radius:11px;padding:2px 12px;font:11.5px system-ui;cursor:pointer}
 .cr-stage{display:flex;justify-content:center;gap:18px;padding:24px 0 28px;background:#E4E6E9}
 .page{position:relative;width:520px;min-height:614px;background:#FEFEFC;box-shadow:0 2px 4px rgba(26,30,38,.14),0 12px 30px rgba(26,30,38,.16);padding:52px 58px 48px;font-size:16.5px;line-height:1.66;cursor:default}
 .page.textured::after{content:"";position:absolute;inset:0;pointer-events:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.11 0 0 0 0 0.10 0 0 0 0 0.09 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E")}
@@ -73,23 +78,24 @@ main{flex:1;display:flex;min-height:0}
 .rnote .q{font:10.5px system-ui;color:var(--muted);display:block;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .rinput{position:absolute;z-index:5;background:var(--card);border:1px solid var(--active);border-radius:7px;padding:6px 8px;box-shadow:0 4px 14px rgba(26,26,24,.18);display:none;width:250px}
 .rinput input{border:none;outline:none;background:none;font:13px Georgia,serif;width:100%;color:var(--text)}
-.rinput .hint{font:10px system-ui;color:var(--muted)}
 .qmarks{display:flex;gap:6px;margin-bottom:5px}
 .qmarks span{font:11.5px system-ui;border:1px solid var(--rule);border-radius:10px;padding:2px 9px;cursor:pointer;background:var(--note)}
 .qmarks span:hover{border-color:var(--active)}
 
-/* ============ scene 2: asides ============ */
-.aside-blk{border-left:3px solid #C9C5BA;background:var(--stale);color:#5d5a50;margin:0 0 22px;font-size:15px;line-height:1.5;border-radius:0 6px 6px 0}
-.aside-hd{font:11.5px system-ui;color:var(--muted);display:flex;gap:8px;align-items:baseline;padding:7px 14px;cursor:pointer;user-select:none}
-.aside-hd:hover{color:var(--text)}
-.aside-body{padding:2px 16px 12px}
-.aside-body p{margin:0 0 .7em}
-.aside-body .done{text-decoration:line-through;opacity:.6}
-.grave{border-left:3px solid #C9C5BA;background:var(--stale);color:#5d5a50;padding:0 0 12px;margin:0 0 0;font-size:15px;line-height:1.5;border-radius:0 6px 6px 0}
+/* ============ scene 2: asides & flanks ============ */
+#scene-asides .win{width:1150px}
+.lrail-wrap{width:200px;flex-shrink:0;border-right:1px solid var(--rule);background:#F7F5EF;padding:30px 0 30px}
+.lrail-wrap h4{font:600 11px system-ui;color:#6e6a5f;text-transform:uppercase;letter-spacing:.05em;margin:0 14px 4px}
+.lrail{padding:0 14px;font:12.5px/1.45 Georgia,serif;color:#3d3a32;outline:none;min-height:400px}
+.lrail p{margin:0;padding:8px 0}
+.lrail p+p{border-top:1px solid var(--rule)}
+.lrail .oq{display:block;font:10.5px system-ui;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
+.tailmark{height:2px;width:26px;background:#D8D2C2;border-radius:1px;margin:10px 14px 0}
+.grave{border-left:3px solid #C9C5BA;background:var(--stale);color:#5d5a50;padding:0 0 12px;font-size:15px;line-height:1.5;border-radius:0 6px 6px 0}
 #scene-asides .body{max-height:620px;overflow-y:auto}
-.gravebar{position:sticky;bottom:-1px;background:var(--stale);border-left:3px solid #C9C5BA;border-top:1px solid var(--rule);padding:8px 16px;font:11.5px system-ui;color:var(--muted);display:flex;gap:10px;align-items:baseline;z-index:3;cursor:pointer;border-radius:0 6px 0 0}
+.gravebar{position:sticky;bottom:-1px;background:var(--stale);border-left:3px solid #C9C5BA;border-top:1px solid var(--rule);padding:8px 16px;font:11.5px system-ui;color:var(--muted);display:flex;gap:12px;align-items:baseline;z-index:3;cursor:pointer;border-radius:0 6px 0 0}
 .gravebar b{color:#5d5a50}
-.gravebar .undo{color:var(--ai);text-decoration:underline dotted;cursor:pointer}
+.gravebar .act{color:var(--ai);text-decoration:underline dotted;cursor:pointer}
 .grave .inner{padding:10px 16px 0}
 .grave .entry{margin-bottom:14px}
 .grave .whisper{font:11px system-ui;color:var(--muted);display:flex;gap:9px;align-items:center;margin-bottom:4px;flex-wrap:wrap}
@@ -103,13 +109,12 @@ main{flex:1;display:flex;min-height:0}
 .selmenu div{padding:7px 12px;cursor:pointer;display:flex;gap:8px;align-items:center}
 .selmenu div:hover{background:var(--note)}
 .selmenu div.grv:hover{background:var(--stale)}
-.selmenu .k{color:var(--muted);font-size:10px;margin-left:auto}
-.leftrail{width:225px;flex-shrink:0;border-right:1px solid var(--rule);padding:38px 14px;font:12.5px/1.45 system-ui;color:#5d5a50;background:var(--stale)}
-.leftrail h4{font:10.5px system-ui;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:9px}
-.leftrail p{margin-bottom:8px}
-.leftrail .done{text-decoration:line-through;opacity:.6}
-.ccard{background:var(--card);border:1px solid var(--rule);border-radius:7px;padding:7px 9px;margin-bottom:8px;font:12.5px/1.4 Georgia,serif;color:#3d3a32}
-.ccard.done{text-decoration:line-through;opacity:.55}
+.selmenu .k{color:var(--muted);font:10px ui-monospace,monospace;margin-left:auto;border:1px solid var(--rule);border-radius:4px;padding:0 4px;background:var(--bg)}
+.fmt{position:absolute;width:60px;display:grid;grid-template-columns:1fr 1fr;gap:2px;background:var(--card);border:1px solid var(--rule);border-radius:9px;box-shadow:0 5px 16px rgba(26,26,24,.12);padding:4px;opacity:.72;transition:opacity .15s;z-index:4;left:-78px}
+.fmt:hover{opacity:1}
+.fmt span{display:flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:5px;cursor:pointer;font:13px Georgia,serif;color:var(--text)}
+.fmt span:hover{background:var(--note)}
+.fmt .sep{grid-column:1/3;height:1px;background:var(--rule);margin:1px 2px}
 .originflash{animation:oflash 1.4s ease-out 1}
 .pulse{animation:oflash 1s ease-out 1}
 @keyframes oflash{0%{background:var(--seltint)}100%{background:none}}
@@ -122,54 +127,41 @@ main{flex:1;display:flex;min-height:0}
 .ebtn:hover{background:var(--card)}
 .emenu{position:absolute;top:0;right:12px;width:392px;border-top-left-radius:0;border-top-right-radius:0;background:var(--card);border:1px solid var(--rule);border-radius:10px;box-shadow:0 10px 30px rgba(26,26,24,.16);font:13px system-ui;z-index:6;overflow:hidden}
 .emenu .carrier{padding:9px 15px 4px;font:11px system-ui;color:var(--muted)}
-.emenu .prom{padding:10px 15px;border-left:3px solid var(--active);cursor:pointer}
-.emenu .prom:hover{background:var(--note)}
-.emenu .why{font-size:11.5px;color:var(--muted);margin-top:3px;font-family:Georgia,serif;font-style:italic}
 .emenu .vq{font-weight:600}
 .emenu .vq small{font-weight:400;color:var(--muted)}
-.erow{padding:8px 15px 8px 18px;cursor:pointer}
+.erow{padding:8px 15px;cursor:pointer}
 .erow:hover{background:var(--diag)}
 .erow.gated{opacity:.5;cursor:default}
 .erow.gated:hover{background:none}
 .erow .when{font-size:11px;color:var(--muted)}
 .emenu .foot{border-top:1px solid var(--rule);padding:8px 15px;color:var(--muted);font-size:11.5px;display:flex;justify-content:space-between}
 .emenu .foot .verb{cursor:pointer;color:var(--text);text-decoration:underline dotted}
-.staterow{display:flex;gap:10px;justify-content:center;padding:12px;font:12px system-ui;background:var(--stale);border-bottom:1px solid var(--rule)}
-.staterow label{cursor:pointer;display:flex;gap:5px;color:var(--text)}
 
 /* ============ scene 4: history strip ============ */
 .hs-wrap{position:absolute;left:0;right:0;bottom:0;background:#26251F;color:#C9C5BA;border-top:1px solid #3a382f;font:11px system-ui;user-select:none}
-.hs-top{display:flex;align-items:baseline;gap:14px;padding:8px 18px 3px}
+.hs-top{display:flex;align-items:center;gap:12px;padding:8px 18px 5px}
 .hs-top b{color:#EAE6D8;font-weight:600}
-.hs-top .zoomlbl{opacity:.6}
-.hs-top .now{margin-left:auto;color:#DFC98A;cursor:pointer}
-#hs-svg{display:block;cursor:crosshair}
-.hs-cap{display:flex;flex-wrap:wrap;gap:3px 16px;padding:6px 18px 9px;color:#8f8b7e;font-size:10.5px}
-.hs-cap .sw{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:-1px}
-.hs-readout{position:absolute;transform:translateX(-50%);background:#111009;border:1px solid #3a382f;border-radius:9px;padding:2px 10px;font:10.5px system-ui;color:#EAE6D8;white-space:nowrap;pointer-events:none;z-index:3}
-.hs-carry{background:#EAE6D8;color:#23221F;border:none;border-radius:12px;padding:3px 13px;font:11.5px system-ui;cursor:pointer}
-/* ============ scene 5: re-entry ============ */
-.wnote{margin:26px auto 4px;width:620px;background:var(--note);border:1px solid var(--rule);border-radius:9px;padding:10px 16px;font:15px Georgia,serif;font-style:italic;display:flex;align-items:baseline;gap:12px}
-.wnote .attr{font:10.5px system-ui;color:var(--muted);font-style:normal;flex-shrink:0;margin-left:auto;white-space:nowrap}
-.wnote .x{font:12px system-ui;color:var(--muted);cursor:pointer;font-style:normal}
-.mini{width:620px;margin:14px auto 0;font:12px system-ui;color:var(--muted);border-top:1px dashed var(--rule);padding-top:10px}
-.mini b{color:var(--text)}
+.hs-ro{background:#111009;border:1px solid #3a382f;border-radius:9px;padding:2px 12px;font:11px system-ui;color:#EAE6D8;white-space:nowrap;font-variant-numeric:tabular-nums;min-width:210px}
+.hs-restore{background:#EAE6D8;color:#23221F;border:none;border-radius:12px;padding:3px 14px;font:11.5px system-ui;cursor:pointer}
+.hs-now{margin-left:auto;color:#DFC98A;cursor:pointer;border:1px solid #4a4840;border-radius:12px;padding:2px 13px;transition:all .15s}
+.hs-now.home{opacity:.35;cursor:default}
+.hs-now:not(.home){background:#EAE6D8;color:#23221F;border-color:#EAE6D8}
+#hs-svg{display:block}
 </style>
 </head>
 <body>
 <div class="labbar">
-  <span class="t">Strop UX Lab · v2</span>
+  <span class="t">Strop UX Lab · v4</span>
   <button class="tab on" data-s="coldread">1 · Cold read</button>
-  <button class="tab" data-s="asides">2 · Asides</button>
+  <button class="tab" data-s="asides">2 · Asides &amp; flanks</button>
   <button class="tab" data-s="editor">3 · The editor button</button>
   <button class="tab" data-s="history">4 · History strip</button>
-  <button class="tab" data-s="reentry">5 · Re-entry</button>
   <div class="vars" id="vars"></div>
 </div>
 <main>
 <div class="stage">
 
-<!-- ============ SCENE 1: COLD READ v2 ============ -->
+<!-- ============ SCENE 1: COLD READ (settled; strings purged) ============ -->
 <section class="scene on" id="scene-coldread">
   <div class="win" style="width:1120px">
     <div class="tbar"><span class="doc">The Crossing</span><span id="cr-mode-label">— reading</span><span class="grow"></span><span class="ic">⌕</span><span class="ic" id="clock1"></span><span class="ic">≡</span></div>
@@ -185,39 +177,31 @@ main{flex:1;display:flex;min-height:0}
       <div class="cr-lane" id="cr-lane">
         <div class="rnote"><span class="q">“the ferry had made the crossing…”</span><b>~</b> drags — cut the schedule talk?</div>
       </div>
-      <div class="rinput" id="cr-rinput"><div class="qmarks"><span data-m="?">?&nbsp;doubt</span><span data-m="!">!&nbsp;alive</span><span data-m="~">~&nbsp;drags</span></div><input placeholder="…or a few words"><div class="hint">a mark or a note — never an edit · Esc drops</div></div>
+      <div class="rinput" id="cr-rinput"><div class="qmarks"><span data-m="?">?&nbsp;doubt</span><span data-m="!">!&nbsp;alive</span><span data-m="~">~&nbsp;drags</span></div><input placeholder="…or a few words"></div>
     </div>
   </div>
 </section>
 
-<!-- ============ SCENE 2: ASIDES v2 ============ -->
+<!-- ============ SCENE 2: ASIDES & FLANKS v3 ============ -->
 <section class="scene" id="scene-asides">
   <div class="win">
-    <div class="tbar"><span class="doc">The Crossing</span><span id="as-count">3,412 words <span style="opacity:.75">· aside 486</span></span><span class="grow"></span><span class="ic">⌕</span><span class="ic" id="clock2"></span><span class="ic">≡</span></div>
+    <div class="tbar"><span class="doc">The Crossing</span><span>3,412 words</span><span class="grow"></span><span class="ic">⌕</span><span class="ic" id="clock2"></span><span class="ic">≡</span></div>
     <div class="body edwrap" id="as-wrap">
-      <div class="leftrail" id="as-rail" style="display:none">
-        <h4>compost — unanchored cards</h4>
-        <div class="ccard">Premise B (dead): generation ship. Everyone has this one.</div>
-        <div class="ccard"><b>ENDING — she stays; the light on the water is the last line.</b></div>
-        <div class="ccard">“Salt on the railing like the river had been chewing it.”</div>
-        <div class="ccard done">beat — Mara takes the night shift</div>
-        <div class="ccard done">beat — the stowaway’s shadow is wrong</div>
-        <div class="ccard">beat — confrontation at the airlock</div>
-        <div class="ccard">beat — the choice at the far dock</div>
-      </div>
-      <div class="col" style="padding-top:32px" id="as-col">
-        <div class="aside-blk" id="as-compost">
-          <div class="aside-hd" id="as-fold"><span id="as-arrow">▸</span><span><b>compost</b> · 214 words — kept out of the story, the count, the passes, the export</span></div>
-          <div class="aside-body" id="as-body" style="display:none">
-            <p>Premise B (dead): generation ship, mutiny in cold storage. Everyone has this one.</p>
-            <p><b>ENDING — she stays. The ferry leaves without her, and the light on the water is the last line.</b></p>
-            <p>Voice line to keep somewhere: “Salt on the railing like the river had been chewing it.”</p>
-            <p class="done">beat — Mara takes the night shift</p>
-            <p class="done">beat — the stowaway’s shadow is wrong</p>
-            <p>beat — confrontation at the airlock</p>
-            <p>beat — the choice at the far dock</p>
-          </div>
+      <div class="lrail-wrap">
+        <h4>Compost</h4>
+        <div class="lrail" contenteditable="true" spellcheck="false" id="as-rail">
+          <p>Premise B (dead): generation ship, mutiny in cold storage. Everyone has this one.</p>
+          <p><b>ENDING — she stays. The ferry leaves without her, and the light on the water is the last line.</b></p>
+          <p>“Salt on the railing like the river had been chewing it.”</p>
+          <p><s>beat — Mara takes the night shift</s></p>
+          <p><s>beat — the stowaway’s shadow is wrong</s></p>
+          <p>beat — confrontation at the airlock</p>
+          <p>beat — the choice at the far dock</p>
+          <p><span class="oq">“the ferry had made the crossing on the hour, every hour…”</span>does the timetable scene survive the cut? the fog needs its clock</p>
         </div>
+        <div class="tailmark"></div>
+      </div>
+      <div class="col" style="padding-top:32px;width:560px;margin:0 24px 0 96px" id="as-col">
         <p>Mara took the night crossing because the day boats were full of people who still believed the far shore existed. The ferry’s old reactor hummed under the deck plates like a hive gone drowsy with cold.</p>
         <p id="as-origin">The stowaway appeared on the third night, standing at the rail where no passenger was supposed to stand, casting two shadows in the single running light.</p>
         <p class="selpara" id="as-victim">The customs officer had a theory about the fog, and he told it to anyone who would listen: that it wasn’t weather at all, but the river forgetting its banks, one memory at a time. He had charts. He had dates. Nobody would listen.</p>
@@ -225,7 +209,14 @@ main{flex:1;display:flex;min-height:0}
         <p>The fog came up the channel at the hour the schedule board called nothing at all, and the running light made a room of it, small and white, moving with the boat.</p>
         <p>On the fourth night she brought him coffee, because the body decides these things before the argument is over. He held the cup in both hands as if warming someone else’s fingers.</p>
         <p>The far dock, when it finally came, was smaller than its legend: four pilings, a bell with no rope, a customs shed with its window boarded from the inside.</p>
-        <div class="gravebar" id="as-gravebar"><b>⚰ graveyard · <span id="as-gcount">1</span></b><span>cut, not gone · out of the count, the passes, the export</span><span class="undo" id="as-undo" style="display:none">undo</span><span style="margin-left:auto">read-only — put back or delete</span></div>
+        <div class="fmt" id="as-fmt">
+          <span><b>B</b></span><span><i>I</i></span>
+          <span style="text-decoration:underline">U</span><span><s>S</s></span>
+          <span><span style="background:var(--seltint);padding:0 3px;border-radius:2px;font-size:11.5px">ab</span></span><span style="font-family:ui-monospace,monospace;font-size:10.5px">&lt;/&gt;</span>
+          <span class="sep"></span>
+          <span>⤴</span><span>†</span>
+        </div>
+        <div class="gravebar" id="as-gravebar"><b>⚰ Graveyard · <span id="as-gcount">1</span></b><span class="act" id="as-undo" style="display:none">put back</span></div>
         <div class="grave" id="as-grave">
           <div class="inner">
           <div class="receded" id="as-receded">▸ the dockmaster’s daughter and her ledger · cut from after “Neither is the river” · Tue 8 Jul · 84 words</div>
@@ -235,6 +226,7 @@ main{flex:1;display:flex;min-height:0}
       <div class="lane" id="as-lane" style="padding-top:32px">
         <div class="selmenu" id="as-selmenu" style="top:296px">
           <div id="sm-note">✎ Add a note<span class="k">m</span></div>
+          <div id="sm-aside">☰ Set aside, out of the story<span class="k">a</span></div>
           <div class="grv" id="sm-exile">✂ Send to the graveyard<span class="k">x</span></div>
           <div>❋ Ask the editor about this…<span class="k">e</span></div>
         </div>
@@ -245,27 +237,24 @@ main{flex:1;display:flex;min-height:0}
 
 <!-- ============ SCENE 3: THE EDITOR BUTTON ============ -->
 <section class="scene" id="scene-editor">
+  <div class="labrow">
+    <label><input type="radio" name="eb" value="idle" checked> drafting, quiet</label>
+    <label><input type="radio" name="eb" value="cooking"> a read is underway</label>
+    <label><input type="radio" name="eb" value="parked"> results parked</label>
+    <label><input type="radio" name="eb" value="open"> reviewing · queries open</label>
+  </div>
   <div class="win">
-    <div class="staterow">
-      <label><input type="radio" name="eb" value="idle" checked> drafting, quiet</label>
-      <label><input type="radio" name="eb" value="cooking"> a read is underway</label>
-      <label><input type="radio" name="eb" value="parked"> results parked (mid-burst)</label>
-      <label><input type="radio" name="eb" value="open"> reviewing · queries open</label>
-    </div>
     <div class="tbar"><span class="doc">The Crossing</span><span>4,120 words</span><span class="grow"></span>
       <span class="ebtn" id="ebtn"></span><span class="ic" id="clock3"></span><span class="ic">≡</span></div>
     <div class="body edwrap">
       <div class="emenu" id="emenu" style="display:none">
         <div class="carrier">Ask the editor for…</div>
-        <div class="prom">
-          <div class="vq">A believing read <small>— what’s alive here, what it’s secretly about</small></div>
-          <div class="why">the draft sealed yesterday; its center of gravity comes before any doubting</div>
-        </div>
-        <div class="erow"><div class="vq">A developmental read <small>— the structure: stakes, turns, the ending</small></div><div class="when">usually after the writer’s own cold read</div></div>
-        <div class="erow"><div class="vq">A line read <small>— rhythm, imagery, dialogue</small></div><div class="when">once the structure stops moving</div></div>
+        <div class="erow"><div class="vq">A believing read <small>— what’s alive here, what it’s secretly about</small></div></div>
+        <div class="erow"><div class="vq">A developmental read <small>— the structure: stakes, turns, the ending</small></div></div>
+        <div class="erow"><div class="vq">A line read <small>— rhythm, imagery, dialogue</small></div></div>
         <div class="erow gated"><div class="vq">A copy read <small>— slips, typos, repetitions</small></div><div class="when">after the structural queries settle</div></div>
-        <div class="erow"><div class="vq">A doubting read <small>— the strongest case against the argument</small></div><div class="when">the believing read’s mirror; for essays and columns</div></div>
-        <div class="foot"><span>3 queries open · 12 resolved</span><span class="verb" id="doorverb">Close the door</span></div>
+        <div class="erow"><div class="vq">A doubting read <small>— the strongest case against the argument</small></div></div>
+        <div class="foot"><span>3 queries open · 12 resolved</span><span class="verb" id="doorverb">Reading</span></div>
       </div>
       <div class="col" style="padding-top:34px">
         <p>Mara took the night crossing because the day boats were full of people who still believed the far shore existed. <span class="squig">The ferry’s old reactor hummed under the deck plates like a hive gone drowsy with cold.</span></p>
@@ -273,51 +262,23 @@ main{flex:1;display:flex;min-height:0}
         <p>“You’re not on the manifest,” Mara said. The stowaway looked down at his two shadows as if counting them. “Neither is the river,” he said.<span class="caret"></span></p>
       </div>
       <div class="lane" style="padding-top:34px" id="eb-lane">
-        <div class="mcard diag"><div class="hd"><span>developmental</span><span class="prov">pass 2 · today</span></div><b>The reactor is set dressing</b><br>It hums twice and decides nothing. Does the crossing need a cost?<div class="acts"><span>done</span><span>×</span></div></div>
-        <div class="mcard diag"><div class="hd"><span>developmental</span><span class="prov">pass 2 · today</span></div><b>Two shadows, one rule</b><br>The image recurs but the rule behind it never lands. What does the second shadow obey?<div class="acts"><span>done</span><span>×</span></div></div>
+        <div class="mcard diag"><div class="hd"><span>developmental</span><span class="prov">pass 2 · today</span></div><b>The reactor is set dressing</b><br>It hums twice and decides nothing. Does the crossing need a cost?<div class="acts"><span class="do">done</span><span>×</span></div></div>
+        <div class="mcard diag"><div class="hd"><span>developmental</span><span class="prov">pass 2 · today</span></div><b>Two shadows, one rule</b><br>The image recurs but the rule behind it never lands. What does the second shadow obey?<div class="acts"><span class="do">done</span><span>×</span></div></div>
       </div>
     </div>
   </div>
 </section>
 
-<!-- ============ SCENE 4: HISTORY STRIP ============ -->
+<!-- ============ SCENE 4: HISTORY STRIP v2 — the seek bar ============ -->
 <section class="scene" id="scene-history">
   <div class="win">
-    <div class="tbar"><span class="doc">The Crossing</span><span id="hs-doclabel">now · 4,010 words</span><span class="grow"></span><span class="ic">⌕</span><span class="ic" id="clock4" style="background:var(--rule)"></span><span class="ic">≡</span></div>
+    <div class="tbar"><span class="doc">The Crossing</span><span id="hs-doclabel">4,010 words</span><span class="grow"></span><span class="ic">⌕</span><span class="ic" id="clock4" style="background:var(--rule)"></span><span class="ic">≡</span></div>
     <div class="body">
-      <div class="col" style="padding-top:34px;padding-bottom:260px" id="hs-col"></div>
+      <div class="col" style="padding-top:34px;padding-bottom:280px" id="hs-col"></div>
       <div class="hs-wrap" id="hs-wrap">
-        <div class="hs-top"><b>History</b><span id="hs-pos"></span><span class="zoomlbl" id="hs-zoom">project · wheel to zoom · shift-click pins a second moment</span><span class="now" id="hs-now" style="display:none">↦ back to now</span><button class="hs-carry" id="hs-carry" style="display:none">Carry this forward</button></div>
+        <div class="hs-top"><b>History</b><span class="hs-ro" id="hs-ro"></span><button class="hs-restore" id="hs-restore" style="display:none">Restore</button><span class="hs-now home" id="hs-now">Now</span></div>
         <div style="position:relative" id="hs-stage"></div>
-        <div class="hs-cap" id="hs-cap">
-          <span><b style="color:#C9C5BA">across</b> — your working time, breaks folded&nbsp;·&nbsp;<b style="color:#C9C5BA">up</b> — the story’s length; a mark’s height is its place in the text</span>
-          <span><span class="sw" style="background:#C8A951"></span>words arriving</span>
-          <span><span class="sw" style="background:none;border:1.5px solid #8A6D35"></span>words leaving</span>
-          <span><span class="sw" style="background:#3D5C8C;opacity:.5"></span>the editor reading</span>
-          <span><span class="sw" style="background:none;border-bottom:2px solid #6E86AC;height:4px;border-radius:0"></span>an open question → sage when answered</span>
-          <span><span class="sw" style="background:#7D8C66"></span>something came back — nothing destroyed</span>
-        </div>
       </div>
-    </div>
-  </div>
-</section>
-
-<!-- ============ SCENE 5: RE-ENTRY v2 ============ -->
-<section class="scene" id="scene-reentry">
-  <div class="win">
-    <div class="staterow">
-      <label><input type="radio" name="re" value="draft" checked> mid-draft (day 5)</label>
-      <label><input type="radio" name="re" value="rest"> the morning after the seal (day 9)</label>
-      <label><input type="radio" name="re" value="descent"> mid-descent (day 11)</label>
-    </div>
-    <div class="tbar"><span class="doc">The Crossing</span><span>4,120 words</span><span class="grow"></span><span class="ebtn" id="re-ebtn"></span><span class="ic" id="clock5"></span><span class="ic">≡</span></div>
-    <div class="body">
-      <div id="re-note-slot"></div>
-      <div class="col" style="padding-top:14px">
-        <p>Mara took the night crossing because the day boats were full of people who still believed the far shore existed. The ferry’s old reactor hummed under the deck plates like a hive gone drowsy with cold.</p>
-        <p id="re-inline"></p>
-      </div>
-      <div class="mini" id="re-mini"></div>
     </div>
   </div>
 </section>
@@ -329,55 +290,39 @@ main{flex:1;display:flex;min-height:0}
 <script>
 /* ---------- shared: clock glyph (history icon: clock face, NO arrow) ---------- */
 const CLOCK=`<svg width="15" height="15" viewBox="0 0 15 15"><circle cx="7.5" cy="7.5" r="5.8" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M7.5 4.4v3.3l2.3 1.4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>`;
-['clock1','clock2','clock3','clock4','clock5'].forEach(id=>{const e=document.getElementById(id);if(e){e.innerHTML=CLOCK;e.title='History';}});
+['clock1','clock2','clock3','clock4'].forEach(id=>{const e=document.getElementById(id);if(e){e.innerHTML=CLOCK;e.title='History';}});
 
+const CONV=`<div class="conv">Lab convention: everything inside the window is product. Everything on this dark ground is lab.</div>`;
 const NOTES={
- coldread:`<h3>Cold read — v2</h3><ul>
-  <li><em>Font strength</em> cycler: mild (Palatino-class) / bookish (Bookman-class) / typescript (Courier). Is mild enough? Taste decides here.</li>
-  <li>Texture: irregular grain now (feTurbulence), not the dot grid. Squint test: if you can name it, it's too loud.</li>
-  <li>Type at the page: the BANNER PHRASE pulses — no toast, nothing covers anything.</li>
-  <li>Churn heat is gone from this screen (it yanked the reader back into writer stance). It lives in scene 4's strip instead.</li>
-  <li>History variant: the checkpoint's NAME + date lead; “viewing” is muted chrome.</li>
-  <li>Quick marks (? ! ~) then words; the input still floats near the selection — the one sanctioned overlap, reading-mode only, positioning to be crafted.</li></ul>`,
- asides:`<h3>Asides — v2</h3><ul>
-  <li>The fold chip IS the header now — one object, click it.</li>
-  <li>Beats: struck through when done (same editing mechanics as all prose; no checkboxes, ever).</li>
-  <li>The graveyard is READ-ONLY (put back · show origin · delete). One old entry has receded to a one-liner — click it.</li>
-  <li><em>Show origin</em> works: exile the highlighted paragraph (✂ in the margin menu), then click “show origin”.</li>
-  <li>Origin labels quote the neighbouring sentence — no headings assumed.</li>
-  <li>The selection menu lives in the RIGHT MARGIN at the selection's height (nothing covers text; it previews where its results will land). It idles quiet, wakes on approach.</li>
-  <li><em>Left-rail variant</em>: compost as a rail (structure territory). Toggle to compare.</li></ul>`,
- editor:`<h3>The editor button — v2</h3><ul>
-  <li>One control, four channels: door STATE as text (noun) · open count only · cooking dot-pulse (hover names the pass) · the menu, anchored under it.</li>
-  <li>Try all four states above, then click the button.</li>
-  <li>Menu grammar: every row completes <em>“Ask the editor for ___”</em> — all noun phrases, parallel.</li>
-  <li>The gated row: “after the structural queries settle” — points at the gate, never at the prose.</li>
-  <li>Door: state in the button (“Reviewing”), the VERB in the menu footer (“Close the door”).</li>
-  <li>Cards v2: provenance persistent at low contrast (no hover hunt), actions quiet at the foot.</li></ul>`,
- history:`<h3>History strip — the Envelope</h3><ul>
-  <li>One design from the six-voice panel (docs/history-strip.md). The cream ENVELOPE — the story's length — is the only bold object; stepwise, never smoothed.</li>
-  <li>One mark = one op-run with true extent: solid amber = words arriving, hollow burnt = words leaving. Both warm — the writer did both; the fabric proves the AI never writes.</li>
-  <li>Blue veils = the editor reading (full height: it read everything). Blue threads = open questions, sage-capped when answered, grey when waved off. One still open — it runs to now.</li>
-  <li>Stations named AT REST in your words + human words ("Started", never "idle-gap"); ranked omission on collision; real dates below, "Today"/"Yesterday" nearest.</li>
-  <li>DRAG anywhere — continuous; the document re-renders; right of the hairline dims. Shift-click pins a second moment → delta ledger. Wheel zooms about the playhead; marks never re-encode.</li>
-  <li>Scrub into the past → <em>Carry this forward</em>: the restore APPENDS (sage tick + arc back + the envelope steps). Nothing truncated, visibly.</li>
-  <li>Spec'd, not mocked: typing-LEAP through time (find the moment a phrase was born), typing-while-parked = restore with zero dialogs, per-session first lines at project zoom.</li></ul>`,
- reentry:`<h3>Re-entry — v3: the intent is TEXT</h3><ul>
-  <li>No entity, no banner, no lifecycle. The note-to-self is a highlighted LINE OF PROSE at the caret (state 1) or a compost card (state 2) — the writer's text, editable, deletable, ordinary.</li>
-  <li>End Session simply TYPES it there for you; or you type it yourself. The tutorial teaches the practice; d=0.65 backs the practice, not any storage.</li>
-  <li>State 3: nothing was written — nothing is shown. The software never fills the silence.</li>
-  <li>Machine facts stay in the button; the “suggestion” is silent menu ordering.</li></ul>`};
+ coldread:`${CONV}<h3>Cold read — settled</h3><ul>
+  <li>Strings purged (P4): the banner explains nothing now — it states the mode, the draft's name, the count. Type at the page: <em>Reading</em> itself pulses.</li>
+  <li>The reaction input lost its footnote; the placeholder carries it.</li>
+  <li>"sealed draft — day 8" became <em>“Draft complete” · Sun 6 Jul</em> — the writer's own station name + a real date (no “seal”, no numbered days).</li>
+  <li>History-preview variant (toggle above): station name leads, a plain <em>Restore</em> chip, no safety lecture — the strip is where safety is <em>visible</em>.</li></ul>`,
+ asides:`${CONV}<h3>Asides — compost is text</h3><ul>
+  <li>The rail is ONE editable text: blank line = new item, drawn as air + hairline. <em>Click in and type</em> — it works. The quiet bar at the tail is the rail's anchor: the live end, the append target.</li>
+  <li>Floor entry is the aside verb (<em>Set aside</em>, in the selection menu); typing straight into the rail is the notch. An empty rail simply isn't there.</li>
+  <li>No item chrome, no counts, no "unanchored cards". Struck lines are the folk “done”.</li>
+  <li>The last item arrived when its margin-note anchor was cut: the anchor quote wears the margin note's own typography — durable provenance, no blink required.</li>
+  <li><em>Both flanks flank the selection</em>, in a reserved gutter: left, the closed set — eight glyphs, 2×4, a seam before the two that take arguments (link, footnote). Right, the open set — sentence verbs, one column. Balance, not mirror-symmetry.</li>
+  <li>Graveyard footer: the caption and the slogan died (P4); the buttons speak. One verb everywhere: <em>put back</em> — and it works, both places.</li></ul>`,
+ editor:`${CONV}<h3>The editor button</h3><ul>
+  <li>De-mentored (P2): the "usually after…" advice lines died; only the GATED row states its gate. The believing read leads by <em>position</em> — no golden border, no why-line.</li>
+  <li>The door state is presence now (P12): <em>Reading</em> ⇄ <em>Away</em>, on the control that switches it. "Door" stays in the specs; «Читает»/«Не смотрит» localizes gender-free.</li>
+  <li>done got its dotted underline (in-text action affordance).</li></ul>`,
+ history:`${CONV}<h3>History strip v2 — the seek bar</h3><ul>
+  <li>The floor: rail + thumb + readout + <em>Now</em> (rightmost). Click or drag anywhere. Nothing needs reading first — the legend, the axes, the instructions are gone.</li>
+  <li>y flipped: the text hangs from the rail like a page from its top edge; the cream envelope is its length. The rail is always the WHOLE history (a true seek bar); the fabric keeps one fixed quant and scrolls under it at novel scale — here they coincide.</li>
+  <li>The quant: one grain = one word, amber in, burnt-amber out; bursts fuse into strokes by density alone. No zoom, ever.</li>
+  <li>Scrub stability law: while you drag, only the thumb, the readout numerals, the dim edge and the page move. Labels never re-rank. Near a station its name <em>brightens</em> — no "after X" sentence, ever.</li>
+  <li>Park in the past → <em>Restore</em> appears by the readout and <em>Now</em> brightens: the two exits announce themselves as a pair. Restore appends: sage tick, arc back, the envelope steps. Shift-click still pins a second moment — unadvertised, a notch.</li></ul>`};
 
 const VARS={
  coldread:[
   {id:'v-face',label:'face',type:'cycle',opts:['bookish','mild','typescript'],cur:0},
   {id:'v-texture',label:'paper texture',on:true},
   {id:'v-hist',label:'history-preview variant',on:false}],
- asides:[
-  {id:'v-rail',label:'compost as left rail',on:false}],
- editor:[],
- history:[],
- reentry:[]};
+ asides:[],editor:[],history:[]};
 
 const stage={cur:'coldread'};
 function show(s){
@@ -399,6 +344,7 @@ function show(s){
     }
   });
   applyVars();
+  if(s==='asides')setTimeout(smAlign,0);
 }
 document.querySelectorAll('.tab[data-s]').forEach(t=>t.onclick=()=>show(t.dataset.s));
 const cyc=id=>(VARS[stage.cur]||[]).find(v=>v.id===id);
@@ -414,15 +360,9 @@ function applyVars(){
     pg.classList.toggle('textured',chk('v-texture'));
     const h=chk('v-hist');
     document.getElementById('cr-banner').innerHTML=h
-      ?`<b>“Draft complete”</b><span>· June 12 · 4,120 words</span><span style="opacity:.6">·</span><span>viewing — <span style="color:var(--text)">restore brings it back as a new version; everything since stays</span></span><span style="opacity:.6">·</span><span>Esc returns</span>`
-      :`<b>Reading</b><span>· sealed draft — day 8 · 4,120 words</span><span style="opacity:.6">·</span><span class="pulseme" id="cr-pulse">reactions become margin notes — the text can’t be edited here</span><span style="opacity:.6">·</span><span>Esc returns to the desk</span>`;
+      ?`<b>“Draft complete”</b><span>· Sun 6 Jul · 4,120 words</span><button class="restore">Restore</button><span style="opacity:.6">·</span><span>Esc returns</span>`
+      :`<b class="pulseme" id="cr-pulse">Reading</b><span>· “Draft complete” · 4,120 words</span><span style="opacity:.6">·</span><span>Esc returns</span>`;
     document.getElementById('cr-mode-label').textContent=h?'— viewing “Draft complete”':'— reading';
-  }
-  if(stage.cur==='asides'){
-    const r=chk('v-rail');
-    document.getElementById('as-rail').style.display=r?'block':'none';
-    document.getElementById('as-compost').style.display=r?'none':'block';
-    setTimeout(smAlign,0);
   }
 }
 
@@ -481,45 +421,52 @@ document.addEventListener('keydown',e=>{
 });
 
 /* ---------- scene 2 ---------- */
-document.getElementById('as-fold').onclick=()=>{
-  const b=document.getElementById('as-body');
-  const open=b.style.display!=='none';
-  b.style.display=open?'none':'block';
-  document.getElementById('as-arrow').textContent=open?'▸':'▾';
-};
+let exiled=null;
 document.getElementById('sm-exile').onclick=()=>{
   const v=document.getElementById('as-victim');if(!v)return;
   const g=document.querySelector('#as-grave .inner');
   const e=document.createElement('div');e.className='entry';
   const txt=v.textContent.trim();
-  e.innerHTML=`<div class="whisper">cut from after <i>“…casting two shadows in the single running light.”</i> · just now · <span class="act" data-act="origin">show origin</span> · <span class="act">put back</span> · <span class="act">delete</span></div>${txt}`;
+  e.innerHTML=`<div class="whisper">cut from after <i>“…casting two shadows in the single running light.”</i> · just now · <span class="act" data-act="origin">show origin</span> · <span class="act" data-act="back">put back</span> · <span class="act">delete</span></div>${txt}`;
   g.appendChild(e);e.classList.add('originflash');
-  e.querySelector('[data-act=origin]').onclick=()=>{
+  e.querySelector('[data-act=origin]').onclick=ev=>{ev.stopPropagation();
     const o=document.getElementById('as-origin');
     o.scrollIntoView({block:'center',behavior:'smooth'});
     o.classList.remove('originflash');void o.offsetWidth;o.classList.add('originflash');
   };
-  v.remove();document.getElementById('as-selmenu').remove();
-  document.getElementById('as-count').innerHTML=`3,340 words <span style="opacity:.75">· aside 558</span>`;
-  // the footer acknowledges: count ticks, bar blinks, undo appears (the visible insurance)
+  const putBack=()=>{
+    const o=document.getElementById('as-origin');
+    o.insertAdjacentElement('afterend',exiled.node);e.remove();
+    document.getElementById('as-gcount').textContent='1';
+    const u0=document.getElementById('as-undo');u0.style.display='none';
+    document.getElementById('as-selmenu').style.display='';
+    document.getElementById('as-fmt').style.display='';
+    exiled.node.classList.add('originflash');exiled=null;
+    setTimeout(smAlign,0);
+  };
+  e.querySelector('[data-act=back]').onclick=ev=>{ev.stopPropagation();putBack();};
+  exiled={node:v,entry:e};
+  v.remove();document.getElementById('as-selmenu').style.display='none';document.getElementById('as-fmt').style.display='none';
   document.getElementById('as-gcount').textContent='2';
   const bar=document.getElementById('as-gravebar');
   bar.classList.remove('pulse');void bar.offsetWidth;bar.classList.add('pulse');
-  document.getElementById('as-undo').style.display='inline';
+  const u=document.getElementById('as-undo');u.style.display='inline';
+  u.onclick=ev=>{ev.stopPropagation();putBack();};
   bar.onclick=()=>{g.scrollIntoView({block:'end',behavior:'smooth'});};
 };
-/* align the selection menu to the selection's first line (the design rule) */
+/* both flanks align to the selection's first line (the design rule) */
 function smAlign(){
   const v=document.getElementById('as-victim'),m=document.getElementById('as-selmenu'),
-        l=document.getElementById('as-lane');
+        f=document.getElementById('as-fmt'),
+        l=document.getElementById('as-lane'),c=document.getElementById('as-col');
   if(v&&m&&l&&v.getBoundingClientRect().height>0){
     m.style.top=(v.getBoundingClientRect().top-l.getBoundingClientRect().top)+'px';
+    f.style.top=(v.getBoundingClientRect().top-c.getBoundingClientRect().top)+'px';
   }
 }
-smAlign();window.addEventListener('resize',smAlign);
-document.getElementById('as-fold').addEventListener('click',()=>setTimeout(smAlign,0));
+window.addEventListener('resize',smAlign);
 document.getElementById('as-receded').onclick=e=>{
-  e.target.outerHTML=`<div class="entry"><div class="whisper">cut from after <i>“Neither is the river.”</i> · day 11 · <span class="act">show origin</span> · <span class="act">put back</span> · <span class="act">delete</span></div>The dockmaster’s daughter kept a ledger of everything the river had taken: four hats, a violin, the summer of ’31, her mother’s good opinion of her father.</div>`;
+  e.target.outerHTML=`<div class="entry"><div class="whisper">cut from after <i>“Neither is the river.”</i> · Tue 8 Jul · <span class="act">show origin</span> · <span class="act">put back</span> · <span class="act">delete</span></div>The dockmaster’s daughter kept a ledger of everything the river had taken: four hats, a violin, the summer of ’31, her mother’s good opinion of her father.</div>`;
 };
 
 /* ---------- scene 3 ---------- */
@@ -548,11 +495,11 @@ document.getElementById('ebtn').onclick=()=>{
 };
 document.getElementById('doorverb').onclick=e=>{
   e.stopPropagation();
-  e.target.textContent=e.target.textContent==='Close the door'?'Open the door':'Close the door';
+  e.target.textContent=e.target.textContent==='Reading'?'Away':'Reading';
 };
 ebRender();
 
-/* ---------- scene 4: the Envelope ---------- */
+/* ---------- scene 4: the seek bar over the fabric ---------- */
 const HS=(()=>{ // deterministic simulation of a 12-day contest story
  let seed=42;const rnd=()=>((seed=(seed*48271)%2147483647)/2147483647);
  const SESS=[
@@ -565,20 +512,18 @@ const HS=(()=>{ // deterministic simulation of a 12-day contest story
   {d:'Sun 6 Jul',runs:26,mode:'draft',gap:'22 h',endSt:{name:'“Draft complete”',rank:1,seal:true}},
   {d:'Tue 8 Jul',runs:4,mode:'read',gap:'2 d',pass:{kind:'believing',cards:2}},
   {d:'Wed 9 Jul',runs:28,mode:'revise',gap:'1 d',pass:{kind:'developmental',cards:4},bigcut:true},
-  {d:'Thu 10 Jul',runs:22,mode:'revise',gap:'19 h',preSt:{name:'Before the line read',rank:4},pass:{kind:'line',cards:3}},
+  {d:'Thu 10 Jul',runs:22,mode:'revise',gap:'19 h',pass:{kind:'line',cards:3}},
   {d:'Yesterday',runs:16,mode:'revise',gap:'1 d',restore:true},
   {d:'Today',runs:18,mode:'polish',gap:'16 h',pass:{kind:'copy',cards:2},endSt:{name:'Submitted',rank:2}},
  ];
- const runs=[],passes=[],cards=[],stations=[],seams=[],env=[];let restoreEv=null;
+ const runs=[],passes=[],cards=[],stations=[],seams=[],env=[];const restoreEvs=[];
  let x=0,len=0;const SEAM=10,RW=2.6;
  const pushEnv=()=>env.push({x,len});
  pushEnv();
  SESS.forEach((S,si)=>{
   if(S.gap){seams.push({x,label:S.gap});x+=SEAM;pushEnv();}
   S.x0=x;
-  if(S.preSt)stations.push({x,...S.preSt});
   if(S.st)S.st.forEach(st=>stations.push({x,...st}));
-  let px=len*.1;
   if(S.pass){const w=4+rnd()*4;passes.push({x0:x,x1:x+w,kind:S.pass.kind});
    for(let c=0;c<S.pass.cards;c++){const anchor=len*(0.12+rnd()*0.8);
     cards.push({x0:x+w*0.6,anchor,alt:S.pass.kind,end:null});}
@@ -592,11 +537,11 @@ const HS=(()=>{ // deterministic simulation of a 12-day contest story
    else{if(rnd()<0.55){kind='del';l=15+rnd()*90;}else{l=15+rnd()*80;}p=rnd()*len*0.95;}
    if(S.bigcut&&r===10){kind='del';l=2600;p=len*0.34;}
    const w=RW*(0.6+Math.min(2.2,l/220));
-   runs.push({x0:x,x1:x+w,p0:p,p1:p+Math.min(l,Math.max(60,l)),kind});
+   runs.push({x0:x,x1:x+w,p0:p,p1:p+l,l,kind});
    len+=(kind==='ins'?l:-l);len=Math.max(200,len);
    x+=w+0.7;pushEnv();
-   if(S.restore&&r===7&&!restoreEv){const from=stations.find(t=>t.seal);
-    restoreEv={x,fromX:from.x};stations.push({x,name:'brought back',rank:3,sage:true});
+   if(S.restore&&r===7&&!restoreEvs.length){const from=stations.find(t=>t.seal);
+    restoreEvs.push({x,fromX:from.x});stations.push({x,name:'Restored',rank:3,sage:true});
     len+=820;pushEnv();x+=1.2;pushEnv();}
   }
   // resolve some earlier cards during this session
@@ -606,85 +551,127 @@ const HS=(()=>{ // deterministic simulation of a 12-day contest story
  });
  // one question stays open to now; unresolved others close sage late
  let open=0;cards.forEach(c=>{if(c.end===null){if(open<1){c.x1=x;c.end='open';open++;}else{c.x1=x-6-rnd()*10;c.end='sage';}}});
- return {runs,passes,cards,stations,seams,env,total:x,maxLen:Math.max(...env.map(e=>e.len)),SESS,restoreEv};
+ return {runs,passes,cards,stations,seams,env,total:x,maxLen:Math.max(...env.map(e=>e.len)),SESS,restoreEvs,rnd};
 })();
 
-const HSV={W:1064,H:150,LANE:24,zoom:1,pan:0,pos:1,pin:null,carried:false};
-function hsX(u){return (u/HS.total)*HSV.W*HSV.zoom - HSV.pan;}
-function hsU(px){return (px+HSV.pan)/(HSV.W*HSV.zoom)*HS.total;}
-function hsY(p){return HSV.LANE+HSV.H-(p/HS.maxLen)*HSV.H;}
+/* geometry: label lane on top, then the RAIL (= the document's top edge), fabric hangs below */
+const HSV={W:1064,LANE:24,RAILY:30,FH:132,DATEH:14,pos:1,pin:null};
+const HSH=()=>HSV.RAILY+HSV.FH+HSV.DATEH+6;
+const hsX=u=>(u/HS.total)*HSV.W;
+const hsU=px=>(px/HSV.W)*HS.total;
+const hsY=p=>HSV.RAILY+(p/HS.maxLen)*HSV.FH;
 function hsLenAt(u){let l=HS.env[0].len;for(const e of HS.env){if(e.x<=u)l=e.len;else break;}return l;}
-function hsRender(){
- const st=document.getElementById('hs-stage');
- const W=HSV.W,H=HSV.H+HSV.LANE;
- const phU=HSV.pos*HS.total,phX=hsX(phU);
- let g='';
- // seams (folded breaks) — visible at rest, labeled
- HS.seams.forEach(s0=>{const a=hsX(s0.x),b=hsX(s0.x+10);if(b<0||a>W)return;
-  g+=`<rect x="${a}" y="${HSV.LANE}" width="${b-a}" height="${HSV.H}" fill="#1D1C17"/><line x1="${a}" y1="${HSV.LANE}" x2="${a}" y2="${H}" stroke="#3a382f"/><line x1="${b}" y1="${HSV.LANE}" x2="${b}" y2="${H}" stroke="#3a382f"/><text x="${(a+b)/2}" y="${H-5}" fill="#6e6a5d" font-size="8.5" text-anchor="middle">${s0.label}</text>`;});
- // AI veils — full height floor→envelope
- HS.passes.forEach(p0=>{const a=hsX(p0.x0),b=hsX(p0.x1);if(b<0||a>W)return;
-  const top=hsY(hsLenAt(p0.x0));
-  g+=`<rect x="${a}" y="${top}" width="${Math.max(2,b-a)}" height="${H-top}" fill="#3D5C8C" opacity="0.32"/><text x="${a+3}" y="${Math.min(H-8,top+11)}" fill="#8FA6C8" font-size="8.5">${p0.kind}</text>`;});
- // op-runs: solid amber ins / hollow burnt del, true extent, additive alpha
- HS.runs.forEach(r=>{const a=hsX(r.x0);if(a<-8||a>W+8)return;
-  const w=Math.max(1.8,hsX(r.x1)-a),y1=hsY(r.p1),y0=hsY(r.p0),hh=Math.max(3,y0-y1);
-  g+= r.kind==='ins'
-   ? `<rect x="${a}" y="${y1}" width="${w}" height="${hh}" fill="#C8A951" opacity="0.75"/>`
-   : `<rect x="${a}" y="${y1}" width="${w}" height="${hh}" fill="none" stroke="#8A6D35" stroke-width="1.1" opacity="0.85"/>`;});
- // card threads at anchor height; terminals sage/grey; open → runs to now
- HS.cards.forEach(c=>{const a=hsX(c.x0),b=hsX(c.end==='open'?HS.total:c.x1);if(b<0||a>W)return;
-  const y=hsY(c.anchor),lw=c.alt==='developmental'?1.6:1;
-  g+=`<line x1="${a}" y1="${y}" x2="${b}" y2="${y}" stroke="#6E86AC" stroke-width="${lw}" opacity="0.8"/><circle cx="${a}" cy="${y}" r="2.2" fill="none" stroke="#6E86AC"/>`;
-  if(c.end==='sage')g+=`<circle cx="${b}" cy="${y}" r="2.6" fill="#7D8C66"/>`;
-  else if(c.end==='grey')g+=`<circle cx="${b}" cy="${y}" r="2.4" fill="none" stroke="#8A8678"/>`;});
- // THE ENVELOPE — stepwise cream skyline, the one bold object
- let d='';HS.env.forEach((e,i)=>{const ex=hsX(e.x),ey=hsY(e.len);d+= i?`H${ex.toFixed(1)}V${ey.toFixed(1)}`:`M${ex.toFixed(1)},${ey.toFixed(1)}`;});
- d+=`H${hsX(HS.total).toFixed(1)}`;
- g+=`<path d="${d}" fill="none" stroke="#FBFAF8" stroke-width="1.6"/>`;
- // restore: sage tick + dashed arc back + (envelope step is in the data)
- if(HS.restoreEv){const rx=hsX(HS.restoreEv.x),fx=hsX(HS.restoreEv.fromX);
-  g+=`<line x1="${rx}" y1="8" x2="${rx}" y2="${H}" stroke="#7D8C66" stroke-width="1.6"/><path d="M${fx},10 C${fx+(rx-fx)*0.3},2 ${fx+(rx-fx)*0.7},2 ${rx},10" fill="none" stroke="#7D8C66" stroke-dasharray="3 3"/>`;}
- // stations: full-height ticks + ranked-omission labels at rest (two-row stagger)
- const sts=[...HS.stations].sort((a,b)=>a.rank-b.rank);const placed=[];
- sts.forEach(t0=>{const tx=hsX(t0.x);if(tx<0||tx>W)return;
-  g+=`<line x1="${tx}" y1="6" x2="${tx}" y2="${H}" stroke="${t0.sage?'#7D8C66':'#EAE6D8'}" stroke-width="1" opacity="0.55"/>`;
+function hsSessionAt(u){for(const S of HS.SESS){if(u<=(S.x1??0)+2&&u>=(S.x0??0)-11)return S;}return HS.SESS[HS.SESS.length-1];}
+
+/* the word-quanta are computed ONCE — the fabric never re-lays-out (the stability law) */
+let HSQ=null,HSLBL=null;
+function hsBake(){
+ let seed=7;const rnd=()=>((seed=(seed*48271)%2147483647)/2147483647);
+ const ins=[],del=[];
+ HS.runs.forEach(r=>{
+  const n=Math.min(70,Math.max(1,Math.round(r.l/5.8)));
+  const a=hsX(r.x0),w=Math.max(1.6,hsX(r.x1)-a);
+  const y0=hsY(Math.min(r.p0,r.p1)),y1=hsY(Math.min(HS.maxLen,Math.max(r.p0,r.p1)));
+  for(let i=0;i<n;i++){
+   const qx=(a+rnd()*w).toFixed(1),qy=(y0+rnd()*Math.max(2,(y1-y0))).toFixed(1);
+   (r.kind==='ins'?ins:del).push(`M${qx} ${qy}h2v2h-2z`);
+  }
+ });
+ // station labels: ranked omission, two rows, computed once — never during scrub
+ const sts=[...HS.stations].sort((a,b)=>a.rank-b.rank);const placed=[];const lbl=[];
+ sts.forEach((t0,i)=>{const tx=hsX(t0.x);
   const tw=t0.name.length*5.6+6;
+  const flip=tx+tw>HSV.W-4; // near the right edge the name sets to the tick's left
   let row=0,fits=!placed.some(p0=>p0.row===0&&Math.abs(p0.x-tx)<(p0.w+tw)/2);
   if(!fits){row=1;fits=!placed.some(p0=>p0.row===1&&Math.abs(p0.x-tx)<(p0.w+tw)/2);}
-  if(fits){placed.push({x:tx,w:tw,row});
-   g+=`<text x="${tx+3}" y="${row?19:9}" fill="${t0.sage?'#9DB088':'#EAE6D8'}" font-size="9">${t0.name}</text>`;}});
- // dim the not-yet (right of playhead) — a static encoding, legal in any still
- if(HSV.pos<0.999)g+=`<rect x="${phX}" y="0" width="${Math.max(0,W-phX)}" height="${H}" fill="#26251F" opacity="0.6"/>`;
- // pin (second moment) + delta
- if(HSV.pin!==null){const px2=hsX(HSV.pin*HS.total);
-  g+=`<line x1="${px2}" y1="0" x2="${px2}" y2="${H}" stroke="#DFC98A" stroke-width="1" stroke-dasharray="2 3"/>`;}
- // playhead
- g+=`<line x1="${phX}" y1="0" x2="${phX}" y2="${H}" stroke="#FFFFFF" stroke-width="1.6"/>`;
- st.innerHTML=`<svg id="hs-svg" width="${W}" height="${H}" style="margin:0 18px">${g}</svg><div class="hs-readout" id="hs-ro" style="left:${Math.min(W-120,Math.max(120,phX+18))}px;top:${H-16}px"></div>`;
- hsReadout(phU);
+  if(fits){placed.push({x:tx,w:tw,row});lbl.push({x:tx,y:row?21:11,name:t0.name,sage:!!t0.sage,u:t0.x,flip});}});
+ // session dates: thinned once, drawn in the bottom lane
+ const dates=[];let lastX=-999;
+ HS.SESS.forEach(S=>{const dx=hsX(S.x0);if(dx-lastX>86){dates.push({x:dx,d:S.d});lastX=dx;}});
+ HSQ={ins:ins.join(''),del:del.join('')};HSLBL={lbl,dates};
+}
+function hsBuild(){
+ hsBake();
+ const W=HSV.W,H=HSH();
+ let g='';
+ // seams — folded breaks, hatched
+ HS.seams.forEach(s0=>{const a=hsX(s0.x),b=hsX(s0.x+10);
+  g+=`<rect x="${a}" y="${HSV.RAILY}" width="${b-a}" height="${HSV.FH}" fill="#1D1C17"/>`;});
+ // the page itself: a faint cream sheet from the rail down to the envelope —
+ // the story hangs from the rail and grows downward (never a falling vital sign)
+ {let pd='';HS.env.forEach((e,i)=>{const ex=hsX(e.x),ey=hsY(e.len);pd+= i?`H${ex.toFixed(1)}V${ey.toFixed(1)}`:`M${ex.toFixed(1)},${ey.toFixed(1)}`;});
+  pd+=`H${hsX(HS.total).toFixed(1)}V${HSV.RAILY}H${hsX(HS.env[0].x).toFixed(1)}Z`;
+  g+=`<path d="${pd}" fill="#FBFAF8" opacity="0.13"/>`;}
+ // AI veils — from the rail down to the envelope (the whole text, read whole)
+ HS.passes.forEach(p0=>{const a=hsX(p0.x0),b=hsX(p0.x1);
+  const bot=hsY(hsLenAt(p0.x0));
+  g+=`<rect x="${a}" y="${HSV.RAILY}" width="${Math.max(2,b-a)}" height="${bot-HSV.RAILY}" fill="#3D5C8C" opacity="0.28"/>`;});
+ // the word-quanta fabric
+ g+=`<path d="${HSQ.ins}" fill="#C8A951" fill-opacity="0.5"/>`;
+ g+=`<path d="${HSQ.del}" fill="#8A6D35" fill-opacity="0.62"/>`;
+ // card threads at anchor depth; sage/grey terminals; the open one runs to now
+ HS.cards.forEach(c=>{const a=hsX(c.x0),b=hsX(c.end==='open'?HS.total:c.x1);
+  const y=hsY(c.anchor),lw=c.alt==='developmental'?1.5:1;
+  g+=`<line x1="${a}" y1="${y}" x2="${b}" y2="${y}" stroke="#6E86AC" stroke-width="${lw}" opacity="0.7"/><circle cx="${a}" cy="${y}" r="2" fill="none" stroke="#6E86AC" opacity="0.8"/>`;
+  if(c.end==='sage')g+=`<circle cx="${b}" cy="${y}" r="2.5" fill="#7D8C66"/>`;
+  else if(c.end==='grey')g+=`<circle cx="${b}" cy="${y}" r="2.3" fill="none" stroke="#8A8678"/>`;});
+ // THE ENVELOPE — the story's length, hanging from the rail
+ let d='';HS.env.forEach((e,i)=>{const ex=hsX(e.x),ey=hsY(e.len);d+= i?`H${ex.toFixed(1)}V${ey.toFixed(1)}`:`M${ex.toFixed(1)},${ey.toFixed(1)}`;});
+ d+=`H${hsX(HS.total).toFixed(1)}`;
+ g+=`<path d="${d}" fill="none" stroke="#FBFAF8" stroke-width="1.3" opacity="0.9"/>`;
+ // restores: sage tick + dashed arc riding the label lane back to its source — every one kept
+ HS.restoreEvs.forEach(ev=>{const rx=hsX(ev.x),fx=hsX(ev.fromX);
+  g+=`<line x1="${rx}" y1="8" x2="${rx}" y2="${HSV.RAILY+HSV.FH}" stroke="#7D8C66" stroke-width="1.5"/><path d="M${rx},9 C${rx-(rx-fx)*0.3},2 ${fx+(rx-fx)*0.3},2 ${fx},9" fill="none" stroke="#7D8C66" stroke-dasharray="3 3" opacity="0.9"/>`;});
+ // stations: ticks + names (baked layout; brightness is the only thing that ever changes)
+ HS.stations.forEach(t0=>{const tx=hsX(t0.x);
+  g+=`<line x1="${tx}" y1="6" x2="${tx}" y2="${HSV.RAILY+HSV.FH}" stroke="${t0.sage?'#7D8C66':'#EAE6D8'}" stroke-width="1" opacity="0.4"/>`;});
+ HSLBL.lbl.forEach((t0,i)=>{
+  g+=`<text id="hs-lb${i}" x="${t0.flip?t0.x-3:t0.x+3}" y="${t0.y}" ${t0.flip?'text-anchor="end"':''} fill="${t0.sage?'#9DB088':'#EAE6D8'}" font-size="9" opacity="0.75">${t0.name}</text>`;});
+ // session dates, bottom lane
+ HSLBL.dates.forEach(t0=>{g+=`<text x="${t0.x+1}" y="${H-3}" fill="#8a8577" font-size="9.5">${t0.d}</text>`;});
+ // the RAIL — the seek bar, the document's own top edge
+ g+=`<line x1="0" y1="${HSV.RAILY}" x2="${W}" y2="${HSV.RAILY}" stroke="#4a4840" stroke-width="2"/>`;
+ document.getElementById('hs-stage').innerHTML=
+  `<svg id="hs-svg" width="${W}" height="${H}" style="margin:0 18px;display:block;cursor:pointer">
+    <g>${g}</g>
+    <line id="hs-pin" x1="0" y1="4" x2="0" y2="${HSV.RAILY+HSV.FH}" stroke="#DFC98A" stroke-width="1" stroke-dasharray="2 3" style="display:none"/>
+    <rect id="hs-dim" x="0" y="0" width="0" height="${HSV.RAILY+HSV.FH}" fill="#26251F" opacity="0.62"/>
+    <line id="hs-ph" x1="0" y1="8" x2="0" y2="${HSV.RAILY+HSV.FH}" stroke="#FFFFFF" stroke-width="1.4"/>
+    <circle id="hs-thumb" cx="0" cy="${HSV.RAILY}" r="5.5" fill="#FBFAF8" stroke="#26251F" stroke-width="1.5"/>
+   </svg>`;
  hsBindSvg();
+ hsFrame();
+}
+/* per-frame: ONLY the thumb, the playhead, the dim edge, the readout, label brightness */
+function hsFrame(){
+ const u=HSV.pos*HS.total,px=hsX(u);
+ const svg=document.getElementById('hs-svg');if(!svg)return;
+ svg.querySelector('#hs-ph').setAttribute('x1',px);svg.querySelector('#hs-ph').setAttribute('x2',px);
+ svg.querySelector('#hs-thumb').setAttribute('cx',Math.max(6,Math.min(HSV.W-6,px)));
+ const dim=svg.querySelector('#hs-dim');dim.setAttribute('x',px);dim.setAttribute('width',Math.max(0,HSV.W-px));
+ const pin=svg.querySelector('#hs-pin');
+ if(HSV.pin!==null){const qx=hsX(HSV.pin*HS.total);pin.style.display='';pin.setAttribute('x1',qx);pin.setAttribute('x2',qx);}
+ else pin.style.display='none';
+ HSLBL.lbl.forEach((t0,i)=>{const el=svg.querySelector('#hs-lb'+i);if(!el)return;
+  el.setAttribute('opacity',Math.abs(hsX(t0.u)-px)<14?'1':'0.75');
+  el.setAttribute('font-weight',Math.abs(hsX(t0.u)-px)<14?'600':'400');});
+ // the readout: date + words. never a sentence, never a station name inside it
+ const words=Math.round(hsLenAt(u)/5.8);
+ let txt=`${hsSessionAt(u).d} · ${words.toLocaleString('en')} words`;
+ if(HSV.pin!==null){const wu=HSV.pin*HS.total;const dw=words-Math.round(hsLenAt(wu)/5.8);
+  txt+=` · ${dw>=0?'+':''}${dw.toLocaleString('en')} since ${hsSessionAt(wu).d}`;}
+ document.getElementById('hs-ro').textContent=txt;
+ const home=HSV.pos>0.999;
+ document.getElementById('hs-now').classList.toggle('home',home);
+ document.getElementById('hs-restore').style.display=home?'none':'inline-block';
+ document.getElementById('hs-doclabel').textContent=`${words.toLocaleString('en')} words`;
  hsDoc();
 }
-function hsSessionAt(u){for(const S of HS.SESS){if(u<=(S.x1??0)+2&&u>=(S.x0??0)-11)return S;}return HS.SESS[HS.SESS.length-1];}
-function hsReadout(u){
- const words=Math.round(hsLenAt(u)/5.8);
- const before=[...HS.stations].filter(t=>t.x<=u).pop();
- const S=hsSessionAt(u);
- let txt=`${S.d} · ${words.toLocaleString('en')} words${before?` · after ${before.name}`:''}`;
- if(HSV.pin!==null){const wu=HSV.pin*HS.total;const dw=words-Math.round(hsLenAt(wu)/5.8);
-  txt+=`  ·  Δ ${dw>=0?'+':''}${dw.toLocaleString('en')} words since the pin`;}
- const ro=document.getElementById('hs-ro');if(ro)ro.textContent=txt;
- document.getElementById('hs-pos').textContent=txt;
- document.getElementById('hs-doclabel').textContent=(HSV.pos>0.999?'now · ':'')+txt.split('  ·  ')[0];
- document.getElementById('hs-now').style.display=HSV.pos>0.999?'none':'inline';
- document.getElementById('hs-carry').style.display=HSV.pos>0.999?'none':'inline-block';
-}
 const HSDOCS=[
- {t:0.10,paras:[`Premise B (dead): generation ship, mutiny in cold storage.`,`<i style="color:var(--muted)">［fragments — the ending arrives on Tue 1 Jul, in the shower］</i>`]},
- {t:0.55,paras:[`Mara took the night crossing because the day boats were full. The ferry’s old reactor hummed under the deck plates.`,`<i style="color:var(--muted)">［mid-draft — the stowaway is two sessions away］</i>`]},
+ {t:0.10,paras:[`Premise B (dead): generation ship, mutiny in cold storage. Everyone has this one.`,`A ferry. A night crossing. The far shore may not be there.`,`“Salt on the railing like the river had been chewing it.”`]},
+ {t:0.55,paras:[`Mara took the night crossing because the day boats were full. The ferry’s old reactor hummed under the deck plates.`,`She had made the run eleven times, and lied about why to the manifest clerk each time.`]},
  {t:0.66,paras:[`Mara took the night crossing because the day boats were full of people who still believed the far shore existed.`,`The stowaway appeared on the third night, casting two shadows in the single running light.`,`The customs officer had a theory about the fog. He had charts. He had dates. Nobody would listen.`]},
- {t:0.86,paras:[`Mara took the night crossing because the day boats were full of people who still believed the far shore existed.`,`The stowaway appeared on the third night, casting two shadows in the single running light.`,`<i style="color:var(--muted)">［the customs officer is in the graveyard — cut in the Wed 9 Jul session］</i>`]},
+ {t:0.86,paras:[`Mara took the night crossing because the day boats were full of people who still believed the far shore existed.`,`The stowaway appeared on the third night, casting two shadows in the single running light.`,`“You’re not on the manifest,” Mara said.`]},
  {t:1.01,paras:[`Mara took the night crossing because the day boats were full of people who still believed the far shore existed.`,`The stowaway appeared on the third night, casting two shadows in the single running light.`,`The customs officer had a theory about the fog. He had charts. He had dates. Nobody would listen.`,`“You’re not on the manifest,” Mara said. “Neither is the river,” he said.`]}];
 function hsDoc(){
  const u=HSV.pos;let d=HSDOCS[0];for(const x0 of HSDOCS){if(u<=x0.t){d=x0;break;}d=x0;}
@@ -693,46 +680,22 @@ function hsDoc(){
 function hsBindSvg(){
  const svg=document.getElementById('hs-svg');if(!svg)return;
  let drag=false;
- const seek=e=>{const r=svg.getBoundingClientRect();HSV.pos=Math.max(0,Math.min(1,hsU(e.clientX-r.left)/HS.total));hsRender();};
- svg.onmousedown=e=>{if(e.shiftKey){const r=svg.getBoundingClientRect();HSV.pin=Math.max(0,Math.min(1,hsU(e.clientX-r.left)/HS.total));hsRender();return;}drag=true;seek(e);};
+ const seek=e=>{const r=svg.getBoundingClientRect();HSV.pos=Math.max(0,Math.min(1,hsU(e.clientX-r.left)/HS.total));hsFrame();};
+ svg.onmousedown=e=>{if(e.shiftKey){const r=svg.getBoundingClientRect();HSV.pin=Math.max(0,Math.min(1,hsU(e.clientX-r.left)/HS.total));hsFrame();return;}drag=true;seek(e);};
  svg.onmousemove=e=>{if(drag)seek(e);};
  window.addEventListener('mouseup',()=>{drag=false;});
- svg.onwheel=e=>{e.preventDefault();const r=svg.getBoundingClientRect();const mx=e.clientX-r.left;const uAt=hsU(mx);
-  HSV.zoom=Math.max(1,Math.min(7,HSV.zoom*(e.deltaY<0?1.25:0.8)));
-  HSV.pan=(uAt/HS.total)*HSV.W*HSV.zoom-mx;HSV.pan=Math.max(0,Math.min(HSV.W*(HSV.zoom-1),HSV.pan));
-  document.getElementById('hs-zoom').textContent=(HSV.zoom<1.4?'project':HSV.zoom<3.5?'session':'burst')+' · wheel to zoom · shift-click pins a second moment';
-  hsRender();};
 }
-document.getElementById('hs-now').onclick=()=>{HSV.pos=1;HSV.pin=null;hsRender();};
-document.getElementById('hs-carry').onclick=()=>{
- if(HSV.carried)return;HSV.carried=true;
+document.getElementById('hs-now').onclick=()=>{HSV.pos=1;HSV.pin=null;hsFrame();};
+document.getElementById('hs-restore').onclick=()=>{
  // the restore APPENDS: a sage tick at the end, an arc back, the envelope steps — nothing truncated
- const from=[...HS.stations].filter(t=>t.x<=HSV.pos*HS.total).pop();
- const l=hsLenAt(HSV.pos*HS.total);
- HS.stations.push({x:HS.total+3,name:'carried forward',rank:3,sage:true});
- HS.restoreEv={x:HS.total+3,fromX:HSV.pos*HS.total};
+ const l=hsLenAt(HSV.pos*HS.total),fromX=HSV.pos*HS.total;
+ HS.stations.push({x:HS.total+3,name:'Restored',rank:3,sage:true});
+ HS.restoreEvs.push({x:HS.total+3,fromX});
  HS.env.push({x:HS.total+2.5,len:hsLenAt(HS.total)},{x:HS.total+3,len:l});
- HS.total+=8;HSV.pos=1;hsRender();
+ HS.total+=8;HSV.pos=1;HSV.pin=null;
+ hsBuild(); // data changed — the one lawful re-layout
 };
-hsRender();
-/* ---------- scene 5 ---------- */
-const RE={
- draft:{inline:`Next: write the confrontation at the airlock — don’t explain the fog yet.`,card:'',btn:EB.idle.btn,fact:`the intent is TEXT — your own highlighted line, exactly where the caret wakes up. Edit it, delete it, ignore it: it is prose, not an entity. The menu leads with <b>A believing read</b>.`},
- rest:{inline:'',card:`It needs to end on the water, not on the dock. Check the ferry timetable scene.`,btn:`Ask the editor ▾`,fact:`the same practice, parked as a compost card at the seal. The menu leads with <b>A cold read of the draft</b> — ordering, not a banner.`},
- descent:{inline:'',card:'',btn:`<span class="state">Reviewing · 3 open</span> · Ask the editor ▾`,fact:`nothing was written down — so nothing is shown. The button states the count; the menu leads with <b>The open queries (3)</b>. No “mid-descent”, no mood.`}};
-function reRender(){
-  const v=document.querySelector('input[name=re]:checked').value,s=RE[v];
-  document.getElementById('re-note-slot').innerHTML=s.card
-    ?`<div class="wnote" style="font-style:normal"><span style="font:11px system-ui;color:var(--muted);flex-shrink:0">compost · yours</span><span>${s.card}</span><span class="x">×</span></div>`
-    :`<div style="height:14px"></div>`;
-  document.getElementById('re-inline').innerHTML=s.inline
-    ?`<mark style="background:#F9E29CAA;padding:1px 3px">${s.inline}</mark><span class="caret"></span>`
-    :`<span class="caret"></span>`;
-  document.getElementById('re-ebtn').innerHTML=s.btn;
-  document.getElementById('re-mini').innerHTML=`${s.fact}`;
-}
-document.querySelectorAll('input[name=re]').forEach(r=>r.onchange=reRender);
-reRender();
+hsBuild();
 
 show('coldread');
 </script>
