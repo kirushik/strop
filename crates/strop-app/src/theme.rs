@@ -144,3 +144,14 @@ pub const CODE_BG_COLOR: u32 = 0x1A1A1814;
 /// Hyperlink ink (AA text, 6.80:1) — cool, shares the machine-voice family
 /// ("points outward, not your warm words"); the underline carries the meaning.
 pub const LINK_COLOR: u32 = 0x2156A8;
+
+// --- Asides: the compost rail & the graveyard ----------------------------
+
+/// The compost tail anchor mark (asides.md §1 / P11): a short quiet bar at the
+/// rail's live end, where arrivals blink and the append caret sits. Drained
+/// neutral — "resting", never the active gold (that would read as engagement).
+pub const COMPOST_TAIL: u32 = 0xD8D2C2;
+/// The compost arrival blink (asides.md §2.3): the active gold made translucent
+/// (~0.33 alpha) — one grammar with the graveyard bar's pulse for "something
+/// arrived over there". A single quiet flash, then gone.
+pub const COMPOST_FLASH: u32 = 0xC8A95154;

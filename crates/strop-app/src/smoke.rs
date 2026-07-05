@@ -139,6 +139,32 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE aside:selection: selection moved to compost");
                 continue;
             }
+            // `seed:demo` seeds the rich asides fixture for the VISUAL rig:
+            // three compost items + sidebar + a full multi-paragraph grave entry
+            // and a receded one (Bugs A & B in one frame).
+            if key == "seed:demo" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_demo(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                eprintln!("SMOKE seed:demo: compost items + graveyard section seeded");
+                continue;
+            }
+            // `seed:annotated` seeds a paragraph carrying a writer note + a
+            // diagnosis, selected — so a following `exile:selection` exercises
+            // the dead-anchor reconcile (note migrates, diagnosis closes — Bug C).
+            if key == "seed:annotated" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_annotated(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:annotated: annotated paragraph seeded + selected");
+                continue;
+            }
             // Flanks (docs/impl/03-flanks.md §3): select the caret paragraph and
             // raise the popover so `dump:ui`'s `flanks` object is observable.
             if key == "select:para" {

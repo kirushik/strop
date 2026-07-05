@@ -266,9 +266,33 @@ if [ "${CB:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the aside birthed the rai
   echo "  FAIL compost_blocks=$CB"; fail=1; fi
 expect "the exile filed one entry"          1 "$(field "$D1" grave_entries)"
 expect "put back empties the graveyard"     0 "$(field "$D2" grave_entries)"
+# The graveyard record renders at the document TAIL in the scroll flow (Bug B):
+# with this short fixture the whole doc + section fit, so the section header is
+# on screen and the sticky footer bar unsticks (hides) into it (asides.md §3).
+expect "the footer bar unsticks when the tail is on screen" true "$(field "$D1" grave_bar_hidden)"
 MW=$(field "$D1" manuscript_words)
 if [ "${MW:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the count is manuscript-only ($MW words)"; else
   echo "  FAIL manuscript_words=$MW"; fail=1; fi
+
+echo "rig-check: a cut annotated paragraph leaves no dangling note (Bug C)"
+# seed:annotated selects a paragraph carrying BOTH a writer note and a machine
+# diagnosis; exile:selection cuts it. The writer note must change address to the
+# compost (its own words are never lost); the diagnosis must close (a machine
+# card never lingers pointing at nothing).
+DOCC=$(mktemp --suffix=.md); cp "$DOC" "$DOCC"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCC" "seed:annotated dump:ui exile:selection dump:ui" 2>/dev/null | grep 'UI-DUMP')
+C1=$(echo "$OUT" | head -1); C2=$(echo "$OUT" | tail -1)
+[ -n "$C1" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCC" "$DOCC.strop"
+expect "the writer note starts open"          1 "$(field "$C1" open_notes)"
+expect "the diagnosis starts open"            1 "$(field "$C1" open_diagnoses)"
+expect "no compost before the cut"            0 "$(field "$C1" compost_blocks)"
+expect "the cut files one grave entry"        1 "$(field "$C2" grave_entries)"
+expect "the writer note left the margin"      0 "$(field "$C2" open_notes)"
+expect "the dead-anchored diagnosis closed"   0 "$(field "$C2" open_diagnoses)"
+CB2=$(field "$C2" compost_blocks)
+if [ "${CB2:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the note migrated to the compost (compost_blocks=$CB2)"; else
+  echo "  FAIL compost_blocks=$CB2 — the note did not migrate"; fail=1; fi
 
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

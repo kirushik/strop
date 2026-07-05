@@ -25,7 +25,8 @@ use gpui::{
     WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
-    Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus, SpanSet,
+    Annotation, Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus,
+    SpanSet,
 };
 use strop_core::{Store, typograph};
 
@@ -41,9 +42,10 @@ use unicode_segmentation::UnicodeSegmentation;
 // The semantic color language lives in `theme`; everything below is layout.
 pub use crate::theme::{BG_COLOR, TEXT_COLOR};
 use crate::theme::{
-    ACTIVE_BORDER, AI_ACCENT, CARD_BG, CODE_BG_COLOR, DIAGNOSIS_CARD_BG, DIAGNOSIS_TINT_ACTIVE,
-    ERROR, FIND_MATCH_BG, HIGHLIGHT_COLOR, LINK_COLOR, MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT,
-    NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR, SELECTION_COLOR, STALE_BG,
+    ACTIVE_BORDER, AI_ACCENT, CARD_BG, CODE_BG_COLOR, COMPOST_FLASH, COMPOST_TAIL,
+    DIAGNOSIS_CARD_BG, DIAGNOSIS_TINT_ACTIVE, ERROR, FIND_MATCH_BG, HIGHLIGHT_COLOR, LINK_COLOR,
+    MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR, SELECTION_COLOR,
+    STALE_BG,
 };
 
 const MARGIN_WIDTH: f32 = 248.;
@@ -1061,10 +1063,12 @@ pub struct Editor {
     /// Outline rail (DESIGN §1.6): toggleable left rail of headings,
     /// session-only — externalized structure at the point of performance.
     outline_open: bool,
-    /// The graveyard section (docs/impl/02-asides.md §4): the sticky footer
-    /// bar is always shown when entries exist; this toggles the read-only
-    /// entry list open. Session-only.
-    graveyard_open: bool,
+    /// The graveyard tail section (docs/impl/02-asides.md §4, Bug B): entries
+    /// the writer clicked to expand out of their one-line receded form. The
+    /// newest entry is always full; older ones recede until expanded. The old
+    /// drop-up overlay + `graveyard_open` toggle are gone — the record now lives
+    /// in the scroll flow at the document tail. Session-only.
+    grave_expanded: Vec<u64>,
     /// The last caret byte offset while it was in the MANUSCRIPT — so Esc from
     /// a compost-rail caret returns exactly there (review B3; asides.md §2.1).
     last_manuscript_caret: usize,
@@ -1080,6 +1084,12 @@ pub struct Editor {
     /// fade-out). The read-only mode is visible and its refusal is legible
     /// (P2/P4). `None` at rest; the fade alpha is a pure function of elapsed.
     strip_pulse: Option<Instant>,
+    /// One-shot blink of a manuscript paragraph (the `originflash` idiom): the
+    /// block containing this char offset tints briefly. Set by "show origin"
+    /// (reveal where a cut came from) and by Put back (the passage returned).
+    /// Painted LIVE (read in `paint`), so it clears on the next frame without a
+    /// layout rebuild. `None` at rest.
+    para_flash: Option<(usize, Instant)>,
     /// store_dirty was set at least once this session — a plain "did the writer
     /// touch this document" flag (the rig's `edits=` tag). Re-entry via the
     /// intent question was retired (impl 04 §1); this now only reports activity.
@@ -1141,9 +1151,49 @@ struct TextFrame {
     scroll_top: Pixels,
     content_height: Pixels,
     paragraphs: Vec<ParagraphLayout>,
+    /// The graveyard tail section's pre-shaped rows (Bug B): painted after the
+    /// last paragraph, inside the scroll flow. Carries each row's click targets,
+    /// so `on_mouse_down` hit-tests the verbs (show origin / put back / delete /
+    /// expand) directly. Empty when the graveyard is.
+    grave_lines: Vec<GraveLine>,
+    /// Doc-space top of the graveyard section header (`None` = no section), for
+    /// the footer bar's hide-when-visible gate (`grave_tail_on_screen`).
+    grave_section_top: Option<Pixels>,
     /// The key the paragraphs were laid out for; the next prepaint reuses them
     /// when its key matches (see `LayoutKey`).
     layout_key: LayoutKey,
+}
+
+/// A verb on the graveyard tail section (Bug B). Click targets carry one.
+#[derive(Clone, Copy)]
+enum GraveAction {
+    ShowOrigin(u64),
+    PutBack(u64),
+    Delete(u64),
+    /// Expand/collapse a receded entry in place.
+    Expand(u64),
+}
+
+/// One pre-shaped row of the graveyard tail section: segments laid left-to-right
+/// (each with its x from the frame origin), the row's doc-space top, and any
+/// click targets (doc-space rects, so `on_mouse_down` tests them verbatim).
+struct GraveLine {
+    /// (x from `bounds.origin.x`, shaped segment) — header/whisper/receded rows.
+    segments: Vec<(Pixels, gpui::ShapedLine)>,
+    /// A wrapped body paragraph of the full cut text (dimmed, ruled): `(x, line)`.
+    /// When set, `segments` is empty. `WrappedLine` isn't `Clone`, so grave_lines
+    /// are moved (never cloned) on the reuse fast-path.
+    body: Option<(Pixels, gpui::WrappedLine)>,
+    /// Doc-space top (relative to `bounds.origin`, pre-scroll).
+    top: Pixels,
+    height: Pixels,
+    line_height: Pixels,
+    /// Draw the 3px stale left-rule beside this row (the full cut-text body).
+    left_rule: bool,
+    /// The section-header row: draws the tombstone slab (+ a flash tint live).
+    header: bool,
+    /// Click targets on this row, doc-space (origin relative to `bounds.origin`).
+    hits: Vec<(Bounds<Pixels>, GraveAction)>,
 }
 
 struct ParagraphLayout {
@@ -1164,6 +1214,16 @@ struct ParagraphLayout {
     /// First block of the trailing footnote-definition run (H4): paints a
     /// hairline "Footnotes" section rule above itself.
     section_rule: bool,
+    /// Compost decorations (asides.md §1, Bug A — the compost was invisible).
+    /// An empty compost/boundary block draws a hairline at its midline (the
+    /// item separator grammar); the boundary block also draws the tail anchor
+    /// bar (P11). `compost_header` carries the "COMPOST" whisper painted above
+    /// the first compost block; `compost_flash` blinks the arrived item's
+    /// background once (asides.md §2.3).
+    compost_rule: bool,
+    compost_tail: bool,
+    compost_header: Option<gpui::ShapedLine>,
+    compost_flash: bool,
     marker: Option<gpui::ShapedLine>,
     /// Painted superior footnote figures (DESIGN §2-footnotes):
     /// (paragraph-local byte offset of the invisible carrier, label).
@@ -1452,11 +1512,12 @@ impl Editor {
             selection_popover: false,
             link_input: None,
             outline_open: false,
-            graveyard_open: false,
+            grave_expanded: Vec::new(),
             last_manuscript_caret: 0,
             rail_flash: None,
             grave_flash: None,
             strip_pulse: None,
+            para_flash: None,
             session_had_edits: false,
             session_goal: None,
             goal_input: None,
@@ -5465,6 +5526,10 @@ impl Editor {
         let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
         self.set_cursor(caret, false, cx);
         self.schedule_flash_clear(cx);
+        // The asided passage may have carried a margin note / diagnosis; its
+        // anchor just died. Migrate the note to the compost, close a dead
+        // diagnosis (Bug C).
+        self.reconcile_dead_anchors(cx);
     }
 
     /// `Send to the graveyard` (selection menu / palette): file the selection
@@ -5499,13 +5564,26 @@ impl Editor {
         self.bump_activity();
         self.schedule_flash_clear(cx);
         cx.notify();
+        // The cut passage may have carried a margin note / diagnosis; its anchor
+        // just collapsed. Migrate the note to the compost, close a dead
+        // diagnosis (Bug C) — the one site that ever files a corpse is also the
+        // one that must tidy the anchors the corpse leaves behind.
+        self.reconcile_dead_anchors(cx);
     }
 
     /// A trailing fragment of the paragraph immediately before `byte_pos` — the
-    /// entry's origin quote (never the whole context). Stops at a line break.
+    /// entry's origin quote (never the whole context). When the cut begins right
+    /// at a block boundary (the common case — whole paragraphs are cut), step
+    /// back over the boundary newline so the quote is the PRIOR paragraph's tail
+    /// rather than empty (the graveyard whisper reads "cut from after …" —
+    /// `GraveEntry::origin_quote`). Stops at the next line break above that.
     fn origin_quote_before(&self, byte_pos: usize) -> String {
         let rope = self.doc.rope();
-        let at = rope.byte_to_char(byte_pos.min(self.doc.len_bytes()));
+        let mut at = rope.byte_to_char(byte_pos.min(self.doc.len_bytes()));
+        if at > 0 && rope.char(at - 1) == '\n' {
+            at -= 1; // the cut sits at a line start: name the paragraph above it
+        }
+        let end = at;
         let mut from = at;
         let mut taken = 0;
         while from > 0 && taken < 48 {
@@ -5515,33 +5593,88 @@ impl Editor {
             from -= 1;
             taken += 1;
         }
-        rope.slice(from..at).to_string().trim().to_owned()
+        rope.slice(from..end).to_string().trim().to_owned()
     }
 
+    /// The graveyard verb (menu / key): scroll to the tail section (Bug B — the
+    /// record lives in the scroll flow now, there is nothing to "open"). Same
+    /// gesture as clicking the footer bar.
     fn toggle_graveyard(&mut self, _: &ToggleGraveyard, _: &mut Window, cx: &mut Context<Self>) {
-        self.graveyard_open = !self.graveyard_open && !self.doc.graveyard().is_empty();
-        cx.notify();
+        self.scroll_to_graveyard(cx);
+    }
+
+    /// Reveal the graveyard tail section by scrolling to the document end (the
+    /// section sits at the tail). The footer bar "unsticks into the section
+    /// header" once it is on screen (asides.md §3).
+    fn scroll_to_graveyard(&mut self, cx: &mut Context<Self>) {
+        if self.doc.graveyard().is_empty() {
+            return;
+        }
+        if let Some(frame) = self.last_frame.as_ref() {
+            self.scroll_top = frame.max_scroll();
+            cx.notify();
+        }
+    }
+
+    /// Everything that changes the graveyard tail section's GEOMETRY beyond the
+    /// document `revision` (which already covers the entries themselves): which
+    /// receded entries the writer expanded. Keyed into `LayoutKey` so an expand
+    /// forces a rebuild (the section grows) rather than a stale reuse.
+    fn grave_layout_fingerprint(&self) -> u64 {
+        let mut h = 1469598103934665603u64; // FNV-1a offset basis
+        for id in &self.grave_expanded {
+            h = (h ^ *id).wrapping_mul(1099511628211);
+        }
+        h
+    }
+
+    /// Is the graveyard tail section's header on screen? The sticky footer bar
+    /// hides when it is (it "unsticks into the section header" — asides.md §3).
+    /// Reads the last painted frame's recorded section top (doc-space).
+    fn grave_tail_on_screen(&self) -> bool {
+        self.last_frame.as_ref().is_some_and(|f| {
+            f.grave_section_top
+                .is_some_and(|top| top - f.scroll_top < f.bounds.size.height)
+        })
+    }
+
+    /// The graveyard verb whose painted hit rect contains a window point, if any
+    /// (Bug B click routing). Doc-space rects were recorded on the last frame.
+    fn grave_action_at(&self, pos: Point<Pixels>) -> Option<GraveAction> {
+        let frame = self.last_frame.as_ref()?;
+        if frame.grave_lines.is_empty() {
+            return None;
+        }
+        let doc = frame.doc_point(pos);
+        frame
+            .grave_lines
+            .iter()
+            .flat_map(|gl| gl.hits.iter())
+            .find(|(rect, _)| rect.contains(&doc))
+            .map(|(_, action)| *action)
     }
 
     /// Put an entry back into the manuscript (one verb everywhere — the entry
-    /// button and the post-cut footer affordance). Re-anchored and clamped into
-    /// the manuscript by the core; here we place the caret and flash nothing
-    /// fancier than moving it there.
+    /// action and the post-cut footer affordance). Re-anchored and clamped into
+    /// the manuscript by the core; here we place the caret, flash the returned
+    /// paragraph, and drop the now-stale expanded flag.
     fn put_back_entry(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(caret_char) = self.doc.put_back(id) else {
             return;
         };
         self.sync_mutations();
         let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
-        if self.doc.graveyard().is_empty() {
-            self.graveyard_open = false;
-        }
+        self.grave_expanded.retain(|e| *e != id);
+        // Flash the paragraph the passage returned to (P13's visible inverse).
+        self.para_flash = Some((caret_char.saturating_sub(1), Instant::now()));
+        self.autoscroll_request = true;
         self.set_cursor(caret, false, cx);
+        self.schedule_flash_clear(cx);
     }
 
     /// Move the caret to an entry's re-anchored origin (clamped into the
-    /// manuscript), so "show origin" reveals where the cut came from without
-    /// re-inserting anything.
+    /// manuscript) and flash that line — "show origin" reveals where the cut
+    /// came from without re-inserting anything (the `originflash` idiom).
     fn show_grave_origin(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(e) = self.doc.graveyard().get(id) else {
             return;
@@ -5549,17 +5682,29 @@ impl Editor {
         let base = self.doc.manuscript_base_char();
         let at = e.origin_pos.clamp(base, self.doc.rope().len_chars());
         let byte = self.doc.char_to_byte(at);
+        self.para_flash = Some((at, Instant::now()));
+        self.autoscroll_request = true;
         self.set_cursor(byte, false, cx);
+        self.schedule_flash_clear(cx);
     }
 
     /// Delete an entry (the journal still holds the record). Undoable in core.
     fn delete_grave_entry(&mut self, id: u64, cx: &mut Context<Self>) {
         self.doc.grave_delete(id);
-        if self.doc.graveyard().is_empty() {
-            self.graveyard_open = false;
-        }
+        self.grave_expanded.retain(|e| *e != id);
         self.mark_dirty();
         self.bump_activity();
+        cx.notify();
+    }
+
+    /// Toggle a receded graveyard entry between its one-line and full forms
+    /// (Bug B — click expands in place; the newest entry is always full).
+    fn toggle_grave_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(ix) = self.grave_expanded.iter().position(|e| *e == id) {
+            self.grave_expanded.remove(ix);
+        } else {
+            self.grave_expanded.push(id);
+        }
         cx.notify();
     }
 
@@ -5627,6 +5772,71 @@ impl Editor {
         cx.notify();
     }
 
+    /// After a structural removal — a graveyard cut or a set-aside — reconcile
+    /// the margin with the anchors that just died (Bug C). Both paths bypassed
+    /// this before, so a cut annotated paragraph left the writer's own margin
+    /// note floating, anchored to nothing.
+    ///
+    /// A WRITER note whose anchor is gone migrates to the compost tail wearing
+    /// its anchor quote (spec §3, the designed provenance — the note simply
+    /// changed address). A DIAGNOSIS whose anchor is gone is CLOSED instead — a
+    /// machine card is never writer material and must not linger pointing at
+    /// nothing: it is dismissed and the strip records its `CardClosed` terminal
+    /// (the existing close idiom). Windowless, so it also serves the IME
+    /// auto-cut path; it mirrors `migrate_orphans_after_restore`'s no-composer
+    /// discipline (a cut is not a composer interaction — clear focus directly,
+    /// commit no draft).
+    fn reconcile_dead_anchors(&mut self, cx: &mut Context<Self>) {
+        // Preserve the caret across any migration: an orphan-note migration
+        // inserts at the compost tail, shifting every manuscript byte by the
+        // same delta, so the caret's DISTANCE FROM THE DOCUMENT END is
+        // invariant. The writer cut/parked a thought — she must not travel (P2).
+        let len_before = self.doc.len_bytes();
+        let tail = len_before.saturating_sub(self.cursor_offset().min(len_before));
+
+        let doomed_diagnoses: Vec<u64> = self
+            .doc
+            .notes()
+            .notes()
+            .iter()
+            .filter(|n| {
+                n.kind == NoteKind::Diagnosis
+                    && n.status == NoteStatus::Open
+                    && (n.orphaned || n.range.start == n.range.end)
+            })
+            .map(|n| n.id)
+            .collect();
+        for id in &doomed_diagnoses {
+            self.doc.set_note_status(*id, NoteStatus::Dismissed);
+            self.doc
+                .journal_mut()
+                .record_event(strop_core::journal::JournalEvent::CardClosed {
+                    t: strop_core::journal::now_ms(),
+                    id: *id,
+                    resolved: false,
+                });
+            if self.focus.active_id() == Some(*id) {
+                self.focus = CardFocus::Idle;
+            }
+        }
+        if !doomed_diagnoses.is_empty() {
+            self.mark_dirty();
+            self.bump_activity();
+            cx.notify();
+        }
+
+        // Then the writer notes — their text migrates to the compost tail.
+        if self.focus.active_id().is_some_and(|id| self.note_is_doomed(id)) {
+            self.focus = CardFocus::Idle;
+        }
+        self.perform_orphan_migrations(cx);
+
+        if self.doc.len_bytes() != len_before {
+            let caret = self.doc.len_bytes().saturating_sub(tail);
+            self.set_cursor(caret, false, cx);
+        }
+    }
+
     /// Clear the one-shot rail/graveyard arrival blinks after a beat.
     fn schedule_flash_clear(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -5636,6 +5846,7 @@ impl Editor {
             this.update(cx, |editor: &mut Editor, cx| {
                 editor.rail_flash = None;
                 editor.grave_flash = None;
+                editor.para_flash = None;
                 cx.notify();
             })
             .ok();
@@ -5816,11 +6027,6 @@ impl Editor {
         }
         if self.selection_popover {
             self.selection_popover = false;
-            cx.notify();
-            return;
-        }
-        if self.graveyard_open {
-            self.graveyard_open = false;
             cx.notify();
             return;
         }
@@ -7027,6 +7233,30 @@ impl Editor {
         if f32::from(ev.position.x) > self.column_right(window) + MARGIN_GAP {
             return;
         }
+        // A click in the graveyard tail section (Bug B). The section is painted
+        // inside this element, so its verbs' hit rects (doc-space) are tested
+        // here. It is a read-only RECORD: a click anywhere in it dispatches a
+        // verb if one is hit and is otherwise swallowed — never a manuscript
+        // caret (the normal logic would snap it to the last paragraph).
+        if ev.click_count == 1
+            && self.history_view.is_none()
+            && self
+                .last_frame
+                .as_ref()
+                .and_then(|f| f.grave_section_top.map(|t| f.doc_point(ev.position).y >= t - px(22.)))
+                .unwrap_or(false)
+        {
+            cx.stop_propagation();
+            if let Some(action) = self.grave_action_at(ev.position) {
+                match action {
+                    GraveAction::ShowOrigin(id) => self.show_grave_origin(id, cx),
+                    GraveAction::PutBack(id) => self.put_back_entry(id, cx),
+                    GraveAction::Delete(id) => self.delete_grave_entry(id, cx),
+                    GraveAction::Expand(id) => self.toggle_grave_entry(id, cx),
+                }
+            }
+            return;
+        }
         // Footnote jumps (DESIGN §2-footnotes): a plain click on a ref's
         // mark goes to its def; a click on a def's "N." gutter goes back
         // to the ref. Never starts a drag selection.
@@ -7373,7 +7603,17 @@ impl Editor {
             // MANUSCRIPT-only word count (compost excluded — asides.md §1).
             "compost_blocks": self.doc.aside_boundary().unwrap_or(0),
             "grave_entries": self.doc.graveyard().len(),
-            "graveyard_open": self.graveyard_open,
+            // Arrival/exile blinks (one-shot), and the open-card census so the
+            // rig can watch a dangling note migrate (writer notes drop, the
+            // compost gains an item) or a dead diagnosis close (Bug C).
+            "compost_flash": self.rail_flash.is_some(),
+            "grave_flash": self.grave_flash.is_some(),
+            "open_notes": self.doc.notes().open().filter(|n| n.kind == NoteKind::Note).count(),
+            "open_diagnoses": self.doc.notes().open().filter(|n| n.kind == NoteKind::Diagnosis).count(),
+            // Presentation gate: the sticky footer bar "unsticks into the section
+            // header" once the tail section is on screen (asides.md §3) — the rig
+            // asserts THIS bit for the bar's hide/show, like `margin_hidden`.
+            "grave_bar_hidden": self.grave_tail_on_screen(),
             "manuscript_words": self.manuscript_word_count(),
             // The selection flanks (docs/impl/03-flanks.md §3): presence of each
             // (`left` false only under a history surface; `right` false for a
@@ -7480,6 +7720,84 @@ impl Editor {
         let end = self.doc.len_bytes();
         self.selected_range = start..end;
         self.send_to_graveyard(&SendToGraveyard, window, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`seed:demo`): a rich asides fixture for the visual rig — three
+    /// compost items (so the separators + tail mark show), the sidebar open (its
+    /// Compost section), and two graveyard entries: an older short one (receded)
+    /// and a newest multi-paragraph one (rendered full). Exercises Bugs A & B in
+    /// one frame.
+    pub fn debug_seed_demo(&mut self, cx: &mut Context<Self>) {
+        let len = self.doc.len_bytes();
+        // Blank lines separate the three compost items; the boundary is the
+        // separator before the manuscript (block 5). Building it directly keeps
+        // the fixture deterministic (repeated asides of the first paragraph would
+        // strand blank lines).
+        self.doc.edit_bytes(
+            0..len,
+            "Premise B (dead): generation ship, mutiny in cold storage.\n\nENDING \u{2014} she stays; the ferry leaves without her, and the light on the water is the last line.\n\n\u{201C}Salt on the railing like the river had been chewing it.\u{201D}\n\nMara took the night crossing because the day boats were full of people who still believed the far shore existed.\nThe stowaway appeared on the third night, casting two shadows in the single running light.\nThe dockmaster's daughter kept a ledger of everything the river had taken.\nThe customs officer had a theory about the fog, and he told it to anyone who would listen: that it was the river forgetting its banks, one memory at a time.\n\nHe had charts. He had dates. Nobody would ever listen to a word of it.",
+        );
+        self.doc.set_aside_boundary(Some(5)); // blocks 0..5 = the compost rail
+        self.sync_mutations();
+        // File two cuts: an older short one (recedes once a newer arrives), then
+        // the newest MULTI-paragraph one (renders full, no character cap).
+        self.debug_cut_substring("The dockmaster's daughter kept a ledger of everything the river had taken.", cx);
+        self.debug_cut_substring(
+            "The customs officer had a theory about the fog, and he told it to anyone who would listen: that it was the river forgetting its banks, one memory at a time.\n\nHe had charts. He had dates. Nobody would ever listen to a word of it.",
+            cx,
+        );
+        self.outline_open = true; // reveal the sidebar's Compost section
+        self.word_count = self.manuscript_word_count();
+        cx.notify();
+    }
+
+    /// Cut the first occurrence of `needle` into the graveyard (rig helper).
+    fn debug_cut_substring(&mut self, needle: &str, cx: &mut Context<Self>) {
+        let text = self.doc.text();
+        if let Some(byte) = text.find(needle) {
+            self.file_cut(byte..byte + needle.len(), cx);
+        }
+    }
+
+    /// Rig hook (`seed:annotated`): a manuscript whose SECOND paragraph carries
+    /// BOTH a writer note and a machine diagnosis, anchored inside it, and is
+    /// selected — ready for `exile:selection`. After the cut the writer note
+    /// must migrate to the compost (open_notes drops, compost_blocks rises) and
+    /// the diagnosis must close (open_diagnoses drops) — Bug C, the dangling
+    /// note the user hit on a real document.
+    pub fn debug_seed_annotated(&mut self, cx: &mut Context<Self>) {
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "Keep this opening paragraph as the manuscript's real first line.\nThis whole annotated paragraph runs comfortably past the eighty-character graveyard threshold and carries the writer's own margin note plus a machine diagnosis, each anchored inside it.",
+        );
+        self.sync_mutations();
+        let para_start = self.doc.rope().line_to_byte(1);
+        let s = self.doc.rope().byte_to_char(para_start);
+        // The writer's own note (migrates to the compost when its anchor dies).
+        self.doc
+            .add_note(s..s + 4, "does this paragraph earn its keep?".into(), now_unix());
+        // A machine diagnosis on a different slice of the same paragraph (closes
+        // — a machine card never lingers pointing at nothing).
+        self.doc.add_diagnoses(vec![Annotation {
+            id: 0,
+            range: (s + 6)..(s + 11),
+            body: "flabby line".into(),
+            status: NoteStatus::Open,
+            created_unix: now_unix(),
+            kind: NoteKind::Diagnosis,
+            title: "flabby".into(),
+            level: "line".into(),
+            orphaned: false,
+            pass_id: 1,
+            unverified: false,
+        }]);
+        // Select the annotated paragraph, ready for exile.
+        self.selected_range = para_start..self.doc.len_bytes();
+        self.selection_reversed = false;
+        self.word_count = self.manuscript_word_count();
+        self.mark_dirty();
         cx.notify();
     }
 
@@ -8105,10 +8423,21 @@ struct LayoutKey {
     marked: Option<(usize, usize)>,
     find_query: Option<String>,
     active_note: Option<u64>,
+    /// The compost arrival blink is a paint decoration baked into the
+    /// paragraphs, but it is NOT captured by `revision` (clearing the flash
+    /// bumps nothing). Keying on it forces a rebuild when it toggles, so the
+    /// blink actually clears instead of sticking on the reuse fast-path.
+    compost_flash: bool,
+    /// The graveyard tail section is painted after the last block; its content
+    /// and the counter live outside `revision` too (a bar flash, an entry
+    /// expand). Keying on a coarse fingerprint rebuilds when they change.
+    grave_fingerprint: u64,
 }
 
 struct PrepaintState {
     paragraphs: Vec<ParagraphLayout>,
+    grave_lines: Vec<GraveLine>,
+    grave_section_top: Option<Pixels>,
     cursor: Option<PaintQuad>,
     line_height: Pixels,
     scroll_top: Pixels,
@@ -8446,6 +8775,207 @@ fn runs_for_paragraph(
         .collect()
 }
 
+/// The graveyard data a frame needs, captured while the `editor` borrow is live
+/// (before it ends at the per-block reuse take), then shaped after the loop.
+struct GraveEntryView {
+    id: u64,
+    text: String,
+    origin_quote: String,
+    cut_unix: i64,
+    words: u32,
+    /// Rendered full (whisper + full text): the newest, or one the writer
+    /// expanded.
+    full: bool,
+}
+
+const GRAVE_SECTION_GAP: f32 = 44.; // breathing room after the last prose block
+const GRAVE_HEADER_H: f32 = 26.;
+const GRAVE_WHISPER_H: f32 = 20.;
+const GRAVE_BODY_SIZE: f32 = 15.;
+const GRAVE_BODY_LH: f32 = 22.;
+const GRAVE_BODY_INDENT: f32 = 14.; // room for the 3px stale left-rule
+const GRAVE_RECEDED_H: f32 = 24.;
+const GRAVE_ENTRY_GAP: f32 = 16.;
+
+/// Shape one graveyard segment (a piece of a whisper/header/receded row).
+fn grave_seg(
+    window: &mut Window,
+    text: impl Into<String>,
+    size: f32,
+    color: u32,
+    family: &'static str,
+    italic: bool,
+    underline: bool,
+) -> gpui::ShapedLine {
+    let text: String = text.into();
+    let mut font = gpui::font(family);
+    if italic {
+        font.style = FontStyle::Italic;
+    }
+    let hsla: gpui::Hsla = rgb(color).into();
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: hsla,
+        background_color: None,
+        underline: underline.then_some(UnderlineStyle {
+            color: Some(hsla),
+            thickness: px(1.),
+            wavy: false,
+        }),
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(SharedString::from(text), px(size), &[run], None)
+}
+
+/// Build the graveyard tail section's pre-shaped rows (Bug B, asides.md §3):
+/// a "Graveyard · N" header, then entries newest-first — the newest (or an
+/// expanded one) in full (whisper + verbs + the full cut text, dimmed, ruled),
+/// older ones receded to a single clickable line. Returns the rows and the
+/// section's bottom (the new content height). `entries` is already newest-first.
+fn shape_grave_section(
+    window: &mut Window,
+    entries: &[GraveEntryView],
+    wrap_width: Pixels,
+    start_top: Pixels,
+) -> (Vec<GraveLine>, Pixels) {
+    let mut lines = Vec::new();
+    if entries.is_empty() {
+        return (lines, start_top);
+    }
+    let mut top = start_top;
+
+    // Section header: the tombstone slab is drawn in paint; the label sits to
+    // its right (same idiom as the footer bar).
+    let header = grave_seg(window, format!("Graveyard · {}", entries.len()), 13., MUTED_COLOR, "PT Sans", false, false);
+    lines.push(GraveLine {
+        segments: vec![(px(18.), header)],
+        body: None,
+        top,
+        height: px(GRAVE_HEADER_H),
+        line_height: px(GRAVE_HEADER_H),
+        left_rule: false,
+        header: true,
+        hits: Vec::new(),
+    });
+    top += px(GRAVE_HEADER_H) + px(10.);
+
+    for e in entries {
+        let date = format_unix(e.cut_unix);
+        if e.full {
+            // The whisper row: prefix + optional italic origin quote + verbs.
+            let mut segments: Vec<(Pixels, gpui::ShapedLine)> = Vec::new();
+            let mut hits: Vec<(Bounds<Pixels>, GraveAction)> = Vec::new();
+            let mut x = px(0.);
+            let mut push =
+                |window: &mut Window, text: String, italic: bool, action: Option<GraveAction>| {
+                    let color = if action.is_some() { AI_ACCENT } else { MUTED_COLOR };
+                    let shaped = grave_seg(window, text, 11., color, "PT Sans", italic, action.is_some());
+                    let w = shaped.width();
+                    if let Some(a) = action {
+                        hits.push((
+                            Bounds::new(point(x, top), size(w, px(GRAVE_WHISPER_H))),
+                            a,
+                        ));
+                    }
+                    segments.push((x, shaped));
+                    x += w;
+                };
+            if e.origin_quote.is_empty() {
+                push(window, format!("cut · {date} · "), false, None);
+            } else {
+                push(window, "cut from after ".to_string(), false, None);
+                push(window, format!("\u{201C}\u{2026}{}\u{201D}", e.origin_quote), true, None);
+                push(window, format!(" · {date} · "), false, None);
+            }
+            push(window, "show origin".to_string(), false, Some(GraveAction::ShowOrigin(e.id)));
+            push(window, " · ".to_string(), false, None);
+            push(window, "put back".to_string(), false, Some(GraveAction::PutBack(e.id)));
+            push(window, " · ".to_string(), false, None);
+            push(window, "delete".to_string(), false, Some(GraveAction::Delete(e.id)));
+            lines.push(GraveLine {
+                segments,
+                body: None,
+                top,
+                height: px(GRAVE_WHISPER_H),
+                line_height: px(GRAVE_WHISPER_H),
+                left_rule: false,
+                header: false,
+                hits,
+            });
+            top += px(GRAVE_WHISPER_H);
+
+            // The full cut text, dimmed, ruled — one wrapped row per source
+            // paragraph, no character cap (P1: the record is verbatim).
+            let body_run = TextRun {
+                len: 0,
+                font: gpui::font("PT Serif"),
+                color: rgb(MUTED_COLOR).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            for para in e.text.split('\n') {
+                let run = TextRun { len: para.len(), ..body_run.clone() };
+                let wrapped = window
+                    .text_system()
+                    .shape_text(
+                        SharedString::from(para.to_owned()),
+                        px(GRAVE_BODY_SIZE),
+                        &[run],
+                        Some(wrap_width - px(GRAVE_BODY_INDENT)),
+                        None,
+                    )
+                    .expect("shape_text failed")
+                    .into_iter()
+                    .next()
+                    .expect("shape_text returned no lines");
+                let h = wrapped.size(px(GRAVE_BODY_LH)).height;
+                lines.push(GraveLine {
+                    segments: Vec::new(),
+                    body: Some((px(GRAVE_BODY_INDENT), wrapped)),
+                    top,
+                    height: h,
+                    line_height: px(GRAVE_BODY_LH),
+                    left_rule: true,
+                    header: false,
+                    hits: Vec::new(),
+                });
+                top += h;
+            }
+            top += px(GRAVE_ENTRY_GAP);
+        } else {
+            // Receded: one clickable line, click expands in place.
+            let first: String = e.text.split_whitespace().take(7).collect::<Vec<_>>().join(" ");
+            let quote = if e.origin_quote.is_empty() {
+                String::new()
+            } else {
+                format!(" · cut from after \u{201C}\u{2026}{}\u{201D}", e.origin_quote)
+            };
+            let line = format!("{first}{quote} · {date} · {} words", e.words);
+            let shaped = grave_seg(window, line, 12., MUTED_COLOR, "PT Sans", false, false);
+            let w = shaped.width();
+            lines.push(GraveLine {
+                segments: vec![(px(GRAVE_BODY_INDENT), shaped)],
+                body: None,
+                top,
+                height: px(GRAVE_RECEDED_H),
+                line_height: px(GRAVE_RECEDED_H),
+                left_rule: true,
+                header: false,
+                hits: vec![(
+                    Bounds::new(point(px(0.), top), size(w + px(GRAVE_BODY_INDENT), px(GRAVE_RECEDED_H))),
+                    GraveAction::Expand(e.id),
+                )],
+            });
+            top += px(GRAVE_RECEDED_H);
+        }
+    }
+    (lines, top)
+}
+
 impl Element for EditorElement {
     type RequestLayoutState = ();
     type PrepaintState = PrepaintState;
@@ -8569,6 +9099,8 @@ impl Element for EditorElement {
                 None
             },
             active_note: editor.focus.active_id(),
+            compost_flash: editor.rail_flash.is_some(),
+            grave_fingerprint: editor.grave_layout_fingerprint(),
         };
         let can_reuse = !in_history
             && !editor
@@ -8588,13 +9120,19 @@ impl Element for EditorElement {
             let mut scroll_top = editor.scroll_top;
             // `editor`'s immutable borrow ends here (last use above); the
             // mutable update_in_draw below is then free to run.
-            let (paragraphs, content_height) = self.editor.update_in_draw(cx, |ed| {
-                let f = ed
-                    .last_frame
-                    .as_mut()
-                    .expect("can_reuse implies a stored frame");
-                (std::mem::take(&mut f.paragraphs), f.content_height)
-            });
+            let (paragraphs, grave_lines, grave_section_top, content_height) =
+                self.editor.update_in_draw(cx, |ed| {
+                    let f = ed
+                        .last_frame
+                        .as_mut()
+                        .expect("can_reuse implies a stored frame");
+                    (
+                        std::mem::take(&mut f.paragraphs),
+                        std::mem::take(&mut f.grave_lines),
+                        f.grave_section_top,
+                        f.content_height,
+                    )
+                });
             let max_scroll = (content_height + line_height - viewport).max(px(0.));
             scroll_top = scroll_top.clamp(px(0.), max_scroll);
             let cursor_pos = paragraphs
@@ -8638,6 +9176,8 @@ impl Element for EditorElement {
             }
             return PrepaintState {
                 paragraphs,
+                grave_lines,
+                grave_section_top,
                 cursor,
                 line_height,
                 scroll_top,
@@ -8754,6 +9294,31 @@ impl Element for EditorElement {
             .collect();
         let scale = window.scale_factor();
 
+        // Asides state captured while the `editor` borrow is still live (it ends
+        // at the `prev` take below): the compost boundary + arrival-blink flag
+        // for the compost face (Bug A), and the graveyard entries for the tail
+        // section (Bug B). History mode shows neither.
+        let aside_boundary = if in_history { None } else { editor.doc.aside_boundary() };
+        let rail_flashing = editor.rail_flash.is_some();
+        let grave_render: Vec<GraveEntryView> = if in_history {
+            Vec::new()
+        } else {
+            let entries = editor.doc.graveyard().entries();
+            let newest_id = entries.last().map(|e| e.id);
+            entries
+                .iter()
+                .rev() // newest-first for the view
+                .map(|e| GraveEntryView {
+                    id: e.id,
+                    text: e.text.clone(),
+                    origin_quote: e.origin_quote.clone(),
+                    cut_unix: e.cut_unix,
+                    words: e.words,
+                    full: Some(e.id) == newest_id || editor.grave_expanded.contains(&e.id),
+                })
+                .collect()
+        };
+
         // Previous frame's paragraphs, for per-block shaped-line reuse on this
         // rebuild: a block whose text, runs and metrics are unchanged keeps its
         // already-shaped line instead of re-shaping. This makes a full rebuild
@@ -8775,7 +9340,29 @@ impl Element for EditorElement {
         let mut ordered_no = 0usize;
         for (block_ix, par_text) in text.split('\n').enumerate() {
             let kind = kinds.get(block_ix).cloned().unwrap_or_default();
-            let bstyle = block_style_scaled(&kind, font_scale);
+            let mut bstyle = block_style_scaled(&kind, font_scale);
+            // The compost face (Bug A, asides.md §1): blocks `0..=boundary` are
+            // the compost region — a mini-column, smaller and muted. Empty
+            // compost/boundary blocks draw a hairline at their midline (the item
+            // separator grammar); the boundary block also gets the tail anchor
+            // bar (P11). The first compost block carries a small "COMPOST"
+            // whisper above it. An absent boundary = no compost = none of this.
+            let in_compost = aside_boundary.is_some_and(|b| block_ix <= b);
+            let is_boundary = aside_boundary == Some(block_ix);
+            let compost_rule = in_compost && par_text.is_empty();
+            if in_compost {
+                bstyle.size = px((f32::from(bstyle.size) * 0.8).round());
+                bstyle.line_height = px((f32::from(bstyle.line_height) * 0.8 / 2.).round() * 2.);
+                bstyle.muted = true;
+            }
+            let compost_header = (aside_boundary.is_some() && block_ix == 0).then(|| {
+                grave_seg(window, "COMPOST", 10.5, MUTED_COLOR, "PT Sans", false, false)
+            });
+            if compost_header.is_some() {
+                bstyle.extra_top += px(20.); // room for the whisper above block 0
+            }
+            let compost_flash = rail_flashing
+                && aside_boundary.is_some_and(|b| block_ix + 1 == b && !par_text.is_empty());
             // The footnote-definition run at the document end reads as one
             // "Footnotes" section: a hairline rule sits above its first
             // block (H4). Detected by neighbour, not by kind alone.
@@ -9006,6 +9593,10 @@ impl Element for EditorElement {
                 bg: bstyle.bg,
                 quote_rule: bstyle.quote_rule,
                 section_rule,
+                compost_rule,
+                compost_tail: is_boundary,
+                compost_header,
+                compost_flash,
                 marker,
                 fn_marks,
                 font_size: bstyle.size,
@@ -9017,7 +9608,19 @@ impl Element for EditorElement {
         }
 
         // `top` has accumulated one trailing gap past the last paragraph.
-        let content_height = top - paragraph_gap;
+        let manuscript_bottom = top - paragraph_gap;
+        // The graveyard tail section (Bug B) lives in the scroll flow, after the
+        // last block — so `content_height` (and thus max_scroll) grows to reach
+        // it. `grave_section_top` records the header's doc-space y for the
+        // footer bar's hide-when-visible gate.
+        let (grave_lines, grave_section_top, content_height) = if grave_render.is_empty() {
+            (Vec::new(), None, manuscript_bottom)
+        } else {
+            let section_top = manuscript_bottom + px(GRAVE_SECTION_GAP);
+            let (lines, bottom) =
+                shape_grave_section(window, &grave_render, wrap_width, section_top);
+            (lines, Some(section_top), bottom)
+        };
         let max_scroll = (content_height + line_height - viewport).max(px(0.));
         scroll_top = scroll_top.clamp(px(0.), max_scroll);
 
@@ -9069,6 +9672,8 @@ impl Element for EditorElement {
 
         PrepaintState {
             paragraphs,
+            grave_lines,
+            grave_section_top,
             cursor,
             line_height,
             scroll_top,
@@ -9088,7 +9693,14 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let _guard = DrawGuard::enter();
-        let focus_handle = self.editor.read(cx).focus_handle.clone();
+        let (focus_handle, para_flash, grave_flashing) = {
+            let ed = self.editor.read(cx);
+            (
+                ed.focus_handle.clone(),
+                ed.para_flash.map(|(c, _)| ed.doc.char_to_byte(c.min(ed.doc.rope().len_chars()))),
+                ed.grave_flash.is_some(),
+            )
+        };
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.editor.clone()),
@@ -9098,6 +9710,9 @@ impl Element for EditorElement {
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
         let viewport = bounds.size.height;
+        // The compost mini-column measure (asides.md §1: ~35ch, capped so it
+        // never runs the full prose width).
+        let compost_w = px(f32::from(bounds.size.width).min(340.));
         for par in &prepaint.paragraphs {
             let y = par.top - scroll_top;
             if y + par.height <= px(0.) || y >= viewport {
@@ -9131,6 +9746,60 @@ impl Element for EditorElement {
                         size(bounds.size.width, px(1.)),
                     ),
                     rgb(RULE_COLOR),
+                ));
+            }
+            // Compost decorations (Bug A). The arrival blink first (behind the
+            // text): the tail item's background pulses on an aside/migration.
+            if par.compost_flash {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(-6.), y - px(3.)),
+                        size(compost_w + px(12.), par.height + px(6.)),
+                    ),
+                    rgba(COMPOST_FLASH),
+                ));
+            }
+            // The "COMPOST" whisper above the first compost block.
+            if let Some(shaped) = &par.compost_header {
+                shaped
+                    .paint(
+                        bounds.origin + point(px(0.), y - px(16.)),
+                        px(14.),
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .ok();
+            }
+            // An empty compost/boundary block is a separator: a hairline at its
+            // midline (asides.md §1). The boundary also gets the tail anchor bar.
+            if par.compost_rule {
+                let mid = y + par.height / 2.;
+                window.paint_quad(fill(
+                    Bounds::new(bounds.origin + point(px(0.), mid), size(compost_w, px(1.))),
+                    rgb(RULE_COLOR),
+                ));
+                if par.compost_tail {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            bounds.origin + point(px(0.), mid - px(1.)),
+                            size(px(26.), px(2.)),
+                        ),
+                        rgb(COMPOST_TAIL),
+                    ));
+                }
+            }
+            // The originflash / put-back paragraph blink (Bug B): tint the block
+            // the caret was sent to. Painted live from `para_flash`, so it clears
+            // next frame without a layout rebuild.
+            if para_flash.is_some_and(|b| par.range.start <= b && b <= par.range.end) {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(-6.), y - px(3.)),
+                        size(bounds.size.width + px(12.), par.height + px(6.)),
+                    ),
+                    rgba(SELECTION_COLOR),
                 ));
             }
             let origin = bounds.origin + point(par.indent, y);
@@ -9194,6 +9863,67 @@ impl Element for EditorElement {
             }
         }
 
+        // The graveyard tail section (Bug B): drawn after the last block, in the
+        // scroll flow. Read-only — dimmed cut text, a section header, the verbs.
+        for gl in &prepaint.grave_lines {
+            let y = gl.top - scroll_top;
+            if y + gl.height <= px(0.) || y >= viewport {
+                continue; // culled
+            }
+            if gl.header {
+                // The tombstone slab + a flash tint on a fresh cut (live).
+                if grave_flashing {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            bounds.origin + point(px(-6.), y - px(3.)),
+                            size(bounds.size.width + px(12.), gl.height + px(6.)),
+                        ),
+                        rgba(COMPOST_FLASH),
+                    ));
+                }
+                // The tombstone slab (a drawn glyph — ⚰ is outside PT). A narrow
+                // "neck" quad over a wider "base" reads as a headstone.
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(3.), y + px(5.)),
+                        size(px(7.), px(3.)),
+                    ),
+                    rgb(MUTED_COLOR),
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(2.), y + px(7.)),
+                        size(px(9.), px(8.)),
+                    ),
+                    rgb(MUTED_COLOR),
+                ));
+                // A hairline above the whole section (the "record" boundary).
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(0.), y - px(20.)),
+                        size(bounds.size.width, px(1.)),
+                    ),
+                    rgb(RULE_COLOR),
+                ));
+            }
+            if gl.left_rule {
+                window.paint_quad(fill(
+                    Bounds::new(bounds.origin + point(px(0.), y), size(px(3.), gl.height)),
+                    rgb(STALE_BG),
+                ));
+            }
+            for (x, shaped) in &gl.segments {
+                shaped
+                    .paint(bounds.origin + point(*x, y), gl.line_height, TextAlign::Left, None, window, cx)
+                    .ok();
+            }
+            if let Some((x, wrapped)) = &gl.body {
+                wrapped
+                    .paint(bounds.origin + point(*x, y), gl.line_height, TextAlign::Left, None, window, cx)
+                    .ok();
+            }
+        }
+
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
         {
@@ -9201,6 +9931,8 @@ impl Element for EditorElement {
         }
 
         let paragraphs = std::mem::take(&mut prepaint.paragraphs);
+        let grave_lines = std::mem::take(&mut prepaint.grave_lines);
+        let grave_section_top = prepaint.grave_section_top;
         let content_height = prepaint.content_height;
         let layout_key = prepaint.layout_key.clone();
         // Overlays (margin lane, AI card/idle hint, selection popover)
@@ -9229,6 +9961,8 @@ impl Element for EditorElement {
                 scroll_top,
                 content_height,
                 paragraphs,
+                grave_lines,
+                grave_section_top,
                 layout_key,
             });
         });
@@ -10399,11 +11133,93 @@ impl Editor {
         items
     }
 
+    /// The compost items for the sidebar (Bug A): one `(preview, byte_start)`
+    /// per item — a run of non-empty compost blocks (blank lines separate
+    /// items). The preview is the item's first line, ~60 chars. Empty when there
+    /// is no rail (the sidebar is then outline-only, unchanged).
+    fn compost_items(&self) -> Vec<(String, usize)> {
+        let Some(boundary) = self.doc.aside_boundary() else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        let mut byte = 0usize;
+        let mut prev_empty = true; // the first non-empty block opens an item
+        for (ix, line) in self.doc.rope().lines().enumerate() {
+            if ix >= boundary {
+                break;
+            }
+            let s: String = line.chars().filter(|c| *c != '\n').collect();
+            let empty = s.trim().is_empty();
+            if !empty && prev_empty {
+                items.push((s.trim().chars().take(60).collect(), byte));
+            }
+            prev_empty = empty;
+            byte += line.len_bytes();
+        }
+        items
+    }
+
+    /// One "Compost" section for the sidebar: a header and a row per item (click
+    /// scrolls to that block and flashes it). Above the outline (Bug A).
+    fn render_compost_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let items = self.compost_items();
+        let mut list = div().flex().flex_col().px(px(8.)).py(px(6.));
+        for (i, (preview, byte_start)) in items.iter().enumerate() {
+            let jump = *byte_start;
+            list = list.child(
+                div()
+                    .id(("compost-row", i))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.move_to(jump, cx); // caret + scroll-to
+                            let c = editor
+                                .doc
+                                .rope()
+                                .byte_to_char(jump.min(editor.doc.len_bytes()));
+                            editor.para_flash = Some((c, Instant::now()));
+                            editor.schedule_flash_clear(cx);
+                            window.focus(&editor.focus_handle, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family("PT Serif")
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(preview.clone()),
+                    ),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(rgb(RULE_COLOR))
+            .child(
+                div()
+                    .px(px(14.))
+                    .py(px(6.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child("Compost"),
+            )
+            .child(list)
+    }
+
     /// The outline rail (DESIGN §1.6 — externalize what working memory
     /// can't hold): a glanceable left rail of headings, level shown by
-    /// indent, current section highlighted, click to jump.
+    /// indent, current section highlighted, click to jump. With a non-empty
+    /// compost rail, a "Compost" section sits above the outline (Bug A).
     fn render_outline(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let items = self.outline_items();
+        let has_compost = self.doc.aside_boundary().is_some();
         let cursor_block = self.doc.block_of_byte(self.cursor_offset());
         // The section the caret is in: the nearest heading above it.
         let current = items.iter().rposition(|(ix, ..)| *ix <= cursor_block);
@@ -10472,6 +11288,7 @@ impl Editor {
             .font_family("PT Sans")
             .text_size(px(12.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(has_compost, |d| d.child(self.render_compost_section(cx)))
             .child(
                 div()
                     .px(px(14.))
@@ -10485,17 +11302,23 @@ impl Editor {
     }
 
     /// The sticky graveyard footer bar (docs/impl/02-asides.md §4; asides.md
-    /// §3): a "Graveyard · N" bar that blinks on an exile and toggles the
-    /// read-only entry list. A bottom overlay, like the composer strip. Shown
-    /// only when a cut is on record (an empty pile has no bar). The ⚰ glyph is
-    /// outside the PT fonts, so the coffin is drawn with a div (never a non-PT
-    /// glyph — the garbled-glyph bug class).
+    /// §3): "Graveyard · N", the omnipresent navigator. It blinks on an exile
+    /// and, clicked, scrolls to the tail section (the record lives in the scroll
+    /// flow now — Bug B). It HIDES when the section header is on screen ("unsticks
+    /// into the section header"). Right after a cut it carries a transient "put
+    /// back" quick-verb for the just-filed entry (the mockup's gravebar). The ⚰
+    /// glyph is outside the PT fonts, so the coffin is a drawn div.
     fn render_graveyard_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let n = self.doc.graveyard().len();
-        if n == 0 || self.history_view.is_some() {
+        if n == 0 || self.history_view.is_some() || self.grave_tail_on_screen() {
             return None;
         }
         let flashing = self.grave_flash.is_some();
+        // The quick "put back" appears only in the flash window right after a cut
+        // — the newest entry (last filed). One verb everywhere (P8, P13).
+        let newest = flashing
+            .then(|| self.doc.graveyard().entries().last().map(|e| e.id))
+            .flatten();
         Some(
             div()
                 .id("graveyard-bar")
@@ -10520,114 +11343,29 @@ impl Editor {
                     MouseButton::Left,
                     cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        editor.graveyard_open = !editor.graveyard_open;
-                        cx.notify();
+                        editor.scroll_to_graveyard(cx);
                     }),
                 )
                 .child(tombstone_icon())
-                .child(format!("Graveyard · {n}")),
-        )
-    }
-
-    /// The read-only graveyard section (asides.md §3): entries newest-first,
-    /// dimmed, each with its origin whisper and the two verbs — Put back (one
-    /// verb everywhere) and Delete. A bottom panel above the bar, mirroring the
-    /// narrow-notes drop-down idiom.
-    fn render_graveyard_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.graveyard_open || self.doc.graveyard().is_empty() {
-            return None;
-        }
-        let mut list = div()
-            .id("graveyard-list")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col();
-        for e in self.doc.graveyard().entries().iter().rev() {
-            let id = e.id;
-            let preview: String = e.text.chars().take(90).collect();
-            let whisper = if e.origin_quote.is_empty() {
-                format_unix(e.cut_unix)
-            } else {
-                format!("…{} · {}", e.origin_quote, format_unix(e.cut_unix))
-            };
-            let action = |label: &'static str,
-                          key: usize,
-                          f: fn(&mut Editor, u64, &mut Context<Editor>)| {
-                div()
-                    .id(("grave-act", key))
-                    .cursor(CursorStyle::PointingHand)
-                    .text_color(rgb(MUTED_COLOR))
-                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            f(editor, id, cx);
-                        }),
-                    )
-                    .child(label)
-            };
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .px(px(14.))
-                    .py(px(8.))
-                    .border_b_1()
-                    .border_color(rgb(RULE_COLOR))
-                    // The cut prose, dimmed (read-only record).
-                    .child(div().text_color(rgb(MUTED_COLOR)).child(preview))
-                    .child(
+                .child(format!("Graveyard · {n}"))
+                .when_some(newest, |d, id| {
+                    d.child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(14.))
-                            .text_size(px(11.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child(whisper),
+                            .id("grave-quick-putback")
+                            .ml(px(4.))
+                            .text_color(rgb(AI_ACCENT))
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    editor.put_back_entry(id, cx);
+                                }),
                             )
-                            .child(action("show origin", id as usize * 3, Editor::show_grave_origin))
-                            .child(action("put back", id as usize * 3 + 1, Editor::put_back_entry))
-                            .child(action("delete", id as usize * 3 + 2, Editor::delete_grave_entry)),
-                    ),
-            );
-        }
-        Some(
-            div()
-                .id("graveyard-panel")
-                .absolute()
-                .bottom(px(28.))
-                .left_0()
-                .right_0()
-                .max_h(px(260.))
-                .bg(rgb(0xFCFAF4))
-                .border_t_1()
-                .border_color(rgb(RULE_COLOR))
-                .shadow_lg()
-                .flex()
-                .flex_col()
-                .font_family("PT Sans")
-                .text_size(px(12.))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .px(px(14.))
-                        .py(px(6.))
-                        .border_b_1()
-                        .border_color(rgb(RULE_COLOR))
-                        .text_color(rgb(MUTED_COLOR))
-                        .child("Graveyard"),
-                )
-                .child(list),
+                            .child("put back"),
+                    )
+                }),
         )
     }
 
@@ -14173,15 +14911,12 @@ impl Render for Editor {
                 Some(whisper) => d.child(whisper),
                 None => d,
             })
-            // The graveyard's sticky footer bar and, when toggled open, its
-            // read-only entry list (asides.md §3). The bar is a bottom overlay;
-            // the panel sits just above it.
+            // The graveyard's sticky footer navigator (asides.md §3): a bottom
+            // overlay that scrolls to the tail section and unsticks (hides) once
+            // that section's header is on screen. The record itself is painted in
+            // the scroll flow by the EditorElement (Bug B) — no overlay panel.
             .map(|d| match self.render_graveyard_bar(cx) {
                 Some(bar) => d.child(bar),
-                None => d,
-            })
-            .map(|d| match self.render_graveyard_panel(cx) {
-                Some(panel) => d.child(panel),
                 None => d,
             })
             // Narrow-window notes: the count pill (low — just feedback) and,

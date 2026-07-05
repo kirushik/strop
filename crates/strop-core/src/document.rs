@@ -346,6 +346,23 @@ impl SpanSet {
         self.spans = result;
     }
 
+    /// The formatting over `range`, clipped to it and rebased so `range.start`
+    /// becomes 0 — the spans of a slice, captured so a later re-insertion can
+    /// restore them (the graveyard's Put back reapplies what was cut, marks and
+    /// all — P1: the tool records the writer's text verbatim, and formatting is
+    /// part of the text). A pure read; the set itself is untouched.
+    pub fn slice(&self, range: Range<usize>) -> SpanSet {
+        let mut out = SpanSet::default();
+        for s in &self.spans {
+            let start = s.range.start.max(range.start);
+            let end = s.range.end.min(range.end);
+            if start < end {
+                out.add(start - range.start..end - range.start, s.attr.clone());
+            }
+        }
+        out
+    }
+
     /// Keep all spans consistent across a text edit: delete `op.delete`
     /// chars at `op.pos`, then insert `op.insert` there.
     pub fn apply_op(&mut self, op: &TextOp) {
@@ -646,6 +663,17 @@ pub struct GraveEntry {
     pub origin_pos: usize,
     pub cut_unix: i64,
     pub words: u32,
+    /// The cut prose's inline formatting, rebased so the entry text starts at 0
+    /// (Bug D / P1: Put back restores what was cut, marks and all). `serde`
+    /// default keeps entries persisted before this field loading (they simply
+    /// put back as plain text, exactly the old lossy behaviour).
+    #[serde(default)]
+    pub spans: SpanSet,
+    /// The cut span's per-block kinds, one per line of `text` (so a cut heading
+    /// or list item comes back styled, not as body paragraphs). `serde` default
+    /// for the same backward-compatibility reason as `spans`.
+    #[serde(default)]
+    pub kinds: Vec<BlockKind>,
 }
 
 /// The graveyard record: a side structure mirroring `Annotations` in every way
@@ -679,12 +707,16 @@ impl Graveyard {
     }
 
     /// File a cut. `words` is counted here, once, from the verbatim text.
+    /// `spans`/`kinds` carry the cut's formatting and block structure so Put
+    /// back is lossless (Bug D); a plain-text caller passes the defaults.
     pub fn file(
         &mut self,
         text: String,
         origin_quote: String,
         origin_pos: usize,
         cut_unix: i64,
+        spans: SpanSet,
+        kinds: Vec<BlockKind>,
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
@@ -696,6 +728,8 @@ impl Graveyard {
             origin_pos,
             cut_unix,
             words,
+            spans,
+            kinds,
         });
         id
     }
@@ -998,12 +1032,27 @@ impl Document {
         let start_char = rope.byte_to_char(byte_range.start);
         let end_char = rope.byte_to_char(byte_range.end);
         let text: String = rope.slice(start_char..end_char).to_string();
+        // Capture the cut's formatting and structure BEFORE the delete shifts
+        // them away, so Put back is lossless (Bug D / P1). One block kind per
+        // line the text will re-create (`count_line_breaks + 1`), so put_back
+        // can re-stamp them onto exactly the re-inserted blocks.
+        let spans = self.spans.slice(start_char..end_char);
+        let first_line = rope.char_to_line(start_char);
+        let n_blocks = count_line_breaks(&text) + 1;
+        let kinds: Vec<BlockKind> = self
+            .blocks
+            .kinds()
+            .iter()
+            .skip(first_line)
+            .take(n_blocks)
+            .cloned()
+            .collect();
         // The non-coalescing edit always opens a fresh transaction, so the
         // pre-cut snapshot is always taken and the filing below rides it.
         self.edit_bytes(byte_range, "");
         self.revision += 1;
         self.graveyard
-            .file(text, origin_quote, start_char, cut_unix)
+            .file(text, origin_quote, start_char, cut_unix, spans, kinds)
     }
 
     /// Put an entry back into the manuscript at its re-anchored origin, as one
@@ -1019,6 +1068,19 @@ impl Document {
         let at_char = entry.origin_pos.clamp(base, len);
         let at_byte = self.buffer.char_to_byte(at_char);
         self.edit_bytes(at_byte..at_byte, &entry.text);
+        // Re-stamp the cut's block kinds and re-add its spans (Bug D / P1): a
+        // heading comes back a heading, bold comes back bold. These ride the
+        // transaction `edit_bytes` opened (no new snapshot), so one undo peels
+        // the text AND its restored formatting back off together. Kinds land on
+        // exactly the re-inserted blocks; spans shift by the insertion offset.
+        let insert_block = self.buffer.rope().char_to_line(at_char);
+        for (i, kind) in entry.kinds.iter().enumerate() {
+            self.blocks.set_kind(insert_block + i, kind.clone());
+        }
+        for s in entry.spans.spans() {
+            self.spans
+                .add(at_char + s.range.start..at_char + s.range.end, s.attr.clone());
+        }
         self.revision += 1;
         self.graveyard.remove(id);
         Some(at_char + entry.text.chars().count())
@@ -1981,7 +2043,7 @@ mod tests {
     #[test]
     fn graveyard_apply_op_shifts_and_clamps_origin() {
         let mut g = Graveyard::default();
-        let id = g.file("cut".into(), "before".into(), 10, 0);
+        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new());
         assert_eq!(g.get(id).unwrap().words, 1);
         // Insert before the origin → shifts right (10 → 12).
         g.apply_op(&op(0, 0, "xx"));
@@ -2042,7 +2104,7 @@ mod tests {
         let base = doc.manuscript_base_char();
         assert!(base > 0);
         let mut g = Graveyard::default();
-        let id = g.file("XX".into(), String::new(), 0, 0); // origin in compost
+        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new()); // origin in compost
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
         assert!(doc.text().starts_with("cc\n\n"), "compost untouched: {}", doc.text());
@@ -2058,6 +2120,69 @@ mod tests {
         assert_eq!(doc.graveyard().len(), 0);
         doc.undo();
         assert_eq!(doc.graveyard().len(), 1, "delete of an entry is undoable");
+    }
+
+    #[test]
+    fn put_back_restores_spans_and_block_kinds() {
+        // A section: a heading, a paragraph carrying a bold span, a list item —
+        // then a manuscript tail to put back before. Cut it all, put it back,
+        // and the formatting AND structure must be byte-for-byte what they were
+        // (Bug D / P1 — put_back was silently flattening headings to body and
+        // dropping inline marks).
+        let text = "Heading line\nsome bold here\nlist thing\nkeep this tail";
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Heading(1),
+            BlockKind::Paragraph,
+            BlockKind::ListItem { ordered: false, depth: 0 },
+            BlockKind::Paragraph,
+        ]);
+        let mut spans = SpanSet::default();
+        spans.add(18..22, InlineAttr::Strong); // "bold" in block 1
+        let mut doc = Document::new(text, spans, blocks);
+        // Cut the three leading blocks (through their trailing newline), so the
+        // origin is the block-aligned start the graveyard's auto-cut produces.
+        let cut_end = doc.char_to_byte(39); // start of "keep this tail"
+        let id = doc.cut_to_graveyard(0..cut_end, String::new(), 0);
+        assert_eq!(doc.text(), "keep this tail");
+        // The entry carries the structure + formatting.
+        let e = doc.graveyard().get(id).unwrap();
+        assert_eq!(e.kinds[0], BlockKind::Heading(1));
+        assert_eq!(e.kinds[2], BlockKind::ListItem { ordered: false, depth: 0 });
+        assert!(e.spans.covers(18..22, &InlineAttr::Strong), "bold captured (cut started at 0)");
+
+        doc.put_back(id);
+        assert_eq!(doc.text(), text, "text restored verbatim");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(1), "heading came back a heading");
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        assert_eq!(
+            doc.blocks().kind(2),
+            &BlockKind::ListItem { ordered: false, depth: 0 },
+            "list item came back a list item"
+        );
+        assert!(doc.spans().covers(18..22, &InlineAttr::Strong), "bold restored in place");
+        // Undo peels the whole put-back (text + restored marks/kinds) back off.
+        doc.undo();
+        assert_eq!(doc.text(), "keep this tail");
+        assert_eq!(doc.graveyard().len(), 1, "entry restored by the undo");
+    }
+
+    #[test]
+    fn graveyard_entry_without_span_kind_fields_still_loads() {
+        // A `.strop` written before Bug D has no `spans`/`kinds` keys; serde
+        // defaults must fill them in (empty), so the file loads and its entries
+        // simply put back as plain text — the old behaviour, never a parse error.
+        let json = r#"{"id":7,"text":"a buried line","origin_quote":"before","origin_pos":4,"cut_unix":99,"words":3}"#;
+        let e: GraveEntry = serde_json::from_str(json).expect("legacy entry loads");
+        assert_eq!(e.text, "a buried line");
+        assert_eq!(e.origin_pos, 4);
+        assert!(e.spans.spans().is_empty());
+        assert!(e.kinds.is_empty());
+        // The whole record round-trips too.
+        let g: Graveyard = serde_json::from_str(
+            r#"{"entries":[{"id":1,"text":"x","origin_quote":"","origin_pos":0,"cut_unix":0,"words":1}],"next_id":1}"#,
+        )
+        .expect("legacy graveyard loads");
+        assert_eq!(g.len(), 1);
     }
 
     #[test]
