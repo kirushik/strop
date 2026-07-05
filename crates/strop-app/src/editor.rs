@@ -4123,6 +4123,15 @@ impl Editor {
             // "match hidden under the find field" bug).
             if matches!(omni_mode(&q).0, OmniMode::Find) {
                 editor.omni_apply_match(0, cx);
+            } else if let Some(sel) = editor.omni_return.clone() {
+                // Leaving find mode (a `>` or `@` prefix) would park the
+                // preview selection on the last match — and a command
+                // executed next would act on it (the cross-mode selection
+                // leak, extraction audit #23). Walk it home; deleting the
+                // prefix re-enters find and re-previews.
+                let max = editor.doc.len_bytes();
+                editor.selected_range = sel.start.min(max)..sel.end.min(max);
+                editor.selection_reversed = false;
             }
             cx.notify();
         })
@@ -6072,10 +6081,8 @@ impl Editor {
                 return;
             }
         }
-        if self.palette_input.is_some() {
-            self.close_palette(window, cx);
-            return;
-        }
+        // (No second palette check here: the one at the top of this fn already
+        // returned — the duplicate was unreachable, extraction audit #24.)
         // The strip: parked → return to now (drop the preview); already at now →
         // close it (spec §2 / review mid — restores the app-wide Esc-closes rule).
         if self.strip.open {
@@ -10736,7 +10743,7 @@ impl Editor {
                         .ml(px(8.))
                         .rounded(px(5.))
                         .cursor(CursorStyle::PointingHand)
-                        .when(self.rail_open, |d| d.bg(rgba(0x1A1A1812u32)))
+                        .when(self.rail_width(window) > 0., |d| d.bg(rgba(0x1A1A1812u32)))
                         // Arrival blink (S2, P12 — the control is the
                         // indicator): when a passage lands in a CLOSED rail,
                         // the always-visible toggle carries the compliance
@@ -10758,7 +10765,11 @@ impl Editor {
                             }),
                         )
                         .child({
-                            let bar_color = if self.rail_open {
+                            // Honest light (extraction audit #7): the toggle
+                            // reads active only when the rail actually shows —
+                            // history or a narrow window can suppress it while
+                            // rail_open stays latently true.
+                            let bar_color = if self.rail_width(window) > 0. {
                                 rgb(TEXT_COLOR)
                             } else {
                                 rgb(MUTED_COLOR)
@@ -10969,7 +10980,10 @@ impl Editor {
                             .flex_shrink_0()
                             .text_size(px(11.))
                             .text_color(rgb(MUTED_COLOR))
-                            .child("Ctrl F"),
+                            // One chord notation everywhere (extraction audit
+                            // #12): the tooltips and palette rows all speak
+                            // lowercase "ctrl-f"; the hint matches them.
+                            .child("ctrl-f"),
                     )
                     .into_any_element(),
             })
@@ -11369,6 +11383,9 @@ impl Editor {
             .font_family("PT Sans")
             .text_size(px(12.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // The rail owns its wheel (extraction audit #15): its list
+            // scrolls itself; the prose behind must not move with it.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .px(px(14.))
