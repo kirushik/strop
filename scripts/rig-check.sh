@@ -171,5 +171,62 @@ MV=$(field "$D1" moves_started)
 if [ "${MV:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the move still registers (moves_started=$MV)"; else
   echo "  FAIL no cross-fade motion (moves_started=$MV)"; fail=1; fi
 
+echo "rig-check: the editor button's face is a priority, and the door law holds"
+# A pass delivered in a lull lands at once: the door opens, the face reads
+# the glossary word (Reading), and the count is the open queries. Delivered
+# mid-burst it parks: the face says a read is ready, and NOTHING surfaces.
+# Fresh docs per run: the .strop SIDECAR persists across wrun launches, so a
+# reused doc reopens the previous run's saved cards into the new assertion.
+DOCB1=$(mktemp --suffix=.md); cp "$DOC" "$DOCB1"
+DOCB2=$(mktemp --suffix=.md); cp "$DOC" "$DOCB2"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCB1" "wait:1100 seed:deliver wait:1400 dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+B=$(echo "$OUT" | grep -oE '"editor_btn":\{[^}]*\}')
+[ -n "$B" ] || { echo "  FAIL no editor_btn dump"; exit 1; }
+expect "the landed pass reads as Reading"   '"reading"' "$(field "$B" face)"
+expect "its queries are the open count"     4 "$(field "$B" open_count)"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCB2" "2 seed:deliver dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+B=$(echo "$OUT" | grep -oE '"editor_btn":\{[^}]*\}')
+M=$(echo "$OUT" | grep -oE '"margin":\{[^}]*\}')
+expect "mid-burst the face says ready"      '"ready"' "$(field "$B" face)"
+expect "and the door law holds (no cards)"  0 "$(field "$M" visible)"
+
+echo "rig-check: the strip scrubs without re-baking, and hides the margin while parked"
+# bakes is session-monotonic: open bakes once; TWO scrubs later it is STILL 1
+# (the stability law — scrubbing may never rebuild the fabric). Parking hides
+# the live margin (cards must not float over past text); Now brings it back.
+DOCS1=$(mktemp --suffix=.md); cp "$DOC" "$DOCS1"
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCS1" "seed:diag seed:journal strip:open dump:ui strip:scrub:0.5 dump:ui strip:scrub:0.8 dump:ui strip:now dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
+S1=$(echo "$D1" | grep -oE '"strip":\{[^}]*\}'); S2=$(echo "$D2" | grep -oE '"strip":\{[^}]*\}'); S3=$(echo "$D3" | grep -oE '"strip":\{[^}]*\}')
+[ -n "$S1" ] || { echo "  FAIL no strip dump"; exit 1; }
+expect "the strip opens at now"             true  "$(field "$S1" open)"
+expect "opening bakes exactly once"         1     "$(field "$S1" bakes)"
+expect "a scrub parks in the past"          true  "$(field "$S2" parked)"
+W=$(field "$S2" words_at)
+if [ "${W:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the readout counts the past ($W words)"; else
+  echo "  FAIL words_at=$W (reconstruction empty?)"; fail=1; fi
+expect "two scrubs later it has NOT re-baked" 1   "$(field "$S3" bakes)"
+# The margin dump reports the MODEL; the hide is a render gate. margin_hidden
+# is that gate's own bit (review H36).
+expect "parked hides the live margin"       true  "$(field "$D2" margin_hidden)"
+expect "Now brings the margin back"         false "$(field "$D4" margin_hidden)"
+
+echo "rig-check: asides file honestly — compost is text, the graveyard gives back"
+# seed:aside asides one paragraph (births the rail) and exiles another (over
+# the cut threshold). putback:last is the graveyard's single verb: the entry
+# leaves the record and the prose returns — the inverse in the same grammar.
+DOCA=$(mktemp --suffix=.md); cp "$DOC" "$DOCA"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCA" "seed:aside dump:ui putback:last dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | head -1); D2=$(echo "$OUT" | tail -1)
+[ -n "$D1" ] || { echo "  FAIL no dump"; exit 1; }
+CB=$(field "$D1" compost_blocks)
+if [ "${CB:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the aside birthed the rail (compost_blocks=$CB)"; else
+  echo "  FAIL compost_blocks=$CB"; fail=1; fi
+expect "the exile filed one entry"          1 "$(field "$D1" grave_entries)"
+expect "put back empties the graveyard"     0 "$(field "$D2" grave_entries)"
+MW=$(field "$D1" manuscript_words)
+if [ "${MW:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the count is manuscript-only ($MW words)"; else
+  echo "  FAIL manuscript_words=$MW"; fail=1; fi
+
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

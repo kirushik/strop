@@ -6975,6 +6975,10 @@ impl Editor {
                 "words_at": self.strip.words_at,
                 "bakes": self.strip.bakes,
             })),
+            // Presentation gate: the margin lane + rail render only when no
+            // history surface is previewing (review H36) — the model above is
+            // ungated, so the rig asserts THIS bit for hide/show.
+            "margin_hidden": self.history_view.is_some() || self.strip.is_parked(),
             // Asides (docs/impl/02-asides.md §6): the rail's compost block
             // count (0 = no rail), the graveyard entry count, and the
             // MANUSCRIPT-only word count (compost excluded — asides.md §1).
