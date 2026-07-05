@@ -31,6 +31,7 @@ use strop_core::{Store, typograph};
 
 use crate::config::{Config, Language};
 use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
+use crate::strip::{self, Strip, StripBake};
 use crate::text_field::{
     FieldBackspace, FieldBackspaceWord, FieldCancel, FieldCommit, FieldPaste, FieldTab, TextField,
     TextFieldEvent,
@@ -406,7 +407,7 @@ actions!(
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
         OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
-        ToggleHistory, TogglePalette, TogglePopover, PaletteUp, PaletteDown, NewDocument,
+        ToggleHistory, ToggleStrip, TogglePalette, TogglePopover, PaletteUp, PaletteDown, NewDocument,
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
@@ -870,6 +871,18 @@ pub struct Editor {
     /// frame in `refresh_card_heights`; `None` when no note is composing.
     active_card_height: Option<f32>,
     last_frame: Option<TextFrame>,
+    /// The history strip (P1 — docs/impl/01-history-strip.md): the bottom
+    /// seek-bar surface. `strip.open` gates its overlay; `strip.parked` drives
+    /// the read-only preview + the Restore/Now controls. The immutable bake
+    /// and the mutable scrub state live apart inside it (the stability law).
+    strip: Strip,
+    /// The strip's painted rail geometry (WINDOW coords), captured every paint
+    /// so the scrub mouse handlers map a pointer x → working px → pos_ms
+    /// against the SAME bounds the fabric drew — CSD-inset-safe without any
+    /// re-derivation. `Rc<RefCell>`, never entity state: it is written from
+    /// inside the draw pass (the 2026-06-12 corruption rule, like
+    /// `zone_row_bounds`).
+    strip_rail: std::rc::Rc<std::cell::RefCell<Option<StripGeom>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1147,6 +1160,8 @@ impl Editor {
             goal_input: None,
             zone_row_bounds: std::rc::Rc::default(),
             last_frame: None,
+            strip: Strip::default(),
+            strip_rail: std::rc::Rc::default(),
         }
     }
 
@@ -1422,6 +1437,10 @@ impl Editor {
     /// persists them into the file, and then fills in texts, deltas and the
     /// preview. The old behaviour materialized inline on the main thread.
     fn enter_history(&mut self, cx: &mut Context<Self>) {
+        // The strip and the panel never open together (spec §0).
+        if self.strip.open {
+            self.close_strip(cx);
+        }
         let Some(store) = &self.store else {
             return;
         };
@@ -1790,6 +1809,31 @@ impl Editor {
             entry.blocks.clone(),
         );
         let from_unix = entry.created_unix;
+        self.restore_to_state(&name, text, spans, blocks, from_unix, cx);
+        cx.notify();
+    }
+
+    /// The shared restore mechanism (review B6, spec §2), reused by both the
+    /// history panel's Restore and the strip's own. Restore is an ordinary
+    /// UNDOABLE forward edit that appends nothing to the past — it destroys
+    /// nothing (design §3). Its record is deliberately layered: a "Before
+    /// restoring" checkpoint of the present (so this restore is itself one
+    /// Restore away from undone), the wholesale swap (journal-suppressed — it
+    /// would be one document-sized run), an honest `Restore` journal event,
+    /// and a POST-restore "Restored" checkpoint that materializes the restored
+    /// state as the reconstruction anchor (without it, `text_at(now)` would
+    /// rebuild the PRE-restore document). `from_unix` is the moment copied
+    /// from, in SECONDS (matching `Checkpoint.created_unix`). The caller
+    /// notifies.
+    fn restore_to_state(
+        &mut self,
+        name: &str,
+        text: String,
+        spans: SpanSet,
+        blocks: BlockMap,
+        from_unix: i64,
+        cx: &mut Context<Self>,
+    ) {
         // Save first so the "Before restoring" checkpoint materializes the
         // present exactly as it stands (see add_checkpoint).
         self.save_now();
@@ -1802,13 +1846,10 @@ impl Editor {
         self.goal_x = None;
         self.marked_range = None;
         self.caret_attrs.clear();
+        // Drops any preview (panel `history_view` OR the strip's
+        // `history_preview`) so the live restored document is what shows.
         self.exit_history(cx);
         self.sync_mutations();
-        // The restore's own record: the journal suppressed the wholesale
-        // swap (it would be one document-sized run), so the honest event
-        // carries the fact — and a POST-restore checkpoint materializes the
-        // restored state as the reconstruction anchor (review B6: without
-        // it, text_at(now) would rebuild the PRE-restore document).
         let len_chars = self.doc.rope().len_chars();
         self.doc
             .journal_mut()
@@ -1823,6 +1864,367 @@ impl Editor {
         }
         self.mark_dirty();
         self.bump_activity();
+    }
+
+    // -- The history strip (P1 — docs/impl/01-history-strip.md) ---------------
+
+    /// ctrl-alt-h / the titlebar clock: toggle the strip (the new first history
+    /// surface). The right-side panel stays reachable via the palette ("History
+    /// panel"); the two never open together (spec §0).
+    fn toggle_strip(&mut self, _: &ToggleStrip, window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip.open {
+            self.close_strip(cx);
+        } else {
+            self.open_strip(window, cx);
+        }
+    }
+
+    fn open_strip(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip.open {
+            return;
+        }
+        // Strip and panel never coexist (spec §0): the panel yields.
+        if self.history_view.is_some() {
+            self.exit_history(cx);
+        }
+        let now = strop_core::journal::now_ms();
+        self.strip.open = true;
+        self.strip.parked = false;
+        self.strip.pin_ms = None;
+        self.strip.pos_ms = now;
+        self.strip.view_offset = 0.;
+        self.strip_bake(now);
+        cx.notify();
+    }
+
+    fn close_strip(&mut self, cx: &mut Context<Self>) {
+        self.strip.open = false;
+        self.strip.parked = false;
+        self.strip.scrubbing = false;
+        self.strip.pin_ms = None;
+        self.strip.scratch = None;
+        self.strip.bake = None;
+        // Drop any preview so the live document returns.
+        self.history_preview = None;
+        *self.strip_rail.borrow_mut() = None;
+        cx.notify();
+    }
+
+    /// Build the immutable bake from `(journal, checkpoints, cards)` and bump
+    /// the session-monotonic `bakes` counter (the stability-law assertion —
+    /// only open and Restore ever call this; scrubbing never does). Snapshots
+    /// the checkpoint metadata so the strip never re-reads the store mid-scrub.
+    fn strip_bake(&mut self, now_ms: i64) {
+        let stations = self.strip_stations();
+        let cards = self.strip_cards();
+        let seed_len = self.strip_seed_len();
+        let bake = StripBake::build(self.doc.journal(), &stations, &cards, seed_len, now_ms);
+        self.strip.bake = Some(bake);
+        self.strip.bakes += 1;
+        self.strip.scratch = None; // re-anchor against the new bake
+    }
+
+    /// Checkpoints reduced to draw/anchor metadata (created_unix SECONDS ×1000
+    /// at the boundary — the unit law).
+    fn strip_stations(&self) -> Vec<strip::StationSnap> {
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        store
+            .checkpoints()
+            .into_iter()
+            .map(|cp| strip::StationSnap {
+                created_ms: cp.created_unix * 1000,
+                name: cp.name,
+                manual: cp.manual,
+                has_state: cp.state.is_some(),
+            })
+            .collect()
+    }
+
+    /// Each margin card's lifespan for its thread: raise time (the note's
+    /// `created_unix` SECONDS ×1000) → its `CardClosed` event, else open to now.
+    fn strip_cards(&self) -> Vec<strip::CardSnap> {
+        use strop_core::journal::JournalEvent;
+        let closes: HashMap<u64, (i64, bool)> = self
+            .doc
+            .journal()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                JournalEvent::CardClosed { t, id, resolved } => Some((*id, (*t, *resolved))),
+                _ => None,
+            })
+            .collect();
+        let doc_len = self.doc.rope().len_chars().max(1) as f32;
+        self.doc
+            .notes()
+            .notes()
+            .iter()
+            .map(|n| {
+                let closed = closes.get(&n.id);
+                strip::CardSnap {
+                    raised_ms: n.created_unix * 1000,
+                    closed_ms: closed.map(|(t, _)| *t),
+                    depth: (n.range.start as f32 / doc_len).clamp(0., 1.),
+                    resolved: closed.map_or(n.status == NoteStatus::Done, |(_, r)| *r),
+                }
+            })
+            .collect()
+    }
+
+    /// The document's char length at journal start (the earliest materialized
+    /// checkpoint ≤ the first run), so the envelope is seeded for a doc that
+    /// already held content when journaling began (else 0 — born empty).
+    fn strip_seed_len(&self) -> usize {
+        let Some(store) = &self.store else {
+            return 0;
+        };
+        let Some(first) = self.doc.journal().runs.first().map(|r| r.t0) else {
+            return 0;
+        };
+        store
+            .checkpoints()
+            .iter()
+            .rfind(|cp| cp.created_unix * 1000 <= first && cp.state.is_some())
+            .and_then(|cp| cp.state.as_ref())
+            .map(|s| s.text.chars().count())
+            .unwrap_or(0)
+    }
+
+    /// A materialized checkpoint's state, found by its ms anchor time. Called
+    /// only on re-anchor (a scrub crossing a checkpoint), never per frame.
+    fn checkpoint_state_at_ms(&self, ms: i64) -> Option<(String, SpanSet, BlockMap)> {
+        let store = self.store.as_ref()?;
+        let cps = store.checkpoints();
+        let cp = cps
+            .iter()
+            .find(|cp| cp.created_unix * 1000 == ms && cp.state.is_some())?;
+        store.checkpoint_state(cp)
+    }
+
+    /// Park the playhead at a rail x (window coords) and begin a continuous
+    /// scrub; `pin` (shift-click) drops/clears the Compare playhead instead.
+    fn strip_park_at_x(&mut self, x: f32, pin: bool, cx: &mut Context<Self>) {
+        let Some(pos) = self.strip_pos_at_x(x) else {
+            return;
+        };
+        if pin {
+            self.strip_toggle_pin(pos, cx);
+            return;
+        }
+        self.strip.parked = true;
+        self.strip.scrubbing = true;
+        self.strip_scrub_to(pos, cx);
+    }
+
+    /// Map a rail x (window coords) → working px → wall-clock ms. The thumb
+    /// travels `min(total_work, rail_width)` (design §1): when the history fits,
+    /// the rail and the fixed-scale fabric coincide 1:1; when it overflows, the
+    /// thumb compresses the whole duration into the rail while the fabric
+    /// auto-scrolls. Both this input map and the painted thumb use `strip_travel`.
+    fn strip_pos_at_x(&self, x: f32) -> Option<i64> {
+        let geom = (*self.strip_rail.borrow())?;
+        let bake = self.strip.bake.as_ref()?;
+        let travel = strip_travel(geom.rail_x1 - geom.rail_x0, bake.timeline.total_work);
+        let frac = ((x - geom.rail_x0) / travel).clamp(0., 1.);
+        Some(bake.timeline.wall_at(frac * bake.timeline.total_work))
+    }
+
+    /// One scrub step: move the playhead, reconstruct the past, and auto-scroll
+    /// the fabric to keep the playhead in view (the mutable half of the
+    /// stability law — the bake never moves; only these do).
+    fn strip_scrub_to(&mut self, pos_ms: i64, cx: &mut Context<Self>) {
+        self.strip.pos_ms = pos_ms;
+        self.strip_reconstruct(pos_ms);
+        let view = {
+            let geom = *self.strip_rail.borrow();
+            match (geom, self.strip.bake.as_ref()) {
+                (Some(g), Some(b)) => {
+                    let rail_w = (g.rail_x1 - g.rail_x0).max(1.);
+                    let work = b.timeline.work_at(pos_ms);
+                    Some((work - rail_w / 2.).clamp(0., (b.timeline.total_work - rail_w).max(0.)))
+                }
+                _ => None,
+            }
+        };
+        if let Some(v) = view {
+            self.strip.view_offset = v;
+        }
+        cx.notify();
+    }
+
+    /// Reconstruct the document as it stood at `pos_ms` (spec §2). Anchors on
+    /// the latest materialized checkpoint ≤ t (the ms law), replays the journal
+    /// forward through a bare `ReplayDoc` (no store — a scrub never journals),
+    /// and shows it read-only through the EXISTING `history_preview` path so
+    /// the margin lane hides and the canvas renders the past. Rightward drags
+    /// advance the cached scratch incrementally; a leftward jump or a new
+    /// anchor rebuilds it.
+    fn strip_reconstruct(&mut self, pos_ms: i64) {
+        let anchor_ms: Option<i64> = self.strip.bake.as_ref().and_then(|b| {
+            strip::anchor_index(&b.anchor_ms, pos_ms).map(|i| b.anchor_ms[i])
+        });
+        let anchor_key = anchor_ms.unwrap_or(i64::MIN);
+        let runs_until = self.doc.journal().runs_until(pos_ms);
+        let reuse = self
+            .strip
+            .scratch
+            .as_ref()
+            .is_some_and(|s| s.anchor_ms == anchor_key && runs_until >= s.replay.applied);
+        if !reuse {
+            let (text, spans, blocks) = match anchor_ms {
+                Some(a) => self
+                    .checkpoint_state_at_ms(a)
+                    .unwrap_or_else(|| (String::new(), SpanSet::default(), BlockMap::default())),
+                None => (String::new(), SpanSet::default(), BlockMap::default()),
+            };
+            let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
+            let replay = strop_core::journal::ReplayDoc::new(&text, spans, blocks, applied);
+            self.strip.scratch = Some(strip::ScrubDoc {
+                replay,
+                anchor_ms: anchor_key,
+            });
+        }
+        // Advance forward to pos_ms (disjoint field borrows: scratch vs doc).
+        if let Some(scratch) = self.strip.scratch.as_mut() {
+            scratch.replay.advance(self.doc.journal(), pos_ms);
+        }
+        // Project the reconstructed rope + spans + blocks into a PreviewDoc.
+        let Some(scratch) = self.strip.scratch.as_ref() else {
+            return;
+        };
+        let text = scratch.replay.text();
+        let words = count_words(std::iter::once(text.as_str()));
+        let spans_bytes: Vec<(Range<usize>, InlineAttr)> = {
+            let mut idx: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+            idx.push(text.len());
+            let b = |ci: usize| idx.get(ci).copied().unwrap_or(text.len());
+            scratch
+                .replay
+                .spans
+                .spans()
+                .iter()
+                .map(|s| (b(s.range.start)..b(s.range.end), s.attr.clone()))
+                .collect()
+        };
+        let kinds = scratch.replay.blocks.kinds().to_vec();
+        // No diff coloring — the strip shows the past AS IT WAS, not a diff.
+        self.history_preview = Some(PreviewDoc {
+            text,
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+            spans_bytes,
+            kinds,
+        });
+        self.strip.words_at = words;
+    }
+
+    /// Esc / the Now chip: drop the preview, return to the present, keep the
+    /// strip open (spec §2). Also clears any Compare pin (review: every state
+    /// needs an exit).
+    fn strip_return_to_now(&mut self, cx: &mut Context<Self>) {
+        let now = self
+            .strip
+            .bake
+            .as_ref()
+            .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
+        self.strip.parked = false;
+        self.strip.scrubbing = false;
+        self.strip.pin_ms = None;
+        self.strip.pos_ms = now;
+        self.strip.scratch = None;
+        self.history_preview = None;
+        cx.notify();
+    }
+
+    /// Compare (shift-click): a second faint playhead whose delta folds into
+    /// the readout's single line. A second shift-click on/near it clears it.
+    fn strip_toggle_pin(&mut self, pos_ms: i64, cx: &mut Context<Self>) {
+        let clear = self.strip.pin_ms.is_some_and(|p| {
+            // Near the existing pin, in working px — a toggle-off.
+            self.strip.bake.as_ref().is_some_and(|b| {
+                (b.timeline.work_at(p) - b.timeline.work_at(pos_ms)).abs() < 8.
+            })
+        });
+        if clear {
+            self.strip.pin_ms = None;
+        } else {
+            self.strip.pin_ms = Some(pos_ms);
+            self.strip.pin_words = self.strip_word_count_at(pos_ms);
+        }
+        cx.notify();
+    }
+
+    /// Word count of the reconstruction at `pos_ms`, computed on a THROWAWAY
+    /// `ReplayDoc` (never touching the cached scratch or the live preview) —
+    /// used once when a Compare pin is set, so the readout's folded delta is
+    /// free thereafter.
+    fn strip_word_count_at(&self, pos_ms: i64) -> usize {
+        let Some(bake) = self.strip.bake.as_ref() else {
+            return 0;
+        };
+        let anchor_ms = strip::anchor_index(&bake.anchor_ms, pos_ms).map(|i| bake.anchor_ms[i]);
+        let (text, spans, blocks) = match anchor_ms {
+            Some(a) => self
+                .checkpoint_state_at_ms(a)
+                .unwrap_or_else(|| (String::new(), SpanSet::default(), BlockMap::default())),
+            None => (String::new(), SpanSet::default(), BlockMap::default()),
+        };
+        let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
+        let mut replay = strop_core::journal::ReplayDoc::new(&text, spans, blocks, applied);
+        replay.advance(self.doc.journal(), pos_ms);
+        count_words(std::iter::once(replay.text().as_str()))
+    }
+
+    /// The strip's own Restore (spec §2): build a `CheckpointState`-shaped value
+    /// from the reconstructed scratch and route through the SAME restore path
+    /// as the panel (undoable forward edit, notes reanchor, the "Before
+    /// restoring" and "Restored" checkpoints, the `Restore` event). Then the one
+    /// lawful in-session re-bake (data changed) and a return to the new present.
+    fn strip_restore(&mut self, cx: &mut Context<Self>) {
+        if !self.strip.is_parked() {
+            return;
+        }
+        let Some(scratch) = self.strip.scratch.as_ref() else {
+            self.strip_return_to_now(cx);
+            return;
+        };
+        let text = scratch.replay.text();
+        let spans = scratch.replay.spans.clone();
+        let blocks = scratch.replay.blocks.clone();
+        let from_unix = self.strip.pos_ms / 1000;
+        self.restore_to_state("an earlier version", text, spans, blocks, from_unix, cx);
+        // Data changed — refresh the bake, snap the playhead to the new present
+        // (the restore IS the new now; the fabric never re-scales under the eye
+        // mid-view, only here — design §1).
+        let now = strop_core::journal::now_ms();
+        self.strip.parked = false;
+        self.strip.scrubbing = false;
+        self.strip.pin_ms = None;
+        self.strip.pos_ms = now;
+        self.strip.scratch = None;
+        // Drop the preview even if the restore degraded (no store): the strip
+        // returns to the live document at now.
+        self.history_preview = None;
+        self.strip_bake(now);
+        cx.notify();
+    }
+
+    /// Wheel over the strip pans the FABRIC only (never the thumb, never the
+    /// document — design §3); the view offset varies, the bake stays frozen.
+    fn strip_pan(&mut self, d: f32, cx: &mut Context<Self>) {
+        let max = {
+            let geom = *self.strip_rail.borrow();
+            match (geom, self.strip.bake.as_ref()) {
+                (Some(g), Some(b)) => {
+                    Some((b.timeline.total_work - (g.rail_x1 - g.rail_x0)).max(0.))
+                }
+                _ => None,
+            }
+        };
+        let Some(max) = max else { return };
+        self.strip.view_offset = (self.strip.view_offset - d).clamp(0., max);
         cx.notify();
     }
 
@@ -4020,7 +4422,9 @@ impl Editor {
     /// and anything less applies; at a bare caret, sets a sticky attr for
     /// the next typed text (the universal rich-editor convention).
     fn toggle_span(&mut self, attr: InlineAttr, cx: &mut Context<Self>) {
-        if self.history_view.is_some() {
+        // Read-only while previewing the past (panel or strip): formatting the
+        // past is undefined; only typing restores (see apply_replace).
+        if self.history_view.is_some() || self.strip.is_parked() {
             return;
         }
         if self.selected_range.is_empty() {
@@ -4603,6 +5007,16 @@ impl Editor {
         }
         if self.palette_input.is_some() {
             self.close_palette(window, cx);
+            return;
+        }
+        // The strip: parked → return to now (drop the preview); already at now →
+        // close it (spec §2 / review mid — restores the app-wide Esc-closes rule).
+        if self.strip.open {
+            if self.strip.parked {
+                self.strip_return_to_now(cx);
+            } else {
+                self.close_strip(cx);
+            }
             return;
         }
         if self.history_view.is_some() {
@@ -5249,7 +5663,7 @@ impl Editor {
 
     /// Toggle a block kind over the selected block range, one transaction.
     fn toggle_block(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
-        if self.history_view.is_some() {
+        if self.history_view.is_some() || self.strip.is_parked() {
             return;
         }
         let start_block = self.doc.block_of_byte(self.selected_range.start);
@@ -5431,7 +5845,7 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.history_view.is_some() {
+        if self.history_view.is_some() || self.strip.is_parked() {
             return;
         }
         if let Some(cursor_char) = self.doc.undo() {
@@ -5451,7 +5865,7 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.history_view.is_some() {
+        if self.history_view.is_some() || self.strip.is_parked() {
             return;
         }
         if let Some(cursor_char) = self.doc.redo() {
@@ -5944,6 +6358,9 @@ impl Editor {
         if self.history_view.is_some() {
             overlays.push("history");
         }
+        if self.strip.open {
+            overlays.push("strip");
+        }
         // Every live single-line field, so "focused" can name its context.
         let mut fields: Vec<Entity<TextField>> = Vec::new();
         if let Some(panel) = &self.ai_settings {
@@ -6029,6 +6446,19 @@ impl Editor {
             "moving": self.moving.len(),
             "moves_started": self.moves_started,
             "reduce_motion": self.config.reduce_motion,
+            // The history strip (P1). `bakes` is session-monotonic — the
+            // stability-law assertion: scrubbing must NEVER bump it (only open
+            // and Restore do). Everything else is scrub state the rig checks.
+            "strip": self.strip.bake.as_ref().map(|b| serde_json::json!({
+                "open": self.strip.open,
+                "pos_ms": self.strip.pos_ms,
+                "parked": self.strip.parked,
+                "runs": self.doc.journal().runs.len(),
+                "events": self.doc.journal().events.len(),
+                "stations": b.stations.len(),
+                "words_at": self.strip.words_at,
+                "bakes": self.strip.bakes,
+            })),
         })
         .to_string()
     }
@@ -6113,6 +6543,95 @@ impl Editor {
         let generation = self.ai_generation;
         self.deliver_pass(Self::demo_diagnoses(), generation, cx);
         cx.notify();
+    }
+
+    /// Rig hook (`seed:journal`): install a deterministic synthetic fortnight —
+    /// four sittings of coalesced-length runs across two weeks, each with a
+    /// pass and a card closure — so the strip has real fabric to bake and
+    /// scrub without a live editing session. Appends only (pos = running
+    /// length), so a scrub reconstruction on the empty doc reproduces cleanly.
+    pub fn debug_seed_journal(&mut self, cx: &mut Context<Self>) {
+        use strop_core::journal::{EditRun, Journal, JournalEvent};
+        let now = strop_core::journal::now_ms();
+        let day = 86_400_000i64;
+        let mut runs: Vec<EditRun> = Vec::new();
+        let mut events: Vec<JournalEvent> = Vec::new();
+        let mut pos = 0usize;
+        for (s, start) in [now - 13 * day, now - 9 * day, now - 4 * day, now - day]
+            .into_iter()
+            .enumerate()
+        {
+            for k in 0..16i64 {
+                let t0 = start + k * 1200;
+                let ins = "the quiet word ";
+                runs.push(EditRun {
+                    t0,
+                    t1: t0 + 800,
+                    pos,
+                    del_chars: 0,
+                    ins: ins.into(),
+                });
+                pos += ins.chars().count();
+            }
+            events.push(JournalEvent::Pass {
+                t: start + 20_000,
+                mode: "developmental".into(),
+                cards: 3,
+            });
+            if s.is_multiple_of(2) {
+                events.push(JournalEvent::CardClosed {
+                    t: start + 40_000,
+                    id: s as u64 + 1,
+                    resolved: true,
+                });
+            }
+        }
+        self.doc.set_journal(Journal::from_parts(runs, events));
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Rig hook (`strip:open`): open the strip surface.
+    pub fn debug_strip_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_strip(window, cx);
+    }
+
+    /// Rig hook (`strip:scrub:<0..1>`): park at a fraction of the whole history
+    /// (via the timeline, not the rail geometry — deterministic headless).
+    pub fn debug_strip_scrub(&mut self, frac: f32, cx: &mut Context<Self>) {
+        let pos = self
+            .strip
+            .bake
+            .as_ref()
+            .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
+        if let Some(pos) = pos {
+            self.strip.parked = true;
+            self.strip.scrubbing = false;
+            self.strip_scrub_to(pos, cx);
+        }
+    }
+
+    /// Rig hook (`strip:pin:<0..1>`): set/clear the Compare pin at a fraction.
+    pub fn debug_strip_pin(&mut self, frac: f32, cx: &mut Context<Self>) {
+        let pos = self
+            .strip
+            .bake
+            .as_ref()
+            .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
+        if let Some(pos) = pos {
+            self.strip_toggle_pin(pos, cx);
+        }
+    }
+
+    /// Rig hook (`strip:restore`): the strip's Restore (re-bakes — the one
+    /// lawful in-session re-bake, so `bakes` legitimately bumps here).
+    pub fn debug_strip_restore(&mut self, cx: &mut Context<Self>) {
+        self.strip_restore(cx);
+    }
+
+    /// Rig hook (`strip:now`): Esc/Now — drop the preview, back to the present.
+    pub fn debug_strip_now(&mut self, cx: &mut Context<Self>) {
+        self.strip_return_to_now(cx);
     }
 
     /// Rig hook (`seed:many`): a CROWDED lane — eight diagnoses across two
@@ -6276,6 +6795,18 @@ impl Editor {
         typograph: bool,
         cx: &mut Context<Self>,
     ) {
+        // Typing while parked in the strip's past = restore-then-type (spec §2,
+        // Raskin's law): a text INSERT first performs the Restore (which drops
+        // the preview and returns to the now-live restored doc), then falls
+        // through to insert. A pure deletion (empty new_text) of the past stays
+        // read-only — there is no "type" gesture to justify restoring.
+        if self.strip.is_parked() {
+            if new_text.is_empty() {
+                return;
+            }
+            self.strip_restore(cx);
+            // strip_restore left the doc live and the strip at now; fall through.
+        }
         if self.history_view.is_some() {
             return; // history preview is read-only
         }
@@ -8248,23 +8779,22 @@ impl Editor {
                     .ml(px(4.))
                     .rounded(px(5.))
                     .cursor(CursorStyle::PointingHand)
-                    .text_color(if self.history_view.is_some() {
+                    .text_color(if self.strip.open {
                         rgb(TEXT_COLOR)
                     } else {
                         rgb(MUTED_COLOR)
                     })
-                    .when(self.history_view.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
+                    .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("History & Rewind", Some("ctrl-alt-h")))
+                    .tooltip(tip("History", Some("ctrl-alt-h")))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        // The clock toggles the STRIP (the new first history
+                        // surface); the right-side panel lives on in the palette
+                        // ("History panel"). The two never open together.
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            if editor.history_view.is_some() {
-                                editor.exit_history(cx);
-                            } else {
-                                editor.enter_history(cx);
-                            }
+                            editor.toggle_strip(&ToggleStrip, window, cx);
                         }),
                     )
                     .child(
@@ -8273,7 +8803,7 @@ impl Editor {
                             .size(px(11.))
                             .rounded_full()
                             .border_1()
-                            .border_color(if self.history_view.is_some() {
+                            .border_color(if self.strip.open {
                                 rgb(TEXT_COLOR)
                             } else {
                                 rgb(MUTED_COLOR)
@@ -8281,13 +8811,11 @@ impl Editor {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(div().size(px(3.)).rounded_full().bg(
-                                if self.history_view.is_some() {
-                                    rgb(TEXT_COLOR)
-                                } else {
-                                    rgb(MUTED_COLOR)
-                                },
-                            )),
+                            .child(div().size(px(3.)).rounded_full().bg(if self.strip.open {
+                                rgb(TEXT_COLOR)
+                            } else {
+                                rgb(MUTED_COLOR)
+                            })),
                     ),
             )
             // Windows/Linux get our own drawn window controls. macOS keeps its
@@ -11552,6 +12080,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::test_ai_connection))
             .on_action(cx.listener(Self::cancel_ai_run))
             .on_action(cx.listener(Self::toggle_history))
+            .on_action(cx.listener(Self::toggle_strip))
             .on_action(cx.listener(Self::add_checkpoint))
             .on_action(cx.listener(Self::set_session_goal))
             .on_action(cx.listener(Self::end_session))
@@ -11663,6 +12192,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::note_tab))
                     .on_action(cx.listener(Self::escape_mode))
                     .on_action(cx.listener(Self::toggle_history))
+                    .on_action(cx.listener(Self::toggle_strip))
                     .on_action(cx.listener(Self::open_file))
                     .on_action(cx.listener(Self::save_copy_as))
                     .on_action(cx.listener(Self::toggle_palette))
@@ -11741,8 +12271,12 @@ impl Render for Editor {
             })
             .map(|d| {
                 // The panel displaces the margin lane while open (DESIGN
-                // §2-history) — and the AI status card that rides it.
-                if self.history_view.is_some() {
+                // §2-history) — and the AI status card that rides it. The strip
+                // hides the lane + rail only while PREVIEWING the past (parked):
+                // cards anchored to the live document must not float over past
+                // text (review H36). At now, with the strip open, the live doc
+                // and its cards stay.
+                if self.history_view.is_some() || self.strip.is_parked() {
                     return d;
                 }
                 let d = match self.render_margin(window, cx) {
@@ -11781,6 +12315,12 @@ impl Render for Editor {
                 None => d,
             })
             .map(|d| match self.render_goal_strip() {
+                Some(strip) => d.child(strip),
+                None => d,
+            })
+            // The history strip (P1): a bottom-strip overlay in the machine-room
+            // dark, above the other bottom bands but below palette/shortcuts.
+            .map(|d| match self.render_strip(window, cx) {
                 Some(strip) => d.child(strip),
                 None => d,
             })
@@ -11928,6 +12468,512 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
             .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
             .map_or(end, |(ix, seg)| offset + ix + seg.len())
             .min(len);
+    }
+}
+
+// ---- The history strip: painting & the floor ------------------------------
+
+/// The strip's painted rail geometry (WINDOW coords), captured each paint so
+/// the scrub mouse handlers map a pointer against the SAME bounds the fabric
+/// drew (see `Editor::strip_rail`).
+#[derive(Clone, Copy)]
+pub struct StripGeom {
+    rail_x0: f32,
+    rail_x1: f32,
+}
+
+/// The thumb's travel: `min(total_work, rail_width)` (design §1). When the
+/// history fits, the rail and the fixed-scale fabric coincide 1:1; when it
+/// overflows, the thumb compresses the whole duration into the rail.
+fn strip_travel(rail_w: f32, total_work: f32) -> f32 {
+    total_work.min(rail_w).max(1.)
+}
+
+/// An rgb constant with an explicit alpha — the strip's translucent fabric
+/// marks (flecks fuse by alpha; veils are faint).
+fn tint(c: u32, a: f32) -> gpui::Rgba {
+    let mut x = rgb(c);
+    x.a = a;
+    x
+}
+
+impl Editor {
+    /// The bottom strip overlay (spec §0): machine-room dark, the seek-bar
+    /// floor. The fabric + rail + thumb + ticks + labels are custom-painted by
+    /// `StripElement`; the readout / Restore / Now chips are real divs on top
+    /// (each `stop_propagation`, so a click on a control never scrubs — the
+    /// hit-region rule, review mid). The container owns the scrub gesture
+    /// (mousedown = park, drag = continuous, up/up_out = end — the selection-
+    /// drag pattern) and pans the fabric on wheel.
+    fn render_strip(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if !self.strip.open {
+            return None;
+        }
+        let parked = self.strip.parked;
+        let now_ms = self
+            .strip
+            .bake
+            .as_ref()
+            .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
+        // The readout: at now → the live count; parked → the reconstructed
+        // moment, plus any Compare delta folded into the SAME single line.
+        let readout = if parked {
+            let mut s = strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms);
+            if let Some(pin) = self.strip.pin_ms {
+                let delta = self.strip.words_at as i64 - self.strip.pin_words as i64;
+                let when = strip::date_label(pin / 1000, now_ms / 1000);
+                s = format!("{s} · {delta:+} since {when}");
+            }
+            s
+        } else {
+            strip::format_readout(now_ms, self.word_count, now_ms)
+        };
+
+        // A chip button in the machine-room family.
+        let chip = |label: SharedString, bright: bool| {
+            div()
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(4.))
+                .bg(rgb(strip::READOUT_CHIP))
+                .font_family("PT Sans")
+                .text_size(px(11.))
+                .text_color(if bright { rgb(0xE7E1D0) } else { rgb(0x8F8A7C) })
+                .child(label)
+        };
+
+        let readout_chip = chip(readout.into(), true)
+            .id("strip-readout")
+            .occlude()
+            // The readout is fixed at the left end and NEVER parks (design §3).
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        let restore_btn = div()
+            .id("strip-restore")
+            .occlude()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .bg(rgb(0x2E2C22))
+            .cursor(CursorStyle::PointingHand)
+            .font_family("PT Sans")
+            .text_size(px(11.))
+            .text_color(rgb(0xE7E1D0))
+            .hover(|d| d.bg(rgb(0x3A3728)))
+            .child("Restore")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.strip_restore(cx);
+                }),
+            );
+
+        // Now: dim at the present, bright when parked (it and Restore announce
+        // themselves as the pair they are — design §3). Click / Esc return.
+        let now_chip = chip("Now".into(), parked)
+            .id("strip-now")
+            .occlude()
+            .cursor(CursorStyle::PointingHand)
+            .hover(|d| d.bg(rgb(0x2E2C22)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.strip_return_to_now(cx);
+                }),
+            );
+
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(strip::STRIP_H))
+                .bg(rgb(strip::GROUND))
+                .border_t_1()
+                .border_color(rgb(0x3A382E))
+                .occlude()
+                // Scrub: mousedown parks (shift = Compare pin), drag scrubs
+                // continuously, up/up_out end — the selection-drag pattern.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.strip_park_at_x(f32::from(ev.position.x), ev.modifiers.shift, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(|editor, ev: &MouseMoveEvent, _, cx| {
+                    if editor.strip.scrubbing
+                        && ev.pressed_button == Some(MouseButton::Left)
+                        && let Some(pos) = editor.strip_pos_at_x(f32::from(ev.position.x))
+                    {
+                        editor.strip_scrub_to(pos, cx);
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseUpEvent, _, cx| {
+                        editor.strip.scrubbing = false;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseUpEvent, _, cx| {
+                        editor.strip.scrubbing = false;
+                        cx.notify();
+                    }),
+                )
+                .on_scroll_wheel(cx.listener(|editor, ev: &ScrollWheelEvent, _, cx| {
+                    cx.stop_propagation();
+                    let d = f32::from(ev.delta.pixel_delta(px(16.)).y)
+                        + f32::from(ev.delta.pixel_delta(px(16.)).x);
+                    editor.strip_pan(d, cx);
+                }))
+                .child(StripElement { editor: cx.entity() })
+                // Left group: the readout, with Restore beside it when parked.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(strip::SIDE_PAD - 8.))
+                        .top(px(4.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(readout_chip)
+                        .when(parked, |d| d.child(restore_btn)),
+                )
+                // Now, fixed at the far right.
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(strip::SIDE_PAD - 8.))
+                        .top(px(4.))
+                        .child(now_chip),
+                ),
+        )
+    }
+}
+
+struct StripElement {
+    editor: Entity<Editor>,
+}
+
+impl IntoElement for StripElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// A shaped strip label, positioned at bake-time geometry (never re-shaped
+/// mid-scrub — the stability law; shaping only ever happens in prepaint, per
+/// the 2026-06-12 sprite-corruption rule).
+struct StripText {
+    origin: Point<Pixels>,
+    line: gpui::ShapedLine,
+}
+
+#[derive(Default)]
+struct StripPrepaint {
+    rail_x0: f32,
+    rail_x1: f32,
+    band_top: f32,
+    view: f32,
+    labels: Vec<StripText>,
+    dates: Vec<StripText>,
+}
+
+impl Element for StripElement {
+    type RequestLayoutState = ();
+    type PrepaintState = StripPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let _guard = DrawGuard::enter();
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let _guard = DrawGuard::enter();
+        let editor = self.editor.read(cx);
+        let rail_x0 = f32::from(bounds.origin.x) + strip::SIDE_PAD;
+        let rail_x1 = f32::from(bounds.origin.x + bounds.size.width) - strip::SIDE_PAD;
+        let band_top = f32::from(bounds.origin.y);
+        let view = editor.strip.view_offset;
+        let Some(bake) = editor.strip.bake.as_ref() else {
+            return StripPrepaint {
+                rail_x0,
+                rail_x1,
+                band_top,
+                view,
+                ..Default::default()
+            };
+        };
+        let fab_x = |work: f32| rail_x0 + work - view;
+        let shape = |text: &str, size: f32, color: u32, w: &mut Window| {
+            let run = TextRun {
+                len: text.len(),
+                font: gpui::font("PT Sans"),
+                color: rgb(color).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            w.text_system()
+                .shape_line(SharedString::from(text.to_owned()), px(size), &[run], None)
+        };
+        // Station labels — only the ones the bake kept, and only within view.
+        let mut labels = Vec::new();
+        for st in &bake.stations {
+            if !st.show || st.label.is_empty() {
+                continue;
+            }
+            let wx = fab_x(st.x);
+            if wx < rail_x0 - 60. || wx > rail_x1 + 60. {
+                continue;
+            }
+            let line = shape(&st.label, 11., 0xB8B2A2, window);
+            let lx = if st.flip_left {
+                wx - f32::from(line.width) - 3.
+            } else {
+                wx + 3.
+            };
+            let ly = band_top + strip::TOP_ROW_H + 1. + (st.row as f32) * 11.;
+            labels.push(StripText {
+                origin: point(px(lx), px(ly)),
+                line,
+            });
+        }
+        // Date lane.
+        let mut dates = Vec::new();
+        for dt in &bake.dates {
+            let wx = fab_x(dt.x);
+            if wx < rail_x0 - 40. || wx > rail_x1 + 40. {
+                continue;
+            }
+            let line = shape(&dt.label, 10., 0x87826F, window);
+            dates.push(StripText {
+                origin: point(px(wx + 2.), px(band_top + strip::STRIP_H - strip::DATE_LANE_H)),
+                line,
+            });
+        }
+        StripPrepaint {
+            rail_x0,
+            rail_x1,
+            band_top,
+            view,
+            labels,
+            dates,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let _guard = DrawGuard::enter();
+        let editor = self.editor.read(cx);
+        let rail_x0 = prepaint.rail_x0;
+        let rail_x1 = prepaint.rail_x1;
+        let band_top = prepaint.band_top;
+        // Hand the rail geometry to the scrub mouse handlers (interior
+        // mutability through the shared Rc — never an entity write).
+        *editor.strip_rail.borrow_mut() = Some(StripGeom { rail_x0, rail_x1 });
+
+        let rail_y = band_top + strip::RAIL_Y;
+        let rail_w = (rail_x1 - rail_x0).max(1.);
+        // A thin quad, clipped to the rail's x-window. `window` is a parameter
+        // (not captured), so the direct paint_quad calls below — thumb, flecks,
+        // playhead — never fight this helper for the mutable window borrow.
+        let rect = |window: &mut Window, x: f32, y: f32, w: f32, h: f32, color: gpui::Rgba| {
+            let xa = x.max(rail_x0);
+            let xb = (x + w).min(rail_x1);
+            if xb <= xa || h <= 0. {
+                return;
+            }
+            window.paint_quad(fill(
+                Bounds::new(point(px(xa), px(y)), size(px(xb - xa), px(h))),
+                color,
+            ));
+        };
+
+        let Some(bake) = editor.strip.bake.as_ref() else {
+            // Degraded (no bake yet): just the rail line, so the floor exists.
+            rect(window, rail_x0, rail_y, rail_w, 2., tint(strip::GREY, 0.6));
+            return;
+        };
+        let view = prepaint.view;
+        let total = bake.timeline.total_work;
+        let pos = editor.strip.pos_ms;
+        let fab_x = |work: f32| rail_x0 + work - view;
+        let fab_top = band_top + strip::FAB_Y0;
+        let fab_bot = fab_top + strip::FABRIC_H;
+
+        // --- Cream page-fill + stepwise envelope stroke ----------------------
+        if !bake.envelope.is_empty() {
+            let mut prev = strip::EnvPoint {
+                x: 0.,
+                y: bake.envelope[0].y,
+            };
+            for p in bake.envelope.iter().chain(std::iter::once(&strip::EnvPoint {
+                x: total,
+                y: bake.envelope.last().map_or(fab_top, |e| e.y),
+            })) {
+                let xa = fab_x(prev.x);
+                let xb = fab_x(p.x);
+                let level = band_top + prev.y;
+                // The faint cream page under the line.
+                rect(window, xa, fab_top, xb - xa, level - fab_top, tint(strip::CREAM, strip::CREAM_FILL_ALPHA));
+                // The envelope stroke: a horizontal cap + the vertical step.
+                rect(window, xa, level - 0.65, xb - xa, 1.3, tint(strip::CREAM, strip::ENVELOPE_ALPHA));
+                let (y0, y1) = ((prev.y).min(p.y), (prev.y).max(p.y));
+                rect(window, xb - 0.65, band_top + y0, 1.3, y1 - y0, tint(strip::CREAM, strip::ENVELOPE_ALPHA));
+                prev = *p;
+            }
+        }
+
+        // --- Veils: the machine read here (a full-height cool column) --------
+        for v in &bake.veils {
+            let x = fab_x(v.x);
+            rect(window, x - 2., fab_top, 4., strip::FABRIC_H, tint(strip::VEIL, strip::VEIL_ALPHA));
+        }
+
+        // --- Threads: a card's open life (cool), sage/grey terminal dot ------
+        for t in &bake.threads {
+            let x0 = fab_x(t.x0);
+            let x1 = fab_x(t.x1);
+            let y = band_top + t.y;
+            rect(window, x0, y, x1 - x0, 1., tint(strip::THREAD, 0.5));
+            if !t.open {
+                let dot = if t.resolved { strip::SAGE } else { strip::GREY };
+                rect(window, x1 - 1.5, y - 1.5, 3., 3., tint(dot, 0.9));
+            }
+        }
+
+        // --- Seams: a folded >15 min gap ------------------------------------
+        for s in &bake.seams {
+            let x = fab_x(s.x);
+            rect(window, x, fab_top, 1., strip::FABRIC_H, tint(strip::GREY, 0.35));
+        }
+
+        // --- Flecks: the fabric (2×2 amber grains; thousands = one batch) ----
+        for f in &bake.flecks {
+            let x = fab_x(f.x);
+            if x < rail_x0 || x > rail_x1 {
+                continue;
+            }
+            let color = if f.del {
+                tint(strip::FLECK_DEL, strip::FLECK_DEL_ALPHA)
+            } else {
+                tint(strip::FLECK_INS, strip::FLECK_INS_ALPHA)
+            };
+            window.paint_quad(fill(
+                Bounds::new(point(px(x), px(band_top + f.y)), size(px(strip::FLECK), px(strip::FLECK))),
+                color,
+            ));
+        }
+
+        // --- Station ticks (+ restore arcs), brightened near the playhead ----
+        let play_x = fab_x(bake.timeline.work_at(pos));
+        for st in &bake.stations {
+            let x = fab_x(st.x);
+            // Brighten by TIME distance to the playhead (association by light,
+            // design §2) — stable under the fabric's zoom, unlike pixel distance.
+            let near = (st.at_ms - pos).abs() < 45_000;
+            let base = if st.restore { strip::SAGE } else { strip::GREY };
+            let a = if near { 0.95 } else { 0.5 };
+            rect(window, x, band_top + strip::TOP_ROW_H, 1., strip::FABRIC_H + strip::LABEL_LANE_H, tint(base, a));
+            // Restore arc: a dashed connector back to the source station, ridden
+            // in the label lane (design §1).
+            if let Some(src) = st.arc_to {
+                let sx = fab_x(src);
+                let (a0, a1) = (sx.min(x), sx.max(x));
+                let ay = band_top + strip::TOP_ROW_H + strip::LABEL_LANE_H - 3.;
+                let mut dash = a0;
+                while dash < a1 {
+                    rect(window, dash, ay, 3., 1., tint(strip::SAGE, 0.55));
+                    dash += 6.;
+                }
+            }
+        }
+
+        // --- The rail, the thumb, the playhead, and the Compare pin ----------
+        rect(window, rail_x0, rail_y, rail_w, 2., tint(strip::GREY, 0.55));
+        let travel = strip_travel(rail_w, total);
+        let frac = if total > 0. {
+            bake.timeline.work_at(pos) / total
+        } else {
+            1.
+        };
+        let thumb_x = rail_x0 + frac * travel;
+        // The thumb carries the highest contrast in the strip (design §0).
+        let mut thumb = fill(
+            Bounds::new(point(px(thumb_x - 5.), px(rail_y - 5.)), size(px(10.), px(10.))),
+            rgb(0xEDE7D6),
+        );
+        thumb.corner_radii = Corners::all(px(5.));
+        window.paint_quad(thumb);
+        // The playhead line binds the rail to the fabric.
+        if play_x >= rail_x0 && play_x <= rail_x1 {
+            window.paint_quad(fill(
+                Bounds::new(point(px(play_x - 0.5), px(rail_y)), size(px(1.), px(fab_bot - rail_y))),
+                tint(0xEDE7D6, if editor.strip.parked { 0.85 } else { 0.4 }),
+            ));
+        }
+        if let Some(pin) = editor.strip.pin_ms {
+            let px_pin = fab_x(bake.timeline.work_at(pin));
+            if px_pin >= rail_x0 && px_pin <= rail_x1 {
+                window.paint_quad(fill(
+                    Bounds::new(point(px(px_pin - 0.5), px(rail_y)), size(px(1.), px(fab_bot - rail_y))),
+                    tint(0xEDE7D6, 0.3),
+                ));
+            }
+        }
+
+        // --- Shaped text: station labels + the date lane ---------------------
+        for t in prepaint.labels.drain(..) {
+            t.line.paint(t.origin, px(12.), TextAlign::Left, None, window, cx).ok();
+        }
+        for t in prepaint.dates.drain(..) {
+            t.line.paint(t.origin, px(12.), TextAlign::Left, None, window, cx).ok();
+        }
     }
 }
 

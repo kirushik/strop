@@ -19,6 +19,7 @@ mod files;
 mod paths;
 mod single_instance;
 mod smoke;
+mod strip;
 mod text_field;
 mod theme;
 mod tutorial;

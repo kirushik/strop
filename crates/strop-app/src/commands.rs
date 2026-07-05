@@ -14,7 +14,7 @@ use crate::editor::{
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode,
     ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList,
-    ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview,
+    ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview, ToggleStrip,
     ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
 };
 
@@ -271,12 +271,22 @@ pub fn all() -> &'static [Command] {
             CancelAiRun,
             ["stop", "отменить"]
         ),
+        // ctrl-alt-h and the titlebar clock open the STRIP (P1, the new first
+        // history surface). The right-side panel lives on as its own palette
+        // verb; the strip and the panel never open together.
         cmd!(
-            "Toggle History & Rewind",
+            "History",
             "History",
             Some("ctrl-alt-h"),
+            ToggleStrip,
+            ["timeline", "strip", "rewind", "scrub", "история", "лента"]
+        ),
+        cmd!(
+            "History panel",
+            "History",
+            None,
             ToggleHistory,
-            ["versions", "rewind", "история", "версии"]
+            ["versions", "rewind", "sidebar", "checkpoints", "версии", "панель истории"]
         ),
         cmd!(
             "Name a Checkpoint",
@@ -529,7 +539,8 @@ mod tests {
             "Find in Document",
             "Find and Replace",
             "Run Editorial Diagnosis",
-            "Toggle History & Rewind",
+            "History",
+            "History panel",
             "Toggle Outline",
             "Set Up AI Provider…",
             "New Document",
