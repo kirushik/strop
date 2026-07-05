@@ -50,9 +50,19 @@ use crate::theme::{
 
 const MARGIN_WIDTH: f32 = 248.;
 const MARGIN_GAP: f32 = 16.;
-/// The omnibar's fixed width (06 §1, S4): the empty runway IS the type-here
-/// affordance, and a fixed box lets the results card hang from its left edge.
-const OMNI_FIELD_W: f32 = 320.;
+/// The omnibar's widest width (06 §1, S4): the empty runway IS the type-here
+/// affordance. ONE width for the field and its dropdown — equal boxes, equal
+/// centres, so all four edges agree (the width-coherence papercut) — computed
+/// by `omni_field_width` from the live window so a narrow bar never squeezes
+/// the window controls.
+const OMNI_FIELD_W: f32 = 400.;
+
+/// The one omnibar width, shared by the titlebar field and its dropdown: a
+/// third of the window, capped. Both surfaces call this — they can never
+/// disagree.
+fn omni_field_width(window: &Window) -> f32 {
+    (f32::from(window.viewport_size().width) / 3.).clamp(160., OMNI_FIELD_W)
+}
 /// Margin-card box metrics, shared by the height MEASUREMENT
 /// (`refresh_card_heights`) and the RENDER (`render_margin`) so a card's packed
 /// extent equals its painted one. Text wraps at the card's inner width; the
@@ -4535,7 +4545,8 @@ impl Editor {
         }
     }
 
-    fn render_omni(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_omni(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
+        let field_w = omni_field_width(window);
         let input = self.palette_input.clone().expect("omnibox open");
         let query = input.read(cx).content.clone();
         let (mode, rest) = omni_mode(&query);
@@ -4684,12 +4695,12 @@ impl Editor {
             .flex()
             .justify_center()
             .child(
-                // An invisible shell exactly the omnibar's width: the card
-                // hangs from the shell's LEFT edge, so the field and its
-                // dropdown share it (S5 — a menu attached to its control).
-                div().w(px(OMNI_FIELD_W)).child(
+                // The dropdown wears the field's own width (06 §1): equal
+                // boxes on the same centre line — every edge agrees, and the
+                // card reads as the field's shadow, not a second object.
+                div().w(px(field_w)).child(
                     div()
-                        .w(px(480.))
+                        .w(px(field_w))
                         .bg(rgb(0xFCFAF4))
                         .border_1()
                         .border_color(rgb(RULE_COLOR))
@@ -10673,7 +10684,7 @@ impl Editor {
     /// The one piece of chrome: title, word count, history, menu, window
     /// controls. Formatting lives in the selection popover (DESIGN
     /// §2-toolbar: zero category precedent for persistent format buttons).
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Dragging the bar moves the window — by two mechanisms, because the
         // platforms split. `start_window_move()` drives Wayland/X11/macOS but
         // is a no-op on Windows, where the OS only moves a window whose
@@ -10903,13 +10914,13 @@ impl Editor {
                         .id("omni-pill")
                         .occlude()
                         .flex_shrink_0()
-                        .w(px(OMNI_FIELD_W))
+                        .w(px(omni_field_width(window)))
                         .px(px(10.))
                         .py(px(2.))
                         .rounded(px(6.))
                         .border_1()
                         .border_color(rgb(ACTIVE_BORDER))
-                        .bg(rgb(0xFCFAF4))
+                        .bg(rgb(0xFFFFFF))
                         .flex()
                         .items_center()
                         .gap(px(8.))
@@ -10929,13 +10940,13 @@ impl Editor {
                     .id("omni-pill")
                     .occlude()
                     .flex_shrink_0()
-                    .w(px(OMNI_FIELD_W))
+                    .w(px(omni_field_width(window)))
                     .px(px(10.))
                     .py(px(2.))
                     .rounded(px(6.))
                     .border_1()
                     .border_color(rgb(RULE_COLOR))
-                    .bg(rgb(0xFCFAF4))
+                    .bg(rgb(0xFFFFFF))
                     .cursor(CursorStyle::IBeam)
                     .hover(|d| d.border_color(rgb(0xD8D2C2)))
                     .tooltip(tip("Search · > commands · @ headings", Some("ctrl-f")))
@@ -10946,7 +10957,20 @@ impl Editor {
                             editor.find(&Find, window, cx);
                         }),
                     )
+                    // The web-placeholder contract: "Search" sits exactly
+                    // where the first typed letter will land (same inset,
+                    // same size), and the chord hint keeps its old home.
+                    .flex()
+                    .items_center()
                     .child(div().text_color(rgb(MUTED_COLOR)).child("Search"))
+                    .child(
+                        div()
+                            .ml_auto()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child("Ctrl F"),
+                    )
                     .into_any_element(),
             })
             // Right third — mirrors the left (equal claims keep the centre
@@ -14743,7 +14767,7 @@ impl Render for Editor {
             // notes) stop_propagation on their own wheel — and on_scroll_wheel
             // early-returns while one is open — so they stay unaffected.
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(window, cx))
             .child(
                 div()
                     .w_full()
@@ -15005,7 +15029,7 @@ impl Render for Editor {
             // Last children = topmost: the omnibox, the keyboard map and
             // the AI settings panel cover everything below.
             .when(self.palette_input.is_some(), |d| {
-                d.child(self.render_omni(cx))
+                d.child(self.render_omni(window, cx))
             })
             .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
             .when(self.ai_settings.is_some(), |d| {
