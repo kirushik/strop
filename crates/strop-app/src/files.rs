@@ -137,16 +137,16 @@ fn bump_palette_freq_at(file: &Path, label: &str) -> u32 {
     count
 }
 
-/// One entry of ~/.local/state/strop/intents.json (DESIGN §4.1, the
-/// close-time if-then ritual): the "Next session I will ___" sentence
-/// recorded by End Session, plus the caret offset at quit so the writer
-/// resumes mid-sentence. Keyed by the document's canonical path.
+/// One entry of ~/.local/state/strop/intents.json: the caret offset at quit
+/// so the writer resumes mid-sentence next open (DESIGN §4 re-entry invariant).
+/// Keyed by the document's canonical path. The re-entry INTENT question was
+/// retired (impl 04 §1); this is now a pure caret-resume sidecar. Old files
+/// still carry an `intent`/`set_unix` key — serde ignores unknown fields, so
+/// they load fine and drop those keys on the next quit write (the caret
+/// survives). The on-disk filename stays `intents.json` so existing carets
+/// aren't orphaned.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct IntentEntry {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intent: Option<String>,
-    #[serde(default)]
-    pub set_unix: i64,
+pub struct SessionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caret: Option<usize>,
 }
@@ -162,14 +162,14 @@ fn intent_key(doc: &Path) -> String {
         .to_string()
 }
 
-fn load_intents_at(file: &Path) -> std::collections::HashMap<String, IntentEntry> {
+fn load_sessions_at(file: &Path) -> std::collections::HashMap<String, SessionEntry> {
     std::fs::read_to_string(file)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
 }
 
-fn save_intents_at(file: &Path, map: &std::collections::HashMap<String, IntentEntry>) {
+fn save_sessions_at(file: &Path, map: &std::collections::HashMap<String, SessionEntry>) {
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -178,59 +178,25 @@ fn save_intents_at(file: &Path, map: &std::collections::HashMap<String, IntentEn
     }
 }
 
-/// The intent (and caret) recorded for this document, if any.
-pub fn load_intent(doc: &Path) -> Option<IntentEntry> {
-    load_intent_at(&intents_file(), doc)
+/// The caret recorded for this document at last quit, if any.
+pub fn load_session(doc: &Path) -> Option<SessionEntry> {
+    load_session_at(&intents_file(), doc)
 }
 
-fn load_intent_at(file: &Path, doc: &Path) -> Option<IntentEntry> {
-    load_intents_at(file).remove(&intent_key(doc))
+fn load_session_at(file: &Path, doc: &Path) -> Option<SessionEntry> {
+    load_sessions_at(file).remove(&intent_key(doc))
 }
 
-/// End Session writes the full entry: the sentence, when, and where.
-pub fn set_intent(doc: &Path, intent: &str, caret: usize) {
-    set_intent_at(&intents_file(), doc, intent, caret);
-}
-
-fn set_intent_at(file: &Path, doc: &Path, intent: &str, caret: usize) {
-    let mut map = load_intents_at(file);
-    map.insert(
-        intent_key(doc),
-        IntentEntry {
-            intent: Some(intent.to_owned()),
-            set_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            caret: Some(caret),
-        },
-    );
-    save_intents_at(file, &map);
-}
-
-/// First edit or an explicit dismiss honors the intent: the whole entry
-/// goes — the caret is re-recorded at the next quit anyway.
-pub fn clear_intent(doc: &Path) {
-    clear_intent_at(&intents_file(), doc);
-}
-
-fn clear_intent_at(file: &Path, doc: &Path) {
-    let mut map = load_intents_at(file);
-    if map.remove(&intent_key(doc)).is_some() {
-        save_intents_at(file, &map);
-    }
-}
-
-/// Quit-time: remember where the caret was (the resume-mid-sentence half
-/// of the ritual). An intent already in the entry survives untouched.
+/// Quit-time: remember where the caret was (the resume-mid-sentence half of
+/// the re-entry ritual — now its whole job).
 pub fn record_caret(doc: &Path, caret: usize) {
     record_caret_at(&intents_file(), doc, caret);
 }
 
 fn record_caret_at(file: &Path, doc: &Path, caret: usize) {
-    let mut map = load_intents_at(file);
+    let mut map = load_sessions_at(file);
     map.entry(intent_key(doc)).or_default().caret = Some(caret);
-    save_intents_at(file, &map);
+    save_sessions_at(file, &map);
 }
 
 /// Open a path or URL with the OS default handler. Best-effort and
@@ -442,11 +408,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// intents.json round-trip against an injected path (env vars are
+    /// intents.json caret round-trip against an injected path (env vars are
     /// process-global; `lifecycle_in_isolated_home` owns them — see
-    /// config.rs `save_ai_to` for the same pattern).
+    /// config.rs `save_ai_to` for the same pattern). The intent half was
+    /// retired (impl 04 §1); the caret-resume half is what remains.
     #[test]
-    fn intents_round_trip_at_injected_path() {
+    fn session_caret_round_trips_at_injected_path() {
         let tmp = std::env::temp_dir().join(format!("strop-intents-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
@@ -456,39 +423,39 @@ mod tests {
         std::fs::write(&doc_a, b"x").unwrap();
         std::fs::write(&doc_b, b"x").unwrap();
 
-        assert!(load_intent_at(&file, &doc_a).is_none(), "empty start");
+        assert!(load_session_at(&file, &doc_a).is_none(), "empty start");
 
-        // End Session writes intent + caret; load round-trips both.
-        set_intent_at(&file, &doc_a, "finish the bridge scene", 42);
-        let entry = load_intent_at(&file, &doc_a).expect("entry saved");
-        assert_eq!(entry.intent.as_deref(), Some("finish the bridge scene"));
-        assert_eq!(entry.caret, Some(42));
-        assert!(entry.set_unix > 0);
-
-        // Keyed by canonical path: a second doc doesn't collide.
-        assert!(load_intent_at(&file, &doc_b).is_none());
+        // Quit records the caret; load round-trips it. Keyed by canonical
+        // path, so a second document never collides.
+        record_caret_at(&file, &doc_a, 42);
+        assert_eq!(load_session_at(&file, &doc_a).unwrap().caret, Some(42));
+        assert!(load_session_at(&file, &doc_b).is_none());
         record_caret_at(&file, &doc_b, 7);
-        let b = load_intent_at(&file, &doc_b).expect("caret-only entry");
-        assert!(b.intent.is_none());
-        assert_eq!(b.caret, Some(7));
+        assert_eq!(load_session_at(&file, &doc_b).unwrap().caret, Some(7));
 
-        // Quit-time caret update preserves a recorded intent.
+        // A later quit overwrites the caret in place, in one entry, without
+        // disturbing the other document.
         record_caret_at(&file, &doc_a, 99);
-        let entry = load_intent_at(&file, &doc_a).unwrap();
-        assert_eq!(entry.intent.as_deref(), Some("finish the bridge scene"));
-        assert_eq!(entry.caret, Some(99));
+        assert_eq!(load_session_at(&file, &doc_a).unwrap().caret, Some(99));
+        assert_eq!(load_session_at(&file, &doc_b).unwrap().caret, Some(7));
 
-        // First edit / dismiss removes the whole entry; idempotent.
-        clear_intent_at(&file, &doc_a);
-        assert!(load_intent_at(&file, &doc_a).is_none());
-        clear_intent_at(&file, &doc_a);
-        assert!(load_intent_at(&file, &doc_b).is_some(), "other doc kept");
+        // An old file still carrying the retired intent keys loads fine
+        // (serde ignores unknown fields) and keeps the caret.
+        std::fs::write(
+            &file,
+            format!(
+                "{{\"{}\":{{\"intent\":\"finish the scene\",\"set_unix\":123,\"caret\":5}}}}",
+                intent_key(&doc_a)
+            ),
+        )
+        .unwrap();
+        assert_eq!(load_session_at(&file, &doc_a).unwrap().caret, Some(5));
 
         // A garbage file degrades to empty, never panics.
         std::fs::write(&file, b"not json").unwrap();
-        assert!(load_intent_at(&file, &doc_a).is_none());
-        set_intent_at(&file, &doc_a, "re-seeded", 1);
-        assert!(load_intent_at(&file, &doc_a).is_some());
+        assert!(load_session_at(&file, &doc_a).is_none());
+        record_caret_at(&file, &doc_a, 1);
+        assert!(load_session_at(&file, &doc_a).is_some());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

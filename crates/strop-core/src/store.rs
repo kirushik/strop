@@ -16,7 +16,7 @@ use loro::{
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::TextOp;
-use crate::document::{Annotations, BlockKind, BlockMap, History, InlineAttr, SpanSet};
+use crate::document::{Annotations, BlockKind, BlockMap, Graveyard, History, InlineAttr, SpanSet};
 use crate::journal::{EditRun, Journal, JournalEvent};
 
 const TEXT_CONTAINER: &str = "content";
@@ -25,6 +25,10 @@ const SESSION_CONTAINER: &str = "session";
 const ANNOTATIONS_CONTAINER: &str = "annotations";
 const CHECKPOINTS_CONTAINER: &str = "checkpoints";
 const ASSETS_CONTAINER: &str = "assets";
+// The graveyard (docs/impl/02-asides.md §4/§5) rides its own map + fingerprint
+// channel, exactly like annotations (review B12): an unguarded blob of verbatim
+// cut text rewriting per idle save is the 4.8 MB class.
+const GRAVEYARD_CONTAINER: &str = "graveyard";
 // The journal persists as LISTS, not as re-inserted JSON blobs: a blob that
 // changes every edit misses its fingerprint on every save and rewrites into
 // the append-only oplog forever (the 4.8 MB class). List pushes append only
@@ -41,6 +45,7 @@ pub struct Loaded {
     pub history: Option<History>,
     pub annotations: Annotations,
     pub journal: Journal,
+    pub graveyard: Graveyard,
 }
 
 /// A named version snapshot. Lives inside the .strop file — Google-Docs
@@ -150,7 +155,7 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
             spans
         }
     };
-    let blocks = match doc.get_map(BLOCKS_CONTAINER).get("kinds") {
+    let mut blocks = match doc.get_map(BLOCKS_CONTAINER).get("kinds") {
         Some(v) => match v.into_value() {
             // JSON first; fall back to the legacy newline-joined token
             // format so pre-existing .strop files and older Loro frontiers
@@ -163,6 +168,17 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
         },
         None => BlockMap::default(),
     };
+    // The aside boundary rides the SAME versioned map, so a checkpoint state
+    // (materialized through this reader) reproduces the rail of ITS moment.
+    // Without this, restoring any version silently merged the compost into
+    // the manuscript — exported, counted, and sent to the AI (wave-1 review,
+    // correctness/high) — and the next save persisted the loss.
+    if let Some(v) = doc.get_map(BLOCKS_CONTAINER).get("boundary")
+        && let Ok(LoroValue::String(s)) = v.into_value()
+        && let Ok(boundary) = serde_json::from_str::<Option<usize>>(&s)
+    {
+        blocks.set_aside_boundary(boundary);
+    }
     (text.to_string(), spans, blocks)
 }
 
@@ -318,6 +334,11 @@ struct SavedHashes {
     blocks: u64,
     history: u64,
     spans: u64,
+    /// The graveyard's own fingerprint channel (review B12). The `blocks`
+    /// channel also covers the out-of-band aside-boundary index, since it moves
+    /// only when block structure does (both driven by `BlockMap::on_edit`) and
+    /// is a few bytes — so its JSON is folded into the blocks fingerprint.
+    graveyard: u64,
 }
 
 /// Content fingerprint for the save guards (not cryptographic — this only
@@ -327,6 +348,17 @@ fn fingerprint(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+/// The blocks channel's fingerprint over BOTH the kinds JSON and the
+/// out-of-band aside-boundary index, so a boundary-only change (creating or
+/// dissolving the rail without touching kinds) still triggers exactly one
+/// write of both keys. An old file that never uses asides fingerprints
+/// `kinds` + `null`, matching a save that stays `None`, so nothing is written.
+fn blocks_fingerprint(blocks: &BlockMap) -> u64 {
+    let kinds = serde_json::to_string(blocks.kinds()).unwrap_or_default();
+    let boundary = serde_json::to_string(&blocks.aside_boundary()).unwrap_or_default();
+    fingerprint(&format!("{kinds}\u{1}{boundary}"))
 }
 
 impl Store {
@@ -373,10 +405,24 @@ impl Store {
                     saved: Default::default(),
                     journal_saved: Default::default(),
                 };
+                // The aside boundary persists as its OWN key beside "kinds"
+                // (review B13/H42): an older build reads only "kinds" and so
+                // ignores it — compost folds into the manuscript, nothing
+                // resets. `read_state_of` applies it, HERE and for every
+                // materialized checkpoint state alike.
                 let (text, spans, blocks) = store.read_state();
                 let journal = journal_of(&store.doc);
                 *store.journal_saved.borrow_mut() =
                     (journal.runs.len(), journal.events.len());
+                let graveyard = match store.doc.get_map(GRAVEYARD_CONTAINER).get("list") {
+                    Some(v) => match v.into_value() {
+                        Ok(LoroValue::String(json)) => {
+                            serde_json::from_str(&json).unwrap_or_default()
+                        }
+                        _ => Graveyard::default(),
+                    },
+                    None => Graveyard::default(),
+                };
                 let history = match store.doc.get_map(SESSION_CONTAINER).get("history") {
                     Some(v) => match v.into_value() {
                         Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
@@ -399,8 +445,9 @@ impl Store {
                     annotations: fingerprint(
                         &serde_json::to_string(&annotations).unwrap_or_default(),
                     ),
-                    blocks: fingerprint(
-                        &serde_json::to_string(blocks.kinds()).unwrap_or_default(),
+                    blocks: blocks_fingerprint(&blocks),
+                    graveyard: fingerprint(
+                        &serde_json::to_string(&graveyard).unwrap_or_default(),
                     ),
                     history: history
                         .as_ref()
@@ -427,6 +474,7 @@ impl Store {
                         history,
                         annotations,
                         journal,
+                        graveyard,
                     }),
                 ))
             }
@@ -685,6 +733,7 @@ impl Store {
         history: &History,
         annotations: &Annotations,
         journal: &Journal,
+        graveyard: &Graveyard,
     ) -> io::Result<()> {
         // Journal: push only the tail past what the file already holds.
         // Callers settle the journal before saving, so every pushed item is
@@ -756,18 +805,40 @@ impl Store {
         // entity-encoded URL) used to desync the token count and silently
         // collapse the whole BlockMap on reopen. JSON also carries Image
         // alt/caption, which the token format dropped.
-        match serde_json::to_string(blocks.kinds()) {
-            Ok(json) => {
-                let h = fingerprint(&json);
-                if h != saved.blocks {
-                    if let Err(e) = self.doc.get_map(BLOCKS_CONTAINER).insert("kinds", json) {
+        // Block kinds AND the out-of-band aside boundary share one fingerprint
+        // channel (see `blocks_fingerprint`): the boundary is a separate key so
+        // an older build that reads only "kinds" ignores it (compost folds into
+        // the manuscript — text preserved, boundary dropped, documented).
+        let h = blocks_fingerprint(blocks);
+        if h != saved.blocks {
+            let bmap = self.doc.get_map(BLOCKS_CONTAINER);
+            let kinds = serde_json::to_string(blocks.kinds());
+            let boundary = serde_json::to_string(&blocks.aside_boundary());
+            match (kinds, boundary) {
+                (Ok(kinds), Ok(boundary)) => {
+                    if let Err(e) = bmap.insert("kinds", kinds) {
                         eprintln!("strop: persist blocks: {e}");
+                    } else if let Err(e) = bmap.insert("boundary", boundary) {
+                        eprintln!("strop: persist aside boundary: {e}");
                     } else {
                         saved.blocks = h;
                     }
                 }
+                (Err(e), _) | (_, Err(e)) => eprintln!("strop: encode blocks: {e}"),
             }
-            Err(e) => eprintln!("strop: encode blocks: {e}"),
+        }
+        match serde_json::to_string(graveyard) {
+            Ok(json) => {
+                let h = fingerprint(&json);
+                if h != saved.graveyard {
+                    if let Err(e) = self.doc.get_map(GRAVEYARD_CONTAINER).insert("list", json) {
+                        eprintln!("strop: persist graveyard: {e}");
+                    } else {
+                        saved.graveyard = h;
+                    }
+                }
+            }
+            Err(e) => eprintln!("strop: encode graveyard: {e}"),
         }
         match serde_json::to_string(history) {
             Ok(json) => {
@@ -942,10 +1013,10 @@ mod tests {
         let mut notes = Annotations::default();
         notes.add(0..5, "заметка".into(), 0);
 
-        store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default()).unwrap();
+        store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &Graveyard::default()).unwrap();
         let first = fs::metadata(&path).unwrap().len();
         for _ in 0..5 {
-            store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default()).unwrap();
+            store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &Graveyard::default()).unwrap();
         }
         let after_idle = fs::metadata(&path).unwrap().len();
         assert_eq!(after_idle, first, "unchanged saves must not grow the file");
@@ -962,6 +1033,7 @@ mod tests {
                 &loaded.history.clone().unwrap_or_default(),
                 &loaded.annotations,
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
         assert_eq!(
@@ -980,6 +1052,7 @@ mod tests {
                 &loaded.history.unwrap_or_default(),
                 &notes2,
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
         let (_, reloaded) = Store::open(&path).unwrap();
@@ -1021,14 +1094,14 @@ mod tests {
             cards: 3,
         });
         store
-            .save_with_state(&spans, &blocks, &history, &notes, &journal)
+            .save_with_state(&spans, &blocks, &history, &notes, &journal, &Graveyard::default())
             .unwrap();
         let first = fs::metadata(&path).unwrap().len();
 
         // Unchanged journal: append nothing.
         for _ in 0..4 {
             store
-                .save_with_state(&spans, &blocks, &history, &notes, &journal)
+                .save_with_state(&spans, &blocks, &history, &notes, &journal, &Graveyard::default())
                 .unwrap();
         }
         assert_eq!(
@@ -1054,12 +1127,53 @@ mod tests {
             ins: " идёт".into(),
         });
         store
-            .save_with_state(&spans, &blocks, &history, &notes, &journal)
+            .save_with_state(&spans, &blocks, &history, &notes, &journal, &Graveyard::default())
             .unwrap();
         let (_, reloaded) = Store::open(&path).unwrap();
         let journal = reloaded.unwrap().journal;
         assert_eq!(journal.runs.len(), 2, "the tail landed once, not twice");
         assert_eq!(journal.runs[1].ins, " идёт");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The wave-1 review's biggest catch: checkpoint states are materialized
+    /// through `read_state_of`, which used to build boundary-None BlockMaps —
+    /// so ANY restore silently merged the compost into the manuscript
+    /// (exported, counted, AI-scoped) and the next save persisted the loss.
+    /// The boundary must ride every materialized state.
+    #[test]
+    fn checkpoint_states_carry_the_aside_boundary() {
+        let path = temp_path("boundary-cp");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("compost line
+
+manuscript opens here");
+        let spans = SpanSet::default();
+        let mut blocks =
+            BlockMap::from_kinds(vec![BlockKind::Paragraph; 3]);
+        blocks.set_aside_boundary(Some(1));
+        store
+            .save_with_state(
+                &spans,
+                &blocks,
+                &History::default(),
+                &Annotations::default(),
+                &Journal::default(),
+                &Graveyard::default(),
+            )
+            .unwrap();
+
+        store.add_checkpoint("with rail", true);
+        let cp = store.checkpoints().pop().unwrap();
+        let (_, _, cp_blocks) = store.checkpoint_state(&cp).unwrap();
+        assert_eq!(
+            cp_blocks.aside_boundary(),
+            Some(1),
+            "a restored version must reproduce its rail"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -1093,11 +1207,11 @@ mod tests {
             }
             let mut notes = Annotations::default();
             notes.add(0..5, body, 0);
-            store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default()).unwrap();
+            store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &Graveyard::default()).unwrap();
         }
         let mut notes = Annotations::default();
         notes.add(0..5, "финальная заметка".into(), 0);
-        store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default()).unwrap();
+        store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &Graveyard::default()).unwrap();
         let bloated = fs::metadata(&path).unwrap().len() as usize;
         assert!(bloated > COMPACT_MIN_BYTES, "fixture must be bloated (got {bloated})");
         drop(store);
@@ -1230,6 +1344,7 @@ mod tests {
                 &History::default(),
                 &Annotations::default(),
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
         store.add_checkpoint_if_changed("bolded", false);
@@ -1323,6 +1438,7 @@ mod tests {
                 &History::default(),
                 &Annotations::default(),
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
         assert!(store.get_asset(&kept_id).is_some(), "referenced asset kept");
@@ -1363,6 +1479,7 @@ mod tests {
                 &History::default(),
                 &Annotations::default(),
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
         store.add_checkpoint("with image", true);
@@ -1379,6 +1496,7 @@ mod tests {
                 &History::default(),
                 &Annotations::default(),
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
         assert!(
@@ -1412,6 +1530,7 @@ mod tests {
                 &History::default(),
                 &Annotations::default(),
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
         let (_s2, loaded) = Store::open(&path).unwrap();
@@ -1447,6 +1566,7 @@ mod tests {
                 &History::default(),
                 &Annotations::default(),
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
         let (_s2, loaded) = Store::open(&path).unwrap();
@@ -1496,7 +1616,7 @@ mod tests {
         spans.add(9..12, InlineAttr::Code);
         spans.add(2..4, InlineAttr::Link("https://e.x".into()));
         store
-            .save_with_state(&spans, &BlockMap::new(1), &History::default(), &Annotations::default(), &Journal::default())
+            .save_with_state(&spans, &BlockMap::new(1), &History::default(), &Annotations::default(), &Journal::default(), &Graveyard::default())
             .unwrap();
 
         let (_s2, existing) = Store::open(&path).unwrap();
@@ -1537,6 +1657,7 @@ mod tests {
                 &doc.export_history(200),
                 doc.notes(),
                 &Journal::default(),
+                &Graveyard::default(),
             )
             .unwrap();
 
@@ -1585,7 +1706,7 @@ mod tests {
         store.apply(&doc.take_ops());
         doc.set_note_body_draft(id, "half-typed thought".into());
         store
-            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200), doc.notes(), &Journal::default())
+            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200), doc.notes(), &Journal::default(), &Graveyard::default())
             .unwrap();
 
         // The uncommitted draft is on disk after reload.
@@ -1623,6 +1744,111 @@ mod tests {
         assert_eq!(store.text(), "so…");
         assert_eq!(store.text(), buf.text());
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn graveyard_and_boundary_persist_and_unchanged_asides_save_appends_nothing() {
+        let path = temp_path("asides");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("comp\n\nmanuscript"); // 3 rope lines
+        let mut blocks = BlockMap::from_kinds(vec![
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+        ]);
+        blocks.set_aside_boundary(Some(1));
+        let spans = SpanSet::default();
+        let history = History::default();
+        let notes = Annotations::default();
+        let mut graveyard = Graveyard::default();
+        graveyard.file("a cut sentence".into(), "origin".into(), 6, 111);
+
+        store
+            .save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &graveyard)
+            .unwrap();
+        let first = fs::metadata(&path).unwrap().len();
+        for _ in 0..4 {
+            store
+                .save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &graveyard)
+                .unwrap();
+        }
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            first,
+            "unchanged asides save must not grow the file"
+        );
+
+        // Reopen: the boundary and the graveyard both survive.
+        drop(store);
+        let (store2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.blocks.aside_boundary(), Some(1));
+        assert_eq!(loaded.graveyard.len(), 1);
+        assert_eq!(loaded.graveyard.entries()[0].text, "a cut sentence");
+        assert_eq!(loaded.graveyard.entries()[0].origin_pos, 6);
+
+        // The reopened session's first unchanged save is also a no-op (both
+        // the graveyard channel and the blocks+boundary channel seeded).
+        store2
+            .save_with_state(
+                &loaded.spans,
+                &loaded.blocks,
+                &loaded.history.clone().unwrap_or_default(),
+                &loaded.annotations,
+                &Journal::default(),
+                &loaded.graveyard,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            first,
+            "reopened unchanged asides save must not grow the file"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_file_without_boundary_key_loads_with_no_rail() {
+        // An older build never wrote the out-of-band "boundary" key; it reads
+        // only "kinds". Such a file must load with text and kinds intact and no
+        // rail (review B13/H42) — compost simply folds into the manuscript.
+        let path = temp_path("legacy-boundary");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("head\n\nbody");
+        let mut blocks = BlockMap::from_kinds(vec![
+            BlockKind::Heading(1),
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+        ]);
+        blocks.set_aside_boundary(Some(1));
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &blocks,
+                &History::default(),
+                &Annotations::default(),
+                &Journal::default(),
+                &Graveyard::default(),
+            )
+            .unwrap();
+        // Drop the boundary key to mimic a file an older build produced.
+        let _ = store.doc.get_map(BLOCKS_CONTAINER).delete("boundary");
+        store.doc.commit();
+        store.save().unwrap();
+        drop(store);
+
+        let (_s2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.text, "head\n\nbody");
+        assert_eq!(
+            loaded.blocks.aside_boundary(),
+            None,
+            "a missing boundary key degrades to no rail"
+        );
+        assert_eq!(loaded.blocks.kinds()[0], BlockKind::Heading(1), "kinds still load");
         let _ = fs::remove_file(&path);
     }
 }

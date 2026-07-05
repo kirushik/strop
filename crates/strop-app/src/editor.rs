@@ -31,6 +31,7 @@ use strop_core::{Store, typograph};
 
 use crate::config::{Config, Language};
 use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
+use crate::strip::{self, Strip, StripBake};
 use crate::text_field::{
     FieldBackspace, FieldBackspaceWord, FieldCancel, FieldCommit, FieldPaste, FieldTab, TextField,
     TextFieldEvent,
@@ -211,6 +212,12 @@ const RESIZE_INSET: f32 = 8.;
 /// from above). Values below are restrained, GNOME/libadwaita-scale.
 const CSD_GUTTER: f32 = 22.;
 const CSD_ROUNDING: f32 = 10.;
+/// Auto-cut threshold (docs/impl/02-asides.md §4): a single SELECTION-deletion
+/// op removing at least this many chars of manuscript prose files itself in the
+/// graveyard automatically — deterministic, and the editor still holds the
+/// deleted text at that point. A backspace RUN (many one-char deletes) never
+/// reaches this in one op, so it never auto-files (reviews H24 + H43).
+const AUTO_CUT_MIN_CHARS: usize = 80;
 
 /// A small hover tooltip: a control's name and, optionally, its chord in a
 /// mono chip (DESIGN §0 — every titlebar control should teach its shortcut).
@@ -406,11 +413,12 @@ actions!(
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
         OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
-        ToggleHistory, TogglePalette, TogglePopover, PaletteUp, PaletteDown, NewDocument,
+        ToggleHistory, ToggleStrip, TogglePalette, TogglePopover, PaletteUp, PaletteDown, NewDocument,
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
-        ToggleOutline, EndSession, SetSessionGoal, ToggleReview,
+        ToggleOutline, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
+        ToggleGraveyard,
     ]
 );
 
@@ -644,6 +652,211 @@ fn card_body(composing_here: bool) -> CardBody {
     }
 }
 
+/// Which read a pass runs (impl 04 §0, review H27). The old `run_pass(bool)`
+/// could name only believing-vs-diagnosis; the doubting read is neither, and a
+/// `"doubting"` *mode string* silently produced the LINE prompt (`system_prompt`
+/// maps every unknown mode to line). A bool also can't survive the
+/// deferred/pending round-trips — `pending_pass`/`last_pass` collapse doubting
+/// onto believing. So the pass identity is an enum, threaded end to end.
+///
+/// `Diagnostic` carries its levels-of-edit mode WITH it, which is the fix for
+/// the sticky-mode trap (review mid): a menu row pins its depth into the run
+/// itself rather than mutating the persistent `diagnosis_mode` session override
+/// (which would silently re-aim the next ctrl-shift-d).
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum PassKind {
+    /// Elbow's believing game — strengths named as mechanisms.
+    Believing,
+    /// The believing read's mirror — the strongest case against it.
+    Doubting,
+    /// The Perkins diagnosis at a levels-of-edit depth
+    /// (developmental / line / copy — the string `effective_mode` yields).
+    Diagnostic(String),
+}
+
+impl PassKind {
+    /// The journal Pass event's mode string ("believing" / "doubting" /
+    /// mode) — recorded by `integrate_pass`, drawn as the strip's veil label.
+    fn mode_str(&self) -> &str {
+        match self {
+            PassKind::Believing => "believing",
+            PassKind::Doubting => "doubting",
+            PassKind::Diagnostic(mode) => mode,
+        }
+    }
+
+    /// The Running-card label stem: "{} · {model}" is completed by `run_pass`.
+    /// Speaks the MENU's grammar ("a read") — the writer clicked "A line
+    /// read", so the running card names the same thing; "pass"/"diagnosis"
+    /// are internal registers (ux-glossary) and never print.
+    fn run_label(&self) -> String {
+        match self {
+            PassKind::Believing => "believing read".to_owned(),
+            PassKind::Doubting => "doubting read".to_owned(),
+            PassKind::Diagnostic(mode) => format!("{mode} read"),
+        }
+    }
+}
+
+/// The editor button's face (impl 04 §0, review H31/H32). The real state is
+/// multi-dimensional — AI lifecycle × a parked read × the door — so the face is
+/// a PRIORITY over it, not four exclusive states: a cooking pass while the door
+/// is open must resolve to ONE face, and Error/NeedsSetup can't fall through to
+/// a bare idle button while `render_ai_status` shows the failure. The door word
+/// is the glossary's presence pair (`Reading`), never the internal "Reviewing".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditorFace {
+    /// No provider configured — routes to setup (the card lives on render_ai_status).
+    NeedsSetup,
+    /// The last read failed — hover carries the message; the card stays too.
+    Error,
+    /// A read is cooking — pulse dot; hover names the read.
+    Cooking,
+    /// A completed read is parked behind the reveal clock ("a read is ready").
+    Ready,
+    /// The door is open — "Reading · {n} open".
+    Reading,
+    /// Drafting, nothing pending — the bare "Ask the editor ▾".
+    Idle,
+}
+
+impl EditorFace {
+    /// The rig token (dump `editor_btn.face`), so a smoke test can assert the
+    /// priority transitions without eyeballing the pixels.
+    fn token(self) -> &'static str {
+        match self {
+            EditorFace::NeedsSetup => "needs_setup",
+            EditorFace::Error => "error",
+            EditorFace::Cooking => "cooking",
+            EditorFace::Ready => "ready",
+            EditorFace::Reading => "reading",
+            EditorFace::Idle => "idle",
+        }
+    }
+}
+
+/// The inputs the face is a pure function of. `count` shapes only the Reading
+/// LABEL, never the priority, so it is not an input here.
+struct FaceInputs {
+    needs_setup: bool,
+    error: bool,
+    cooking: bool,
+    ready: bool,
+    door_open: bool,
+}
+
+/// The priority function itself, pure and table-tested. Order is the spec's:
+/// NeedsSetup > Error > cooking > read-ready > Reading·N > idle.
+fn face_for(i: &FaceInputs) -> EditorFace {
+    if i.needs_setup {
+        EditorFace::NeedsSetup
+    } else if i.error {
+        EditorFace::Error
+    } else if i.cooking {
+        EditorFace::Cooking
+    } else if i.ready {
+        EditorFace::Ready
+    } else if i.door_open {
+        EditorFace::Reading
+    } else {
+        EditorFace::Idle
+    }
+}
+
+/// The gutter-float grid's fixed width (docs/impl/03-flanks.md §0.1): wide
+/// enough for two toggle columns AND the three-wide heading block row. The
+/// gutter-fit threshold keys off it (finding 90 — recomputed for the 2-column
+/// grid, wider than the old 1×N stack), so a window whose left gutter can't hold
+/// it falls back to the formatting-only horizontal popover instead.
+const FLANK_GRID_W: f32 = 100.;
+/// Estimated grid height (six rows + two seams), to keep the float on-screen.
+const FLANK_GRID_H: f32 = 210.;
+
+/// A right-flank verb (docs/impl/03-flanks.md §0.2). Carried by value into the
+/// row's click listener so the four rows share one dispatch, each routing to an
+/// existing path — note composer, the P2 aside/graveyard verbs, the scoped ask.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelVerb {
+    Note,
+    Aside,
+    Graveyard,
+    Ask,
+}
+
+/// The LEFT (formatting) flank's form (docs/impl/03-flanks.md §1, review H21).
+/// It always rises for a live selection — only its shape narrows: the closed-set
+/// grid in a real gutter, the formatting-only horizontal popover where the
+/// window is too narrow to float one (the verbs stay palette-reachable there).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlankLeft {
+    /// Suppressed — a history surface is up (the past is read-only, review H22).
+    None,
+    /// The closed-set grid, floating in the left gutter (the resting form).
+    Grid,
+    /// The formatting-only horizontal popover above the line (narrow fallback).
+    Horizontal,
+}
+
+/// Which flanks rise, as one decision (docs/impl/03-flanks.md §1-2). Both are a
+/// consequence of chirality: tools left, the conversation right (asides.md §4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FlankGate {
+    left: FlankLeft,
+    /// The right verb menu. Manuscript-only, needs a live lane, no history —
+    /// see `flank_gate`.
+    right: bool,
+}
+
+/// The single gating predicate (docs/impl/03-flanks.md §1-2, reviews H21/H22/B8,
+/// findings 57/91/108). Pure over booleans so the test sweeps every
+/// region × history × width case without a live frame.
+fn flank_gate(history_up: bool, in_compost: bool, lane_available: bool, gutter_ok: bool) -> FlankGate {
+    if history_up {
+        // A history surface claims the right side AND the past is not editable —
+        // neither flank may offer live mutation over a read-only state (H22).
+        return FlankGate {
+            left: FlankLeft::None,
+            right: false,
+        };
+    }
+    FlankGate {
+        // The formatting flank always rises; only its FORM narrows.
+        left: if gutter_ok { FlankLeft::Grid } else { FlankLeft::Horizontal },
+        // The verb menu needs the right lane to occlude into (B8) and is
+        // MANUSCRIPT-only — a compost-rail selection is the writer's private
+        // scrap box, no verb menu (spec §1, finding 108). Its fallback keys on
+        // the LANE's own fit (`margin_fits`), never the left gutter (finding 57):
+        // there is a width band where the gutter is gone but the lane remains,
+        // and vice versa.
+        right: lane_available && !in_compost,
+    }
+}
+
+/// The per-frame flank geometry + gating, computed once (`flank_layout`) so the
+/// left popover, the right menu, and the rig dump all agree on presence and y.
+/// The two y bases differ ON PURPOSE (review finding 89): `left_top` co-registers
+/// with the prose column (CSD-corrected content space), `right_top` co-registers
+/// with the margin CARDS (raw frame y, no inset) — sharing one would drift the
+/// menu a gutter (22px) off the cards it means to occlude on floating windows.
+struct FlankLayout {
+    gate: FlankGate,
+    /// Content-space top of the selection's first visual line — the LEFT flank.
+    left_top: f32,
+    /// LANE-space top (raw frame y) — the RIGHT menu, co-registered with cards.
+    right_top: f32,
+    line_h: f32,
+    /// Caret x within its line (for centring the horizontal fallback).
+    x: f32,
+    /// The prose column's left edge, content space.
+    col_left: f32,
+    /// Width the flanks live in (viewport minus CSD gutters) and its height.
+    vw: f32,
+    vh: f32,
+    outline_w: f32,
+    /// The note lane's left edge, content space (the right menu pins here).
+    lane_left: f32,
+}
+
 pub struct Editor {
     focus_handle: FocusHandle,
     /// Text + formatting with unified transaction history. Marks persist
@@ -712,14 +925,15 @@ pub struct Editor {
     /// Session override of the levels-of-edit depth; None = config's
     /// [ai].mode (the thesis switch, editorial-foundations §2.2).
     diagnosis_mode: Option<String>,
-    /// What the last pass was, so an error card's Retry can repeat it.
-    last_pass_believing: bool,
-    /// A pass the writer asked for before a provider existed (Some =
-    /// believing?). Finishing setup — the panel's Save, or the one-click
-    /// local-model path — consumes it and runs the pass, so the request
-    /// that *triggered* setup is the request that gets answered (no
-    /// "now press ctrl-shift-d again" dead end).
-    pending_pass: Option<bool>,
+    /// What the last pass was, so an error card's Retry can repeat it exactly
+    /// (believing / doubting / a diagnosis at its pinned depth).
+    last_pass: PassKind,
+    /// A pass the writer asked for before a provider existed. Finishing setup —
+    /// the panel's Save, or the one-click local-model path — consumes it and
+    /// runs THIS pass, so the request that *triggered* setup is the request
+    /// that gets answered (no "now press ctrl-shift-d again" dead end). Carries
+    /// the full `PassKind`, so a doubting/menu request survives the detour.
+    pending_pass: Option<PassKind>,
     /// A completed pass whose results arrived MID-TYPING-BURST: integrating
     /// would pop squiggles into the very sentence being typed and re-pack the
     /// lane — an involuntary peripheral onset (attention-motion.md §2). Held
@@ -820,28 +1034,45 @@ pub struct Editor {
     /// vanish. Instead a top-right pill shows the count (never silent) and
     /// this toggles the drop-down panel that lists them.
     narrow_notes_open: bool,
+    /// The editor button's dropdown (impl 04 §0): the subsystem's single home,
+    /// glued flush under the titlebar control. A bool-toggled overlay, light-
+    /// dismissed like the narrow-notes panel it borrows its anchoring from.
+    editor_menu_open: bool,
     /// Selection popover (DESIGN §2-toolbar): formatting rides the
     /// selection. Shown on mouse-up over a selection or via ctrl-.;
     /// dismissed by mousedown, typing, scrolling, or escape.
     selection_popover: bool,
+    /// The left flank's link argument-field (docs/impl/03-flanks.md §0.1,
+    /// review B2 + findings 59/88): the URL editor opened from the grid's link
+    /// cell. It CAPTURES the target CHAR range at open — never a re-read of
+    /// `selected_range` at commit, which could have drifted (Link is
+    /// non-expanding, `expands()` == false). While it is `Some` the field owns
+    /// the flank and keyboard focus, so "typing dismisses" (an EDITOR-focus rule)
+    /// can't fire over the URL; commit applies `doc.set_link`, an empty commit
+    /// removes the link.
+    link_input: Option<(Range<usize>, Entity<TextField>)>,
     /// Titlebar word count, recomputed on mutation — never per frame.
     word_count: usize,
     /// Outline rail (DESIGN §1.6): toggleable left rail of headings,
     /// session-only — externalized structure at the point of performance.
     outline_open: bool,
-    /// "Next session I will ___" recorded at the previous close (DESIGN
-    /// §4.1), shown as a dismissible banner; auto-clears on first edit.
-    /// Deliberately NOT ai_status — the AI never speaks first.
-    next_intent: Option<String>,
-    /// End Session recorded an intent this run; quit then skips the
-    /// caret-only rewrite (the entry is already complete).
-    intent_recorded: bool,
-    /// store_dirty was set at least once this session. The close-time
-    /// decision it feeds (DESIGN §4b tension 6): edits + no intent =
-    /// still NOTHING at quit — no dialog, ever. The ritual is pull-only.
+    /// The graveyard section (docs/impl/02-asides.md §4): the sticky footer
+    /// bar is always shown when entries exist; this toggles the read-only
+    /// entry list open. Session-only.
+    graveyard_open: bool,
+    /// The last caret byte offset while it was in the MANUSCRIPT — so Esc from
+    /// a compost-rail caret returns exactly there (review B3; asides.md §2.1).
+    last_manuscript_caret: usize,
+    /// One-shot blink of the compost rail edge on an arrival (aside / orphan
+    /// migration) — the same "something arrived over there" grammar the
+    /// graveyard bar uses. `None` at rest.
+    rail_flash: Option<Instant>,
+    /// One-shot blink of the graveyard bar on an exile (a fresh cut filed).
+    grave_flash: Option<Instant>,
+    /// store_dirty was set at least once this session — a plain "did the writer
+    /// touch this document" flag (the rig's `edits=` tag). Re-entry via the
+    /// intent question was retired (impl 04 §1); this now only reports activity.
     session_had_edits: bool,
-    /// The "End Session…" composer (bottom strip, like find).
-    end_session_input: Option<Entity<TextField>>,
     /// Session word goal (DESIGN §4.2): (target, word_count at set time).
     /// Session-only — per-session progress, never lifetime totals.
     session_goal: Option<(usize, usize)>,
@@ -870,6 +1101,18 @@ pub struct Editor {
     /// frame in `refresh_card_heights`; `None` when no note is composing.
     active_card_height: Option<f32>,
     last_frame: Option<TextFrame>,
+    /// The history strip (P1 — docs/impl/01-history-strip.md): the bottom
+    /// seek-bar surface. `strip.open` gates its overlay; `strip.parked` drives
+    /// the read-only preview + the Restore/Now controls. The immutable bake
+    /// and the mutable scrub state live apart inside it (the stability law).
+    strip: Strip,
+    /// The strip's painted rail geometry (WINDOW coords), captured every paint
+    /// so the scrub mouse handlers map a pointer x → working px → pos_ms
+    /// against the SAME bounds the fabric drew — CSD-inset-safe without any
+    /// re-derivation. `Rc<RefCell>`, never entity state: it is written from
+    /// inside the draw pass (the 2026-06-12 corruption rule, like
+    /// `zone_row_bounds`).
+    strip_rail: std::rc::Rc<std::cell::RefCell<Option<StripGeom>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1051,6 +1294,40 @@ fn format_thousands(n: usize) -> String {
     out
 }
 
+/// The auto-cut predicate (docs/impl/02-asides.md §4): a single
+/// SELECTION-deletion op — an EMPTY replacement over a non-empty selection —
+/// of at least `AUTO_CUT_MIN_CHARS` chars, entirely inside the manuscript
+/// (`start_char >= manuscript_base`). Pure, so both sides of the threshold and
+/// the move-vs-cut distinction are unit-tested.
+fn auto_cut_qualifies(
+    new_text: &str,
+    range_chars: usize,
+    start_char: usize,
+    manuscript_base: usize,
+) -> bool {
+    new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS && start_char >= manuscript_base
+}
+
+/// A drawn headstone for the graveyard bar: a small muted slab with rounded
+/// top corners. The ⚰/⚱ glyphs are outside the bundled PT fonts, so the icon
+/// is divs, never a glyph (the garbled-glyph bug class, editor comment at the
+/// titlebar-controls note).
+fn tombstone_icon() -> impl IntoElement {
+    div()
+        .w(px(9.))
+        .h(px(12.))
+        .rounded_t(px(4.5))
+        .bg(rgb(MUTED_COLOR))
+}
+
+/// Wall clock in unix seconds (matching checkpoints and card raise-times).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Whitespace-delimited word count over text chunks (rope chunks may split
 /// mid-word, so track the in-word state across them).
 fn count_words<'a>(chunks: impl Iterator<Item = &'a str>) -> usize {
@@ -1118,7 +1395,9 @@ impl Editor {
             ai_generation: 0,
             diagnosis_pass: 0,
             diagnosis_mode: None,
-            last_pass_believing: false,
+            // Never read before the first pass sets it (Retry only exists after
+            // a pass ran); a plain line diagnosis is the sensible default.
+            last_pass: PassKind::Diagnostic("line".to_owned()),
             palette_input: None,
             palette_selected: 0,
             palette_query: String::new(),
@@ -1137,16 +1416,21 @@ impl Editor {
             card_heights: HashMap::new(),
             active_card_height: None,
             narrow_notes_open: false,
+            editor_menu_open: false,
             selection_popover: false,
+            link_input: None,
             outline_open: false,
-            next_intent: None,
-            intent_recorded: false,
+            graveyard_open: false,
+            last_manuscript_caret: 0,
+            rail_flash: None,
+            grave_flash: None,
             session_had_edits: false,
-            end_session_input: None,
             session_goal: None,
             goal_input: None,
             zone_row_bounds: std::rc::Rc::default(),
             last_frame: None,
+            strip: Strip::default(),
+            strip_rail: std::rc::Rc::default(),
         }
     }
 
@@ -1207,6 +1491,14 @@ impl Editor {
 
     /// Fan buffer changes out to every offset-tracking consumer (formatting
     /// spans, durable store). Must run after every mutation.
+    /// Words in the MANUSCRIPT only — the compost rail is excluded (asides.md
+    /// §1: "the accounting does not bleed"). Slicing by char range avoids
+    /// cloning the text; `manuscript_char_range` is the whole doc when there is
+    /// no rail.
+    fn manuscript_word_count(&self) -> usize {
+        count_words(self.doc.rope().slice(self.doc.manuscript_char_range()).chunks())
+    }
+
     fn sync_mutations(&mut self) {
         let ops = self.doc.take_ops();
         if ops.is_empty() {
@@ -1215,24 +1507,16 @@ impl Editor {
         // Real buffer ops only — this stamp is what tells a live typing burst
         // from a lull (deferred_pass), so caret moves must never touch it.
         self.last_text_edit = Some(Instant::now());
-        self.word_count = count_words(self.doc.rope().chunks());
-        // Apply to the store and capture its path before releasing the borrow,
-        // so the dirty-flag chokepoint (mark_dirty) can take &mut self.
-        let intent_path = match &self.store {
-            Some(store) => {
-                store.apply(&ops);
-                store.path().to_path_buf()
-            }
+        self.word_count = self.manuscript_word_count();
+        // Apply to the store before releasing the borrow, so the dirty-flag
+        // chokepoint (mark_dirty) can take &mut self.
+        match &self.store {
+            Some(store) => store.apply(&ops),
             None => return,
-        };
+        }
         self.mark_dirty();
         self.dirty_since_checkpoint = true;
         self.session_had_edits = true;
-        // The first edit honors the open-time intent: the banner has done its
-        // job and clears itself (DESIGN §4.1).
-        if self.next_intent.take().is_some() {
-            crate::files::clear_intent(&intent_path);
-        }
     }
 
     /// Mirror the open note composer's draft onto the note so the idle-save
@@ -1255,9 +1539,10 @@ impl Editor {
     }
 
     /// Re-enter the document where the last session left it (DESIGN §4
-    /// invariant: caret restored, zero questions asked, within a second)
-    /// and surface the recorded next-session intent as a banner.
-    pub fn restore_session(&mut self, entry: crate::files::IntentEntry) {
+    /// invariant: caret restored, zero questions asked, within a second). The
+    /// re-entry intent question was retired (impl 04 §1); the caret-resume half
+    /// of the ritual stays — it is the only thing the sidecar now carries.
+    pub fn restore_session(&mut self, entry: crate::files::SessionEntry) {
         if let Some(caret) = entry.caret {
             // Clamp to the document and snap to a char boundary (the doc
             // may have changed under us since the caret was recorded).
@@ -1267,20 +1552,13 @@ impl Editor {
             self.selected_range = byte..byte;
             self.autoscroll_request = true;
         }
-        if let Some(intent) = entry.intent.filter(|i| !i.trim().is_empty()) {
-            self.next_intent = Some(intent);
-        }
     }
 
     /// Quit-time bookkeeping: remember the caret so the next open resumes
-    /// mid-sentence. The intent itself is only ever written by End
-    /// Session — a quit with edits and no intent stays a plain quit
-    /// (DESIGN §4b tension 6: prompts at close are offered, never owed).
+    /// mid-sentence. The only thing quit records now — the intent question
+    /// (and its End Session verb) is gone (impl 04 §1).
     pub fn record_exit_state(&self) {
         let Some(store) = &self.store else { return };
-        if self.intent_recorded {
-            return; // End Session already wrote the full entry.
-        }
         crate::files::record_caret(store.path(), self.cursor_offset());
     }
 
@@ -1349,6 +1627,13 @@ impl Editor {
     /// Install the persisted edit-run journal at load.
     pub fn restore_journal(&mut self, journal: strop_core::journal::Journal) {
         self.doc.set_journal(journal);
+    }
+
+    /// Install the persisted graveyard at load, then recompute the manuscript
+    /// word count (a loaded doc may carry a compost boundary that scopes it).
+    pub fn restore_graveyard(&mut self, graveyard: strop_core::document::Graveyard) {
+        self.doc.set_graveyard(graveyard);
+        self.word_count = self.manuscript_word_count();
     }
 
     /// Record a named version snapshot in the document file.
@@ -1422,6 +1707,10 @@ impl Editor {
     /// persists them into the file, and then fills in texts, deltas and the
     /// preview. The old behaviour materialized inline on the main thread.
     fn enter_history(&mut self, cx: &mut Context<Self>) {
+        // The strip and the panel never open together (spec §0).
+        if self.strip.open {
+            self.close_strip(cx);
+        }
         let Some(store) = &self.store else {
             return;
         };
@@ -1783,18 +2072,45 @@ impl Editor {
             return; // states still assembling; the row can't restore yet
         }
         let entry = &hv.entries[hv.selected];
-        let (name, text, spans, blocks) = (
-            entry.name.clone(),
+        let (text, spans, blocks) = (
             entry.text.clone(),
             entry.spans.clone(),
             entry.blocks.clone(),
         );
         let from_unix = entry.created_unix;
-        // Save first so the "Before restoring" checkpoint materializes the
-        // present exactly as it stands (see add_checkpoint).
+        self.restore_to_state(text, spans, blocks, from_unix, cx);
+        cx.notify();
+    }
+
+    /// The shared restore mechanism (review B6, spec §2), reused by both the
+    /// history panel's Restore and the strip's own. Restore is an ordinary
+    /// UNDOABLE forward edit that appends nothing to the past — it destroys
+    /// nothing (design §3). Its record is deliberately layered: a "Before
+    /// restoring" checkpoint of the present (so this restore is itself one
+    /// Restore away from undone), the wholesale swap (journal-suppressed — it
+    /// would be one document-sized run), an honest `Restore` journal event,
+    /// and a POST-restore "Restored" checkpoint that materializes the restored
+    /// state as the reconstruction anchor (without it, `text_at(now)` would
+    /// rebuild the PRE-restore document). `from_unix` is the moment copied
+    /// from, in SECONDS (matching `Checkpoint.created_unix`). The caller
+    /// notifies.
+    fn restore_to_state(
+        &mut self,
+        text: String,
+        spans: SpanSet,
+        blocks: BlockMap,
+        from_unix: i64,
+        cx: &mut Context<Self>,
+    ) {
+        // Save first so the "Before restore" checkpoint materializes the
+        // present exactly as it stands (see add_checkpoint). Its name is a
+        // bare automatic: inlining the source version's title composed
+        // writer text into a system label — P8's born-from bug class. The
+        // sage arc already points at the source (P10: words don't repeat
+        // what the arc says).
         self.save_now();
         let Some(store) = &self.store else { return };
-        store.add_checkpoint(&format!("Before restoring “{name}”"), false);
+        store.add_checkpoint("Before restore", false);
         self.doc.restore_state(&text, spans, blocks);
         self.selected_range = 0..0;
         self.selection_reversed = false;
@@ -1802,8 +2118,13 @@ impl Editor {
         self.goal_x = None;
         self.marked_range = None;
         self.caret_attrs.clear();
+        // Drops any preview (panel `history_view` OR the strip's
+        // `history_preview`) so the live restored document is what shows.
         self.exit_history(cx);
         self.sync_mutations();
+        // A restore can orphan writer notes (reanchor sets `orphaned` when a
+        // passage vanished): migrate their text to the compost (spec §3).
+        self.migrate_orphans_after_restore(cx);
         // The restore's own record: the journal suppressed the wholesale
         // swap (it would be one document-sized run), so the honest event
         // carries the fact — and a POST-restore checkpoint materializes the
@@ -1823,6 +2144,389 @@ impl Editor {
         }
         self.mark_dirty();
         self.bump_activity();
+    }
+
+    // -- The history strip (P1 — docs/impl/01-history-strip.md) ---------------
+
+    /// ctrl-alt-h / the titlebar clock: toggle the strip (the new first history
+    /// surface). The right-side panel stays reachable via the palette ("History
+    /// panel"); the two never open together (spec §0).
+    fn toggle_strip(&mut self, _: &ToggleStrip, window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip.open {
+            self.close_strip(cx);
+        } else {
+            self.open_strip(window, cx);
+        }
+    }
+
+    fn open_strip(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip.open {
+            return;
+        }
+        // Strip and panel never coexist (spec §0): the panel yields.
+        if self.history_view.is_some() {
+            self.exit_history(cx);
+        }
+        let now = strop_core::journal::now_ms();
+        self.strip.open = true;
+        self.strip.parked = false;
+        self.strip.pin_ms = None;
+        self.strip.pos_ms = now;
+        self.strip.view_offset = 0.;
+        self.strip_bake(now);
+        cx.notify();
+    }
+
+    fn close_strip(&mut self, cx: &mut Context<Self>) {
+        self.strip.open = false;
+        self.strip.parked = false;
+        self.strip.scrubbing = false;
+        self.strip.pin_ms = None;
+        self.strip.scratch = None;
+        self.strip.bake = None;
+        // Drop any preview so the live document returns.
+        self.history_preview = None;
+        *self.strip_rail.borrow_mut() = None;
+        cx.notify();
+    }
+
+    /// Build the immutable bake from `(journal, checkpoints, cards)` and bump
+    /// the session-monotonic `bakes` counter (the stability-law assertion —
+    /// only open and Restore ever call this; scrubbing never does). Snapshots
+    /// the checkpoint metadata so the strip never re-reads the store mid-scrub.
+    fn strip_bake(&mut self, now_ms: i64) {
+        let stations = self.strip_stations();
+        let cards = self.strip_cards();
+        let seed_len = self.strip_seed_len();
+        let bake = StripBake::build(self.doc.journal(), &stations, &cards, seed_len, now_ms);
+        self.strip.bake = Some(bake);
+        self.strip.bakes += 1;
+        self.strip.scratch = None; // re-anchor against the new bake
+    }
+
+    /// Checkpoints reduced to draw/anchor metadata (created_unix SECONDS ×1000
+    /// at the boundary — the unit law).
+    fn strip_stations(&self) -> Vec<strip::StationSnap> {
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        store
+            .checkpoints()
+            .into_iter()
+            .map(|cp| strip::StationSnap {
+                created_ms: cp.created_unix * 1000,
+                name: cp.name,
+                manual: cp.manual,
+                has_state: cp.state.is_some(),
+            })
+            .collect()
+    }
+
+    /// Each margin card's lifespan for its thread: raise time (the note's
+    /// `created_unix` SECONDS ×1000) → its `CardClosed` event, else open to now.
+    fn strip_cards(&self) -> Vec<strip::CardSnap> {
+        use strop_core::journal::JournalEvent;
+        let closes: HashMap<u64, (i64, bool)> = self
+            .doc
+            .journal()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                JournalEvent::CardClosed { t, id, resolved } => Some((*id, (*t, *resolved))),
+                _ => None,
+            })
+            .collect();
+        let doc_len = self.doc.rope().len_chars().max(1) as f32;
+        self.doc
+            .notes()
+            .notes()
+            .iter()
+            .map(|n| {
+                let closed = closes.get(&n.id);
+                strip::CardSnap {
+                    raised_ms: n.created_unix * 1000,
+                    closed_ms: closed.map(|(t, _)| *t),
+                    depth: (n.range.start as f32 / doc_len).clamp(0., 1.),
+                    resolved: closed.map_or(n.status == NoteStatus::Done, |(_, r)| *r),
+                }
+            })
+            .collect()
+    }
+
+    /// The document's char length at journal start (the earliest materialized
+    /// checkpoint ≤ the first run), so the envelope is seeded for a doc that
+    /// already held content when journaling began (else 0 — born empty).
+    fn strip_seed_len(&self) -> usize {
+        let Some(store) = &self.store else {
+            return 0;
+        };
+        let Some(first) = self.doc.journal().runs.first().map(|r| r.t0) else {
+            return 0;
+        };
+        store
+            .checkpoints()
+            .iter()
+            .rfind(|cp| cp.created_unix * 1000 <= first && cp.state.is_some())
+            .and_then(|cp| cp.state.as_ref())
+            .map(|s| s.text.chars().count())
+            .unwrap_or(0)
+    }
+
+    /// A materialized checkpoint's state, found by its ms anchor time. Called
+    /// only on re-anchor (a scrub crossing a checkpoint), never per frame.
+    fn checkpoint_state_at_ms(&self, ms: i64) -> Option<(String, SpanSet, BlockMap)> {
+        let store = self.store.as_ref()?;
+        let cps = store.checkpoints();
+        // .rev(): same-second neighbors exist by design — "Before restore"
+        // and "Restored" are written moments apart, and the LATER one is the
+        // truthful anchor (wave-1 review: anchoring on the earlier twin
+        // rebuilt the pre-restore text right after a restore).
+        let cp = cps
+            .iter()
+            .rev()
+            .find(|cp| cp.created_unix * 1000 == ms && cp.state.is_some())?;
+        store.checkpoint_state(cp)
+    }
+
+    /// Park the playhead at a rail x (window coords) and begin a continuous
+    /// scrub; `pin` (shift-click) drops/clears the Compare playhead instead.
+    fn strip_park_at_x(&mut self, x: f32, pin: bool, cx: &mut Context<Self>) {
+        let Some(pos) = self.strip_pos_at_x(x) else {
+            return;
+        };
+        if pin {
+            self.strip_toggle_pin(pos, cx);
+            return;
+        }
+        self.strip.parked = true;
+        self.strip.scrubbing = true;
+        self.strip_scrub_to(pos, cx);
+    }
+
+    /// Map a rail x (window coords) → working px → wall-clock ms. The thumb
+    /// travels `min(total_work, rail_width)` (design §1): when the history fits,
+    /// the rail and the fixed-scale fabric coincide 1:1; when it overflows, the
+    /// thumb compresses the whole duration into the rail while the fabric
+    /// auto-scrolls. Both this input map and the painted thumb use `strip_travel`.
+    fn strip_pos_at_x(&self, x: f32) -> Option<i64> {
+        let geom = (*self.strip_rail.borrow())?;
+        let bake = self.strip.bake.as_ref()?;
+        let travel = strip_travel(geom.rail_x1 - geom.rail_x0, bake.timeline.total_work);
+        let frac = ((x - geom.rail_x0) / travel).clamp(0., 1.);
+        Some(bake.timeline.wall_at(frac * bake.timeline.total_work))
+    }
+
+    /// One scrub step: move the playhead, reconstruct the past, and auto-scroll
+    /// the fabric to keep the playhead in view (the mutable half of the
+    /// stability law — the bake never moves; only these do).
+    fn strip_scrub_to(&mut self, pos_ms: i64, cx: &mut Context<Self>) {
+        self.strip.pos_ms = pos_ms;
+        self.strip_reconstruct(pos_ms);
+        let view = {
+            let geom = *self.strip_rail.borrow();
+            match (geom, self.strip.bake.as_ref()) {
+                (Some(g), Some(b)) => {
+                    let rail_w = (g.rail_x1 - g.rail_x0).max(1.);
+                    let work = b.timeline.work_at(pos_ms);
+                    Some((work - rail_w / 2.).clamp(0., (b.timeline.total_work - rail_w).max(0.)))
+                }
+                _ => None,
+            }
+        };
+        if let Some(v) = view {
+            self.strip.view_offset = v;
+        }
+        cx.notify();
+    }
+
+    /// Reconstruct the document as it stood at `pos_ms` (spec §2). Anchors on
+    /// the latest materialized checkpoint ≤ t (the ms law), replays the journal
+    /// forward through a bare `ReplayDoc` (no store — a scrub never journals),
+    /// and shows it read-only through the EXISTING `history_preview` path so
+    /// the margin lane hides and the canvas renders the past. Rightward drags
+    /// advance the cached scratch incrementally; a leftward jump or a new
+    /// anchor rebuilds it.
+    fn strip_reconstruct(&mut self, pos_ms: i64) {
+        let anchor_ms: Option<i64> = self.strip.bake.as_ref().and_then(|b| {
+            strip::anchor_index(&b.anchor_ms, pos_ms).map(|i| b.anchor_ms[i])
+        });
+        let anchor_key = anchor_ms.unwrap_or(i64::MIN);
+        let runs_until = self.doc.journal().runs_until(pos_ms);
+        let reuse = self
+            .strip
+            .scratch
+            .as_ref()
+            .is_some_and(|s| s.anchor_ms == anchor_key && runs_until >= s.replay.applied);
+        if !reuse {
+            // A leftward drag within the SAME anchor rebuilds from the
+            // scratch's own cached state; only a genuinely new anchor reads
+            // the store (whose checkpoint list parse is per-call).
+            let cached = self
+                .strip
+                .scratch
+                .as_ref()
+                .filter(|s| s.anchor_ms == anchor_key)
+                .map(|s| s.anchor_state.clone());
+            let (text, spans, blocks) = cached.unwrap_or_else(|| match anchor_ms {
+                Some(a) => self
+                    .checkpoint_state_at_ms(a)
+                    .unwrap_or_else(|| (String::new(), SpanSet::default(), BlockMap::default())),
+                None => (String::new(), SpanSet::default(), BlockMap::default()),
+            });
+            let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
+            let replay =
+                strop_core::journal::ReplayDoc::new(&text, spans.clone(), blocks.clone(), applied);
+            self.strip.scratch = Some(strip::ScrubDoc {
+                replay,
+                anchor_ms: anchor_key,
+                anchor_state: (text, spans, blocks),
+            });
+        }
+        // Advance forward to pos_ms (disjoint field borrows: scratch vs doc).
+        // Unchanged replay on a reused scratch = the projection below would
+        // rebuild an identical PreviewDoc — skip the O(doc) work per frame.
+        let mut advanced = false;
+        if let Some(scratch) = self.strip.scratch.as_mut() {
+            advanced = scratch.replay.advance(self.doc.journal(), pos_ms);
+        }
+        if reuse && !advanced {
+            return;
+        }
+        // Project the reconstructed rope + spans + blocks into a PreviewDoc.
+        let Some(scratch) = self.strip.scratch.as_ref() else {
+            return;
+        };
+        let text = scratch.replay.text();
+        let words = count_words(std::iter::once(text.as_str()));
+        let spans_bytes: Vec<(Range<usize>, InlineAttr)> = {
+            let mut idx: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+            idx.push(text.len());
+            let b = |ci: usize| idx.get(ci).copied().unwrap_or(text.len());
+            scratch
+                .replay
+                .spans
+                .spans()
+                .iter()
+                .map(|s| (b(s.range.start)..b(s.range.end), s.attr.clone()))
+                .collect()
+        };
+        let kinds = scratch.replay.blocks.kinds().to_vec();
+        // No diff coloring — the strip shows the past AS IT WAS, not a diff.
+        self.history_preview = Some(PreviewDoc {
+            text,
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+            spans_bytes,
+            kinds,
+        });
+        self.strip.words_at = words;
+    }
+
+    /// Esc / the Now chip: drop the preview, return to the present, keep the
+    /// strip open (spec §2). Also clears any Compare pin (review: every state
+    /// needs an exit).
+    fn strip_return_to_now(&mut self, cx: &mut Context<Self>) {
+        let now = self
+            .strip
+            .bake
+            .as_ref()
+            .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
+        self.strip.parked = false;
+        self.strip.scrubbing = false;
+        self.strip.pin_ms = None;
+        self.strip.pos_ms = now;
+        self.strip.scratch = None;
+        self.history_preview = None;
+        cx.notify();
+    }
+
+    /// Compare (shift-click): a second faint playhead whose delta folds into
+    /// the readout's single line. A second shift-click on/near it clears it.
+    fn strip_toggle_pin(&mut self, pos_ms: i64, cx: &mut Context<Self>) {
+        let clear = self.strip.pin_ms.is_some_and(|p| {
+            // Near the existing pin, in working px — a toggle-off.
+            self.strip.bake.as_ref().is_some_and(|b| {
+                (b.timeline.work_at(p) - b.timeline.work_at(pos_ms)).abs() < 8.
+            })
+        });
+        if clear {
+            self.strip.pin_ms = None;
+        } else {
+            self.strip.pin_ms = Some(pos_ms);
+            self.strip.pin_words = self.strip_word_count_at(pos_ms);
+        }
+        cx.notify();
+    }
+
+    /// Word count of the reconstruction at `pos_ms`, computed on a THROWAWAY
+    /// `ReplayDoc` (never touching the cached scratch or the live preview) —
+    /// used once when a Compare pin is set, so the readout's folded delta is
+    /// free thereafter.
+    fn strip_word_count_at(&self, pos_ms: i64) -> usize {
+        let Some(bake) = self.strip.bake.as_ref() else {
+            return 0;
+        };
+        let anchor_ms = strip::anchor_index(&bake.anchor_ms, pos_ms).map(|i| bake.anchor_ms[i]);
+        let (text, spans, blocks) = match anchor_ms {
+            Some(a) => self
+                .checkpoint_state_at_ms(a)
+                .unwrap_or_else(|| (String::new(), SpanSet::default(), BlockMap::default())),
+            None => (String::new(), SpanSet::default(), BlockMap::default()),
+        };
+        let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
+        let mut replay = strop_core::journal::ReplayDoc::new(&text, spans, blocks, applied);
+        replay.advance(self.doc.journal(), pos_ms);
+        count_words(std::iter::once(replay.text().as_str()))
+    }
+
+    /// The strip's own Restore (spec §2): build a `CheckpointState`-shaped value
+    /// from the reconstructed scratch and route through the SAME restore path
+    /// as the panel (undoable forward edit, notes reanchor, the "Before
+    /// restoring" and "Restored" checkpoints, the `Restore` event). Then the one
+    /// lawful in-session re-bake (data changed) and a return to the new present.
+    fn strip_restore(&mut self, cx: &mut Context<Self>) {
+        if !self.strip.is_parked() {
+            return;
+        }
+        let Some(scratch) = self.strip.scratch.as_ref() else {
+            self.strip_return_to_now(cx);
+            return;
+        };
+        let text = scratch.replay.text();
+        let spans = scratch.replay.spans.clone();
+        let blocks = scratch.replay.blocks.clone();
+        let from_unix = self.strip.pos_ms / 1000;
+        self.restore_to_state(text, spans, blocks, from_unix, cx);
+        // Data changed — refresh the bake, snap the playhead to the new present
+        // (the restore IS the new now; the fabric never re-scales under the eye
+        // mid-view, only here — design §1).
+        let now = strop_core::journal::now_ms();
+        self.strip.parked = false;
+        self.strip.scrubbing = false;
+        self.strip.pin_ms = None;
+        self.strip.pos_ms = now;
+        self.strip.scratch = None;
+        // Drop the preview even if the restore degraded (no store): the strip
+        // returns to the live document at now.
+        self.history_preview = None;
+        self.strip_bake(now);
+        cx.notify();
+    }
+
+    /// Wheel over the strip pans the FABRIC only (never the thumb, never the
+    /// document — design §3); the view offset varies, the bake stays frozen.
+    fn strip_pan(&mut self, d: f32, cx: &mut Context<Self>) {
+        let max = {
+            let geom = *self.strip_rail.borrow();
+            match (geom, self.strip.bake.as_ref()) {
+                (Some(g), Some(b)) => {
+                    Some((b.timeline.total_work - (g.rail_x1 - g.rail_x0)).max(0.))
+                }
+                _ => None,
+            }
+        };
+        let Some(max) = max else { return };
+        self.strip.view_offset = (self.strip.view_offset - d).clamp(0., max);
         cx.notify();
     }
 
@@ -1832,11 +2536,11 @@ impl Editor {
             eprintln!("strop: no document file to export next to");
             return;
         };
-        let mut md = strop_core::markdown::to_markdown(
-            &self.doc.text(),
-            self.doc.spans(),
-            self.doc.blocks(),
-        );
+        // Export the MANUSCRIPT only — the compost rail is the writer's private
+        // scrap box, never part of the exported document (asides.md §1). The
+        // slice rebases span/block offsets to 0 (review H40, TRAP 14).
+        let (mtext, mspans, mblocks) = self.doc.manuscript_slice();
+        let mut md = strop_core::markdown::to_markdown(&mtext, &mspans, &mblocks);
         let path = store.path().with_extension("md");
         // Materialize in-file assets as a sidecar dir with relative links
         // (document-model §6).
@@ -2300,11 +3004,14 @@ impl Editor {
     /// The thesis, running: an editorial pass that names problems as
     /// queries in the margin and never rewrites a word.
     fn run_diagnosis(&mut self, _: &RunDiagnosis, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_pass(false, cx);
+        // ctrl-shift-d honours the session depth (`diagnosis_mode`, else config);
+        // the mode is resolved HERE and pinned into the run, so a later menu row
+        // can pin a different depth without disturbing this default.
+        self.run_pass(PassKind::Diagnostic(self.effective_mode()), cx);
     }
 
     fn run_believing(&mut self, _: &RunBelieving, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_pass(true, cx);
+        self.run_pass(PassKind::Believing, cx);
     }
 
     /// The door (DESIGN §4.4): flip between drafting (margin quiet) and
@@ -2312,8 +3019,14 @@ impl Editor {
     /// research asks for — never inferred, never automatic in v1, so a
     /// drafting burst can never be interrupted by a wrong guess.
     fn toggle_review(&mut self, _: &ToggleReview, _: &mut Window, cx: &mut Context<Self>) {
-        // Touching the door is an explicit attention shift — a parked pass
-        // lands right now, mid-burst or not.
+        self.toggle_door(cx);
+    }
+
+    /// The door's flush-and-flip, shared by the ctrl-shift-r action, the editor
+    /// menu's presence verb (`Reading ⇄ Away`), and the rig hook. Touching the
+    /// door is an explicit attention shift — a parked pass lands right now,
+    /// mid-burst or not.
+    fn toggle_door(&mut self, cx: &mut Context<Self>) {
         self.flush_deferred_pass(cx);
         self.drafting = !self.drafting;
         cx.notify();
@@ -2368,7 +3081,72 @@ impl Editor {
         }
     }
 
-    fn run_pass(&mut self, believing: bool, cx: &mut Context<Self>) {
+    /// The editor button's live face inputs (impl 04 §0). `configured` gates
+    /// NeedsSetup even before any pass runs (ai_status is None until one does),
+    /// so an unconfigured provider is announced on the button, not just when a
+    /// pass is attempted.
+    fn face_inputs(&self) -> FaceInputs {
+        FaceInputs {
+            needs_setup: !self.config.ai.configured()
+                || matches!(self.ai_status, Some(AiStatus::NeedsSetup { .. })),
+            error: matches!(self.ai_status, Some(AiStatus::Error { .. })),
+            cooking: matches!(self.ai_status, Some(AiStatus::Running { .. })),
+            ready: self.deferred_pass.is_some(),
+            door_open: !self.drafting,
+        }
+    }
+
+    fn editor_face(&self) -> EditorFace {
+        face_for(&self.face_inputs())
+    }
+
+    /// Open editorial queries (open diagnosis cards) — the button's "{n} open"
+    /// and the footer's "{open} queries open". `resting_diagnoses` already
+    /// counts exactly these, regardless of the door.
+    fn open_query_count(&self) -> usize {
+        self.resting_diagnoses()
+    }
+
+    /// Queries the writer RESOLVED (marked Done) in this document — the footer's
+    /// "{resolved} resolved". Deliberately Done-ONLY: Dismissed cards are
+    /// permanent suppression tombstones (`is_suppressed` leans on them), not work
+    /// done, so counting them would inflate the tally with silenced nags (review
+    /// mid). Bounded by the document's real annotation set.
+    fn resolved_query_count(&self) -> usize {
+        self.doc
+            .notes()
+            .notes()
+            .iter()
+            .filter(|n| n.kind == NoteKind::Diagnosis && n.status == NoteStatus::Done)
+            .count()
+    }
+
+    /// The copy row's gate (impl 04 §0): while any developmental query is open,
+    /// polishing prose the structural edit may cut is premature (the altitude
+    /// order — Reedsy, Sommers). This is the REQUEST-side complement of
+    /// `suppressed_copy`'s RESULT-hold — both key off the same signal (an open
+    /// developmental diagnosis), so the button and the lane never disagree. It
+    /// releases the moment the last developmental query closes, no pass re-run.
+    fn copy_gated(&self) -> bool {
+        copy_gate_active(self.doc.notes().open().map(|n| (n.kind, n.level.as_str())))
+    }
+
+    /// Toggle the editor button's dropdown (impl 04 §0). A pass in flight leaves
+    /// the rows inert (see the menu render), but the button still opens so the
+    /// pulse and the door verb stay reachable.
+    fn toggle_editor_menu(&mut self, cx: &mut Context<Self>) {
+        self.editor_menu_open = !self.editor_menu_open;
+        cx.notify();
+    }
+
+    fn close_editor_menu(&mut self, cx: &mut Context<Self>) {
+        if self.editor_menu_open {
+            self.editor_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    fn run_pass(&mut self, kind: PassKind, cx: &mut Context<Self>) {
         if matches!(self.ai_status, Some(AiStatus::Running { .. })) {
             return;
         }
@@ -2377,16 +3155,16 @@ impl Editor {
         self.config = crate::config::load();
         let ai = self.config.ai.clone();
         if !ai.configured() {
-            // Remember what was asked: once a provider exists, this exact
-            // pass runs without the writer re-issuing it.
-            self.pending_pass = Some(believing);
+            // Remember what was asked: once a provider exists, THIS exact
+            // pass (believing/doubting/depth) runs without the writer re-issuing.
+            self.pending_pass = Some(kind);
             self.ai_generation += 1;
             self.ai_status = Some(AiStatus::NeedsSetup { local_model: None });
             self.probe_local_model(self.ai_generation, cx);
             cx.notify();
             return;
         }
-        self.last_pass_believing = believing;
+        self.last_pass = kind.clone();
         // You asked to evaluate — open the door, so results land in a margin
         // the writer is actually looking at (and any earlier resting cards
         // come back into view alongside them). Asking again is also the most
@@ -2394,27 +3172,19 @@ impl Editor {
         // lands now rather than racing the run it just triggered.
         self.flush_deferred_pass(cx);
         self.drafting = false;
-        // Scope: the selection if there is one, else the whole document
-        // (capped — a 24k-char window is plenty for an editorial pass).
+        // Scope: the selection if there is one, else the MANUSCRIPT (never the
+        // compost — the rail is the writer's private scrap box, asides.md §1).
+        // Capped — a 24k-char window is plenty for an editorial pass.
         let scope = if self.selected_range.is_empty() {
-            self.doc.text()
+            self.doc.manuscript_slice().0
         } else {
             self.doc.slice_bytes(self.selected_range.clone())
         };
         let scope: String = scope.chars().take(24_000).collect();
-        let mode = self.effective_mode();
         self.ai_generation += 1;
         let generation = self.ai_generation;
         self.ai_status = Some(AiStatus::Running {
-            label: format!(
-                "{} · {}",
-                if believing {
-                    "believing pass".to_owned()
-                } else {
-                    format!("{mode} diagnosis")
-                },
-                ai.model
-            ),
+            label: format!("{} · {}", kind.run_label(), ai.model),
         });
         cx.notify();
 
@@ -2426,10 +3196,12 @@ impl Editor {
                 .background_executor()
                 .spawn(async move {
                     let client = strop_core::llm::LlmClient::new(&base_url, &api_key, &model);
-                    let system = if believing {
-                        strop_core::diagnose::believing_system_prompt()
-                    } else {
-                        strop_core::diagnose::system_prompt(&mode)
+                    // The pinned kind picks the prompt; a Diagnostic carries its
+                    // own depth (so `system_prompt` never falls through to line).
+                    let system = match &kind {
+                        PassKind::Believing => strop_core::diagnose::believing_system_prompt(),
+                        PassKind::Doubting => strop_core::diagnose::doubting_system_prompt(),
+                        PassKind::Diagnostic(mode) => strop_core::diagnose::system_prompt(mode),
                     };
                     let user = strop_core::diagnose::user_prompt(&scope);
                     client
@@ -2517,26 +3289,36 @@ impl Editor {
         // that no longer match are dropped.
         self.diagnosis_pass += 1;
         let pass_id = self.diagnosis_pass;
-        let annotations = strop_core::diagnose::to_annotations(
-            &self.doc.text(),
-            diagnoses,
-            self.doc.notes(),
-            now,
-            pass_id,
-        );
+        // Anchor within the MANUSCRIPT slice, then rebase every range back by
+        // the manuscript base — so a card can never land in the compost, even
+        // when the writer set aside an earlier draft of the very sentence
+        // (review H40, TRAP 4). Existing notes are rebased into the slice too,
+        // so suppression still matches. When there is no rail the base is 0 and
+        // this is identical to anchoring against the whole document.
+        let base = self.doc.manuscript_base_char();
+        let mtext = self.doc.manuscript_slice().0;
+        let mut existing = Annotations::default();
+        for n in self.doc.notes().notes() {
+            if n.range.start >= base {
+                let mut n = n.clone();
+                n.range = (n.range.start - base)..(n.range.end - base);
+                existing.push(n);
+            }
+        }
+        let mut annotations =
+            strop_core::diagnose::to_annotations(&mtext, diagnoses, &existing, now, pass_id);
+        for a in &mut annotations {
+            a.range.start += base;
+            a.range.end += base;
+        }
         let kept = annotations.len();
         self.doc.add_diagnoses(annotations);
         // The strip's veil: which read landed, when, how many queries.
-        let mode = if self.last_pass_believing {
-            "believing".to_owned()
-        } else {
-            self.diagnosis_mode.clone().unwrap_or_default()
-        };
         self.doc
             .journal_mut()
             .record_event(strop_core::journal::JournalEvent::Pass {
                 t: strop_core::journal::now_ms(),
-                mode,
+                mode: self.last_pass.mode_str().to_owned(),
                 cards: kept as u32,
             });
         self.mark_dirty();
@@ -2701,8 +3483,11 @@ impl Editor {
     /// defaults to a diagnosis if the queue is empty (the writer reached
     /// setup some other way — running the core feature is the right guess).
     fn run_pending_pass(&mut self, cx: &mut Context<Self>) {
-        let believing = self.pending_pass.take().unwrap_or(false);
-        self.run_pass(believing, cx);
+        let kind = self
+            .pending_pass
+            .take()
+            .unwrap_or_else(|| PassKind::Diagnostic(self.effective_mode()));
+        self.run_pass(kind, cx);
     }
 
     /// Guided config-file flow: ensure the commented template exists,
@@ -3975,6 +4760,7 @@ impl Editor {
                 &self.doc.export_history(50),
                 self.doc.notes(),
                 self.doc.journal(),
+                self.doc.graveyard(),
             ) {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
@@ -4020,7 +4806,9 @@ impl Editor {
     /// and anything less applies; at a bare caret, sets a sticky attr for
     /// the next typed text (the universal rich-editor convention).
     fn toggle_span(&mut self, attr: InlineAttr, cx: &mut Context<Self>) {
-        if self.history_view.is_some() {
+        // Read-only while previewing the past (panel or strip): formatting the
+        // past is undefined; only typing restores (see apply_replace).
+        if self.history_view.is_some() || self.strip.is_parked() {
             return;
         }
         if self.selected_range.is_empty() {
@@ -4035,6 +4823,75 @@ impl Editor {
             rope.byte_to_char(self.selected_range.start)..rope.byte_to_char(self.selected_range.end);
         self.doc.toggle_format(range, attr);
         self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Open the left flank's link argument-field (docs/impl/03-flanks.md §0.1).
+    /// CAPTURES the selection's CHAR range now and applies to THAT on commit —
+    /// never a re-read of `selected_range`, which could drift (Link doesn't
+    /// expand under the caret). Pre-filled from the current target so editing a
+    /// link shows it. The rename-input idiom: Enter commits, Esc cancels, a
+    /// click-away blur commits (`commit_field_on_blur`).
+    fn open_link_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Read-only while previewing the past (mirrors toggle_span).
+        if self.history_view.is_some() || self.strip.is_parked() || self.selected_range.is_empty() {
+            return;
+        }
+        let rope = self.doc.rope();
+        let range = rope.byte_to_char(self.selected_range.start)
+            ..rope.byte_to_char(self.selected_range.end);
+        let seed = self.doc.link_over(range.clone()).unwrap_or_default();
+        let input = cx.new(|cx| TextField::single(cx, seed));
+        cx.subscribe_in(
+            &input,
+            window,
+            move |editor, _, event: &TextFieldEvent, window, cx| match event {
+                TextFieldEvent::Commit(url) => editor.commit_link(url.clone(), window, cx),
+                TextFieldEvent::Cancel => editor.cancel_link(window, cx),
+            },
+        )
+        .detach();
+        // Blur commits (e.g. the palette steals focus): `still` re-checks the
+        // field is the one open, so a stale handle never double-commits.
+        self.commit_field_on_blur(&input, window, cx, |e| {
+            e.link_input.as_ref().map(|(_, f)| f.clone())
+        });
+        let handle = input.read(cx).focus_handle.clone();
+        window.focus(&handle, cx);
+        self.link_input = Some((range, input));
+        cx.notify();
+    }
+
+    /// Commit the link over its CAPTURED range: a non-empty URL sets it, an empty
+    /// one removes it (spec §0.1). Focus returns to the document; the flank stays
+    /// up so the writer can apply another mark.
+    fn commit_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((range, _)) = self.link_input.take() else {
+            return;
+        };
+        let url = url.trim().to_owned();
+        self.doc
+            .set_link(range, if url.is_empty() { None } else { Some(url) });
+        self.mark_dirty();
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Esc from the link field cancels just the argument and returns to the flank
+    /// (the two-level Esc, finding 59) — the selection and popover stay.
+    fn cancel_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_input = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Tear down BOTH flanks (review H20): acting on any right-menu row clears
+    /// them before its result (a composer card, a pass, an aside) takes the lane,
+    /// so only one pinned object ever sits at the selection's y. Also drops a
+    /// half-typed link argument.
+    fn dismiss_flanks(&mut self, cx: &mut Context<Self>) {
+        self.selection_popover = false;
+        self.link_input = None;
         cx.notify();
     }
 
@@ -4098,12 +4955,25 @@ impl Editor {
         self.selection_reversed = false;
         self.cursor_affinity_down = affinity_down;
         self.caret_attrs.clear();
+        // Remember the manuscript caret so Esc from a compost caret returns
+        // exactly here (review B3). A no-rail doc is all manuscript.
+        if offset >= self.doc.char_to_byte(self.doc.manuscript_base_char()) {
+            self.last_manuscript_caret = offset;
+        }
         self.bump_activity();
         cx.notify();
     }
 
     /// Extend the selection's moving end to `offset`. Keeps `goal_x`.
     fn extend_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
+        // Never let a selection straddle the boundary (review B4): clamp the
+        // moving end into the fixed anchor's region.
+        let anchor = if self.selection_reversed {
+            self.selected_range.end
+        } else {
+            self.selected_range.start
+        };
+        let offset = self.clamp_to_region(anchor, offset);
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -4340,6 +5210,11 @@ impl Editor {
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            // The boundary line is removed only via the aside machinery:
+            // backspace at manuscript start is a no-op, like backspace at 0.
+            if self.at_manuscript_start(self.cursor_offset()) {
+                return;
+            }
             // At the start of a styled block, the first backspace strips
             // the block kind instead of merging (Notion/Docs convention).
             let cursor = self.cursor_offset();
@@ -4358,22 +5233,34 @@ impl Editor {
             self.select_to(prev, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.migrate_orphaned_writer_notes(window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            // Forward-delete at the compost tail must not merge the boundary.
+            if self.at_compost_tail(self.cursor_offset())
+                || self.at_separator_start(self.cursor_offset())
+            {
+                return;
+            }
             let next = self.next_boundary(self.cursor_offset());
             self.select_to(next, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.migrate_orphaned_writer_notes(window, cx);
     }
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            if self.at_manuscript_start(self.cursor_offset()) {
+                return;
+            }
             let prev = self.previous_word_boundary(self.cursor_offset());
             self.select_to(prev, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.migrate_orphaned_writer_notes(window, cx);
     }
 
     fn delete_word_right(
@@ -4383,10 +5270,16 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if self.selected_range.is_empty() {
+            if self.at_compost_tail(self.cursor_offset())
+                || self.at_separator_start(self.cursor_offset())
+            {
+                return;
+            }
             let next = self.next_word_boundary(self.cursor_offset());
             self.select_to(next, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.migrate_orphaned_writer_notes(window, cx);
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -4433,47 +5326,286 @@ impl Editor {
 
     /// The outline rail (DESIGN §1.6): session-only, no config.
     pub(crate) fn toggle_outline(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
+        // Outline and the compost rail share the left column and are mutually
+        // exclusive (review H26): the rail render checks `!outline_open`, so
+        // simply toggling the outline hides/reveals the rail beneath it.
         self.outline_open = !self.outline_open;
         cx.notify();
     }
 
-    /// "End Session…" (DESIGN §4.1 — the strongest evidence card, d=0.65):
-    /// one line, "Next session I will ___", saved per-document; enter
-    /// saves AND quits (it IS end-session), escape stays. The ritual
-    /// lives at close and only on request — ctrl-q never blocks.
-    fn end_session(&mut self, _: &EndSession, window: &mut Window, cx: &mut Context<Self>) {
-        if self.end_session_input.is_some() {
+    // -- Asides: the compost rail and the graveyard -------------------------
+
+    /// `Set aside` (docs/impl/02-asides.md §2): move the selection — or, with
+    /// an empty selection, the caret's paragraph (review H25) — into the
+    /// compost rail. A MOVE, never a cut: `file_cut` is the only path that
+    /// files, so the graveyard is suppressed by construction (review H41).
+    /// Births the rail on first use, closes the outline (shared left column),
+    /// blinks the rail edge, and leaves the caret at the collapse point — the
+    /// writer parked a thought, she did not travel.
+    fn set_aside(&mut self, _: &SetAside, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
             return;
         }
-        let input = cx.new(|cx| TextField::single(cx, String::new()));
-        cx.subscribe_in(
-            &input,
-            window,
-            |editor, _, event: &TextFieldEvent, window, cx| match event {
-                TextFieldEvent::Commit(text) => {
-                    let text = text.trim().to_owned();
-                    if let Some(store) = &editor.store
-                        && !text.is_empty()
-                    {
-                        crate::files::set_intent(store.path(), &text, editor.cursor_offset());
-                        editor.intent_recorded = true;
-                    }
-                    editor.save_now();
-                    cx.quit();
-                }
-                TextFieldEvent::Cancel => {
-                    editor.end_session_input = None;
-                    window.focus(&editor.focus_handle, cx);
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
-        cx.observe(&input, |_, _, cx| cx.notify()).detach();
-        let input_focus = input.read(cx).focus_handle.clone();
-        window.focus(&input_focus, cx);
-        self.end_session_input = Some(input);
+        let range = if self.selected_range.is_empty() {
+            let (start, end) = self.paragraph_bounds(self.cursor_offset());
+            start..end
+        } else {
+            self.selected_range.clone()
+        };
+        let Some(caret_char) = self.doc.set_aside(range) else {
+            return; // empty, or the range is compost already
+        };
+        self.outline_open = false; // the new rail takes the left column
+        self.rail_flash = Some(Instant::now());
+        self.sync_mutations();
+        let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
+        self.set_cursor(caret, false, cx);
+        self.schedule_flash_clear(cx);
+    }
+
+    /// `Send to the graveyard` (selection menu / palette): file the selection
+    /// as a cut, any size. Only a manuscript selection is a cut — a compost
+    /// selection would be a move, and the boundary clamp keeps selections
+    /// single-region anyway.
+    fn send_to_graveyard(&mut self, _: &SendToGraveyard, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() || self.selected_range.is_empty() {
+            return;
+        }
+        let start_char = self.doc.rope().byte_to_char(self.selected_range.start);
+        if start_char < self.doc.manuscript_base_char() {
+            return; // compost selection — not a cut
+        }
+        let range = self.selected_range.clone();
+        self.file_cut(range, cx);
+    }
+
+    /// File `byte_range` in the graveyard and collapse the caret to the cut
+    /// point. Shared by the auto-cut trigger and the explicit verb — the one
+    /// site that ever files a corpse.
+    fn file_cut(&mut self, byte_range: Range<usize>, cx: &mut Context<Self>) {
+        let quote = self.origin_quote_before(byte_range.start);
+        self.doc.cut_to_graveyard(byte_range.clone(), quote, now_unix());
+        self.selected_range = byte_range.start..byte_range.start;
+        self.selection_reversed = false;
+        self.cursor_affinity_down = false;
+        self.goal_x = None;
+        self.marked_range = None;
+        self.grave_flash = Some(Instant::now());
+        self.sync_mutations();
+        self.bump_activity();
+        self.schedule_flash_clear(cx);
         cx.notify();
+    }
+
+    /// A trailing fragment of the paragraph immediately before `byte_pos` — the
+    /// entry's origin quote (never the whole context). Stops at a line break.
+    fn origin_quote_before(&self, byte_pos: usize) -> String {
+        let rope = self.doc.rope();
+        let at = rope.byte_to_char(byte_pos.min(self.doc.len_bytes()));
+        let mut from = at;
+        let mut taken = 0;
+        while from > 0 && taken < 48 {
+            if rope.char(from - 1) == '\n' {
+                break;
+            }
+            from -= 1;
+            taken += 1;
+        }
+        rope.slice(from..at).to_string().trim().to_owned()
+    }
+
+    fn toggle_graveyard(&mut self, _: &ToggleGraveyard, _: &mut Window, cx: &mut Context<Self>) {
+        self.graveyard_open = !self.graveyard_open && !self.doc.graveyard().is_empty();
+        cx.notify();
+    }
+
+    /// Put an entry back into the manuscript (one verb everywhere — the entry
+    /// button and the post-cut footer affordance). Re-anchored and clamped into
+    /// the manuscript by the core; here we place the caret and flash nothing
+    /// fancier than moving it there.
+    fn put_back_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(caret_char) = self.doc.put_back(id) else {
+            return;
+        };
+        self.sync_mutations();
+        let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
+        if self.doc.graveyard().is_empty() {
+            self.graveyard_open = false;
+        }
+        self.set_cursor(caret, false, cx);
+    }
+
+    /// Move the caret to an entry's re-anchored origin (clamped into the
+    /// manuscript), so "show origin" reveals where the cut came from without
+    /// re-inserting anything.
+    fn show_grave_origin(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(e) = self.doc.graveyard().get(id) else {
+            return;
+        };
+        let base = self.doc.manuscript_base_char();
+        let at = e.origin_pos.clamp(base, self.doc.rope().len_chars());
+        let byte = self.doc.char_to_byte(at);
+        self.set_cursor(byte, false, cx);
+    }
+
+    /// Delete an entry (the journal still holds the record). Undoable in core.
+    fn delete_grave_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.doc.grave_delete(id);
+        if self.doc.graveyard().is_empty() {
+            self.graveyard_open = false;
+        }
+        self.mark_dirty();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// Has this WRITER note lost its anchor? Either `Annotations::reanchor`
+    /// flagged it `orphaned` on a restore, or an ordinary edit collapsed the
+    /// anchor to a zero-width point. Diagnoses never qualify — machine cards
+    /// are not writer material and stay in the card lifecycle.
+    fn note_is_doomed(&self, id: u64) -> bool {
+        self.doc.notes().get(id).is_some_and(|n| {
+            n.kind == NoteKind::Note
+                && n.status == NoteStatus::Open
+                && (n.orphaned || n.range.start == n.range.end)
+        })
+    }
+
+    /// The ordinary-edit path (spec §3): after a deletion, migrate any writer
+    /// note whose anchor collapsed. Has a Window, so an active doomed card is
+    /// resolved-and-deselected properly first (review B5).
+    fn migrate_orphaned_writer_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus.active_id().is_some_and(|id| self.note_is_doomed(id)) {
+            self.deselect_card(window, cx);
+        }
+        self.perform_orphan_migrations(cx);
+    }
+
+    /// The restore path (spec §3): `reanchor` set `orphaned`. No Window here
+    /// (history mode has no live composer), so a stray active card is simply
+    /// cleared — there is no in-progress draft to commit.
+    fn migrate_orphans_after_restore(&mut self, cx: &mut Context<Self>) {
+        if self.focus.active_id().is_some_and(|id| self.note_is_doomed(id)) {
+            self.focus = CardFocus::Idle;
+        }
+        self.perform_orphan_migrations(cx);
+    }
+
+    /// Move every doomed writer note's text to the compost tail. The caller has
+    /// already resolved focus for any active doomed card.
+    fn perform_orphan_migrations(&mut self, cx: &mut Context<Self>) {
+        let doomed: Vec<u64> = self
+            .doc
+            .notes()
+            .notes()
+            .iter()
+            .filter(|n| self.note_is_doomed(n.id))
+            .map(|n| n.id)
+            .collect();
+        if doomed.is_empty() {
+            return;
+        }
+        for id in doomed {
+            let anchor = self
+                .doc
+                .notes()
+                .get(id)
+                .map(|n| self.doc.char_to_byte(n.range.start.min(self.doc.rope().len_chars())))
+                .unwrap_or(0);
+            let quote = self.origin_quote_before(anchor);
+            if self.doc.migrate_note_to_compost(id, &quote) {
+                self.outline_open = false;
+                self.rail_flash = Some(Instant::now());
+            }
+        }
+        self.sync_mutations();
+        self.schedule_flash_clear(cx);
+        cx.notify();
+    }
+
+    /// Clear the one-shot rail/graveyard arrival blinks after a beat.
+    fn schedule_flash_clear(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(420))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor.rail_flash = None;
+                editor.grave_flash = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // -- Region geometry (byte offsets) -------------------------------------
+
+    /// Byte bounds of the region the caret is in: the manuscript, the compost,
+    /// or the whole document when there is no rail. Ctrl+A scopes to this so a
+    /// select-all in prose never nukes the compost (spec §1, review #110).
+    fn caret_region_bytes(&self) -> (usize, usize) {
+        let len = self.doc.len_bytes();
+        let Some(b) = self.doc.aside_boundary() else {
+            return (0, len);
+        };
+        let compost_edge = self.doc.rope().line_to_byte(b);
+        let manuscript_base = self.doc.char_to_byte(self.doc.manuscript_base_char());
+        if self.cursor_offset() >= manuscript_base {
+            (manuscript_base, len)
+        } else {
+            (0, compost_edge)
+        }
+    }
+
+    /// Clamp a selection's moving end so it never crosses the boundary from the
+    /// anchor's region (review B4): every verb's input is single-region by
+    /// construction. Applies to keyboard AND drag selection (both go through
+    /// `extend_cursor`).
+    fn clamp_to_region(&self, anchor: usize, target: usize) -> usize {
+        let Some(b) = self.doc.aside_boundary() else {
+            return target;
+        };
+        let compost_edge = self.doc.rope().line_to_byte(b);
+        let manuscript_base = self.doc.char_to_byte(self.doc.manuscript_base_char());
+        if anchor >= manuscript_base {
+            target.max(manuscript_base)
+        } else if anchor < compost_edge {
+            target.min(compost_edge)
+        } else {
+            target
+        }
+    }
+
+    /// Is `byte` the first manuscript position (just after the boundary line)?
+    /// Backspace there must be a no-op (the boundary is removed only via the
+    /// aside machinery — spec §1 guard).
+    fn at_manuscript_start(&self, byte: usize) -> bool {
+        self.doc.aside_boundary().is_some()
+            && byte == self.doc.char_to_byte(self.doc.manuscript_base_char())
+    }
+
+    /// Is `byte` the end of the last compost line (the newline before the
+    /// boundary line)? Forward-delete there would merge the boundary away.
+    fn at_compost_tail(&self, byte: usize) -> bool {
+        match self.doc.aside_boundary() {
+            Some(b) => byte == self.doc.rope().line_to_byte(b).saturating_sub(1),
+            None => false,
+        }
+    }
+
+    /// Caret at the START of the boundary's own empty line. Forward-delete
+    /// here would eat the separator's newline and merge block b into b+1 —
+    /// the boundary index stays pinned at b, so the first MANUSCRIPT
+    /// paragraph silently becomes compost (excluded from export, the count,
+    /// and passes) with no visible change to the text. Wave-1 review,
+    /// correctness/high: the separator's newline is removable only by the
+    /// aside machinery, like the other two edges.
+    fn at_separator_start(&self, byte: usize) -> bool {
+        match self.doc.aside_boundary() {
+            Some(b) => byte == self.doc.rope().line_to_byte(b),
+            None => false,
+        }
     }
 
     /// "Set Session Goal…" (DESIGN §4.2): a number, a live delta in the
@@ -4513,36 +5645,6 @@ impl Editor {
         window.focus(&input_focus, cx);
         self.goal_input = Some(input);
         cx.notify();
-    }
-
-    /// "Next session I will" — the bottom strip, find-bar pattern.
-    fn render_end_session_strip(&self) -> Option<impl IntoElement> {
-        let input = self.end_session_input.clone()?;
-        Some(
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .bg(rgb(0xF4F1EA))
-                .border_t_1()
-                .border_color(rgb(RULE_COLOR))
-                .px(px(28.))
-                .py(px(8.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .font_family("PT Serif")
-                .text_size(px(13.))
-                .child(div().text_color(rgb(MUTED_COLOR)).child("Next session I will"))
-                .child(div().flex_1().child(input))
-                .child(
-                    div()
-                        .text_color(rgb(MUTED_COLOR))
-                        .text_size(px(11.))
-                        .child("enter saves & quits · esc stays"),
-                ),
-        )
     }
 
     fn render_goal_strip(&self) -> Option<impl IntoElement> {
@@ -4596,13 +5698,50 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.editor_menu_open {
+            self.editor_menu_open = false;
+            cx.notify();
+            return;
+        }
+        // The link argument-field is the innermost flank layer (finding 59's
+        // two-level Esc): its own FieldCancel handles Esc while it holds focus;
+        // this covers the edge case where the editor has focus with a field open.
+        if self.link_input.is_some() {
+            self.cancel_link(window, cx);
+            return;
+        }
         if self.selection_popover {
             self.selection_popover = false;
             cx.notify();
             return;
         }
+        if self.graveyard_open {
+            self.graveyard_open = false;
+            cx.notify();
+            return;
+        }
+        // Esc from a compost caret returns to the last manuscript caret (review
+        // B3): the rail is a hard edge to drift INTO, soft to leave.
+        if let Some(b) = self.doc.aside_boundary() {
+            let compost_edge = self.doc.rope().line_to_byte(b);
+            if self.cursor_offset() < compost_edge {
+                let target = self.last_manuscript_caret.min(self.doc.len_bytes());
+                self.move_to(target, cx);
+                return;
+            }
+        }
         if self.palette_input.is_some() {
             self.close_palette(window, cx);
+            return;
+        }
+        // The strip: parked → return to now (drop the preview); already at now →
+        // close it (spec §2 / review mid — restores the app-wide Esc-closes rule).
+        if self.strip.open {
+            if self.strip.parked {
+                self.strip_return_to_now(cx);
+            } else {
+                self.close_strip(cx);
+            }
             return;
         }
         if self.history_view.is_some() {
@@ -5157,8 +6296,11 @@ impl Editor {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(0, cx);
-        self.select_to(self.doc.len_bytes(), cx);
+        // Scope to the caret's REGION (spec §1): the writer selecting-all in the
+        // manuscript must not sweep up the private compost, and vice versa.
+        let (start, end) = self.caret_region_bytes();
+        self.move_to(start, cx);
+        self.select_to(end, cx);
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
@@ -5249,7 +6391,7 @@ impl Editor {
 
     /// Toggle a block kind over the selected block range, one transaction.
     fn toggle_block(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
-        if self.history_view.is_some() {
+        if self.history_view.is_some() || self.strip.is_parked() {
             return;
         }
         let start_block = self.doc.block_of_byte(self.selected_range.start);
@@ -5431,7 +6573,7 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.history_view.is_some() {
+        if self.history_view.is_some() || self.strip.is_parked() {
             return;
         }
         if let Some(cursor_char) = self.doc.undo() {
@@ -5451,7 +6593,7 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.history_view.is_some() {
+        if self.history_view.is_some() || self.strip.is_parked() {
             return;
         }
         if let Some(cursor_char) = self.doc.redo() {
@@ -5706,6 +6848,11 @@ impl Editor {
             window.focus(&self.focus_handle, cx);
             cx.notify();
         }
+        // A click outside the flank commits its open link argument-field before
+        // the popover itself is dismissed, so the URL lands (spec §0.1).
+        if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
+            self.commit_link(url, window, cx);
+        }
         if self.selection_popover {
             self.selection_popover = false;
             cx.notify();
@@ -5714,9 +6861,21 @@ impl Editor {
             self.narrow_notes_open = false;
             cx.notify();
         }
+        if self.editor_menu_open {
+            self.editor_menu_open = false;
+            cx.notify();
+        }
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A live link argument-field commits like every other single-line field
+        // when the writer clicks away into the document (spec §0.1). Done up
+        // front so even the early-return paths below (lane click, footnote jump)
+        // don't strand it; the flank's own chrome stops propagation, so a click
+        // that reaches here is genuinely outside it.
+        if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
+            self.commit_link(url, window, cx);
+        }
         // A click in the right note lane is NOT a document click — the lane's
         // own cards and pills handle it. The lane is a sibling element painted
         // over this (full-width) column, so a card/pill's stop_propagation
@@ -5944,6 +7103,9 @@ impl Editor {
         if self.history_view.is_some() {
             overlays.push("history");
         }
+        if self.strip.open {
+            overlays.push("strip");
+        }
         // Every live single-line field, so "focused" can name its context.
         let mut fields: Vec<Entity<TextField>> = Vec::new();
         if let Some(panel) = &self.ai_settings {
@@ -5959,7 +7121,7 @@ impl Editor {
         fields.extend(self.focus.input().cloned());
         fields.extend(self.rename_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.alt_input.as_ref().map(|(_, i)| i.clone()));
-        fields.extend(self.end_session_input.clone());
+        fields.extend(self.link_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.goal_input.clone());
         let focused_field = fields
             .iter()
@@ -6029,6 +7191,50 @@ impl Editor {
             "moving": self.moving.len(),
             "moves_started": self.moves_started,
             "reduce_motion": self.config.reduce_motion,
+            // The editor button's face + the state it's a priority over, so the
+            // rig can assert the transitions (seed:deliver → cooking → ready →
+            // reading) and the door law (open menu while drafting rests cards).
+            "editor_btn": {
+                "face": self.editor_face().token(),
+                "open": !self.drafting,
+                "cooking": matches!(self.ai_status, Some(AiStatus::Running { .. })),
+                "ready": self.deferred_pass.is_some(),
+                "open_count": self.open_query_count(),
+            },
+            // The history strip (P1). `bakes` is session-monotonic — the
+            // stability-law assertion: scrubbing must NEVER bump it (only open
+            // and Restore do). Everything else is scrub state the rig checks.
+            "strip": self.strip.bake.as_ref().map(|b| serde_json::json!({
+                "open": self.strip.open,
+                "pos_ms": self.strip.pos_ms,
+                "parked": self.strip.parked,
+                "runs": self.doc.journal().runs.len(),
+                "events": self.doc.journal().events.len(),
+                "stations": b.stations.len(),
+                "words_at": self.strip.words_at,
+                "bakes": self.strip.bakes,
+            })),
+            // Presentation gate: the margin lane + rail render only when no
+            // history surface is previewing (review H36) — the model above is
+            // ungated, so the rig asserts THIS bit for hide/show.
+            "margin_hidden": self.history_view.is_some() || self.strip.is_parked(),
+            // Asides (docs/impl/02-asides.md §6): the rail's compost block
+            // count (0 = no rail), the graveyard entry count, and the
+            // MANUSCRIPT-only word count (compost excluded — asides.md §1).
+            "compost_blocks": self.doc.aside_boundary().unwrap_or(0),
+            "grave_entries": self.doc.graveyard().len(),
+            "graveyard_open": self.graveyard_open,
+            "manuscript_words": self.manuscript_word_count(),
+            // The selection flanks (docs/impl/03-flanks.md §3): presence of each
+            // (`left` false only under a history surface; `right` false for a
+            // compost-rail selection or a narrow lane) and the lane `y` the right
+            // menu pins to. `null` when there's no live selection to flank.
+            "flanks": self.flank_layout(window).map(|l| serde_json::json!({
+                "left": !matches!(l.gate.left, FlankLeft::None),
+                "right": l.gate.right,
+                "link": self.link_input.is_some(),
+                "y": l.right_top,
+            })),
         })
         .to_string()
     }
@@ -6103,6 +7309,67 @@ impl Editor {
         }
     }
 
+    /// Rig hook (`seed:aside`): a fixture with BOTH piles — a compost rail
+    /// (one asided item) and a graveyard (one filed cut). Replaces the doc so
+    /// the geometry is deterministic, then drives the real verbs.
+    pub fn debug_seed_aside(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "A compost note to keep for later.\nThe manuscript opens here with its real first line.\nAnd a second manuscript sentence long enough — comfortably over the eighty-character graveyard cut threshold — to file automatically.",
+        );
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        // Aside the first paragraph → births the rail.
+        let end0 = self.doc.rope().line_to_byte(1).saturating_sub(1);
+        self.selected_range = 0..end0;
+        self.set_aside(&SetAside, window, cx);
+        // Send the last paragraph (well over the threshold) → a graveyard entry.
+        let lines = self.doc.rope().len_lines();
+        let start = self.doc.rope().line_to_byte(lines.saturating_sub(1));
+        let end = self.doc.len_bytes();
+        self.selected_range = start..end;
+        self.send_to_graveyard(&SendToGraveyard, window, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`select:para`, docs/impl/03-flanks.md §3): select the caret's
+    /// paragraph deterministically AND raise the popover — programmatic selection
+    /// alone never sets `selection_popover` (only mouse-up does), so without this
+    /// the flanks would never render for the dump to observe (finding 117).
+    pub fn debug_select_para(&mut self, cx: &mut Context<Self>) {
+        let (start, end) = self.paragraph_bounds(self.cursor_offset());
+        if start >= end {
+            return;
+        }
+        self.selected_range = start..end;
+        self.selection_reversed = false;
+        self.is_selecting = false;
+        self.selection_popover = true;
+        cx.notify();
+    }
+
+    /// Rig hook (`aside:selection`): run `Set aside` on the current selection.
+    pub fn debug_aside_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_aside(&SetAside, window, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`exile:selection`): run `Send to the graveyard` on the
+    /// current selection (any size — the explicit verb).
+    pub fn debug_exile_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_to_graveyard(&SendToGraveyard, window, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`putback:last`): put the newest graveyard entry back.
+    pub fn debug_putback_last(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.doc.graveyard().entries().last().map(|e| e.id) {
+            self.put_back_entry(id, cx);
+        }
+        cx.notify();
+    }
+
     /// Rig hook (`seed:deliver`): push the demo pass through the REAL arrival
     /// gate (`deliver_pass`) — mid-typing-burst it parks behind the reveal
     /// clock, in a lull it lands at once. rig-check.sh types a key first to
@@ -6113,6 +7380,132 @@ impl Editor {
         let generation = self.ai_generation;
         self.deliver_pass(Self::demo_diagnoses(), generation, cx);
         cx.notify();
+    }
+
+    /// Rig hook (`ebtn:open`): open the editor button's dropdown. The door law
+    /// then holds even with the menu up — cards rest while drafting.
+    pub fn debug_open_editor_menu(&mut self, cx: &mut Context<Self>) {
+        self.editor_menu_open = true;
+        cx.notify();
+    }
+
+    /// Rig hook (`ebtn:door`): the menu footer's presence verb — flush a parked
+    /// pass and flip the door, exactly the path a click on it takes.
+    pub fn debug_toggle_door(&mut self, cx: &mut Context<Self>) {
+        self.toggle_door(cx);
+    }
+
+    /// Rig hook (`seed:journal`): install a deterministic synthetic fortnight —
+    /// six sittings of ~100 minutes' WORKING time across two weeks (drafting
+    /// early, reworking late, one big mid-arc cut), each closed by a pass —
+    /// so the strip has a screen-filling fabric to bake and scrub without a
+    /// live session. The first fixture's sittings were 20 SECONDS long and
+    /// the fixed quant honestly rendered the whole fortnight one sliver wide.
+    pub fn debug_seed_journal(&mut self, cx: &mut Context<Self>) {
+        use strop_core::journal::{EditRun, Journal, JournalEvent};
+        let now = strop_core::journal::now_ms();
+        let day = 86_400_000i64;
+        let mut runs: Vec<EditRun> = Vec::new();
+        let mut events: Vec<JournalEvent> = Vec::new();
+        let mut len = 0usize;
+        for (s, days_ago) in [13i64, 11, 8, 5, 2, 0].into_iter().enumerate() {
+            let start = now - days_ago * day - 4 * 3_600_000;
+            let drafting = s < 3; // early sittings grow; late ones rework
+            for k in 0..150i64 {
+                let t0 = start + k * 40_000; // a run every ~40s of work
+                if !drafting && k % 5 == 2 {
+                    // Rework: cut a stretch from the middle (burnt flecks, the
+                    // envelope dips). One big cut mid-arc.
+                    let big = s == 4 && k == 60;
+                    let del = if big { 1400 } else { 90 + (k as usize % 7) * 22 };
+                    runs.push(EditRun {
+                        t0,
+                        t1: t0 + 9_000,
+                        pos: (len / 3).min(len),
+                        del_chars: del.min(len),
+                        ins: String::new(),
+                    });
+                    len = len.saturating_sub(del).max(200);
+                } else {
+                    // Prose arrives in ~5-14 word gusts near the leading edge.
+                    let words = 5 + (k as usize % 10);
+                    let ins = "the ferry held its line against the dark water "
+                        .split_whitespace()
+                        .cycle()
+                        .take(words)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        + " ";
+                    runs.push(EditRun {
+                        t0,
+                        t1: t0 + 12_000,
+                        pos: len.saturating_sub(k as usize % 40),
+                        del_chars: 0,
+                        ins: ins.clone(),
+                    });
+                    len += ins.chars().count();
+                }
+            }
+            let sit_end = start + 150 * 40_000;
+            events.push(JournalEvent::Pass {
+                t: sit_end + 60_000,
+                mode: if s == 3 { "believing".into() } else { "developmental".into() },
+                cards: 2 + (s as u32 % 3),
+            });
+            if s.is_multiple_of(2) {
+                events.push(JournalEvent::CardClosed {
+                    t: sit_end + 300_000,
+                    id: s as u64 + 1,
+                    resolved: true,
+                });
+            }
+        }
+        self.doc.set_journal(Journal::from_parts(runs, events));
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Rig hook (`strip:open`): open the strip surface.
+    pub fn debug_strip_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_strip(window, cx);
+    }
+
+    /// Rig hook (`strip:scrub:<0..1>`): park at a fraction of the whole history
+    /// (via the timeline, not the rail geometry — deterministic headless).
+    pub fn debug_strip_scrub(&mut self, frac: f32, cx: &mut Context<Self>) {
+        let pos = self
+            .strip
+            .bake
+            .as_ref()
+            .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
+        if let Some(pos) = pos {
+            self.strip.parked = true;
+            self.strip.scrubbing = false;
+            self.strip_scrub_to(pos, cx);
+        }
+    }
+
+    /// Rig hook (`strip:pin:<0..1>`): set/clear the Compare pin at a fraction.
+    pub fn debug_strip_pin(&mut self, frac: f32, cx: &mut Context<Self>) {
+        let pos = self
+            .strip
+            .bake
+            .as_ref()
+            .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
+        if let Some(pos) = pos {
+            self.strip_toggle_pin(pos, cx);
+        }
+    }
+
+    /// Rig hook (`strip:restore`): the strip's Restore (re-bakes — the one
+    /// lawful in-session re-bake, so `bakes` legitimately bumps here).
+    pub fn debug_strip_restore(&mut self, cx: &mut Context<Self>) {
+        self.strip_restore(cx);
+    }
+
+    /// Rig hook (`strip:now`): Esc/Now — drop the preview, back to the present.
+    pub fn debug_strip_now(&mut self, cx: &mut Context<Self>) {
+        self.strip_return_to_now(cx);
     }
 
     /// Rig hook (`seed:many`): a CROWDED lane — eight diagnoses across two
@@ -6212,9 +7605,6 @@ impl Editor {
         if let Some((goal, start)) = self.session_goal {
             session += &format!(" goal={:+}/{goal}", self.word_count as i64 - start as i64);
         }
-        if self.next_intent.is_some() {
-            session += " intent=banner";
-        }
         if self.session_had_edits {
             session += " edits=1";
         }
@@ -6276,6 +7666,18 @@ impl Editor {
         typograph: bool,
         cx: &mut Context<Self>,
     ) {
+        // Typing while parked in the strip's past = restore-then-type (spec §2,
+        // Raskin's law): a text INSERT first performs the Restore (which drops
+        // the preview and returns to the now-live restored doc), then falls
+        // through to insert. A pure deletion (empty new_text) of the past stays
+        // read-only — there is no "type" gesture to justify restoring.
+        if self.strip.is_parked() {
+            if new_text.is_empty() {
+                return;
+            }
+            self.strip_restore(cx);
+            // strip_restore left the doc live and the strip at now; fall through.
+        }
         if self.history_view.is_some() {
             return; // history preview is read-only
         }
@@ -6285,6 +7687,27 @@ impl Editor {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+
+        // The auto-cut trigger (docs/impl/02-asides.md §4): a SINGLE
+        // selection-deletion op of a manuscript passage ≥ AUTO_CUT_MIN_CHARS
+        // files itself in the graveyard. Only a real deletion of a real
+        // selection — a replace-by-typing keeps its text and never files; a
+        // backspace run is many one-char ops, none reaching the threshold
+        // (H24 + H43). The cut never straddles the boundary (selections are
+        // clamped, review B4). See `auto_cut_qualifies` for the pure predicate.
+        if !range.is_empty() {
+            let start_char = self.doc.rope().byte_to_char(range.start);
+            let end_char = self.doc.rope().byte_to_char(range.end);
+            if auto_cut_qualifies(
+                new_text,
+                end_char - start_char,
+                start_char,
+                self.doc.manuscript_base_char(),
+            ) {
+                self.file_cut(range, cx);
+                return;
+            }
+        }
 
         self.doc.edit_bytes_coalescing(range.clone(), new_text);
         let mut cursor = range.start + new_text.len();
@@ -7741,33 +9164,60 @@ impl Editor {
             )
     }
 
-    /// The selection popover (DESIGN §2-toolbar, Medium lineage): formatting
-    /// rides the selection. An in-surface GPUI overlay — never a Wayland
-    /// xdg_popup (Zed's documented popup fragility under wlroots).
-    /// The formatting tools — inline marks, the heading ladder, footnote — in
-    /// document order, grouped by a divider. `vertical` lays them out as the
-    /// gutter-float's column; otherwise as the fallback popover's row. Same
-    /// buttons either way; only the divider rotates.
-    fn format_tools(&self, vertical: bool, cx: &mut Context<Self>) -> gpui::Div {
-        let divider = || {
-            if vertical {
-                div().h(px(1.)).w(px(18.)).my(px(3.)).bg(rgb(RULE_COLOR))
-            } else {
-                popover_divider()
-            }
+    /// The link cell (docs/impl/03-flanks.md §0.1): the second argument-taker.
+    /// A link has no PT-covered glyph (⤴ would force a font fallback — the
+    /// garbled-glyph bug class), so it draws its own mark: a short LINK_COLOR
+    /// underline bar (blue = link, per the color language). Clicking opens the
+    /// URL argument-field (`open_link_input`) rather than toggling — a link needs
+    /// a target — and the cell lights when the selection already carries one.
+    fn link_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = if self.selected_range.is_empty() {
+            false
+        } else {
+            let rope = self.doc.rope();
+            let range = rope.byte_to_char(self.selected_range.start)
+                ..rope.byte_to_char(self.selected_range.end);
+            self.doc.link_over(range).is_some()
         };
         div()
+            .id("link-mark")
+            .px(px(7.))
+            .py(px(2.))
+            .rounded(px(5.))
+            .cursor(CursorStyle::PointingHand)
+            .when(active, |d| d.bg(rgba(0x1A1A1812u32)))
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .tooltip(tip("Link", None))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    editor.open_link_input(window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(14.))
+                    .child(div().w(px(13.)).h(px(2.)).rounded(px(1.)).bg(rgb(LINK_COLOR))),
+            )
+    }
+
+    /// The FLATTENED formatting set for the narrow horizontal fallback (review
+    /// H21): the whole closed grid on one row — inline marks, the two
+    /// argument-takers (link, footnote), the heading ladder — grouped by
+    /// dividers. The VERBS never join it; they stay palette-reachable. This is
+    /// formatting only, so a window too narrow to float a grid still formats.
+    fn format_tools(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
             .flex()
-            .map(|d| {
-                if vertical {
-                    d.flex_col().items_center().gap(px(1.))
-                } else {
-                    d.items_center().justify_center().gap(px(1.))
-                }
-            })
-            // Group 1 — inline marks.
+            .items_center()
+            .justify_center()
+            .gap(px(1.))
             .child(self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx))
             .child(self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx))
+            .child(self.format_button("U", InlineAttr::Underline, "Underline", Some("ctrl-u"), cx))
             .child(self.format_button(
                 "S",
                 InlineAttr::Strikethrough,
@@ -7775,7 +9225,6 @@ impl Editor {
                 Some("ctrl-shift-x"),
                 cx,
             ))
-            .child(self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx))
             .child(self.format_button(
                 "==",
                 InlineAttr::Highlight,
@@ -7783,46 +9232,115 @@ impl Editor {
                 Some("ctrl-shift-h"),
                 cx,
             ))
-            .child(divider())
-            // Group 2 — headings, the full ladder.
+            .child(self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx))
+            .child(popover_divider())
+            // The two argument-takers.
+            .child(self.link_button(cx))
+            .child(self.footnote_button(cx))
+            .child(popover_divider())
+            // The heading ladder.
             .child(self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx))
             .child(self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx))
             .child(self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx))
-            .child(divider())
-            // Group 3 — footnote.
-            .child(self.footnote_button(cx))
     }
 
-    /// Formatting rides the selection (DESIGN §2-toolbar) — but "the text I'm
-    /// writing is sacred": covering even a sliver of prose with chrome is the
-    /// last resort. So the toolbar floats VERTICALLY in the empty left gutter,
-    /// aligned to the selection's line, never over the words. Only when there
-    /// is no gutter to hold it (a narrow or left-shifted window) does it fall
-    /// back to the horizontal popover that does float above the line.
-    fn render_selection_popover(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        if !self.selection_popover
-            || self.selected_range.is_empty()
-            || self.is_selecting
-            || self.history_view.is_some()
-        {
+    /// The closed-set GRID for the gutter-float (docs/impl/03-flanks.md §0.1,
+    /// asides.md §4: "closed sets pack into grids"). The eight inline attrs in
+    /// two columns — six instant toggles, a hairline SEAM, then the two
+    /// argument-takers (link, footnote) below it: parallel form reserved for
+    /// parallel behaviour (P8). A SECOND seam separates the heading block row.
+    /// Two columns halve pointer travel versus the old 1×N stack (Fitts).
+    fn format_grid(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let seam = || div().h(px(1.)).w_full().my(px(3.)).bg(rgb(RULE_COLOR));
+        // Fixed cells so the two columns align regardless of glyph width.
+        let cell = |el: gpui::AnyElement| {
+            div()
+                .w(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(el)
+        };
+        let row = |a: gpui::AnyElement, b: gpui::AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(cell(a))
+                .child(cell(b))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(2.))
+            .child(row(
+                self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx)
+                    .into_any_element(),
+                self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx)
+                    .into_any_element(),
+            ))
+            .child(row(
+                self.format_button("U", InlineAttr::Underline, "Underline", Some("ctrl-u"), cx)
+                    .into_any_element(),
+                self.format_button(
+                    "S",
+                    InlineAttr::Strikethrough,
+                    "Strikethrough",
+                    Some("ctrl-shift-x"),
+                    cx,
+                )
+                .into_any_element(),
+            ))
+            .child(row(
+                self.format_button("==", InlineAttr::Highlight, "Highlight", Some("ctrl-shift-h"), cx)
+                    .into_any_element(),
+                self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx)
+                    .into_any_element(),
+            ))
+            .child(seam())
+            // The argument-takers, below the first seam.
+            .child(row(
+                self.link_button(cx).into_any_element(),
+                self.footnote_button(cx).into_any_element(),
+            ))
+            .child(seam())
+            // The heading block row: the full ladder on one line under the seam.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .child(cell(
+                        self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx)
+                            .into_any_element(),
+                    ))
+                    .child(cell(
+                        self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx)
+                            .into_any_element(),
+                    ))
+                    .child(cell(
+                        self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx)
+                            .into_any_element(),
+                    )),
+            )
+    }
+
+    /// The per-frame flank geometry + gating (docs/impl/03-flanks.md §1-2).
+    /// `None` when there's no live selection to flank. Computed ONCE so the left
+    /// popover, the right menu, and the rig dump all agree on presence and y.
+    fn flank_layout(&self, window: &Window) -> Option<FlankLayout> {
+        if !self.selection_popover || self.selected_range.is_empty() || self.is_selecting {
             return None;
         }
         let frame = self.last_frame.as_ref()?;
         let (par_ix, line, x) =
             frame.cursor_position(self.selected_range.start.min(frame.doc_len()), false)?;
         let par = &frame.paragraphs[par_ix];
-        // `frame.bounds` are WINDOW-global, but this popover is a child of the
-        // `content` surface, which the CSD shadow gutter insets by `CSD_GUTTER`
-        // on each untiled edge (Linux/Wayland floating windows; server-decorated
-        // platforms inset 0, tiled edges 0). Convert frame coords into content
-        // space by subtracting that inset — the column lane already works in
-        // content space (`column_frame`); the popover read window space and so
-        // landed a gutter too far right, over the text, when the left margin was
-        // tight (the Linux-only overlap). `content_width` is content space too.
+        // CSD insets (the old popover math): the `content` surface the flanks are
+        // children of is inset by the shadow gutter on each untiled edge
+        // (Wayland floating windows; server-decorated platforms and tiled edges
+        // inset 0). Content space = window space minus that inset.
         let (l_inset, t_inset, b_inset) = match window.window_decorations() {
             Decorations::Client { tiling } => (
                 if tiling.left { 0. } else { CSD_GUTTER },
@@ -7831,87 +9349,323 @@ impl Editor {
             ),
             Decorations::Server => (0., 0., 0.),
         };
-        // Content-space top of the selection's first visual line.
-        let line_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
+        // RAW (lane) y of the selection's first visual line — co-registers with
+        // the margin CARDS (which also skip the inset: `margin_cards` uses the
+        // bare `frame.bounds.origin.y + pos.y - scroll_top`). The LEFT flank
+        // subtracts the top inset to co-register with the prose column instead;
+        // sharing one basis would drift the menu a gutter off the cards it
+        // occludes on floating windows (review finding 89).
+        let raw_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
             + f32::from(par.line_height) * line as f32
-            - f32::from(frame.scroll_top)
-            - t_inset;
-        let line_h = f32::from(par.line_height);
-        let vw = self.content_width(window);
-        let vh = f32::from(window.viewport_size().height) - t_inset - b_inset;
+            - f32::from(frame.scroll_top);
         let col_left = f32::from(frame.bounds.origin.x) - l_inset;
         let outline_w = self.outline_width(window);
-
-        // Gutter-float: a vertical toolbar hugging the column's left edge, in
-        // the empty margin. Needs a gutter wide enough to hold it — the note
-        // lane lives on the RIGHT, so the left gutter never collides with a
-        // card. Estimate the stack height to keep it on-screen.
-        const GUTTER_W: f32 = 44.;
-        const GUTTER_TOOLBAR_H: f32 = 252.;
         let left_gutter = col_left - outline_w;
-        if left_gutter >= GUTTER_W + 14. {
-            let top = line_top.clamp(BAR_HEIGHT + 8., (vh - GUTTER_TOOLBAR_H - 8.).max(BAR_HEIGHT + 8.));
-            let left = (col_left - 12. - GUTTER_W).max(outline_w + 6.);
-            return Some(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(top))
-                    .w(px(GUTTER_W))
-                    .bg(rgb(0xFCFAF4))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .rounded(px(8.))
-                    .shadow_md()
-                    .py(px(5.))
-                    .px(px(1.))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .font_family("PT Serif")
-                    .text_size(px(13.))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.format_tools(true, cx)),
-            );
-        }
+        // A history surface (strip open, the panel, or a parked preview) claims
+        // the right side AND freezes a read-only past — suppress both flanks so
+        // neither offers live mutation over it (review H22).
+        let history_up =
+            self.history_view.is_some() || self.strip.open || self.history_preview.is_some();
+        // A compost-rail selection: the manuscript-only verbs don't apply, so the
+        // right menu stands down (spec §1, finding 108); the left flank still
+        // rises (the rail is the writer's text, and it renders as leading
+        // paragraphs in the SAME frame, so its coordinates are in hand).
+        let in_compost = self.doc.aside_boundary().is_some()
+            && self
+                .doc
+                .rope()
+                .byte_to_char(self.selected_range.start.min(self.doc.len_bytes()))
+                < self.doc.manuscript_base_char();
+        let lane_available = self.margin_fits(window);
+        let gutter_ok = left_gutter >= FLANK_GRID_W + 12.;
+        Some(FlankLayout {
+            gate: flank_gate(history_up, in_compost, lane_available, gutter_ok),
+            left_top: raw_top - t_inset,
+            right_top: raw_top,
+            line_h: f32::from(par.line_height),
+            x: f32::from(x),
+            col_left,
+            vw: self.content_width(window),
+            vh: f32::from(window.viewport_size().height) - t_inset - b_inset,
+            outline_w,
+            lane_left: self.column_right(window) + MARGIN_GAP,
+        })
+    }
 
-        // Fallback (narrow / left-shifted window — no gutter): the horizontal
-        // popover above the selection start, dropping below its line when the
-        // titlebar is in the way, clamped on-screen either way.
-        const POPOVER_W: f32 = 300.;
+    /// The LEFT flank (docs/impl/03-flanks.md §0.1). Formatting rides the
+    /// selection (DESIGN §2-toolbar) — but "the text I'm writing is sacred", so
+    /// the closed-set grid floats VERTICALLY in the empty left gutter, never over
+    /// the words. The link argument-field, when open, OWNS the flank; where there
+    /// is no gutter to hold a grid it falls back to the formatting-only
+    /// horizontal popover above the line.
+    fn render_selection_popover(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let layout = self.flank_layout(window)?;
+        // The link argument-field OWNS the flank while open (spec §0.1): a wide
+        // URL field at the selection line — the grid is far too narrow to type a
+        // URL into. The field holds keyboard focus, so "typing dismisses" (an
+        // EDITOR-focus rule) never fires over the URL; Enter commits, Esc cancels.
+        if let Some((_, input)) = &self.link_input {
+            return Some(self.render_link_field(&layout, input.clone()));
+        }
+        match layout.gate.left {
+            FlankLeft::None => None,
+            FlankLeft::Grid => Some(self.render_flank_grid(&layout, cx)),
+            FlankLeft::Horizontal => Some(self.render_flank_horizontal(&layout, cx)),
+        }
+    }
+
+    /// The gutter-float grid (the resting left flank).
+    fn render_flank_grid(&self, layout: &FlankLayout, cx: &mut Context<Self>) -> gpui::Div {
+        let top = layout
+            .left_top
+            .clamp(BAR_HEIGHT + 8., (layout.vh - FLANK_GRID_H - 8.).max(BAR_HEIGHT + 8.));
+        let left = (layout.col_left - 12. - FLANK_GRID_W).max(layout.outline_w + 6.);
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(FLANK_GRID_W))
+            .bg(rgb(0xFCFAF4))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(8.))
+            .shadow_md()
+            .py(px(5.))
+            .px(px(3.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .font_family("PT Serif")
+            .text_size(px(13.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.format_grid(cx))
+    }
+
+    /// The narrow fallback: the FORMATTING-ONLY horizontal popover above the
+    /// selection line (review H21 — the verbs stay palette-reachable, they do
+    /// NOT crowd this row).
+    fn render_flank_horizontal(&self, layout: &FlankLayout, cx: &mut Context<Self>) -> gpui::Div {
+        const POPOVER_W: f32 = 340.;
         const POPOVER_H: f32 = 30.;
-        let left = (col_left + f32::from(x) - POPOVER_W / 2.)
-            .clamp(8., (vw - POPOVER_W - 8.).max(8.));
-        let above = line_top - POPOVER_H - 8.;
+        let left = (layout.col_left + layout.x - POPOVER_W / 2.)
+            .clamp(8., (layout.vw - POPOVER_W - 8.).max(8.));
+        let above = layout.left_top - POPOVER_H - 8.;
         let top = if above >= BAR_HEIGHT + 4. {
             above
         } else {
-            line_top + line_h + 8.
+            layout.left_top + layout.line_h + 8.
         }
-        .clamp(BAR_HEIGHT + 4., vh - POPOVER_H - 8.);
+        .clamp(BAR_HEIGHT + 4., layout.vh - POPOVER_H - 8.);
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(POPOVER_W))
+            .bg(rgb(0xFCFAF4))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(6.))
+            .shadow_md()
+            .px(px(4.))
+            .py(px(3.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .font_family("PT Serif")
+            .text_size(px(13.))
+            // Clicks on the popover chrome must not reach the canvas — they would
+            // collapse the very selection being formatted.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.format_tools(cx))
+    }
+
+    /// The link argument-field popover (spec §0.1): a single-line URL editor at
+    /// the selection line, the rename-input idiom. It stops propagation on its
+    /// own chrome so a click inside never collapses the selection the link needs.
+    fn render_link_field(&self, layout: &FlankLayout, input: Entity<TextField>) -> gpui::Div {
+        const LINK_W: f32 = 320.;
+        const LINK_H: f32 = 34.;
+        let left = (layout.col_left + layout.x - LINK_W / 2.)
+            .clamp(8., (layout.vw - LINK_W - 8.).max(8.));
+        let above = layout.left_top - LINK_H - 8.;
+        let top = if above >= BAR_HEIGHT + 4. {
+            above
+        } else {
+            layout.left_top + layout.line_h + 8.
+        }
+        .clamp(BAR_HEIGHT + 4., layout.vh - LINK_H - 8.);
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(LINK_W))
+            .bg(rgb(0xFCFAF4))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(6.))
+            .shadow_md()
+            .px(px(8.))
+            .py(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .font_family("PT Sans")
+            .text_size(px(12.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().text_color(rgb(MUTED_COLOR)).child("Link"))
+            .child(div().flex_1().child(input))
+            .child(
+                div()
+                    .text_color(rgb(MUTED_COLOR))
+                    .text_size(px(10.))
+            )
+    }
+
+    /// The RIGHT flank — the selection's verb menu (docs/impl/03-flanks.md §0.2).
+    /// An INDEPENDENT overlay that OCCLUDES cards at its y (review B8: it is
+    /// transient, so it never touches the packer — no re-pack, so the lane never
+    /// slides on a select/deselect, finding 61). Rows are carrier sentences,
+    /// MOUSE-ONLY (reviews B2/B9: no letter caps — bare keys would type over the
+    /// live selection); each acts and dismisses BOTH flanks first (H20). Idle at
+    /// α≈0.72, waking on hover (the lab selmenu idiom). Presence is decided in
+    /// `flank_layout` (compost-rail and history both stand it down).
+    fn render_selection_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let layout = self.flank_layout(window)?;
+        if !layout.gate.right {
+            return None;
+        }
+        // Never cover the lane-top furniture the writer needs (the door rail /
+        // ai_status band): clamp below it when present (finding 60), else just
+        // below the titlebar — the same floor the cards clear.
+        let has_top_furniture = self.margin_rail_count().is_some() || self.ai_status.is_some();
+        let floor = BAR_HEIGHT + 8. + if has_top_furniture { 30. } else { 0. };
+        const MENU_H_EST: f32 = 132.; // four carrier rows
+        let top = layout
+            .right_top
+            .clamp(floor, (layout.vh - MENU_H_EST - 8.).max(floor));
         Some(
             div()
                 .absolute()
-                .left(px(left))
-                .top(px(top))
-                .w(px(POPOVER_W))
-                .bg(rgb(0xFCFAF4))
-                .border_1()
-                .border_color(rgb(RULE_COLOR))
-                .rounded(px(6.))
-                .shadow_md()
-                .px(px(4.))
-                .py(px(3.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .font_family("PT Serif")
-                .text_size(px(13.))
-                // Clicks on the popover chrome must not reach the canvas —
-                // they would collapse the very selection being formatted.
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(self.format_tools(false, cx)),
+                .left(px(layout.lane_left))
+                .top_0()
+                .bottom_0()
+                .w(px(MARGIN_WIDTH))
+                // No wheel handler — the one document scroll owns the lane; a
+                // handler here would double-fire (mirrors render_margin).
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(top))
+                        .left(px(8.))
+                        .w(px(MARGIN_WIDTH - 8.))
+                        // Rows stack top-down (GPUI defaults to flex-row): the
+                        // carrier sentences are a column, one verb per line.
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(CARD_BG))
+                        .border_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .rounded(px(9.))
+                        .shadow_md()
+                        // Idle translucent, waking on hover (the selmenu idiom):
+                        // a resting affordance that doesn't shout over the prose.
+                        .opacity(0.72)
+                        .hover(|d| d.opacity(1.))
+                        .font_family("PT Sans")
+                        .text_size(px(12.5))
+                        .py(px(2.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.selection_menu_row(
+                            "sel-note",
+                            SelVerb::Note,
+                            rgb(ACTIVE_BORDER),
+                            "Add a note",
+                            false,
+                            cx,
+                        ))
+                        .child(self.selection_menu_row(
+                            "sel-aside",
+                            SelVerb::Aside,
+                            rgb(MUTED_COLOR),
+                            "Set aside, out of the story",
+                            false,
+                            cx,
+                        ))
+                        .child(self.selection_menu_row(
+                            "sel-grave",
+                            SelVerb::Graveyard,
+                            rgb(0xC9C5BAu32),
+                            "Send to the graveyard",
+                            true,
+                            cx,
+                        ))
+                        .child(self.selection_menu_row(
+                            "sel-ask",
+                            SelVerb::Ask,
+                            rgb(AI_ACCENT),
+                            "Ask the editor about this…",
+                            false,
+                            cx,
+                        )),
+                ),
         )
+    }
+
+    /// One carrier-sentence row of the right verb menu. The icon is a small
+    /// color-language dot drawn as a div (no non-PT glyph — the ☰/✂/❋ of the
+    /// mockup would force a font fallback, and ☰ collides with outline/palette,
+    /// finding 109): warm amber for the writer's note, drained for the graveyard,
+    /// cool blue for the machine ask. Acting dismisses BOTH flanks first (H20),
+    /// THEN dispatches — the verb still sees the live `selected_range` (dismissal
+    /// only hides the flanks, it never clears the selection).
+    fn selection_menu_row(
+        &self,
+        id: &'static str,
+        verb: SelVerb,
+        dot: gpui::Rgba,
+        label: &'static str,
+        destructive: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(7.))
+            .cursor(CursorStyle::PointingHand)
+            .hover(|d| d.bg(rgb(if destructive { STALE_BG } else { NOTE_CARD_BG })))
+            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(dot))
+            .child(div().text_color(rgb(TEXT_COLOR)).child(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    // H20: both flanks down before the result (a composer card, a
+                    // pass, an aside) takes the lane — one pinned object at that y.
+                    editor.dismiss_flanks(cx);
+                    match verb {
+                        SelVerb::Note => editor.add_note(&AddNote, window, cx),
+                        SelVerb::Aside => editor.set_aside(&SetAside, window, cx),
+                        SelVerb::Graveyard => {
+                            editor.send_to_graveyard(&SendToGraveyard, window, cx)
+                        }
+                        // The scoped ask reuses ctrl-shift-d's path: `run_pass`
+                        // already scopes over a non-empty selection, opens the
+                        // door, and runs `effective_mode` (finding 118).
+                        SelVerb::Ask => editor.run_diagnosis(&RunDiagnosis, window, cx),
+                    }
+                }),
+            )
     }
 
     // UI chrome avoids glyphs outside the bundled PT fonts (arrows, circles,
@@ -8165,46 +9919,89 @@ impl Editor {
                             ),
                     ),
             )
-            // The core feature earns a seat in the chrome (E3-research's
-            // deferred "titlebar diagnosis button — buttons teach chords").
-            // It lives where its results live: just left of the margin side.
-            // Drawn as a little margin card (the shape a diagnosis takes), so
-            // it rhymes with the feature instead of borrowing a stock glyph.
+            // The editor button (impl 04 §0): the AI subsystem's single home,
+            // where its results live — just left of the margin side. The old
+            // drawn mini-card is gone; the control now WEARS its state (a
+            // priority face) and opens the dropdown that names the reads.
             .child({
-                let running = matches!(self.ai_status, Some(AiStatus::Running { .. }));
-                let mark = if running { rgb(SAGE_COLOR) } else { rgb(MUTED_COLOR) };
+                let face = self.editor_face();
+                let open = self.editor_menu_open;
+                let n = self.open_query_count();
+                // The face's label. "Reading" is the glossary presence word,
+                // never the internal "Reviewing" (review H31).
+                let label: String = match face {
+                    EditorFace::NeedsSetup => "Ask the editor · needs setup".to_owned(),
+                    EditorFace::Cooking | EditorFace::Error | EditorFace::Idle => {
+                        "Ask the editor".to_owned()
+                    }
+                    EditorFace::Ready => "Ask the editor · a read is ready".to_owned(),
+                    EditorFace::Reading if n > 0 => {
+                        format!("Reading · {n} open · Ask the editor")
+                    }
+                    EditorFace::Reading => "Reading · Ask the editor".to_owned(),
+                };
+                // A colour cue only where the words don't carry it: cool = the
+                // machine is at work, red = it failed (color-language.md axis).
+                let dot = match face {
+                    EditorFace::Cooking => Some(AI_ACCENT),
+                    EditorFace::Error => Some(ERROR),
+                    _ => None,
+                };
+                // Hover names the read while cooking, carries the message on a
+                // failure (the full card still lives on render_ai_status), and
+                // teaches the chord in every state.
+                let tip_label: SharedString = match (face, self.ai_status.as_ref()) {
+                    (EditorFace::Cooking, Some(AiStatus::Running { label })) => {
+                        format!("Running: {label}").into()
+                    }
+                    (EditorFace::Error, Some(AiStatus::Error { title, .. })) => title.clone().into(),
+                    (EditorFace::NeedsSetup, _) => "Ask the editor — set up a provider".into(),
+                    _ => "Ask the editor".into(),
+                };
                 div()
-                    .id("diagnose-toggle")
+                    .id("editor-btn")
                     .occlude()
+                    .flex_shrink_0()
+                    .ml(px(4.))
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(5.))
                     .cursor(CursorStyle::PointingHand)
-                    .when(running, |d| d.bg(rgba(0x1A1A1812u32)))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .when(open, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("Run Editorial Diagnosis", Some("ctrl-shift-d")))
+                    .text_color(rgb(if face == EditorFace::Reading {
+                        TEXT_COLOR
+                    } else {
+                        MUTED_COLOR
+                    }))
+                    .tooltip(tip(tip_label, Some("ctrl-shift-d")))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            editor.run_diagnosis(&RunDiagnosis, window, cx);
+                            editor.toggle_editor_menu(cx);
                         }),
                     )
+                    .when_some(dot, |d, color| {
+                        d.child(div().size(px(6.)).rounded_full().bg(rgb(color)))
+                    })
+                    .child(div().child(label))
+                    // The dropdown wedge — three centred, decreasing bars (the
+                    // app's own drawn-glyph idiom; "▾" isn't in the PT fonts).
                     .child(
-                        // A 14×11 card outline with two short text lines.
                         div()
-                            .w(px(14.))
-                            .h(px(11.))
-                            .rounded(px(2.))
-                            .border_1()
-                            .border_color(mark)
                             .flex()
                             .flex_col()
-                            .justify_center()
-                            .gap(px(2.))
-                            .px(px(2.5))
-                            .child(div().w(px(7.)).h(px(1.)).bg(mark))
-                            .child(div().w(px(5.)).h(px(1.)).bg(mark)),
+                            .items_center()
+                            .gap(px(1.))
+                            .children(
+                                [6., 4., 2.]
+                                    .into_iter()
+                                    .map(|w| div().w(px(w)).h(px(1.)).bg(rgb(MUTED_COLOR))),
+                            ),
                     )
             })
             // The day-zero affordance: a user who knows nothing clicks the
@@ -8248,23 +10045,22 @@ impl Editor {
                     .ml(px(4.))
                     .rounded(px(5.))
                     .cursor(CursorStyle::PointingHand)
-                    .text_color(if self.history_view.is_some() {
+                    .text_color(if self.strip.open {
                         rgb(TEXT_COLOR)
                     } else {
                         rgb(MUTED_COLOR)
                     })
-                    .when(self.history_view.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
+                    .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("History & Rewind", Some("ctrl-alt-h")))
+                    .tooltip(tip("History", Some("ctrl-alt-h")))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        // The clock toggles the STRIP (the new first history
+                        // surface); the right-side panel lives on in the palette
+                        // ("History panel"). The two never open together.
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            if editor.history_view.is_some() {
-                                editor.exit_history(cx);
-                            } else {
-                                editor.enter_history(cx);
-                            }
+                            editor.toggle_strip(&ToggleStrip, window, cx);
                         }),
                     )
                     .child(
@@ -8273,7 +10069,7 @@ impl Editor {
                             .size(px(11.))
                             .rounded_full()
                             .border_1()
-                            .border_color(if self.history_view.is_some() {
+                            .border_color(if self.strip.open {
                                 rgb(TEXT_COLOR)
                             } else {
                                 rgb(MUTED_COLOR)
@@ -8281,13 +10077,11 @@ impl Editor {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(div().size(px(3.)).rounded_full().bg(
-                                if self.history_view.is_some() {
-                                    rgb(TEXT_COLOR)
-                                } else {
-                                    rgb(MUTED_COLOR)
-                                },
-                            )),
+                            .child(div().size(px(3.)).rounded_full().bg(if self.strip.open {
+                                rgb(TEXT_COLOR)
+                            } else {
+                                rgb(MUTED_COLOR)
+                            })),
                     ),
             )
             // Windows/Linux get our own drawn window controls. macOS keeps its
@@ -8476,6 +10270,153 @@ impl Editor {
                     .child("Outline"),
             )
             .child(list)
+    }
+
+    /// The sticky graveyard footer bar (docs/impl/02-asides.md §4; asides.md
+    /// §3): a "Graveyard · N" bar that blinks on an exile and toggles the
+    /// read-only entry list. A bottom overlay, like the composer strip. Shown
+    /// only when a cut is on record (an empty pile has no bar). The ⚰ glyph is
+    /// outside the PT fonts, so the coffin is drawn with a div (never a non-PT
+    /// glyph — the garbled-glyph bug class).
+    fn render_graveyard_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let n = self.doc.graveyard().len();
+        if n == 0 || self.history_view.is_some() {
+            return None;
+        }
+        let flashing = self.grave_flash.is_some();
+        Some(
+            div()
+                .id("graveyard-bar")
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(16.))
+                .bg(rgb(if flashing { 0xEFE6D0 } else { 0xF4F1EA }))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .font_family("PT Sans")
+                .text_size(px(12.))
+                .text_color(rgb(if flashing { TEXT_COLOR } else { MUTED_COLOR }))
+                .cursor(CursorStyle::PointingHand)
+                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.graveyard_open = !editor.graveyard_open;
+                        cx.notify();
+                    }),
+                )
+                .child(tombstone_icon())
+                .child(format!("Graveyard · {n}")),
+        )
+    }
+
+    /// The read-only graveyard section (asides.md §3): entries newest-first,
+    /// dimmed, each with its origin whisper and the two verbs — Put back (one
+    /// verb everywhere) and Delete. A bottom panel above the bar, mirroring the
+    /// narrow-notes drop-down idiom.
+    fn render_graveyard_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.graveyard_open || self.doc.graveyard().is_empty() {
+            return None;
+        }
+        let mut list = div()
+            .id("graveyard-list")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for e in self.doc.graveyard().entries().iter().rev() {
+            let id = e.id;
+            let preview: String = e.text.chars().take(90).collect();
+            let whisper = if e.origin_quote.is_empty() {
+                format_unix(e.cut_unix)
+            } else {
+                format!("…{} · {}", e.origin_quote, format_unix(e.cut_unix))
+            };
+            let action = |label: &'static str,
+                          key: usize,
+                          f: fn(&mut Editor, u64, &mut Context<Editor>)| {
+                div()
+                    .id(("grave-act", key))
+                    .cursor(CursorStyle::PointingHand)
+                    .text_color(rgb(MUTED_COLOR))
+                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            f(editor, id, cx);
+                        }),
+                    )
+                    .child(label)
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .px(px(14.))
+                    .py(px(8.))
+                    .border_b_1()
+                    .border_color(rgb(RULE_COLOR))
+                    // The cut prose, dimmed (read-only record).
+                    .child(div().text_color(rgb(MUTED_COLOR)).child(preview))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(14.))
+                            .text_size(px(11.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child(whisper),
+                            )
+                            .child(action("show origin", id as usize * 3, Editor::show_grave_origin))
+                            .child(action("put back", id as usize * 3 + 1, Editor::put_back_entry))
+                            .child(action("delete", id as usize * 3 + 2, Editor::delete_grave_entry)),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .id("graveyard-panel")
+                .absolute()
+                .bottom(px(28.))
+                .left_0()
+                .right_0()
+                .max_h(px(260.))
+                .bg(rgb(0xFCFAF4))
+                .border_t_1()
+                .border_color(rgb(RULE_COLOR))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .font_family("PT Sans")
+                .text_size(px(12.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .px(px(14.))
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child("Graveyard"),
+                )
+                .child(list),
+        )
     }
 
     /// The mode banner (DESIGN §2-history, principle 5 — no hidden modes):
@@ -9906,6 +11847,15 @@ fn note_surfaces(kind: NoteKind, level: &str, drafting: bool, has_dev: bool) -> 
     kind != NoteKind::Diagnosis || (!drafting && (!has_dev || level != "copy"))
 }
 
+/// The editor menu's copy-row gate (impl 04 §0), pure so its RELEASE is unit-
+/// tested: gated iff any OPEN diagnosis sits at the developmental level. Keyed
+/// off the same signal as `note_surfaces`'s copy-hold, so the request gate and
+/// the result hold can never disagree. Releases the instant the last
+/// developmental query closes — no pass re-run.
+fn copy_gate_active<'a>(open_notes: impl Iterator<Item = (NoteKind, &'a str)>) -> bool {
+    open_notes.filter(|(k, _)| *k == NoteKind::Diagnosis).any(|(_, level)| level == "developmental")
+}
+
 impl Editor {
     /// Shape `text` at the card's inner width and return its REAL wrapped
     /// height (the measurement that replaced the `chars/30` estimate). Embedded
@@ -10135,7 +12085,7 @@ impl Editor {
         // the active card hold their anchors, inactive diagnoses yield around
         // them, the selected card is kept fully in view, and no two overlap.
         // `top` currently holds each card's anchor target.
-        let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
+        let floor = BAR_HEIGHT + 8.;
         let viewport_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
         let items: Vec<PlaceItem> = cards
             .iter()
@@ -10374,7 +12324,6 @@ impl Editor {
         self.has_margin_cards()
             || self.margin_rail_count().is_some()
             || self.ai_status.is_some()
-            || self.next_intent.is_some()
     }
 
     /// The prose column's geometry — (left inset, width) — as a function of
@@ -10471,99 +12420,12 @@ impl Editor {
         )
     }
 
-    /// Estimated height of the intent banner at the margin-lane top, so
-    /// the AI status card mounts below it instead of on top of it.
-    fn intent_banner_height(&self) -> f32 {
-        match &self.next_intent {
-            None => 0.,
-            Some(intent) => {
-                let lines = (intent.chars().count() / 28 + 1).clamp(1, 4) as f32;
-                16. + 17. * lines + 8.
-            }
-        }
-    }
-
-    /// "Next: <intent>" (DESIGN §4.1, the open half of the ritual): the
-    /// sentence recorded at close, shown at the top of the margin lane
-    /// (a bottom strip in narrow windows — status never covers prose),
-    /// dismissible, auto-cleared by the first edit. Its own field, not
-    /// ai_status — this is the writer's voice, not the model's.
-    fn render_intent_banner(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let intent = self.next_intent.clone()?;
-        let fits = self.margin_fits(window);
-        let dismiss = div()
-            .id("intent-dismiss")
-            .flex_shrink_0()
-            .cursor(CursorStyle::PointingHand)
-            .text_color(rgb(MUTED_COLOR))
-            .hover(|d| d.text_color(rgb(TEXT_COLOR)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    editor.next_intent = None;
-                    if let Some(store) = &editor.store {
-                        crate::files::clear_intent(store.path());
-                    }
-                    cx.notify();
-                }),
-            )
-            .child("×");
-        let body = |d: gpui::Div| {
-            d.font_family("PT Serif")
-                .text_size(px(12.))
-                .text_color(rgb(TEXT_COLOR))
-                .flex()
-                .items_start()
-                .gap(px(6.))
-                .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Next:"))
-                .child(div().flex_1().min_w(px(0.)).child(intent))
-                .child(dismiss)
-        };
-        Some(if fits {
-            let col_right = self.column_right(window);
-            body(
-                div()
-                    .absolute()
-                    .top(px(BAR_HEIGHT + 8.))
-                    .left(px(col_right + MARGIN_GAP + 8.))
-                    .w(px(MARGIN_WIDTH - 8.))
-                    .p(px(8.))
-                    .rounded(px(6.))
-                    .bg(rgb(0xF2F4EC))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR)),
-            )
-            .into_any_element()
-        } else {
-            body(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .bg(rgb(0xF2F4EC))
-                    .border_t_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .px(px(28.))
-                    .py(px(8.)),
-            )
-            .into_any_element()
-        })
-    }
-
     /// The AI surface (PLAN.md E3), pinned where results land: top of the
     /// margin lane when it fits, a floating top-right card otherwise.
     /// With no status and an empty margin, a one-line hint teaches the
     /// chord — the AI must be visible before the chord is known.
     fn render_ai_status(&self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let fits = self.margin_fits(window);
-        // The intent banner holds the lane's top slot while it lives.
-        let banner_h = self.intent_banner_height();
         let (left, width) = if fits {
             let col_right = self.column_right(window);
             (col_right + MARGIN_GAP + 8., MARGIN_WIDTH - 8.)
@@ -10577,7 +12439,7 @@ impl Editor {
             if fits {
                 div()
                     .absolute()
-                    .top(px(BAR_HEIGHT + 8. + banner_h))
+                    .top(px(BAR_HEIGHT + 8.))
                     .left(px(left))
                     .w(px(width))
                     .rounded(px(6.))
@@ -10616,14 +12478,12 @@ impl Editor {
         let mode = self.effective_mode();
         Some(match self.ai_status.as_ref() {
             None => {
-                // Idle hint, only in the wide margin and only when the
-                // margin is otherwise empty (the intent banner counts —
-                // that one sentence should open the session alone).
-                // The door rail (render_margin_rail) claims the same top-of-
-                // lane slot whenever it's holding something back; in drafting
-                // that happens with zero visible cards, so margin_cards being
-                // empty isn't enough — check the rail's own condition too, or
-                // the hint paints straight over it (Image-4 bug).
+                // Idle hint, only in the wide margin and only when the margin
+                // is otherwise empty. The door rail (render_margin_rail) claims
+                // the same top-of-lane slot whenever it's holding something
+                // back; in drafting that happens with zero visible cards, so
+                // margin_cards being empty isn't enough — check the rail's own
+                // condition too, or the hint paints straight over it (Image-4).
                 let rail_showing = if self.drafting {
                     self.resting_diagnoses() > 0
                 } else {
@@ -10633,7 +12493,6 @@ impl Editor {
                     || self.has_margin_cards()
                     || rail_showing
                     || self.doc.len_bytes() == 0
-                    || self.next_intent.is_some()
                 {
                     return None;
                 }
@@ -10645,7 +12504,7 @@ impl Editor {
                     .font_family("PT Serif")
                     .text_size(px(11.))
                     .text_color(rgb(MUTED_COLOR))
-                    .child(format!("Margin: ctrl-shift-d — {mode} diagnosis"))
+                    .child(format!("Margin: ctrl-shift-d — {mode} read"))
                     .into_any_element()
             }
             Some(AiStatus::NeedsSetup { local_model }) => {
@@ -10772,8 +12631,8 @@ impl Editor {
                             cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
                                 editor.ai_status = None;
-                                let believing = editor.last_pass_believing;
-                                editor.run_pass(believing, cx);
+                                let kind = editor.last_pass.clone();
+                                editor.run_pass(kind, cx);
                             }),
                         ))
                         .child(action_button("ai-err-dismiss", "Dismiss").on_mouse_down(
@@ -10852,7 +12711,7 @@ impl Editor {
             })
             .collect();
         let (above_n, below_n) = (above.len(), below.len());
-        let floor = BAR_HEIGHT + 8. + self.intent_banner_height();
+        let floor = BAR_HEIGHT + 8.;
         // A quiet pill at a lane edge when cards are hidden past it — the honest
         // "there's more here, it didn't vanish" cue (DESIGN principle 2).
         let edge_chip = move |label: String, at_bottom: bool| {
@@ -11180,7 +13039,7 @@ impl Editor {
         }
         let col_right = self.column_right(window);
         let lane_left = col_right + MARGIN_GAP + 8.;
-        let top = BAR_HEIGHT + 8. + self.intent_banner_height();
+        let top = BAR_HEIGHT + 8.;
         let drafting = self.drafting;
         let n = self.margin_rail_count()?;
         let label = if drafting {
@@ -11233,6 +13092,210 @@ impl Editor {
         } else {
             cards.len()
         }
+    }
+
+    /// One menu row (impl 04 §0): a carrier sentence ("A believing read — …")
+    /// that teaches the craft word in place. Its `kind` is pinned into the run
+    /// directly, so choosing a depth never mutates the persistent
+    /// `diagnosis_mode` (the sticky-mode trap). Inert rows stay VISIBLE but
+    /// unclickable (review H33: cooking or a history preview must not dispatch);
+    /// a `gate` reason livens the copy row's `when` line — the only row that
+    /// explains, because the gate is data (no "usually after…" advice anywhere).
+    fn editor_menu_row(
+        &self,
+        id: &'static str,
+        text: &'static str,
+        kind: PassKind,
+        inert: bool,
+        gate: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let disabled = inert || gate.is_some();
+        let base = div()
+            .id(id)
+            .px(px(12.))
+            .py(px(6.))
+            .rounded(px(5.))
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_family("PT Serif")
+                    .text_color(rgb(if disabled { MUTED_COLOR } else { TEXT_COLOR }))
+                    .child(text),
+            );
+        let base = match gate {
+            Some(reason) => base.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child(reason),
+            ),
+            None => base,
+        };
+        if disabled {
+            base.into_any_element()
+        } else {
+            base.cursor(CursorStyle::PointingHand)
+                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        // Selecting a row closes the menu, then runs the pinned
+                        // read (single-flight guard in run_pass handles the rest).
+                        editor.close_editor_menu(cx);
+                        editor.run_pass(kind.clone(), cx);
+                    }),
+                )
+                .into_any_element()
+        }
+    }
+
+    /// The editor button's dropdown (impl 04 §0): the AI subsystem's single
+    /// home, glued flush under the titlebar control (right edges aligned — the
+    /// lab's fix for the detached-dropdown sin), borrowing the narrow-notes
+    /// panel's anchoring idiom (a bool-toggled overlay, light-dismissed + Esc).
+    fn render_editor_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.editor_menu_open {
+            return None;
+        }
+        // Rows go inert while a pass cooks (single-flight — no queueing in v1)
+        // or the past is on screen (review H33: a pass must never diagnose a
+        // document the screen isn't showing). An UNCONFIGURED provider does NOT
+        // disable them — clicking routes through run_pass's pending-pass path,
+        // so the request that triggers setup is the one that gets answered.
+        let inert = self.history_preview.is_some()
+            || matches!(self.ai_status, Some(AiStatus::Running { .. }));
+        // The copy gate is DATA: while a developmental query is open, the copy
+        // row wears its reason as a `when` line and stands down (the altitude
+        // order). Releases with no pass re-run when the last one closes.
+        let copy_gate = self
+            .copy_gated()
+            .then_some("after the structural queries settle");
+        // Anchored flush under the button, right edges aligned. Everything to
+        // the button's right is fixed-width chrome: palette-toggle (27) +
+        // history-toggle (31) [+ the three drawn window controls, 3×34, on
+        // non-macOS — macOS keeps its traffic lights top-LEFT]. So the button's
+        // right edge — and thus the menu's — sits this far from the content edge.
+        let menu_right = if cfg!(target_os = "macos") { 58. } else { 160. };
+        let door_open = !self.drafting;
+        let footer = div()
+            .pt(px(6.))
+            .px(px(12.))
+            .pb(px(2.))
+            .border_t_1()
+            .border_color(rgb(RULE_COLOR))
+            .flex()
+            .items_center()
+            .justify_between()
+            .text_size(px(11.))
+            .child(div().text_color(rgb(MUTED_COLOR)).child(format!(
+                "{} queries open · {} resolved",
+                self.open_query_count(),
+                self.resolved_query_count(),
+            )))
+            .child(
+                // The presence pair (glossary): Reading (door open) / Away
+                // (drafting). A drawn toggle — the current pole is emphasized, a
+                // click flips it through toggle_door's flush semantics. No "⇄"
+                // glyph (not in the bundled PT fonts); a dot divides the poles.
+                div()
+                    .id("editor-menu-door")
+                    .cursor(CursorStyle::PointingHand)
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .px(px(4.))
+                    .py(px(1.))
+                    .rounded(px(4.))
+                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                    .tooltip(tip("The door", Some("ctrl-shift-r")))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.toggle_door(cx);
+                        }),
+                    )
+                    .child(div().text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR })).child("Reading"))
+                    .child(div().size(px(3.)).rounded_full().bg(rgb(MUTED_COLOR)))
+                    .child(div().text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR })).child("Away")),
+            );
+        Some(
+            div()
+                .id("editor-menu")
+                .absolute()
+                .top(px(BAR_HEIGHT + 4.))
+                .right(px(menu_right))
+                .w(px(292.))
+                .bg(rgb(0xFCFAF4))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .rounded(px(8.))
+                .shadow_lg()
+                .py(px(6.))
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .font_family("PT Sans")
+                .text_color(rgb(TEXT_COLOR))
+                // Contained like the palette/narrow panel: clicks/scroll stay in.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .px(px(12.))
+                        .py(px(4.))
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .child("Ask the editor for…"),
+                )
+                .child(self.editor_menu_row(
+                    "er-believing",
+                    "A believing read — what's alive here, what it's secretly about",
+                    PassKind::Believing,
+                    inert,
+                    None,
+                    cx,
+                ))
+                .child(self.editor_menu_row(
+                    "er-developmental",
+                    "A developmental read — the structure: stakes, turns, the ending",
+                    PassKind::Diagnostic("developmental".to_owned()),
+                    inert,
+                    None,
+                    cx,
+                ))
+                .child(self.editor_menu_row(
+                    "er-line",
+                    "A line read — rhythm, imagery, dialogue",
+                    PassKind::Diagnostic("line".to_owned()),
+                    inert,
+                    None,
+                    cx,
+                ))
+                .child(self.editor_menu_row(
+                    "er-copy",
+                    "A copy read — slips, typos, repetitions",
+                    PassKind::Diagnostic("copy".to_owned()),
+                    inert,
+                    copy_gate,
+                    cx,
+                ))
+                .child(self.editor_menu_row(
+                    "er-doubting",
+                    "A doubting read — the strongest case against it",
+                    PassKind::Doubting,
+                    inert,
+                    None,
+                    cx,
+                ))
+                .child(footer)
+                .into_any_element(),
+        )
     }
 
     /// The always-visible feedback that notes EXIST when the window is too
@@ -11541,6 +13604,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::export_markdown))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::toggle_outline))
+            .on_action(cx.listener(Self::toggle_graveyard))
             .on_action(cx.listener(Self::run_diagnosis))
             .on_action(cx.listener(Self::run_believing))
             .on_action(cx.listener(Self::toggle_review))
@@ -11552,9 +13616,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::test_ai_connection))
             .on_action(cx.listener(Self::cancel_ai_run))
             .on_action(cx.listener(Self::toggle_history))
+            .on_action(cx.listener(Self::toggle_strip))
             .on_action(cx.listener(Self::add_checkpoint))
             .on_action(cx.listener(Self::set_session_goal))
-            .on_action(cx.listener(Self::end_session))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::show_shortcuts))
             .on_action(cx.listener(Self::open_welcome))
@@ -11663,6 +13727,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::note_tab))
                     .on_action(cx.listener(Self::escape_mode))
                     .on_action(cx.listener(Self::toggle_history))
+                    .on_action(cx.listener(Self::toggle_strip))
                     .on_action(cx.listener(Self::open_file))
                     .on_action(cx.listener(Self::save_copy_as))
                     .on_action(cx.listener(Self::toggle_palette))
@@ -11683,8 +13748,9 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::open_welcome))
                     .on_action(cx.listener(Self::toggle_outline))
-                    .on_action(cx.listener(Self::end_session))
                     .on_action(cx.listener(Self::set_session_goal))
+                    .on_action(cx.listener(Self::set_aside))
+                    .on_action(cx.listener(Self::send_to_graveyard))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -11741,8 +13807,12 @@ impl Render for Editor {
             })
             .map(|d| {
                 // The panel displaces the margin lane while open (DESIGN
-                // §2-history) — and the AI status card that rides it.
-                if self.history_view.is_some() {
+                // §2-history) — and the AI status card that rides it. The strip
+                // hides the lane + rail only while PREVIEWING the past (parked):
+                // cards anchored to the live document must not float over past
+                // text (review H36). At now, with the strip open, the live doc
+                // and its cards stay.
+                if self.history_view.is_some() || self.strip.is_parked() {
                     return d;
                 }
                 let d = match self.render_margin(window, cx) {
@@ -11753,12 +13823,8 @@ impl Render for Editor {
                     Some(rail) => d.child(rail),
                     None => d,
                 };
-                let d = match self.render_ai_status(window, cx) {
+                match self.render_ai_status(window, cx) {
                     Some(status) => d.child(status),
-                    None => d,
-                };
-                match self.render_intent_banner(window, cx) {
-                    Some(banner) => d.child(banner),
                     None => d,
                 }
             })
@@ -11776,16 +13842,29 @@ impl Render for Editor {
                 Some(strip) => d.child(strip),
                 None => d,
             })
-            .map(|d| match self.render_end_session_strip() {
+            .map(|d| match self.render_goal_strip() {
                 Some(strip) => d.child(strip),
                 None => d,
             })
-            .map(|d| match self.render_goal_strip() {
+            // The history strip (P1): a bottom-strip overlay in the machine-room
+            // dark, above the other bottom bands but below palette/shortcuts.
+            .map(|d| match self.render_strip(window, cx) {
                 Some(strip) => d.child(strip),
                 None => d,
             })
             .map(|d| match self.render_chord_whisper() {
                 Some(whisper) => d.child(whisper),
+                None => d,
+            })
+            // The graveyard's sticky footer bar and, when toggled open, its
+            // read-only entry list (asides.md §3). The bar is a bottom overlay;
+            // the panel sits just above it.
+            .map(|d| match self.render_graveyard_bar(cx) {
+                Some(bar) => d.child(bar),
+                None => d,
+            })
+            .map(|d| match self.render_graveyard_panel(cx) {
+                Some(panel) => d.child(panel),
                 None => d,
             })
             // Narrow-window notes: the count pill (low — just feedback) and,
@@ -11794,12 +13873,25 @@ impl Render for Editor {
                 Some(pill) => d.child(pill),
                 None => d,
             })
+            // The two selection flanks rise together (docs/impl/03-flanks.md).
+            // The RIGHT verb menu paints AFTER render_margin (above), so it
+            // OCCLUDES the cards at its y (review B8); the LEFT formatting flank
+            // lives in the opposite gutter.
+            .map(|d| match self.render_selection_menu(window, cx) {
+                Some(menu) => d.child(menu),
+                None => d,
+            })
             .map(|d| match self.render_selection_popover(window, cx) {
                 Some(popover) => d.child(popover),
                 None => d,
             })
             .map(|d| match self.render_narrow_notes_panel(window, cx) {
                 Some(panel) => d.child(panel),
+                None => d,
+            })
+            // The editor button's dropdown, glued under its titlebar control.
+            .map(|d| match self.render_editor_menu(cx) {
+                Some(menu) => d.child(menu),
                 None => d,
             })
             // Last children = topmost: the omnibox, the keyboard map and
@@ -11928,6 +14020,536 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
             .find(|(_, seg)| seg.chars().next().is_some_and(char::is_alphanumeric))
             .map_or(end, |(ix, seg)| offset + ix + seg.len())
             .min(len);
+    }
+}
+
+// ---- The history strip: painting & the floor ------------------------------
+
+/// The strip's painted rail geometry (WINDOW coords), captured each paint so
+/// the scrub mouse handlers map a pointer against the SAME bounds the fabric
+/// drew (see `Editor::strip_rail`).
+#[derive(Clone, Copy)]
+pub struct StripGeom {
+    rail_x0: f32,
+    rail_x1: f32,
+}
+
+/// The thumb's travel: `min(total_work, rail_width)` (design §1). When the
+/// history fits, the rail and the fixed-scale fabric coincide 1:1; when it
+/// overflows, the thumb compresses the whole duration into the rail.
+fn strip_travel(rail_w: f32, total_work: f32) -> f32 {
+    total_work.min(rail_w).max(1.)
+}
+
+/// An rgb constant with an explicit alpha — the strip's translucent fabric
+/// marks (flecks fuse by alpha; veils are faint).
+fn tint(c: u32, a: f32) -> gpui::Rgba {
+    let mut x = rgb(c);
+    x.a = a;
+    x
+}
+
+impl Editor {
+    /// The bottom strip overlay (spec §0): machine-room dark, the seek-bar
+    /// floor. The fabric + rail + thumb + ticks + labels are custom-painted by
+    /// `StripElement`; the readout / Restore / Now chips are real divs on top
+    /// (each `stop_propagation`, so a click on a control never scrubs — the
+    /// hit-region rule, review mid). The container owns the scrub gesture
+    /// (mousedown = park, drag = continuous, up/up_out = end — the selection-
+    /// drag pattern) and pans the fabric on wheel.
+    fn render_strip(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if !self.strip.open {
+            return None;
+        }
+        let parked = self.strip.parked;
+        let now_ms = self
+            .strip
+            .bake
+            .as_ref()
+            .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
+        // The readout: at now → the live count; parked → the reconstructed
+        // moment, plus any Compare delta folded into the SAME single line.
+        let readout = if parked {
+            let mut s = strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms);
+            if let Some(pin) = self.strip.pin_ms {
+                let delta = self.strip.words_at as i64 - self.strip.pin_words as i64;
+                let when = strip::date_label(pin / 1000, now_ms / 1000);
+                s = format!("{s} · {delta:+} since {when}");
+            }
+            s
+        } else {
+            strip::format_readout(now_ms, self.word_count, now_ms)
+        };
+
+        // A chip button in the machine-room family.
+        let chip = |label: SharedString, bright: bool| {
+            div()
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(4.))
+                .bg(rgb(strip::READOUT_CHIP))
+                .font_family("PT Sans")
+                .text_size(px(11.))
+                .text_color(if bright { rgb(0xE7E1D0) } else { rgb(0x8F8A7C) })
+                .child(label)
+        };
+
+        let readout_chip = chip(readout.into(), true)
+            .id("strip-readout")
+            .occlude()
+            // The readout is fixed at the left end and NEVER parks (design §3).
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        let restore_btn = div()
+            .id("strip-restore")
+            .occlude()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .bg(rgb(0x2E2C22))
+            .cursor(CursorStyle::PointingHand)
+            .font_family("PT Sans")
+            .text_size(px(11.))
+            .text_color(rgb(0xE7E1D0))
+            .hover(|d| d.bg(rgb(0x3A3728)))
+            .child("Restore")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.strip_restore(cx);
+                }),
+            );
+
+        // Now: dim at the present, bright when parked (it and Restore announce
+        // themselves as the pair they are — design §3, review H4: the two
+        // exits from the past light up in the same beat). Click / Esc return.
+        let now_chip = chip("Now".into(), parked)
+            .when(parked, |d| d.bg(rgb(0xEAE6D8)).text_color(rgb(0x23221F)))
+            .id("strip-now")
+            .occlude()
+            .cursor(CursorStyle::PointingHand)
+            .hover(|d| d.bg(rgb(0x2E2C22)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.strip_return_to_now(cx);
+                }),
+            );
+
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(strip::STRIP_H))
+                .bg(rgb(strip::GROUND))
+                .border_t_1()
+                .border_color(rgb(0x3A382E))
+                .occlude()
+                // Scrub: mousedown parks (shift = Compare pin), drag scrubs
+                // continuously, up/up_out end — the selection-drag pattern.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.strip_park_at_x(f32::from(ev.position.x), ev.modifiers.shift, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(|editor, ev: &MouseMoveEvent, _, cx| {
+                    if editor.strip.scrubbing
+                        && ev.pressed_button == Some(MouseButton::Left)
+                        && let Some(pos) = editor.strip_pos_at_x(f32::from(ev.position.x))
+                    {
+                        editor.strip_scrub_to(pos, cx);
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseUpEvent, _, cx| {
+                        editor.strip.scrubbing = false;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseUpEvent, _, cx| {
+                        editor.strip.scrubbing = false;
+                        cx.notify();
+                    }),
+                )
+                .on_scroll_wheel(cx.listener(|editor, ev: &ScrollWheelEvent, _, cx| {
+                    cx.stop_propagation();
+                    let d = f32::from(ev.delta.pixel_delta(px(16.)).y)
+                        + f32::from(ev.delta.pixel_delta(px(16.)).x);
+                    editor.strip_pan(d, cx);
+                }))
+                .child(StripElement { editor: cx.entity() })
+                // Left group: the readout, with Restore beside it when parked.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(strip::SIDE_PAD - 8.))
+                        .top(px(4.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(readout_chip)
+                        .when(parked, |d| d.child(restore_btn)),
+                )
+                // Now, fixed at the far right.
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(strip::SIDE_PAD - 8.))
+                        .top(px(4.))
+                        .child(now_chip),
+                ),
+        )
+    }
+}
+
+struct StripElement {
+    editor: Entity<Editor>,
+}
+
+impl IntoElement for StripElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// A shaped strip label, positioned at bake-time geometry (never re-shaped
+/// mid-scrub — the stability law; shaping only ever happens in prepaint, per
+/// the 2026-06-12 sprite-corruption rule).
+struct StripText {
+    origin: Point<Pixels>,
+    line: gpui::ShapedLine,
+}
+
+#[derive(Default)]
+struct StripPrepaint {
+    rail_x0: f32,
+    rail_x1: f32,
+    band_top: f32,
+    view: f32,
+    labels: Vec<StripText>,
+    dates: Vec<StripText>,
+}
+
+impl Element for StripElement {
+    type RequestLayoutState = ();
+    type PrepaintState = StripPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let _guard = DrawGuard::enter();
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let _guard = DrawGuard::enter();
+        let editor = self.editor.read(cx);
+        let rail_x0 = f32::from(bounds.origin.x) + strip::SIDE_PAD;
+        let rail_x1 = f32::from(bounds.origin.x + bounds.size.width) - strip::SIDE_PAD;
+        let band_top = f32::from(bounds.origin.y);
+        let view = editor.strip.view_offset;
+        let Some(bake) = editor.strip.bake.as_ref() else {
+            return StripPrepaint {
+                rail_x0,
+                rail_x1,
+                band_top,
+                view,
+                ..Default::default()
+            };
+        };
+        let fab_x = |work: f32| rail_x0 + work - view;
+        let shape = |text: &str, size: f32, color: u32, w: &mut Window| {
+            let run = TextRun {
+                len: text.len(),
+                font: gpui::font("PT Sans"),
+                color: rgb(color).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            w.text_system()
+                .shape_line(SharedString::from(text.to_owned()), px(size), &[run], None)
+        };
+        // Station labels — only the ones the bake kept, and only within view.
+        let mut labels = Vec::new();
+        for st in &bake.stations {
+            if !st.show || st.label.is_empty() {
+                continue;
+            }
+            let wx = fab_x(st.x);
+            if wx < rail_x0 - 60. || wx > rail_x1 + 60. {
+                continue;
+            }
+            let line = shape(&st.label, 11., 0xB8B2A2, window);
+            let lx = if st.flip_left {
+                wx - f32::from(line.width) - 3.
+            } else {
+                wx + 3.
+            };
+            let ly = band_top + strip::TOP_ROW_H + 1. + (st.row as f32) * 11.;
+            labels.push(StripText {
+                origin: point(px(lx), px(ly)),
+                line,
+            });
+        }
+        // Date lane.
+        let mut dates = Vec::new();
+        for dt in &bake.dates {
+            let wx = fab_x(dt.x);
+            if wx < rail_x0 - 40. || wx > rail_x1 + 40. {
+                continue;
+            }
+            let line = shape(&dt.label, 10., 0x87826F, window);
+            dates.push(StripText {
+                origin: point(px(wx + 2.), px(band_top + strip::STRIP_H - strip::DATE_LANE_H)),
+                line,
+            });
+        }
+        StripPrepaint {
+            rail_x0,
+            rail_x1,
+            band_top,
+            view,
+            labels,
+            dates,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let _guard = DrawGuard::enter();
+        let editor = self.editor.read(cx);
+        let rail_x0 = prepaint.rail_x0;
+        let rail_x1 = prepaint.rail_x1;
+        let band_top = prepaint.band_top;
+        // Hand the rail geometry to the scrub mouse handlers (interior
+        // mutability through the shared Rc — never an entity write).
+        *editor.strip_rail.borrow_mut() = Some(StripGeom { rail_x0, rail_x1 });
+
+        let rail_y = band_top + strip::RAIL_Y;
+        let rail_w = (rail_x1 - rail_x0).max(1.);
+        // A thin quad, clipped to the rail's x-window. `window` is a parameter
+        // (not captured), so the direct paint_quad calls below — thumb, flecks,
+        // playhead — never fight this helper for the mutable window borrow.
+        let rect = |window: &mut Window, x: f32, y: f32, w: f32, h: f32, color: gpui::Rgba| {
+            let xa = x.max(rail_x0);
+            let xb = (x + w).min(rail_x1);
+            if xb <= xa || h <= 0. {
+                return;
+            }
+            window.paint_quad(fill(
+                Bounds::new(point(px(xa), px(y)), size(px(xb - xa), px(h))),
+                color,
+            ));
+        };
+
+        let Some(bake) = editor.strip.bake.as_ref() else {
+            // Degraded (no bake yet): just the rail line, so the floor exists.
+            rect(window, rail_x0, rail_y, rail_w, 2., tint(strip::GREY, 0.6));
+            return;
+        };
+        let view = prepaint.view;
+        let total = bake.timeline.total_work;
+        let pos = editor.strip.pos_ms;
+        let fab_x = |work: f32| rail_x0 + work - view;
+        let fab_top = band_top + strip::FAB_Y0;
+        let fab_bot = fab_top + strip::FABRIC_H;
+
+        // --- Cream page-fill + stepwise envelope stroke ----------------------
+        if !bake.envelope.is_empty() {
+            let mut prev = strip::EnvPoint {
+                x: 0.,
+                y: bake.envelope[0].y,
+            };
+            for p in bake.envelope.iter().chain(std::iter::once(&strip::EnvPoint {
+                x: total,
+                y: bake.envelope.last().map_or(fab_top, |e| e.y),
+            })) {
+                let xa = fab_x(prev.x);
+                let xb = fab_x(p.x);
+                let level = band_top + prev.y;
+                // The faint cream page under the line.
+                rect(window, xa, fab_top, xb - xa, level - fab_top, tint(strip::CREAM, strip::CREAM_FILL_ALPHA));
+                // The envelope stroke: a horizontal cap + the vertical step.
+                rect(window, xa, level - 0.65, xb - xa, 1.3, tint(strip::CREAM, strip::ENVELOPE_ALPHA));
+                let (y0, y1) = ((prev.y).min(p.y), (prev.y).max(p.y));
+                rect(window, xb - 0.65, band_top + y0, 1.3, y1 - y0, tint(strip::CREAM, strip::ENVELOPE_ALPHA));
+                prev = *p;
+            }
+        }
+
+        // --- Veils: the machine read here (a full-height cool column) --------
+        for v in &bake.veils {
+            let x = fab_x(v.x);
+            rect(window, x - 2., fab_top, 4., strip::FABRIC_H, tint(strip::VEIL, strip::VEIL_ALPHA));
+        }
+
+        // --- Threads: a card's open life (cool), sage/grey terminal dot ------
+        for t in &bake.threads {
+            let x0 = fab_x(t.x0);
+            let x1 = fab_x(t.x1);
+            let y = band_top + t.y;
+            rect(window, x0, y, x1 - x0, 1., tint(strip::THREAD, 0.5));
+            if !t.open {
+                let dot = if t.resolved { strip::SAGE } else { strip::GREY };
+                rect(window, x1 - 1.5, y - 1.5, 3., 3., tint(dot, 0.9));
+            }
+        }
+
+        // --- Seams: a folded >15 min gap ------------------------------------
+        for s in &bake.seams {
+            let x = fab_x(s.x);
+            rect(window, x, fab_top, 1., strip::FABRIC_H, tint(strip::GREY, 0.35));
+        }
+
+        // --- Flecks: the fabric (2×2 amber grains; thousands = one batch).
+        // Windowed: flecks are baked in time order (x non-decreasing), so the
+        // visible range is one partition_point + an early break — paint cost
+        // is O(visible), not O(journal) (wave-1 review, perf/mid; a year of
+        // history would otherwise walk every grain per frame).
+        let lo = view;
+        let hi = view + (rail_x1 - rail_x0);
+        let start = bake.flecks.partition_point(|f| f.x < lo);
+        for f in &bake.flecks[start..] {
+            if f.x > hi {
+                break;
+            }
+            let x = fab_x(f.x);
+            let color = if f.del {
+                tint(strip::FLECK_DEL, strip::FLECK_DEL_ALPHA)
+            } else {
+                tint(strip::FLECK_INS, strip::FLECK_INS_ALPHA)
+            };
+            window.paint_quad(fill(
+                Bounds::new(point(px(x), px(band_top + f.y)), size(px(strip::FLECK), px(strip::FLECK))),
+                color,
+            ));
+        }
+
+        // --- Station ticks (+ restore arcs), brightened near the playhead ----
+        let play_x = fab_x(bake.timeline.work_at(pos));
+        for st in &bake.stations {
+            let x = fab_x(st.x);
+            // Brighten by TIME distance to the playhead (association by light,
+            // design §2) — stable under the fabric's zoom, unlike pixel distance.
+            let near = (st.at_ms - pos).abs() < 45_000;
+            let base = if st.restore { strip::SAGE } else { strip::GREY };
+            let a = if near { 0.95 } else { 0.5 };
+            rect(window, x, band_top + strip::TOP_ROW_H, 1., strip::FABRIC_H + strip::LABEL_LANE_H, tint(base, a));
+            // Restore arc: a dashed connector back to the source station, ridden
+            // in the label lane (design §1).
+            if let Some(src) = st.arc_to {
+                let sx = fab_x(src);
+                let (a0, a1) = (sx.min(x), sx.max(x));
+                let ay = band_top + strip::TOP_ROW_H + strip::LABEL_LANE_H - 3.;
+                let mut dash = a0;
+                while dash < a1 {
+                    rect(window, dash, ay, 3., 1., tint(strip::SAGE, 0.55));
+                    dash += 6.;
+                }
+            }
+        }
+
+        // --- The not-yet: everything right of a parked playhead dims one
+        // alpha step — a STATIC encoding of position, so any paused frame
+        // reads correctly (design §0's screenshot test; the corridor tester's
+        // safety signal is seeing today still ON the strip, dimmed not gone).
+        if editor.strip.parked && play_x < rail_x1 {
+            rect(
+                window,
+                play_x,
+                band_top,
+                rail_x1 - play_x,
+                strip::TOP_ROW_H + strip::LABEL_LANE_H + strip::FABRIC_H,
+                tint(strip::GROUND, 0.55),
+            );
+        }
+
+        // --- The rail, the thumb, the playhead, and the Compare pin ----------
+        rect(window, rail_x0, rail_y, rail_w, 2., tint(strip::GREY, 0.55));
+        let travel = strip_travel(rail_w, total);
+        let frac = if total > 0. {
+            bake.timeline.work_at(pos) / total
+        } else {
+            1.
+        };
+        let thumb_x = rail_x0 + frac * travel;
+        // The thumb carries the highest contrast in the strip (design §0).
+        let mut thumb = fill(
+            Bounds::new(point(px(thumb_x - 5.), px(rail_y - 5.)), size(px(10.), px(10.))),
+            rgb(0xEDE7D6),
+        );
+        thumb.corner_radii = Corners::all(px(5.));
+        window.paint_quad(thumb);
+        // The playhead line binds the rail to the fabric.
+        if play_x >= rail_x0 && play_x <= rail_x1 {
+            window.paint_quad(fill(
+                Bounds::new(point(px(play_x - 0.5), px(rail_y)), size(px(1.), px(fab_bot - rail_y))),
+                tint(0xEDE7D6, if editor.strip.parked { 0.85 } else { 0.4 }),
+            ));
+        }
+        if let Some(pin) = editor.strip.pin_ms {
+            let px_pin = fab_x(bake.timeline.work_at(pin));
+            if px_pin >= rail_x0 && px_pin <= rail_x1 {
+                window.paint_quad(fill(
+                    Bounds::new(point(px(px_pin - 0.5), px(rail_y)), size(px(1.), px(fab_bot - rail_y))),
+                    tint(0xEDE7D6, 0.3),
+                ));
+            }
+        }
+
+        // --- Shaped text: station labels + the date lane ---------------------
+        for t in prepaint.labels.drain(..) {
+            t.line.paint(t.origin, px(12.), TextAlign::Left, None, window, cx).ok();
+        }
+        for t in prepaint.dates.drain(..) {
+            t.line.paint(t.origin, px(12.), TextAlign::Left, None, window, cx).ok();
+        }
     }
 }
 
@@ -12095,6 +14717,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_cut_fires_only_on_a_big_manuscript_deletion() {
+        // At/over the threshold, a pure deletion inside the manuscript fires.
+        assert!(auto_cut_qualifies("", AUTO_CUT_MIN_CHARS, 100, 0));
+        assert!(auto_cut_qualifies("", 500, 100, 40));
+        // Just under the threshold does NOT (both sides of the boundary case).
+        assert!(!auto_cut_qualifies("", AUTO_CUT_MIN_CHARS - 1, 100, 0));
+        // A replace-by-typing never files, however large the deleted run.
+        assert!(!auto_cut_qualifies("x", 500, 100, 0));
+        // A compost deletion (before the manuscript base) is a move, not a cut.
+        assert!(!auto_cut_qualifies("", 200, 5, 40));
+        // An empty selection never fires.
+        assert!(!auto_cut_qualifies("", 0, 100, 0));
+    }
+
+    #[test]
     fn oldest_beyond_cap_recedes_the_oldest_passes() {
         use std::collections::HashSet;
         // At or under the budget: everything renders full.
@@ -12154,6 +14791,120 @@ mod tests {
         assert!(note_surfaces(NoteKind::Diagnosis, "developmental", false, true));
         assert!(!note_surfaces(NoteKind::Diagnosis, "copy", false, true));
         assert!(note_surfaces(NoteKind::Diagnosis, "copy", false, false));
+    }
+
+    #[test]
+    fn flank_gate_decides_which_flanks_rise() {
+        use FlankLeft::*;
+        // (history_up, in_compost, lane_available, gutter_ok)
+        let g = |h, c, l, gk| flank_gate(h, c, l, gk);
+
+        // A history surface suppresses BOTH flanks — the past is read-only and
+        // the right side is claimed (review H22). Every other input is ignored.
+        for &(c, l, gk) in &[(false, true, true), (true, false, false)] {
+            let r = g(true, c, l, gk);
+            assert_eq!(r.left, None, "history suppresses the left flank");
+            assert!(!r.right, "history suppresses the right flank");
+        }
+
+        // No history, wide gutter, live lane, manuscript selection: the grid and
+        // the verb menu both rise (the resting case).
+        let r = g(false, false, true, true);
+        assert_eq!(r.left, Grid);
+        assert!(r.right);
+
+        // The narrow gutter narrows only the FORM of the left flank — it still
+        // rises, as the formatting-only horizontal fallback (review H21). The
+        // right menu is unaffected: its fallback keys on the LANE, not the gutter
+        // (finding 57), so it stays up while the lane is available.
+        let r = g(false, false, true, false);
+        assert_eq!(r.left, Horizontal);
+        assert!(r.right, "the gutter width never gates the right menu");
+
+        // A compost-rail selection: the left (formatting) flank rises, the right
+        // (verb) menu does not — the rail is the writer's scrap box (finding 108).
+        let r = g(false, true, true, true);
+        assert_eq!(r.left, Grid);
+        assert!(!r.right, "no verb menu for a rail selection");
+
+        // No lane (narrow-notes mode collapsed it): the right menu has nowhere to
+        // occlude into, so it stands down even for a manuscript selection.
+        let r = g(false, false, false, true);
+        assert_eq!(r.left, Grid);
+        assert!(!r.right, "no lane, no right menu");
+    }
+
+    #[test]
+    fn editor_face_is_a_priority_not_exclusive_states() {
+        use EditorFace::*;
+        let mk = |needs_setup, error, cooking, ready, door_open| {
+            face_for(&FaceInputs { needs_setup, error, cooking, ready, door_open })
+        };
+        // The spec's order, top-down: NeedsSetup > Error > cooking > ready >
+        // Reading·N > idle. Each row lights SEVERAL inputs and asserts the
+        // winner, so the priority is what's tested, not a lucky single input.
+        assert_eq!(mk(true, true, true, true, true), NeedsSetup, "setup outranks all");
+        assert_eq!(mk(false, true, true, true, true), Error, "error outranks cooking");
+        assert_eq!(mk(false, false, true, true, true), Cooking, "cooking outranks a parked read");
+        assert_eq!(mk(false, false, false, true, true), Ready, "a parked read outranks the door");
+        assert_eq!(mk(false, false, false, false, true), Reading, "door open, nothing pending");
+        assert_eq!(mk(false, false, false, false, false), Idle, "drafting, quiet");
+        // The two combinations the review named (H32): door open × cooking, and
+        // door open × a parked read, each resolve to exactly ONE face.
+        assert_eq!(mk(false, false, true, false, true), Cooking);
+        assert_eq!(mk(false, false, false, true, true), Ready);
+        // Every face round-trips to its rig token.
+        for f in [NeedsSetup, Error, Cooking, Ready, Reading, Idle] {
+            assert_eq!(
+                face_for(&FaceInputs {
+                    needs_setup: f == NeedsSetup,
+                    error: f == Error,
+                    cooking: f == Cooking,
+                    ready: f == Ready,
+                    door_open: f == Reading,
+                }),
+                f,
+                "{}",
+                f.token()
+            );
+        }
+    }
+
+    #[test]
+    fn pass_kind_threads_its_identity_end_to_end() {
+        // The journal mode string and the Running label both derive from the
+        // kind, so doubting can never collapse onto believing (review H27) and
+        // a "doubting" string can never fall through to the line prompt.
+        assert_eq!(PassKind::Believing.mode_str(), "believing");
+        assert_eq!(PassKind::Doubting.mode_str(), "doubting");
+        assert_eq!(PassKind::Diagnostic("copy".into()).mode_str(), "copy");
+        assert_eq!(PassKind::Believing.run_label(), "believing read");
+        assert_eq!(PassKind::Doubting.run_label(), "doubting read");
+        assert_eq!(
+            PassKind::Diagnostic("developmental".into()).run_label(),
+            "developmental read"
+        );
+        // The three kinds are distinct, and a pinned depth is carried by value
+        // (the fix for the sticky-mode trap — no diagnosis_mode mutation).
+        assert_ne!(PassKind::Doubting, PassKind::Believing);
+        assert_ne!(PassKind::Diagnostic("line".into()), PassKind::Diagnostic("copy".into()));
+    }
+
+    #[test]
+    fn copy_gate_releases_when_the_last_developmental_closes() {
+        use NoteKind::{Diagnosis, Note};
+        // Gated while an open developmental query stands (line/copy alongside
+        // don't matter — the developmental one is the gate).
+        assert!(copy_gate_active(
+            [(Diagnosis, "developmental"), (Diagnosis, "line")].into_iter()
+        ));
+        // Released the moment none is open: copy/line/believing-level cards
+        // never gate, so closing the last developmental livens the row with no
+        // pass re-run.
+        assert!(!copy_gate_active([(Diagnosis, "copy"), (Diagnosis, "line")].into_iter()));
+        // A writer note is not a diagnosis and never gates; empty never gates.
+        assert!(!copy_gate_active([(Note, "developmental")].into_iter()));
+        assert!(!copy_gate_active(std::iter::empty()));
     }
 
     #[test]

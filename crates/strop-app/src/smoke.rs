@@ -115,6 +115,62 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:diag: demo diagnosis cards seeded");
                 continue;
             }
+            // Asides (docs/impl/02-asides.md §6). `seed:aside` builds a doc
+            // with a compost rail and a graveyard entry; `aside:selection` /
+            // `exile:selection` run the verbs on the current selection;
+            // `putback:last` restores the newest cut.
+            if key == "seed:aside" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_seed_aside(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:aside: compost rail + graveyard entry seeded");
+                continue;
+            }
+            if key == "aside:selection" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_aside_selection(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE aside:selection: selection moved to compost");
+                continue;
+            }
+            // Flanks (docs/impl/03-flanks.md §3): select the caret paragraph and
+            // raise the popover so `dump:ui`'s `flanks` object is observable.
+            if key == "select:para" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_select_para(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE select:para: caret paragraph selected + flanks raised");
+                continue;
+            }
+            if key == "exile:selection" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_exile_selection(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE exile:selection: selection filed in the graveyard");
+                continue;
+            }
+            if key == "putback:last" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_putback_last(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE putback:last: newest cut put back");
+                continue;
+            }
             if key == "seed:many" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_seed_many(cx))
@@ -136,6 +192,96 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(120))
                     .await;
                 eprintln!("SMOKE seed:deliver: demo pass sent through the arrival gate");
+                continue;
+            }
+            // `ebtn:open` opens the editor button's dropdown; `ebtn:door`
+            // flips the door through the menu footer's presence verb. Together
+            // they let the rig assert the door law (cards rest while drafting
+            // even with the menu open) and the face's transitions.
+            if key == "ebtn:open" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_open_editor_menu(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ebtn:open: editor menu opened");
+                continue;
+            }
+            if key == "ebtn:door" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_toggle_door(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ebtn:door: door toggled");
+                continue;
+            }
+            // History strip (P1): `seed:journal` installs a synthetic fortnight;
+            // `strip:open` opens the surface; `strip:scrub:<0..1>` /
+            // `strip:pin:<0..1>` park/pin at a fraction of the whole history;
+            // `strip:restore` / `strip:now` are the two exits from the past.
+            if key == "seed:journal" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_journal(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE seed:journal: synthetic fortnight installed");
+                continue;
+            }
+            if key == "strip:open" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_strip_open(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE strip:open");
+                continue;
+            }
+            if let Some(frac) = key.strip_prefix("strip:scrub:") {
+                let f: f32 = frac.parse().expect("bad strip:scrub fraction");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_scrub(f, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:scrub:{f}");
+                continue;
+            }
+            if let Some(frac) = key.strip_prefix("strip:pin:") {
+                let f: f32 = frac.parse().expect("bad strip:pin fraction");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_pin(f, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:pin:{f}");
+                continue;
+            }
+            if key == "strip:restore" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_restore(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE strip:restore");
+                continue;
+            }
+            if key == "strip:now" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_now(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:now");
                 continue;
             }
             // `reduce:motion` flips the config's motion-sensitivity switch

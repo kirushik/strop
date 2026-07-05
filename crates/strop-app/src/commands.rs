@@ -9,12 +9,12 @@ use gpui::Action;
 
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
-    DiagnosisModeDevelopmental, DiagnosisModeLine, EndSession, ExportMarkdown, Find, Heading1,
+    DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1,
     Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
-    SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode,
-    ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList,
-    ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview,
+    SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
+    ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleGraveyard, ToggleHighlight, ToggleHistory,
+    ToggleOrderedList, ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview, ToggleStrip,
     ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
 };
 
@@ -41,7 +41,10 @@ impl Command {
     /// the "App" and "Editor" key contexts respectively.
     pub fn global(&self) -> bool {
         match self.section {
-            "Format" | "Structure" => false,
+            // Asides' "Set aside" / "Send to the graveyard" act on the document
+            // selection, so they stay editor-scoped like Format/Structure —
+            // a chord typed into a field never reaches the document behind it.
+            "Format" | "Structure" | "Asides" => false,
             "Edit" => matches!(self.label, "Find in Document" | "Find and Replace"),
             "Margin & AI" => self.label != "Add Margin Note",
             // File, View, History, Session, Help.
@@ -198,6 +201,29 @@ pub fn all() -> &'static [Command] {
             ToggleOutline,
             ["headings", "beats", "оглавление", "план", "структура"]
         ),
+        // Asides (docs/asides.md): the compost is the writer's deliberate scrap
+        // box; the graveyard is the automatic record of cuts.
+        cmd!(
+            "Set Aside",
+            "Asides",
+            Some("ctrl-shift-a"),
+            SetAside,
+            ["compost", "park", "shelf", "отложить", "компост"]
+        ),
+        cmd!(
+            "Send to the Graveyard",
+            "Asides",
+            None,
+            SendToGraveyard,
+            ["cut", "delete to graveyard", "в могилу", "вырезать"]
+        ),
+        cmd!(
+            "Toggle Graveyard",
+            "View",
+            Some("ctrl-alt-g"),
+            ToggleGraveyard,
+            ["cuts", "restore cut", "put back", "кладбище", "могила"]
+        ),
         cmd!(
             "Run Editorial Diagnosis",
             "Margin & AI",
@@ -271,12 +297,22 @@ pub fn all() -> &'static [Command] {
             CancelAiRun,
             ["stop", "отменить"]
         ),
+        // ctrl-alt-h and the titlebar clock open the STRIP (P1, the new first
+        // history surface). The right-side panel lives on as its own palette
+        // verb; the strip and the panel never open together.
         cmd!(
-            "Toggle History & Rewind",
+            "History",
             "History",
             Some("ctrl-alt-h"),
+            ToggleStrip,
+            ["timeline", "strip", "rewind", "scrub", "история", "лента"]
+        ),
+        cmd!(
+            "History panel",
+            "History",
+            None,
             ToggleHistory,
-            ["versions", "rewind", "история", "версии"]
+            ["versions", "rewind", "sidebar", "checkpoints", "версии", "панель истории"]
         ),
         cmd!(
             "Name a Checkpoint",
@@ -285,22 +321,15 @@ pub fn all() -> &'static [Command] {
             AddCheckpoint,
             ["snapshot", "version", "чекпоинт"]
         ),
-        // The finish-your-story layer (DESIGN §4): per-session progress
-        // and the close-time if-then ritual. Scaffolds prompt at CLOSE,
-        // never at open (§4b tension 6) — both are pull-only.
+        // The finish-your-story layer (DESIGN §4): per-session progress.
+        // Scaffolds prompt at CLOSE, never at open (§4b tension 6) — pull-only.
+        // (The re-entry intent question / End Session was retired: impl 04 §1.)
         cmd!(
             "Set Session Goal…",
             "Session",
             None,
             SetSessionGoal,
             ["words", "target", "progress", "цель", "норма слов"]
-        ),
-        cmd!(
-            "End Session…",
-            "Session",
-            None,
-            EndSession,
-            ["quit", "next session", "intent", "закончить сессию", "намерение"]
         ),
         cmd!(
             "Open Command Palette",
@@ -529,11 +558,12 @@ mod tests {
             "Find in Document",
             "Find and Replace",
             "Run Editorial Diagnosis",
-            "Toggle History & Rewind",
+            "History",
+            "History panel",
             "Toggle Outline",
             "Set Up AI Provider…",
             "New Document",
-            "End Session…",
+            "Set Session Goal…",
         ] {
             assert!(by_label(l).global(), "{l} should be global");
         }

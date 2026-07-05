@@ -77,6 +77,49 @@ Write in the language of the manuscript."
         .to_owned()
 }
 
+/// The believing game's mirror (impl 04 §0, review H34): the strongest case
+/// AGAINST the draft, named the same disciplined way — quoted, mechanism-first,
+/// as questions to the author, never rewrites. Form-NEUTRAL by mandate: no
+/// form primitive exists yet, so it must not assert the piece is an "argument"
+/// (a novelist opening this row would meet a thesis her manuscript doesn't
+/// have). It mirrors `believing_system_prompt`'s shape exactly — a small fixed
+/// set of levels, max 5, scarcity as the credibility signal — and returns the
+/// SAME parse format, so `to_annotations` anchors it unchanged. The level words
+/// are deliberately NOT "developmental"/"copy": those two drive the altitude
+/// gate (`suppressed_copy`), and a doubting card is a whole-piece objection,
+/// not a copy nit — it should surface like any open diagnosis, never be held
+/// back under a developmental one.
+pub fn doubting_system_prompt() -> String {
+    "You are playing the doubting game — Peter Elbow's disciplined opposite of \
+the believing game. Your only job is to build the strongest honest case \
+AGAINST this draft on its own terms: where a fair, attentive reader stops \
+trusting it, loses the thread, or puts it down. You are diagnosing weakness, \
+not scoring quality, and never rewriting. Report reader experience (\"I \
+stopped believing at...\", \"my attention slid off here...\"), never verdicts \
+or fixes.\n\
+Respond with ONLY a JSON array, no prose, no markdown fences:\n\
+[{\"quote\": \"exact verbatim excerpt, under 120 characters\", \"problem\": \
+\"the named weakness kind + what gives way\", \"query\": \"one sentence: the \
+MECHANISM (what it does to the reader and why it costs trust), asked as a \
+question that presupposes the author's competence — never replacement text\", \
+\"level\": \"doubt|weakest|flat|unearned\"}]\n\
+Exactly these kinds: 2-3 items of level \"doubt\" (a specific place a \
+skeptical reader pushes back, named with a craft term); exactly 1 of level \
+\"weakest\" (the single most load-bearing weakness — the one thing most \
+likely to make the piece fail on its OWN terms, which may NOT be the obvious \
+flaw); at most 1 of level \"flat\" (the single sentence where the piece goes \
+inert and the reader disengages); at most 1 of level \"unearned\" (something \
+the piece assumes or asserts but has not yet earned, asked as a question). \
+Maximum 5 items total.\n\
+RULES: every item must contain a verbatim quote. This is the DOUBTING game — \
+find fault honestly, but voice is never a defect: never flag rhythm, register, \
+or unusual phrasing unless it fails the author's own apparent intent. Advice \
+verbs (cut, add, rewrite, change, consider) are BANNED — objections and \
+questions only. If the piece is strong, return fewer, truer doubts — scarcity \
+is the credibility signal. Write in the language of the manuscript."
+        .to_owned()
+}
+
 pub fn user_prompt(text: &str) -> String {
     format!("The manuscript:\n\n{text}")
 }
@@ -175,6 +218,26 @@ mod tests {
         assert!(p.contains("BANNED"));
         assert!(p.contains("center of gravity"));
         assert!(p.contains("JSON array"));
+    }
+
+    #[test]
+    fn doubting_prompt_mirrors_believing_form_neutrally() {
+        let p = doubting_system_prompt();
+        // The doubting game, its own discipline (not the believing one).
+        assert!(p.contains("doubting game"));
+        assert!(p.contains("case AGAINST"));
+        // Form-neutral (review H34): never asserts the piece is an "argument".
+        assert!(!p.to_lowercase().contains("argument"));
+        // Same parser contract as believing: JSON array of quote/level items,
+        // advice verbs banned (queries, not rewrites), voice never a defect.
+        assert!(p.contains("JSON array"));
+        assert!(p.contains("BANNED"));
+        assert!(p.contains("voice is never a defect"));
+        // Its level words avoid the altitude-gate strings so a doubting card
+        // is never held back as "copy" under a "developmental" one.
+        assert!(p.contains("doubt|weakest|flat|unearned"));
+        assert!(!p.contains("developmental"));
+        assert!(!p.contains("\"copy\""));
     }
 
     #[test]
