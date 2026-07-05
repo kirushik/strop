@@ -1763,7 +1763,7 @@ manuscript opens here");
         let history = History::default();
         let notes = Annotations::default();
         let mut graveyard = Graveyard::default();
-        graveyard.file("a cut sentence".into(), "origin".into(), 6, 111);
+        graveyard.file("a cut sentence".into(), "origin".into(), 6, 111, SpanSet::default(), Vec::new());
 
         store
             .save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &graveyard)
