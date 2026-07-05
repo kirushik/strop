@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::buffer::TextOp;
 use crate::document::{Annotations, BlockKind, BlockMap, History, InlineAttr, SpanSet};
+use crate::journal::{EditRun, Journal, JournalEvent};
 
 const TEXT_CONTAINER: &str = "content";
 const BLOCKS_CONTAINER: &str = "blocks";
@@ -24,6 +25,13 @@ const SESSION_CONTAINER: &str = "session";
 const ANNOTATIONS_CONTAINER: &str = "annotations";
 const CHECKPOINTS_CONTAINER: &str = "checkpoints";
 const ASSETS_CONTAINER: &str = "assets";
+// The journal persists as LISTS, not as re-inserted JSON blobs: a blob that
+// changes every edit misses its fingerprint on every save and rewrites into
+// the append-only oplog forever (the 4.8 MB class). List pushes append only
+// the new items — and a list's current value survives shallow compaction as
+// state, exactly like checkpoints do.
+const JOURNAL_RUNS_CONTAINER: &str = "journal.runs";
+const JOURNAL_EVENTS_CONTAINER: &str = "journal.events";
 
 /// Everything a reopened document restores.
 pub struct Loaded {
@@ -32,6 +40,7 @@ pub struct Loaded {
     pub blocks: BlockMap,
     pub history: Option<History>,
     pub annotations: Annotations,
+    pub journal: Journal,
 }
 
 /// A named version snapshot. Lives inside the .strop file — Google-Docs
@@ -225,6 +234,30 @@ fn checkpoints_of(doc: &LoroDoc) -> Vec<Checkpoint> {
         .collect()
 }
 
+/// The persisted journal of `doc`: two append-only lists, one JSON item per
+/// settled run/event. Damaged items are skipped, never trusted into a panic.
+fn journal_of(doc: &LoroDoc) -> Journal {
+    let parse_list = |name: &str| -> Vec<String> {
+        let list = doc.get_list(name);
+        (0..list.len())
+            .filter_map(|i| list.get(i))
+            .filter_map(|v| match v.into_value() {
+                Ok(LoroValue::String(json)) => Some(json.to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let runs: Vec<EditRun> = parse_list(JOURNAL_RUNS_CONTAINER)
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect();
+    let events: Vec<JournalEvent> = parse_list(JOURNAL_EVENTS_CONTAINER)
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect();
+    Journal::from_parts(runs, events)
+}
+
 /// Legacy-marks reader (spans persist as JSON now; see `read_state_of`).
 fn attr_from(key: &str, value: &LoroValue) -> Option<InlineAttr> {
     if matches!(value, LoroValue::Null | LoroValue::Bool(false)) {
@@ -272,6 +305,10 @@ pub struct Store {
     /// 5.7 KB of prose). Now each piece writes only when its content
     /// actually changed.
     saved: std::cell::RefCell<SavedHashes>,
+    /// Journal items already pushed to the list containers (runs, events):
+    /// a save appends only the tail past these counts. Seeded from the file
+    /// at open; a fresh document starts at zero.
+    journal_saved: std::cell::RefCell<(usize, usize)>,
 }
 
 /// See `Store::saved`. Zeroes mean "unknown" — the next save writes.
@@ -330,8 +367,16 @@ impl Store {
             Ok(bytes) => {
                 doc.import(&bytes).map_err(io::Error::other)?;
                 let doc = compact_on_open(doc, &bytes, &path);
-                let store = Self { doc, path, saved: Default::default() };
+                let store = Self {
+                    doc,
+                    path,
+                    saved: Default::default(),
+                    journal_saved: Default::default(),
+                };
                 let (text, spans, blocks) = store.read_state();
+                let journal = journal_of(&store.doc);
+                *store.journal_saved.borrow_mut() =
+                    (journal.runs.len(), journal.events.len());
                 let history = match store.doc.get_map(SESSION_CONTAINER).get("history") {
                     Some(v) => match v.into_value() {
                         Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
@@ -381,12 +426,19 @@ impl Store {
                         blocks,
                         history,
                         annotations,
+                        journal,
                     }),
                 ))
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Ok((Self { doc, path, saved: Default::default() }, None))
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((
+                Self {
+                    doc,
+                    path,
+                    saved: Default::default(),
+                    journal_saved: Default::default(),
+                },
+                None,
+            )),
             Err(e) => Err(e),
         }
     }
@@ -632,7 +684,38 @@ impl Store {
         blocks: &BlockMap,
         history: &History,
         annotations: &Annotations,
+        journal: &Journal,
     ) -> io::Result<()> {
+        // Journal: push only the tail past what the file already holds.
+        // Callers settle the journal before saving, so every pushed item is
+        // final — the containers stay strictly append-only (no rewrites, no
+        // fingerprint needed).
+        {
+            let mut jsaved = self.journal_saved.borrow_mut();
+            let runs = self.doc.get_list(JOURNAL_RUNS_CONTAINER);
+            for run in &journal.runs[jsaved.0.min(journal.runs.len())..] {
+                match serde_json::to_string(run) {
+                    Ok(json) => {
+                        if let Err(e) = runs.push(json) {
+                            eprintln!("strop: persist journal run: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("strop: encode journal run: {e}"),
+                }
+            }
+            let events = self.doc.get_list(JOURNAL_EVENTS_CONTAINER);
+            for ev in &journal.events[jsaved.1.min(journal.events.len())..] {
+                match serde_json::to_string(ev) {
+                    Ok(json) => {
+                        if let Err(e) = events.push(json) {
+                            eprintln!("strop: persist journal event: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("strop: encode journal event: {e}"),
+                }
+            }
+            *jsaved = (journal.runs.len(), journal.events.len());
+        }
         let mut saved = self.saved.borrow_mut();
         match serde_json::to_string(annotations) {
             Ok(json) => {
@@ -859,10 +942,10 @@ mod tests {
         let mut notes = Annotations::default();
         notes.add(0..5, "заметка".into(), 0);
 
-        store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+        store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default()).unwrap();
         let first = fs::metadata(&path).unwrap().len();
         for _ in 0..5 {
-            store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+            store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default()).unwrap();
         }
         let after_idle = fs::metadata(&path).unwrap().len();
         assert_eq!(after_idle, first, "unchanged saves must not grow the file");
@@ -878,6 +961,7 @@ mod tests {
                 &loaded.blocks,
                 &loaded.history.clone().unwrap_or_default(),
                 &loaded.annotations,
+                &Journal::default(),
             )
             .unwrap();
         assert_eq!(
@@ -895,10 +979,87 @@ mod tests {
                 &loaded.blocks,
                 &loaded.history.unwrap_or_default(),
                 &notes2,
+                &Journal::default(),
             )
             .unwrap();
         let (_, reloaded) = Store::open(&path).unwrap();
         assert_eq!(reloaded.unwrap().annotations.open().count(), 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The journal roundtrips: settled runs and events survive reopen in
+    /// order, an unchanged journal appends nothing (the containers are
+    /// strictly append-only — same bloat class as the guards above), and a
+    /// new tail appends only itself.
+    #[test]
+    fn journal_persists_appends_only_the_tail() {
+        use crate::journal::{EditRun, JournalEvent};
+        let path = temp_path("journal");
+        let _ = fs::remove_file(&path);
+
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("ночной паром");
+        let spans = SpanSet::default();
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Paragraph]);
+        let history = History::default();
+        let notes = Annotations::default();
+
+        let mut journal = Journal::default();
+        journal.record(
+            &TextOp {
+                pos: 0,
+                delete: 0,
+                insert: "паром".into(),
+            },
+            1_000,
+        );
+        journal.settle();
+        journal.record_event(JournalEvent::Pass {
+            t: 2_000,
+            mode: "developmental".into(),
+            cards: 3,
+        });
+        store
+            .save_with_state(&spans, &blocks, &history, &notes, &journal)
+            .unwrap();
+        let first = fs::metadata(&path).unwrap().len();
+
+        // Unchanged journal: append nothing.
+        for _ in 0..4 {
+            store
+                .save_with_state(&spans, &blocks, &history, &notes, &journal)
+                .unwrap();
+        }
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            first,
+            "an unchanged journal must not grow the file"
+        );
+
+        // Reopen: the journal survives, in order, tail closed.
+        drop(store);
+        let (store, loaded) = Store::open(&path).unwrap();
+        let mut journal = loaded.unwrap().journal;
+        assert_eq!(journal.runs.len(), 1);
+        assert_eq!(journal.runs[0].ins, "паром");
+        assert_eq!(journal.events.len(), 1);
+
+        // A new tail appends only itself (counters seeded from the file).
+        journal.runs.push(EditRun {
+            t0: 3_000,
+            t1: 3_100,
+            pos: 5,
+            del_chars: 0,
+            ins: " идёт".into(),
+        });
+        store
+            .save_with_state(&spans, &blocks, &history, &notes, &journal)
+            .unwrap();
+        let (_, reloaded) = Store::open(&path).unwrap();
+        let journal = reloaded.unwrap().journal;
+        assert_eq!(journal.runs.len(), 2, "the tail landed once, not twice");
+        assert_eq!(journal.runs[1].ins, " идёт");
 
         let _ = fs::remove_file(&path);
     }
@@ -932,11 +1093,11 @@ mod tests {
             }
             let mut notes = Annotations::default();
             notes.add(0..5, body, 0);
-            store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+            store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default()).unwrap();
         }
         let mut notes = Annotations::default();
         notes.add(0..5, "финальная заметка".into(), 0);
-        store.save_with_state(&spans, &blocks, &history, &notes).unwrap();
+        store.save_with_state(&spans, &blocks, &history, &notes, &Journal::default()).unwrap();
         let bloated = fs::metadata(&path).unwrap().len() as usize;
         assert!(bloated > COMPACT_MIN_BYTES, "fixture must be bloated (got {bloated})");
         drop(store);
@@ -1068,6 +1229,7 @@ mod tests {
                 &BlockMap::from_kinds(vec![crate::document::BlockKind::Paragraph]),
                 &History::default(),
                 &Annotations::default(),
+                &Journal::default(),
             )
             .unwrap();
         store.add_checkpoint_if_changed("bolded", false);
@@ -1160,6 +1322,7 @@ mod tests {
                 &blocks,
                 &History::default(),
                 &Annotations::default(),
+                &Journal::default(),
             )
             .unwrap();
         assert!(store.get_asset(&kept_id).is_some(), "referenced asset kept");
@@ -1199,6 +1362,7 @@ mod tests {
                 &live,
                 &History::default(),
                 &Annotations::default(),
+                &Journal::default(),
             )
             .unwrap();
         store.add_checkpoint("with image", true);
@@ -1214,6 +1378,7 @@ mod tests {
                 &no_image,
                 &History::default(),
                 &Annotations::default(),
+                &Journal::default(),
             )
             .unwrap();
         assert!(
@@ -1246,6 +1411,7 @@ mod tests {
                 &blocks,
                 &History::default(),
                 &Annotations::default(),
+                &Journal::default(),
             )
             .unwrap();
         let (_s2, loaded) = Store::open(&path).unwrap();
@@ -1280,6 +1446,7 @@ mod tests {
                 &blocks,
                 &History::default(),
                 &Annotations::default(),
+                &Journal::default(),
             )
             .unwrap();
         let (_s2, loaded) = Store::open(&path).unwrap();
@@ -1329,7 +1496,7 @@ mod tests {
         spans.add(9..12, InlineAttr::Code);
         spans.add(2..4, InlineAttr::Link("https://e.x".into()));
         store
-            .save_with_state(&spans, &BlockMap::new(1), &History::default(), &Annotations::default())
+            .save_with_state(&spans, &BlockMap::new(1), &History::default(), &Annotations::default(), &Journal::default())
             .unwrap();
 
         let (_s2, existing) = Store::open(&path).unwrap();
@@ -1369,6 +1536,7 @@ mod tests {
                 doc.blocks(),
                 &doc.export_history(200),
                 doc.notes(),
+                &Journal::default(),
             )
             .unwrap();
 
@@ -1417,7 +1585,7 @@ mod tests {
         store.apply(&doc.take_ops());
         doc.set_note_body_draft(id, "half-typed thought".into());
         store
-            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200), doc.notes())
+            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200), doc.notes(), &Journal::default())
             .unwrap();
 
         // The uncommitted draft is on disk after reload.

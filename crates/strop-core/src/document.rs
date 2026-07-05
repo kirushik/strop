@@ -15,7 +15,7 @@ use crate::buffer::{Buffer, TextOp, Transaction};
 /// block-map split count always agrees with `Rope::len_lines()`: CRLF counts
 /// as one break, and CR / VT / FF / NEL / U+2028 / U+2029 all count — unlike a
 /// plain '\n' scan, which a paste of classic-Mac or PDF-copied text defeats.
-fn count_line_breaks(text: &str) -> usize {
+pub(crate) fn count_line_breaks(text: &str) -> usize {
     // Fast path for the hot edit case (typing non-break chars): only build a
     // throwaway Rope — the price of ropey's exact CRLF-as-one / CR / VT / FF /
     // NEL / U+2028 / U+2029 counting — when a line-break char is actually
@@ -560,6 +560,11 @@ pub struct Document {
     undo_states: Vec<(SpanSet, BlockMap, Annotations)>,
     redo_states: Vec<(SpanSet, BlockMap, Annotations)>,
     pending_ops: Vec<TextOp>,
+    /// The edit-run record (docs/impl/00-journal.md). Fed at the op drains —
+    /// absorb, undo, redo — so every text mutation is journaled with a wall
+    /// clock, including inverse edits. Wholesale swaps (restore) pause it
+    /// and record their honest event instead.
+    journal: crate::journal::Journal,
     /// Monotonic counter bumped by every layout-affecting mutation (text,
     /// spans, blocks, note ranges). The view caches its laid-out frame keyed
     /// on this, so a scroll/blink/caret-move with an unchanged document reuses
@@ -645,11 +650,29 @@ impl Document {
 
     fn absorb_buffer_ops(&mut self) {
         let ops = self.buffer.take_ops();
+        let now = crate::journal::now_ms();
         for op in &ops {
             self.spans.apply_op(op);
             self.notes.apply_op(op);
+            self.journal.record(op, now);
         }
         self.pending_ops.extend(ops);
+    }
+
+    pub fn journal(&self) -> &crate::journal::Journal {
+        &self.journal
+    }
+
+    /// Mutable for event recording (passes, card closures, restores) and
+    /// pre-save settling. Journal changes never affect layout — no
+    /// `revision` bump.
+    pub fn journal_mut(&mut self) -> &mut crate::journal::Journal {
+        &mut self.journal
+    }
+
+    /// Install the persisted journal at load (like `set_notes`).
+    pub fn set_journal(&mut self, journal: crate::journal::Journal) {
+        self.journal = journal;
     }
 
     /// (block containing the edit start, line breaks deleted) — computed
@@ -828,7 +851,14 @@ impl Document {
         }
         // Buffer inverse ops still mirror to the store, but must NOT be
         // re-applied to spans/blocks (the snapshot is the correct state).
-        self.pending_ops.extend(self.buffer.take_ops());
+        // They DO journal — an undo is an honest edit and the envelope
+        // visibly steps back.
+        let ops = self.buffer.take_ops();
+        let now = crate::journal::now_ms();
+        for op in &ops {
+            self.journal.record(op, now);
+        }
+        self.pending_ops.extend(ops);
         Some(cursor)
     }
 
@@ -842,7 +872,12 @@ impl Document {
                 std::mem::replace(&mut self.notes, notes),
             ));
         }
-        self.pending_ops.extend(self.buffer.take_ops());
+        let ops = self.buffer.take_ops();
+        let now = crate::journal::now_ms();
+        for op in &ops {
+            self.journal.record(op, now);
+        }
+        self.pending_ops.extend(ops);
         Some(cursor)
     }
 
@@ -862,11 +897,15 @@ impl Document {
         reanchored.reanchor(&old_text, text);
 
         let len = self.buffer.len_bytes();
+        // The wholesale swap must not journal as one document-sized run;
+        // the caller records the honest Restore event instead.
+        self.journal.pause();
         if self.buffer.edit_bytes(0..len, text) {
             self.undo_states.push(snapshot);
             self.redo_states.clear();
         }
         self.absorb_buffer_ops();
+        self.journal.resume();
         // The wholesale text op mangled span/block/note adjustment; the
         // restored state and the content-based re-anchoring are authoritative.
         self.spans = spans;

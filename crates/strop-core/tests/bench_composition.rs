@@ -27,7 +27,7 @@ fn bench_file_composition() {
     let hist = loaded.history.clone().unwrap_or_default();
     for i in 0..3 {
         store
-            .save_with_state(&loaded.spans, &loaded.blocks, &hist, &loaded.annotations)
+            .save_with_state(&loaded.spans, &loaded.blocks, &hist, &loaded.annotations, &strop_core::journal::Journal::default())
             .unwrap();
         let now = std::fs::metadata(&path).unwrap().len();
         eprintln!("after no-change save {i}: {:>9} bytes (+{})", now, now as i64 - disk as i64);
