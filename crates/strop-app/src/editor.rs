@@ -760,6 +760,100 @@ fn face_for(i: &FaceInputs) -> EditorFace {
     }
 }
 
+/// The gutter-float grid's fixed width (docs/impl/03-flanks.md §0.1): wide
+/// enough for two toggle columns AND the three-wide heading block row. The
+/// gutter-fit threshold keys off it (finding 90 — recomputed for the 2-column
+/// grid, wider than the old 1×N stack), so a window whose left gutter can't hold
+/// it falls back to the formatting-only horizontal popover instead.
+const FLANK_GRID_W: f32 = 100.;
+/// Estimated grid height (six rows + two seams), to keep the float on-screen.
+const FLANK_GRID_H: f32 = 210.;
+
+/// A right-flank verb (docs/impl/03-flanks.md §0.2). Carried by value into the
+/// row's click listener so the four rows share one dispatch, each routing to an
+/// existing path — note composer, the P2 aside/graveyard verbs, the scoped ask.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelVerb {
+    Note,
+    Aside,
+    Graveyard,
+    Ask,
+}
+
+/// The LEFT (formatting) flank's form (docs/impl/03-flanks.md §1, review H21).
+/// It always rises for a live selection — only its shape narrows: the closed-set
+/// grid in a real gutter, the formatting-only horizontal popover where the
+/// window is too narrow to float one (the verbs stay palette-reachable there).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlankLeft {
+    /// Suppressed — a history surface is up (the past is read-only, review H22).
+    None,
+    /// The closed-set grid, floating in the left gutter (the resting form).
+    Grid,
+    /// The formatting-only horizontal popover above the line (narrow fallback).
+    Horizontal,
+}
+
+/// Which flanks rise, as one decision (docs/impl/03-flanks.md §1-2). Both are a
+/// consequence of chirality: tools left, the conversation right (asides.md §4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FlankGate {
+    left: FlankLeft,
+    /// The right verb menu. Manuscript-only, needs a live lane, no history —
+    /// see `flank_gate`.
+    right: bool,
+}
+
+/// The single gating predicate (docs/impl/03-flanks.md §1-2, reviews H21/H22/B8,
+/// findings 57/91/108). Pure over booleans so the test sweeps every
+/// region × history × width case without a live frame.
+fn flank_gate(history_up: bool, in_compost: bool, lane_available: bool, gutter_ok: bool) -> FlankGate {
+    if history_up {
+        // A history surface claims the right side AND the past is not editable —
+        // neither flank may offer live mutation over a read-only state (H22).
+        return FlankGate {
+            left: FlankLeft::None,
+            right: false,
+        };
+    }
+    FlankGate {
+        // The formatting flank always rises; only its FORM narrows.
+        left: if gutter_ok { FlankLeft::Grid } else { FlankLeft::Horizontal },
+        // The verb menu needs the right lane to occlude into (B8) and is
+        // MANUSCRIPT-only — a compost-rail selection is the writer's private
+        // scrap box, no verb menu (spec §1, finding 108). Its fallback keys on
+        // the LANE's own fit (`margin_fits`), never the left gutter (finding 57):
+        // there is a width band where the gutter is gone but the lane remains,
+        // and vice versa.
+        right: lane_available && !in_compost,
+    }
+}
+
+/// The per-frame flank geometry + gating, computed once (`flank_layout`) so the
+/// left popover, the right menu, and the rig dump all agree on presence and y.
+/// The two y bases differ ON PURPOSE (review finding 89): `left_top` co-registers
+/// with the prose column (CSD-corrected content space), `right_top` co-registers
+/// with the margin CARDS (raw frame y, no inset) — sharing one would drift the
+/// menu a gutter (22px) off the cards it means to occlude on floating windows.
+struct FlankLayout {
+    gate: FlankGate,
+    /// Content-space top of the selection's first visual line — the LEFT flank.
+    left_top: f32,
+    /// LANE-space top (raw frame y) — the RIGHT menu, co-registered with cards.
+    right_top: f32,
+    line_h: f32,
+    /// Caret x within its line (for centring the horizontal fallback).
+    x: f32,
+    /// The prose column's left edge, content space.
+    col_left: f32,
+    /// Width the flanks live in (viewport minus CSD gutters) and its height.
+    vw: f32,
+    vh: f32,
+    outline_w: f32,
+    /// The note lane's left edge, content space (the right menu pins here).
+    lane_left: f32,
+}
+
 pub struct Editor {
     focus_handle: FocusHandle,
     /// Text + formatting with unified transaction history. Marks persist
@@ -945,6 +1039,15 @@ pub struct Editor {
     /// selection. Shown on mouse-up over a selection or via ctrl-.;
     /// dismissed by mousedown, typing, scrolling, or escape.
     selection_popover: bool,
+    /// The left flank's link argument-field (docs/impl/03-flanks.md §0.1,
+    /// review B2 + findings 59/88): the URL editor opened from the grid's link
+    /// cell. It CAPTURES the target CHAR range at open — never a re-read of
+    /// `selected_range` at commit, which could have drifted (Link is
+    /// non-expanding, `expands()` == false). While it is `Some` the field owns
+    /// the flank and keyboard focus, so "typing dismisses" (an EDITOR-focus rule)
+    /// can't fire over the URL; commit applies `doc.set_link`, an empty commit
+    /// removes the link.
+    link_input: Option<(Range<usize>, Entity<TextField>)>,
     /// Titlebar word count, recomputed on mutation — never per frame.
     word_count: usize,
     /// Outline rail (DESIGN §1.6): toggleable left rail of headings,
@@ -1312,6 +1415,7 @@ impl Editor {
             narrow_notes_open: false,
             editor_menu_open: false,
             selection_popover: false,
+            link_input: None,
             outline_open: false,
             graveyard_open: false,
             last_manuscript_caret: 0,
@@ -4695,6 +4799,75 @@ impl Editor {
         cx.notify();
     }
 
+    /// Open the left flank's link argument-field (docs/impl/03-flanks.md §0.1).
+    /// CAPTURES the selection's CHAR range now and applies to THAT on commit —
+    /// never a re-read of `selected_range`, which could drift (Link doesn't
+    /// expand under the caret). Pre-filled from the current target so editing a
+    /// link shows it. The rename-input idiom: Enter commits, Esc cancels, a
+    /// click-away blur commits (`commit_field_on_blur`).
+    fn open_link_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Read-only while previewing the past (mirrors toggle_span).
+        if self.history_view.is_some() || self.strip.is_parked() || self.selected_range.is_empty() {
+            return;
+        }
+        let rope = self.doc.rope();
+        let range = rope.byte_to_char(self.selected_range.start)
+            ..rope.byte_to_char(self.selected_range.end);
+        let seed = self.doc.link_over(range.clone()).unwrap_or_default();
+        let input = cx.new(|cx| TextField::single(cx, seed));
+        cx.subscribe_in(
+            &input,
+            window,
+            move |editor, _, event: &TextFieldEvent, window, cx| match event {
+                TextFieldEvent::Commit(url) => editor.commit_link(url.clone(), window, cx),
+                TextFieldEvent::Cancel => editor.cancel_link(window, cx),
+            },
+        )
+        .detach();
+        // Blur commits (e.g. the palette steals focus): `still` re-checks the
+        // field is the one open, so a stale handle never double-commits.
+        self.commit_field_on_blur(&input, window, cx, |e| {
+            e.link_input.as_ref().map(|(_, f)| f.clone())
+        });
+        let handle = input.read(cx).focus_handle.clone();
+        window.focus(&handle, cx);
+        self.link_input = Some((range, input));
+        cx.notify();
+    }
+
+    /// Commit the link over its CAPTURED range: a non-empty URL sets it, an empty
+    /// one removes it (spec §0.1). Focus returns to the document; the flank stays
+    /// up so the writer can apply another mark.
+    fn commit_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((range, _)) = self.link_input.take() else {
+            return;
+        };
+        let url = url.trim().to_owned();
+        self.doc
+            .set_link(range, if url.is_empty() { None } else { Some(url) });
+        self.mark_dirty();
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Esc from the link field cancels just the argument and returns to the flank
+    /// (the two-level Esc, finding 59) — the selection and popover stay.
+    fn cancel_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_input = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Tear down BOTH flanks (review H20): acting on any right-menu row clears
+    /// them before its result (a composer card, a pass, an aside) takes the lane,
+    /// so only one pinned object ever sits at the selection's y. Also drops a
+    /// half-typed link argument.
+    fn dismiss_flanks(&mut self, cx: &mut Context<Self>) {
+        self.selection_popover = false;
+        self.link_input = None;
+        cx.notify();
+    }
+
     /// Start the cursor-blink heartbeat. GNOME-style: solid while typing,
     /// blinking when idle, solid again (and quiet — no repaints) after 10s.
     ///
@@ -5483,6 +5656,13 @@ impl Editor {
         if self.editor_menu_open {
             self.editor_menu_open = false;
             cx.notify();
+            return;
+        }
+        // The link argument-field is the innermost flank layer (finding 59's
+        // two-level Esc): its own FieldCancel handles Esc while it holds focus;
+        // this covers the edge case where the editor has focus with a field open.
+        if self.link_input.is_some() {
+            self.cancel_link(window, cx);
             return;
         }
         if self.selection_popover {
@@ -6623,6 +6803,11 @@ impl Editor {
             window.focus(&self.focus_handle, cx);
             cx.notify();
         }
+        // A click outside the flank commits its open link argument-field before
+        // the popover itself is dismissed, so the URL lands (spec §0.1).
+        if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
+            self.commit_link(url, window, cx);
+        }
         if self.selection_popover {
             self.selection_popover = false;
             cx.notify();
@@ -6638,6 +6823,14 @@ impl Editor {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A live link argument-field commits like every other single-line field
+        // when the writer clicks away into the document (spec §0.1). Done up
+        // front so even the early-return paths below (lane click, footnote jump)
+        // don't strand it; the flank's own chrome stops propagation, so a click
+        // that reaches here is genuinely outside it.
+        if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
+            self.commit_link(url, window, cx);
+        }
         // A click in the right note lane is NOT a document click — the lane's
         // own cards and pills handle it. The lane is a sibling element painted
         // over this (full-width) column, so a card/pill's stop_propagation
@@ -6883,6 +7076,7 @@ impl Editor {
         fields.extend(self.focus.input().cloned());
         fields.extend(self.rename_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.alt_input.as_ref().map(|(_, i)| i.clone()));
+        fields.extend(self.link_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.goal_input.clone());
         let focused_field = fields
             .iter()
@@ -6986,6 +7180,16 @@ impl Editor {
             "grave_entries": self.doc.graveyard().len(),
             "graveyard_open": self.graveyard_open,
             "manuscript_words": self.manuscript_word_count(),
+            // The selection flanks (docs/impl/03-flanks.md §3): presence of each
+            // (`left` false only under a history surface; `right` false for a
+            // compost-rail selection or a narrow lane) and the lane `y` the right
+            // menu pins to. `null` when there's no live selection to flank.
+            "flanks": self.flank_layout(window).map(|l| serde_json::json!({
+                "left": !matches!(l.gate.left, FlankLeft::None),
+                "right": l.gate.right,
+                "link": self.link_input.is_some(),
+                "y": l.right_top,
+            })),
         })
         .to_string()
     }
@@ -7081,6 +7285,22 @@ impl Editor {
         let end = self.doc.len_bytes();
         self.selected_range = start..end;
         self.send_to_graveyard(&SendToGraveyard, window, cx);
+        cx.notify();
+    }
+
+    /// Rig hook (`select:para`, docs/impl/03-flanks.md §3): select the caret's
+    /// paragraph deterministically AND raise the popover — programmatic selection
+    /// alone never sets `selection_popover` (only mouse-up does), so without this
+    /// the flanks would never render for the dump to observe (finding 117).
+    pub fn debug_select_para(&mut self, cx: &mut Context<Self>) {
+        let (start, end) = self.paragraph_bounds(self.cursor_offset());
+        if start >= end {
+            return;
+        }
+        self.selected_range = start..end;
+        self.selection_reversed = false;
+        self.is_selecting = false;
+        self.selection_popover = true;
         cx.notify();
     }
 
@@ -8899,33 +9119,60 @@ impl Editor {
             )
     }
 
-    /// The selection popover (DESIGN §2-toolbar, Medium lineage): formatting
-    /// rides the selection. An in-surface GPUI overlay — never a Wayland
-    /// xdg_popup (Zed's documented popup fragility under wlroots).
-    /// The formatting tools — inline marks, the heading ladder, footnote — in
-    /// document order, grouped by a divider. `vertical` lays them out as the
-    /// gutter-float's column; otherwise as the fallback popover's row. Same
-    /// buttons either way; only the divider rotates.
-    fn format_tools(&self, vertical: bool, cx: &mut Context<Self>) -> gpui::Div {
-        let divider = || {
-            if vertical {
-                div().h(px(1.)).w(px(18.)).my(px(3.)).bg(rgb(RULE_COLOR))
-            } else {
-                popover_divider()
-            }
+    /// The link cell (docs/impl/03-flanks.md §0.1): the second argument-taker.
+    /// A link has no PT-covered glyph (⤴ would force a font fallback — the
+    /// garbled-glyph bug class), so it draws its own mark: a short LINK_COLOR
+    /// underline bar (blue = link, per the color language). Clicking opens the
+    /// URL argument-field (`open_link_input`) rather than toggling — a link needs
+    /// a target — and the cell lights when the selection already carries one.
+    fn link_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = if self.selected_range.is_empty() {
+            false
+        } else {
+            let rope = self.doc.rope();
+            let range = rope.byte_to_char(self.selected_range.start)
+                ..rope.byte_to_char(self.selected_range.end);
+            self.doc.link_over(range).is_some()
         };
         div()
+            .id("link-mark")
+            .px(px(7.))
+            .py(px(2.))
+            .rounded(px(5.))
+            .cursor(CursorStyle::PointingHand)
+            .when(active, |d| d.bg(rgba(0x1A1A1812u32)))
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .tooltip(tip("Link", None))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    editor.open_link_input(window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(14.))
+                    .child(div().w(px(13.)).h(px(2.)).rounded(px(1.)).bg(rgb(LINK_COLOR))),
+            )
+    }
+
+    /// The FLATTENED formatting set for the narrow horizontal fallback (review
+    /// H21): the whole closed grid on one row — inline marks, the two
+    /// argument-takers (link, footnote), the heading ladder — grouped by
+    /// dividers. The VERBS never join it; they stay palette-reachable. This is
+    /// formatting only, so a window too narrow to float a grid still formats.
+    fn format_tools(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
             .flex()
-            .map(|d| {
-                if vertical {
-                    d.flex_col().items_center().gap(px(1.))
-                } else {
-                    d.items_center().justify_center().gap(px(1.))
-                }
-            })
-            // Group 1 — inline marks.
+            .items_center()
+            .justify_center()
+            .gap(px(1.))
             .child(self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx))
             .child(self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx))
+            .child(self.format_button("U", InlineAttr::Underline, "Underline", Some("ctrl-u"), cx))
             .child(self.format_button(
                 "S",
                 InlineAttr::Strikethrough,
@@ -8933,7 +9180,6 @@ impl Editor {
                 Some("ctrl-shift-x"),
                 cx,
             ))
-            .child(self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx))
             .child(self.format_button(
                 "==",
                 InlineAttr::Highlight,
@@ -8941,46 +9187,115 @@ impl Editor {
                 Some("ctrl-shift-h"),
                 cx,
             ))
-            .child(divider())
-            // Group 2 — headings, the full ladder.
+            .child(self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx))
+            .child(popover_divider())
+            // The two argument-takers.
+            .child(self.link_button(cx))
+            .child(self.footnote_button(cx))
+            .child(popover_divider())
+            // The heading ladder.
             .child(self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx))
             .child(self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx))
             .child(self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx))
-            .child(divider())
-            // Group 3 — footnote.
-            .child(self.footnote_button(cx))
     }
 
-    /// Formatting rides the selection (DESIGN §2-toolbar) — but "the text I'm
-    /// writing is sacred": covering even a sliver of prose with chrome is the
-    /// last resort. So the toolbar floats VERTICALLY in the empty left gutter,
-    /// aligned to the selection's line, never over the words. Only when there
-    /// is no gutter to hold it (a narrow or left-shifted window) does it fall
-    /// back to the horizontal popover that does float above the line.
-    fn render_selection_popover(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        if !self.selection_popover
-            || self.selected_range.is_empty()
-            || self.is_selecting
-            || self.history_view.is_some()
-        {
+    /// The closed-set GRID for the gutter-float (docs/impl/03-flanks.md §0.1,
+    /// asides.md §4: "closed sets pack into grids"). The eight inline attrs in
+    /// two columns — six instant toggles, a hairline SEAM, then the two
+    /// argument-takers (link, footnote) below it: parallel form reserved for
+    /// parallel behaviour (P8). A SECOND seam separates the heading block row.
+    /// Two columns halve pointer travel versus the old 1×N stack (Fitts).
+    fn format_grid(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let seam = || div().h(px(1.)).w_full().my(px(3.)).bg(rgb(RULE_COLOR));
+        // Fixed cells so the two columns align regardless of glyph width.
+        let cell = |el: gpui::AnyElement| {
+            div()
+                .w(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(el)
+        };
+        let row = |a: gpui::AnyElement, b: gpui::AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(cell(a))
+                .child(cell(b))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(2.))
+            .child(row(
+                self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx)
+                    .into_any_element(),
+                self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx)
+                    .into_any_element(),
+            ))
+            .child(row(
+                self.format_button("U", InlineAttr::Underline, "Underline", Some("ctrl-u"), cx)
+                    .into_any_element(),
+                self.format_button(
+                    "S",
+                    InlineAttr::Strikethrough,
+                    "Strikethrough",
+                    Some("ctrl-shift-x"),
+                    cx,
+                )
+                .into_any_element(),
+            ))
+            .child(row(
+                self.format_button("==", InlineAttr::Highlight, "Highlight", Some("ctrl-shift-h"), cx)
+                    .into_any_element(),
+                self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx)
+                    .into_any_element(),
+            ))
+            .child(seam())
+            // The argument-takers, below the first seam.
+            .child(row(
+                self.link_button(cx).into_any_element(),
+                self.footnote_button(cx).into_any_element(),
+            ))
+            .child(seam())
+            // The heading block row: the full ladder on one line under the seam.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .child(cell(
+                        self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx)
+                            .into_any_element(),
+                    ))
+                    .child(cell(
+                        self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx)
+                            .into_any_element(),
+                    ))
+                    .child(cell(
+                        self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx)
+                            .into_any_element(),
+                    )),
+            )
+    }
+
+    /// The per-frame flank geometry + gating (docs/impl/03-flanks.md §1-2).
+    /// `None` when there's no live selection to flank. Computed ONCE so the left
+    /// popover, the right menu, and the rig dump all agree on presence and y.
+    fn flank_layout(&self, window: &Window) -> Option<FlankLayout> {
+        if !self.selection_popover || self.selected_range.is_empty() || self.is_selecting {
             return None;
         }
         let frame = self.last_frame.as_ref()?;
         let (par_ix, line, x) =
             frame.cursor_position(self.selected_range.start.min(frame.doc_len()), false)?;
         let par = &frame.paragraphs[par_ix];
-        // `frame.bounds` are WINDOW-global, but this popover is a child of the
-        // `content` surface, which the CSD shadow gutter insets by `CSD_GUTTER`
-        // on each untiled edge (Linux/Wayland floating windows; server-decorated
-        // platforms inset 0, tiled edges 0). Convert frame coords into content
-        // space by subtracting that inset — the column lane already works in
-        // content space (`column_frame`); the popover read window space and so
-        // landed a gutter too far right, over the text, when the left margin was
-        // tight (the Linux-only overlap). `content_width` is content space too.
+        // CSD insets (the old popover math): the `content` surface the flanks are
+        // children of is inset by the shadow gutter on each untiled edge
+        // (Wayland floating windows; server-decorated platforms and tiled edges
+        // inset 0). Content space = window space minus that inset.
         let (l_inset, t_inset, b_inset) = match window.window_decorations() {
             Decorations::Client { tiling } => (
                 if tiling.left { 0. } else { CSD_GUTTER },
@@ -8989,87 +9304,324 @@ impl Editor {
             ),
             Decorations::Server => (0., 0., 0.),
         };
-        // Content-space top of the selection's first visual line.
-        let line_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
+        // RAW (lane) y of the selection's first visual line — co-registers with
+        // the margin CARDS (which also skip the inset: `margin_cards` uses the
+        // bare `frame.bounds.origin.y + pos.y - scroll_top`). The LEFT flank
+        // subtracts the top inset to co-register with the prose column instead;
+        // sharing one basis would drift the menu a gutter off the cards it
+        // occludes on floating windows (review finding 89).
+        let raw_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
             + f32::from(par.line_height) * line as f32
-            - f32::from(frame.scroll_top)
-            - t_inset;
-        let line_h = f32::from(par.line_height);
-        let vw = self.content_width(window);
-        let vh = f32::from(window.viewport_size().height) - t_inset - b_inset;
+            - f32::from(frame.scroll_top);
         let col_left = f32::from(frame.bounds.origin.x) - l_inset;
         let outline_w = self.outline_width(window);
-
-        // Gutter-float: a vertical toolbar hugging the column's left edge, in
-        // the empty margin. Needs a gutter wide enough to hold it — the note
-        // lane lives on the RIGHT, so the left gutter never collides with a
-        // card. Estimate the stack height to keep it on-screen.
-        const GUTTER_W: f32 = 44.;
-        const GUTTER_TOOLBAR_H: f32 = 252.;
         let left_gutter = col_left - outline_w;
-        if left_gutter >= GUTTER_W + 14. {
-            let top = line_top.clamp(BAR_HEIGHT + 8., (vh - GUTTER_TOOLBAR_H - 8.).max(BAR_HEIGHT + 8.));
-            let left = (col_left - 12. - GUTTER_W).max(outline_w + 6.);
-            return Some(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(top))
-                    .w(px(GUTTER_W))
-                    .bg(rgb(0xFCFAF4))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .rounded(px(8.))
-                    .shadow_md()
-                    .py(px(5.))
-                    .px(px(1.))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .font_family("PT Serif")
-                    .text_size(px(13.))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.format_tools(true, cx)),
-            );
-        }
+        // A history surface (strip open, the panel, or a parked preview) claims
+        // the right side AND freezes a read-only past — suppress both flanks so
+        // neither offers live mutation over it (review H22).
+        let history_up =
+            self.history_view.is_some() || self.strip.open || self.history_preview.is_some();
+        // A compost-rail selection: the manuscript-only verbs don't apply, so the
+        // right menu stands down (spec §1, finding 108); the left flank still
+        // rises (the rail is the writer's text, and it renders as leading
+        // paragraphs in the SAME frame, so its coordinates are in hand).
+        let in_compost = self.doc.aside_boundary().is_some()
+            && self
+                .doc
+                .rope()
+                .byte_to_char(self.selected_range.start.min(self.doc.len_bytes()))
+                < self.doc.manuscript_base_char();
+        let lane_available = self.margin_fits(window);
+        let gutter_ok = left_gutter >= FLANK_GRID_W + 12.;
+        Some(FlankLayout {
+            gate: flank_gate(history_up, in_compost, lane_available, gutter_ok),
+            left_top: raw_top - t_inset,
+            right_top: raw_top,
+            line_h: f32::from(par.line_height),
+            x: f32::from(x),
+            col_left,
+            vw: self.content_width(window),
+            vh: f32::from(window.viewport_size().height) - t_inset - b_inset,
+            outline_w,
+            lane_left: self.column_right(window) + MARGIN_GAP,
+        })
+    }
 
-        // Fallback (narrow / left-shifted window — no gutter): the horizontal
-        // popover above the selection start, dropping below its line when the
-        // titlebar is in the way, clamped on-screen either way.
-        const POPOVER_W: f32 = 300.;
+    /// The LEFT flank (docs/impl/03-flanks.md §0.1). Formatting rides the
+    /// selection (DESIGN §2-toolbar) — but "the text I'm writing is sacred", so
+    /// the closed-set grid floats VERTICALLY in the empty left gutter, never over
+    /// the words. The link argument-field, when open, OWNS the flank; where there
+    /// is no gutter to hold a grid it falls back to the formatting-only
+    /// horizontal popover above the line.
+    fn render_selection_popover(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let layout = self.flank_layout(window)?;
+        // The link argument-field OWNS the flank while open (spec §0.1): a wide
+        // URL field at the selection line — the grid is far too narrow to type a
+        // URL into. The field holds keyboard focus, so "typing dismisses" (an
+        // EDITOR-focus rule) never fires over the URL; Enter commits, Esc cancels.
+        if let Some((_, input)) = &self.link_input {
+            return Some(self.render_link_field(&layout, input.clone()));
+        }
+        match layout.gate.left {
+            FlankLeft::None => None,
+            FlankLeft::Grid => Some(self.render_flank_grid(&layout, cx)),
+            FlankLeft::Horizontal => Some(self.render_flank_horizontal(&layout, cx)),
+        }
+    }
+
+    /// The gutter-float grid (the resting left flank).
+    fn render_flank_grid(&self, layout: &FlankLayout, cx: &mut Context<Self>) -> gpui::Div {
+        let top = layout
+            .left_top
+            .clamp(BAR_HEIGHT + 8., (layout.vh - FLANK_GRID_H - 8.).max(BAR_HEIGHT + 8.));
+        let left = (layout.col_left - 12. - FLANK_GRID_W).max(layout.outline_w + 6.);
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(FLANK_GRID_W))
+            .bg(rgb(0xFCFAF4))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(8.))
+            .shadow_md()
+            .py(px(5.))
+            .px(px(3.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .font_family("PT Serif")
+            .text_size(px(13.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.format_grid(cx))
+    }
+
+    /// The narrow fallback: the FORMATTING-ONLY horizontal popover above the
+    /// selection line (review H21 — the verbs stay palette-reachable, they do
+    /// NOT crowd this row).
+    fn render_flank_horizontal(&self, layout: &FlankLayout, cx: &mut Context<Self>) -> gpui::Div {
+        const POPOVER_W: f32 = 340.;
         const POPOVER_H: f32 = 30.;
-        let left = (col_left + f32::from(x) - POPOVER_W / 2.)
-            .clamp(8., (vw - POPOVER_W - 8.).max(8.));
-        let above = line_top - POPOVER_H - 8.;
+        let left = (layout.col_left + layout.x - POPOVER_W / 2.)
+            .clamp(8., (layout.vw - POPOVER_W - 8.).max(8.));
+        let above = layout.left_top - POPOVER_H - 8.;
         let top = if above >= BAR_HEIGHT + 4. {
             above
         } else {
-            line_top + line_h + 8.
+            layout.left_top + layout.line_h + 8.
         }
-        .clamp(BAR_HEIGHT + 4., vh - POPOVER_H - 8.);
+        .clamp(BAR_HEIGHT + 4., layout.vh - POPOVER_H - 8.);
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(POPOVER_W))
+            .bg(rgb(0xFCFAF4))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(6.))
+            .shadow_md()
+            .px(px(4.))
+            .py(px(3.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .font_family("PT Serif")
+            .text_size(px(13.))
+            // Clicks on the popover chrome must not reach the canvas — they would
+            // collapse the very selection being formatted.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.format_tools(cx))
+    }
+
+    /// The link argument-field popover (spec §0.1): a single-line URL editor at
+    /// the selection line, the rename-input idiom. It stops propagation on its
+    /// own chrome so a click inside never collapses the selection the link needs.
+    fn render_link_field(&self, layout: &FlankLayout, input: Entity<TextField>) -> gpui::Div {
+        const LINK_W: f32 = 320.;
+        const LINK_H: f32 = 34.;
+        let left = (layout.col_left + layout.x - LINK_W / 2.)
+            .clamp(8., (layout.vw - LINK_W - 8.).max(8.));
+        let above = layout.left_top - LINK_H - 8.;
+        let top = if above >= BAR_HEIGHT + 4. {
+            above
+        } else {
+            layout.left_top + layout.line_h + 8.
+        }
+        .clamp(BAR_HEIGHT + 4., layout.vh - LINK_H - 8.);
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(LINK_W))
+            .bg(rgb(0xFCFAF4))
+            .border_1()
+            .border_color(rgb(RULE_COLOR))
+            .rounded(px(6.))
+            .shadow_md()
+            .px(px(8.))
+            .py(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .font_family("PT Sans")
+            .text_size(px(12.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().text_color(rgb(MUTED_COLOR)).child("Link"))
+            .child(div().flex_1().child(input))
+            .child(
+                div()
+                    .text_color(rgb(MUTED_COLOR))
+                    .text_size(px(10.))
+                    .child("enter · empty removes · esc"),
+            )
+    }
+
+    /// The RIGHT flank — the selection's verb menu (docs/impl/03-flanks.md §0.2).
+    /// An INDEPENDENT overlay that OCCLUDES cards at its y (review B8: it is
+    /// transient, so it never touches the packer — no re-pack, so the lane never
+    /// slides on a select/deselect, finding 61). Rows are carrier sentences,
+    /// MOUSE-ONLY (reviews B2/B9: no letter caps — bare keys would type over the
+    /// live selection); each acts and dismisses BOTH flanks first (H20). Idle at
+    /// α≈0.72, waking on hover (the lab selmenu idiom). Presence is decided in
+    /// `flank_layout` (compost-rail and history both stand it down).
+    fn render_selection_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let layout = self.flank_layout(window)?;
+        if !layout.gate.right {
+            return None;
+        }
+        // Never cover the lane-top furniture the writer needs (the door rail /
+        // ai_status band): clamp below it when present (finding 60), else just
+        // below the titlebar — the same floor the cards clear.
+        let has_top_furniture = self.margin_rail_count().is_some() || self.ai_status.is_some();
+        let floor = BAR_HEIGHT + 8. + if has_top_furniture { 30. } else { 0. };
+        const MENU_H_EST: f32 = 132.; // four carrier rows
+        let top = layout
+            .right_top
+            .clamp(floor, (layout.vh - MENU_H_EST - 8.).max(floor));
         Some(
             div()
                 .absolute()
-                .left(px(left))
-                .top(px(top))
-                .w(px(POPOVER_W))
-                .bg(rgb(0xFCFAF4))
-                .border_1()
-                .border_color(rgb(RULE_COLOR))
-                .rounded(px(6.))
-                .shadow_md()
-                .px(px(4.))
-                .py(px(3.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .font_family("PT Serif")
-                .text_size(px(13.))
-                // Clicks on the popover chrome must not reach the canvas —
-                // they would collapse the very selection being formatted.
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(self.format_tools(false, cx)),
+                .left(px(layout.lane_left))
+                .top_0()
+                .bottom_0()
+                .w(px(MARGIN_WIDTH))
+                // No wheel handler — the one document scroll owns the lane; a
+                // handler here would double-fire (mirrors render_margin).
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(top))
+                        .left(px(8.))
+                        .w(px(MARGIN_WIDTH - 8.))
+                        // Rows stack top-down (GPUI defaults to flex-row): the
+                        // carrier sentences are a column, one verb per line.
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(CARD_BG))
+                        .border_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .rounded(px(9.))
+                        .shadow_md()
+                        // Idle translucent, waking on hover (the selmenu idiom):
+                        // a resting affordance that doesn't shout over the prose.
+                        .opacity(0.72)
+                        .hover(|d| d.opacity(1.))
+                        .font_family("PT Sans")
+                        .text_size(px(12.5))
+                        .py(px(2.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.selection_menu_row(
+                            "sel-note",
+                            SelVerb::Note,
+                            rgb(ACTIVE_BORDER),
+                            "Add a note",
+                            false,
+                            cx,
+                        ))
+                        .child(self.selection_menu_row(
+                            "sel-aside",
+                            SelVerb::Aside,
+                            rgb(MUTED_COLOR),
+                            "Set aside, out of the story",
+                            false,
+                            cx,
+                        ))
+                        .child(self.selection_menu_row(
+                            "sel-grave",
+                            SelVerb::Graveyard,
+                            rgb(0xC9C5BAu32),
+                            "Send to the graveyard",
+                            true,
+                            cx,
+                        ))
+                        .child(self.selection_menu_row(
+                            "sel-ask",
+                            SelVerb::Ask,
+                            rgb(AI_ACCENT),
+                            "Ask the editor about this…",
+                            false,
+                            cx,
+                        )),
+                ),
         )
+    }
+
+    /// One carrier-sentence row of the right verb menu. The icon is a small
+    /// color-language dot drawn as a div (no non-PT glyph — the ☰/✂/❋ of the
+    /// mockup would force a font fallback, and ☰ collides with outline/palette,
+    /// finding 109): warm amber for the writer's note, drained for the graveyard,
+    /// cool blue for the machine ask. Acting dismisses BOTH flanks first (H20),
+    /// THEN dispatches — the verb still sees the live `selected_range` (dismissal
+    /// only hides the flanks, it never clears the selection).
+    fn selection_menu_row(
+        &self,
+        id: &'static str,
+        verb: SelVerb,
+        dot: gpui::Rgba,
+        label: &'static str,
+        destructive: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(7.))
+            .cursor(CursorStyle::PointingHand)
+            .hover(|d| d.bg(rgb(if destructive { STALE_BG } else { NOTE_CARD_BG })))
+            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(dot))
+            .child(div().text_color(rgb(TEXT_COLOR)).child(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    // H20: both flanks down before the result (a composer card, a
+                    // pass, an aside) takes the lane — one pinned object at that y.
+                    editor.dismiss_flanks(cx);
+                    match verb {
+                        SelVerb::Note => editor.add_note(&AddNote, window, cx),
+                        SelVerb::Aside => editor.set_aside(&SetAside, window, cx),
+                        SelVerb::Graveyard => {
+                            editor.send_to_graveyard(&SendToGraveyard, window, cx)
+                        }
+                        // The scoped ask reuses ctrl-shift-d's path: `run_pass`
+                        // already scopes over a non-empty selection, opens the
+                        // door, and runs `effective_mode` (finding 118).
+                        SelVerb::Ask => editor.run_diagnosis(&RunDiagnosis, window, cx),
+                    }
+                }),
+            )
     }
 
     // UI chrome avoids glyphs outside the bundled PT fonts (arrows, circles,
@@ -13277,6 +13829,14 @@ impl Render for Editor {
                 Some(pill) => d.child(pill),
                 None => d,
             })
+            // The two selection flanks rise together (docs/impl/03-flanks.md).
+            // The RIGHT verb menu paints AFTER render_margin (above), so it
+            // OCCLUDES the cards at its y (review B8); the LEFT formatting flank
+            // lives in the opposite gutter.
+            .map(|d| match self.render_selection_menu(window, cx) {
+                Some(menu) => d.child(menu),
+                None => d,
+            })
             .map(|d| match self.render_selection_popover(window, cx) {
                 Some(popover) => d.child(popover),
                 None => d,
@@ -14180,6 +14740,47 @@ mod tests {
         assert!(note_surfaces(NoteKind::Diagnosis, "developmental", false, true));
         assert!(!note_surfaces(NoteKind::Diagnosis, "copy", false, true));
         assert!(note_surfaces(NoteKind::Diagnosis, "copy", false, false));
+    }
+
+    #[test]
+    fn flank_gate_decides_which_flanks_rise() {
+        use FlankLeft::*;
+        // (history_up, in_compost, lane_available, gutter_ok)
+        let g = |h, c, l, gk| flank_gate(h, c, l, gk);
+
+        // A history surface suppresses BOTH flanks — the past is read-only and
+        // the right side is claimed (review H22). Every other input is ignored.
+        for &(c, l, gk) in &[(false, true, true), (true, false, false)] {
+            let r = g(true, c, l, gk);
+            assert_eq!(r.left, None, "history suppresses the left flank");
+            assert!(!r.right, "history suppresses the right flank");
+        }
+
+        // No history, wide gutter, live lane, manuscript selection: the grid and
+        // the verb menu both rise (the resting case).
+        let r = g(false, false, true, true);
+        assert_eq!(r.left, Grid);
+        assert!(r.right);
+
+        // The narrow gutter narrows only the FORM of the left flank — it still
+        // rises, as the formatting-only horizontal fallback (review H21). The
+        // right menu is unaffected: its fallback keys on the LANE, not the gutter
+        // (finding 57), so it stays up while the lane is available.
+        let r = g(false, false, true, false);
+        assert_eq!(r.left, Horizontal);
+        assert!(r.right, "the gutter width never gates the right menu");
+
+        // A compost-rail selection: the left (formatting) flank rises, the right
+        // (verb) menu does not — the rail is the writer's scrap box (finding 108).
+        let r = g(false, true, true, true);
+        assert_eq!(r.left, Grid);
+        assert!(!r.right, "no verb menu for a rail selection");
+
+        // No lane (narrow-notes mode collapsed it): the right menu has nowhere to
+        // occlude into, so it stands down even for a manuscript selection.
+        let r = g(false, false, false, true);
+        assert_eq!(r.left, Grid);
+        assert!(!r.right, "no lane, no right menu");
     }
 
     #[test]
