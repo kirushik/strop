@@ -1,5 +1,21 @@
 # Acceptance gates — what "done" must survive
 
+## 0 · Triage — before any gate applies
+
+UX feedback splits into two kinds, and mistaking one for the other is
+how the omnibar became a button (2026-07-05): **bugs** (behaviour
+diverges from an agreed design — fix directly, gates 1-3 apply) and
+**design corrections** (the agreed design itself is wrong). A design
+correction never goes straight to code. It gets: an *intent echo* — a
+one-paragraph behavioural spec of what will be built, cheap to veto;
+a *critique pass* (the personas, against design-principles.md); then
+implementation against the fidelity gates. Two more standing rules:
+when the writer's words support two readings, take the one that makes
+the product more capable, not the one cheaper to build — and name the
+reading taken; and when a correction repeats ("the third time I'm
+trying to tell you"), it is a standing product decision — record it
+in the spec so it can never be relitigated by default.
+
 Born 2026-07-05, from the litmus-file round: a wave that was green on
 every gate we had (204 tests, clippy, 48 rig assertions, wshots) shipped
 a history strip that rendered a real document's June as one thin line,

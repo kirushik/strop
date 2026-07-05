@@ -96,7 +96,7 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
             if key == "toggle:outline" {
                 window
                     .update(cx, |editor, window, cx| {
-                        editor.toggle_outline(&crate::editor::ToggleOutline, window, cx)
+                        editor.toggle_rail(&crate::editor::ToggleOutline, window, cx)
                     })
                     .ok();
                 cx.background_executor()

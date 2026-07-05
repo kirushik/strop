@@ -294,5 +294,31 @@ CB2=$(field "$C2" compost_blocks)
 if [ "${CB2:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the note migrated to the compost (compost_blocks=$CB2)"; else
   echo "  FAIL compost_blocks=$CB2 — the note did not migrate"; fail=1; fi
 
+echo "rig-check: the omnibar is a field, and Esc walks the selection home (06 §1)"
+# Typing "abcdef", parking the caret at the end, then ctrl-f + "b": the find
+# preview WALKS selected_range onto the match [1,2). Esc must restore the
+# pre-find state (S3/P13) and hand focus back to the prose.
+DOCO=$(mktemp --suffix=.md); : > "$DOCO"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCO" "abcdef ctrl-f wait:80 dump:ui b wait:80 dump:ui escape wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+O1=$(echo "$OUT" | sed -n 1p); O2=$(echo "$OUT" | sed -n 2p); O3=$(echo "$OUT" | sed -n 3p)
+[ -n "$O3" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCO" "$DOCO.strop"
+expect "ctrl-f focuses the omnibar field"    '"PaletteInput"' "$(field "$O1" focused)"
+expect "the preview walks the selection"     '[1,2]' "$(echo "$O2" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')"
+expect "Esc returns focus to the prose"      '"Editor"' "$(field "$O3" focused)"
+expect "Esc walks the selection home"        '[6,6]' "$(echo "$O3" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')"
+
+echo "rig-check: set-aside shows compliance — the rail opens on first birth and never self-closes"
+DOCR=$(mktemp --suffix=.md); : > "$DOCR"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCR" "onexx enter enter twoxx ctrl-home select:para aside:selection wait:80 dump:ui ctrl-end select:para aside:selection wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+R1=$(echo "$OUT" | sed -n 1p); R2=$(echo "$OUT" | sed -n 2p)
+[ -n "$R2" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCR" "$DOCR.strop"
+expect "the first aside opens the rail"      true "$(field "$R1" rail)"
+expect "the second aside keeps it open"      true "$(field "$R2" rail)"
+CBR=$(field "$R2" compost_blocks)
+if [ "${CBR:-0}" -gt 1 ] 2>/dev/null; then echo "  ok   both passages landed in the compost (compost_blocks=$CBR)"; else
+  echo "  FAIL compost_blocks=$CBR"; fail=1; fi
+
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

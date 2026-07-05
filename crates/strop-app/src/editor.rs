@@ -50,6 +50,9 @@ use crate::theme::{
 
 const MARGIN_WIDTH: f32 = 248.;
 const MARGIN_GAP: f32 = 16.;
+/// The omnibar's fixed width (06 §1, S4): the empty runway IS the type-here
+/// affordance, and a fixed box lets the results card hang from its left edge.
+const OMNI_FIELD_W: f32 = 320.;
 /// Margin-card box metrics, shared by the height MEASUREMENT
 /// (`refresh_card_heights`) and the RENDER (`render_margin`) so a card's packed
 /// extent equals its painted one. Text wraps at the card's inner width; the
@@ -188,8 +191,8 @@ const COL_LEFT_MIN: f32 = 24.;
 /// History side panel (DESIGN §2-history): push, not overlay. The panel
 /// shrinks before the document does — prose keeps DOC_MIN_WIDTH.
 const HISTORY_PANEL_WIDTH: f32 = 320.;
-/// Outline rail (DESIGN §1.6): left, push — mirrors the history panel.
-const OUTLINE_PANEL_WIDTH: f32 = 200.;
+/// The compost rail panel (06 §2): left, push — mirrors the history panel.
+const RAIL_PANEL_WIDTH: f32 = 200.;
 const DOC_MIN_WIDTH: f32 = 400.;
 const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
@@ -859,7 +862,7 @@ struct FlankLayout {
     /// Width the flanks live in (viewport minus CSD gutters) and its height.
     vw: f32,
     vh: f32,
-    outline_w: f32,
+    rail_w: f32,
     /// The note lane's left edge, content space (the right menu pins here).
     lane_left: f32,
 }
@@ -1005,6 +1008,12 @@ pub struct Editor {
     /// Mirror of the palette query (debug_cursor has no `cx` to read the
     /// input entity); maintained by the palette's observe hook.
     palette_query: String,
+    /// The selection the omnibar opened on (06 §1, critique S3/P13): the
+    /// find preview walks `selected_range` across matches as you type, so
+    /// Esc must walk it home — cancel restores this, Enter-executed jumps
+    /// don't (travel was the point), and click-away doesn't either (the
+    /// click placed a new caret on purpose).
+    omni_return: Option<Range<usize>>,
     /// Per-command execution counts (DESIGN §3.3, hit-frequency
     /// ordering): loaded from disk at palette open, written through on
     /// every palette execution — the palette becomes *your* instrument.
@@ -1060,9 +1069,10 @@ pub struct Editor {
     link_input: Option<(Range<usize>, Entity<TextField>)>,
     /// Titlebar word count, recomputed on mutation — never per frame.
     word_count: usize,
-    /// Outline rail (DESIGN §1.6): toggleable left rail of headings,
-    /// session-only — externalized structure at the point of performance.
-    outline_open: bool,
+    /// The compost rail (docs/impl/06-omnibar.md §2): the toggleable left
+    /// panel listing the compost's items, session-only. The outline it
+    /// replaced is gone — heading navigation lives in the palette's `@` mode.
+    rail_open: bool,
     /// The graveyard tail section (docs/impl/02-asides.md §4, Bug B): entries
     /// the writer clicked to expand out of their one-line receded form. The
     /// newest entry is always full; older ones recede until expanded. The old
@@ -1493,6 +1503,7 @@ impl Editor {
             palette_input: None,
             palette_selected: 0,
             palette_query: String::new(),
+            omni_return: None,
             palette_freq: HashMap::new(),
             chord_whisper: None,
             chord_whisper_shown: false,
@@ -1511,7 +1522,7 @@ impl Editor {
             editor_menu_open: false,
             selection_popover: false,
             link_input: None,
-            outline_open: false,
+            rail_open: false,
             grave_expanded: Vec::new(),
             last_manuscript_caret: 0,
             rail_flash: None,
@@ -4120,12 +4131,24 @@ impl Editor {
                         editor.execute_palette_entry(&q, editor.palette_selected, window, cx);
                     }
                 }
-                TextFieldEvent::Cancel => editor.close_palette(window, cx),
+                TextFieldEvent::Cancel => {
+                    // Esc restores the selection the omnibar opened on (S3,
+                    // P13): the find preview walked `selected_range` across
+                    // matches; cancel walks it home and scrolls it back in.
+                    if let Some(sel) = editor.omni_return.take() {
+                        let max = editor.doc.len_bytes();
+                        editor.selected_range = sel.start.min(max)..sel.end.min(max);
+                        editor.selection_reversed = false;
+                        editor.autoscroll_request = true;
+                    }
+                    editor.close_palette(window, cx)
+                }
             },
         )
         .detach();
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
+        self.omni_return = Some(self.selected_range.clone());
         self.palette_input = Some(input);
         self.replace_input = None;
         self.palette_selected = 0;
@@ -4233,6 +4256,7 @@ impl Editor {
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_input = None;
         self.replace_input = None;
+        self.omni_return = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -4645,97 +4669,80 @@ impl Editor {
                     .child(msg),
             );
         }
-        // Find mode carries a match counter and (when ctrl-h was pressed) the
-        // replace field, right under the query — never a bottom strip, so a
-        // match can't scroll behind it.
-        let match_count = if mode == OmniMode::Find && !rest.is_empty() {
-            let n = rows.len();
-            Some(if n == 0 {
-                "0".to_owned()
-            } else {
-                format!("{}/{n}", selected + 1)
-            })
-        } else {
-            None
-        };
+        // The query input lives in the TITLEBAR now (06 §1) — the card is the
+        // field's dropdown: results (+ the replace row, a sanctioned distinct
+        // function, S6), never a second query input. The match counter rides
+        // the titlebar field. A mousedown on card chrome that isn't a row
+        // refocuses the query (H2): the card must never look active while
+        // keystrokes route to the prose behind it.
+        let query_focus = input.read(cx).focus_handle.clone();
         div()
             .absolute()
-            .top(px(BAR_HEIGHT + 6.))
+            .top(px(BAR_HEIGHT + 2.))
             .left_0()
             .right_0()
             .flex()
             .justify_center()
             .child(
-                div()
-                    .w(px(480.))
-                    .bg(rgb(0xFCFAF4))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .rounded(px(8.))
-                    .shadow_lg()
-                    .font_family("PT Serif")
-                    .flex()
-                    .flex_col()
-                    // §0.6: clicks inside the omnibox stay in it (rows handle
-                    // their own); clicks outside reach the document's handler,
-                    // which light-dismisses it. The wheel is contained the
-                    // same way — the list scrolls, the document never does.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .p(px(8.))
-                            .border_b_1()
-                            .border_color(rgb(RULE_COLOR))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(div().flex_1().min_w(px(0.)).child(input.clone()))
-                            .when_some(match_count, |d, c| {
-                                d.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(MUTED_COLOR))
-                                        .child(c),
-                                )
-                            }),
-                    )
-                    .when_some(self.replace_input.clone(), |d, rep| {
-                        d.child(
-                            div()
-                                .p(px(8.))
-                                .border_b_1()
-                                .border_color(rgb(RULE_COLOR))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .text_size(px(13.))
-                                .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Replace"))
-                                .child(div().flex_1().min_w(px(0.)).child(rep))
-                                .child(
-                                    div()
-                                        .id("replace-all")
-                                        .flex_shrink_0()
-                                        .px(px(8.))
-                                        .py(px(1.))
-                                        .rounded(px(4.))
-                                        .cursor(CursorStyle::PointingHand)
-                                        .bg(rgb(0xE8DFC8))
-                                        .hover(|d| d.bg(rgb(0xDFD3B0)))
-                                        .text_size(px(12.))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                                                cx.stop_propagation();
-                                                editor.replace_all(cx);
-                                            }),
-                                        )
-                                        .child("All"),
-                                ),
-                        )
-                    })
-                    .child(list),
+                // An invisible shell exactly the omnibar's width: the card
+                // hangs from the shell's LEFT edge, so the field and its
+                // dropdown share it (S5 — a menu attached to its control).
+                div().w(px(OMNI_FIELD_W)).child(
+                    div()
+                        .w(px(480.))
+                        .bg(rgb(0xFCFAF4))
+                        .border_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .rounded(px(8.))
+                        .shadow_lg()
+                        .font_family("PT Serif")
+                        .flex()
+                        .flex_col()
+                        // §0.6: clicks inside the omnibox stay in it (rows
+                        // handle their own); clicks outside reach the
+                        // document's handler, which light-dismisses it. The
+                        // wheel is contained the same way.
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&query_focus, cx);
+                        })
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .when_some(self.replace_input.clone(), |d, rep| {
+                            d.child(
+                                div()
+                                    .p(px(8.))
+                                    .border_b_1()
+                                    .border_color(rgb(RULE_COLOR))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .text_size(px(13.))
+                                    .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Replace"))
+                                    .child(div().flex_1().min_w(px(0.)).child(rep))
+                                    .child(
+                                        div()
+                                            .id("replace-all")
+                                            .flex_shrink_0()
+                                            .px(px(8.))
+                                            .py(px(1.))
+                                            .rounded(px(4.))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .bg(rgb(0xE8DFC8))
+                                            .hover(|d| d.bg(rgb(0xDFD3B0)))
+                                            .text_size(px(12.))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    editor.replace_all(cx);
+                                                }),
+                                            )
+                                            .child("All"),
+                                    ),
+                            )
+                        })
+                        .child(list),
+                ),
             )
     }
 
@@ -5490,11 +5497,8 @@ impl Editor {
     }
 
     /// The outline rail (DESIGN §1.6): session-only, no config.
-    pub(crate) fn toggle_outline(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
-        // Outline and the compost rail share the left column and are mutually
-        // exclusive (review H26): the rail render checks `!outline_open`, so
-        // simply toggling the outline hides/reveals the rail beneath it.
-        self.outline_open = !self.outline_open;
+    pub(crate) fn toggle_rail(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
+        self.rail_open = !self.rail_open;
         cx.notify();
     }
 
@@ -5502,11 +5506,13 @@ impl Editor {
 
     /// `Set aside` (docs/impl/02-asides.md §2): move the selection — or, with
     /// an empty selection, the caret's paragraph (review H25) — into the
-    /// compost rail. A MOVE, never a cut: `file_cut` is the only path that
+    /// compost. A MOVE, never a cut: `file_cut` is the only path that
     /// files, so the graveyard is suppressed by construction (review H41).
-    /// Births the rail on first use, closes the outline (shared left column),
-    /// blinks the rail edge, and leaves the caret at the collapse point — the
-    /// writer parked a thought, she did not travel.
+    /// The verb NEVER closes the rail (the writer issued a command and must
+    /// see compliance, not a vanishing panel — 06 §2): the arrival blinks
+    /// both the in-document region and, when the rail is open, its new row.
+    /// The caret stays at the collapse point — the writer parked a thought,
+    /// she did not travel.
     fn set_aside(&mut self, _: &SetAside, _: &mut Window, cx: &mut Context<Self>) {
         if self.history_view.is_some() {
             return;
@@ -5517,10 +5523,17 @@ impl Editor {
         } else {
             self.selected_range.clone()
         };
+        let first_birth = self.doc.aside_boundary().is_none();
         let Some(caret_char) = self.doc.set_aside(range) else {
             return; // empty, or the range is compost already
         };
-        self.outline_open = false; // the new rail takes the left column
+        // The compost's first birth opens the rail once (S2/N1) — the writer
+        // must SEE where the passage went; a relocation that shows nothing
+        // reads as destruction. Later arrivals only blink: the toggle when
+        // the rail is closed, the newest row when it's open.
+        if first_birth {
+            self.rail_open = true;
+        }
         self.rail_flash = Some(Instant::now());
         self.sync_mutations();
         let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
@@ -5754,6 +5767,8 @@ impl Editor {
         if doomed.is_empty() {
             return;
         }
+        let first_birth = self.doc.aside_boundary().is_none();
+        let mut migrated = false;
         for id in doomed {
             let anchor = self
                 .doc
@@ -5763,9 +5778,15 @@ impl Editor {
                 .unwrap_or(0);
             let quote = self.origin_quote_before(anchor);
             if self.doc.migrate_note_to_compost(id, &quote) {
-                self.outline_open = false;
                 self.rail_flash = Some(Instant::now());
+                migrated = true;
             }
+        }
+        // The compost's first birth opens the rail once (S2/N1): the writer
+        // must SEE where the note went, not deduce it. Later arrivals only
+        // blink — the toggle when the rail is closed, the row when open.
+        if migrated && first_birth {
+            self.rail_open = true;
         }
         self.sync_mutations();
         self.schedule_flash_clear(cx);
@@ -7615,6 +7636,8 @@ impl Editor {
             // asserts THIS bit for the bar's hide/show, like `margin_hidden`.
             "grave_bar_hidden": self.grave_tail_on_screen(),
             "manuscript_words": self.manuscript_word_count(),
+            "rail": self.rail_open,
+            "sel": [self.selected_range.start, self.selected_range.end],
             // The selection flanks (docs/impl/03-flanks.md §3): presence of each
             // (`left` false only under a history surface; `right` false for a
             // compost-rail selection or a narrow lane) and the lane `y` the right
@@ -7747,7 +7770,7 @@ impl Editor {
             "The customs officer had a theory about the fog, and he told it to anyone who would listen: that it was the river forgetting its banks, one memory at a time.\n\nHe had charts. He had dates. Nobody would ever listen to a word of it.",
             cx,
         );
-        self.outline_open = true; // reveal the sidebar's Compost section
+        self.rail_open = true; // reveal the sidebar's Compost section
         self.word_count = self.manuscript_word_count();
         cx.notify();
     }
@@ -8103,8 +8126,8 @@ impl Editor {
         };
         // F5 session tags: outline rail, word goal, open-time intent.
         let mut session = String::new();
-        if self.outline_open {
-            session += " outline=open";
+        if self.rail_open {
+            session += " rail=open";
         }
         // The door (DESIGN §4.4): drafting hides the editor's cards, reviewing
         // shows them; the held-back counts let smoke prove the rail's content.
@@ -10295,8 +10318,8 @@ impl Editor {
             + f32::from(par.line_height) * line as f32
             - f32::from(frame.scroll_top);
         let col_left = f32::from(frame.bounds.origin.x) - l_inset;
-        let outline_w = self.outline_width(window);
-        let left_gutter = col_left - outline_w;
+        let rail_w = self.rail_width(window);
+        let left_gutter = col_left - rail_w;
         // A history surface (strip open, the panel, or a parked preview) claims
         // the right side AND freezes a read-only past — suppress both flanks so
         // neither offers live mutation over it (review H22).
@@ -10323,7 +10346,7 @@ impl Editor {
             col_left,
             vw: self.content_width(window),
             vh: f32::from(window.viewport_size().height) - t_inset - b_inset,
-            outline_w,
+            rail_w,
             lane_left: self.column_right(window) + MARGIN_GAP,
         })
     }
@@ -10359,7 +10382,7 @@ impl Editor {
         let top = layout
             .left_top
             .clamp(BAR_HEIGHT + 8., (layout.vh - FLANK_GRID_H - 8.).max(BAR_HEIGHT + 8.));
-        let left = (layout.col_left - 12. - FLANK_GRID_W).max(layout.outline_w + 6.);
+        let left = (layout.col_left - 12. - FLANK_GRID_W).max(layout.rail_w + 6.);
         div()
             .absolute()
             .left(px(left))
@@ -10690,9 +10713,9 @@ impl Editor {
                 .when(cfg!(target_os = "macos"), |bar| {
                     bar.child(div().w(px(76.)).h_full())
                 })
-                // The outline opens the LEFT rail, so its control lives at the
-                // far left — spatial honesty (the H2 papercut: it was on the
-                // right). Three stacked bars, drawn like every titlebar glyph.
+                // The compost rail opens on the LEFT, so its control lives
+                // at the far left — spatial honesty (the H2 papercut: it was
+                // on the right). Three stacked bars, drawn like every glyph.
                 .child(
                     div()
                         .id("outline-toggle")
@@ -10702,32 +10725,61 @@ impl Editor {
                         .ml(px(8.))
                         .rounded(px(5.))
                         .cursor(CursorStyle::PointingHand)
-                        .when(self.outline_open, |d| d.bg(rgba(0x1A1A1812u32)))
+                        .when(self.rail_open, |d| d.bg(rgba(0x1A1A1812u32)))
+                        // Arrival blink (S2, P12 — the control is the
+                        // indicator): when a passage lands in a CLOSED rail,
+                        // the always-visible toggle carries the compliance
+                        // signal; an off-screen region flash can't.
+                        .map(|d| {
+                            let a = self.rail_flash.map_or(0., |t| {
+                                let e = t.elapsed().as_millis() as f32 / 1400.;
+                                (0.33 * (1. - e)).clamp(0., 0.33)
+                            });
+                            d.when(a > 0. && !self.rail_open, |d| d.bg(tint(0xC8A951, a)))
+                        })
                         .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("Outline", Some("ctrl-shift-o")))
+                        .tooltip(tip("Compost", Some("ctrl-shift-o")))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
-                                editor.toggle_outline(&ToggleOutline, window, cx);
+                                editor.toggle_rail(&ToggleOutline, window, cx);
                             }),
                         )
                         .child({
-                            let bar_color = if self.outline_open {
+                            let bar_color = if self.rail_open {
                                 rgb(TEXT_COLOR)
                             } else {
                                 rgb(MUTED_COLOR)
                             };
                             div()
                                 .flex()
-                                .flex_col()
-                                .items_start()
-                                .gap(px(2.))
-                                .children(
-                                    [11., 8., 5.]
-                                        .into_iter()
-                                        .map(|w| div().w(px(w)).h(px(1.5)).bg(bar_color)),
+                                .items_center()
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_start()
+                                        .gap(px(2.))
+                                        .children(
+                                            [11., 8., 5.]
+                                                .into_iter()
+                                                .map(|w| div().w(px(w)).h(px(1.5)).bg(bar_color)),
+                                        ),
                                 )
+                                // Presence, not a count (H5; asides.md §5
+                                // forbids gamified size): a non-empty compost
+                                // leaves a lasting dot on its control — the
+                                // residual trace a transient blink can't be.
+                                .when(self.doc.aside_boundary().is_some(), |d| {
+                                    d.child(
+                                        div()
+                                            .size(px(4.))
+                                            .rounded_full()
+                                            .bg(rgb(0xC9C5BAu32)),
+                                    )
+                                })
                         }),
                 )
                 // Document name — click or F2 to rename in place, file and all.
@@ -10824,23 +10876,68 @@ impl Editor {
                         }),
                 )
             )
-            // The centre holds the search button (DESIGN §2-omnibox). A
-            // button, dressed as one — never a fake input field: "text is
-            // sacred", so the chrome only ever opens the real thing (the
-            // palette carries the live field). The space around it stays
-            // the window-drag handle.
-            .child(
-                div()
+            // The omnibar (06 §1): the centre control IS the palette's input —
+            // a real type-able field whose dropdown is the results card, never
+            // a second input. At rest the same box holds the placeholder; the
+            // first click swaps the live TextField in at identical geometry
+            // and `find` focuses it, so the box types the moment it's touched.
+            // The runway (fixed width, S4) is the affordance; the I-beam
+            // confirms it. The space around it stays the window-drag handle.
+            .child(match &self.palette_input {
+                Some(input) => {
+                    // The find-mode match counter rides right of the query —
+                    // where the eye reads it (S7); the ranges are already
+                    // computed for the live preview.
+                    let counter = match omni_mode(&self.palette_query) {
+                        (OmniMode::Find, rest) if !rest.trim().is_empty() => {
+                            let n = self.omni_match_ranges().len();
+                            Some(if n == 0 {
+                                "0".to_owned()
+                            } else {
+                                format!("{}/{n}", self.palette_selected.min(n - 1) + 1)
+                            })
+                        }
+                        _ => None,
+                    };
+                    div()
+                        .id("omni-pill")
+                        .occlude()
+                        .flex_shrink_0()
+                        .w(px(OMNI_FIELD_W))
+                        .px(px(10.))
+                        .py(px(2.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(rgb(ACTIVE_BORDER))
+                        .bg(rgb(0xFCFAF4))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().flex_1().min_w(px(0.)).child(input.clone()))
+                        .when_some(counter, |d, c| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child(c),
+                            )
+                        })
+                        .into_any_element()
+                }
+                None => div()
                     .id("omni-pill")
                     .occlude()
                     .flex_shrink_0()
+                    .w(px(OMNI_FIELD_W))
                     .px(px(10.))
                     .py(px(2.))
-                    .rounded(px(5.))
-                    .cursor(CursorStyle::PointingHand)
-                    .when(self.palette_input.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .text_color(rgb(MUTED_COLOR))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .bg(rgb(0xFCFAF4))
+                    .cursor(CursorStyle::IBeam)
+                    .hover(|d| d.border_color(rgb(0xD8D2C2)))
                     .tooltip(tip("Search · > commands · @ headings", Some("ctrl-f")))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -10849,8 +10946,9 @@ impl Editor {
                             editor.find(&Find, window, cx);
                         }),
                     )
-                    .child("Search"),
-            )
+                    .child(div().text_color(rgb(MUTED_COLOR)).child("Search"))
+                    .into_any_element(),
+            })
             // Right third — mirrors the left (equal claims keep the centre
             // still): the editor button, palette, history, window controls.
             .child(
@@ -11115,13 +11213,13 @@ impl Editor {
     /// the history panel; it stands down while history is open (the canvas
     /// shows a merged diff there — live-doc offsets wouldn't match) and in
     /// windows too narrow to keep the prose at DOC_MIN_WIDTH.
-    fn outline_width(&self, window: &Window) -> f32 {
-        if !self.outline_open || self.history_view.is_some() {
+    fn rail_width(&self, window: &Window) -> f32 {
+        if !self.rail_open || self.history_view.is_some() {
             return 0.;
         }
         let vw = f32::from(window.viewport_size().width);
         let free = vw - DOC_MIN_WIDTH;
-        if free < 120. { 0. } else { free.min(OUTLINE_PANEL_WIDTH) }
+        if free < 120. { 0. } else { free.min(RAIL_PANEL_WIDTH) }
     }
 
     /// The document's headings: (block index, level, text, byte offset of
@@ -11171,11 +11269,30 @@ impl Editor {
         items
     }
 
-    /// One "Compost" section for the sidebar: a header and a row per item (click
-    /// scrolls to that block and flashes it). Above the outline (Bug A).
-    fn render_compost_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The compost rail (06 §2): the left panel IS the compost's navigator —
+    /// a header and a row per item; click scrolls to the block and flashes
+    /// it. The outline that used to live here is gone (third-time product
+    /// decision: nobody cares about a header tree in a three-page blogpost);
+    /// heading navigation survives as the palette's `@` mode. An empty
+    /// compost opens to the header and air — no hint, no lecture (P4).
+    fn render_rail(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let items = self.compost_items();
-        let mut list = div().flex().flex_col().px(px(8.)).py(px(6.));
+        // Arrival blink (06 §2): the newest item is the compost tail — the
+        // same decaying seltint wash the parked banner's refusal pulse uses.
+        let flash_a = self.rail_flash.map_or(0., |t| {
+            let e = t.elapsed().as_millis() as f32 / 1400.;
+            (0.33 * (1. - e)).clamp(0., 0.33)
+        });
+        let last = items.len().saturating_sub(1);
+        let mut list = div()
+            .id("rail-list")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .px(px(8.))
+            .py(px(6.));
         for (i, (preview, byte_start)) in items.iter().enumerate() {
             let jump = *byte_start;
             list = list.child(
@@ -11185,6 +11302,9 @@ impl Editor {
                     .py(px(3.))
                     .rounded(px(4.))
                     .cursor(CursorStyle::PointingHand)
+                    .when(i == last && flash_a > 0., |d| {
+                        d.bg(tint(0xC8A951, flash_a))
+                    })
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -11211,82 +11331,7 @@ impl Editor {
             );
         }
         div()
-            .flex()
-            .flex_col()
-            .border_b_1()
-            .border_color(rgb(RULE_COLOR))
-            .child(
-                div()
-                    .px(px(14.))
-                    .py(px(6.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .child("Compost"),
-            )
-            .child(list)
-    }
-
-    /// The outline rail (DESIGN §1.6 — externalize what working memory
-    /// can't hold): a glanceable left rail of headings, level shown by
-    /// indent, current section highlighted, click to jump. With a non-empty
-    /// compost rail, a "Compost" section sits above the outline (Bug A).
-    fn render_outline(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.outline_items();
-        let has_compost = self.doc.aside_boundary().is_some();
-        let cursor_block = self.doc.block_of_byte(self.cursor_offset());
-        // The section the caret is in: the nearest heading above it.
-        let current = items.iter().rposition(|(ix, ..)| *ix <= cursor_block);
-        let mut list = div()
-            .id("outline-list")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .px(px(8.))
-            .py(px(6.));
-        if items.is_empty() {
-            list = list.child(
-                div()
-                    .px(px(8.))
-                    .py(px(4.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .child("No headings yet — ctrl-1..3 structure the story"),
-            );
-        }
-        for (i, (_, level, text, byte_start)) in items.iter().enumerate() {
-            let jump = *byte_start;
-            list = list.child(
-                div()
-                    .id(("outline-row", i))
-                    .px(px(8.))
-                    .py(px(3.))
-                    .pl(px(8. + 12. * (level.saturating_sub(1)) as f32))
-                    .rounded(px(4.))
-                    .cursor(CursorStyle::PointingHand)
-                    .when(Some(i) == current, |d| d.bg(rgba(0x1A1A1812u32)))
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            // Jump: caret to the heading's start + autoscroll
-                            // (move_to requests scroll-to-cursor).
-                            editor.move_to(jump, cx);
-                            window.focus(&editor.focus_handle, cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_color(rgb(TEXT_COLOR))
-                            .when(*level == 1, |d| d.font_weight(FontWeight::BOLD))
-                            .child(text.clone()),
-                    ),
-            );
-        }
-        div()
-            .id("outline-panel")
+            .id("rail-panel")
             .absolute()
             .top(px(BAR_HEIGHT))
             .left_0()
@@ -11300,7 +11345,6 @@ impl Editor {
             .font_family("PT Sans")
             .text_size(px(12.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .when(has_compost, |d| d.child(self.render_compost_section(cx)))
             .child(
                 div()
                     .px(px(14.))
@@ -11308,7 +11352,7 @@ impl Editor {
                     .border_b_1()
                     .border_color(rgb(RULE_COLOR))
                     .text_color(rgb(MUTED_COLOR))
-                    .child("Outline"),
+                    .child("Compost"),
             )
             .child(list)
     }
@@ -14611,8 +14655,8 @@ impl Render for Editor {
         // re-centers and re-wraps in the remaining width.
         let hist_panel_w = self.history_panel_width(window);
         // The outline rail OVERLAYS the reserved left margin now (no push) —
-        // outline_w is still its width, for the rail's own render.
-        let outline_w = self.outline_width(window);
+        // rail_w is still its width, for the rail's own render.
+        let rail_w = self.rail_width(window);
         let in_history = self.history_view.is_some();
         // The column's left inset and width — a pure function of viewport width
         // (column_frame): the no-jump invariant. Used only outside history.
@@ -14664,7 +14708,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::save_copy_as))
             .on_action(cx.listener(Self::export_markdown))
             .on_action(cx.listener(Self::find))
-            .on_action(cx.listener(Self::toggle_outline))
+            .on_action(cx.listener(Self::toggle_rail))
             .on_action(cx.listener(Self::toggle_graveyard))
             .on_action(cx.listener(Self::run_diagnosis))
             .on_action(cx.listener(Self::run_believing))
@@ -14808,7 +14852,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::mode_copy))
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::open_welcome))
-                    .on_action(cx.listener(Self::toggle_outline))
+                    .on_action(cx.listener(Self::toggle_rail))
                     .on_action(cx.listener(Self::set_session_goal))
                     .on_action(cx.listener(Self::set_aside))
                     .on_action(cx.listener(Self::send_to_graveyard))
@@ -14853,7 +14897,7 @@ impl Render for Editor {
                 d.child(self.render_history_banner(hist_panel_w, cx))
                     .child(self.render_history_panel(hist_panel_w, cx))
             })
-            .when(outline_w > 0., |d| d.child(self.render_outline(outline_w, cx)))
+            .when(rail_w > 0., |d| d.child(self.render_rail(rail_w, cx)))
             .map(|d| {
                 // The footnote zone keys off live-doc offsets; in history
                 // the canvas shows the merged diff, so it stands down.

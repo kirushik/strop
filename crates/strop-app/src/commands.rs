@@ -192,14 +192,15 @@ pub fn all() -> &'static [Command] {
             InsertFootnote,
             ["сноска"]
         ),
-        // The outline rail (DESIGN §1.6): externalized structure at the
-        // point of performance — the biggest structural gap, per research.
+        // The compost rail (06 §2): the left panel lists the compost's
+        // items. The outline it replaced is gone — heading navigation lives
+        // in the palette's `@` mode; "outline" survives as an alias only.
         cmd!(
-            "Toggle Outline",
+            "Compost Rail",
             "View",
             Some("ctrl-shift-o"),
             ToggleOutline,
-            ["headings", "beats", "оглавление", "план", "структура"]
+            ["outline", "asides", "компост", "отложенное"]
         ),
         // Asides (docs/asides.md): the compost is the writer's deliberate scrap
         // box; the graveyard is the automatic record of cuts.
@@ -560,7 +561,7 @@ mod tests {
             "Run Editorial Diagnosis",
             "History",
             "History panel",
-            "Toggle Outline",
+            "Compost Rail",
             "Set Up AI Provider…",
             "New Document",
             "Set Session Goal…",
