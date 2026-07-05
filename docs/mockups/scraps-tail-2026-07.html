@@ -85,8 +85,6 @@ main{flex:1;display:flex;min-height:0}
 .vmenu .row.kill{color:var(--error)}
 .vmenu .sep{border-top:1px solid var(--rule);margin:3px 0}
 
-/* ---- jot capture ---- */
-.jot{background:var(--note);border-radius:3px;margin:2px -10px 1.05em;padding:5px 10px;font-size:15px;line-height:1.5}
 .ghost{opacity:.38}
 .departing{opacity:.55;transform:translateY(6px)}
 </style>
@@ -96,7 +94,7 @@ main{flex:1;display:flex;min-height:0}
   <span class="t">Scraps — the tail, amended (fresh-slate round)</span>
   <button class="tab on" data-s="1">1 · The tail at rest</button>
   <button class="tab" data-s="2">2 · The park</button>
-  <button class="tab" data-s="3">3 · New scrap at the caret</button>
+  <button class="tab" data-s="3">3 · Typing in the pile</button>
 </div>
 <main>
 <div class="stage">
@@ -164,23 +162,27 @@ main{flex:1;display:flex;min-height:0}
 </div>
 </section>
 
-<!-- ================= SCENE 3: new scrap at the caret ================= -->
+<!-- ================= SCENE 3: typing in the pile ================= -->
 <section class="scene" id="s3">
 <div class="win">
   <div class="tbar">
     <div class="third"><span class="doc">Sourdough, actually</span></div>
     <div class="third c"><span class="omni"><span>Search</span><span class="hint">ctrl-f</span></span></div>
-    <div class="third r"><span class="ebtn">Drafting <span class="arr">▾</span></span><span class="count"><b>piece · 1,842</b></span></div>
+    <div class="third r"><span class="ebtn">Drafting <span class="arr">▾</span></span><span class="count"><b>scraps · 326</b></span></div>
   </div>
   <div class="body"><div class="edwrap">
     <div class="col">
-      <p>The starter is older than my marriage and considerably more reliable. It has crossed two borders in a jam jar, wrapped in a sock, declared to no customs officer.<span class="caret"></span></p>
-      <div class="jot">what if the ending opens with the dog instead — check Friday note<span class="caret"></span></div>
-      <p>Flour, water, salt, patience — everyone recites the litany, and everyone lies about the fourth.</p>
+      <p>…the kitchen at six in the morning, the windows still black, the radio murmuring to itself — that was the point, and the bread merely proved I had been there.</p>
+      <div class="seam"><span class="lbl">Scraps</span><span class="ln"></span><span class="ct">326 words</span></div>
+      <div class="scraps">
+        <p>The neighbour's dog knows the smell of the starter and sits by my door on Fridays.<br>Cut this, but the dog might open the next essay.</p>
+        <p>what if the middle section runs backwards — start with the burnt loaf, end with the flour bag unopened</p>
+        <p>title candidates: Proof. / Crumb. / What the Oven Keeps. / Starter Culture<span class="caret"></span></p>
+      </div>
     </div>
     <div class="lane"></div>
   </div></div>
-  <div class="foot"><span class="chip warm">Scraps · 312</span><span class="chip dead">Graveyard</span></div>
+  <div class="foot"><span class="chip dead">Graveyard</span></div>
 </div>
 </section>
 
@@ -203,11 +205,12 @@ main{flex:1;display:flex;min-height:0}
     <li>Caret, scroll, selection remnant untouched — the unchanged screen is the resumption cue.</li>
   </ul>
   <ul id="n3" style="display:none">
-    <li><em>New scrap</em>: a scrap-toned line blooms below the caret's line — in-flow, ordinary text mechanics: typing types, Enter grows it.</li>
-    <li>On Esc or click-away it <em>departs to the pile in the same arrival grammar as a park</em>; the paragraph closes; the caret never moved.</li>
-    <li>Its own verb (palette row + proposed ctrl-shift-enter); ctrl-shift-a with no selection also opens it, as forgiveness.</li>
-    <li>No filing decision: seed, cut, or aside — one pile, classification deferred.</li>
-    <li>Writer-initiated motion is lawful mid-burst; the reveal clock governs machine deliveries only.</li>
+    <li><em>The pile is ordinary text</em>: click in, type, paste — no entry verb, no capture UI. (The at-caret capture line was shelved at veto; a stray thought is typed as its own paragraph and parked with ctrl-shift-a, caret staying at the join.)</li>
+    <li><em>Blank-line item model</em>: a scrap is a run of blocks; a blank line ends it. Enter breaks a line inside a scrap (first item above); Enter twice starts a sibling. A paste containing blank lines lands as several scraps.</li>
+    <li>No split or merge verbs — identity is geometry, never widgets (asides §5).</li>
+    <li><em>One caret, always.</em></li>
+    <li>Scraps on screen → its chip hides; the drained Graveyard chip stays (its section is below the fold).</li>
+    <li>Count control reads the caret's region: “scraps · 326”.</li>
   </ul>
 </aside>
 </main>

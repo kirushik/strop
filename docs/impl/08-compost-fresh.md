@@ -81,7 +81,11 @@ writer's living pile: warm face at a *smaller size* — every line
 self-identifies; full ink same-size was killed by the mid-pile
 screenshot test) → the graveyard slab → the dead record. One downward
 gradient of aliveness; byte 0 is the manuscript's first line; the
-document opens on the story.
+document opens on the story. Post-veto caution: the region wash is its
+OWN token — visibly distant in value and form from the note-card cream
+and the amber selection tint (region-wide wash vs bordered card vs
+inline tint); the full warm-family revisit the writer floated is
+parked to the taste round.
 
 **The boundary.** One structural node in the document model — not a
 character, not typed, never backspace-deletable; caret arrows across it
@@ -116,21 +120,30 @@ manuscript. This is also the recovery for the stale-selection misfire
 (intended jot, forgotten selection → a park you *watch happen* and undo
 with one key).
 
-**Jot — New scrap, its own verb** (the blind design's own §6
-concession; the chord overload was killed by both panels). Palette row
-"New scrap" + proposed chord ctrl-shift-enter ("the Enter that doesn't
-enter the piece" — tentative, rig-checked); ctrl-shift-a with no
-selection opens it too, as forgiveness, not the taught path. The
-capture: a scrap-toned line blooms directly below the caret's line —
-in-flow, ordinary text mechanics (typing types, Enter grows it; P3) —
-and on Esc or click-away it **departs to the pile in the same arrival
-grammar as a park**; the paragraph closes; the caret never moved. One
-motion grammar: park = existing text departs, jot = new text is born
-already leaving. No filing decision of any kind within the pile.
-(The ctrl-m-vs-jot split is not capture-time classification: research
-finds practitioners already split inline-about-here from
-pile-of-strays without hesitation; what kills capture habits is schema
-*within* the pile, and there is none.)
+**Jot — the capture line is SHELVED (post-veto, 2026-07-06).** The
+writer's counter holds: *why not type it first and send it later?* —
+and the mockup itself showed the indefensible frame (two blinking
+carets; the caret is where typing lands, and multi-cursor stays in
+programmers' IDEs). The steelman — no manuscript transit, no lull
+checkpoint catching a stray thought mid-flight — wasn't worth a new
+surface with weak discoverability. The flow that ships: Enter, type
+the thought as its own paragraph, ctrl-shift-a — with no selection the
+chord parks the caret's paragraph, which departs in the arrival
+grammar while the caret lands back at the join. Zero new surface,
+zero new verb, still one undo atom. History remembering that a
+thought once occurred mid-manuscript is accepted as harmless.
+
+**Typing and pasting in the pile (post-veto).** Entering the pile
+directly is first-class — click in, type, paste; it is ordinary text.
+Item identity keeps asides §1's blank-line model: a scrap is a
+contiguous run of blocks; a blank line ends it; whatever is typed or
+pasted below a blank line is a new scrap. Enter once breaks a line
+inside a scrap; Enter twice starts a sibling. A small paste mid-scrap
+extends that scrap; a paste containing blank lines lands as several.
+No item-surgery UI — no split or merge verbs (the writer's 80-20
+call); deleting the blank line between two scraps merges them as
+plain editing (the two-provenances corner goes to the interaction
+pass). Identity is geometry, never widgets (asides §5).
 
 **Skim & return — the excursion latch** (07 R3, re-derived and
 re-demanded). The Scraps chip (and ctrl-shift-o) travels to the seam;
@@ -216,8 +229,9 @@ versioning, two rhymed chips, tap-travel + excursion latch, Move to
 the manuscript, warm-smaller face, Replace-All manuscript-only,
 one-transaction migration. New or changed:
 
-1. Jot is at-caret (a scrap-toned line under the caret, departing on
-   commit) — not a footer composer, not a bare New-scrap verb.
+1. Jot: the at-caret capture line was proposed here, then SHELVED at
+   veto — F2 ships as type-then-park (the chord with no selection
+   parks the caret's paragraph; the caret stays at the join).
 2. Park/jot are single undo atoms; ctrl-Z is the reflex inverse; a
    just-born seam evaporates on undo.
 3. The receipt is an arrival (departure slide + chip pulse), never a
@@ -242,7 +256,8 @@ one-transaction migration. New or changed:
 Against the six named baseline failures: scope trespass (1), cold-read
 leakage (2), and the unknowable boundary (6) die with the seam; the
 park round trip (3) dies with Set aside; the jot round trip (4) dies
-with New scrap; the unrelated afterlives (5) die with the gradient and
+with type-then-park (one chord, caret at the join) and with typing
+straight into the pile; the unrelated afterlives (5) die with the gradient and
 the rhymed chips. F7 honestly **matches** the baseline (one pile,
 classification deferred — exactly her pile). Everything else beats it,
 and the empty state ships zero standing chrome, so the cost of the win
@@ -268,10 +283,12 @@ to a writer who never uses it is nothing — pixel for pixel.
 *Scraps are the editable text at your document's own tail, under a
 scrap line the tool knows and respects: export, counts, the AI, and
 cold read end at the line; your caret, typing, find, and history never
-do. With no scraps, nothing exists — first Set aside (one row above
-Exile) or New scrap (a scrap-toned line born at your caret, leaving as
-you commit it) creates the line; emptying the pile dissolves it; ctrl-Z
-is always the instant inverse. Parked text visibly departs toward the
+do. With no scraps, nothing exists — the first Set aside (one row
+above Exile) creates the line; a stray thought is typed as its own
+paragraph and parked by the same chord (no selection: the caret's
+paragraph departs, the caret stays at the join); typing or pasting
+straight into the pile just works (a blank line starts a new scrap);
+emptying the pile dissolves it; ctrl-Z is always the instant inverse. Parked text visibly departs toward the
 foot and the warm Scraps chip pulses; the drained graveyard chip stays
 its own. The chip takes you down; Esc brings you exactly home (only
 from excursions — a caret you walked in yourself is just text); the
@@ -283,10 +300,18 @@ your bottom-of-the-file pile, finally respected — and if you keep one
 already, selecting it and pressing Set aside once teaches the tool
 where your scrap line is.*
 
-**Arbitrations for the writer:** (a) the name — Scraps vs Compost;
-(b) newest-under-the-seam vs append-at-end; (c) formally close the 07
-travel question in favour of tap-travel + latch; (d) jot chord
-(ctrl-shift-enter proposed).
+**Arbitrations — resolved at veto (2026-07-06):** (a) the name is
+**Scraps** (adopted in the writer's review); (b) newest-under-the-seam
+stands unvetoed; (c) the travel question is closed — tap-travel +
+excursion latch; (d) the jot chord is moot, the capture line shelved.
+The writer's own words fix the mental model for the record: Scraps =
+deliberate, counted, visible, living; the graveyard = almost-by-
+accident, "undo-plus-plus" that spares digging through history.
+Post-veto mandates: the park receipt stays a careful attention-
+directing animation; the living-vs-dead visual language is audited
+app-wide for consistency; menu richness must survive the Rust build
+(the editor-passes dropdown named the current worst offender); the
+scrap wash gets its own token, distinct from note cards and selection.
 
 ## 7 · The record
 
