@@ -162,6 +162,72 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE ebtn:door: door toggled");
                 continue;
             }
+            // History strip (P1): `seed:journal` installs a synthetic fortnight;
+            // `strip:open` opens the surface; `strip:scrub:<0..1>` /
+            // `strip:pin:<0..1>` park/pin at a fraction of the whole history;
+            // `strip:restore` / `strip:now` are the two exits from the past.
+            if key == "seed:journal" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_journal(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE seed:journal: synthetic fortnight installed");
+                continue;
+            }
+            if key == "strip:open" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_strip_open(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE strip:open");
+                continue;
+            }
+            if let Some(frac) = key.strip_prefix("strip:scrub:") {
+                let f: f32 = frac.parse().expect("bad strip:scrub fraction");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_scrub(f, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:scrub:{f}");
+                continue;
+            }
+            if let Some(frac) = key.strip_prefix("strip:pin:") {
+                let f: f32 = frac.parse().expect("bad strip:pin fraction");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_pin(f, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:pin:{f}");
+                continue;
+            }
+            if key == "strip:restore" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_restore(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE strip:restore");
+                continue;
+            }
+            if key == "strip:now" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_now(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:now");
+                continue;
+            }
             // `reduce:motion` flips the config's motion-sensitivity switch
             // for this run, so the rig can drive the cross-fade code path.
             if key == "reduce:motion" {
