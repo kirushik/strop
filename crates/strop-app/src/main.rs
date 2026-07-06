@@ -324,6 +324,7 @@ fn main() {
                         editor.restore_annotations(loaded.annotations.clone());
                         editor.restore_journal(loaded.journal.clone());
                         editor.restore_graveyard(loaded.graveyard.clone());
+                        editor.restore_provenance(loaded.provenance.clone());
                     }
                     if let Some(notes) = tutorial_notes {
                         editor.restore_annotations(notes);
@@ -344,6 +345,11 @@ fn main() {
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);
                     }
+                    // A shipped compost-at-top document migrates ONCE, here —
+                    // after every channel is restored, before the first edit
+                    // (docs/impl/08-compost-fresh.md §2 "Adoption &
+                    // migration"; adjudications time-persistence 4).
+                    editor.migrate_scraps_geometry();
                     editor
                 });
                 window.focus(&editor.focus_handle(cx), cx);
