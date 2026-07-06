@@ -563,6 +563,33 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE {key}: {state}");
                 continue;
             }
+            // `move:X,Y` — a plain pointer move (no button): hover states
+            // (the cold read's flip-zone shading, tooltips-by-position).
+            if let Some(spec) = key.strip_prefix("move:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .expect("bad move in STROP_SMOKE")
+                };
+                let (x, y) = (next(), next());
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: point(px(x), px(y)),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
             // `drag:X1,Y1,X2,Y2` — press at the start, move in steps to the end,
             // release: the canonical click-drag selection gesture. Each move
             // carries the pressed button so drag-tracking sees a real drag.
