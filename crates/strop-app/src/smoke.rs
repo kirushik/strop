@@ -203,6 +203,21 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE exile:selection: selection filed in the graveyard");
                 continue;
             }
+            // `seed:mockup1|2|3` — the Gate-2 fidelity scenes, built
+            // through the real verbs (park / typed scraps / exile).
+            if let Some(n) = key.strip_prefix("seed:mockup") {
+                let scene: u8 = n.parse().expect("bad seed:mockup scene");
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_seed_mockup(scene, window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                eprintln!("SMOKE {key}: sourdough scene seeded");
+                continue;
+            }
             // `move:manuscript` selects the caret's pile paragraph and runs
             // the retrieval verb; `putback:scrap` runs the provenance line's
             // Put back at the caret's record.

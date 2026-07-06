@@ -8875,6 +8875,82 @@ impl Editor {
         cx.notify();
     }
 
+    /// Rig hook (`seed:mockup1|2|3`): the Gate-2 fidelity fixture — the
+    /// mockup's Sourdough scenes (docs/mockups/scraps-tail-2026-07.html)
+    /// built through the REAL verbs: one selection park (so the first scrap
+    /// carries provenance), typed scraps appended into the pile, one exile.
+    /// Scene 1 rests the caret inside the parked scrap (the provenance
+    /// one-liner after its delay); scene 2 parks the caret at the
+    /// "grandmother" paragraph for the selection-menu still; scene 3 grows
+    /// the pile (so the graveyard drops below the fold) and rests the caret
+    /// at the title-candidates scrap, typing-in-the-pile style.
+    pub fn debug_seed_mockup(&mut self, scene: u8, window: &mut Window, cx: &mut Context<Self>) {
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "The starter is older than my marriage and considerably more reliable. It has crossed two borders in a jam jar, wrapped in a sock, declared to no customs officer.\nMy grandmother would have said that bread rises on grief, which is the kind of sentence that sounds wise until you try to bake with it.\nFlour, water, salt, patience \u{2014} everyone recites the litany, and everyone lies about the fourth.\n\u{2026}and that is the whole secret: the loaf was never the point. The kitchen at six in the morning, the windows still black, the radio murmuring to itself \u{2014} that was the point, and the bread merely proved I had been there.\nThe neighbour's dog knows the smell of the starter and sits by my door on Fridays. Cut this, but the dog might open the next essay.\nThere was a longer version of this morning, with the neighbour, the dog, and a whole paragraph about the milkman that never earned its keep.",
+        );
+        self.sync_mutations();
+        if scene == 2 {
+            // Scene 2's piece runs long (the mockup's 1,842-word essay): the
+            // tail drops below the fold, so BOTH chips stand at the foot.
+            let after_c = self.doc.text().find("\u{2026}and that is").expect("fixture text");
+            self.doc.edit_bytes(
+                after_c..after_c,
+                "The first loaf of the week is a rehearsal, and we both know it; the oven forgives on Mondays what it will not forgive on Sundays.\nI have read that sourdough cultures carry the fingerprint of their kitchen, which would make mine a biography I never agreed to write.\nThe scale broke in March and the bread got better, which is either a lesson about instruments or a lesson about me, and I am not ready to know which.\nA neighbour once asked for a cup of the starter the way you would ask for a cup of sugar, and I have never felt so surveilled in my life.\nThere is a version of this essay that is only about the window above the sink, and some mornings I am writing that one instead.\n",
+            );
+            self.sync_mutations();
+        }
+        // Park the dog paragraph through the real verb (provenance + receipt).
+        let text = self.doc.text();
+        let dog = text.find("The neighbour's dog").expect("fixture text");
+        let (ds, de) = self.paragraph_bounds(dog);
+        self.selected_range = ds..de;
+        self.selection_reversed = false;
+        self.set_aside(&SetAside, window, cx);
+        // Two idea scraps, as typed-into-the-pile text (blank-line items).
+        let tail = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            tail..tail,
+            "\n\nwhat if the middle section runs backwards \u{2014} start with the burnt loaf, end with the flour bag unopened\n\ntitle candidates: Proof. / Crumb. / What the Oven Keeps.",
+        );
+        self.sync_mutations();
+        if scene == 3 {
+            // Scene 3's pile is deep enough that the record drops below the
+            // fold — the drained Graveyard chip is the frame's one chip.
+            let tail = self.doc.len_bytes();
+            self.doc.edit_bytes(
+                tail..tail,
+                "\n\nthe milkman detour could be its own piece \u{2014} three hundred words about the glass bottles nobody collects any more\n\nthe oven door hinge squeals in the same key as the gate; find out if that is a paragraph or a coincidence\n\ndoes the reader need the recipe at all, or is the recipe the part the piece exists to refuse\n\nbread as a clock: the whole essay told in rise times, nothing else allowed to mark the hours",
+            );
+            self.sync_mutations();
+        }
+        // Exile the milkman paragraph (the record's one entry).
+        let text = self.doc.text();
+        let milk = text.find("There was a longer version").expect("fixture text");
+        let (ms, me) = self.paragraph_bounds(milk);
+        // Take the leading newline so no empty block strands above the seam.
+        self.file_cut(ms.saturating_sub(1)..me, true, cx);
+        self.word_count = self.manuscript_word_count();
+        // Scene carets.
+        let text = self.doc.text();
+        match scene {
+            2 => {
+                let b = text.find("My grandmother").expect("fixture text");
+                self.set_cursor(b, false, cx);
+            }
+            3 => {
+                let t = text.find("What the Oven Keeps.").expect("fixture text");
+                self.set_cursor(t + "What the Oven Keeps.".len(), false, cx);
+            }
+            _ => {
+                let c = text.find("Cut this").expect("fixture text");
+                self.set_cursor(c, false, cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// Rig hook (`move:manuscript`): select the caret's paragraph in the
     /// pile and run the retrieval verb — the flank row's path without pixel
     /// coordinates. The landed range arrives SELECTED (the rig asserts sel).
@@ -10824,7 +10900,15 @@ impl Element for EditorElement {
                 image,
                 runs,
             });
-            top += height + paragraph_gap;
+            // The pile keeps a tighter vertical rhythm (the mockup's
+            // ~0.95em item spacing): its blank separator lines are honest
+            // text, so the gap halves instead.
+            top += height
+                + if in_pile {
+                    px((f32::from(paragraph_gap) * 0.5 / 2.).round() * 2.)
+                } else {
+                    paragraph_gap
+                };
             offset = range.end + 1; // step over '\n'
         }
 
@@ -10950,7 +11034,11 @@ impl Element for EditorElement {
             // viewport-wide: at 1600pt a full-width band would run under the
             // margin lane and change every card's ground.
             if par.scrap_wash {
-                let wash_top = y - if par.wash_edges.0 { px(16.) } else { line_height };
+                // The tile's upward bleed covers exactly the pile's own
+                // (halved) gap, so tiles join without ever painting over the
+                // previous block's text.
+                let pile_gap = px((f32::from(line_height) * 0.5 / 2.).round() * 2.);
+                let wash_top = y - if par.wash_edges.0 { px(16.) } else { pile_gap };
                 let wash_bottom =
                     y + par.height + if par.wash_edges.1 { px(10.) } else { px(0.) };
                 window.paint_quad(fill(
@@ -14510,15 +14598,18 @@ impl Editor {
                     rec.parked_unix,
                     strop_core::journal::now_ms() / 1000,
                 );
+                // The quote is a TRAILING fragment: keep its tail so the
+                // one-liner's date and verb survive the lane's width.
+                let quote: String = {
+                    let tail: Vec<char> = rec.origin_quote.chars().rev().take(24).collect();
+                    tail.into_iter().rev().collect()
+                };
                 cards.push(MarginCard {
                     id: PROV_ID_FLAG | rec_id,
                     top: desired,
                     anchor_y: f32::from(pos.y),
                     height: PROV_CARD_H,
-                    body: format!(
-                        "from \u{201C}\u{2026}{}\u{201D} · {date}",
-                        rec.origin_quote
-                    ),
+                    body: format!("from \u{201C}\u{2026}{quote}\u{201D} · {date}"),
                     active: false,
                     kind: NoteKind::Note,
                     title: String::new(),
