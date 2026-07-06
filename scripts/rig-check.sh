@@ -353,5 +353,27 @@ CBR=$(field "$R2" compost_blocks)
 if [ "${CBR:-0}" -gt 1 ] 2>/dev/null; then echo "  ok   both passages landed in the scraps (compost_blocks=$CBR)"; else
   echo "  FAIL compost_blocks=$CBR"; fail=1; fi
 
+echo "rig-check: a shipped compost-at-top file migrates once, at open (Scraps Wave A)"
+# Run 1 writes a REAL top-era .strop (seed:topera installs the legacy
+# boundary and saves). Run 2 reopens it: the one-time migration flips the
+# geometry before the first edit — the tail seam exists, the pile counts,
+# and the manuscript-only word count is UNCHANGED (membership-preserving).
+DOCM=$(mktemp --suffix=.md); : > "$DOCM"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCM" "seed:topera dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+[ -n "$OUT" ] || { echo "  FAIL no dump (seed:topera)"; exit 1; }
+expect "run 1 is top-era (no tail seam yet)"   null "$(field "$OUT" seam)"
+MW1=$(field "$OUT" manuscript_words)
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCM" "dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+[ -n "$OUT" ] || { echo "  FAIL no dump (migration run)"; exit 1; }
+rm -f "$DOCM" "$DOCM.strop"
+SEAM=$(field "$OUT" seam)
+if [ "${SEAM:-null}" != "null" ] && [ "${SEAM:-0}" -ge 1 ] 2>/dev/null; then
+  echo "  ok   reopening migrated to the tail era (seam=$SEAM)"
+else
+  echo "  FAIL seam=$SEAM — the top-era file did not migrate"; fail=1
+fi
+expect "the pile survived the flip"            1 "$(field "$OUT" compost_blocks)"
+expect "the count never teleported (07 N3)"    "$MW1" "$(field "$OUT" manuscript_words)"
+
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

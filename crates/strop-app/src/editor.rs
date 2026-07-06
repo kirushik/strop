@@ -8142,6 +8142,24 @@ impl Editor {
         cx.notify();
     }
 
+    /// Rig hook (`seed:topera`): rebuild the LIVE doc in the SHIPPED
+    /// compost-at-top shape and save — so the NEXT launch of this same file
+    /// exercises the one-time migration against a real store. The direct
+    /// boundary install mimics what an old build persisted; migration ran
+    /// at open (before smoke keys), so the live doc is boundary-less here.
+    pub fn debug_seed_top_era(&mut self, cx: &mut Context<Self>) {
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "an old compost thought kept at the top\n\nthe manuscript proper begins here",
+        );
+        self.doc.set_aside_boundary(Some(1));
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        self.save_now();
+        cx.notify();
+    }
+
     /// Cut the first occurrence of `needle` into the graveyard (rig helper;
     /// the deliberate form — collapses an emptied pile like the verb does).
     fn debug_cut_substring(&mut self, needle: &str, cx: &mut Context<Self>) {

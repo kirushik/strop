@@ -139,6 +139,20 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE aside:selection: selection moved to compost");
                 continue;
             }
+            // `seed:topera` rebuilds the live doc in the SHIPPED
+            // compost-at-top shape and saves it — the NEXT launch of the
+            // same file then exercises the one-time Scraps migration against
+            // a real store (rig-check's migration section).
+            if key == "seed:topera" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_top_era(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:topera: top-era compost file written");
+                continue;
+            }
             // `seed:demo` seeds the rich asides fixture for the VISUAL rig:
             // three compost items + sidebar + a full multi-paragraph grave entry
             // and a receded one (Bugs A & B in one frame).
