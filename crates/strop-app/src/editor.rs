@@ -18002,12 +18002,15 @@ impl Editor {
         let live = matches!(source, ColdReadSource::Live);
         // Banner station: the newest checkpoint the WRITER named, walked
         // newest→oldest; every automatic skipped by the one manual rule
-        // (Time 3). The Past banner leads with its own name instead.
+        // (Time 3) — and the ctrl-alt-s default "Checkpoint N" too: it is
+        // manual by flag but not her words, and the strip's own display
+        // law blanks exactly that prefix (L14 outranks the flag). The
+        // Past banner leads with its own name instead.
         let station = if live {
             self.store.as_ref().and_then(|s| {
                 s.checkpoints()
                     .iter()
-                    .filter(|c| c.manual)
+                    .filter(|c| c.manual && !c.name.starts_with("Checkpoint "))
                     .max_by_key(|c| c.created_unix)
                     .map(|c| c.name.clone())
             })
