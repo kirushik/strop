@@ -102,7 +102,9 @@ without hyphenation for that script + log. NOTICE gains Kuiken and
 Lebedev/LPPL attributions. Language routing: per word by first
 alphabetic char's script — Cyrillic → ru, Latin → en-US, else none.
 Soft hyphens (U+00AD) override the dictionary (crate behavior),
-stripped from painted text. NFC guaranteed at the document layer.
+stripped from painted text. The slice string is NEVER transformed
+(adjudications F2): hyphenation looks up an NFC copy of the single
+word and skips the word when its NFC form differs from the raw form.
 
 **2.5 Shaping.** Shape per fragment via
 `shape_line(text, size, &[TextRun], None)`; hyphenated fragments are
@@ -203,8 +205,9 @@ dimmed. History variant:
 
 > **"Draft complete"** · Sun 6 Jul · 4,120 words [Restore] · Esc returns
 
-— name-led bold, real date, plain dark **Restore** chip (routes
-through `restore_to_state`, which exits the takeover itself).
+— name-led bold, real date (computed at render), plain dark
+**Restore** chip (routes through `restore_to_state`, which is taught
+to exit the takeover and unpark the strip — adjudications F3).
 Titlebar: doc name + muted `— reading` / `— viewing "Draft
 complete"`; word-count pill and editor button hidden; ⌕, history
 clock, ≡ remain (their handlers guard, §4.5).
@@ -234,8 +237,10 @@ showing), omnibar (closed on entry). The scraps seam, pile, and
 graveyard never render — the book consumes `manuscript_slice`
 (rebased triple; reactions add `manuscript_base_char()` back when
 filing). The door state is untouched; a pass completing mid-read
-parks (the deferred-pass lull gate holds; cards reveal on exit —
-corner round confirms the reveal-clock interaction).
+parks because the parking predicate learns the room
+(`typing_burst_live() || cold_read.is_some()` in `deliver_pass` AND
+the lull watcher — adjudications F7); exit joins scroll/door/new-pass
+as the flush trigger, after surfaces are restored.
 
 **4.5 Chords that pierce the ColdRead context** (App-scoped):
 palette (ctrl-shift-p), find (ctrl-f), strip (ctrl-alt-h), passes
@@ -254,9 +259,11 @@ table.
   bare tick), snapshot `manuscript_slice`, paginate, **always page
   1** (research-page §4.6 argues this; re-entry = the performance
   starts from the top), focus the takeover.
-- If the strip is open (parked or not) a Live entry closes it first;
-  the omnibar/menu/popover close; a running pass does NOT block
-  entry (results park).
+- Strip open at now: a Live entry closes it first. Canvas showing
+  the PAST (parked strip or history panel): the Live verb guards with
+  the pulse (adjudications Time 1). The omnibar/menu/popover close;
+  the composer resolves first (F8); a running pass does NOT block
+  entry (results park per F7).
 - Exit (Esc, two-level): reaction input open → close input (clear);
   else drop the takeover, restore every suppressed surface, return
   caret/scroll exactly as left (nothing moved — the takeover never
@@ -267,11 +274,13 @@ table.
 **4.7 History variant ("read this version").** Source: a
 **materialized checkpoint state** — its OWN manuscript (the state's
 own boundary; `checkpoint_state(cp)`). v1 affordance: a quiet `Read`
-text-verb in the strip's parked banner beside Restore (corner round
-may add the panel path). Reactions are **disabled** in Past mode
-(selection does nothing; you annotate the present only). Restore
-chip per §4.1. Strip-scrub arbitrary moments stay in the flat parked
-preview — the book binds to checkpoints only (v1).
+text-verb in the strip's parked banner beside Restore — rendered only
+when the playhead resolves to a checkpoint WITH a materialized state
+(adjudications Regions 1). Selection and copy stay LIVE in Past mode;
+what Past disables is the reaction INPUT (never raises — you annotate
+the present only; adjudications Scopes 6). Restore chip per §4.1.
+Strip-scrub arbitrary moments stay in the flat parked preview — the
+book binds to checkpoints only (v1).
 
 ## 5. Reactions (Wave B)
 
@@ -296,13 +305,16 @@ undo, same re-anchoring, same margin afterlife (done/dismissed fade;
 orphan → Scraps with anchor fragment). Cosmetic rule at card render:
 a body starting `[?!~] ` bolds its first glyph. No schema change.
 
-**5.4 The reading lane.** 230 px right of the page, top-aligned with
-the text block: this session's reactions as warm note cards — muted
-ellipsized quoted anchor line (~42 chars), then body. **Anchor
-links:** clicking a lane card flips to the page containing its
-anchor and flashes the anchored words once (ARRIVAL_FLASH grammar).
-Narrow windows (< ~900 px): the lane hides; reactions still file
-(cards await on the desk).
+**5.4 The reading lane.** 230 px right of the page (18 px gap; the
+page + lane GROUP centers, and the lane is reserved from entry so the
+page never moves — adjudications S2), top-aligned with the text
+block: this session's reactions as warm note cards in DOCUMENT order
+— muted ellipsized quoted anchor line (~42 chars, grapheme-safe),
+then body. Overflow: recede-in-place, the margin's own grammar (S6).
+**Anchor links:** clicking a lane card flips to the page containing
+`range.start` and flashes the anchored words once (ARRIVAL_FLASH
+grammar, via the book's own paint). Windows too narrow for the group:
+the lane hides; reactions still file (cards await on the desk).
 
 ## 6. Decisions taken in this spec (arbitrations within settled law)
 
