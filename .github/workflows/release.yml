@@ -47,7 +47,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             bin: strop.exe
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: exclude build dirs from Defender (Windows build speedup)
         # The dist build (thin LTO + cg=1) is the slowest leg; Defender scanning
         # every compiler artifact drags it further. Exclude the build dirs.
