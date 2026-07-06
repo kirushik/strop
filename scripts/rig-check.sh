@@ -469,5 +469,125 @@ fi
 expect "the pile survived the flip"            1 "$(field "$OUT" compost_blocks)"
 expect "the count never teleported (07 N3)"    "$MW1" "$(field "$OUT" manuscript_words)"
 
+# ---------------- The cold read (impl 05 Wave B) ----------------------------
+
+echo "rig-check: cold read — entry/exit round-trip (scroll, checkpoints, focus, margin)"
+DOCR=$(mktemp --suffix=.md); cp "$DOC" "$DOCR"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCR" "wheel:800,400,-240 dump:ui coldread:open dump:ui escape dump:ui coldread:open escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
+[ -n "$D4" ] || { echo "  FAIL missing dumps"; exit 1; }
+rm -f "$DOCR" "$DOCR.strop"
+SY1=$(field "$D1" scroll_y); SY3=$(field "$D3" scroll_y)
+CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
+expect "the room is up with a real book"      true "$(field "$CR2" open)"
+expect "always page 1 (research-page 4.6)"    0 "$(field "$CR2" page)"
+expect "the takeover holds focus (F8)"        '"ColdRead"' "$(field "$D2" focused)"
+expect "the margin sleeps under the desk"     true "$(field "$D2" margin_hidden)"
+expect "entry checkpointed once (L3)"         1 "$(field "$D2" checkpoints)"
+expect "Esc drops the room"                   null "$(field "$D3" coldread)"
+expect "the margin gate reopens"              false "$(field "$D3" margin_hidden)"
+expect "scroll untouched by the round trip"   "$SY1" "$SY3"
+expect "double-open dedupes the checkpoint"   1 "$(field "$D4" checkpoints)"
+
+echo "rig-check: cold read — guard pulses (the pierce table, F4)"
+DOCG=$(mktemp --suffix=.md); cp "$DOC" "$DOCG"
+OUT=$(WRUN_TAIL=300 scripts/wrun.sh "$DOCG" "coldread:open ctrl-shift-p dump:ui ctrl-f dump:ui ctrl-alt-h dump:ui ctrl-shift-d dump:ui j dump:ui wait:1100 shift dump:ui" 2>/dev/null | grep 'UI-DUMP')
+rm -f "$DOCG" "$DOCG.strop"
+i=1
+for chord in ctrl-shift-p ctrl-f ctrl-alt-h ctrl-shift-d; do
+  D=$(echo "$OUT" | sed -n ${i}p); i=$((i+1))
+  CR=$(echo "$D" | grep -oE '"coldread":\{[^}]*\}')
+  expect "$chord raises nothing"              '[]' "$(echo "$D" | grep -oE '"overlays":\[[^]]*\]' | sed 's/"overlays"://')"
+  expect "$chord pulses the banner"           true "$(field "$CR" pulse)"
+done
+D=$(echo "$OUT" | sed -n 5p); CR=$(echo "$D" | grep -oE '"coldread":\{[^}]*\}')
+expect "a letter key pulses (typing rule)"    true "$(field "$CR" pulse)"
+D=$(echo "$OUT" | sed -n 6p); CR=$(echo "$D" | grep -oE '"coldread":\{[^}]*\}')
+expect "a lone shift does NOT pulse"          false "$(field "$CR" pulse)"
+
+echo "rig-check: cold read — copy is source-honest across hyphenated breaks (F5)"
+DOCC=$(mktemp --suffix=.md)
+{
+  echo "Типографика переносов проверяется длинными русскими словами: образовательными учреждениями, предположительными обстоятельствами, естественнонаучными представлениями."
+  echo
+  echo "Замечательное словосочетание переносится предсказуемо, и выделение через перенос обязано вернуть исходную подстроку без дефисов и без потерянных пробелов."
+} > "$DOCC"
+OUT=$(WRUN_TAIL=100 scripts/wrun.sh "$DOCC" "coldread:open dump:ui coldread:select:0,300 coldread:copycheck" 2>&1 | grep -E "UI-DUMP|COPY-GOLDEN")
+rm -f "$DOCC" "$DOCC.strop"
+CR=$(echo "$OUT" | grep -oE '"coldread":\{[^}]*\}' | head -1)
+HY=$(field "$CR" hyphens)
+if [ "${HY:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the RU page really hyphenates (hyphens=$HY)"; else
+  echo "  FAIL no hyphen-ended lines on the RU page"; fail=1; fi
+if echo "$OUT" | grep -q "COPY-GOLDEN: OK"; then echo "  ok   clipboard equals the source substring"; else
+  echo "  FAIL $(echo "$OUT" | grep COPY-GOLDEN)"; fail=1; fi
+
+echo "rig-check: cold read — the reveal clock holds in the room (F7)"
+DOCD=$(mktemp --suffix=.md); cp "$DOC" "$DOCD"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCD" "coldread:open seed:deliver wait:1200 dump:ui wheel:800,500,-240 dump:ui escape wait:200 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); DW=$(echo "$OUT" | sed -n 2p); D2=$(echo "$OUT" | sed -n 3p)
+rm -f "$DOCD" "$DOCD.strop"
+expect "results park while the room is up"    true "$(field "$D1" ai_deferred)"
+expect "no cards land mid-read"               0 "$(field "$D1" open_diagnoses)"
+# F6: the wheel is eaten twice — nothing scrolls, nothing flushes, no flip.
+CRW=$(echo "$DW" | grep -oE '"coldread":\{[^}]*\}')
+expect "a wheel mid-read never scrolls (F6)"  "$(field "$D1" scroll_y)" "$(field "$DW" scroll_y)"
+expect "…never flushes the parked pass"       true "$(field "$DW" ai_deferred)"
+expect "…never flips the page"                0 "$(field "$CRW" page)"
+expect "exit flushes the parked pass"         false "$(field "$D2" ai_deferred)"
+OD=$(field "$D2" open_diagnoses)
+if [ "${OD:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the cards landed after Esc ($OD)"; else
+  echo "  FAIL nothing landed after exit"; fail=1; fi
+
+echo "rig-check: cold read — reactions file as ordinary notes (spec 5.3)"
+DOCN=$(mktemp --suffix=.md); cp "$DOC" "$DOCN"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCN" "coldread:open coldread:select:5,40 coldread:react:? dump:ui coldread:select:60,90 coldread:react:~ dump:ui escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p)
+rm -f "$DOCN" "$DOCN.strop"
+CR1=$(echo "$D1" | grep -oE '"coldread":\{[^}]*\}')
+CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
+expect "the chip filed the glyph body (P3)"   '"? doubt"' "$(field "$CR1" last_body)"
+expect "the lane carries the session card"    1 "$(field "$CR1" lane)"
+expect "a second reaction joins the lane"     2 "$(field "$CR2" lane)"
+expect "both are ordinary open notes"         2 "$(field "$D2" open_notes)"
+expect "they live on after the room closes"   2 "$(field "$D3" open_notes)"
+
+echo "rig-check: cold read — Past-from-parked round trip (Time 7, regions 13)"
+DOCL=$(mktemp --suffix=.md); echo "A live line for the legacy litmus." > "$DOCL"
+OUT=$(WRUN_TAIL=300 scripts/wrun.sh "$DOCL" "seed:legacy dump:ui coldread:open dump:ui escape strip:open strip:scrub:0.5 coldread:past:6 dump:ui escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
+rm -f "$DOCL" "$DOCL.strop"
+CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
+CR3=$(echo "$D3" | grep -oE '"coldread":\{[^}]*\}')
+expect "seed:legacy carries the Top-era tick" 7 "$(field "$D1" checkpoints)"
+expect "a Live read of a legacy file opens"   true "$(field "$CR2" open)"
+expect "the Past book reads the OLD state"    '"past"' "$(field "$CR3" source)"
+P1=$(field "$CR3" p1)
+case "$P1" in
+  '"The manuscript opens on '*) echo "  ok   page 1 is the manuscript, never the pile (F1)";;
+  *) echo "  FAIL Past page 1 = $P1 (the pile leaked in)"; fail=1;;
+esac
+POS3=$(field "$D3" pos_ms); POS4=$(field "$D4" pos_ms)
+CP3=$(field "$D3" checkpoints); CP4=$(field "$D4" checkpoints)
+expect "a Past read leaves NO entry checkpoint" "$CP3" "$CP4"
+expect "the parked strip survives untouched"  true "$(field "$D4" parked)"
+expect "…at the identical playhead"           "$POS3" "$POS4"
+expect "the parked banner returns"            true "$(field "$D4" banner)"
+
+echo "rig-check: cold read — the empty book and the reduce-motion flip (regions 4, S12)"
+DOCE=$(mktemp --suffix=.md); : > "$DOCE"
+OUT=$(WRUN_TAIL=100 scripts/wrun.sh "$DOCE" "coldread:open dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+rm -f "$DOCE" "$DOCE.strop"
+CR=$(echo "$OUT" | grep -oE '"coldread":\{[^}]*\}')
+expect "an empty doc is one honest blank page" 1 "$(field "$CR" pages)"
+expect "…counted honestly in the banner"       0 "$(field "$CR" words)"
+DOCM2=$(mktemp --suffix=.md); cp "$DOC2" "$DOCM2"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCM2" "coldread:open right dump:ui escape reduce:motion coldread:open right dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p)
+rm -f "$DOCM2" "$DOCM2.strop"
+CR1=$(echo "$D1" | grep -oE '"coldread":\{[^}]*\}')
+CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
+expect "a flip from rest fades in (S5)"        true "$(field "$CR1" fading)"
+expect "reduce_motion flips instantly (S12)"   false "$(field "$CR2" fading)"
+
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

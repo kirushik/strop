@@ -469,7 +469,8 @@ actions!(
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
         ScrapsTravel, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
-        MoveToManuscript, PutBackScrap, ToggleGraveyard,
+        MoveToManuscript, PutBackScrap, ToggleGraveyard, ReadItCold, CrRefuse, CrNoop,
+        CrCopy, CrEscape, CrNextPage, CrPrevPage, CrFirstPage, CrLastPage,
     ]
 );
 
@@ -617,6 +618,60 @@ pub fn bind_keys(cx: &mut App) {
         cx.bind_keys(crate::text_field::field_editing_bindings(ctx));
     }
     cx.bind_keys(crate::text_field::composer_only_bindings("NoteComposer"));
+
+    // The cold read's own key context (impl 05 §1; adjudications Scopes 1).
+    // ColdRead OWNS the reader navigation set; everything else that is bound
+    // anywhere binds HERE to the one refusal action, so a guarded chord can
+    // never fall through to an App-context binding underneath (unbound =
+    // silent swallow = banned). up/down are inert without a pulse.
+    let cr = Some("ColdRead");
+    cx.bind_keys([
+        KeyBinding::new("escape", CrEscape, cr),
+        KeyBinding::new("right", CrNextPage, cr),
+        KeyBinding::new("left", CrPrevPage, cr),
+        KeyBinding::new("space", CrNextPage, cr),
+        KeyBinding::new("shift-space", CrPrevPage, cr),
+        KeyBinding::new("pagedown", CrNextPage, cr),
+        KeyBinding::new("pageup", CrPrevPage, cr),
+        KeyBinding::new("home", CrFirstPage, cr),
+        KeyBinding::new("end", CrLastPage, cr),
+        KeyBinding::new("ctrl-home", CrFirstPage, cr),
+        KeyBinding::new("ctrl-end", CrLastPage, cr),
+        KeyBinding::new("up", CrNoop, cr),
+        KeyBinding::new("down", CrNoop, cr),
+        // F5: copy is source-honest and alive — both CUA entrances.
+        KeyBinding::new("ctrl-c", CrCopy, cr),
+        KeyBinding::new("ctrl-insert", CrCopy, cr),
+    ]);
+    // F4 belt 1: registry-driven refusal. Every command chord binds to
+    // `CrRefuse` in the ColdRead context UNLESS the ratified allow-list names
+    // it (Scopes 1: f2 rename, ctrl-n, ctrl-o pierce; ctrl-shift-l is the
+    // toggle-exit and must reach the App-context ReadItCold binding; ctrl-q
+    // is bound outside the registry and stays live). A future command added
+    // to the registry is guarded by default.
+    const CR_PIERCE: &[&str] = &["Rename Document…", "New Document", "Open Document…", "Read it cold"];
+    cx.bind_keys(crate::commands::all().iter().filter_map(|cmd| {
+        let keys = cmd.keys?;
+        if CR_PIERCE.contains(&cmd.label) {
+            return None;
+        }
+        Some(KeyBinding::new(keys, CrRefuse, cr))
+    }));
+    // …and the raw Editor-context chords that aren't registry commands: every
+    // one the ColdRead rows above don't own binds to the refusal too.
+    cx.bind_keys(
+        [
+            "backspace", "shift-backspace", "delete", "ctrl-backspace", "ctrl-delete",
+            "ctrl-left", "ctrl-right", "ctrl-up", "ctrl-down", "ctrl-shift-up",
+            "ctrl-shift-down", "shift-left", "shift-right", "shift-up", "shift-down",
+            "ctrl-shift-left", "ctrl-shift-right", "ctrl-a", "shift-home", "shift-end",
+            "ctrl-shift-home", "ctrl-shift-end", "shift-pageup", "shift-pagedown", "enter",
+            "shift-enter", "ctrl-x", "ctrl-v", "shift-delete", "shift-insert", "ctrl-y",
+            "ctrl-alt-1", "ctrl-alt-2", "ctrl-alt-3", "f10",
+        ]
+        .into_iter()
+        .map(|chord| KeyBinding::new(chord, CrRefuse, cr)),
+    );
 }
 
 
@@ -1240,6 +1295,15 @@ pub struct Editor {
     /// inside the draw pass (the 2026-06-12 corruption rule, like
     /// `zone_row_bounds`).
     strip_rail: std::rc::Rc<std::cell::RefCell<Option<StripGeom>>>,
+    /// The cold read (impl 05 Wave B): the writer-invoked, read-only, paged
+    /// takeover — the reading room. `Some` while the room is up; beside
+    /// `history_preview` per the state-on-Editor + render-switch precedent.
+    cold_read: Option<ColdRead>,
+    /// The book page's painted bounds (WINDOW coords), captured every
+    /// prepaint so the flip/selection mouse handlers map pointer positions
+    /// against the SAME bounds the page drew — CSD-inset-safe. `Rc<RefCell>`,
+    /// never entity state (the 2026-06-12 rule, like `zone_row_bounds`).
+    cr_page_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1642,6 +1706,8 @@ impl Editor {
             last_frame: None,
             strip: Strip::default(),
             strip_rail: std::rc::Rc::default(),
+            cold_read: None,
+            cr_page_bounds: std::rc::Rc::default(),
         }
     }
 
@@ -1906,6 +1972,9 @@ impl Editor {
 
     /// Record a named version snapshot in the document file.
     fn add_checkpoint(&mut self, _: &AddCheckpoint, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         // Save first: the checkpoint materializes its state from the store
         // (Checkpoint::state), and the store's spans/blocks/annotations are
         // only as fresh as the last save. Checkpointing implying durability
@@ -2390,6 +2459,11 @@ impl Editor {
         self.goal_x = None;
         self.marked_range = None;
         self.caret_attrs.clear();
+        // F3: Restore exits everything, everywhere — the reading room drops
+        // in the same breath as the previews below (the "nothing moved"
+        // promise belongs to Esc, not to a document swap).
+        self.cold_read = None;
+        *self.cr_page_bounds.borrow_mut() = None;
         // Drops any preview (panel `history_view` OR the strip's
         // `history_preview`) so the live restored document is what shows.
         self.exit_history(cx);
@@ -2414,6 +2488,20 @@ impl Editor {
         if let Some(store) = &self.store {
             store.add_checkpoint("Restored", false);
         }
+        // F3, the strip epilogue (hoisted from `strip_restore` so EVERY
+        // entrance — panel, strip, the book's Restore chip — leaves an open
+        // strip unparked, snapped to now, and re-baked over the new data).
+        if self.strip.open {
+            let now = strop_core::journal::now_ms();
+            self.strip.parked = false;
+            self.strip.scrubbing = false;
+            self.strip.pin_ms = None;
+            self.strip.pos_ms = now;
+            self.strip.scratch = None;
+            self.history_preview = None;
+            self.strip_bake(now);
+            cx.notify();
+        }
         self.mark_dirty();
         self.bump_activity();
     }
@@ -2424,6 +2512,9 @@ impl Editor {
     /// surface). The right-side panel stays reachable via the palette ("History
     /// panel"); the two never open together (spec §0).
     fn toggle_strip(&mut self, _: &ToggleStrip, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.strip.open {
             self.close_strip(cx);
         } else {
@@ -2865,20 +2956,14 @@ impl Editor {
         let spans = scratch.replay.spans.clone();
         let blocks = scratch.replay.blocks.clone();
         let from_unix = self.strip.pos_ms / 1000;
+        // The strip epilogue (unpark, snap to now, re-bake) now lives inside
+        // `restore_to_state` (F3) so every Restore entrance shares it.
         self.restore_to_state(text, spans, blocks, from_unix, cx);
-        // Data changed — refresh the bake, snap the playhead to the new present
-        // (the restore IS the new now; the fabric never re-scales under the eye
-        // mid-view, only here — design §1).
-        let now = strop_core::journal::now_ms();
-        self.strip.parked = false;
-        self.strip.scrubbing = false;
-        self.strip.pin_ms = None;
-        self.strip.pos_ms = now;
-        self.strip.scratch = None;
-        // Drop the preview even if the restore degraded (no store): the strip
-        // returns to the live document at now.
-        self.history_preview = None;
-        self.strip_bake(now);
+        // Belt for the degraded no-store path (restore_to_state returned
+        // before its epilogue): the strip still returns to the live now.
+        if self.strip.parked {
+            self.strip_return_to_now(cx);
+        }
         cx.notify();
     }
 
@@ -2901,6 +2986,9 @@ impl Editor {
 
     /// Export next to the .strop file (doc.strop -> doc.md).
     fn export_markdown(&mut self, _: &ExportMarkdown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         let Some(store) = &self.store else {
             eprintln!("strop: no document file to export next to");
             return;
@@ -2957,6 +3045,9 @@ impl Editor {
     /// Insert a footnote: a ref atom at the cursor, a def block at the end,
     /// cursor lands in the def. (Two transactions; two undos remove it.)
     fn insert_footnote(&mut self, _: &InsertFootnote, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         // Fresh internal label, Pandoc-style: never reused (counting defs
         // collides after a deletion). The PAINTED number derives from ref
         // order at paint time; the stored id is identity only.
@@ -3163,6 +3254,9 @@ impl Editor {
     /// snapshot (history included). The open document keeps its own path —
     /// continuous save never re-targets.
     fn save_copy_as(&mut self, _: &SaveCopyAs, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.save_now();
         let Some(store) = &self.store else {
             eprintln!("strop: no document to copy");
@@ -3207,6 +3301,9 @@ impl Editor {
     /// ctrl-m: note on the selection (or the word at the caret), then
     /// open the composer for its body.
     fn add_note(&mut self, _: &AddNote, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         let range = if self.selected_range.is_empty() {
             self.word_range_at(self.cursor_offset())
         } else {
@@ -3378,6 +3475,9 @@ impl Editor {
     /// The thesis, running: an editorial pass that names problems as
     /// queries in the margin and never rewrites a word.
     fn run_diagnosis(&mut self, _: &RunDiagnosis, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         // ctrl-shift-d honours the session depth (`diagnosis_mode`, else config);
         // the mode is resolved HERE and pinned into the run, so a later menu row
         // can pin a different depth without disturbing this default.
@@ -3385,6 +3485,9 @@ impl Editor {
     }
 
     fn run_believing(&mut self, _: &RunBelieving, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.run_pass(PassKind::Believing, cx);
     }
 
@@ -3393,6 +3496,9 @@ impl Editor {
     /// research asks for — never inferred, never automatic in v1, so a
     /// drafting burst can never be interrupted by a wrong guess.
     fn toggle_review(&mut self, _: &ToggleReview, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.toggle_door(cx);
     }
 
@@ -3624,6 +3730,9 @@ impl Editor {
     }
 
     fn cancel_ai_run(&mut self, _: &CancelAiRun, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         // UI-level cancel: the response of the abandoned generation is
         // ignored when it lands (no need to abort the request itself).
         // A parked deferral dies with its generation too (flush checks it),
@@ -3756,7 +3865,10 @@ impl Editor {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
-        if self.typing_burst_live() {
+        if self.typing_burst_live() || self.cold_read.is_some() {
+            // F7: the reveal clock holds in the reading room — a pass
+            // completing mid-read parks; exit flushes it after the
+            // suppressed surfaces restore.
             self.deferred_pass = Some(DeferredPass { diagnoses, generation });
             self.watch_for_lull(cx);
         } else {
@@ -3791,7 +3903,10 @@ impl Editor {
                     if editor.deferred_pass.is_none() {
                         return true;
                     }
-                    if editor.typing_burst_live() {
+                    // F7: the room holds results parked like a live burst
+                    // does — the lull watcher waits it out; the exit flush
+                    // usually lands them first.
+                    if editor.typing_burst_live() || editor.cold_read.is_some() {
                         return false;
                     }
                     editor.flush_deferred_pass(cx);
@@ -3871,6 +3986,9 @@ impl Editor {
     /// Guided config-file flow: ensure the commented template exists,
     /// open it in the system editor, and say what happens next.
     fn open_ai_config(&mut self, _: &OpenAiConfig, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         let path = crate::config::write_template_if_missing();
         crate::files::open_external(&path);
         self.ai_generation += 1;
@@ -3888,6 +4006,9 @@ impl Editor {
     /// A 1-token chat call: moves 401s from run-time to setup-time. On a
     /// provider error it also fetches /models — that list IS the picker.
     fn test_ai_connection(&mut self, _: &TestAiConnection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.config = crate::config::load();
         let ai = self.config.ai.clone();
         if !ai.configured() {
@@ -3965,6 +4086,9 @@ impl Editor {
     /// through toml_edit, so the file stays the storage and hand edits
     /// stay respected (DESIGN §0 directive 3).
     fn open_ai_settings(&mut self, _: &OpenAiSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.ai_settings.is_some() {
             return;
         }
@@ -4295,14 +4419,23 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.set_diagnosis_mode("developmental", cx);
     }
 
     fn mode_line(&mut self, _: &DiagnosisModeLine, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.set_diagnosis_mode("line", cx);
     }
 
     fn mode_copy(&mut self, _: &DiagnosisModeCopy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.set_diagnosis_mode("copy", cx);
     }
 
@@ -4402,6 +4535,9 @@ impl Editor {
     /// ctrl-f / the titlebar search pill: the omnibox in find mode, seeded
     /// with the selection so "select, ctrl-f" searches for it.
     fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         let seed = if self.selected_range.is_empty() {
             String::new()
         } else {
@@ -4517,6 +4653,9 @@ impl Editor {
     /// menu bar of a chrome-minimal editor, PLAN.md E1). Already in command
     /// mode → close; in another mode → switch to it; closed → open.
     fn toggle_palette(&mut self, _: &TogglePalette, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.palette_input.is_some()
             && matches!(omni_mode(&self.palette_query).0, OmniMode::Command)
         {
@@ -5102,6 +5241,9 @@ impl Editor {
     /// ctrl-h: open the omnibox in find mode (if not already there) and add
     /// the replace field beneath the query.
     fn replace(&mut self, _: &Replace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         let in_find = self.palette_input.is_some()
             && matches!(omni_mode(&self.palette_query).0, OmniMode::Find);
         if !in_find {
@@ -5348,6 +5490,9 @@ impl Editor {
     /// and anything less applies; at a bare caret, sets a sticky attr for
     /// the next typed text (the universal rich-editor convention).
     fn toggle_span(&mut self, attr: InlineAttr, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         // Read-only while previewing the past: formatting the past is
         // undefined. The strip pulses its banner (the uniform refusal, Bug B);
         // the panel just no-ops.
@@ -5380,6 +5525,9 @@ impl Editor {
     /// link shows it. The rename-input idiom: Enter commits, Esc cancels, a
     /// click-away blur commits (`commit_field_on_blur`).
     fn open_link_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         // Read-only while previewing the past (mirrors toggle_span).
         if self.strip.is_parked() {
             self.pulse_strip(cx);
@@ -5991,6 +6139,9 @@ impl Editor {
     }
 
     fn toggle_history(&mut self, _: &ToggleHistory, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.history_view.is_some() {
             self.exit_history(cx);
         } else {
@@ -6005,7 +6156,16 @@ impl Editor {
     /// control flips to "scraps · N", the mid-pile screenshot self-identifies);
     /// later presses resume `pile_end`, clamped into the current pile.
     pub(crate) fn scraps_travel(&mut self, _: &ScrapsTravel, _: &mut Window, cx: &mut Context<Self>) {
-        if self.history_view.is_some() || self.strip.is_parked() {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
+        if self.strip.is_parked() {
+            // Fix-in-passing (scopes 12): the parked swallow becomes the
+            // one uniform refusal.
+            self.pulse_strip(cx);
+            return;
+        }
+        if self.history_view.is_some() {
             return; // the past is a preview — no live travel over it
         }
         let Some(pile) = self.doc.scraps_char_range() else {
@@ -6058,6 +6218,14 @@ impl Editor {
     /// blink the receipt. Seam-spanning selections are refused (region verbs
     /// are single-region; seam-mechanics 2).
     fn set_aside(&mut self, _: &SetAside, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
+        if self.strip.is_parked() {
+            // Fix-in-passing (scopes 12): pulse, never a silent swallow.
+            self.pulse_strip(cx);
+            return;
+        }
         if self.history_view.is_some() {
             return;
         }
@@ -6213,6 +6381,9 @@ impl Editor {
     /// graveyard-interplay 5; Exile works below the seam, 08 §2). Refused on
     /// a seam-spanning selection (region verbs are single-region).
     fn send_to_graveyard(&mut self, _: &SendToGraveyard, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.history_view.is_some() || self.selected_range.is_empty() {
             return;
         }
@@ -6239,6 +6410,9 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.history_view.is_some() || self.selected_range.is_empty() {
             return;
         }
@@ -6262,6 +6436,9 @@ impl Editor {
     /// narrow-width fallback). Degrades to the retrieval landing when the
     /// quote was edited away — loudly selected either way, never silent.
     fn put_back_scrap(&mut self, _: &PutBackScrap, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.history_view.is_some() {
             return;
         }
@@ -6475,6 +6652,9 @@ impl Editor {
     /// record lives in the scroll flow now, there is nothing to "open"). Same
     /// gesture as clicking the footer bar.
     fn toggle_graveyard(&mut self, _: &ToggleGraveyard, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.scroll_to_graveyard(cx);
     }
 
@@ -6867,6 +7047,9 @@ impl Editor {
     /// "Set Session Goal…" (DESIGN §4.2): a number, a live delta in the
     /// titlebar, a quiet sage dot at the finish line. Session-only.
     fn set_session_goal(&mut self, _: &SetSessionGoal, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.goal_input.is_some() {
             return;
         }
@@ -6938,6 +7121,13 @@ impl Editor {
     /// which closes the same layer. Order: AI settings → palette →
     /// shortcuts → selection popover → find/replace → history takeover.
     fn escape_mode(&mut self, _: &EscapeMode, window: &mut Window, cx: &mut Context<Self>) {
+        // The cold read's belt for focus loss (F4): its own key context owns
+        // Esc while focused; this branch catches an Esc that reached the
+        // editor context while the takeover is somehow up.
+        if self.cold_read.is_some() {
+            self.cr_escape_impl(window, cx);
+            return;
+        }
         if self.ai_settings.is_some() {
             self.close_ai_settings(window, cx);
             return;
@@ -7015,11 +7205,17 @@ impl Editor {
     }
 
     fn show_shortcuts(&mut self, _: &ShowShortcuts, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         self.shortcuts_open = !self.shortcuts_open;
         cx.notify();
     }
 
-    fn open_welcome(&mut self, _: &OpenWelcome, _: &mut Window, _: &mut Context<Self>) {
+    fn open_welcome(&mut self, _: &OpenWelcome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         crate::files::open_welcome_window();
     }
 
@@ -7662,6 +7858,9 @@ impl Editor {
     /// but kinds NEVER stamp the seam line itself: it renders as the seam
     /// regardless, and a kinded seam was the "tiny grey heading" bug.
     fn toggle_block(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.strip.is_parked() {
             self.pulse_strip(cx);
             return;
@@ -7781,6 +7980,9 @@ impl Editor {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         // A cut is a mutation — refused (pulsed) while parked, not a silent
         // copy-then-nothing (Bug B). Use Copy to lift text out of the past.
         if self.strip.is_parked() {
@@ -7798,6 +8000,9 @@ impl Editor {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         let Some(item) = cx.read_from_clipboard() else {
             // Headless-rig transport shim (see smoke::clipboard_override):
             // present so a leak test CAN catch a field paste falling
@@ -7883,6 +8088,9 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.strip.is_parked() {
             self.pulse_strip(cx);
             return;
@@ -7907,6 +8115,9 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         if self.strip.is_parked() {
             self.pulse_strip(cx);
             return;
@@ -7933,6 +8144,13 @@ impl Editor {
     // -- Scrolling ------------------------------------------------------------
 
     fn on_scroll_wheel(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // F6: the wheel is eaten while the reading room is up — BEFORE the
+        // deferred-pass flush below (nothing inside the read flushes, F7)
+        // and before any scroll. The takeover also stops propagation; this
+        // is the second belt.
+        if self.cold_read.is_some() {
+            return;
+        }
         // §0.6 law 1, second line of defense: while a blocking overlay is
         // up, the document never scrolls — even if a wheel event slips
         // past the overlay's own stop_propagation.
@@ -8493,10 +8711,25 @@ impl Editor {
         fields.extend(self.alt_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.link_input.as_ref().map(|(_, i)| i.clone()));
         fields.extend(self.goal_input.clone());
+        fields.extend(self.cold_read.as_ref().and_then(|cr| cr.input.clone()));
         let focused_field = fields
             .iter()
             .find(|f| f.read(cx).focus_handle.is_focused(window));
-        let focused = focused_field.map_or("Editor", |f| f.read(cx).debug_caret().0);
+        let focused = focused_field.map_or_else(
+            || {
+                // The reading room's desk holds its own focus (F8's rig bit).
+                if self
+                    .cold_read
+                    .as_ref()
+                    .is_some_and(|cr| cr.focus_handle.is_focused(window))
+                {
+                    "ColdRead"
+                } else {
+                    "Editor"
+                }
+            },
+            |f| f.read(cx).debug_caret().0,
+        );
         let focused_input_text = focused_field.map(|f| f.read(cx).content.clone());
         // The focused field's caret + selection as CHAR indices, so the smoke
         // rig can assert mouse/keyboard selection behavior (not just eyeball it).
@@ -8533,6 +8766,59 @@ impl Editor {
             .prov_rest
             .is_some_and(|(_, since)| since.elapsed() >= PROV_REST_DELAY);
         let park_ghost = self.park_ghost.is_some();
+        // The reading room, hoisted into a `let` like `margin` (the json!
+        // macro's recursion budget is finite and the dump is large).
+        let coldread = self.cold_read.as_ref().map(|cr| {
+            let page_hyphens = cr
+                .book
+                .pages
+                .get(cr.page)
+                .map(|p| {
+                    p.items
+                        .iter()
+                        .filter(|i| {
+                            matches!(i, crate::bookpage::PageItem::Line(l) if l.ends_hyphen)
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let lane = self
+                .doc
+                .notes()
+                .notes()
+                .iter()
+                .filter(|n| n.status == NoteStatus::Open && cr.reactions.contains(&n.id))
+                .count();
+            let last_body = cr.reactions.last().and_then(|id| {
+                self.doc.notes().notes().iter().find(|n| n.id == *id).map(|n| n.body.clone())
+            });
+            let p1: String = cr.text.chars().take(24).collect();
+            serde_json::json!({
+                "open": true,
+                "pages": cr.book.pages.len(),
+                "page": cr.page,
+                "source": match &cr.source {
+                    ColdReadSource::Live => "live",
+                    ColdReadSource::Past { .. } => "past",
+                },
+                "pulse": cr.pulse.is_some_and(|t| {
+                    t.elapsed() < Duration::from_millis(STRIP_PULSE_MS)
+                }),
+                "words": cr.words,
+                "lane": lane,
+                "last_body": last_body,
+                "sel": cr.selection.as_ref().map(|s| [s.start, s.end]),
+                "input": cr.input.is_some(),
+                "hyphens": page_hyphens,
+                "p1": p1,
+                // "The most recent flip entered WITH a fade" — stable
+                // against the rig racing the 120ms window; reduce_motion
+                // and rapid flips never set flip_at at all.
+                "fading": cr.flip_at.is_some(),
+                "lane_shown": cr.geom.lane,
+            })
+        });
+        let checkpoints = self.store.as_ref().map_or(0, |s| s.checkpoints().len());
         let margin = self.last_frame.as_ref().map(|_| {
             let layout = self.margin_cards(true);
             let mut spans: Vec<(f32, f32)> =
@@ -8627,9 +8913,15 @@ impl Editor {
                 "pulse": self.strip_pulse.is_some(),
             })),
             // Presentation gate: the margin lane + rail render only when no
-            // history surface is previewing (review H36) — the model above is
-            // ungated, so the rig asserts THIS bit for hide/show.
-            "margin_hidden": self.history_view.is_some() || self.strip.is_parked(),
+            // history surface is previewing (review H36) and the reading
+            // room is down — the model above is ungated, so the rig asserts
+            // THIS bit for hide/show.
+            "margin_hidden": self.history_view.is_some() || self.strip.is_parked()
+                || self.cold_read.is_some(),
+            // The reading room (impl 05 Wave B) + the checkpoint census the
+            // entry/exit round-trip asserts against.
+            "coldread": coldread,
+            "checkpoints": checkpoints,
             // Scraps: the pile's block count (0 = no seam; era-aware — the
             // key keeps its name so rig assertions carry), the seam's block
             // index, the graveyard entry count, and the MANUSCRIPT-only word
@@ -9138,6 +9430,24 @@ impl Editor {
             };
             store.debug_push_checkpoint(name, now_secs - days_ago * day - 4 * 3600, manual, state);
         }
+        // One checkpoint whose STATE still lives in the shipped
+        // compost-at-top geometry (F1's regression tripwire, regions 13):
+        // the Past book must slice the manuscript out from UNDER the pile.
+        let top_text = "Old compost idea: the pile must never enter the book.\n\n\
+                        The manuscript opens on the far side of the old boundary, \
+                        and the cold read must begin exactly here.";
+        let mut top_blocks = BlockMap::new(top_text.lines().count());
+        top_blocks.set_aside_boundary(Some(1));
+        store.debug_push_checkpoint(
+            "Top era draft",
+            now_secs - 6 * day - 4 * 3600,
+            false,
+            CheckpointState {
+                text: top_text.to_owned(),
+                spans: SpanSet::default(),
+                blocks: top_blocks,
+            },
+        );
         // The litmus is checkpoints WITHOUT a journal (no keystroke record).
         self.doc.set_journal(Journal::default());
         self.mark_dirty();
@@ -9147,6 +9457,114 @@ impl Editor {
     /// Rig hook (`strip:open`): open the strip surface.
     pub fn debug_strip_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_strip(window, cx);
+    }
+
+    /// Rig hook (`coldread:open`): the real verb — toggle the reading room.
+    pub fn debug_coldread_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.read_it_cold(&ReadItCold, window, cx);
+    }
+
+    /// Rig hook (`coldread:flip:N`): flip to page N (0-based), through the
+    /// real flip path (fade rules included).
+    pub fn debug_coldread_flip(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.cr_flip_to(page, cx);
+    }
+
+    /// Rig hook (`coldread:select:F,T`): a word-snapped selection over the
+    /// slice char range F..T — the union of the engine's own token ranges
+    /// (F9), exactly what a drag would set. Publishes PRIMARY like a real
+    /// mouseup; does NOT raise the input (drive that with a real `drag:`).
+    pub fn debug_coldread_select(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        let (mut lo, mut hi) = (usize::MAX, 0usize);
+        for page in &cr.book.pages {
+            for item in &page.items {
+                let crate::bookpage::PageItem::Line(line) = item else { continue };
+                for frag in &line.frags {
+                    if frag.token.start < to.max(from + 1) && from < frag.token.end {
+                        lo = lo.min(frag.token.start);
+                        hi = hi.max(frag.token.end);
+                    }
+                }
+            }
+        }
+        if lo < hi {
+            cr.selection = Some(lo..hi);
+            self.cr_publish_primary(cx);
+            cx.notify();
+        }
+    }
+
+    /// Rig hook (`coldread:react:<glyph>`): a chip files on the current
+    /// selection through the real filing path.
+    pub fn debug_coldread_react(&mut self, glyph: &str, cx: &mut Context<Self>) {
+        let body = match glyph {
+            "?" => "? doubt",
+            "!" => "! alive",
+            _ => "~ drags",
+        };
+        self.cr_react_chip(body, cx);
+    }
+
+    /// Rig hook (`coldread:past[:N]`): park the strip exactly ON a
+    /// materialized tick (checkpoint N, or the newest with a state), then
+    /// enter the Past read through the banner verb's own gate.
+    pub fn debug_coldread_past(
+        &mut self,
+        pick: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.strip.is_parked()
+            && let Some(store) = &self.store
+        {
+            let cps = store.checkpoints();
+            let target = match pick {
+                Some(i) => cps.get(i).filter(|c| c.state.is_some()).map(|c| c.created_unix),
+                None => cps
+                    .iter()
+                    .filter(|c| c.state.is_some())
+                    .max_by_key(|c| c.created_unix)
+                    .map(|c| c.created_unix),
+            };
+            if let Some(secs) = target {
+                self.strip_scrub_to(secs * 1000, cx);
+            }
+        }
+        match self.strip_read_target() {
+            Some(ix) => self.enter_cold_read_past(ix, window, cx),
+            None => eprintln!("coldread:past: no materialized tick at the playhead"),
+        }
+    }
+
+    /// Rig hook (`coldread:copycheck`): run the REAL cr_copy over the
+    /// current selection, then compare the clipboard shim against an
+    /// INDEPENDENT slice of the live manuscript — the F5 golden (a copy
+    /// assembled from painted fragments would carry invented hyphens and
+    /// no spaces, and mismatch).
+    pub fn debug_coldread_copycheck(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let expected: Option<String> = self.cold_read.as_ref().and_then(|cr| {
+            let sel = cr.selection.clone()?;
+            if !cr.live() {
+                return None;
+            }
+            let base = self.doc.manuscript_base_char();
+            let rope = self.doc.rope();
+            let s = rope.char_to_byte((base + sel.start).min(rope.len_chars()));
+            let e = rope.char_to_byte((base + sel.end).min(rope.len_chars()));
+            Some(self.doc.slice_bytes(s..e))
+        });
+        self.cr_copy(&CrCopy, window, cx);
+        match (expected, crate::smoke::clipboard_override()) {
+            (Some(e), Some(g)) if !e.is_empty() && e == g => {
+                eprintln!("COPY-GOLDEN: OK len={}", e.chars().count());
+            }
+            (e, g) => eprintln!(
+                "COPY-GOLDEN: MISMATCH expected={:?} got={:?}",
+                e.map(|s| s.chars().take(40).collect::<String>()),
+                g.map(|s| s.chars().take(40).collect::<String>()),
+            ),
+        }
     }
 
     /// Rig hook (`strip:scrub:<0..1>`): park at a fraction of the whole history
@@ -9347,6 +9765,9 @@ impl Editor {
         typograph: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse (F4 belt 2)
+        }
         // The past is READ-ONLY (Bug B): every edit gesture while parked —
         // insert, delete, paste alike — leaves the text untouched and pulses
         // the banner instead. The old restore-then-type path is gone: a
@@ -11602,6 +12023,12 @@ impl Editor {
         if !self.selection_popover || self.selected_range.is_empty() || self.is_selecting {
             return None;
         }
+        // The reading room suppresses both flanks (spec §4.4): the page's
+        // own word-selection has its own reaction input; the editor's
+        // selection stays untouched underneath.
+        if self.cold_read.is_some() {
+            return None;
+        }
         let frame = self.last_frame.as_ref()?;
         let (par_ix, line, x) =
             frame.cursor_position(self.selected_range.start.min(frame.doc_len()), false)?;
@@ -12026,6 +12453,18 @@ impl Editor {
     /// controls. Formatting lives in the selection popover (DESIGN
     /// §2-toolbar: zero category precedent for persistent format buttons).
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The reading room dims the titlebar's instruments (Scopes 7): the
+        // count pill and the editor button hide; ⌕/≡/clock stay visible but
+        // muted, default cursor, clicks pulse; window controls fully live;
+        // the doc name keeps its rename (both entrances pierce). The muted
+        // mode label rides beside the name (L16).
+        let in_cold = self.cold_read.is_some();
+        let cr_mode_label: Option<String> = self.cold_read.as_ref().map(|cr| match &cr.source {
+            ColdReadSource::Live => "\u{2014} reading".to_owned(),
+            ColdReadSource::Past { name, .. } => {
+                format!("\u{2014} viewing \u{201c}{name}\u{201d}")
+            }
+        });
         // Dragging the bar moves the window — by two mechanisms, because the
         // platforms split. `start_window_move()` drives Wayland/X11/macOS but
         // is a no-op on Windows, where the OS only moves a window whose
@@ -12109,9 +12548,16 @@ impl Editor {
                         .child("Strop")
                         .into_any_element(),
                 })
+                // The reading room's mode word, muted, beside the name (L16):
+                // "— reading" / "— viewing “Draft complete”".
+                .when_some(cr_mode_label, |bar, label| {
+                    bar.child(div().ml(px(6.)).text_color(rgb(MUTED_COLOR)).child(label))
+                })
                 // Word count + the session goal's live delta (DESIGN §4.2).
                 // Clickable: sets or changes the goal for this sitting.
-                .child(
+                // Hidden in the reading room — the count lives in the banner
+                // (L16).
+                .when(!in_cold, |bar| bar.child(
                     div()
                         .id("word-count")
                         .occlude()
@@ -12179,7 +12625,7 @@ impl Editor {
                                     .into_any_element(),
                             }
                         }),
-                )
+                ))
             )
             // The omnibar (06 §1): the centre control IS the palette's input —
             // a real type-able field whose dropdown is the results card, never
@@ -12242,6 +12688,32 @@ impl Editor {
                         })
                         .into_any_element()
                 }
+                None if in_cold => div()
+                    // DIMMED in the reading room (Scopes 7): muted, no hover
+                    // tint, default cursor, the tooltip kept but the pill's
+                    // "ctrl-f" hint dropped; a click pulses the banner.
+                    .id("omni-pill")
+                    .occlude()
+                    .flex_shrink_0()
+                    .w(px(omni_field_width(window)))
+                    .px(px(10.))
+                    .py(px(2.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .opacity(0.55)
+                    .tooltip(tip("Search · > commands · @ headings", None))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.pulse_cold_read(cx);
+                        }),
+                    )
+                    .flex()
+                    .items_center()
+                    .child(div().text_color(rgb(MUTED_COLOR)).child("Search"))
+                    .into_any_element(),
                 None => div()
                     .id("omni-pill")
                     .occlude()
@@ -12296,7 +12768,9 @@ impl Editor {
                 // where its results live — just left of the margin side. The old
                 // drawn mini-card is gone; the control now WEARS its state (a
                 // priority face) and opens the dropdown that names the reads.
-                .child({
+                // Hidden in the reading room (L16) — which also keeps the two
+                // "Reading"s from ever co-occurring (O10).
+                .when(!in_cold, |bar| bar.child({
                     let face = self.editor_face();
                     let open = self.editor_menu_open;
                     let n = self.open_query_count();
@@ -12414,10 +12888,11 @@ impl Editor {
                                     ))
                                 })),
                         )
-                })
+                }))
                 // The day-zero affordance: a user who knows nothing clicks the
                 // one unexplained button and lands in a searchable list of every
-                // capability (GNOME primary-menu position).
+                // capability (GNOME primary-menu position). DIMMED in the
+                // reading room; a click pulses (Scopes 7).
                 .child(
                     div()
                         .id("palette-toggle")
@@ -12425,14 +12900,26 @@ impl Editor {
                         .px(px(8.))
                         .py(px(2.))
                         .rounded(px(5.))
-                        .cursor(CursorStyle::PointingHand)
-                        .when(self.palette_input.is_some(), |d| d.bg(rgba(0x1A1A1812u32)))
-                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("Command Palette", Some("ctrl-shift-p")))
+                        .map(|d| {
+                            if in_cold {
+                                d.opacity(0.55).tooltip(tip("Command Palette", None))
+                            } else {
+                                d.cursor(CursorStyle::PointingHand)
+                                    .when(self.palette_input.is_some(), |d| {
+                                        d.bg(rgba(0x1A1A1812u32))
+                                    })
+                                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                    .tooltip(tip("Command Palette", Some("ctrl-shift-p")))
+                            }
+                        })
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
+                                if editor.cold_read.is_some() {
+                                    editor.pulse_cold_read(cx);
+                                    return;
+                                }
                                 editor.toggle_palette(&TogglePalette, window, cx);
                             }),
                         )
@@ -12455,15 +12942,22 @@ impl Editor {
                         .py(px(2.))
                         .ml(px(4.))
                         .rounded(px(5.))
-                        .cursor(CursorStyle::PointingHand)
-                        .text_color(if self.strip.open {
+                        .text_color(if self.strip.open && !in_cold {
                             rgb(TEXT_COLOR)
                         } else {
                             rgb(MUTED_COLOR)
                         })
-                        .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
-                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("History", Some("ctrl-alt-h")))
+                        .map(|d| {
+                            if in_cold {
+                                // Dimmed; the click pulses (Scopes 7).
+                                d.opacity(0.55).tooltip(tip("History", None))
+                            } else {
+                                d.cursor(CursorStyle::PointingHand)
+                                    .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
+                                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                    .tooltip(tip("History", Some("ctrl-alt-h")))
+                            }
+                        })
                         .on_mouse_down(
                             MouseButton::Left,
                             // The clock toggles the STRIP (the new first history
@@ -12480,7 +12974,7 @@ impl Editor {
                                 .size(px(11.))
                                 .rounded_full()
                                 .border_1()
-                                .border_color(if self.strip.open {
+                                .border_color(if self.strip.open && !in_cold {
                                     rgb(TEXT_COLOR)
                                 } else {
                                     rgb(MUTED_COLOR)
@@ -12488,11 +12982,13 @@ impl Editor {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(div().size(px(3.)).rounded_full().bg(if self.strip.open {
-                                    rgb(TEXT_COLOR)
-                                } else {
-                                    rgb(MUTED_COLOR)
-                                })),
+                                .child(div().size(px(3.)).rounded_full().bg(
+                                    if self.strip.open && !in_cold {
+                                        rgb(TEXT_COLOR)
+                                    } else {
+                                        rgb(MUTED_COLOR)
+                                    },
+                                )),
                         ),
                 )
                 // Windows/Linux get our own drawn window controls. macOS keeps its
@@ -12620,7 +13116,10 @@ impl Editor {
     /// the transient put-back quick-verb in the flash window, click scrolls
     /// to the record, hidden while the section header is on screen.
     fn render_footer_chips(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if self.history_view.is_some() {
+        // Hidden under every read-only takeover. `is_parked` is the
+        // fix-in-passing of the pre-existing history_view-only gap (spec
+        // §4.4 names it lawful); the cold read joins the same predicate.
+        if self.history_view.is_some() || self.strip.is_parked() || self.cold_read.is_some() {
             return None;
         }
         let scraps_chip = matches!(
@@ -12851,6 +13350,11 @@ impl Editor {
         if !self.strip.is_parked() {
             return None;
         }
+        // The reading room's banner replaces this row while a Past read is
+        // up; Esc restores the identical parked frame (Time 7).
+        if self.cold_read.is_some() {
+            return None;
+        }
         let now_ms = self
             .strip
             .bake
@@ -12867,6 +13371,11 @@ impl Editor {
         });
         let moment = at_station.unwrap_or_else(|| strip::format_moment(self.strip.pos_ms, now_ms));
         let words = format!("{} words", format_thousands(self.strip.words_at));
+        // The quiet `Read` text-verb (Regions 1): rendered ONLY when the
+        // playhead resolves to a checkpoint WITH a materialized state within
+        // the banner's 5-working-px window — identity by tick (index/at_ms),
+        // regardless of label rank; never `state_at`.
+        let read_cp = self.strip_read_target();
         // The refusal pulse: seltint (0xC8A951 @ .33) decaying to 0 across the
         // pulse window — a pure function of the stored Instant.
         let pulse_a = self.strip_pulse.map_or(0., |t| {
@@ -12925,6 +13434,25 @@ impl Editor {
                         .child(moment),
                 )
                 .child(div().child(format!("\u{b7} {words}")))
+                .when_some(read_cp, |d, ix| {
+                    d.child(
+                        div()
+                            .id("strip-banner-read")
+                            .occlude()
+                            .px(px(4.))
+                            .text_color(rgb(TEXT_COLOR))
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                            .child("Read")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.enter_cold_read_past(ix, window, cx);
+                                }),
+                            ),
+                    )
+                })
                 .child(restore_chip)
                 .child(div().text_color(rgb(0xB8B4A8)).child("\u{b7}"))
                 .child(div().child("Esc returns")),
@@ -14752,7 +15280,11 @@ impl Editor {
             || resized
             || prov_changed
             || self.focus.composing_id().is_some()
-            || self.typing_burst_live();
+            || self.typing_burst_live()
+            // The margin is hidden under the reading room: keep its tops
+            // current but never start motion — `moves_started` stays
+            // unchanged across open→react→escape (N6; S11 transient rule).
+            || self.cold_read.is_some();
         if snap {
             self.moving.clear();
             self.lane_tops = now_tops.into_iter().collect();
@@ -15857,7 +16389,10 @@ impl Editor {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        if !self.editor_menu_open {
+        if !self.editor_menu_open || self.cold_read.is_some() {
+            // The menu closes on cold-read entry and never renders inside it
+            // (spec §4.4 — H33's inert gate, extended: never diagnose a
+            // document the screen isn't showing).
             return None;
         }
         // Rows go inert while a pass cooks (single-flight — no queueing in v1)
@@ -16031,8 +16566,13 @@ impl Editor {
     ) -> Option<gpui::AnyElement> {
         // Parked = previewing the past: the pill counts cards anchored to the
         // LIVE document, and its panel would float them over past text — the
-        // same law that hides the wide margin while parked (H36).
-        if self.margin_fits(window) || self.history_view.is_some() || self.strip.is_parked() {
+        // same law that hides the wide margin while parked (H36). The cold
+        // read suppresses it with the rest of the margin (spec §4.4).
+        if self.margin_fits(window)
+            || self.history_view.is_some()
+            || self.strip.is_parked()
+            || self.cold_read.is_some()
+        {
             return None;
         }
         let count = self.narrow_notes_count(&self.margin_cards(false).cards);
@@ -16107,6 +16647,7 @@ impl Editor {
             || self.margin_fits(window)
             || self.history_view.is_some()
             || self.strip.is_parked()
+            || self.cold_read.is_some()
         {
             return None;
         }
@@ -16381,6 +16922,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::show_shortcuts))
             .on_action(cx.listener(Self::open_welcome))
+            .on_action(cx.listener(Self::read_it_cold))
             // §0.6 law 3 (click-outside) lives on the root so the whole
             // window counts as "outside", gutters and titlebar included.
             .on_mouse_down(
@@ -16506,6 +17048,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::mode_copy))
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::open_welcome))
+                    .on_action(cx.listener(Self::read_it_cold))
                     .on_action(cx.listener(Self::scraps_travel))
                     .on_action(cx.listener(Self::set_session_goal))
                     .on_action(cx.listener(Self::set_aside))
@@ -16555,8 +17098,10 @@ impl Render for Editor {
             })
             .map(|d| {
                 // The footnote zone keys off live-doc offsets; in history
-                // the canvas shows the merged diff, so it stands down.
-                let (footnotes, hidden) = if self.history_view.is_some() {
+                // the canvas shows the merged diff, so it stands down —
+                // and it sleeps under the reading room's desk.
+                let (footnotes, hidden) = if self.history_view.is_some() || self.cold_read.is_some()
+                {
                     (Vec::new(), 0)
                 } else {
                     self.visible_footnotes()
@@ -16571,8 +17116,13 @@ impl Render for Editor {
                 // hides the lane + rail only while PREVIEWING the past (parked):
                 // cards anchored to the live document must not float over past
                 // text (review H36). At now, with the strip open, the live doc
-                // and its cards stay.
-                if self.history_view.is_some() || self.strip.is_parked() {
+                // and its cards stay. The cold read is the ONE shared
+                // suppression block for margin + rail + render_ai_status
+                // (S10; F7: machine states sleep, Error/NeedsSetup survive
+                // to exit by construction) — and the lane/margin
+                // mutual-exclusion switch (N6).
+                if self.history_view.is_some() || self.strip.is_parked() || self.cold_read.is_some()
+                {
                     return d;
                 }
                 let d = match self.render_margin(window, cx) {
@@ -16589,7 +17139,7 @@ impl Render for Editor {
                 }
             })
             .map(|d| {
-                if !self.margin_fits(window) {
+                if !self.margin_fits(window) && self.cold_read.is_none() {
                     match self.render_composer_strip() {
                         Some(strip) => d.child(strip),
                         None => d,
@@ -16616,6 +17166,14 @@ impl Render for Editor {
             // over the past preview — the text area's mode indicator.
             .map(|d| match self.render_strip_banner(cx) {
                 Some(banner) => d.child(banner),
+                None => d,
+            })
+            // The cold read (impl 05 Wave B): the reading-room takeover —
+            // banner + desk + page + lane, one subtree, painted over every
+            // suppressed surface. The strip's parked STATE survives beneath
+            // a Past read untouched (Time 7); only its pixels yield.
+            .map(|d| match self.render_cold_read(window, cx) {
+                Some(room) => d.child(room),
                 None => d,
             })
             .map(|d| match self.render_chord_whisper() {
@@ -16819,6 +17377,2276 @@ fn tint(c: u32, a: f32) -> gpui::Rgba {
     x
 }
 
+// ---- The cold read (impl 05 Wave B: the reading room) ----------------------
+//
+// Spec: docs/impl/05-cold-read.md §§1, 3.2, 4–5; rulings:
+// docs/impl/cold-read/adjudications.md (cited per site as F/S/N/Regions/
+// Time/Scopes). The engine is bookpage.rs (Wave A); this is the surface:
+// state, entry/exit, the banner, the page element, guards, reactions, and
+// the history ("read this version") variant.
+
+/// Page paper — a near-white distinct from the editor's `BG_COLOR`
+/// (mock-approved surface value, design-law L29).
+const PAGE_PAPER: u32 = 0xFEFEFC;
+/// The desk the page sits on.
+const DESK_BG: u32 = 0xE4E6E9;
+/// The banner row under the titlebar (the strip-banner pattern; S16: page
+/// height counts from this row's hairline).
+const CR_BANNER_H: f32 = 30.;
+/// Page width at font_scale 1 (spec §3.2: 450px measure + 2×60 margins).
+const CR_PAGE_W: f32 = 570.;
+const CR_MARGIN_SIDE: f32 = 60.;
+const CR_MARGIN_TOP: f32 = 48.;
+const CR_MARGIN_BOTTOM: f32 = 64.;
+const CR_BODY_SIZE: f32 = 16.5;
+const CR_LINE_H: f32 = 25.;
+/// The small-window emergency type step (spec §3.2; S9 hysteresis):
+/// below ~12 lines drop once to 15px type / 420px measure.
+const CR_BODY_SIZE_SMALL: f32 = 15.;
+const CR_MEASURE_SMALL: f32 = 420.;
+/// Page height cap: 1.5 × page width (research-page §1.3).
+const CR_HEIGHT_RATIO: f32 = 1.5;
+/// Desk gutter above/below the page; degrades to 0 before type does.
+const CR_GUTTER: f32 = 24.;
+/// The reading lane (S2/S20): fixed width + the named 18px gap token.
+const CR_LANE_W: f32 = 230.;
+const CR_LANE_GAP: f32 = 18.;
+/// Flip zones: symmetric 26% of the page width, full height (L13).
+const CR_FLIP_ZONE: f32 = 0.26;
+/// Incoming-page fade ≤120ms; a flip within 250ms of the previous swaps
+/// instantly — only a flip from rest fades (S5; research-page §4.4).
+const CR_FLIP_FADE_MS: u64 = 120;
+const CR_FLIP_REST_MS: u64 = 250;
+/// Mousedown arms a flip; a drag past this converts to selection (S1).
+const CR_DRAG_PX: f32 = 4.;
+/// The anchor-link word-box flash (S19): the ARRIVAL_FLASH grammar, 420ms.
+const CR_FLASH_MS: u64 = 420;
+/// URW Bookman's measured average advances at 16.5px (research-page §1.1) —
+/// the S7 justification-floor inputs, scaled with the type size.
+const CR_AVG_EN: f32 = 8.14;
+const CR_AVG_RU: f32 = 8.99;
+/// The S9 type-step re-evaluation runs at resize-end, not mid-drag.
+const CR_RESIZE_SETTLE_MS: u64 = 250;
+/// The reaction input card (L20): ~250px, chips over one line.
+const CR_INPUT_W: f32 = 250.;
+const CR_INPUT_H: f32 = 62.;
+/// The anchor quote in a lane card: ≤42 graphemes + an ellipsis (N9).
+const CR_QUOTE_GRAPHEMES: usize = 42;
+
+/// Which manuscript the book shows (spec 05 §1).
+enum ColdReadSource {
+    Live,
+    Past { name: String, created_unix: i64 },
+}
+
+/// The page/desk geometry, a pure function of (desk size, font_scale, the
+/// type step, live-vs-past) — unit-tested below. All page tokens scale by
+/// `font_scale` (spec §3.2); the desk gutter and the lane are chrome and
+/// deliberately don't (S20).
+#[derive(Clone, Copy, PartialEq)]
+struct CrGeom {
+    scale: f32,
+    page_w: f32,
+    page_h: f32,
+    measure: f32,
+    side: f32,
+    top: f32,
+    bottom: f32,
+    body: f32,
+    line_h: f32,
+    lines: usize,
+    gutter: f32,
+    lane: bool,
+    desk_w: f32,
+    desk_h: f32,
+}
+
+fn cr_geom(desk_w: f32, desk_h: f32, scale: f32, small: bool, live: bool) -> CrGeom {
+    let (body, want_measure) = if small {
+        (CR_BODY_SIZE_SMALL * scale, CR_MEASURE_SMALL * scale)
+    } else {
+        (CR_BODY_SIZE * scale, (CR_PAGE_W - 2. * CR_MARGIN_SIDE) * scale)
+    };
+    let side = CR_MARGIN_SIDE * scale;
+    let top = CR_MARGIN_TOP * scale;
+    let bottom = CR_MARGIN_BOTTOM * scale;
+    // S7: page width = min(full, window); clamped → the MEASURE shrinks,
+    // the margins hold at 60·scale.
+    let page_w = (want_measure + 2. * side).min(desk_w).max(2. * side + 40.);
+    let measure = (page_w - 2. * side).max(1.);
+    // Whole-pixel line height keeps pagination arithmetic exact; the small
+    // step preserves chars-per-line, so leading scales with the type.
+    let line_h = (CR_LINE_H * body / CR_BODY_SIZE).round().max(1.);
+    // Height: fill the desk minus gutters, cap 1.5×w, floored to whole
+    // lines. The desk already begins at the banner's hairline (S16); at
+    // gutter→0 the page abuts it. Floor = margins + 2 lines; anything
+    // shorter clips the page, never the text (S8).
+    let cap = CR_HEIGHT_RATIO * page_w;
+    let mut gutter = CR_GUTTER;
+    let mut page_h = (desk_h - 2. * gutter).min(cap);
+    if page_h < 2. * line_h + top + bottom {
+        gutter = 0.;
+        page_h = desk_h.min(cap);
+    }
+    let lines = (((page_h - top - bottom) / line_h).floor() as usize).max(2);
+    let page_h = lines as f32 * line_h + top + bottom;
+    // S2: Live reserves the lane from entry so the page never moves; too
+    // narrow for the group → the lane hides (reactions still file).
+    let lane = live && desk_w >= page_w + CR_LANE_GAP + CR_LANE_W;
+    CrGeom {
+        scale,
+        page_w,
+        page_h,
+        measure,
+        side,
+        top,
+        bottom,
+        body,
+        line_h,
+        lines,
+        gutter,
+        lane,
+        desk_w,
+        desk_h,
+    }
+}
+
+impl CrGeom {
+    fn metrics(&self) -> crate::bookpage::BookMetrics {
+        let ratio = self.body / CR_BODY_SIZE;
+        crate::bookpage::BookMetrics {
+            measure: self.measure,
+            line_height: self.line_h,
+            heading_line_height: (self.line_h * 1.15).round(),
+            page_height: self.lines as f32 * self.line_h,
+            em: self.body,
+            // S7: below the justification floor the whole block sets
+            // ragged-right, unhyphenated.
+            justify: !crate::bookpage::below_justification_floor(
+                self.measure,
+                CR_AVG_EN * ratio,
+                CR_AVG_RU * ratio,
+            ),
+            // The approved mock's inter-paragraph air (1em — scene 1 CSS);
+            // a named §3.2-register entry at Gate 2.
+            para_gap: self.body.round(),
+        }
+    }
+}
+
+/// The immortal width-cache key: the painted string under a concrete
+/// (role, styled-runs) identity (Wave A hand-off; research-linebreak §7).
+type CrWidthKey = (String, crate::bookpage::Role, Vec<(usize, crate::bookpage::Style)>);
+
+/// The concrete face for a (role, style) pair. URW Bookman ships NO Regular
+/// weight: Light IS the classic text weight, Demi (≈SEMIBOLD) carries bold
+/// and headings (impl 05 §3.1; examples/bookface_audit.rs proves both
+/// resolve). Code spans and code blocks set in PT Mono (spec §2.7).
+fn cr_font(role: crate::bookpage::Role, st: crate::bookpage::Style) -> gpui::Font {
+    if st.code || matches!(role, crate::bookpage::Role::Code) {
+        let mut f = gpui::font("PT Mono");
+        if st.italic {
+            f.style = FontStyle::Italic;
+        }
+        return f;
+    }
+    let mut f = gpui::font("URW Bookman");
+    f.weight = if st.bold || matches!(role, crate::bookpage::Role::Heading(_)) {
+        FontWeight::SEMIBOLD
+    } else {
+        FontWeight::LIGHT
+    };
+    if st.italic {
+        f.style = FontStyle::Italic;
+    }
+    // The safety net for exotic codepoints; Russian never takes this path
+    // because the bundled primary is Cyrillic-complete (research-page §2.4).
+    f.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
+        "Bookman Old Style".into(),
+        "Iowan Old Style".into(),
+        "Palatino Linotype".into(),
+        "Palatino".into(),
+        "Georgia".into(),
+        "PT Serif".into(),
+    ]));
+    f
+}
+
+fn cr_font_size(role: crate::bookpage::Role, body: f32) -> f32 {
+    match role {
+        // Headings set in Demi at ~1.15× body (spec §2.7).
+        crate::bookpage::Role::Heading(_) => (body * 1.15).round(),
+        _ => body,
+    }
+}
+
+/// One styled run of a fragment, painted-faithful (spec §6.10): bold→Demi,
+/// italic→Light Italic, strike, highlight, code→PT Mono. A footnote-ref
+/// carrier keeps its advance but paints transparent — the superscript is
+/// painted over it (regions 11). Links keep the page's own ink; only the
+/// underline carries the meaning (a book page has no chrome-blue).
+fn cr_text_run(len: usize, role: crate::bookpage::Role, st: crate::bookpage::Style) -> TextRun {
+    TextRun {
+        len,
+        font: cr_font(role, st),
+        color: if st.footnote {
+            gpui::transparent_black()
+        } else {
+            rgb(TEXT_COLOR).into()
+        },
+        background_color: st.highlight.then(|| rgba(HIGHLIGHT_COLOR).into()),
+        underline: (st.underline || st.link).then(|| UnderlineStyle {
+            thickness: px(1.),
+            color: None,
+            wavy: false,
+        }),
+        strikethrough: st.strike.then(|| StrikethroughStyle {
+            thickness: px(1.),
+            color: None,
+        }),
+    }
+}
+
+/// The engine's width oracle over the real shaper (spec §2.6): gpui's
+/// LineLayoutCache is frame-scoped, so the view keeps its own immortal
+/// `(string, style) → width` cache for pagination.
+struct CrMeasure<'a> {
+    ts: std::sync::Arc<gpui::WindowTextSystem>,
+    widths: &'a mut HashMap<CrWidthKey, f32>,
+    sizes: &'a HashMap<String, (f32, f32)>,
+    body: f32,
+}
+
+impl crate::bookpage::Measure for CrMeasure<'_> {
+    fn width(
+        &mut self,
+        text: &str,
+        role: crate::bookpage::Role,
+        runs: &[(usize, crate::bookpage::Style)],
+    ) -> f32 {
+        let key = (text.to_owned(), role, runs.to_vec());
+        if let Some(w) = self.widths.get(&key) {
+            return *w;
+        }
+        let truns: Vec<TextRun> =
+            runs.iter().map(|&(len, st)| cr_text_run(len, role, st)).collect();
+        let line = self.ts.shape_line(
+            SharedString::from(text.to_owned()),
+            px(cr_font_size(role, self.body)),
+            &truns,
+            None,
+        );
+        let w = f32::from(line.width);
+        self.widths.insert(key, w);
+        w
+    }
+
+    fn space(&mut self, role: crate::bookpage::Role, style: crate::bookpage::Style) -> f32 {
+        // The shaped space of the run's own style — italic and bold spaces
+        // differ; never hardcoded (research §4).
+        self.width(" ", role, &[(1, style)])
+    }
+
+    fn image_size(&mut self, src: &str) -> Option<(f32, f32)> {
+        self.sizes.get(src).copied()
+    }
+}
+
+/// Paginate a slice triple at `geom` — same input, same layout, bit for bit.
+fn cr_layout(
+    text: &str,
+    spans: &SpanSet,
+    blocks: &BlockMap,
+    geom: &CrGeom,
+    sizes: &HashMap<String, (f32, f32)>,
+    widths: &mut HashMap<CrWidthKey, f32>,
+    ts: &std::sync::Arc<gpui::WindowTextSystem>,
+) -> crate::bookpage::BookLayout {
+    let metrics = geom.metrics();
+    let mut m = CrMeasure { ts: ts.clone(), widths, sizes, body: geom.body };
+    if metrics.justify {
+        crate::bookpage::paginate(text, spans, blocks, &metrics, &mut m, &mut crate::hyphen::DictHyphenator)
+    } else {
+        // S7: below the justification floor the block sets ragged-right,
+        // UNHYPHENATED — the honest-fallback oracle.
+        crate::bookpage::paginate(text, spans, blocks, &metrics, &mut m, &mut crate::bookpage::NoHyphen)
+    }
+}
+
+/// An in-progress page gesture: mousedown ARMED a flip (or nothing, mid-page);
+/// a drag past the threshold converts to selection — click-only,
+/// drag-transparent flip zones (S1).
+struct CrDrag {
+    start: Point<Pixels>,
+    zone: i8,
+    selecting: bool,
+    anchor: Option<Range<usize>>,
+}
+
+/// One shaped, positioned paint op of the current page (page-local coords —
+/// margins already added). Shaped in prepaint, never in paint (the
+/// 2026-06-12 law); `ShapedLine` is an Arc, so the per-page cache clones
+/// cheaply into each frame's prepaint state.
+#[derive(Clone)]
+enum CrOp {
+    Ink { x: f32, y: f32, line_h: f32, shaped: Box<gpui::ShapedLine> },
+    Rule { x: f32, y: f32, w: f32 },
+    Image { x: f32, y: f32, w: f32, h: f32, src: String },
+}
+
+/// The current page, shaped once per (page, layout generation).
+struct CrShapedPage {
+    page: usize,
+    layout_gen: u64,
+    ops: Vec<CrOp>,
+}
+
+/// The reading room's whole state (spec 05 §1), computed BEFORE `cold_read`
+/// is set — no bookless-desk frame exists (S17).
+struct ColdRead {
+    source: ColdReadSource,
+    /// The entry snapshot: the manuscript slice triple (F1) — the book's
+    /// ONLY text. Never re-read from the live document (spec §2.6).
+    text: String,
+    spans: SpanSet,
+    blocks: BlockMap,
+    /// A Past read keeps the checkpoint's FULL state for its Restore chip
+    /// (the slice above is only what the book paints).
+    restore_state: Option<(String, SpanSet, BlockMap)>,
+    book: crate::bookpage::BookLayout,
+    geom: CrGeom,
+    /// Desk size the layout was computed for (resize detection, S9).
+    laid_for: (f32, f32),
+    /// The emergency type step is engaged (S9 hysteresis: <12 in, ≥13 out).
+    small: bool,
+    page: usize,
+    /// Manuscript word count at entry (regions 5/7 — one accounting).
+    words: usize,
+    /// Newest writer-named checkpoint at entry (Time 3), banner data.
+    station: Option<String>,
+    /// Slice char ranges of footnote refs, in slice order — the superscript
+    /// numbering (regions 11).
+    fn_refs: Vec<Range<usize>>,
+    /// Natural image sizes resolved once at entry (regions 12 determinism).
+    image_sizes: HashMap<String, (f32, f32)>,
+    /// Manuscript-space (slice) char range, word-snapped (F9).
+    selection: Option<Range<usize>>,
+    input: Option<Entity<TextField>>,
+    /// The raise-time range — what filing uses even if the selection is
+    /// gone by commit time (N1).
+    input_range: Option<Range<usize>>,
+    /// Page-local (x, y) of the input card.
+    input_at: Option<(f32, f32)>,
+    /// The banner refusal pulse: INSTANT onset, ~900ms decay (S4).
+    pulse: Option<Instant>,
+    /// The incoming page's fade origin; `None` = at rest (instant swap).
+    flip_at: Option<Instant>,
+    last_flip: Option<Instant>,
+    drag: Option<CrDrag>,
+    /// Hover flip zone (−1/0/+1), edge dead zones already resolved.
+    hover_zone: i8,
+    /// Session reactions in FILING order (the recede priority — S6); the
+    /// lane displays them in DOCUMENT order.
+    reactions: Vec<u64>,
+    /// The anchor-link receipt: flashed word range + onset (S19).
+    flash: Option<(Range<usize>, Instant)>,
+    shaped: Option<CrShapedPage>,
+    /// Bumped by every re-pagination; keys the shaped-page cache.
+    layout_gen: u64,
+    widths: HashMap<CrWidthKey, f32>,
+    /// The shaper handle, kept so resize-settle re-pagination can shape
+    /// outside a draw pass.
+    ts: std::sync::Arc<gpui::WindowTextSystem>,
+    focus_handle: FocusHandle,
+    /// The last resize seen by the probe; the settle watcher re-evaluates
+    /// the type step once this is CR_RESIZE_SETTLE_MS old (S9).
+    resized_at: Option<Instant>,
+    /// The paper-noise tile (assets/paper-noise-256.png), decoded once.
+    paper: Option<Arc<gpui::Image>>,
+}
+
+impl ColdRead {
+    fn live(&self) -> bool {
+        matches!(self.source, ColdReadSource::Live)
+    }
+
+    fn pulse_alpha(&self) -> f32 {
+        self.pulse.map_or(0., |t| {
+            let e = t.elapsed().as_millis() as f32 / STRIP_PULSE_MS as f32;
+            (0.33 * (1. - e)).clamp(0., 0.33)
+        })
+    }
+
+    /// Slice a slice-space char range out of the snapshot (F5: copy slices
+    /// the SOURCE, never the painted fragments).
+    fn slice_text(&self, range: &Range<usize>) -> String {
+        self.text
+            .chars()
+            .skip(range.start)
+            .take(range.end.saturating_sub(range.start))
+            .collect()
+    }
+
+    /// Page-local word boxes of a char range on the current page, merged
+    /// into per-line continuous runs (S14: extend a selected fragment's box
+    /// across its following gap when the next is selected too).
+    fn range_boxes(&self, range: &Range<usize>) -> Vec<(f32, f32, f32, f32)> {
+        let mut out = Vec::new();
+        let Some(page) = self.book.pages.get(self.page) else {
+            return out;
+        };
+        let g = &self.geom;
+        for item in &page.items {
+            let crate::bookpage::PageItem::Line(line) = item else {
+                continue;
+            };
+            let mut run: Option<(f32, f32)> = None;
+            for (i, frag) in line.frags.iter().enumerate() {
+                let hit = frag.token.start < range.end && range.start < frag.token.end;
+                if hit {
+                    let x0 = frag.x;
+                    let mut x1 = frag.x + frag.width;
+                    // Extend across the following gap when the next frag is
+                    // selected too (one continuous run per line).
+                    if let Some(next) = line.frags.get(i + 1)
+                        && next.token.start < range.end
+                        && range.start < next.token.end
+                    {
+                        x1 = next.x;
+                    }
+                    run = Some(match run {
+                        Some((a, _)) => (a, x1),
+                        None => (x0, x1),
+                    });
+                } else if let Some((a, b)) = run.take() {
+                    out.push((g.side + a, g.top + line.y, b - a, line.height));
+                }
+            }
+            if let Some((a, b)) = run.take() {
+                out.push((g.side + a, g.top + line.y, b - a, line.height));
+            }
+        }
+        out
+    }
+
+    /// The whitespace-delimited token under (or nearest on the line of) a
+    /// page-local point — the selection unit (F9).
+    fn hit_token(&self, local: Point<Pixels>) -> Option<Range<usize>> {
+        let page = self.book.pages.get(self.page)?;
+        let g = &self.geom;
+        let (x, y) = (f32::from(local.x) - g.side, f32::from(local.y) - g.top);
+        let mut best: Option<(f32, Range<usize>)> = None;
+        for item in &page.items {
+            let crate::bookpage::PageItem::Line(line) = item else {
+                continue; // image boxes and captions carry no ranges (N10)
+            };
+            if y < line.y || y >= line.y + line.height {
+                continue;
+            }
+            for frag in &line.frags {
+                let dx = if x < frag.x {
+                    frag.x - x
+                } else if x > frag.x + frag.width {
+                    x - (frag.x + frag.width)
+                } else {
+                    0.
+                };
+                if best.as_ref().is_none_or(|(d, _)| dx < *d) {
+                    best = Some((dx, frag.token.clone()));
+                }
+            }
+        }
+        best.map(|(_, t)| t)
+    }
+}
+
+/// Grapheme-safe quote for a lane card (N9): ≤42 graphemes, newlines
+/// flattened to spaces, U+2026 when truncated, typographic quotes around.
+fn cr_quote(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let mut cut = flat.len();
+    for (n, (i, _)) in flat.grapheme_indices(true).enumerate() {
+        if n == CR_QUOTE_GRAPHEMES {
+            cut = i;
+            break;
+        }
+    }
+    if cut < flat.len() {
+        format!("\u{201c}{}\u{2026}\u{201d}", &flat[..cut])
+    } else {
+        format!("\u{201c}{flat}\u{201d}")
+    }
+}
+
+impl Editor {
+    /// `Read it cold` (ctrl-shift-l): enter the reading room; inside it, the
+    /// same chord is the toggle-exit (Time 9 — the strip/palette precedent).
+    pub(crate) fn read_it_cold(
+        &mut self,
+        _: &ReadItCold,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cold_read.is_some() {
+            self.exit_cold_read(window, cx);
+        } else {
+            self.enter_cold_read_live(window, cx);
+        }
+    }
+
+    /// Entry, Live (spec §4.6). Order is LAW (Time 8): composer → save →
+    /// guard → checkpoint → snapshot → paginate → set state → focus.
+    fn enter_cold_read_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // F8: entry's first act — the open composer resolves (the universal
+        // blur law commits the draft), and entry ends with CardFocus::Idle.
+        self.finish_composing(window, cx);
+        self.save_now();
+        // Time 1: the canvas showing the PAST guards the Live verb with the
+        // pulse; a strip open AT NOW closes and entry proceeds.
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return;
+        }
+        if self.history_view.is_some() {
+            // The panel preview: same refusal; the panel has no pulse home —
+            // papercut-tier (the panel is the legacy surface).
+            return;
+        }
+        if self.strip.open {
+            self.close_strip(cx);
+        }
+        // The entry surfaces close (spec §4.6); suppression handles the rest.
+        if self.palette_input.is_some() {
+            self.close_palette(window, cx);
+        }
+        self.editor_menu_open = false;
+        self.selection_popover = false;
+        // L3: entry quietly checkpoints — fingerprint-guarded, reflex tier.
+        // (On a legacy file mid-backfill the store defers silently —
+        // accepted and named, regions 13.)
+        if let Some(store) = &self.store {
+            store.add_checkpoint_if_changed("Cold read", false);
+        }
+        self.dirty_since_checkpoint = false;
+        // The snapshot: the ONE slice both books consume (F1).
+        let (text, spans, blocks) = self.doc.manuscript_slice();
+        let words = self.manuscript_word_count();
+        self.enter_cold_read(ColdReadSource::Live, text, spans, blocks, words, None, window, cx);
+    }
+
+    /// Entry, Past ("read this version", spec §4.7): the parked banner's
+    /// `Read` verb, checkpoint identity by INDEX (regions 1). Runs NO
+    /// entry-checkpoint sequence — a Past read starts from a checkpoint by
+    /// construction.
+    fn enter_cold_read_past(&mut self, cp_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else { return };
+        let cps = store.checkpoints();
+        let Some(cp) = cps.get(cp_index) else { return };
+        let Some((text, spans, blocks)) = store.checkpoint_state(cp) else {
+            return; // never state_at (regions 1)
+        };
+        let (name, created_unix) = (cp.name.clone(), cp.created_unix);
+        self.finish_composing(window, cx);
+        // The state's OWN boundary scopes both the slice and the count
+        // (regions 5; the words_at precedent).
+        let rope = ropey::Rope::from_str(&text);
+        let words = count_words(
+            rope.slice(strop_core::document::manuscript_range_of(&rope, &blocks)).chunks(),
+        );
+        let (stext, sspans, sblocks) =
+            strop_core::document::manuscript_slice_of(&rope, &spans, &blocks);
+        self.enter_cold_read(
+            ColdReadSource::Past { name, created_unix },
+            stext,
+            sspans,
+            sblocks,
+            words,
+            Some((text, spans, blocks)),
+            window,
+            cx,
+        );
+    }
+
+    /// The parked banner's `Read`-verb gate (Regions 1): the checkpoint —
+    /// by INDEX — whose materialized tick the playhead resolves to within
+    /// the 5-working-px window; label rank irrelevant, never `state_at`.
+    fn strip_read_target(&self) -> Option<usize> {
+        let b = self.strip.bake.as_ref()?;
+        let play = b.timeline.work_at(self.strip.pos_ms);
+        let store = self.store.as_ref()?;
+        store.checkpoints().iter().enumerate().find_map(|(i, cp)| {
+            (cp.state.is_some()
+                && (b.timeline.work_at(cp.created_unix * 1000) - play).abs() < 5.)
+                .then_some(i)
+        })
+    }
+
+    /// The shared tail of both entrances: paginate the snapshot, THEN set
+    /// the state (S17 atomicity — no bookless-desk frame), always page 1
+    /// (research-page §4.6: the performance starts from the top).
+    #[allow(clippy::too_many_arguments)]
+    fn enter_cold_read(
+        &mut self,
+        source: ColdReadSource,
+        text: String,
+        spans: SpanSet,
+        blocks: BlockMap,
+        words: usize,
+        restore_state: Option<(String, SpanSet, BlockMap)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let live = matches!(source, ColdReadSource::Live);
+        // Banner station: the newest checkpoint the WRITER named, walked
+        // newest→oldest; every automatic skipped by the one manual rule
+        // (Time 3). The Past banner leads with its own name instead.
+        let station = if live {
+            self.store.as_ref().and_then(|s| {
+                s.checkpoints()
+                    .iter()
+                    .filter(|c| c.manual)
+                    .max_by_key(|c| c.created_unix)
+                    .map(|c| c.name.clone())
+            })
+        } else {
+            None
+        };
+        // Natural image sizes, resolved once — same input, same pagination,
+        // every time (regions 12).
+        let scale_f = window.scale_factor();
+        let mut image_sizes: HashMap<String, (f32, f32)> = HashMap::new();
+        for k in blocks.kinds() {
+            if let BlockKind::Image { src, .. } = k
+                && let Some(handle) = self.image_assets.get(src)
+                && let Some(render) = handle.clone().use_render_image(window, cx)
+            {
+                let d = render.size(0);
+                image_sizes.insert(
+                    src.clone(),
+                    (d.width.0 as f32 / scale_f, d.height.0 as f32 / scale_f),
+                );
+            }
+        }
+        // Footnote refs in slice order — the superscript numbering source
+        // (regions 11).
+        let slice_len = text.chars().count();
+        let mut fn_refs: Vec<Range<usize>> = spans
+            .spans()
+            .iter()
+            .filter(|s| matches!(s.attr, InlineAttr::FootnoteRef(_)))
+            .map(|s| s.range.start.min(slice_len)..s.range.end.min(slice_len))
+            .collect();
+        fn_refs.sort_by_key(|r| r.start);
+        // Geometry from the window as it stands; the desk probe corrects a
+        // CSD-inset estimate on the first frame (S9's resize path).
+        let scale = self.config.font_size.map_or(1., |s| (s / 20.).clamp(0.6, 2.));
+        let desk_w = f32::from(window.viewport_size().width);
+        let desk_h = (f32::from(window.viewport_size().height) - BAR_HEIGHT - CR_BANNER_H).max(1.);
+        let normal = cr_geom(desk_w, desk_h, scale, false, live);
+        let small = normal.lines < 12;
+        let geom = if small { cr_geom(desk_w, desk_h, scale, true, live) } else { normal };
+        let ts = window.text_system().clone();
+        let mut widths = HashMap::new();
+        let book = cr_layout(&text, &spans, &blocks, &geom, &image_sizes, &mut widths, &ts);
+        let paper = crate::paths::asset_file("paper-noise-256.png").and_then(|p| {
+            std::fs::read(&p)
+                .ok()
+                .map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes)))
+        });
+        let cr = ColdRead {
+            source,
+            text,
+            spans,
+            blocks,
+            restore_state,
+            book,
+            geom,
+            laid_for: (desk_w, desk_h),
+            small,
+            page: 0,
+            words,
+            station,
+            fn_refs,
+            image_sizes,
+            selection: None,
+            input: None,
+            input_range: None,
+            input_at: None,
+            pulse: None,
+            flip_at: None,
+            last_flip: None,
+            drag: None,
+            hover_zone: 0,
+            reactions: Vec::new(),
+            flash: None,
+            shaped: None,
+            layout_gen: 0,
+            widths,
+            ts,
+            focus_handle: cx.focus_handle(),
+            resized_at: None,
+            paper,
+        };
+        window.focus(&cr.focus_handle, cx);
+        self.cold_read = Some(cr);
+        self.focus = CardFocus::Idle; // F8
+        // The S9 settle watcher: re-evaluates the type step at resize-end;
+        // exits with the takeover.
+        self.cr_watch_settle(cx);
+        cx.notify();
+    }
+
+    /// Exit (Esc / toggle-exit): drop the takeover; every suppressed surface
+    /// restores by predicate; caret and scroll were never touched. A Past
+    /// read returns to the untouched parked frame (Time 7).
+    fn exit_cold_read(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cold_read.take().is_none() {
+            return;
+        }
+        *self.cr_page_bounds.borrow_mut() = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+        // F7: exit joins scroll/door/new-pass as the flush trigger — AFTER
+        // the surfaces are restored above, so cards land visibly with their
+        // one enter fade.
+        self.flush_deferred_pass(cx);
+    }
+
+    /// F4 belt 2: the handler-side guard — `cold_read` outranks
+    /// `is_parked`/`history_view` at every sink (Time 13).
+    fn cr_guard(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.cold_read.is_some() {
+            self.pulse_cold_read(cx);
+            return true;
+        }
+        false
+    }
+
+    /// The one refusal (F4 belt 1's target): pulse the banner's bold word —
+    /// warm seltint, INSTANT onset, ~900ms decay (S4; the <100ms feedback
+    /// law overrules the mock's 180ms ramp — named divergence).
+    fn cr_refuse(&mut self, _: &CrRefuse, _: &mut Window, cx: &mut Context<Self>) {
+        self.pulse_cold_read(cx);
+    }
+
+    fn cr_noop(&mut self, _: &CrNoop, _: &mut Window, _: &mut Context<Self>) {
+        // up/down inside the read: inert, without a pulse (Scopes 1).
+    }
+
+    fn pulse_cold_read(&mut self, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        cr.pulse = Some(Instant::now());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            for _ in 0..STRIP_PULSE_FRAMES {
+                cx.background_executor()
+                    .timer(Duration::from_millis(STRIP_PULSE_MS / STRIP_PULSE_FRAMES))
+                    .await;
+                let cont = this.update(cx, |editor: &mut Editor, cx| {
+                    let done = editor
+                        .cold_read
+                        .as_ref()
+                        .and_then(|cr| cr.pulse)
+                        .is_none_or(|t| t.elapsed() >= Duration::from_millis(STRIP_PULSE_MS));
+                    if done && let Some(cr) = editor.cold_read.as_mut() {
+                        cr.pulse = None;
+                    }
+                    cx.notify();
+                    done
+                });
+                if !matches!(cont, Ok(false)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A short notify loop while a pure-function-of-Instant visual decays
+    /// (flip fade, anchor flash) — the pulse_strip idiom.
+    fn cr_animate(&self, ms: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let frames = (ms / 30).max(1);
+            for _ in 0..=frames {
+                cx.background_executor().timer(Duration::from_millis(30)).await;
+                let live = this.update(cx, |editor: &mut Editor, cx| {
+                    cx.notify();
+                    editor.cold_read.is_some()
+                });
+                if !matches!(live, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    // -- Flips ---------------------------------------------------------------
+
+    fn cr_flip_to(&mut self, target: usize, cx: &mut Context<Self>) {
+        let reduce = self.config.reduce_motion;
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        let last = cr.book.pages.len().saturating_sub(1);
+        let target = target.min(last);
+        if target == cr.page {
+            return;
+        }
+        cr.page = target;
+        cr.selection = None; // collapses on flip (spec §5.1)
+        cr.hover_zone = 0;
+        // S5: only a flip from rest fades (≤120ms, incoming page only);
+        // reduce_motion → strictly instant (S12).
+        let from_rest = cr
+            .last_flip
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(CR_FLIP_REST_MS));
+        cr.last_flip = Some(Instant::now());
+        cr.flip_at = (!reduce && from_rest).then(Instant::now);
+        if cr.flip_at.is_some() {
+            self.cr_animate(CR_FLIP_FADE_MS + 40, cx);
+        }
+        cx.notify();
+    }
+
+    fn cr_mid_drag(&self) -> bool {
+        // Flip keys are ignored while the mouse is captured mid-drag (N4).
+        self.cold_read
+            .as_ref()
+            .is_some_and(|cr| cr.drag.as_ref().is_some_and(|d| d.selecting))
+    }
+
+    fn cr_next_page(&mut self, _: &CrNextPage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_mid_drag() {
+            return;
+        }
+        self.cr_commit_input(window, cx); // a flip files first (N1)
+        let Some(cr) = self.cold_read.as_ref() else { return };
+        if cr.page + 1 < cr.book.pages.len() {
+            self.cr_flip_to(cr.page + 1, cx);
+        }
+    }
+
+    fn cr_prev_page(&mut self, _: &CrPrevPage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_mid_drag() {
+            return;
+        }
+        self.cr_commit_input(window, cx);
+        let Some(cr) = self.cold_read.as_ref() else { return };
+        if cr.page > 0 {
+            self.cr_flip_to(cr.page - 1, cx);
+        }
+    }
+
+    fn cr_first_page(&mut self, _: &CrFirstPage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_mid_drag() {
+            return;
+        }
+        self.cr_commit_input(window, cx);
+        self.cr_flip_to(0, cx);
+    }
+
+    fn cr_last_page(&mut self, _: &CrLastPage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cr_mid_drag() {
+            return;
+        }
+        self.cr_commit_input(window, cx);
+        let Some(cr) = self.cold_read.as_ref() else { return };
+        self.cr_flip_to(cr.book.pages.len().saturating_sub(1), cx);
+    }
+
+    // -- Esc & copy ------------------------------------------------------------
+
+    /// Two-level Esc (I3): the reaction input closes first (Esc is the only
+    /// DISCARD — N1), then the desk.
+    fn cr_escape(&mut self, _: &CrEscape, window: &mut Window, cx: &mut Context<Self>) {
+        self.cr_escape_impl(window, cx);
+    }
+
+    fn cr_escape_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        if cr.input.is_some() {
+            self.cr_discard_input(window, cx);
+            return;
+        }
+        self.exit_cold_read(window, cx);
+    }
+
+    /// F5: ctrl-c / ctrl-insert slice the SOURCE snapshot by the selection's
+    /// manuscript char range — never the painted fragments (which carry no
+    /// spaces and invented hyphens). Empty selection: silent no-op.
+    fn cr_copy(&mut self, _: &CrCopy, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_ref() else { return };
+        let Some(sel) = cr.selection.clone() else { return };
+        if sel.is_empty() {
+            return;
+        }
+        let text = cr.slice_text(&sel);
+        // Headless-rig transport shim (the paste read-sites' counterpart):
+        // no-op outside STROP_SMOKE runs.
+        crate::smoke::mirror_clipboard(&text);
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        cx.write_to_primary(ClipboardItem::new_string(text));
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let _ = text;
+    }
+
+    /// F5's PRIMARY parity (the publish_primary contract): a finished page
+    /// selection is published; auto_copy_selection mirrors to the clipboard.
+    fn cr_publish_primary(&self, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_ref() else { return };
+        let Some(sel) = cr.selection.clone() else { return };
+        if sel.is_empty() {
+            return;
+        }
+        let text = cr.slice_text(&sel);
+        if self.config.auto_copy_selection {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        }
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        cx.write_to_primary(ClipboardItem::new_string(text));
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let _ = text;
+    }
+
+    // -- Page mouse model (S1) --------------------------------------------------
+
+    fn cr_zone_at(cr: &ColdRead, local: Point<Pixels>) -> i8 {
+        let x = f32::from(local.x);
+        if x < cr.geom.page_w * CR_FLIP_ZONE {
+            -1
+        } else if x > cr.geom.page_w * (1. - CR_FLIP_ZONE) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// The hover zone with the edge dead zones resolved: page 1's left and
+    /// the last page's right show no affordance (research-page §4.5 — the
+    /// control disappearing IS the "you are at the edge" message).
+    fn cr_live_zone(cr: &ColdRead, local: Point<Pixels>) -> i8 {
+        match Self::cr_zone_at(cr, local) {
+            -1 if cr.page > 0 => -1,
+            1 if cr.page + 1 < cr.book.pages.len() => 1,
+            _ => 0,
+        }
+    }
+
+    fn cr_page_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.cr_page_bounds.borrow() else { return };
+        // A page mousedown is a blur of the open input: file-or-close first
+        // (N1), then act.
+        self.cr_commit_input(window, cx);
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        let handle = cr.focus_handle.clone();
+        let local = point(ev.position.x - bounds.origin.x, ev.position.y - bounds.origin.y);
+        let zone = Self::cr_zone_at(cr, local);
+        let anchor = cr.hit_token(local);
+        cr.drag = Some(CrDrag { start: local, zone, selecting: false, anchor });
+        window.focus(&handle, cx);
+    }
+
+    fn cr_page_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.cr_page_bounds.borrow() else { return };
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        let local = point(ev.position.x - bounds.origin.x, ev.position.y - bounds.origin.y);
+        if ev.pressed_button == Some(MouseButton::Left)
+            && let Some(drag) = cr.drag.as_mut()
+        {
+            if !drag.selecting {
+                let moved = (f32::from(local.x - drag.start.x)).abs()
+                    + (f32::from(local.y - drag.start.y)).abs();
+                if moved > CR_DRAG_PX {
+                    drag.selecting = true; // S1: drag converts to selection
+                }
+            }
+            if drag.selecting {
+                let anchor = drag.anchor.clone();
+                let cur = cr.hit_token(local);
+                let sel = match (anchor, cur) {
+                    (Some(a), Some(c)) => {
+                        Some(a.start.min(c.start)..a.end.max(c.end))
+                    }
+                    (Some(a), None) => Some(a),
+                    (None, Some(c)) => {
+                        // The drag started off-text: adopt the first token.
+                        if let Some(d) = cr.drag.as_mut() {
+                            d.anchor = Some(c.clone());
+                        }
+                        Some(c)
+                    }
+                    (None, None) => None,
+                };
+                if sel != cr.selection {
+                    cr.selection = sel;
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        // Plain hover: the flip-zone shading (P9 — the zone works without
+        // the mouse; hover only announces it).
+        let zone = if bounds.contains(&ev.position) { Self::cr_live_zone(cr, local) } else { 0 };
+        if zone != cr.hover_zone {
+            cr.hover_zone = zone;
+            cx.notify();
+        }
+    }
+
+    fn cr_page_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.cr_page_bounds.borrow() else { return };
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        let Some(drag) = cr.drag.take() else { return };
+        let local = point(ev.position.x - bounds.origin.x, ev.position.y - bounds.origin.y);
+        if drag.selecting {
+            if cr.selection.as_ref().is_some_and(|s| !s.is_empty()) {
+                self.cr_publish_primary(cx);
+                self.cr_raise_input(window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        // A click in place: the armed flip fires (edges are dead zones —
+        // click eaten, the folio corroborates); mid-page, nothing (no caret
+        // exists; a stale selection collapses).
+        let _ = local;
+        match drag.zone {
+            -1 if cr.page > 0 => {
+                let p = cr.page - 1;
+                self.cr_flip_to(p, cx);
+            }
+            1 if cr.page + 1 < cr.book.pages.len() => {
+                let p = cr.page + 1;
+                self.cr_flip_to(p, cx);
+            }
+            -1 | 1 => {}
+            _ => {
+                if cr.selection.take().is_some() {
+                    cx.notify();
+                }
+            }
+        }
+        let _ = window;
+    }
+
+    // -- The reaction input (spec §5.2; L20) -------------------------------------
+
+    /// Raise the amber-bordered floating card under the selection. Past
+    /// never raises — you annotate the present only (Scopes 6).
+    fn cr_raise_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        if !cr.live() {
+            return;
+        }
+        let Some(sel) = cr.selection.clone() else { return };
+        let boxes = cr.range_boxes(&sel);
+        let anchor = boxes
+            .last()
+            .copied()
+            .unwrap_or((cr.geom.side, cr.geom.top, 120., cr.geom.line_h));
+        // S15: below the selection; ABOVE when the space below is tight;
+        // clamped; never covering the words it quotes.
+        let below_y = anchor.1 + anchor.3 + 8.;
+        let space_below = cr.geom.page_h + cr.geom.gutter - below_y;
+        let y = if space_below < CR_INPUT_H + 8. {
+            (anchor.1 - 8. - CR_INPUT_H).max(0.)
+        } else {
+            below_y
+        };
+        let max_x = cr.geom.page_w
+            + if cr.geom.lane { CR_LANE_GAP + CR_LANE_W } else { 0. }
+            - CR_INPUT_W;
+        let x = anchor.0.clamp(0., max_x.max(0.));
+        let input = cx.new(|cx| TextField::single(cx, String::new()));
+        let handle = input.read(cx).focus_handle.clone();
+        cx.subscribe(&input, move |editor, _, ev: &TextFieldEvent, cx| match ev {
+            TextFieldEvent::Commit(text) => {
+                let t = text.trim().to_owned();
+                if t.is_empty() {
+                    return; // Enter on empty = no-op (Scopes 5)
+                }
+                editor.cr_file_reaction(t, cx);
+            }
+            TextFieldEvent::Cancel => {
+                // Esc: the ONLY discard (N1) — close + collapse.
+                if let Some(cr) = editor.cold_read.as_mut() {
+                    cr.input = None;
+                    cr.input_range = None;
+                    cr.input_at = None;
+                    cr.selection = None;
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
+        // The universal commit-on-blur law (N1): any focus loss files
+        // non-empty trimmed text exactly as Enter would.
+        let this_input = input.clone();
+        let weak = cx.entity().downgrade();
+        window
+            .on_focus_out(&handle, cx, move |_, _window, cx| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.update_checked(cx, |editor, cx| {
+                    if editor
+                        .cold_read
+                        .as_ref()
+                        .is_some_and(|cr| cr.input.as_ref() == Some(&this_input))
+                    {
+                        editor.cr_commit_input_inner(cx);
+                    }
+                });
+            })
+            .detach();
+        window.focus(&handle, cx);
+        let cr = self.cold_read.as_mut().expect("still reading");
+        cr.input = Some(input);
+        cr.input_range = Some(sel);
+        cr.input_at = Some((x, y));
+        cx.notify();
+    }
+
+    /// File-or-close the open input (blur, lane-card click, flip, resize —
+    /// N1): non-empty trimmed text files exactly as Enter would;
+    /// whitespace-only is a plain close.
+    fn cr_commit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let refocus = self
+            .cold_read
+            .as_ref()
+            .filter(|cr| cr.input.is_some())
+            .map(|cr| cr.focus_handle.clone());
+        self.cr_commit_input_inner(cx);
+        if let Some(handle) = refocus {
+            window.focus(&handle, cx);
+        }
+    }
+
+    fn cr_commit_input_inner(&mut self, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        let Some(input) = cr.input.take() else { return };
+        let text = input.read(cx).content.trim().to_owned();
+        if text.is_empty() {
+            cr.input_range = None;
+            cr.input_at = None;
+            cr.selection = None;
+            cx.notify();
+            return;
+        }
+        self.cr_file_reaction(text, cx);
+    }
+
+    /// Esc inside the input: discard (N1's one discard path).
+    fn cr_discard_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        cr.input = None;
+        cr.input_range = None;
+        cr.input_at = None;
+        cr.selection = None;
+        let handle = cr.focus_handle.clone();
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// A chip files immediately; chip + typed text combine as
+    /// `"~ drags — {text}"` (N2, em-dash — L21's own exemplar).
+    fn cr_react_chip(&mut self, glyph: &str, cx: &mut Context<Self>) {
+        let typed = self
+            .cold_read
+            .as_ref()
+            .and_then(|cr| cr.input.as_ref())
+            .map(|i| i.read(cx).content.trim().to_owned())
+            .unwrap_or_default();
+        let body = if typed.is_empty() {
+            glyph.to_owned()
+        } else {
+            format!("{glyph} \u{2014} {typed}")
+        };
+        self.cr_file_reaction(body, cx);
+    }
+
+    /// Filing (spec §5.3): an ordinary writer note — `add_note(range +
+    /// manuscript_base_char(), body, now)`; same undo, same re-anchoring,
+    /// same margin afterlife. Bumps dirty + activity (N11); the book keys
+    /// off the snapshot, so the revision bump is absorbed.
+    fn cr_file_reaction(&mut self, body: String, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        if !cr.live() {
+            return; // the input never raises in Past; belt anyway (Scopes 6)
+        }
+        let Some(range) = cr.input_range.clone().or_else(|| cr.selection.clone()) else {
+            cr.input = None;
+            cr.input_at = None;
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let base = self.doc.manuscript_base_char();
+        let id = self.doc.add_note(base + range.start..base + range.end, body, now);
+        let cr = self.cold_read.as_mut().expect("still reading");
+        cr.reactions.push(id);
+        cr.input = None;
+        cr.input_range = None;
+        cr.input_at = None;
+        cr.selection = None;
+        self.mark_dirty();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// A lane card's dismiss: the margin's own inverse (`set_note_status`
+    /// Dismissed — Time 2), minus the exit-fade ghost (its surface is
+    /// suppressed — the S11 transient rule; lane departures are instant,
+    /// writer material, S6).
+    fn cr_dismiss_reaction(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.doc.set_note_status(id, NoteStatus::Dismissed);
+        self.doc
+            .journal_mut()
+            .record_event(strop_core::journal::JournalEvent::CardClosed {
+                t: strop_core::journal::now_ms(),
+                id,
+                resolved: false,
+            });
+        self.mark_dirty();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// The anchor link (spec §5.4; S19): flip to the page containing
+    /// `range.start` (fade rules apply; same-page click flashes only) +
+    /// one 420ms word-box flash via the book's own paint.
+    fn cr_lane_click(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.cr_commit_input(window, cx); // a lane click files first (N1)
+        let base = self.doc.manuscript_base_char();
+        let note_range = self.doc.notes().notes().iter().find(|n| n.id == id).map(|n| n.range.clone());
+        let Some(range) = note_range else { return };
+        let Some(cr) = self.cold_read.as_mut() else { return };
+        // Inverse rebase (regions 4): display = doc − base; out-of-range
+        // drops the link.
+        if range.start < base {
+            return;
+        }
+        let slice = range.start - base..range.end.saturating_sub(base);
+        // A clicked receded card is the one the writer wants whole: promote
+        // it to newest in the recede priority (S6 click-expands).
+        if let Some(pos) = cr.reactions.iter().position(|&r| r == id) {
+            let moved = cr.reactions.remove(pos);
+            cr.reactions.push(moved);
+        }
+        let target = cr.book.page_of_char(slice.start);
+        cr.flash = Some((slice, Instant::now()));
+        self.cr_animate(CR_FLASH_MS + 40, cx);
+        self.cr_flip_to(target, cx); // no-op fade-wise when already there
+        cx.notify();
+    }
+
+    // -- Resize (S9) -------------------------------------------------------------
+
+    /// The desk probe (a capture_canvas prepaint): on a size change,
+    /// re-break at the SAME metrics (snap) and resume at the page-top char.
+    /// The type step defers to resize-end (the settle watcher below).
+    fn cr_resize_probe(&mut self, desk_w: f32, desk_h: f32) -> bool {
+        let Some(cr) = self.cold_read.as_mut() else { return false };
+        if (desk_w - cr.laid_for.0).abs() < 0.5 && (desk_h - cr.laid_for.1).abs() < 0.5 {
+            return false;
+        }
+        let top_char = cr.book.page_top_char(cr.page);
+        let live = cr.live();
+        let geom = cr_geom(desk_w, desk_h, cr.geom.scale, cr.small, live);
+        let ts = cr.ts.clone();
+        let (text, spans, blocks) = (cr.text.clone(), cr.spans.clone(), cr.blocks.clone());
+        let sizes = cr.image_sizes.clone();
+        let book = cr_layout(&text, &spans, &blocks, &geom, &sizes, &mut cr.widths, &ts);
+        cr.page = book.page_of_char(top_char);
+        cr.book = book;
+        cr.geom = geom;
+        cr.laid_for = (desk_w, desk_h);
+        cr.layout_gen += 1;
+        cr.shaped = None;
+        // Motion yields to the writer's own movement: snap (S9), and the
+        // one-shot transients die with their geometry.
+        cr.flash = None;
+        cr.flip_at = None;
+        cr.selection = None; // collapses on resize (spec §5.1)
+        cr.resized_at = Some(Instant::now());
+        true
+    }
+
+    /// The settle watcher: while the takeover is up, re-evaluate the S9
+    /// type step once a resize is CR_RESIZE_SETTLE_MS old (hysteresis:
+    /// engage below 12 lines, release at ≥13) and file the input a resize
+    /// left open (N1 — done here, outside the draw pass).
+    fn cr_watch_settle(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(CR_RESIZE_SETTLE_MS))
+                    .await;
+                let done = this.update(cx, |editor: &mut Editor, cx| {
+                    let Some(cr) = editor.cold_read.as_mut() else {
+                        return true; // the room closed; the watcher exits
+                    };
+                    let Some(at) = cr.resized_at else { return false };
+                    if at.elapsed() < Duration::from_millis(CR_RESIZE_SETTLE_MS) {
+                        return false;
+                    }
+                    cr.resized_at = None;
+                    editor.cr_commit_input_inner(cx);
+                    let Some(cr) = editor.cold_read.as_mut() else { return true };
+                    let (dw, dh) = cr.laid_for;
+                    let normal = cr_geom(dw, dh, cr.geom.scale, false, cr.live());
+                    let want_small =
+                        if cr.small { normal.lines < 13 } else { normal.lines < 12 };
+                    if want_small != cr.small {
+                        let top_char = cr.book.page_top_char(cr.page);
+                        cr.small = want_small;
+                        let geom = cr_geom(dw, dh, cr.geom.scale, want_small, cr.live());
+                        let ts = cr.ts.clone();
+                        let (text, spans, blocks) =
+                            (cr.text.clone(), cr.spans.clone(), cr.blocks.clone());
+                        let sizes = cr.image_sizes.clone();
+                        let book = cr_layout(
+                            &text, &spans, &blocks, &geom, &sizes, &mut cr.widths, &ts,
+                        );
+                        cr.page = book.page_of_char(top_char);
+                        cr.book = book;
+                        cr.geom = geom;
+                        cr.layout_gen += 1;
+                        cr.shaped = None;
+                        cx.notify();
+                    }
+                    false
+                });
+                if done.unwrap_or(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+}
+
+impl Editor {
+    /// The reading room (impl 05 §4): the banner + the desk, mounted as a
+    /// takeover overlay in the root render switch. The reaction input and
+    /// the lane live INSIDE this subtree (F4 belt 3).
+    fn render_cold_read(&self, _window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let cr = self.cold_read.as_ref()?;
+        let g = cr.geom;
+        let entity = cx.entity();
+        // Vertical placement: the computed gutter, or dead-centre when the
+        // desk is taller than the capped page.
+        let pad_top = ((g.desk_h - g.page_h) / 2.).max(g.gutter.min((g.desk_h - g.page_h).max(0.)));
+        let cursor = match cr.hover_zone {
+            0 => CursorStyle::Arrow,
+            _ => CursorStyle::PointingHand,
+        };
+        let page = div()
+            .relative()
+            .flex_shrink_0()
+            .w(px(g.page_w))
+            .h(px(g.page_h))
+            .bg(rgb(PAGE_PAPER))
+            .cursor(cursor)
+            // The mock's double shadow (spec §3.2): 2/4 + 12/30 of #1A1E26.
+            .shadow(vec![
+                BoxShadow::new(px(0.), px(2.), gpui::Rgba { r: 26. / 255., g: 30. / 255., b: 38. / 255., a: 0.14 }.into())
+                    .blur_radius(px(4.)),
+                BoxShadow::new(px(0.), px(12.), gpui::Rgba { r: 26. / 255., g: 30. / 255., b: 38. / 255., a: 0.16 }.into())
+                    .blur_radius(px(30.)),
+            ])
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::cr_page_mouse_down))
+            .on_mouse_move(cx.listener(Self::cr_page_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::cr_page_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::cr_page_mouse_up))
+            .child(BookElement { editor: entity })
+            .map(|d| match self.render_cr_input(cr, cx) {
+                Some(input) => d.child(input),
+                None => d,
+            });
+        let group = div()
+            .flex()
+            .gap(px(CR_LANE_GAP))
+            .child(page)
+            .when(g.lane, |d| d.child(self.render_cr_lane(cr, cx)));
+        Some(
+            div()
+                .absolute()
+                .top(px(BAR_HEIGHT))
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .flex_col()
+                .key_context("ColdRead")
+                .track_focus(&cr.focus_handle)
+                .occlude()
+                .on_action(cx.listener(Self::cr_refuse))
+                .on_action(cx.listener(Self::cr_noop))
+                .on_action(cx.listener(Self::cr_copy))
+                .on_action(cx.listener(Self::cr_escape))
+                .on_action(cx.listener(Self::cr_next_page))
+                .on_action(cx.listener(Self::cr_prev_page))
+                .on_action(cx.listener(Self::cr_first_page))
+                .on_action(cx.listener(Self::cr_last_page))
+                // The typing pulse (Scopes 4): an UNBOUND keydown carrying a
+                // key_char, without ctrl/platform, is a typing attempt.
+                // Bound chords never reach key listeners; the open reaction
+                // input owns its keystrokes (S4 — never re-pulse).
+                .on_key_down(cx.listener(|editor, ev: &gpui::KeyDownEvent, _, cx| {
+                    if editor.cold_read.as_ref().is_some_and(|cr| cr.input.is_some()) {
+                        return;
+                    }
+                    let ks = &ev.keystroke;
+                    // A named modifier pressed alone never carries a key_char
+                    // from real hardware; gpui's simulated-IME path (the rig's
+                    // dispatch_keystroke) fabricates one, so the names are
+                    // excluded explicitly to keep Scopes 4 provable.
+                    let modifier_key = matches!(
+                        ks.key.as_str(),
+                        "shift" | "control" | "alt" | "platform" | "function"
+                    );
+                    if ks.key_char.is_some()
+                        && !ks.modifiers.control
+                        && !ks.modifiers.platform
+                        && !modifier_key
+                    {
+                        editor.pulse_cold_read(cx);
+                    }
+                }))
+                // F6: the wheel is eaten twice — the root early-returns and
+                // the takeover stops propagation.
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                // A desk click is not a document click; it also blurs the
+                // input (commit-on-blur, N1) and collapses the selection.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        editor.cr_commit_input(window, cx);
+                        if let Some(cr) = editor.cold_read.as_mut()
+                            && cr.selection.take().is_some()
+                        {
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child(self.render_cold_read_banner(cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .relative()
+                        .bg(rgb(DESK_BG))
+                        .overflow_hidden()
+                        .child({
+                            // The desk-size probe: geometry truth for the S9
+                            // resize path (plain shared-cell + in-draw write,
+                            // never a notify — the 2026-06-12 rule).
+                            let entity = cx.entity();
+                            capture_canvas(
+                                move |bounds, window, cx| {
+                                    let changed = entity.update_in_draw(cx, |editor| {
+                                        editor.cr_resize_probe(
+                                            f32::from(bounds.size.width),
+                                            f32::from(bounds.size.height),
+                                        )
+                                    });
+                                    if changed {
+                                        window.request_animation_frame();
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0()
+                        })
+                        .child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .justify_center()
+                                .items_start()
+                                .pt(px(pad_top))
+                                .child(group),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The banner (L14/L15 — strings are LAW): a full-width row flush under
+    /// the titlebar, drained wash, hairline below. Live:
+    /// **Reading** · “Draft complete” · 4,120 words · Esc returns.
+    /// History: **“Draft complete”** · Sun 6 Jul · 4,120 words [Restore] ·
+    /// Esc returns. The bold segment is the pulse target (one idiom, two
+    /// banners — Time 7).
+    fn render_cold_read_banner(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(cr) = self.cold_read.as_ref() else {
+            return div().into_any_element();
+        };
+        let words = format!("{} words", format_thousands(cr.words));
+        let pulse_a = cr.pulse_alpha();
+        let bold = |label: String| {
+            div()
+                .px(px(5.))
+                .py(px(1.))
+                .rounded(px(4.))
+                .bg(tint(0xC8A951, pulse_a))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT_COLOR))
+                .child(label)
+        };
+        let banner = div()
+            .h(px(CR_BANNER_H))
+            .flex_shrink_0()
+            .bg(rgb(STALE_BG))
+            .border_b_1()
+            .border_color(rgb(RULE_COLOR))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(9.))
+            .font_family("PT Sans")
+            .text_size(px(12.))
+            .text_color(rgb(MUTED_COLOR))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        match &cr.source {
+            ColdReadSource::Live => banner
+                .child(bold("Reading".into()))
+                .child(div().child(match &cr.station {
+                    Some(s) => format!("\u{b7} \u{201c}{s}\u{201d} \u{b7} {words}"),
+                    None => format!("\u{b7} {words}"),
+                }))
+                .child(div().text_color(rgb(0xB8B4A8)).child("\u{b7}"))
+                .child(div().child("Esc returns"))
+                .into_any_element(),
+            ColdReadSource::Past { name, created_unix } => {
+                // The date computes at render from a fresh now — never baked
+                // (Time 12; the strip's date_label convention).
+                let now_secs = strop_core::journal::now_ms() / 1000;
+                let date = strip::date_label(*created_unix, now_secs);
+                banner
+                    .child(bold(format!("\u{201c}{name}\u{201d}")))
+                    .child(div().child(format!("\u{b7} {date} \u{b7} {words}")))
+                    .child(
+                        div()
+                            .id("cr-restore")
+                            .occlude()
+                            .px(px(12.))
+                            .py(px(2.))
+                            .rounded(px(11.))
+                            .bg(rgb(TEXT_COLOR))
+                            .text_color(rgb(BG_COLOR))
+                            .text_size(px(11.5))
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|d| d.bg(rgb(0x33322D)))
+                            .child("Restore")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    editor.cr_restore(cx);
+                                }),
+                            ),
+                    )
+                    .child(div().text_color(rgb(0xB8B4A8)).child("\u{b7}"))
+                    .child(div().child("Esc returns"))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// The Past book's Restore chip: routes through `restore_to_state`,
+    /// which is taught to exit the takeover and unpark the strip (F3); the
+    /// `is_parked`-style idempotency guard is the Past-source match.
+    fn cr_restore(&mut self, cx: &mut Context<Self>) {
+        let Some(cr) = self.cold_read.as_ref() else { return };
+        let ColdReadSource::Past { created_unix, .. } = &cr.source else {
+            return;
+        };
+        let from_unix = *created_unix;
+        let Some((text, spans, blocks)) = cr.restore_state.clone() else {
+            return;
+        };
+        self.restore_to_state(text, spans, blocks, from_unix, cx);
+    }
+
+    /// The reading lane (spec §5.4): 230px right of the page, top-aligned
+    /// with the text block (S20), this session's reactions as warm note
+    /// cards in DOCUMENT order; overflow = the margin's own recede-in-place
+    /// grammar, oldest-filed first (S6).
+    fn render_cr_lane(&self, cr: &ColdRead, cx: &mut Context<Self>) -> gpui::Div {
+        let base = self.doc.manuscript_base_char();
+        // The session's still-open reactions, with their CURRENT bodies.
+        let mut cards: Vec<(u64, Range<usize>, String)> = Vec::new();
+        for n in self.doc.notes().notes() {
+            if n.status != NoteStatus::Open || !cr.reactions.contains(&n.id) {
+                continue;
+            }
+            let slice = n.range.start.saturating_sub(base)..n.range.end.saturating_sub(base);
+            cards.push((n.id, slice, n.body.clone()));
+        }
+        cards.sort_by_key(|(_, r, _)| r.start); // document order (S6)
+        // Recede-in-place: estimate heights, recede oldest-FILED until the
+        // stack fits the lane; pathological overflow clips at the lane top
+        // (accepted papercut tier — S6).
+        let budget = cr.geom.page_h - CR_MARGIN_TOP * cr.geom.scale;
+        let est = |body: &str, receded: bool| -> f32 {
+            if receded {
+                34.
+            } else {
+                let lines = (body.chars().count() as f32 / 28.).ceil().max(1.);
+                36. + lines * 17.
+            }
+        };
+        let mut receded: HashSet<u64> = HashSet::new();
+        let mut total: f32 = cards.iter().map(|(_, _, b)| est(b, false) + 10.).sum();
+        for &id in &cr.reactions {
+            if total <= budget {
+                break;
+            }
+            if let Some((_, _, body)) = cards.iter().find(|(cid, _, _)| *cid == id) {
+                total -= est(body, false) - est(body, true);
+                receded.insert(id);
+            }
+        }
+        div()
+            .w(px(CR_LANE_W))
+            .flex_shrink_0()
+            .pt(px(CR_MARGIN_TOP * cr.geom.scale))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .children(cards.into_iter().map(|(id, slice, body)| {
+                let is_receded = receded.contains(&id);
+                let quote = cr_quote(&cr.slice_text(&slice));
+                // The cosmetic rule (spec §5.3): a body starting `? ` / `! `
+                // / `~ ` bolds its first glyph — the glyph is text, not
+                // widget state (P3).
+                let glyph_led = body.len() > 1
+                    && matches!(body.as_bytes()[0], b'?' | b'!' | b'~')
+                    && body.as_bytes()[1] == b' ';
+                let card = div()
+                    .id(("cr-lane-card", id as usize))
+                    .occlude()
+                    .mb(px(10.))
+                    .bg(rgb(NOTE_CARD_BG))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .rounded(px(9.))
+                    .px(px(10.))
+                    .py(px(8.))
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.cr_lane_click(id, window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .font_family("PT Sans")
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child(quote),
+                            )
+                            .child(
+                                // The margin's own dismiss (Time 2) — the
+                                // inverse the note keeps for life.
+                                div()
+                                    .id(("cr-lane-x", id as usize))
+                                    .occlude()
+                                    .px(px(4.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.cr_dismiss_reaction(id, cx);
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    );
+                if is_receded {
+                    card.into_any_element()
+                } else {
+                    card.child(
+                        div()
+                            .mt(px(2.))
+                            .font_family("PT Serif")
+                            .text_size(px(13.))
+                            .line_height(px(18.))
+                            .text_color(rgb(TEXT_COLOR))
+                            .map(|d| {
+                                if glyph_led {
+                                    // Bold first glyph, still ordinary text
+                                    // (P3): a body-render rule, no schema.
+                                    d.child(
+                                        gpui::StyledText::new(body.clone()).with_highlights([(
+                                            0..1,
+                                            gpui::HighlightStyle {
+                                                font_weight: Some(FontWeight::BOLD),
+                                                ..Default::default()
+                                            },
+                                        )]),
+                                    )
+                                } else {
+                                    d.child(body.clone())
+                                }
+                            }),
+                    )
+                    .into_any_element()
+                }
+            }))
+    }
+}
+
+impl Editor {
+    /// The reaction input (L20): three quick-mark chips over one line with
+    /// the placeholder carrying the free-text option. Amber-bordered, ~250px,
+    /// floating under (or above — S15) the selection; eats mouse + wheel.
+    fn render_cr_input(&self, cr: &ColdRead, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let input = cr.input.clone()?;
+        let (x, y) = cr.input_at?;
+        let empty = input.read(cx).content.is_empty();
+        let chip = |glyph: &'static str, word: &'static str| {
+            div()
+                .id(("cr-chip", glyph.len() + word.len()))
+                .occlude()
+                .px(px(9.))
+                .py(px(2.))
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(RULE_COLOR))
+                .bg(rgb(NOTE_CARD_BG))
+                .font_family("PT Sans")
+                .text_size(px(11.5))
+                .text_color(rgb(TEXT_COLOR))
+                .cursor(CursorStyle::PointingHand)
+                .hover(|d| d.border_color(rgb(ACTIVE_BORDER)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.cr_react_chip(&format!("{glyph} {word}"), cx);
+                    }),
+                )
+                .child(format!("{glyph}\u{a0}{word}"))
+        };
+        Some(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(CR_INPUT_W))
+                .occlude()
+                .bg(rgb(CARD_BG))
+                .border_1()
+                .border_color(rgb(ACTIVE_BORDER))
+                .rounded(px(7.))
+                .px(px(8.))
+                .py(px(6.))
+                .shadow(vec![BoxShadow::new(
+                    px(0.),
+                    px(4.),
+                    gpui::Rgba { r: 26. / 255., g: 26. / 255., b: 24. / 255., a: 0.18 }.into(),
+                )
+                .blur_radius(px(14.))])
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .mb(px(5.))
+                        .child(chip("?", "doubt"))
+                        .child(chip("!", "alive"))
+                        .child(chip("~", "drags")),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .font_family("PT Serif")
+                        .text_size(px(13.))
+                        .child(input.clone())
+                        .when(empty, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child("\u{2026}or a few words"),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+/// The book page: a custom element painting the paginated manuscript —
+/// paper grain, justified fragments at their pen positions, running head,
+/// drop folio, flip-zone shading, selection tint and the anchor flash. All
+/// shaping happens in prepaint (the 2026-06-12 law); the shaped page is
+/// cached per (page, layout generation) on the ColdRead state.
+struct BookElement {
+    editor: Entity<Editor>,
+}
+
+#[derive(Default)]
+struct BookPrepaint {
+    ops: Vec<CrOp>,
+    tints: Vec<(f32, f32, f32, f32)>,
+    flash: Vec<(f32, f32, f32, f32)>,
+    flash_a: f32,
+    zone: i8,
+    veil: f32,
+    head: Option<(gpui::ShapedLine, f32, f32)>,
+    folio: Option<(gpui::ShapedLine, f32, f32)>,
+    paper: Option<Arc<RenderImage>>,
+    images: HashMap<String, Arc<RenderImage>>,
+    page_w: f32,
+    page_h: f32,
+}
+
+impl IntoElement for BookElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for BookElement {
+    type RequestLayoutState = ();
+    type PrepaintState = BookPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let _guard = DrawGuard::enter();
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let _guard = DrawGuard::enter();
+        // Geometry truth for the mouse handlers (the zone_row_bounds idiom).
+        *self.editor.read(cx).cr_page_bounds.borrow_mut() = Some(bounds);
+        let ts = window.text_system().clone();
+        let doc_name = {
+            let editor = self.editor.read(cx);
+            editor
+                .store
+                .as_ref()
+                .and_then(|s| s.path().file_stem().and_then(|x| x.to_str()).map(String::from))
+                .unwrap_or_else(|| "Untitled".into())
+        };
+        // Shape the current page once per (page, generation); the cache
+        // lives on the ColdRead state (an entity write without a notify).
+        self.editor.update_in_draw(cx, |editor| {
+            let Some(cr) = editor.cold_read.as_mut() else { return };
+            let fresh = cr
+                .shaped
+                .as_ref()
+                .is_some_and(|s| s.page == cr.page && s.layout_gen == cr.layout_gen);
+            if !fresh {
+                cr.shaped = Some(cr_shape_page(cr, &ts));
+            }
+        });
+        let editor = self.editor.read(cx);
+        let Some(cr) = editor.cold_read.as_ref() else {
+            return BookPrepaint::default();
+        };
+        let g = cr.geom;
+        let ops = cr.shaped.as_ref().map(|s| s.ops.clone()).unwrap_or_default();
+        let tints = cr
+            .selection
+            .as_ref()
+            .map(|sel| cr.range_boxes(sel))
+            .unwrap_or_default();
+        let (flash, flash_a) = match &cr.flash {
+            Some((range, at)) => {
+                let e = at.elapsed().as_millis() as f32 / CR_FLASH_MS as f32;
+                let a = (0.33 * (1. - e)).clamp(0., 0.33);
+                if a > 0.005 { (cr.range_boxes(range), a) } else { (Vec::new(), 0.) }
+            }
+            None => (Vec::new(), 0.),
+        };
+        let veil = cr
+            .flip_at
+            .map(|t| {
+                let e = t.elapsed().as_millis() as f32 / CR_FLIP_FADE_MS as f32;
+                (1. - e).clamp(0., 1.)
+            })
+            .filter(|a| *a > 0.005)
+            .unwrap_or(0.);
+        // The running head (L12/O11): live `{doc} — draft`, Past `{doc}`
+        // alone (the banner already carries the checkpoint name). Italic,
+        // muted, top-right, ellipsized, never wraps.
+        let muted: Hsla = rgb(MUTED_COLOR).into();
+        let head_text = match &cr.source {
+            ColdReadSource::Live => format!("{doc_name} \u{2014} draft"),
+            ColdReadSource::Past { .. } => doc_name,
+        };
+        let head_size = 12.5 * g.scale;
+        let head_st = crate::bookpage::Style { italic: true, ..Default::default() };
+        let shape_small = |text: String, st: crate::bookpage::Style, size: f32| {
+            let run = TextRun {
+                len: text.len(),
+                font: cr_font(crate::bookpage::Role::Body, st),
+                color: muted,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            ts.shape_line(SharedString::from(text), px(size), &[run], None)
+        };
+        // Ellipsize the head into the measure (it never wraps).
+        let mut head_line = shape_small(head_text.clone(), head_st, head_size);
+        if f32::from(head_line.width) > g.measure {
+            let mut text = head_text.clone();
+            while !text.is_empty() && f32::from(head_line.width) > g.measure {
+                text.pop();
+                head_line = shape_small(format!("{text}\u{2026}"), head_st, head_size);
+            }
+        }
+        let head_x = g.page_w - g.side - f32::from(head_line.width);
+        let head_y = 26. * g.scale - f32::from(head_line.ascent);
+        // The drop folio: `— 2 of 9 —`, centered, ~26px above the foot.
+        let folio_text = format!("\u{2014} {} of {} \u{2014}", cr.page + 1, cr.book.pages.len());
+        let folio_line = shape_small(folio_text, crate::bookpage::Style::default(), head_size);
+        let folio_x = (g.page_w - f32::from(folio_line.width)) / 2.;
+        let folio_y = g.page_h - 26. * g.scale - f32::from(folio_line.ascent);
+        // Decode handles are collected first: `use_render_image` needs the
+        // App borrow the `editor` read above still holds.
+        let paper_img = cr.paper.clone();
+        let image_handles: Vec<(String, Arc<gpui::Image>)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                CrOp::Image { src, .. } => {
+                    editor.image_assets.get(src).map(|h| (src.clone(), h.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let zone = cr.hover_zone;
+        let paper = paper_img.and_then(|img| img.use_render_image(window, cx));
+        let mut images = HashMap::new();
+        for (src, handle) in image_handles {
+            if let Some(render) = handle.use_render_image(window, cx) {
+                images.insert(src, render);
+            }
+        }
+        BookPrepaint {
+            ops,
+            tints,
+            flash,
+            flash_a,
+            zone,
+            veil,
+            head: Some((head_line, head_x, head_y)),
+            folio: Some((folio_line, folio_x, folio_y)),
+            paper,
+            images,
+            page_w: g.page_w,
+            page_h: g.page_h,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let _guard = DrawGuard::enter();
+        let origin = bounds.origin;
+        let p = prepaint;
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            // Paper: the page fill IS the pre-multiplied noise tile, drawn
+            // tiled over the paper color — zero runtime blending (§3.3).
+            window.paint_quad(fill(bounds, rgb(PAGE_PAPER)));
+            if let Some(paper) = &p.paper {
+                let tile = 256.;
+                let (cols, rows) =
+                    ((p.page_w / tile).ceil() as usize, (p.page_h / tile).ceil() as usize);
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let b = Bounds::new(
+                            origin + point(px(col as f32 * tile), px(row as f32 * tile)),
+                            size(px(tile), px(tile)),
+                        );
+                        let _ = window.paint_image(b, Corners::default(), paper.clone(), 0, false);
+                    }
+                }
+            }
+            // Flip-zone hover shading: the inward gradient UNDER the ink (S1).
+            if p.zone != 0 {
+                let w = p.page_w * CR_FLIP_ZONE;
+                let shade = gpui::Rgba { r: 26. / 255., g: 30. / 255., b: 38. / 255., a: 0.035 };
+                let clear = gpui::Rgba { r: 26. / 255., g: 30. / 255., b: 38. / 255., a: 0. };
+                let (x, angle) = if p.zone < 0 { (0., 90.) } else { (p.page_w - w, 270.) };
+                window.paint_quad(fill(
+                    Bounds::new(origin + point(px(x), px(0.)), size(px(w), px(p.page_h))),
+                    gpui::linear_gradient(
+                        angle,
+                        gpui::linear_color_stop(shade, 0.),
+                        gpui::linear_color_stop(clear, 1.),
+                    ),
+                ));
+            }
+            // Selection tint and the anchor flash: painted before ink (S14).
+            for &(x, y, w, h) in &p.tints {
+                window.paint_quad(fill(
+                    Bounds::new(origin + point(px(x), px(y)), size(px(w), px(h))),
+                    rgba(SELECTION_COLOR),
+                ));
+            }
+            for &(x, y, w, h) in &p.flash {
+                window.paint_quad(fill(
+                    Bounds::new(origin + point(px(x), px(y)), size(px(w), px(h))),
+                    tint(0xC8A951, p.flash_a),
+                ));
+            }
+            // The ink.
+            for op in &p.ops {
+                match op {
+                    CrOp::Ink { x, y, line_h, shaped } => {
+                        shaped
+                            .paint(
+                                origin + point(px(*x), px(*y)),
+                                px(*line_h),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
+                    }
+                    CrOp::Rule { x, y, w } => {
+                        window.paint_quad(fill(
+                            Bounds::new(origin + point(px(*x), px(*y)), size(px(*w), px(1.))),
+                            rgb(RULE_COLOR),
+                        ));
+                    }
+                    CrOp::Image { x, y, w, h, src } => {
+                        let b = Bounds::new(origin + point(px(*x), px(*y)), size(px(*w), px(*h)));
+                        match p.images.get(src) {
+                            Some(render) => {
+                                let _ = window.paint_image(
+                                    b,
+                                    Corners::default(),
+                                    render.clone(),
+                                    0,
+                                    false,
+                                );
+                            }
+                            None => {
+                                // The missing-image degradation at a
+                                // deterministic size (regions 12): a quiet
+                                // drained box.
+                                window.paint_quad(fill(b, rgb(STALE_BG)));
+                            }
+                        }
+                    }
+                }
+            }
+            // Running head + drop folio.
+            if let Some((line, x, y)) = &p.head {
+                let lh = f32::from(line.ascent) + f32::from(line.descent);
+                line.paint(origin + point(px(*x), px(*y)), px(lh), TextAlign::Left, None, window, cx)
+                    .ok();
+            }
+            if let Some((line, x, y)) = &p.folio {
+                let lh = f32::from(line.ascent) + f32::from(line.descent);
+                line.paint(origin + point(px(*x), px(*y)), px(lh), TextAlign::Left, None, window, cx)
+                    .ok();
+            }
+            // The flip fade (S5): the incoming page's ink fades in under a
+            // paper-colored veil — a pure function of the stored Instant;
+            // reduce_motion never sets it (S12).
+            if p.veil > 0. {
+                window.paint_quad(fill(bounds, tint(PAGE_PAPER, p.veil)));
+            }
+        });
+    }
+}
+
+/// Shape one page into positioned paint ops (page-local coords).
+fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> CrShapedPage {
+    use crate::bookpage::{PageItem, Role};
+    let g = cr.geom;
+    let mut ops: Vec<CrOp> = Vec::new();
+    let Some(page) = cr.book.pages.get(cr.page) else {
+        return CrShapedPage { page: cr.page, layout_gen: cr.layout_gen, ops };
+    };
+    for item in &page.items {
+        match item {
+            PageItem::Line(line) => {
+                let ly = g.top + line.y;
+                if matches!(line.role, Role::Divider) {
+                    // A Divider's line is empty — paint the rule (Wave A
+                    // hand-off): a quiet centered half-measure.
+                    ops.push(CrOp::Rule {
+                        x: g.side + g.measure * 0.25,
+                        y: ly + line.height / 2.,
+                        w: g.measure * 0.5,
+                    });
+                    continue;
+                }
+                if let Some(mk) = &line.marker {
+                    let run = TextRun {
+                        len: mk.text.len(),
+                        font: cr_font(Role::Body, crate::bookpage::Style::default()),
+                        color: rgb(TEXT_COLOR).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped =
+                        ts.shape_line(SharedString::from(mk.text.clone()), px(g.body), &[run], None);
+                    ops.push(CrOp::Ink { x: g.side + mk.x, y: ly, line_h: line.height, shaped: Box::new(shaped) });
+                }
+                for frag in &line.frags {
+                    let runs: Vec<TextRun> = frag
+                        .runs
+                        .iter()
+                        .map(|&(len, st)| cr_text_run(len, line.role, st))
+                        .collect();
+                    let shaped = ts.shape_line(
+                        SharedString::from(frag.text.clone()),
+                        px(cr_font_size(line.role, g.body)),
+                        &runs,
+                        None,
+                    );
+                    // Footnote refs paint as superior figures over their
+                    // invisible carriers, numbered by slice order
+                    // (regions 11; the fn_marks machinery's grammar).
+                    if frag.runs.iter().any(|(_, st)| st.footnote) {
+                        for (n, r) in cr.fn_refs.iter().enumerate() {
+                            if r.start >= frag.slice.end || frag.slice.start >= r.end {
+                                continue;
+                            }
+                            let ch_off = r.start.saturating_sub(frag.slice.start);
+                            let byte = frag
+                                .text
+                                .char_indices()
+                                .nth(ch_off)
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            let x_off = f32::from(shaped.x_for_index(byte));
+                            let label = (n + 1).to_string();
+                            let sup_size = g.body * 0.65;
+                            let sup_run = TextRun {
+                                len: label.len(),
+                                font: cr_font(line.role, crate::bookpage::Style::default()),
+                                color: rgb(LINK_COLOR).into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let sup = ts.shape_line(
+                                SharedString::from(label),
+                                px(sup_size),
+                                &[sup_run],
+                                None,
+                            );
+                            let body_baseline = (line.height
+                                - f32::from(shaped.ascent)
+                                - f32::from(shaped.descent))
+                                / 2.
+                                + f32::from(shaped.ascent);
+                            let sup_lh = f32::from(sup.ascent) + f32::from(sup.descent);
+                            let sup_y =
+                                ly + body_baseline - g.body * 0.35 - f32::from(sup.ascent);
+                            ops.push(CrOp::Ink {
+                                x: g.side + frag.x + x_off,
+                                y: sup_y,
+                                line_h: sup_lh,
+                                shaped: Box::new(sup),
+                            });
+                        }
+                    }
+                    ops.push(CrOp::Ink { x: g.side + frag.x, y: ly, line_h: line.height, shaped: Box::new(shaped) });
+                }
+            }
+            PageItem::Image { x, y, width, height, src, caption, .. } => {
+                ops.push(CrOp::Image {
+                    x: g.side + x,
+                    y: g.top + y,
+                    w: *width,
+                    h: *height,
+                    src: src.clone(),
+                });
+                if !caption.trim().is_empty() {
+                    // One caption line, muted italic, centered — no source
+                    // range (N10: dead to selection).
+                    let st = crate::bookpage::Style { italic: true, ..Default::default() };
+                    let run = TextRun {
+                        len: caption.len(),
+                        font: cr_font(Role::Body, st),
+                        color: rgb(MUTED_COLOR).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = ts.shape_line(
+                        SharedString::from(caption.clone()),
+                        px(g.body * 0.8),
+                        &[run],
+                        None,
+                    );
+                    let cx0 = g.side + x + (width - f32::from(shaped.width)) / 2.;
+                    ops.push(CrOp::Ink { x: cx0, y: g.top + y + height, line_h: g.line_h, shaped: Box::new(shaped) });
+                }
+            }
+        }
+    }
+    CrShapedPage { page: cr.page, layout_gen: cr.layout_gen, ops }
+}
+
 impl Editor {
     /// The bottom strip overlay (spec §0): machine-room dark, the seek-bar
     /// floor. The fabric + rail + thumb + ticks + labels are custom-painted by
@@ -16833,6 +19661,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         if !self.strip.open {
+            return None;
+        }
+        // A Past cold read hides the strip's ELEMENT; the parked state
+        // survives untouched and Esc returns the identical frame (Time 7).
+        if self.cold_read.is_some() {
             return None;
         }
         let parked = self.strip.parked;
@@ -17964,5 +20797,91 @@ mod tests {
         // That is the structural guarantee that retired the draft-leak bug; it
         // needs no test because it cannot be constructed wrong (the entity-
         // bearing variant would take gpui `test-support`, deliberately not on).
+    }
+
+    // ---- The cold read's geometry (impl 05 §3.2; S7/S8/S9) -----------------
+
+    #[test]
+    fn cr_geom_spec_metrics_at_scale_one() {
+        // A roomy desk: the §3.2 table verbatim — 570 page, 450 measure,
+        // 60/48/64 margins, 25px lines, height capped at 1.5×w and floored
+        // to whole lines.
+        let g = cr_geom(1300., 1000., 1., false, true);
+        assert_eq!(g.page_w, 570.);
+        assert_eq!(g.measure, 450.);
+        assert_eq!(g.side, 60.);
+        assert_eq!(g.top, 48.);
+        assert_eq!(g.bottom, 64.);
+        assert_eq!(g.line_h, 25.);
+        assert!(g.page_h <= 855., "cap 1.5×w");
+        let text_h = g.page_h - g.top - g.bottom;
+        assert_eq!(text_h % g.line_h, 0., "whole lines");
+        assert!(g.lane, "Live reserves the lane from entry (S2)");
+        assert!(g.metrics().justify);
+        assert_eq!(g.metrics().para_gap, 17., "1em air, rounded");
+    }
+
+    #[test]
+    fn cr_geom_width_clause_shrinks_the_measure_not_the_margins() {
+        // S7: clamped page → the MEASURE shrinks, margins hold at 60·scale;
+        // far enough down the block sets ragged (justify=false).
+        let g = cr_geom(500., 900., 1., false, true);
+        assert_eq!(g.page_w, 500.);
+        assert_eq!(g.side, 60.);
+        assert_eq!(g.measure, 380.);
+        assert!(g.metrics().justify, "380px ≈ 46 EN / 42 RU chars — above both floors");
+        assert!(!g.lane, "no room for the group: the lane hides");
+        // Narrower still: 340px ≈ 38 RU chars — under the RU floor (40),
+        // the whole block sets ragged-right, unhyphenated (S7).
+        let g = cr_geom(460., 900., 1., false, true);
+        assert_eq!(g.measure, 340.);
+        assert!(!g.metrics().justify);
+    }
+
+    #[test]
+    fn cr_geom_small_step_preserves_chars_per_line() {
+        // The S9 emergency step: 15px type / 420px measure — the same
+        // chars-per-line, tighter leading, still justified.
+        let g = cr_geom(1300., 400., 1., true, true);
+        assert_eq!(g.body, 15.);
+        assert_eq!(g.measure, 420.);
+        assert_eq!(g.line_h, (25. * 15. / 16.5_f32).round());
+        assert!(g.metrics().justify);
+    }
+
+    #[test]
+    fn cr_geom_tiny_window_floors_at_two_lines_and_sheds_the_gutter() {
+        // S8: the floor is margins + 2 lines; shorter desks clip the page,
+        // never the text; the gutter goes before the type does.
+        let g = cr_geom(700., 130., 1., false, true);
+        assert_eq!(g.gutter, 0.);
+        assert_eq!(g.lines, 2);
+        assert!(g.page_h >= 2. * g.line_h + g.top + g.bottom);
+    }
+
+    #[test]
+    fn cr_geom_scales_the_page_tokens_by_font_scale() {
+        let g = cr_geom(2000., 1600., 1.5, false, true);
+        assert_eq!(g.page_w, 855.);
+        assert_eq!(g.side, 90.);
+        assert_eq!(g.body, 16.5 * 1.5);
+        assert_eq!(g.line_h, (25. * 1.5_f32).round());
+    }
+
+    #[test]
+    fn cr_quote_is_grapheme_safe_and_flattens_newlines() {
+        // N9: 42-grapheme cap + U+2026; newlines become spaces; a combining
+        // sequence never splits.
+        assert_eq!(cr_quote("a\nb"), "\u{201c}a b\u{201d}");
+        let long: String = "слово ".repeat(20);
+        let q = cr_quote(&long);
+        assert!(q.ends_with("\u{2026}\u{201d}"));
+        let inner: Vec<&str> = q.graphemes(true).collect();
+        // “ + 42 + … + ” = 45 graphemes.
+        assert_eq!(inner.len(), 45);
+        // A grapheme cluster at the cut point stays whole.
+        let cluster: String = "y\u{0301}".repeat(50);
+        let qc = cr_quote(&cluster);
+        assert!(qc.graphemes(true).count() <= 45);
     }
 }

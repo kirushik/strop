@@ -31,7 +31,7 @@ pub const SPACE_MAX_PREFERRED: f32 = 1.33;
 /// (the \emergencystretch analogue).
 pub const SPACE_MAX_ACCEPTABLE: f32 = 2.00;
 /// Per-gap stretch window: nominal × 0.33 (= SPACE_MAX_PREFERRED − 1).
-pub const STRETCH_PER_GAP: f32 = 0.33;
+pub const STRETCH_PER_GAP: f32 = SPACE_MAX_PREFERRED - 1.;
 /// Per-gap shrink window: nominal × 0.20 (= 1 − SPACE_MIN).
 pub const SHRINK_PER_GAP: f32 = 0.20;
 /// TeX badness saturates at 10000 ("awful"); ours does too, so penalties
@@ -319,6 +319,9 @@ pub struct BookMetrics {
     /// False below the justification floor (S7): the whole block sets
     /// ragged-right, unhyphenated.
     pub justify: bool,
+    /// Air between two consecutive text blocks (the approved mock's
+    /// `margin: 0 0 1em` — ux-lab scene 1); 0 = the bare line grid.
+    pub para_gap: f32,
 }
 
 /// S7: is `measure` too narrow to justify? Below ~45 EN / ~40 RU characters
@@ -1222,7 +1225,20 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
         base: usize::from(capacity < RELAX_CAPACITY),
     };
     let mut it = flows.into_iter().peekable();
+    let mut prev_text = false;
     while let Some(flow) = it.next() {
+        // Inter-paragraph air (`para_gap`, the lab mock's `margin: 0 0 1em`
+        // — scene 1 CSS): between two consecutive TEXT blocks only; a
+        // writer's own blank line (or a divider's empty line) is already
+        // separation, and a page never opens with a gap (close() resets y).
+        let is_text = match &flow {
+            Flow::Para { lines, .. } => lines.iter().any(|l| !l.frags.is_empty()),
+            Flow::Image(_) => true,
+        };
+        if prev_text && is_text && asm.y > 0.0 {
+            asm.y += metrics.para_gap;
+        }
+        prev_text = is_text;
         match flow {
             Flow::Para { lines, heading } => {
                 if heading && let Some(next) = it.peek() {
@@ -1292,6 +1308,9 @@ mod tests {
             page_height: page_lines as f32 * 25.0,
             em: 16.0,
             justify: true,
+            // The pagination tests reason in whole lines; the surface's
+            // inter-paragraph air is exercised by its own test below.
+            para_gap: 0.0,
         }
     }
 
@@ -1892,6 +1911,7 @@ mod tests {
             page_height: 725.0,
             em: 16.5,
             justify: true,
+            para_gap: 17.0,
         };
         let spans = SpanSet::default();
         let t0 = std::time::Instant::now();
@@ -1905,6 +1925,38 @@ mod tests {
         println!(
             "bookpage microbench: 5k words -> {} pages; run1 {first:?}, run2 {second:?} (fake measurer)",
             a.pages.len()
+        );
+    }
+
+    /// The surface's inter-paragraph air (the approved mock's 1em margin):
+    /// applied between two consecutive TEXT blocks only — a writer's own
+    /// blank line already separates, and a page never opens with a gap.
+    #[test]
+    fn para_gap_airs_consecutive_text_blocks_only() {
+        let text = "one two\nthree four\n\nfive six";
+        let blocks = BlockMap::new(4);
+        let mut m = metrics(200.0, 20);
+        m.para_gap = 5.0;
+        let book = paginate(text, &SpanSet::default(), &blocks, &m, &mut FakeM, &mut FakeH);
+        let ls = lines(&book);
+        assert_eq!(ls.len(), 4);
+        assert_eq!(ls[0].y, 0.0, "the first block never gaps");
+        assert_eq!(ls[1].y, 30.0, "text→text gets the air");
+        assert_eq!(ls[2].y, 55.0, "a blank line is already separation");
+        assert_eq!(ls[3].y, 80.0, "…on both of its sides");
+        // With the gap at 0 the grid is bare (the Wave A default).
+        let plain = paginate(
+            text,
+            &SpanSet::default(),
+            &blocks,
+            &metrics(200.0, 20),
+            &mut FakeM,
+            &mut FakeH,
+        );
+        let pl = lines(&plain);
+        assert_eq!(
+            pl.iter().map(|l| l.y).collect::<Vec<_>>(),
+            vec![0.0, 25.0, 50.0, 75.0]
         );
     }
 }

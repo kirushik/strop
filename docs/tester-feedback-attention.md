@@ -161,3 +161,16 @@ each way.)*
   number.
 - Any jank report on a low-power machine → revisit durations / frame budget before
   shipping wider.
+
+---
+
+## 8. The cold read (Wave B addendum)
+
+- Filing a reaction inside the read is an ordinary undoable note — which
+  means it CLEARS your redo stack, like any edit would (adjudications N3:
+  the top-of-stack revert-under-a-snapshot lie was judged worse than the
+  two-gesture fix). If a tester reports "I lost my redo after reading",
+  that is this accepted trade — collect frequency, don't hot-fix.
+- Undo is refused (the banner pulses) inside the read; dismissing a lane
+  card is the inverse that works everywhere: the note keeps its dismiss
+  for life.
