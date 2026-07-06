@@ -15,16 +15,11 @@
 // it past the default 128. A wider budget beats splitting the dump.
 #![recursion_limit = "256"]
 
-// The cold read's layout engine and hyphenation router ship one wave ahead
-// of their surface (impl 05 §8: Wave A = the engine, Wave B = the room), so
-// nothing calls them from the app yet — only their unit tests do.
-#[allow(dead_code)]
 mod bookpage;
 mod commands;
 mod config;
 mod draw_guard;
 mod editor;
-#[allow(dead_code)]
 mod hyphen;
 mod files;
 mod paths;
