@@ -87,3 +87,27 @@ pub fn home_dir() -> PathBuf {
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(std::env::temp_dir)
 }
+
+/// Locate a runtime asset data file (the cold read's hyphenation
+/// dictionaries and book fonts). These ship as LOOSE files beside the
+/// binary — never `include_bytes!` — because hyph-ru is LPPL 1.2+ and the
+/// URW fonts are AGPL-3.0-with-exception: the mere-aggregation posture
+/// wants each an intact independent work on disk (impl 05 §2.4/§3.1).
+/// Search order: `$STROP_ASSETS` override → the executable's own `assets/`
+/// sibling (packaged installs) → the repo's `assets/` (dev builds; the
+/// compile-time manifest path) → the per-user data dir. Missing everywhere
+/// → `None`; callers degrade honestly and log.
+pub fn asset_file(rel: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = std::env::var("STROP_ASSETS") {
+        candidates.push(PathBuf::from(root).join(rel));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("assets").join(rel));
+    }
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets").join(rel));
+    candidates.push(data_dir().join("assets").join(rel));
+    candidates.into_iter().find(|p| p.is_file())
+}

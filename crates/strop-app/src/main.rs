@@ -24,6 +24,8 @@ mod commands;
 mod config;
 mod draw_guard;
 mod editor;
+#[allow(dead_code)]
+mod hyphen;
 mod files;
 mod paths;
 mod single_instance;

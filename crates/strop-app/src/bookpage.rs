@@ -1274,15 +1274,13 @@ mod tests {
         }
     }
 
-    /// The crate's soft-hyphen convention: shy positions are the only breaks.
+    /// The crate's soft-hyphen convention (hyphenator.rs
+    /// soft_hyphen_indices): the byte index OF each shy, as the only breaks.
     struct ShyH;
 
     impl Hyphenate for ShyH {
         fn breaks(&mut self, word: &str) -> Vec<usize> {
-            word.char_indices()
-                .filter(|&(_, c)| c == '\u{AD}')
-                .map(|(i, c)| i + c.len_utf8())
-                .collect()
+            word.match_indices('\u{ad}').map(|(i, _)| i).collect()
         }
     }
 
