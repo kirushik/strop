@@ -6088,18 +6088,27 @@ impl Editor {
                 && sel.end == self.paragraph_bounds(sel.end.max(sel.start)).1;
             if whole_blocks {
                 let bytes = self.doc.rope();
-                let len = self.doc.len_bytes();
-                let at = |i: usize| (i < len).then(|| bytes.byte(i));
-                if sel.end + 2 <= len && at(sel.end) == Some(b'\n') && at(sel.end + 1) == Some(b'\n') {
+                // Widen only WITHIN the manuscript: the join above the seam
+                // belongs to the boundary, and a widened range crossing it
+                // would be refused as seam-spanning (the second-park bug the
+                // rig caught).
+                let m = self.doc.manuscript_char_range();
+                let m_end = self.doc.char_to_byte(m.end);
+                let m_start = self.doc.char_to_byte(m.start);
+                let at = |i: usize| (i < m_end).then(|| bytes.byte(i));
+                if sel.end + 2 <= m_end
+                    && at(sel.end) == Some(b'\n')
+                    && at(sel.end + 1) == Some(b'\n')
+                {
                     sel.start..sel.end + 2 // the trailing blank-line separator
-                } else if sel.end < len && at(sel.end) == Some(b'\n') {
+                } else if sel.end < m_end && at(sel.end) == Some(b'\n') {
                     sel.start..sel.end + 1 // a plain block join
-                } else if sel.start >= 2
+                } else if sel.start >= m_start + 2
                     && at(sel.start - 1) == Some(b'\n')
                     && at(sel.start - 2) == Some(b'\n')
                 {
                     sel.start - 2..sel.end // the leading separator (tail case)
-                } else if sel.start > 0 {
+                } else if sel.start > m_start {
                     sel.start - 1..sel.end
                 } else {
                     sel
@@ -8557,12 +8566,20 @@ impl Editor {
             // the list's own scroll (not the document's) — the rig asserts
             // keyboard nav past the fold actually moves this, and that mouse
             // wheel still does too. `null` when the omnibox is closed.
-            "omni": self.palette_input.as_ref().map(|_| serde_json::json!({
-                "selected": self.palette_selected,
-                "rows": self.omni_rows(&self.palette_query).len(),
-                "scroll_y": f32::from(self.omni_scroll.offset().y),
-                "max_scroll_y": f32::from(self.omni_scroll.max_offset().y),
-            })),
+            "omni": self.palette_input.as_ref().map(|_| {
+                // The find split (scopes-search 2): the announced
+                // "N in the piece · M in scraps" halves, as data.
+                let (piece, scraps, capped) = self.find_split(&self.omni_match_ranges());
+                serde_json::json!({
+                    "selected": self.palette_selected,
+                    "rows": self.omni_rows(&self.palette_query).len(),
+                    "scroll_y": f32::from(self.omni_scroll.offset().y),
+                    "max_scroll_y": f32::from(self.omni_scroll.max_offset().y),
+                    "find_piece": piece,
+                    "find_scraps": scraps,
+                    "find_capped": capped,
+                })
+            }),
             // A completed pass parked behind the reveal clock (mid-burst
             // arrival) — the rig asserts park-then-land timing against this.
             "ai_deferred": self.deferred_pass.is_some(),
