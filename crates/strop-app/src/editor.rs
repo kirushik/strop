@@ -158,6 +158,25 @@ impl CardMove {
     }
 }
 
+/// The park receipt's origin station (surfaces-attention 3/4): a
+/// viewport-FROZEN echo of the departed block, fading ~150ms with a short
+/// downward drift while the prose closes up instantly beneath it — every
+/// frame shows committed text plus a fading light, so a park right after
+/// typing can never read as "did I delete it?". Writer-initiated, so it
+/// rides its own channel, exempt from the lane's burst snap; reduce_motion
+/// drops the drift (pure cross-fade).
+struct ParkGhost {
+    text: String,
+    /// Window-space rect at freeze time.
+    left: f32,
+    top: f32,
+    width: f32,
+    font_size: f32,
+    line_height: f32,
+    /// Keys the element animation (a fresh park = a fresh run).
+    seq: usize,
+}
+
 /// A completed pass parked until the typing lull (see `Editor::deferred_pass`).
 /// Carries the RAW diagnoses (quotes not yet anchored) and the generation that
 /// produced them — a cancel or a newer run bumps `ai_generation`, and a stale
@@ -239,6 +258,17 @@ const AUTO_CUT_MIN_CHARS: usize = 80;
 /// The Scraps chip's arrival ring: two expanding beats (the mockup's
 /// `chippulse`, 1.4s ease-out × 2) — an event, never a standing light.
 const CHIP_PULSE_MS: u64 = 2800;
+/// The provenance one-liner's id namespace in the margin lane (a packer
+/// citizen beside real note cards — the flag keeps record ids and note ids
+/// from ever colliding in the motion/appearing maps).
+const PROV_ID_FLAG: u64 = 1 << 63;
+/// The provenance one-liner's fixed height: one quiet row (quote · date ·
+/// Put back), truncated — deterministic for the packer.
+const PROV_CARD_H: f32 = 22.;
+/// The rest delay before the caret-block's provenance shows (~one caret
+/// blink): traversing a 60-scrap pile must not strobe the margin
+/// (surfaces-attention 5). Hide on leave is instant.
+const PROV_REST_DELAY: Duration = Duration::from_millis(1000);
 
 /// A small hover tooltip: a control's name and, optionally, its chord in a
 /// mono chip (DESIGN §0 — every titlebar control should teach its shortcut).
@@ -439,7 +469,7 @@ actions!(
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
         ScrapsTravel, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
-        ToggleGraveyard,
+        MoveToManuscript, PutBackScrap, ToggleGraveyard,
     ]
 );
 
@@ -800,6 +830,9 @@ const FLANK_GRID_H: f32 = 210.;
 enum SelVerb {
     Note,
     Aside,
+    /// The pile's retrieval verb (below the seam only): the text lands at
+    /// the latch's home position, arriving SELECTED (08 §2).
+    MoveToManuscript,
     Graveyard,
     Ask,
 }
@@ -831,7 +864,7 @@ struct FlankGate {
 /// The single gating predicate (docs/impl/03-flanks.md §1-2, reviews H21/H22/B8,
 /// findings 57/91/108). Pure over booleans so the test sweeps every
 /// region × history × width case without a live frame.
-fn flank_gate(history_up: bool, in_compost: bool, lane_available: bool, gutter_ok: bool) -> FlankGate {
+fn flank_gate(history_up: bool, spanning: bool, lane_available: bool, gutter_ok: bool) -> FlankGate {
     if history_up {
         // A history surface claims the right side AND the past is not editable —
         // neither flank may offer live mutation over a read-only state (H22).
@@ -843,13 +876,15 @@ fn flank_gate(history_up: bool, in_compost: bool, lane_available: bool, gutter_o
     FlankGate {
         // The formatting flank always rises; only its FORM narrows.
         left: if gutter_ok { FlankLeft::Grid } else { FlankLeft::Horizontal },
-        // The verb menu needs the right lane to occlude into (B8) and is
-        // MANUSCRIPT-only — a compost-rail selection is the writer's private
-        // scrap box, no verb menu (spec §1, finding 108). Its fallback keys on
-        // the LANE's own fit (`margin_fits`), never the left gutter (finding 57):
-        // there is a width band where the gutter is gone but the lane remains,
-        // and vice versa.
-        right: lane_available && !in_compost,
+        // The verb menu needs the right lane to occlude into (B8) and rises
+        // on BOTH sides of the seam now — below it the flank swaps Set aside
+        // for "Move to the manuscript" (08 §2) — but never on a
+        // seam-SPANNING selection (region verbs are single-region;
+        // seam-mechanics 1). Its fallback keys on the LANE's own fit
+        // (`margin_fits`), never the left gutter (finding 57): there is a
+        // width band where the gutter is gone but the lane remains, and
+        // vice versa.
+        right: lane_available && !spanning,
     }
 }
 
@@ -875,6 +910,9 @@ struct FlankLayout {
     vh: f32,
     /// The note lane's left edge, content space (the right menu pins here).
     lane_left: f32,
+    /// The selection rests entirely BELOW the seam: the verb menu swaps
+    /// Set aside for "Move to the manuscript" (08 §2).
+    pile_selection: bool,
 }
 
 pub struct Editor {
@@ -1119,6 +1157,17 @@ pub struct Editor {
     /// Bumps per pulse — keys the ring's element animation so each arrival
     /// gets a fresh run instead of resuming a stale clock.
     chip_pulse_seq: usize,
+    /// The caret-block's provenance rest: (record id, when the caret came to
+    /// rest inside that record). The one-liner shows after PROV_REST_DELAY
+    /// and hides instantly on leave (surfaces-attention 5); a 150ms departing
+    /// ghost carries the light out.
+    prov_rest: Option<(u64, Instant)>,
+    /// The provenance row visible on the last motion-diffed frame (its lane
+    /// id) — an appear/disappear/anchor change is caret travel, and the lane
+    /// SNAPS around it (never slides against the writer's own movement).
+    lane_prov_last: Option<u64>,
+    /// The park receipt's origin ghost, `None` at rest (see `ParkGhost`).
+    park_ghost: Option<(ParkGhost, Instant)>,
     /// The graveyard tail section (docs/impl/02-asides.md §4, Bug B): entries
     /// the writer clicked to expand out of their one-line receded form. The
     /// newest entry is always full; older ones recede until expanded. The old
@@ -1577,6 +1626,9 @@ impl Editor {
             pile_end: None,
             chip_pulse: None,
             chip_pulse_seq: 0,
+            prov_rest: None,
+            lane_prov_last: None,
+            park_ghost: None,
             grave_expanded: Vec::new(),
             last_manuscript_caret: 0,
             arrival_flash: None,
@@ -3283,19 +3335,7 @@ impl Editor {
                 self.margin_cards(true).cards.into_iter().find(|c| c.id == id)
         {
             self.departing.push((card, Instant::now()));
-            cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(CARD_RESOLVE + Duration::from_millis(50))
-                    .await;
-                this.update(cx, |editor: &mut Editor, cx| {
-                    editor
-                        .departing
-                        .retain(|(_, since)| since.elapsed() < CARD_RESOLVE);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+            self.schedule_departing_clear(cx);
         }
         self.doc.set_note_status(id, status);
         // Thread terminals on the strip: when a card left and by which door.
@@ -3314,6 +3354,25 @@ impl Editor {
         self.mark_dirty();
         self.bump_activity();
         cx.notify();
+    }
+
+    /// Retire the departing exit-fade ghosts once their light is spent —
+    /// shared by every writer-initiated departure (a resolved card, a parked
+    /// passage's retiring diagnosis, the provenance row's leave).
+    fn schedule_departing_clear(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(CARD_RESOLVE + Duration::from_millis(50))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor
+                    .departing
+                    .retain(|(_, since)| since.elapsed() < CARD_RESOLVE);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The thesis, running: an editorial pass that names problems as
@@ -4363,6 +4422,20 @@ impl Editor {
         }
     }
 
+    /// The find matches split by region (scopes-search 2): (in the piece,
+    /// in scraps, capped). `capped` = the 500-match cap was hit, so the true
+    /// totals are unknown — an announced split must degrade to "500+", never
+    /// state an exact lie.
+    fn find_split(&self, matches: &[Range<usize>]) -> (usize, usize, bool) {
+        let m = self.doc.manuscript_char_range();
+        let (ms, me) = (self.doc.char_to_byte(m.start), self.doc.char_to_byte(m.end));
+        let piece = matches
+            .iter()
+            .filter(|r| r.start >= ms && r.start < me)
+            .count();
+        (piece, matches.len() - piece, matches.len() >= 500)
+    }
+
     /// Move the document selection to the ix-th find match and scroll it into
     /// view (live preview for type / arrow / Enter / click). No-op off find
     /// mode or with no matches.
@@ -4571,10 +4644,12 @@ impl Editor {
                 .into_iter()
                 .take(100)
                 .map(|range| {
-                    let line = self.doc.rope().byte_to_line(range.start.min(self.doc.len_bytes()));
+                    let start = range.start.min(self.doc.len_bytes());
+                    let line = self.doc.rope().byte_to_line(start);
                     OmniRow::Match {
                         line,
                         snippet: self.omni_line_snippet(line),
+                        scraps: self.byte_in_scraps(start),
                     }
                 })
                 .collect(),
@@ -4584,7 +4659,12 @@ impl Editor {
                 .filter(|(_, _, text, _)| {
                     rest.is_empty() || crate::commands::score_text(rest, text).is_some()
                 })
-                .map(|(_, level, text, byte)| OmniRow::Heading { byte, level, text })
+                .map(|(_, level, text, byte)| OmniRow::Heading {
+                    byte,
+                    level,
+                    text,
+                    scraps: self.byte_in_scraps(byte),
+                })
                 .collect(),
             OmniMode::Command => {
                 let mut rows: Vec<OmniRow> = Vec::new();
@@ -4696,7 +4776,14 @@ impl Editor {
             return;
         }
         self.chord_whisper_shown = true;
-        self.chord_whisper = Some(format!("Chord: {keys} does this directly"));
+        self.whisper(format!("Chord: {keys} does this directly"), cx);
+    }
+
+    /// The status whisper (the muted bottom-right one-liner): one quiet
+    /// sentence that fades on the AI-note timer window. The chord reveal and
+    /// the replace-all announcement share this one surface.
+    fn whisper(&mut self, text: String, cx: &mut Context<Self>) {
+        self.chord_whisper = Some(text);
         self.chord_whisper_generation += 1;
         let generation = self.chord_whisper_generation;
         cx.spawn(async move |this, cx| {
@@ -4826,12 +4913,24 @@ impl Editor {
                         .unwrap_or_default();
                     (stem, Some(dir), None)
                 }
-                OmniRow::Match { line, snippet, .. } => {
-                    (snippet.clone(), None, Some(format!("{}", line + 1)))
-                }
-                OmniRow::Heading { level, text, .. } => {
+                OmniRow::Match { line, snippet, scraps, .. } => (
+                    snippet.clone(),
+                    // The region as DATA, the find-split's register: a row
+                    // that jumps into the pile says so before the jump.
+                    scraps.then(|| "scraps".to_owned()),
+                    Some(format!("{}", line + 1)),
+                ),
+                OmniRow::Heading { level, text, scraps, .. } => {
                     let indent = "  ".repeat((*level as usize).saturating_sub(1));
-                    (format!("{indent}{text}"), Some(format!("H{level}")), None)
+                    (
+                        format!("{indent}{text}"),
+                        Some(if *scraps {
+                            format!("H{level} · scraps")
+                        } else {
+                            format!("H{level}")
+                        }),
+                        None,
+                    )
                 }
             };
             list = list.child(
@@ -4957,7 +5056,23 @@ impl Editor {
                                     .text_size(px(13.))
                                     .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Replace"))
                                     .child(div().flex_1().min_w(px(0.)).child(rep))
-                                    .child(
+                                    .child({
+                                        // The All button wears its scope
+                                        // (P12; scopes-search 2): the sweep
+                                        // is manuscript-only, and the button
+                                        // says so BEFORE the click.
+                                        let label = {
+                                            let matches = self.omni_match_ranges();
+                                            let (piece, scraps, capped) =
+                                                self.find_split(&matches);
+                                            if capped {
+                                                "All · 500+ in the piece".to_owned()
+                                            } else if scraps > 0 {
+                                                format!("All · {piece} in the piece")
+                                            } else {
+                                                "All".to_owned()
+                                            }
+                                        };
                                         div()
                                             .id("replace-all")
                                             .flex_shrink_0()
@@ -4975,8 +5090,8 @@ impl Editor {
                                                     editor.replace_all(cx);
                                                 }),
                                             )
-                                            .child("All"),
-                                    ),
+                                            .child(label)
+                                    }),
                             )
                         })
                         .child(list),
@@ -5089,10 +5204,16 @@ impl Editor {
         self.mark_dirty();
         self.palette_selected = 0;
         self.omni_scroll_into_view(0);
+        // The refusal IS the announcement (scopes-search 2): after the sweep
+        // the status whisper names both halves; the scrap matches stay in
+        // the row list, each wearing its region.
         if skipped > 0 {
-            eprintln!("strop: replaced {count} in the piece · {skipped} in scraps untouched");
+            self.whisper(
+                format!("Replaced {count} in the piece · {skipped} in scraps untouched"),
+                cx,
+            );
         } else {
-            eprintln!("strop: replaced {count} matches");
+            self.whisper(format!("Replaced {count} in the piece"), cx);
         }
         self.bump_activity();
         cx.notify();
@@ -5397,6 +5518,64 @@ impl Editor {
         if self.doc.region_of_char(ch) == strop_core::document::Region::Manuscript {
             self.last_manuscript_caret = offset;
         }
+        // The provenance one-liner's caret gate (surfaces-attention 5): the
+        // record under a RESTING caret shows after ~one caret-blink; leaving
+        // hides it instantly, a 150ms departing ghost carrying the light out.
+        let prov_now = self
+            .doc
+            .provenance()
+            .at(ch)
+            .filter(|_| self.caret_in_scraps())
+            .map(|r| r.id);
+        match (prov_now, self.prov_rest) {
+            (Some(id), Some((cur, _))) if cur == id => {} // still resting here
+            (Some(id), _) => {
+                self.prov_rest = Some((id, Instant::now()));
+                // One notify at the reveal moment (the appear fade starts
+                // then); a fresh rest supersedes a stale timer by the id+time
+                // check on arrival.
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(PROV_REST_DELAY).await;
+                    this.update(cx, |editor: &mut Editor, cx| {
+                        if editor
+                            .prov_rest
+                            .is_some_and(|(cur, s)| cur == id && s.elapsed() >= PROV_REST_DELAY)
+                        {
+                            editor.appearing.insert(PROV_ID_FLAG | id);
+                            cx.notify();
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(CARD_APPEAR + Duration::from_millis(150))
+                                    .await;
+                                this.update(cx, |editor: &mut Editor, cx| {
+                                    editor.appearing.remove(&(PROV_ID_FLAG | id));
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .detach();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            (None, Some((id, since))) => {
+                // Instant hide; the departing channel carries the echo.
+                if since.elapsed() >= PROV_REST_DELAY
+                    && let Some(card) = self
+                        .margin_cards(true)
+                        .cards
+                        .into_iter()
+                        .find(|c| c.provenance == Some(id))
+                {
+                    self.departing.push((card, Instant::now()));
+                    self.schedule_departing_clear(cx);
+                }
+                self.prov_rest = None;
+            }
+            (None, None) => {}
+        }
         if was_in_pile && !self.caret_in_scraps() {
             // The caret entering the manuscript by the writer's own act ends
             // the excursion (scopes-search 1, clear (b)): the latch drops and
@@ -5415,6 +5594,12 @@ impl Editor {
         }
         self.bump_activity();
         cx.notify();
+    }
+
+    /// Is a byte offset inside the Scraps region?
+    fn byte_in_scraps(&self, byte: usize) -> bool {
+        let ch = self.doc.rope().byte_to_char(byte.min(self.doc.len_bytes()));
+        self.doc.region_of_char(ch) == strop_core::document::Region::Scraps
     }
 
     /// Is the caret inside the Scraps region right now?
@@ -5890,17 +6075,61 @@ impl Editor {
                 start..end
             }
         } else {
-            self.selected_range.clone()
+            let sel = self.selected_range.clone();
+            // A selection covering WHOLE paragraphs takes its adjoining
+            // separator too (the jot's rule, widened to the blank-line
+            // grammar): the prose closes up beneath the departing ghost —
+            // the mockup's after-still is "the paragraph closed", never a
+            // stranded blank the writer must sweep herself. A partial
+            // selection stays exact (the remnant is untouched). Mirrors the
+            // model's own separator absorption in move_to_manuscript.
+            let whole_blocks = !sel.is_empty()
+                && sel.start == self.paragraph_bounds(sel.start).0
+                && sel.end == self.paragraph_bounds(sel.end.max(sel.start)).1;
+            if whole_blocks {
+                let bytes = self.doc.rope();
+                let len = self.doc.len_bytes();
+                let at = |i: usize| (i < len).then(|| bytes.byte(i));
+                if sel.end + 2 <= len && at(sel.end) == Some(b'\n') && at(sel.end + 1) == Some(b'\n') {
+                    sel.start..sel.end + 2 // the trailing blank-line separator
+                } else if sel.end < len && at(sel.end) == Some(b'\n') {
+                    sel.start..sel.end + 1 // a plain block join
+                } else if sel.start >= 2
+                    && at(sel.start - 1) == Some(b'\n')
+                    && at(sel.start - 2) == Some(b'\n')
+                {
+                    sel.start - 2..sel.end // the leading separator (tail case)
+                } else if sel.start > 0 {
+                    sel.start - 1..sel.end
+                } else {
+                    sel
+                }
+            } else {
+                sel
+            }
         };
         if self.selection_spans_seam(&range) {
             return; // never offered on a spanning selection
         }
+        // Freeze the origin ghost + the about-to-retire cards BEFORE the
+        // model commits (afterwards there is nothing left to snapshot). Both
+        // ride writer-initiated receipt channels, exempt from the lane's
+        // burst snap (surfaces-attention 3 — every park is "mid-burst").
+        let ghost = self.freeze_park_ghost(&range);
+        let doomed_cards: Vec<MarginCard> = self
+            .margin_cards(true)
+            .cards
+            .into_iter()
+            .filter(|c| c.kind == NoteKind::Diagnosis)
+            .collect();
         let quote = self.origin_quote_before(range.start);
         let Some(outcome) = self.doc.set_aside(range, quote, now_unix(), jot) else {
             return; // empty, scraps-side, or a top-era doc (migration owns those)
         };
-        // Card retirement happened inside the atom; journal each terminal
-        // and release focus if the retired card was active.
+        // Card retirement happened inside the atom; journal each terminal,
+        // release focus if the retired card was active, and let its light
+        // leave through the exit-fade ghost (never the burst-gated slide).
+        let mut ghosts_pushed = false;
         for id in &outcome.retired {
             self.doc
                 .journal_mut()
@@ -5912,6 +6141,33 @@ impl Editor {
             if self.focus.active_id() == Some(*id) {
                 self.focus = CardFocus::Idle;
             }
+            if let Some(card) = doomed_cards.iter().find(|c| c.id == *id) {
+                self.departing.push((card.clone(), Instant::now()));
+                ghosts_pushed = true;
+            }
+        }
+        if ghosts_pushed {
+            self.schedule_departing_clear(cx);
+        }
+        if let Some(g) = ghost {
+            self.park_ghost = Some((g, Instant::now()));
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(CARD_RESOLVE + Duration::from_millis(50))
+                    .await;
+                this.update(cx, |editor: &mut Editor, cx| {
+                    if editor
+                        .park_ghost
+                        .as_ref()
+                        .is_some_and(|(_, t)| t.elapsed() >= CARD_RESOLVE)
+                    {
+                        editor.park_ghost = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
         }
         // The destination receipt (surfaces-attention 4): the landed block
         // flashes when the seam is on screen; the Scraps chip pulses when it
@@ -5958,6 +6214,190 @@ impl Editor {
         // The deliberate verb collapses an emptied pile in the same atom
         // (graveyard-interplay 4).
         self.file_cut(range, true, cx);
+    }
+
+    /// `Move to the manuscript` — the retrieval verb's SURFACE half (08 §2):
+    /// a Scraps selection lands at the writing position the latch remembers
+    /// (else the last manuscript caret), ARRIVING SELECTED — the selection is
+    /// the feedback and the immediate undo/move handle (verso graft). One
+    /// model atom (`Document::move_to_manuscript`: spans/kinds/notes travel
+    /// home, the provenance record dies with its text, an emptied pile
+    /// evaporates). The writer's text came home, and so does she: the
+    /// excursion ends, `pile_end` remembering the spot it left.
+    fn move_to_manuscript(
+        &mut self,
+        _: &MoveToManuscript,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.history_view.is_some() || self.selected_range.is_empty() {
+            return;
+        }
+        let range = self.selected_range.clone();
+        let dest_byte = self
+            .excursion
+            .map(|(home, _)| home)
+            .unwrap_or(self.last_manuscript_caret);
+        let dest_char = self
+            .doc
+            .rope()
+            .byte_to_char(dest_byte.min(self.doc.len_bytes()));
+        self.land_from_pile(range, dest_char, cx);
+    }
+
+    /// `Put back` — the parity verb for a parked scrap (08 §2): the
+    /// caret-block's provenance text returns to its ORIGIN — the paragraph
+    /// after its origin quote, found by content (provenance is a
+    /// range-anchored side record; the origin lives on as a quote). Lives
+    /// inside the provenance one-liner and as this palette verb (the
+    /// narrow-width fallback). Degrades to the retrieval landing when the
+    /// quote was edited away — loudly selected either way, never silent.
+    fn put_back_scrap(&mut self, _: &PutBackScrap, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            return;
+        }
+        let ch = self
+            .doc
+            .rope()
+            .byte_to_char(self.cursor_offset().min(self.doc.len_bytes()));
+        let Some(rec) = self.doc.provenance().at(ch).cloned() else {
+            return;
+        };
+        self.put_back_scrap_record(rec.id, cx);
+    }
+
+    /// Put a provenance record's text back at its origin (shared by the
+    /// one-liner's verb and the palette verb).
+    fn put_back_scrap_record(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(rec) = self
+            .doc
+            .provenance()
+            .records()
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        let sb = self.doc.char_to_byte(rec.range.start);
+        let eb = self
+            .doc
+            .char_to_byte(rec.range.end.min(self.doc.rope().len_chars()));
+        let dest_char = self.scrap_origin_dest(&rec.origin_quote);
+        self.land_from_pile(sb..eb, dest_char, cx);
+    }
+
+    /// Where a scrap's origin return lands: the start of the line after the
+    /// paragraph holding its origin quote (the spot the park cut from —
+    /// content-anchored, so it follows the paragraph through edits); the
+    /// last manuscript caret when the quote no longer exists.
+    fn scrap_origin_dest(&self, quote: &str) -> usize {
+        let rope = self.doc.rope();
+        let m = self.doc.manuscript_char_range();
+        if !quote.is_empty() {
+            let hay = rope.slice(m.clone()).to_string();
+            if let Some(b) = hay.find(quote) {
+                let q_end = m.start + hay[..b + quote.len()].chars().count();
+                let line = rope.char_to_line(q_end.min(rope.len_chars()));
+                if line + 1 < rope.len_lines() {
+                    return rope.line_to_char(line + 1).min(m.end);
+                }
+                return m.end;
+            }
+        }
+        rope.byte_to_char(self.last_manuscript_caret.min(self.doc.len_bytes()))
+            .min(m.end)
+    }
+
+    /// The shared landing for both pile-return verbs: run the model atom,
+    /// arrive SELECTED at the destination, end the excursion (the writer's
+    /// own verb brought her home) and remember `pile_end`.
+    fn land_from_pile(&mut self, byte_range: Range<usize>, dest_char: usize, cx: &mut Context<Self>) {
+        let pile_pos = byte_range.start;
+        let Some(landed) = self.doc.move_to_manuscript(byte_range, dest_char) else {
+            return;
+        };
+        self.sync_mutations();
+        let s = self.doc.char_to_byte(landed.start.min(self.doc.rope().len_chars()));
+        let e = self.doc.char_to_byte(landed.end.min(self.doc.rope().len_chars()));
+        self.selected_range = s..e;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.selection_popover = false;
+        self.excursion = None;
+        self.pile_end = self
+            .doc
+            .boundary()
+            .is_some()
+            .then(|| pile_pos.min(self.doc.len_bytes()));
+        self.last_manuscript_caret = e;
+        self.publish_primary(cx);
+        self.mark_dirty();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// Snapshot the departing block's window-space geometry + text for the
+    /// park receipt's origin ghost. `None` when no frame exists yet (a park
+    /// before first paint — the receipt degrades to the chip pulse alone).
+    fn freeze_park_ghost(&self, range: &Range<usize>) -> Option<ParkGhost> {
+        let frame = self.last_frame.as_ref()?;
+        let par = frame
+            .paragraphs
+            .iter()
+            .find(|p| range.start <= p.range.end && p.range.start <= range.end)?;
+        let mut park_seq = 0usize;
+        if let Some((g, _)) = &self.park_ghost {
+            park_seq = g.seq + 1;
+        }
+        Some(ParkGhost {
+            text: self
+                .doc
+                .slice_bytes(range.clone())
+                .trim_matches('\n')
+                .replace('\n', " "),
+            left: f32::from(frame.bounds.origin.x + par.indent),
+            top: f32::from(frame.bounds.origin.y) + f32::from(par.top)
+                - f32::from(frame.scroll_top),
+            width: f32::from(frame.bounds.size.width - par.indent),
+            font_size: f32::from(par.font_size),
+            line_height: f32::from(par.line_height),
+            seq: park_seq,
+        })
+    }
+
+    /// The origin ghost's overlay (see `ParkGhost`): non-interactive, fading
+    /// over CARD_RESOLVE with a short downward drift — the motion vector that
+    /// says *down*, toward the pile. reduce_motion drops the drift.
+    fn render_park_ghost(&self) -> Option<gpui::AnyElement> {
+        let (g, _) = self.park_ghost.as_ref()?;
+        let reduce = self.config.reduce_motion;
+        let (top, left) = (g.top, g.left);
+        Some(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(g.width))
+                .font_family("PT Serif")
+                .text_size(px(g.font_size))
+                .line_height(px(g.line_height))
+                .text_color(rgb(TEXT_COLOR))
+                .child(g.text.clone())
+                .with_animation(
+                    ("park-ghost", g.seq),
+                    Animation::new(CARD_RESOLVE).with_easing(|t| t * t),
+                    move |el, t| {
+                        let el = el.opacity(1. - t);
+                        if reduce {
+                            el
+                        } else {
+                            el.top(px(top + 6. * t))
+                        }
+                    },
+                )
+                .into_any_element(),
+        )
     }
 
     /// File `byte_range` in the graveyard and collapse the caret to the cut
@@ -8080,6 +8520,10 @@ impl Editor {
         let scraps_chip_hidden = self.scraps_region_on_screen();
         let chip_pulse = self.chip_pulse.is_some();
         let count_label = self.count_label();
+        let prov_visible = self
+            .prov_rest
+            .is_some_and(|(_, since)| since.elapsed() >= PROV_REST_DELAY);
+        let park_ghost = self.park_ghost.is_some();
         let margin = self.last_frame.as_ref().map(|_| {
             let layout = self.margin_cards(true);
             let mut spans: Vec<(f32, f32)> =
@@ -8205,6 +8649,8 @@ impl Editor {
             "scraps_chip_hidden": scraps_chip_hidden,
             "chip_pulse": chip_pulse,
             "count_label": count_label,
+            "prov_visible": prov_visible,
+            "park_ghost": park_ghost,
             "sel": [self.selected_range.start, self.selected_range.end],
             // The selection flanks (docs/impl/03-flanks.md §3): presence of each
             // (`left` false only under a history surface; `right` false for a
@@ -8410,6 +8856,25 @@ impl Editor {
         self.word_count = self.manuscript_word_count();
         self.mark_dirty();
         cx.notify();
+    }
+
+    /// Rig hook (`move:manuscript`): select the caret's paragraph in the
+    /// pile and run the retrieval verb — the flank row's path without pixel
+    /// coordinates. The landed range arrives SELECTED (the rig asserts sel).
+    pub fn debug_move_to_manuscript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (start, end) = self.paragraph_bounds(self.cursor_offset());
+        if start >= end {
+            return;
+        }
+        self.selected_range = start..end;
+        self.selection_reversed = false;
+        self.move_to_manuscript(&MoveToManuscript, window, cx);
+    }
+
+    /// Rig hook (`putback:scrap`): the provenance line's Put back at the
+    /// caret's record, without pixel coordinates.
+    pub fn debug_put_back_scrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.put_back_scrap(&PutBackScrap, window, cx);
     }
 
     /// Rig hook (`select:para`, docs/impl/03-flanks.md §3): select the caret's
@@ -11068,20 +11533,19 @@ impl Editor {
         // the manuscript" below the seam (08 §2). A seam-SPANNING selection
         // gets no right menu (region verbs are never offered on spanning
         // selections) — the left formatting flank still rises for both.
-        let in_compost = {
-            let sel = self.selected_range.clone();
+        let sel = self.selected_range.clone();
+        let spanning = self.selection_spans_seam(&sel);
+        let pile_selection = !spanning && self.doc.boundary().is_some() && {
             let start_ch = self
                 .doc
                 .rope()
                 .byte_to_char(sel.start.min(self.doc.len_bytes()));
-            self.doc.boundary().is_some()
-                && (self.doc.region_of_char(start_ch) == strop_core::document::Region::Scraps
-                    || self.selection_spans_seam(&sel))
+            self.doc.region_of_char(start_ch) == strop_core::document::Region::Scraps
         };
         let lane_available = self.margin_fits(window);
         let gutter_ok = left_gutter >= FLANK_GRID_W + 12.;
         Some(FlankLayout {
-            gate: flank_gate(history_up, in_compost, lane_available, gutter_ok),
+            gate: flank_gate(history_up, spanning, lane_available, gutter_ok),
             left_top: raw_top - t_inset,
             right_top: raw_top,
             line_h: f32::from(par.line_height),
@@ -11090,6 +11554,7 @@ impl Editor {
             vw: self.content_width(window),
             vh: f32::from(window.viewport_size().height) - t_inset - b_inset,
             lane_left: self.column_right(window) + MARGIN_GAP,
+            pile_selection,
         })
     }
 
@@ -11297,7 +11762,10 @@ impl Editor {
                         // (emphasized, the gentle verb) resting ONE ROW ABOVE
                         // Exile (destructive red): this adjacency at the
                         // hesitation over a deletion is the entire invitation
-                        // (08 §2, F8 — no tips, no tours).
+                        // (08 §2, F8 — no tips, no tours). Below the seam the
+                        // gentle slot swaps to "Move to the manuscript" —
+                        // retrieval in the exact place parking lived; Exile
+                        // stays (one capture law on both sides of the seam).
                         .child(self.selection_menu_row("sel-note", SelVerb::Note, "Annotate", cx))
                         .child(
                             div()
@@ -11305,12 +11773,16 @@ impl Editor {
                                 .border_t_1()
                                 .border_color(rgb(RULE_COLOR)),
                         )
-                        .child(self.selection_menu_row(
-                            "sel-aside",
-                            SelVerb::Aside,
-                            "Set aside",
-                            cx,
-                        ))
+                        .child(if layout.pile_selection {
+                            self.selection_menu_row(
+                                "sel-move-home",
+                                SelVerb::MoveToManuscript,
+                                "Move to the manuscript",
+                                cx,
+                            )
+                        } else {
+                            self.selection_menu_row("sel-aside", SelVerb::Aside, "Set aside", cx)
+                        })
                         .child(self.selection_menu_row("sel-grave", SelVerb::Graveyard, "Exile", cx))
                         .child(
                             div()
@@ -11345,6 +11817,7 @@ impl Editor {
         let (chord, destructive, emphasized) = match verb {
             SelVerb::Note => ("ctrl-m", false, false),
             SelVerb::Aside => ("ctrl-shift-a", false, true),
+            SelVerb::MoveToManuscript => ("", false, true),
             SelVerb::Graveyard => ("ctrl-shift-g", true, false),
             SelVerb::Ask => ("ctrl-shift-d", false, false),
         };
@@ -11371,20 +11844,23 @@ impl Editor {
             )
             // The chord chip (the lab's `.k` keycap): the menu teaches its own
             // shortcuts in place, instead of a manual teaching them in prose.
-            .child(
-                div()
-                    .ml_auto()
-                    .flex_shrink_0()
-                    .px(px(3.))
-                    .font_family(CODE_FONT)
-                    .text_size(px(9.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .rounded(px(4.))
-                    .bg(rgb(BG_COLOR))
-                    .child(chord),
-            )
+            // A chordless verb (Move to the manuscript) wears no empty chip.
+            .when(!chord.is_empty(), |d| {
+                d.child(
+                    div()
+                        .ml_auto()
+                        .flex_shrink_0()
+                        .px(px(3.))
+                        .font_family(CODE_FONT)
+                        .text_size(px(9.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .border_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .rounded(px(4.))
+                        .bg(rgb(BG_COLOR))
+                        .child(chord),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
@@ -11395,6 +11871,9 @@ impl Editor {
                     match verb {
                         SelVerb::Note => editor.add_note(&AddNote, window, cx),
                         SelVerb::Aside => editor.set_aside(&SetAside, window, cx),
+                        SelVerb::MoveToManuscript => {
+                            editor.move_to_manuscript(&MoveToManuscript, window, cx)
+                        }
                         SelVerb::Graveyard => {
                             editor.send_to_graveyard(&SendToGraveyard, window, cx)
                         }
@@ -11608,15 +12087,27 @@ impl Editor {
                 Some(input) => {
                     // The find-mode match counter rides right of the query —
                     // where the eye reads it (S7); the ranges are already
-                    // computed for the live preview.
-                    let counter = match omni_mode(&self.palette_query) {
+                    // computed for the live preview. With a seam it announces
+                    // its SPLIT — "7 in the piece · 2 in scraps" — both
+                    // counts data, the scraps half muted (scopes-search 2);
+                    // at the cap it degrades to "500+", never an exact lie.
+                    let counter: Option<String> = match omni_mode(&self.palette_query) {
                         (OmniMode::Find, rest) if !rest.trim().is_empty() => {
-                            let n = self.omni_match_ranges().len();
-                            Some(if n == 0 {
-                                "0".to_owned()
+                            let matches = self.omni_match_ranges();
+                            let n = matches.len();
+                            if n == 0 {
+                                Some("0".to_owned())
                             } else {
-                                format!("{}/{n}", self.palette_selected.min(n - 1) + 1)
-                            })
+                                let k = self.palette_selected.min(n - 1) + 1;
+                                let (piece, scraps, capped) = self.find_split(&matches);
+                                if capped {
+                                    Some(format!("{k}/500+"))
+                                } else if scraps > 0 {
+                                    Some(format!("{k}/{piece} in the piece · {scraps} in scraps"))
+                                } else {
+                                    Some(format!("{k}/{n}"))
+                                }
+                            }
                         }
                         _ => None,
                     };
@@ -13086,11 +13577,17 @@ enum OmniRow {
     Match {
         line: usize,
         snippet: String,
+        /// The match starts below the seam: the row wears a muted "scraps"
+        /// tag as data (scopes-search 2/7 — a row that teleports into the
+        /// pile must self-identify).
+        scraps: bool,
     },
     Heading {
         byte: usize,
         level: u8,
         text: String,
+        /// A heading typed inside the pile (in document order, tagged).
+        scraps: bool,
     },
 }
 
@@ -13388,6 +13885,10 @@ struct MarginCard {
     /// anchor (title only, muted) instead of the full card. Never true for
     /// writer notes or the selected card; `height` is COLLAPSED_CARD_H.
     collapsed: bool,
+    /// `Some(record_id)` = this is the caret-block's provenance one-liner
+    /// (08 §2): muted machine bookkeeping, no card fill, carrying the quiet
+    /// Put back verb. `body` holds the one-liner text.
+    provenance: Option<u64>,
 }
 
 /// A note card's header label: "Note" / a diagnosis level (or "Diagnosis"),
@@ -13677,6 +14178,22 @@ fn move_slide<E: Styled + IntoElement + 'static>(
 /// receded one-liner included — so the fading light reads as the same object,
 /// and a collapsed card's ghost never sprawls over its neighbours.
 fn ghost_card(card: &MarginCard) -> gpui::Div {
+    // The provenance one-liner's ghost: the same quiet row, no card fill —
+    // its leave is instant in the model, this echo is the 150ms light.
+    if card.provenance.is_some() {
+        return div()
+            .absolute()
+            .top(px(card.top.max(4.)))
+            .left(px(8.))
+            .w(px(MARGIN_WIDTH - 8.))
+            .h(px(PROV_CARD_H))
+            .flex()
+            .items_center()
+            .font_family("PT Sans")
+            .text_size(px(10.5))
+            .text_color(rgb(MUTED_COLOR))
+            .child(div().min_w(px(0.)).truncate().child(card.body.clone()));
+    }
     let is_diagnosis = card.kind == NoteKind::Diagnosis;
     let base = div()
         .absolute()
@@ -13951,7 +14468,52 @@ impl Editor {
                 unverified: n.unverified,
                 pass_id: n.pass_id,
                 collapsed: false,
+                provenance: None,
             });
+        }
+        // The caret-block's provenance one-liner (08 §2; surfaces-attention
+        // 5): a packer citizen beside the real cards, shown only after the
+        // caret has RESTED inside a parked block one caret-blink. Muted
+        // machine bookkeeping — no card fill — carrying the quiet Put back.
+        // Anchor order is kept so the placement pass stacks it honestly.
+        if let Some((rec_id, since)) = self.prov_rest
+            && since.elapsed() >= PROV_REST_DELAY
+            && let Some(rec) = self
+                .doc
+                .provenance()
+                .records()
+                .iter()
+                .find(|r| r.id == rec_id)
+        {
+            let byte = rope.char_to_byte(rec.range.start.min(rope.len_chars())).min(len);
+            if let Some(pos) = frame.position_of(byte, false) {
+                let desired = f32::from(frame.bounds.origin.y) + f32::from(pos.y)
+                    - f32::from(frame.scroll_top);
+                let date = strip::date_label(
+                    rec.parked_unix,
+                    strop_core::journal::now_ms() / 1000,
+                );
+                cards.push(MarginCard {
+                    id: PROV_ID_FLAG | rec_id,
+                    top: desired,
+                    anchor_y: f32::from(pos.y),
+                    height: PROV_CARD_H,
+                    body: format!(
+                        "from \u{201C}\u{2026}{}\u{201D} · {date}",
+                        rec.origin_quote
+                    ),
+                    active: false,
+                    kind: NoteKind::Note,
+                    title: String::new(),
+                    level: String::new(),
+                    orphaned: false,
+                    unverified: false,
+                    pass_id: 0,
+                    collapsed: false,
+                    provenance: Some(rec_id),
+                });
+                cards.sort_by(|a, b| a.top.total_cmp(&b.top));
+            }
         }
         // The full-size budget (FULL_DIAGNOSIS_CAP): among the diagnoses that
         // made it into THIS lane, the newest few render full and older passes
@@ -14069,8 +14631,20 @@ impl Editor {
         self.moving
             .retain(|id, mv| present.contains(id) && mv.start.elapsed() < mv.total());
         self.lane_tops.retain(|id, _| present.contains(id));
-        let snap =
-            scrolled || resized || self.focus.composing_id().is_some() || self.typing_burst_live();
+        // A lane diff caused by CARET TRAVEL — the provenance row appearing,
+        // leaving, or re-anchoring to another scrap — snaps: never animate
+        // against the writer's own continuous movement (surfaces-attention 5).
+        let prov_now = layout
+            .cards
+            .iter()
+            .find_map(|c| c.provenance.map(|_| c.id));
+        let prov_changed = prov_now != self.lane_prov_last;
+        self.lane_prov_last = prov_now;
+        let snap = scrolled
+            || resized
+            || prov_changed
+            || self.focus.composing_id().is_some()
+            || self.typing_burst_live();
         if snap {
             self.moving.clear();
             self.lane_tops = now_tops.into_iter().collect();
@@ -14083,6 +14657,11 @@ impl Editor {
         let reduce = self.config.reduce_motion;
         let mut started = false;
         for (i, &(id, from, to)) in moves.iter().enumerate() {
+            // The provenance one-liner only FADES, never slides — a re-pack
+            // that would move it just re-places it (surfaces-attention 5).
+            if id & PROV_ID_FLAG != 0 {
+                continue;
+            }
             started = true;
             if let Some(mv) = self.moving.get_mut(&id) {
                 // Mid-flight and the pack moved again: head for the new
@@ -14691,11 +15270,54 @@ impl Editor {
                         orphaned,
                         unverified,
                         collapsed,
+                        provenance,
                         ..
                     } = card;
                     // Inside its entrance fade? (One fade per landed pass;
                     // never replayed — see appear_fade.)
                     let is_new = self.appearing.contains(&id);
+                    // The provenance one-liner (08 §2; the mockup's .prov):
+                    // muted machine bookkeeping, NO card fill, carrying the
+                    // quiet Put back in its one dress — muted ink, dotted
+                    // underline (token audit A5). Enters by the appear fade,
+                    // leaves by the departing ghost, never slides.
+                    if let Some(rec_id) = provenance {
+                        let row = div()
+                            .id(("prov-line", rec_id as usize))
+                            .absolute()
+                            .top(px(top.max(4.)))
+                            .left(px(8.))
+                            .w(px(MARGIN_WIDTH - 8.))
+                            .h(px(PROV_CARD_H))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .font_family("PT Sans")
+                            .text_size(px(10.5))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(div().min_w(px(0.)).truncate().child(body.clone()))
+                            .child(
+                                div()
+                                    .id(("prov-putback", rec_id as usize))
+                                    .flex_shrink_0()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .border_b_1()
+                                    .border_dashed()
+                                    .border_color(rgb(MUTED_COLOR))
+                                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |editor, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                editor.put_back_scrap_record(rec_id, cx);
+                                            },
+                                        ),
+                                    )
+                                    .child("Put back"),
+                            );
+                        return appear_fade(row, id, is_new);
+                    }
                     // Receded (over the full-size budget): one muted title line
                     // at the anchor — present and clickable, just smaller, the
                     // way dense marginalia shrink on paper. Clicking selects it,
@@ -15454,6 +16076,40 @@ impl Editor {
     /// stacked (non-absolute) box. No inline composer — a writer's note opens
     /// the bottom strip on click; diagnoses are read-only here as everywhere.
     fn narrow_note_card(&self, card: &MarginCard, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The caret-block's provenance rides the narrow drawer exactly as
+        // cards do (surfaces-attention 6) — same quiet row, same Put back.
+        if let Some(rec_id) = card.provenance {
+            return div()
+                .id(("narrow-prov", rec_id as usize))
+                .px(px(8.))
+                .py(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .font_family("PT Sans")
+                .text_size(px(10.5))
+                .text_color(rgb(MUTED_COLOR))
+                .child(div().min_w(px(0.)).truncate().child(card.body.clone()))
+                .child(
+                    div()
+                        .id(("narrow-prov-putback", rec_id as usize))
+                        .flex_shrink_0()
+                        .cursor(CursorStyle::PointingHand)
+                        .border_b_1()
+                        .border_dashed()
+                        .border_color(rgb(MUTED_COLOR))
+                        .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                editor.put_back_scrap_record(rec_id, cx);
+                            }),
+                        )
+                        .child("Put back"),
+                )
+                .into_any_element();
+        }
         let MarginCard { id, body, kind, title, level, orphaned, .. } = card;
         let (id, kind) = (*id, *kind);
         let is_diagnosis = kind == NoteKind::Diagnosis;
@@ -15746,6 +16402,8 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::set_session_goal))
                     .on_action(cx.listener(Self::set_aside))
                     .on_action(cx.listener(Self::send_to_graveyard))
+                    .on_action(cx.listener(Self::move_to_manuscript))
+                    .on_action(cx.listener(Self::put_back_scrap))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -15862,6 +16520,13 @@ impl Render for Editor {
             // flow by the EditorElement — no overlay panels.
             .map(|d| match self.render_footer_chips(cx) {
                 Some(chips) => d.child(chips),
+                None => d,
+            })
+            // The park receipt's origin ghost: a brief viewport-frozen echo
+            // of the departed block over the closed-up prose (08 §2 — the
+            // receipt is an arrival, and the departure must be seen too).
+            .map(|d| match self.render_park_ghost() {
+                Some(ghost) => d.child(ghost),
                 None => d,
             })
             // Narrow-window notes: the count pill (low — just feedback) and,

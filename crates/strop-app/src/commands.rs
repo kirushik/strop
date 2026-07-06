@@ -12,7 +12,7 @@ use crate::editor::{
     DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1,
     Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
-    SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
+    MoveToManuscript, PutBackScrap, SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
     ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleGraveyard, ToggleHighlight, ToggleHistory,
     ToggleOrderedList, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview, ToggleStrip,
     ToggleStrikethrough, ToggleStrong, ToggleUnderline, ScrapsTravel, Undo,
@@ -41,10 +41,11 @@ impl Command {
     /// the "App" and "Editor" key contexts respectively.
     pub fn global(&self) -> bool {
         match self.section {
-            // Asides' "Set aside" / "Send to the graveyard" act on the document
-            // selection, so they stay editor-scoped like Format/Structure —
-            // a chord typed into a field never reaches the document behind it.
-            "Format" | "Structure" | "Asides" => false,
+            // Scraps' verbs (Set aside / Exile / Move to the manuscript /
+            // Put back) act on the document selection or caret, so they stay
+            // editor-scoped like Format/Structure — a chord typed into a
+            // field never reaches the document behind it.
+            "Format" | "Structure" | "Scraps" => false,
             "Edit" => matches!(self.label, "Find in Document" | "Find and Replace"),
             "Margin & AI" => self.label != "Add Margin Note",
             // File, View, History, Session, Help.
@@ -202,21 +203,38 @@ pub fn all() -> &'static [Command] {
             ScrapsTravel,
             ["compost", "asides", "компост", "отложенное"]
         ),
-        // Asides (docs/asides.md): the compost is the writer's deliberate scrap
-        // box; the graveyard is the automatic record of cuts.
+        // Scraps (08 §2): the writer's deliberate pile at the tail; the
+        // graveyard is the automatic record of cuts. "Scraps live; the
+        // graveyard remembers."
         cmd!(
             "Set Aside",
-            "Asides",
+            "Scraps",
             Some("ctrl-shift-a"),
             SetAside,
-            ["compost", "park", "shelf", "отложить", "компост"]
+            ["scraps", "park", "shelf", "отложить", "компост"]
+        ),
+        // The pile-return verbs: chordless (the flank and the provenance
+        // line are their homes; the palette is the narrow-width fallback).
+        cmd!(
+            "Move to the Manuscript",
+            "Scraps",
+            None,
+            MoveToManuscript,
+            ["retrieve", "bring back", "в рукопись", "вернуть в текст"]
+        ),
+        cmd!(
+            "Put Back",
+            "Scraps",
+            None,
+            PutBackScrap,
+            ["return to origin", "unpark", "вернуть на место"]
         ),
         cmd!(
             "Send to the Graveyard",
-            "Asides",
+            "Scraps",
             Some("ctrl-shift-g"),
             SendToGraveyard,
-            ["cut", "delete to graveyard", "в могилу", "вырезать"]
+            ["cut", "exile", "delete to graveyard", "в могилу", "вырезать"]
         ),
         cmd!(
             "Toggle Graveyard",

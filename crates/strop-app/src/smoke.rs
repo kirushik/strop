@@ -203,6 +203,33 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE exile:selection: selection filed in the graveyard");
                 continue;
             }
+            // `move:manuscript` selects the caret's pile paragraph and runs
+            // the retrieval verb; `putback:scrap` runs the provenance line's
+            // Put back at the caret's record.
+            if key == "move:manuscript" {
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_move_to_manuscript(window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE move:manuscript: scrap moved home");
+                continue;
+            }
+            if key == "putback:scrap" {
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_put_back_scrap(window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE putback:scrap: scrap returned to origin");
+                continue;
+            }
             if key == "putback:last" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_putback_last(cx))
