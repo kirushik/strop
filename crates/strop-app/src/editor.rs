@@ -42,10 +42,10 @@ use unicode_segmentation::UnicodeSegmentation;
 // The semantic color language lives in `theme`; everything below is layout.
 pub use crate::theme::{BG_COLOR, TEXT_COLOR};
 use crate::theme::{
-    ACTIVE_BORDER, AI_ACCENT, CARD_BG, CODE_BG_COLOR, COMPOST_FLASH, COMPOST_TAIL,
+    ACTIVE_BORDER, AI_ACCENT, ARRIVAL_FLASH, CARD_BG, CODE_BG_COLOR,
     DIAGNOSIS_CARD_BG, DIAGNOSIS_TINT_ACTIVE, ERROR, FIND_MATCH_BG, HIGHLIGHT_COLOR, LINK_COLOR,
-    MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR, SELECTION_COLOR,
-    STALE_BG,
+    MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR, SCRAP_WASH,
+    SELECTION_COLOR, STALE_BG,
 };
 
 const MARGIN_WIDTH: f32 = 248.;
@@ -1108,10 +1108,11 @@ pub struct Editor {
     /// The last caret byte offset while it was in the MANUSCRIPT — so Esc from
     /// a compost-rail caret returns exactly there (review B3; asides.md §2.1).
     last_manuscript_caret: usize,
-    /// One-shot blink of the compost rail edge on an arrival (aside / orphan
-    /// migration) — the same "something arrived over there" grammar the
-    /// graveyard bar uses. `None` at rest.
-    rail_flash: Option<Instant>,
+    /// One-shot blink on a Scraps arrival (park / jot / orphan migration):
+    /// the landed block's ARRIVAL_FLASH when the seam is on screen, and the
+    /// footer chip's reduce_motion blink — one "something arrived over
+    /// there" grammar with the graveyard's exile blink. `None` at rest.
+    arrival_flash: Option<Instant>,
     /// One-shot blink of the graveyard bar on an exile (a fresh cut filed).
     grave_flash: Option<Instant>,
     /// One-shot pulse of the parked history banner's moment label (Bug B): an
@@ -1250,16 +1251,18 @@ struct ParagraphLayout {
     /// First block of the trailing footnote-definition run (H4): paints a
     /// hairline "Footnotes" section rule above itself.
     section_rule: bool,
-    /// Compost decorations (asides.md §1, Bug A — the compost was invisible).
-    /// An empty compost/boundary block draws a hairline at its midline (the
-    /// item separator grammar); the boundary block also draws the tail anchor
-    /// bar (P11). `compost_header` carries the "COMPOST" whisper painted above
-    /// the first compost block; `compost_flash` blinks the arrived item's
-    /// background once (asides.md §2.3).
-    compost_rule: bool,
-    compost_tail: bool,
-    compost_header: Option<gpui::ShapedLine>,
-    compost_flash: bool,
+    /// Scraps decorations (08 §2, the tail geometry). `scrap_wash` paints the
+    /// SCRAP_WASH region tint behind this pile block — over the measure plus a
+    /// ~14px bleed, tiled per block so the wash reads as ONE region;
+    /// `wash_edges` marks the pile's first/last block (the wash's own top and
+    /// bottom padding). `seam` carries the scrap line's pre-shaped row — the
+    /// quiet "Scraps" label and the region's live word count — drawn on the
+    /// boundary block (label · hairline · count, riding the measure at every
+    /// width). `scrap_flash` blinks the arrived block once (ARRIVAL_FLASH).
+    scrap_wash: bool,
+    wash_edges: (bool, bool),
+    seam: Option<(gpui::ShapedLine, gpui::ShapedLine)>,
+    scrap_flash: bool,
     marker: Option<gpui::ShapedLine>,
     /// Painted superior footnote figures (DESIGN §2-footnotes):
     /// (paragraph-local byte offset of the invisible carrier, label).
@@ -1550,7 +1553,7 @@ impl Editor {
             rail_open: false,
             grave_expanded: Vec::new(),
             last_manuscript_caret: 0,
-            rail_flash: None,
+            arrival_flash: None,
             grave_flash: None,
             strip_pulse: None,
             para_flash: None,
@@ -1627,6 +1630,16 @@ impl Editor {
     /// no rail.
     fn manuscript_word_count(&self) -> usize {
         count_words(self.doc.rope().slice(self.doc.manuscript_char_range()).chunks())
+    }
+
+    /// Words in the Scraps pile — the seam row's live count, the footer
+    /// chip's count, and the caret-scoped count control ("scraps · N").
+    /// 0 with no seam (and for a textless pile held by the retype guard).
+    fn scraps_word_count(&self) -> usize {
+        match self.doc.scraps_char_range() {
+            Some(r) => count_words(self.doc.rope().slice(r).chunks()),
+            None => 0,
+        }
     }
 
     fn sync_mutations(&mut self) {
@@ -5782,7 +5795,7 @@ impl Editor {
         if first_birth {
             self.rail_open = true;
         }
-        self.rail_flash = Some(Instant::now());
+        self.arrival_flash = Some(Instant::now());
         self.sync_mutations();
         let caret = self
             .doc
@@ -6062,7 +6075,7 @@ impl Editor {
                 .unwrap_or(0);
             let quote = self.origin_quote_before(anchor);
             if self.doc.migrate_note_to_compost(id, &quote) {
-                self.rail_flash = Some(Instant::now());
+                self.arrival_flash = Some(Instant::now());
                 migrated = true;
             }
         }
@@ -6149,7 +6162,7 @@ impl Editor {
                 .timer(Duration::from_millis(420))
                 .await;
             this.update(cx, |editor: &mut Editor, cx| {
-                editor.rail_flash = None;
+                editor.arrival_flash = None;
                 editor.grave_flash = None;
                 editor.para_flash = None;
                 cx.notify();
@@ -8001,7 +8014,7 @@ impl Editor {
             // Arrival/exile blinks (one-shot), and the open-card census so the
             // rig can watch a dangling note migrate (writer notes drop, the
             // compost gains an item) or a dead diagnosis close (Bug C).
-            "compost_flash": self.rail_flash.is_some(),
+            "compost_flash": self.arrival_flash.is_some(),
             "grave_flash": self.grave_flash.is_some(),
             "open_notes": self.doc.notes().open().filter(|n| n.kind == NoteKind::Note).count(),
             "open_diagnoses": self.doc.notes().open().filter(|n| n.kind == NoteKind::Diagnosis).count(),
@@ -8886,11 +8899,15 @@ struct LayoutKey {
     marked: Option<(usize, usize)>,
     find_query: Option<String>,
     active_note: Option<u64>,
-    /// The compost arrival blink is a paint decoration baked into the
+    /// The Scraps arrival blink is a paint decoration baked into the
     /// paragraphs, but it is NOT captured by `revision` (clearing the flash
     /// bumps nothing). Keying on it forces a rebuild when it toggles, so the
     /// blink actually clears instead of sticking on the reuse fast-path.
-    compost_flash: bool,
+    scrap_flash: bool,
+    /// The seam row's live word count (seam-mechanics 10): the scrap line must
+    /// repaint on a count change even when no line count changed — the count
+    /// is shaped into the seam row at prepaint, so it is part of the layout.
+    scrap_words: usize,
     /// The graveyard tail section is painted after the last block; its content
     /// and the counter live outside `revision` too (a bar flash, an entry
     /// expand). Keying on a coarse fingerprint rebuilds when they change.
@@ -9249,6 +9266,9 @@ struct GraveEntryView {
     /// Rendered full (whisper + full text): the newest, or one the writer
     /// expanded.
     full: bool,
+    /// Which side of the seam the text was cut from — the whisper's honest
+    /// "from scraps" (graveyard-interplay 2).
+    region: strop_core::document::GraveRegion,
 }
 
 const GRAVE_SECTION_GAP: f32 = 44.; // breathing room after the last prose block
@@ -9310,11 +9330,13 @@ fn shape_grave_section(
     }
     let mut top = start_top;
 
-    // Section header: the tombstone slab is drawn in paint; the label sits to
-    // its right (same idiom as the footer bar).
-    let header = grave_seg(window, format!("Graveyard · {}", entries.len()), 13., MUTED_COLOR, "PT Sans", false, false);
+    // Section header (the mockup's .gyhead): a bare 11px muted "Graveyard"
+    // label — the 3px STALE slab after it is drawn in paint. Subordinate to
+    // the seam row by size and ink (P11: one anchor per surface); the count
+    // lives on the footer chip, which hides exactly while this is on screen.
+    let header = grave_seg(window, "Graveyard", 11., MUTED_COLOR, "PT Sans", false, false);
     lines.push(GraveLine {
-        segments: vec![(px(18.), header)],
+        segments: vec![(px(0.), header)],
         body: None,
         top,
         height: px(GRAVE_HEADER_H),
@@ -9341,8 +9363,10 @@ fn shape_grave_section(
             let mut x = px(0.);
             let mut push =
                 |window: &mut Window, text: String, italic: bool, action: Option<GraveAction>| {
-                    let color = if action.is_some() { AI_ACCENT } else { MUTED_COLOR };
-                    let shaped = grave_seg(window, text, 11., color, "PT Sans", italic, action.is_some());
+                    // Verbs wear the one whisper dress (A5): muted ink; the
+                    // dotted underline is painted from the hit rects.
+                    let shaped =
+                        grave_seg(window, text, 11., MUTED_COLOR, "PT Sans", italic, false);
                     let w = shaped.width();
                     if let Some(a) = action {
                         hits.push((
@@ -9353,10 +9377,20 @@ fn shape_grave_section(
                     segments.push((x, shaped));
                     x += w;
                 };
+            // A scrap-origin entry whispers its region as a frozen past-tense
+            // fact (graveyard-interplay 2/6): "from scraps", never a live link.
+            let from_scraps =
+                e.region == strop_core::document::GraveRegion::Scraps;
             if e.origin_quote.is_empty() {
-                push(window, format!("cut · {date} · "), false, None);
+                let prefix = if from_scraps { "cut from scraps" } else { "cut" };
+                push(window, format!("{prefix} · {date} · "), false, None);
             } else {
-                push(window, "cut from after ".to_string(), false, None);
+                let prefix = if from_scraps {
+                    "cut from scraps, after "
+                } else {
+                    "cut from after "
+                };
+                push(window, prefix.to_string(), false, None);
                 push(window, format!("\u{201C}\u{2026}{}\u{201D}", e.origin_quote), true, None);
                 push(window, format!(" · {date} · "), false, None);
             }
@@ -9569,7 +9603,8 @@ impl Element for EditorElement {
                 None
             },
             active_note: editor.focus.active_id(),
-            compost_flash: editor.rail_flash.is_some(),
+            scrap_flash: editor.arrival_flash.is_some(),
+            scrap_words: editor.scraps_word_count(),
             grave_fingerprint: editor.grave_layout_fingerprint(),
         };
         let can_reuse = !in_history
@@ -9778,7 +9813,7 @@ impl Element for EditorElement {
         } else {
             editor.doc.boundary()
         };
-        let rail_flashing = editor.rail_flash.is_some();
+        let scrap_flashing = editor.arrival_flash.is_some();
         let grave_render: Vec<GraveEntryView> = if in_history {
             Vec::new()
         } else {
@@ -9794,6 +9829,7 @@ impl Element for EditorElement {
                     cut_unix: e.cut_unix,
                     words: e.words,
                     full: Some(e.id) == newest_id || editor.grave_expanded.contains(&e.id),
+                    region: e.region,
                 })
                 .collect()
         };
@@ -9813,52 +9849,70 @@ impl Element for EditorElement {
                 }
                 _ => None,
             });
+        // The Scraps geometry for this frame's text, ERA-AWARE (the live doc
+        // is tail-era; a history/strip preview draws a past state's own
+        // boundary read-only). `pile` is the inclusive block range of the
+        // writer's pile; the seam row draws on the boundary block itself.
+        let last_block = text.bytes().filter(|b| *b == b'\n').count();
+        let (pile, seam_block, newest_block) = match boundary {
+            Some((strop_core::document::BoundaryEra::Top, b)) => {
+                (Some((0, b.saturating_sub(1))), Some(b), b.saturating_sub(1))
+            }
+            Some((strop_core::document::BoundaryEra::Tail, b)) => {
+                (Some((b + 1, last_block)), Some(b), b + 1)
+            }
+            None => (None, None, usize::MAX),
+        };
+        // The seam row's live datum: the region's own word count, from THIS
+        // frame's text (a preview counts its own past pile).
+        let seam_row: Option<(gpui::ShapedLine, gpui::ShapedLine)> = seam_block.map(|_| {
+            let (first, last) = pile.expect("a seam implies a pile range");
+            let words = count_words(
+                text.split('\n')
+                    .enumerate()
+                    .filter(|(ix, _)| *ix >= first && *ix <= last)
+                    .map(|(_, l)| l),
+            );
+            // P11: the seam is the tail's ONE anchor — label + count at 12px
+            // full ink, a step above the graveyard header's 11px muted, so
+            // the returning eye lands on the living boundary, not the record.
+            (
+                grave_seg(window, "Scraps", 12., TEXT_COLOR, "PT Sans", false, false),
+                grave_seg(
+                    window,
+                    format!("{} words", format_thousands(words)),
+                    12.,
+                    TEXT_COLOR,
+                    "PT Sans",
+                    false,
+                    false,
+                ),
+            )
+        });
         let mut paragraphs = Vec::new();
         let mut top = px(0.);
         let mut offset = 0;
         let mut ordered_no = 0usize;
+        let mut seam_row = seam_row; // moved into the boundary block below
         for (block_ix, par_text) in text.split('\n').enumerate() {
             let kind = kinds.get(block_ix).cloned().unwrap_or_default();
             let mut bstyle = block_style_scaled(&kind, font_scale);
-            // The pile face, ERA-AWARE (the geometry flip; Wave B restyles
-            // the seam row/wash — this keeps today's styling coherent at the
-            // new location). Tail era: the seam line + everything after it;
-            // top era (a read-only preview of the past): blocks 0..=b, as
-            // shipped. The pile renders as a mini-column, smaller and muted;
-            // empty pile/boundary blocks draw a hairline at their midline;
-            // the boundary block also gets the anchor bar (P11); a small
-            // whisper marks the pile's first block. Absent boundary = none
-            // of this.
-            let (in_compost, is_boundary, header_here, newest_row) = match boundary {
-                Some((strop_core::document::BoundaryEra::Top, b)) => (
-                    block_ix <= b,
-                    block_ix == b,
-                    block_ix == 0,
-                    block_ix + 1 == b,
-                ),
-                Some((strop_core::document::BoundaryEra::Tail, b)) => (
-                    block_ix >= b,
-                    block_ix == b,
-                    block_ix == b + 1,
-                    block_ix == b + 1,
-                ),
-                None => (false, false, false, false),
-            };
-            let compost_rule = in_compost && par_text.is_empty();
-            if in_compost {
+            // The pile face (08 §2; token audit A1): FULL ink at 0.8 size —
+            // the writer's living scraps never wear the dead muted face; the
+            // smaller size + the SCRAP_WASH region tint carry the register.
+            let in_pile = pile.is_some_and(|(f, l)| block_ix >= f && block_ix <= l);
+            let is_boundary = seam_block == Some(block_ix);
+            if in_pile {
                 bstyle.size = px((f32::from(bstyle.size) * 0.8).round());
                 bstyle.line_height = px((f32::from(bstyle.line_height) * 0.8 / 2.).round() * 2.);
-                bstyle.muted = true;
             }
-            let compost_header = header_here.then(|| {
-                grave_seg(window, "SCRAPS", 10.5, MUTED_COLOR, "PT Sans", false, false)
-            });
-            if compost_header.is_some() {
-                bstyle.extra_top += px(20.); // room for the whisper above the pile
+            let seam = if is_boundary { seam_row.take() } else { None };
+            if seam.is_some() {
+                bstyle.extra_top += px(8.); // the mockup's air above the scrap line
             }
             // The arrival blink: the NEWEST item — under the tail era that is
             // the first scrap (newest nearest the story, 08 §2).
-            let compost_flash = rail_flashing && newest_row && !par_text.is_empty();
+            let scrap_flash = scrap_flashing && block_ix == newest_block && !par_text.is_empty();
             // The footnote-definition run at the document end reads as one
             // "Footnotes" section: a hairline rule sits above its first
             // block (H4). Detected by neighbour, not by kind alone.
@@ -10089,10 +10143,12 @@ impl Element for EditorElement {
                 bg: bstyle.bg,
                 quote_rule: bstyle.quote_rule,
                 section_rule,
-                compost_rule,
-                compost_tail: is_boundary,
-                compost_header,
-                compost_flash,
+                scrap_wash: in_pile,
+                wash_edges: pile.map_or((false, false), |(f, l)| {
+                    (block_ix == f, block_ix == l)
+                }),
+                seam,
+                scrap_flash,
                 marker,
                 fn_marks,
                 font_size: bstyle.size,
@@ -10206,13 +10262,32 @@ impl Element for EditorElement {
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
         let viewport = bounds.size.height;
-        // The compost mini-column measure (asides.md §1: ~35ch, capped so it
-        // never runs the full prose width).
-        let compost_w = px(f32::from(bounds.size.width).min(340.));
         for par in &prepaint.paragraphs {
             let y = par.top - scroll_top;
-            if y + par.height <= px(0.) || y >= viewport {
+            // The wash tile bleeds one paragraph gap above its block (tiles
+            // must join), so cull with that much grace on both edges: a block
+            // just past the bottom still paints the tile that covers the gap
+            // above it.
+            if y + par.height + line_height <= px(0.) || y - line_height >= viewport {
                 continue; // outside the viewport
+            }
+            // Scraps decorations (08 §2). The region wash FIRST — the ground
+            // everything else sits on: SCRAP_WASH over the measure plus a
+            // ~14px bleed, tiled per block (each tile covers the gap above
+            // itself) so the pile reads as ONE washed region — and never
+            // viewport-wide: at 1600pt a full-width band would run under the
+            // margin lane and change every card's ground.
+            if par.scrap_wash {
+                let wash_top = y - if par.wash_edges.0 { px(16.) } else { line_height };
+                let wash_bottom =
+                    y + par.height + if par.wash_edges.1 { px(10.) } else { px(0.) };
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(-14.), wash_top),
+                        size(bounds.size.width + px(28.), wash_bottom - wash_top),
+                    ),
+                    rgb(SCRAP_WASH),
+                ));
             }
             // Kind decorations: code-block panel, quote rule, list markers.
             if let Some(bg) = par.bg {
@@ -10244,47 +10319,44 @@ impl Element for EditorElement {
                     rgb(RULE_COLOR),
                 ));
             }
-            // Compost decorations (Bug A). The arrival blink first (behind the
-            // text): the tail item's background pulses on an aside/migration.
-            if par.compost_flash {
+            // The arrival blink (destination receipt, seam on screen): the
+            // landed block pulses once in the ONE warm (ARRIVAL_FLASH), over
+            // the wash, behind the text.
+            if par.scrap_flash {
                 window.paint_quad(fill(
                     Bounds::new(
                         bounds.origin + point(px(-6.), y - px(3.)),
-                        size(compost_w + px(12.), par.height + px(6.)),
+                        size(bounds.size.width + px(12.), par.height + px(6.)),
                     ),
-                    rgba(COMPOST_FLASH),
+                    rgba(ARRIVAL_FLASH),
                 ));
             }
-            // The "COMPOST" whisper above the first compost block.
-            if let Some(shaped) = &par.compost_header {
-                shaped
+            // The scrap line (08 §2): quiet label · hairline · the region's
+            // live word count, riding the measure at every width — centred at
+            // 1600, left at 800, count right-aligned to the measure so the
+            // seam arithmetic reads on one axis (surfaces-attention 9).
+            if let Some((label, count)) = &par.seam {
+                let mid = y + par.height / 2.;
+                let lw = label.width();
+                let cw = count.width();
+                label
+                    .paint(bounds.origin + point(px(0.), y), par.height, TextAlign::Left, None, window, cx)
+                    .ok();
+                count
                     .paint(
-                        bounds.origin + point(px(0.), y - px(16.)),
-                        px(14.),
+                        bounds.origin + point(bounds.size.width - cw, y),
+                        par.height,
                         TextAlign::Left,
                         None,
                         window,
                         cx,
                     )
                     .ok();
-            }
-            // An empty compost/boundary block is a separator: a hairline at its
-            // midline (asides.md §1). The boundary also gets the tail anchor bar.
-            if par.compost_rule {
-                let mid = y + par.height / 2.;
+                let rule_w = (bounds.size.width - cw - lw - px(20.)).max(px(0.));
                 window.paint_quad(fill(
-                    Bounds::new(bounds.origin + point(px(0.), mid), size(compost_w, px(1.))),
+                    Bounds::new(bounds.origin + point(lw + px(10.), mid), size(rule_w, px(1.))),
                     rgb(RULE_COLOR),
                 ));
-                if par.compost_tail {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            bounds.origin + point(px(0.), mid - px(1.)),
-                            size(px(26.), px(2.)),
-                        ),
-                        rgb(COMPOST_TAIL),
-                    ));
-                }
             }
             // The originflash / put-back paragraph blink (Bug B): tint the block
             // the caret was sent to. Painted live from `para_flash`, so it clears
@@ -10367,39 +10439,28 @@ impl Element for EditorElement {
                 continue; // culled
             }
             if gl.header {
-                // The tombstone slab + a flash tint on a fresh cut (live).
+                // A flash tint on a fresh cut (live) — the one arrival warm.
                 if grave_flashing {
                     window.paint_quad(fill(
                         Bounds::new(
                             bounds.origin + point(px(-6.), y - px(3.)),
                             size(bounds.size.width + px(12.), gl.height + px(6.)),
                         ),
-                        rgba(COMPOST_FLASH),
+                        rgba(ARRIVAL_FLASH),
                     ));
                 }
-                // The tombstone slab (a drawn glyph — ⚰ is outside PT). A narrow
-                // "neck" quad over a wider "base" reads as a headstone.
+                // The mockup's 3px STALE slab after the label (.gyhead) — the
+                // record's own boundary, deliberately QUIETER than the seam's
+                // full-ink hairline row (P11: the graveyard header
+                // subordinates; the seam is the tail's one anchor).
+                let label_w = gl.segments.first().map_or(px(0.), |(x, s)| *x + s.width());
+                let mid = y + gl.height / 2. - px(1.);
                 window.paint_quad(fill(
                     Bounds::new(
-                        bounds.origin + point(px(3.), y + px(5.)),
-                        size(px(7.), px(3.)),
+                        bounds.origin + point(label_w + px(10.), mid),
+                        size((bounds.size.width - label_w - px(10.)).max(px(0.)), px(3.)),
                     ),
-                    rgb(MUTED_COLOR),
-                ));
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(2.), y + px(7.)),
-                        size(px(9.), px(8.)),
-                    ),
-                    rgb(MUTED_COLOR),
-                ));
-                // A hairline above the whole section (the "record" boundary).
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(0.), y - px(20.)),
-                        size(bounds.size.width, px(1.)),
-                    ),
-                    rgb(RULE_COLOR),
+                    rgb(STALE_BG),
                 ));
             }
             if gl.left_rule {
@@ -10417,6 +10478,27 @@ impl Element for EditorElement {
                 wrapped
                     .paint(bounds.origin + point(*x, y), gl.line_height, TextAlign::Left, None, window, cx)
                     .ok();
+            }
+            // Record verbs wear one whisper dress (token audit A5): muted ink
+            // with a DOTTED underline — painted as dashes (gpui runs have no
+            // dotted style). Expand hits are whole receded rows, not verbs.
+            for (rect, action) in &gl.hits {
+                if matches!(action, GraveAction::Expand(_)) {
+                    continue;
+                }
+                let uy = rect.origin.y - scroll_top + rect.size.height - px(5.);
+                let mut dx = rect.origin.x;
+                let end = rect.origin.x + rect.size.width;
+                while dx < end {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            bounds.origin + point(dx, uy),
+                            size(px(1.5).min(end - dx), px(1.)),
+                        ),
+                        rgb(MUTED_COLOR),
+                    ));
+                    dx += px(4.);
+                }
             }
         }
 
@@ -11022,19 +11104,32 @@ impl Editor {
                         .text_size(px(12.5))
                         .py(px(2.))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(self.selection_menu_row("sel-note", SelVerb::Note, "Add a note", cx))
+                        // The mockup's .vmenu order: Annotate, then the two
+                        // afterlife verbs grouped under a hairline — Set aside
+                        // (emphasized, the gentle verb) resting ONE ROW ABOVE
+                        // Exile (destructive red): this adjacency at the
+                        // hesitation over a deletion is the entire invitation
+                        // (08 §2, F8 — no tips, no tours).
+                        .child(self.selection_menu_row("sel-note", SelVerb::Note, "Annotate", cx))
+                        .child(
+                            div()
+                                .my(px(3.))
+                                .border_t_1()
+                                .border_color(rgb(RULE_COLOR)),
+                        )
                         .child(self.selection_menu_row(
                             "sel-aside",
                             SelVerb::Aside,
-                            "Set aside, out of the story",
+                            "Set aside",
                             cx,
                         ))
-                        .child(self.selection_menu_row(
-                            "sel-grave",
-                            SelVerb::Graveyard,
-                            "Send to the graveyard",
-                            cx,
-                        ))
+                        .child(self.selection_menu_row("sel-grave", SelVerb::Graveyard, "Exile", cx))
+                        .child(
+                            div()
+                                .my(px(3.))
+                                .border_t_1()
+                                .border_color(rgb(RULE_COLOR)),
+                        )
                         .child(self.selection_menu_row(
                             "sel-ask",
                             SelVerb::Ask,
@@ -11045,13 +11140,13 @@ impl Editor {
         )
     }
 
-    /// One carrier-sentence row of the right verb menu. The icon is a small
-    /// color-language dot drawn as a div (no non-PT glyph — the ☰/✂/❋ of the
-    /// mockup would force a font fallback, and ☰ collides with outline/palette,
-    /// finding 109): warm amber for the writer's note, drained for the graveyard,
-    /// cool blue for the machine ask. Acting dismisses BOTH flanks first (H20),
-    /// THEN dispatches — the verb still sees the live `selected_range` (dismissal
-    /// only hides the flanks, it never clears the selection).
+    /// One carrier row of the right verb menu (the mockup's .vmenu row): the
+    /// label wears the verb's own dress — Set aside emphasized (the gentle
+    /// verb), Exile in destructive red, the machine ask keeps its cool dot
+    /// (the one row the mockup doesn't stage). Acting dismisses BOTH flanks
+    /// first (H20), THEN dispatches — the verb still sees the live
+    /// `selected_range` (dismissal only hides the flanks, never clears the
+    /// selection).
     fn selection_menu_row(
         &self,
         id: &'static str,
@@ -11059,14 +11154,11 @@ impl Editor {
         label: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Each verb's dress derives from the verb itself: the colour-language
-        // dot (warm = the writer's note, drained = the graveyard, cool = the
-        // machine ask), the chord it teaches, and whether the hover wash warns.
-        let (dot, chord, destructive) = match verb {
-            SelVerb::Note => (rgb(ACTIVE_BORDER), "ctrl-m", false),
-            SelVerb::Aside => (rgb(MUTED_COLOR), "ctrl-shift-a", false),
-            SelVerb::Graveyard => (rgb(0xC9C5BAu32), "ctrl-shift-g", true),
-            SelVerb::Ask => (rgb(AI_ACCENT), "ctrl-shift-d", false),
+        let (chord, destructive, emphasized) = match verb {
+            SelVerb::Note => ("ctrl-m", false, false),
+            SelVerb::Aside => ("ctrl-shift-a", false, true),
+            SelVerb::Graveyard => ("ctrl-shift-g", true, false),
+            SelVerb::Ask => ("ctrl-shift-d", false, false),
         };
         div()
             .id(id)
@@ -11076,9 +11168,19 @@ impl Editor {
             .px(px(11.))
             .py(px(7.))
             .cursor(CursorStyle::PointingHand)
-            .hover(|d| d.bg(rgb(if destructive { STALE_BG } else { NOTE_CARD_BG })))
-            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(dot))
-            .child(div().text_color(rgb(TEXT_COLOR)).child(label))
+            // The documented interaction-state overlay (token audit A4/A7):
+            // hover is chrome, never a content meaning — the warm note cream
+            // said "mine" and the drained wash said "stale", both lies here.
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .when(matches!(verb, SelVerb::Ask), |d| {
+                d.child(div().w(px(7.)).h(px(7.)).rounded_full().bg(rgb(AI_ACCENT)))
+            })
+            .child(
+                div()
+                    .text_color(rgb(if destructive { ERROR } else { TEXT_COLOR }))
+                    .when(emphasized, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .child(label),
+            )
             // The chord chip (the lab's `.k` keycap): the menu teaches its own
             // shortcuts in place, instead of a manual teaching them in prose.
             .child(
@@ -11209,7 +11311,7 @@ impl Editor {
                         // the always-visible toggle carries the compliance
                         // signal; an off-screen region flash can't.
                         .map(|d| {
-                            let a = self.rail_flash.map_or(0., |t| {
+                            let a = self.arrival_flash.map_or(0., |t| {
                                 let e = t.elapsed().as_millis() as f32 / 1400.;
                                 (0.33 * (1. - e)).clamp(0., 0.33)
                             });
@@ -11810,7 +11912,7 @@ impl Editor {
         let items = self.compost_items();
         // Arrival blink (06 §2): the newest item is the compost tail — the
         // same decaying seltint wash the parked banner's refusal pulse uses.
-        let flash_a = self.rail_flash.map_or(0., |t| {
+        let flash_a = self.arrival_flash.map_or(0., |t| {
             let e = t.elapsed().as_millis() as f32 / 1400.;
             (0.33 * (1. - e)).clamp(0., 0.33)
         });

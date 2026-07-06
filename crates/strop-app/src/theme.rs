@@ -80,6 +80,16 @@ pub const DIAGNOSIS_CARD_BG: u32 = 0xEEF3FB;
 /// warmth (AAA, 15.01:1). Doubt = desaturation, "fading back into the page" —
 /// never red (staleness is not an error).
 pub const STALE_BG: u32 = 0xEFEEEA;
+/// The Scraps region wash (08 §2): the writer's living pile at the document
+/// tail, painted over the column measure + ~14px bleed — never viewport-wide.
+/// This is `NOTE_CARD_BG` at ~45% over the page, baked solid (~15.5:1 vs
+/// TEXT_COLOR, AAA holds). Distinctness from the note-card cream is carried
+/// by CHROMA (same value, roughly half the saturation) plus FORM (a
+/// borderless region wash at full measure vs a bordered rounded card; wash
+/// text is 0.8-size full ink) — no page-legible wash can be "visibly distant
+/// in value" from cream, so the distance here is chroma-not-value. Flagged
+/// for the taste round, where the writer parked the warm-family revisit.
+pub const SCRAP_WASH: u32 = 0xFAF7EE;
 
 // --- Cool blue: the AI / machine voice -----------------------------------
 
@@ -145,13 +155,12 @@ pub const CODE_BG_COLOR: u32 = 0x1A1A1814;
 /// ("points outward, not your warm words"); the underline carries the meaning.
 pub const LINK_COLOR: u32 = 0x2156A8;
 
-// --- Asides: the compost rail & the graveyard ----------------------------
+// --- Scraps & the graveyard ----------------------------------------------
 
-/// The compost tail anchor mark (asides.md §1 / P11): a short quiet bar at the
-/// rail's live end, where arrivals blink and the append caret sits. Drained
-/// neutral — "resting", never the active gold (that would read as engagement).
-pub const COMPOST_TAIL: u32 = 0xD8D2C2;
-/// The compost arrival blink (asides.md §2.3): the active gold made translucent
-/// (~0.33 alpha) — one grammar with the graveyard bar's pulse for "something
-/// arrived over there". A single quiet flash, then gone.
-pub const COMPOST_FLASH: u32 = 0xC8A95154;
+/// The arrival blink (08 §2; token audit A3): the active gold made translucent
+/// (~0.33 alpha) — ONE warm for "something arrived over there", shared by the
+/// landed-block flash in the pile, the graveyard section's exile blink, and
+/// the footer chips' pulse/blink. A single quiet flash, then gone. (Unified
+/// from the old COMPOST_FLASH + the graveyard bar's inline 0xEFE6D0; the
+/// COMPOST_TAIL anchor mark died with the rail.)
+pub const ARRIVAL_FLASH: u32 = 0xC8A95154;
