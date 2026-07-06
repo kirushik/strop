@@ -10,7 +10,7 @@ use gpui::Action;
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
     DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1,
-    Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
+    Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, ReadItCold, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     MoveToManuscript, PutBackScrap, SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
     ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleGraveyard, ToggleHighlight, ToggleHistory,
@@ -242,6 +242,17 @@ pub fn all() -> &'static [Command] {
             Some("ctrl-alt-g"),
             ToggleGraveyard,
             ["cuts", "restore cut", "put back", "кладбище", "могила"]
+        ),
+        // The cold read (impl 05 §4.6, arbitration O7): the estrangement
+        // ritual's one entry verb. "Cold read" is a carried term — the
+        // Russian aliases translate the function, never the metaphor
+        // (ux-glossary). Inside the room the same chord is the toggle-exit.
+        cmd!(
+            "Read it cold",
+            "View",
+            Some("ctrl-shift-l"),
+            ReadItCold,
+            ["cold read", "reading", "book", "свежим взглядом", "перечитать"]
         ),
         cmd!(
             "Run Editorial Diagnosis",

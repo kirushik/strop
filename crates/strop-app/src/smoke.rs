@@ -25,6 +25,17 @@ pub fn clipboard_override() -> Option<String> {
     CLIP_OVERRIDE.lock().ok()?.clone()
 }
 
+/// Mirror an app-side clipboard WRITE into the shim so the rig can read it
+/// back (the wayland write is dropped without real seat focus — see above).
+/// A no-op outside STROP_SMOKE runs.
+pub fn mirror_clipboard(text: &str) {
+    if std::env::var("STROP_SMOKE").is_ok()
+        && let Ok(mut slot) = CLIP_OVERRIDE.lock()
+    {
+        *slot = Some(text.to_owned());
+    }
+}
+
 use crate::editor::Editor;
 
 pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
@@ -381,6 +392,88 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE strip:now");
                 continue;
             }
+            // The cold read (impl 05 Wave B). `coldread:open` toggles the
+            // room through the real verb; `coldread:flip:N` flips to page N;
+            // `coldread:select:F,T` sets a word-snapped page selection;
+            // `coldread:react:<glyph>` files a chip reaction;
+            // `coldread:past[:N]` enters the history variant through the
+            // parked banner's own gate; `coldread:copycheck` runs the F5
+            // copy golden through the clipboard shim.
+            if key == "coldread:open" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_coldread_open(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                eprintln!("SMOKE coldread:open");
+                continue;
+            }
+            if let Some(n) = key.strip_prefix("coldread:flip:") {
+                let page: usize = n.parse().expect("bad coldread:flip page");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_coldread_flip(page, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if let Some(spec) = key.strip_prefix("coldread:select:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .expect("bad coldread:select range")
+                };
+                let (from, to) = (next(), next());
+                window
+                    .update(cx, |editor, _, cx| editor.debug_coldread_select(from, to, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if let Some(glyph) = key.strip_prefix("coldread:react:") {
+                let glyph = glyph.to_owned();
+                window
+                    .update(cx, |editor, _, cx| editor.debug_coldread_react(&glyph, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if key == "coldread:past" || key.starts_with("coldread:past:") {
+                let pick = key
+                    .strip_prefix("coldread:past:")
+                    .and_then(|n| n.parse::<usize>().ok());
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_coldread_past(pick, window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if key == "coldread:copycheck" {
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_coldread_copycheck(window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                continue;
+            }
             // `reduce:motion` flips the config's motion-sensitivity switch
             // for this run, so the rig can drive the cross-fade code path.
             if key == "reduce:motion" {
@@ -468,6 +561,33 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .update(cx, |editor, _, _| editor.debug_cursor())
                     .unwrap_or_default();
                 eprintln!("SMOKE {key}: {state}");
+                continue;
+            }
+            // `move:X,Y` — a plain pointer move (no button): hover states
+            // (the cold read's flip-zone shading, tooltips-by-position).
+            if let Some(spec) = key.strip_prefix("move:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .expect("bad move in STROP_SMOKE")
+                };
+                let (x, y) = (next(), next());
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: point(px(x), px(y)),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
                 continue;
             }
             // `drag:X1,Y1,X2,Y2` — press at the start, move in steps to the end,
