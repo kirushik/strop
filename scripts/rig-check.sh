@@ -337,18 +337,19 @@ if [ "$S2" != "$S1" ]; then echo "  ok   the wheel still moves the list ($S1 -> 
 expect "selection is untouched by the wheel"            20  "$(field "$P2" selected)"
 expect "an unrelated redraw doesn't snap the wheel back" "$S2" "$S3"
 
-echo "rig-check: set-aside shows compliance — the rail opens on first birth and never self-closes"
-# Wave B restyles — the pile lives at the TAIL now (the Scraps flip): the
-# first aside is the ADOPTION of the trailing paragraph (its blank divider
-# becomes the seam); the second parks the manuscript's first paragraph.
-# ctrl-end lands in the pile after the flip, so the parks aim head-first.
+echo "rig-check: set-aside births the region — the chip exists, the receipt fires"
+# The pile lives at the TAIL (the Scraps flip): the first aside is the
+# ADOPTION of the trailing paragraph (its blank divider becomes the seam);
+# the second parks the manuscript's first paragraph. The rail is dead — the
+# compliance signal is the chip's existence + the arrival pulse.
 DOCR=$(mktemp --suffix=.md); : > "$DOCR"
 OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCR" "onexx enter enter twoxx ctrl-end select:para aside:selection wait:80 dump:ui ctrl-home select:para aside:selection wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
 R1=$(echo "$OUT" | sed -n 1p); R2=$(echo "$OUT" | sed -n 2p)
 [ -n "$R2" ] || { echo "  FAIL no dump"; exit 1; }
 rm -f "$DOCR" "$DOCR.strop"
-expect "the first aside opens the rail"      true "$(field "$R1" rail)"
-expect "the second aside keeps it open"      true "$(field "$R2" rail)"
+expect "the first aside births the region"   true "$(field "$R1" scraps_chip_exists)"
+expect "the second park keeps it"            true "$(field "$R2" scraps_chip_exists)"
+expect "the park's chip receipt fired"       true "$(field "$R2" chip_pulse)"
 CBR=$(field "$R2" compost_blocks)
 if [ "${CBR:-0}" -gt 1 ] 2>/dev/null; then echo "  ok   both passages landed in the scraps (compost_blocks=$CBR)"; else
   echo "  FAIL compost_blocks=$CBR"; fail=1; fi

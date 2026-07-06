@@ -14,8 +14,8 @@ use crate::editor::{
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
     ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleGraveyard, ToggleHighlight, ToggleHistory,
-    ToggleOrderedList, ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview, ToggleStrip,
-    ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
+    ToggleOrderedList, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview, ToggleStrip,
+    ToggleStrikethrough, ToggleStrong, ToggleUnderline, ScrapsTravel, Undo,
 };
 
 pub struct Command {
@@ -192,15 +192,15 @@ pub fn all() -> &'static [Command] {
             InsertFootnote,
             ["сноска"]
         ),
-        // The compost rail (06 §2): the left panel lists the compost's
-        // items. The outline it replaced is gone — heading navigation lives
-        // in the palette's `@` mode; "outline" survives as an alias only.
+        // "Scraps" is the TRAVEL verb (08 §2; the rail it replaced is gone):
+        // it arms the excursion latch and lands at the seam — the next press
+        // resumes where the last visit stopped; Esc returns exactly home.
         cmd!(
-            "Compost Rail",
+            "Scraps",
             "View",
             Some("ctrl-shift-o"),
-            ToggleOutline,
-            ["outline", "asides", "компост", "отложенное"]
+            ScrapsTravel,
+            ["compost", "asides", "компост", "отложенное"]
         ),
         // Asides (docs/asides.md): the compost is the writer's deliberate scrap
         // box; the graveyard is the automatic record of cuts.
@@ -561,7 +561,7 @@ mod tests {
             "Run Editorial Diagnosis",
             "History",
             "History panel",
-            "Compost Rail",
+            "Scraps",
             "Set Up AI Provider…",
             "New Document",
             "Set Session Goal…",

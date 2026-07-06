@@ -10,6 +10,10 @@
 // are banned crate-wide; clippy.toml points each ban at its draw_guard
 // wrapper. Deny, not warn — a mid-draw notify is a corruption bug, not style.
 #![deny(clippy::disallowed_methods)]
+// The rig's UI dump is one large serde_json::json! literal (editor.rs,
+// debug_ui_dump); json_internal! recurses per key and the Scraps keys pushed
+// it past the default 128. A wider budget beats splitting the dump.
+#![recursion_limit = "256"]
 
 mod commands;
 mod config;

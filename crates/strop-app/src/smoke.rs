@@ -93,16 +93,18 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE {key}: {state}");
                 continue;
             }
-            if key == "toggle:outline" {
+            // `scraps:travel` — the travel verb (the chip / ctrl-shift-o):
+            // arms the excursion latch and lands at the seam or `pile_end`.
+            if key == "scraps:travel" {
                 window
                     .update(cx, |editor, window, cx| {
-                        editor.toggle_rail(&crate::editor::ToggleOutline, window, cx)
+                        editor.scraps_travel(&crate::editor::ScrapsTravel, window, cx)
                     })
                     .ok();
                 cx.background_executor()
                     .timer(Duration::from_millis(80))
                     .await;
-                eprintln!("SMOKE toggle:outline");
+                eprintln!("SMOKE scraps:travel");
                 continue;
             }
             if key == "seed:diag" {
