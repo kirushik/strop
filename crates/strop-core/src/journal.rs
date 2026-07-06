@@ -51,8 +51,11 @@ impl EditRun {
 }
 
 /// Non-edit history the strip draws: passes, card closures, restores,
-/// exports. Raise-times live on the cards themselves (`created_unix`);
-/// checkpoints carry their own `created_unix` — neither is duplicated here.
+/// exports — and every SEAM mutation (time-persistence 2: boundary changes
+/// were invisible to the record; a scrub-restore across a park silently
+/// re-scoped the pile as manuscript). Raise-times live on the cards
+/// themselves (`created_unix`); checkpoints carry their own `created_unix`
+/// — neither is duplicated here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JournalEvent {
@@ -64,6 +67,13 @@ pub enum JournalEvent {
     /// from the state at `from_unix` (seconds, matching checkpoints).
     Restore { t: i64, from_unix: i64, len_chars: usize },
     Export { t: i64 },
+    /// The scrap line moved: born, shifted, or evaporated (`at: None`).
+    /// Recorded by every boundary mutation — park, chord-park, adoption,
+    /// undo/redo, put-back re-birth, exile collapse, migration — and applied
+    /// by `ReplayDoc::advance` interleaved with runs by timestamp, so a
+    /// reconstruction (and the strip's Restore of it) carries the scrubbed
+    /// moment's own seam. `at` is the tail-era boundary block index.
+    Seam { t: i64, at: Option<usize> },
 }
 
 impl JournalEvent {
@@ -72,7 +82,8 @@ impl JournalEvent {
             Self::Pass { t, .. }
             | Self::CardClosed { t, .. }
             | Self::Restore { t, .. }
-            | Self::Export { t } => *t,
+            | Self::Export { t }
+            | Self::Seam { t, .. } => *t,
         }
     }
 }
@@ -210,6 +221,7 @@ impl Journal {
                 len_chars,
             },
             JournalEvent::Export { .. } => JournalEvent::Export { t: clamped },
+            JournalEvent::Seam { at, .. } => JournalEvent::Seam { t: clamped, at },
         };
         self.events.push(ev);
     }
@@ -219,6 +231,22 @@ impl Journal {
     /// whole; runs are seconds long, below the scrub's perceptual grain).
     pub fn runs_until(&self, t_ms: i64) -> usize {
         self.runs.partition_point(|r| r.t0 <= t_ms)
+    }
+
+    /// The Seam events, in record order: `(t, at)` pairs. Events are
+    /// appended time-clamped, so this sequence is monotonic in t.
+    pub fn seams(&self) -> impl Iterator<Item = (i64, Option<usize>)> + '_ {
+        self.events.iter().filter_map(|e| match e {
+            JournalEvent::Seam { t, at } => Some((*t, *at)),
+            _ => None,
+        })
+    }
+
+    /// How many Seam events fall at or before `t_ms` — the replay cursor a
+    /// reconstruction anchored AT `t_ms` starts from (the anchor state's own
+    /// BlockMap already reflects them).
+    pub fn seams_until(&self, t_ms: i64) -> usize {
+        self.seams().take_while(|(t, _)| *t <= t_ms).count()
     }
 }
 
@@ -238,6 +266,9 @@ pub struct ReplayDoc {
     /// Runs consumed so far — the strip scrubs forward incrementally and
     /// re-anchors on backward jumps.
     pub applied: usize,
+    /// Seam events consumed so far (see `Journal::seams_until`); the
+    /// boundary itself lives in `blocks`, exactly as in the live doc.
+    pub seams_applied: usize,
 }
 
 impl ReplayDoc {
@@ -245,13 +276,21 @@ impl ReplayDoc {
         let rope = ropey::Rope::from_str(text);
         let mut blocks = blocks;
         if blocks.len() != rope.len_lines() {
-            blocks = BlockMap::new(rope.len_lines());
+            // Rebuild the kinds but CARRY THE BOUNDARY through the clamp
+            // (time-persistence 7): a foreign or off-by-one state must
+            // degrade approximately, never into the silent scope trespass of
+            // a dropped seam. Truly out-of-range indexes clamp to None.
+            let mut fresh = BlockMap::new(rope.len_lines());
+            fresh.set_aside_boundary(blocks.aside_boundary());
+            fresh.set_scrap_line(blocks.scrap_line());
+            blocks = fresh;
         }
         Self {
             rope,
             spans,
             blocks,
             applied,
+            seams_applied: 0,
         }
     }
 
@@ -275,15 +314,36 @@ impl ReplayDoc {
         self.applied += 1;
     }
 
-    /// Replay forward until `journal.runs_until(t_ms)`; returns whether
-    /// anything changed (the strip repaints only then).
+    /// Replay forward until `t_ms`, runs and Seam events interleaved by
+    /// timestamp (time-persistence 2: the boundary evolves with the text it
+    /// belongs to; on a tie the run applies first — a park's move ops precede
+    /// its boundary rider). Returns whether anything changed (the strip
+    /// repaints only then). Pre-Scraps journals carry no Seam events and
+    /// reconstruct against their own era's anchors unchanged.
     pub fn advance(&mut self, journal: &Journal, t_ms: i64) -> bool {
-        let until = journal.runs_until(t_ms);
-        let from = self.applied;
-        for run in &journal.runs[from..until] {
-            self.apply(run);
+        let runs_until = journal.runs_until(t_ms);
+        let seams: Vec<(i64, Option<usize>)> = journal.seams().collect();
+        let seams_until = seams.partition_point(|(t, _)| *t <= t_ms);
+        let (from_runs, from_seams) = (self.applied, self.seams_applied);
+        loop {
+            let next_run = (self.applied < runs_until).then(|| journal.runs[self.applied].t0);
+            let next_seam =
+                (self.seams_applied < seams_until).then(|| seams[self.seams_applied].0);
+            let take_run = match (next_run, next_seam) {
+                (Some(rt), Some(st)) => rt <= st, // tie: the run first
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_run {
+                let run = journal.runs[self.applied].clone();
+                self.apply(&run);
+            } else {
+                self.blocks.set_scrap_line(seams[self.seams_applied].1);
+                self.seams_applied += 1;
+            }
         }
-        from != until
+        from_runs != self.applied || from_seams != self.seams_applied
     }
 
     pub fn text(&self) -> String {

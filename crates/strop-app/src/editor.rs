@@ -20,8 +20,8 @@ use gpui::{
     Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ResizeEdge, ScrollWheelEvent, SharedString, StrikethroughStyle, Style,
-    TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
+    Pixels, Point, ResizeEdge, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
+    Style, TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
     WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
@@ -42,10 +42,10 @@ use unicode_segmentation::UnicodeSegmentation;
 // The semantic color language lives in `theme`; everything below is layout.
 pub use crate::theme::{BG_COLOR, TEXT_COLOR};
 use crate::theme::{
-    ACTIVE_BORDER, AI_ACCENT, CARD_BG, CODE_BG_COLOR, COMPOST_FLASH, COMPOST_TAIL,
+    ACTIVE_BORDER, AI_ACCENT, ARRIVAL_FLASH, CARD_BG, CODE_BG_COLOR,
     DIAGNOSIS_CARD_BG, DIAGNOSIS_TINT_ACTIVE, ERROR, FIND_MATCH_BG, HIGHLIGHT_COLOR, LINK_COLOR,
-    MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR, SELECTION_COLOR,
-    STALE_BG,
+    MUTED_COLOR, NOTE_CARD_BG, NOTE_TINT, NOTE_TINT_ACTIVE, RULE_COLOR, SAGE_COLOR, SCRAP_WASH,
+    SELECTION_COLOR, STALE_BG,
 };
 
 const MARGIN_WIDTH: f32 = 248.;
@@ -158,6 +158,25 @@ impl CardMove {
     }
 }
 
+/// The park receipt's origin station (surfaces-attention 3/4): a
+/// viewport-FROZEN echo of the departed block, fading ~150ms with a short
+/// downward drift while the prose closes up instantly beneath it — every
+/// frame shows committed text plus a fading light, so a park right after
+/// typing can never read as "did I delete it?". Writer-initiated, so it
+/// rides its own channel, exempt from the lane's burst snap; reduce_motion
+/// drops the drift (pure cross-fade).
+struct ParkGhost {
+    text: String,
+    /// Window-space rect at freeze time.
+    left: f32,
+    top: f32,
+    width: f32,
+    font_size: f32,
+    line_height: f32,
+    /// Keys the element animation (a fresh park = a fresh run).
+    seq: usize,
+}
+
 /// A completed pass parked until the typing lull (see `Editor::deferred_pass`).
 /// Carries the RAW diagnoses (quotes not yet anchored) and the generation that
 /// produced them — a cancel or a newer run bumps `ai_generation`, and a stale
@@ -201,8 +220,6 @@ const COL_LEFT_MIN: f32 = 24.;
 /// History side panel (DESIGN §2-history): push, not overlay. The panel
 /// shrinks before the document does — prose keeps DOC_MIN_WIDTH.
 const HISTORY_PANEL_WIDTH: f32 = 320.;
-/// The compost rail panel (06 §2): left, push — mirrors the history panel.
-const RAIL_PANEL_WIDTH: f32 = 200.;
 const DOC_MIN_WIDTH: f32 = 400.;
 const CODE_FONT: &str = "PT Mono";
 const BAR_HEIGHT: f32 = 36.;
@@ -238,6 +255,20 @@ const CSD_ROUNDING: f32 = 10.;
 /// deleted text at that point. A backspace RUN (many one-char deletes) never
 /// reaches this in one op, so it never auto-files (reviews H24 + H43).
 const AUTO_CUT_MIN_CHARS: usize = 80;
+/// The Scraps chip's arrival ring: two expanding beats (the mockup's
+/// `chippulse`, 1.4s ease-out × 2) — an event, never a standing light.
+const CHIP_PULSE_MS: u64 = 2800;
+/// The provenance one-liner's id namespace in the margin lane (a packer
+/// citizen beside real note cards — the flag keeps record ids and note ids
+/// from ever colliding in the motion/appearing maps).
+const PROV_ID_FLAG: u64 = 1 << 63;
+/// The provenance one-liner's fixed height: one quiet row (quote · date ·
+/// Put back), truncated — deterministic for the packer.
+const PROV_CARD_H: f32 = 22.;
+/// The rest delay before the caret-block's provenance shows (~one caret
+/// blink): traversing a 60-scrap pile must not strobe the margin
+/// (surfaces-attention 5). Hide on leave is instant.
+const PROV_REST_DELAY: Duration = Duration::from_millis(1000);
 
 /// A small hover tooltip: a control's name and, optionally, its chord in a
 /// mono chip (DESIGN §0 — every titlebar control should teach its shortcut).
@@ -437,8 +468,8 @@ actions!(
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
         CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
         ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
-        ToggleOutline, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
-        ToggleGraveyard,
+        ScrapsTravel, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
+        MoveToManuscript, PutBackScrap, ToggleGraveyard,
     ]
 );
 
@@ -799,6 +830,9 @@ const FLANK_GRID_H: f32 = 210.;
 enum SelVerb {
     Note,
     Aside,
+    /// The pile's retrieval verb (below the seam only): the text lands at
+    /// the latch's home position, arriving SELECTED (08 §2).
+    MoveToManuscript,
     Graveyard,
     Ask,
 }
@@ -830,7 +864,7 @@ struct FlankGate {
 /// The single gating predicate (docs/impl/03-flanks.md §1-2, reviews H21/H22/B8,
 /// findings 57/91/108). Pure over booleans so the test sweeps every
 /// region × history × width case without a live frame.
-fn flank_gate(history_up: bool, in_compost: bool, lane_available: bool, gutter_ok: bool) -> FlankGate {
+fn flank_gate(history_up: bool, spanning: bool, lane_available: bool, gutter_ok: bool) -> FlankGate {
     if history_up {
         // A history surface claims the right side AND the past is not editable —
         // neither flank may offer live mutation over a read-only state (H22).
@@ -842,13 +876,15 @@ fn flank_gate(history_up: bool, in_compost: bool, lane_available: bool, gutter_o
     FlankGate {
         // The formatting flank always rises; only its FORM narrows.
         left: if gutter_ok { FlankLeft::Grid } else { FlankLeft::Horizontal },
-        // The verb menu needs the right lane to occlude into (B8) and is
-        // MANUSCRIPT-only — a compost-rail selection is the writer's private
-        // scrap box, no verb menu (spec §1, finding 108). Its fallback keys on
-        // the LANE's own fit (`margin_fits`), never the left gutter (finding 57):
-        // there is a width band where the gutter is gone but the lane remains,
-        // and vice versa.
-        right: lane_available && !in_compost,
+        // The verb menu needs the right lane to occlude into (B8) and rises
+        // on BOTH sides of the seam now — below it the flank swaps Set aside
+        // for "Move to the manuscript" (08 §2) — but never on a
+        // seam-SPANNING selection (region verbs are single-region;
+        // seam-mechanics 1). Its fallback keys on the LANE's own fit
+        // (`margin_fits`), never the left gutter (finding 57): there is a
+        // width band where the gutter is gone but the lane remains, and
+        // vice versa.
+        right: lane_available && !spanning,
     }
 }
 
@@ -872,9 +908,11 @@ struct FlankLayout {
     /// Width the flanks live in (viewport minus CSD gutters) and its height.
     vw: f32,
     vh: f32,
-    rail_w: f32,
     /// The note lane's left edge, content space (the right menu pins here).
     lane_left: f32,
+    /// The selection rests entirely BELOW the seam: the verb menu swaps
+    /// Set aside for "Move to the manuscript" (08 §2).
+    pile_selection: bool,
 }
 
 pub struct Editor {
@@ -1015,6 +1053,14 @@ pub struct Editor {
     /// headings (`@`). `palette_*` is its backing state across all modes.
     palette_input: Option<Entity<TextField>>,
     palette_selected: usize,
+    /// The omni-list's scroll state (`render_omni`'s "omni-list" div),
+    /// persisted across frames so it survives the per-frame rebuild. Mouse
+    /// wheel scrolling drives it directly (GPUI's normal `track_scroll`
+    /// wiring); keyboard navigation additionally nudges it via
+    /// `omni_scroll_into_view` so the selected row can't wander past the
+    /// visible window — a `scroll_to_item` request is a no-op when the row
+    /// is already on-screen, so it never fights a manual wheel scroll.
+    omni_scroll: ScrollHandle,
     /// Mirror of the palette query (debug_cursor has no `cx` to read the
     /// input entity); maintained by the palette's observe hook.
     palette_query: String,
@@ -1064,6 +1110,14 @@ pub struct Editor {
     /// glued flush under the titlebar control. A bool-toggled overlay, light-
     /// dismissed like the narrow-notes panel it borrows its anchoring from.
     editor_menu_open: bool,
+    /// The editor button's PAINTED right edge (window coords), written by a
+    /// bounds canvas inside the control each frame (the zone_row_bounds
+    /// idiom — a plain shared cell, never an entity write mid-draw). The
+    /// dropdown reads it to stay glued right-edge-to-right-edge with its
+    /// button: the fixed-width estimate it replaced assumed the chrome right
+    /// of the button never changes, but those controls flex-shrink in a
+    /// narrow bar, which left the menu floating ~75px off its control.
+    editor_btn_right: std::rc::Rc<std::cell::Cell<Option<Pixels>>>,
     /// Selection popover (DESIGN §2-toolbar): formatting rides the
     /// selection. Shown on mouse-up over a selection or via ctrl-.;
     /// dismissed by mousedown, typing, scrolling, or escape.
@@ -1079,10 +1133,41 @@ pub struct Editor {
     link_input: Option<(Range<usize>, Entity<TextField>)>,
     /// Titlebar word count, recomputed on mutation — never per frame.
     word_count: usize,
-    /// The compost rail (docs/impl/06-omnibar.md §2): the toggleable left
-    /// panel listing the compost's items, session-only. The outline it
-    /// replaced is gone — heading navigation lives in the palette's `@` mode.
-    rail_open: bool,
+    /// The excursion latch (08 §2; scopes-search 1): `Some((home_caret,
+    /// home_scroll))` = the tail was entered by TRAVEL this excursion (the
+    /// Scraps chip, ctrl-shift-o, or an omnibar find/@ jump landing below the
+    /// seam), so Esc returns exactly home. `None` = a caret the writer walked
+    /// in herself (scroll-and-click) — the pile is plain text, Esc inert.
+    /// Home is captured at travel time. Clicks, selection, cuts and typing
+    /// INSIDE the latched tail never clear it (the find→cut→Esc→paste dance
+    /// stays whole); the caret entering the manuscript by the writer's own
+    /// act ends the excursion (see `set_cursor`).
+    excursion: Option<(usize, f32)>,
+    /// Where the last pile visit stopped (session-scoped, outlives the
+    /// latch): the chip's next press resumes here, so an iterated
+    /// scrap-vs-passage hunt never restarts a 3,000-word pile. The first
+    /// press of a session (None) lands at the seam. Cleared when the pile
+    /// evaporates — the next seam is a new object.
+    pile_end: Option<usize>,
+    /// One-shot ring pulse of the Scraps chip on an arrival while the seam is
+    /// off-screen (the destination receipt's chip half; XOR with the landed
+    /// block flash by the chip-hiding law). reduce_motion swaps the ring for
+    /// the 420ms ARRIVAL_FLASH background blink (luminance, not travel).
+    chip_pulse: Option<Instant>,
+    /// Bumps per pulse — keys the ring's element animation so each arrival
+    /// gets a fresh run instead of resuming a stale clock.
+    chip_pulse_seq: usize,
+    /// The caret-block's provenance rest: (record id, when the caret came to
+    /// rest inside that record). The one-liner shows after PROV_REST_DELAY
+    /// and hides instantly on leave (surfaces-attention 5); a 150ms departing
+    /// ghost carries the light out.
+    prov_rest: Option<(u64, Instant)>,
+    /// The provenance row visible on the last motion-diffed frame (its lane
+    /// id) — an appear/disappear/anchor change is caret travel, and the lane
+    /// SNAPS around it (never slides against the writer's own movement).
+    lane_prov_last: Option<u64>,
+    /// The park receipt's origin ghost, `None` at rest (see `ParkGhost`).
+    park_ghost: Option<(ParkGhost, Instant)>,
     /// The graveyard tail section (docs/impl/02-asides.md §4, Bug B): entries
     /// the writer clicked to expand out of their one-line receded form. The
     /// newest entry is always full; older ones recede until expanded. The old
@@ -1092,10 +1177,11 @@ pub struct Editor {
     /// The last caret byte offset while it was in the MANUSCRIPT — so Esc from
     /// a compost-rail caret returns exactly there (review B3; asides.md §2.1).
     last_manuscript_caret: usize,
-    /// One-shot blink of the compost rail edge on an arrival (aside / orphan
-    /// migration) — the same "something arrived over there" grammar the
-    /// graveyard bar uses. `None` at rest.
-    rail_flash: Option<Instant>,
+    /// One-shot blink on a Scraps arrival (park / jot / orphan migration):
+    /// the landed block's ARRIVAL_FLASH when the seam is on screen, and the
+    /// footer chip's reduce_motion blink — one "something arrived over
+    /// there" grammar with the graveyard's exile blink. `None` at rest.
+    arrival_flash: Option<Instant>,
     /// One-shot blink of the graveyard bar on an exile (a fresh cut filed).
     grave_flash: Option<Instant>,
     /// One-shot pulse of the parked history banner's moment label (Bug B): an
@@ -1179,6 +1265,9 @@ struct TextFrame {
     /// Doc-space top of the graveyard section header (`None` = no section), for
     /// the footer bar's hide-when-visible gate (`grave_tail_on_screen`).
     grave_section_top: Option<Pixels>,
+    /// Doc-space top of the scrap line's row (`None` = no seam), for the
+    /// Scraps chip's region-intersection hide gate (`scraps_region_on_screen`).
+    seam_top: Option<Pixels>,
     /// The key the paragraphs were laid out for; the next prepaint reuses them
     /// when its key matches (see `LayoutKey`).
     layout_key: LayoutKey,
@@ -1234,16 +1323,18 @@ struct ParagraphLayout {
     /// First block of the trailing footnote-definition run (H4): paints a
     /// hairline "Footnotes" section rule above itself.
     section_rule: bool,
-    /// Compost decorations (asides.md §1, Bug A — the compost was invisible).
-    /// An empty compost/boundary block draws a hairline at its midline (the
-    /// item separator grammar); the boundary block also draws the tail anchor
-    /// bar (P11). `compost_header` carries the "COMPOST" whisper painted above
-    /// the first compost block; `compost_flash` blinks the arrived item's
-    /// background once (asides.md §2.3).
-    compost_rule: bool,
-    compost_tail: bool,
-    compost_header: Option<gpui::ShapedLine>,
-    compost_flash: bool,
+    /// Scraps decorations (08 §2, the tail geometry). `scrap_wash` paints the
+    /// SCRAP_WASH region tint behind this pile block — over the measure plus a
+    /// ~14px bleed, tiled per block so the wash reads as ONE region;
+    /// `wash_edges` marks the pile's first/last block (the wash's own top and
+    /// bottom padding). `seam` carries the scrap line's pre-shaped row — the
+    /// quiet "Scraps" label and the region's live word count — drawn on the
+    /// boundary block (label · hairline · count, riding the measure at every
+    /// width). `scrap_flash` blinks the arrived block once (ARRIVAL_FLASH).
+    scrap_wash: bool,
+    wash_edges: (bool, bool),
+    seam: Option<(gpui::ShapedLine, gpui::ShapedLine)>,
+    scrap_flash: bool,
     marker: Option<gpui::ShapedLine>,
     /// Painted superior footnote figures (DESIGN §2-footnotes):
     /// (paragraph-local byte offset of the invisible carrier, label).
@@ -1387,16 +1478,13 @@ fn format_thousands(n: usize) -> String {
 
 /// The auto-cut predicate (docs/impl/02-asides.md §4): a single
 /// SELECTION-deletion op — an EMPTY replacement over a non-empty selection —
-/// of at least `AUTO_CUT_MIN_CHARS` chars, entirely inside the manuscript
-/// (`start_char >= manuscript_base`). Pure, so both sides of the threshold and
-/// the move-vs-cut distinction are unit-tested.
-fn auto_cut_qualifies(
-    new_text: &str,
-    range_chars: usize,
-    start_char: usize,
-    manuscript_base: usize,
-) -> bool {
-    new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS && start_char >= manuscript_base
+/// of at least `AUTO_CUT_MIN_CHARS` chars. The old manuscript-only gate is
+/// gone (adjudicated, graveyard-interplay 5: ONE capture law on both sides
+/// of the seam — rope text always qualifies; only the graveyard slab, which
+/// is not rope text, sits outside it). Pure, so both sides of the threshold
+/// and the move-vs-cut distinction are unit-tested.
+fn auto_cut_qualifies(new_text: &str, range_chars: usize) -> bool {
+    new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS
 }
 
 /// A drawn headstone for the graveyard bar: a small muted slab with rounded
@@ -1512,6 +1600,7 @@ impl Editor {
             last_pass: PassKind::Diagnostic("line".to_owned()),
             palette_input: None,
             palette_selected: 0,
+            omni_scroll: ScrollHandle::new(),
             palette_query: String::new(),
             omni_return: None,
             palette_freq: HashMap::new(),
@@ -1530,12 +1619,19 @@ impl Editor {
             active_card_height: None,
             narrow_notes_open: false,
             editor_menu_open: false,
+            editor_btn_right: std::rc::Rc::default(),
             selection_popover: false,
             link_input: None,
-            rail_open: false,
+            excursion: None,
+            pile_end: None,
+            chip_pulse: None,
+            chip_pulse_seq: 0,
+            prov_rest: None,
+            lane_prov_last: None,
+            park_ghost: None,
             grave_expanded: Vec::new(),
             last_manuscript_caret: 0,
-            rail_flash: None,
+            arrival_flash: None,
             grave_flash: None,
             strip_pulse: None,
             para_flash: None,
@@ -1612,6 +1708,32 @@ impl Editor {
     /// no rail.
     fn manuscript_word_count(&self) -> usize {
         count_words(self.doc.rope().slice(self.doc.manuscript_char_range()).chunks())
+    }
+
+    /// Words in the Scraps pile — the seam row's live count, the footer
+    /// chip's count, and the caret-scoped count control ("scraps · N").
+    /// 0 with no seam (and for a textless pile held by the retype guard).
+    fn scraps_word_count(&self) -> usize {
+        match self.doc.scraps_char_range() {
+            Some(r) => count_words(self.doc.rope().slice(r).chunks()),
+            None => 0,
+        }
+    }
+
+    /// The count control's caret-scoped text (P12; scopes-search 5): in the
+    /// pile it reads "scraps · N" alone; in the piece, "piece · N" — but the
+    /// "piece ·" prefix exists only once a seam does (no vocabulary before
+    /// its referent, P4): a seamless doc says "N words" as it always has.
+    /// The chrome count and the seam count visibly sum.
+    fn count_label(&self) -> String {
+        if self.doc.boundary().is_none() {
+            return format!("{} words", format_thousands(self.word_count));
+        }
+        if self.caret_in_scraps() {
+            format!("scraps · {}", format_thousands(self.scraps_word_count()))
+        } else {
+            format!("piece · {}", format_thousands(self.word_count))
+        }
     }
 
     fn sync_mutations(&mut self) {
@@ -1745,10 +1867,41 @@ impl Editor {
     }
 
     /// Install the persisted graveyard at load, then recompute the manuscript
-    /// word count (a loaded doc may carry a compost boundary that scopes it).
+    /// word count (a loaded doc may carry a boundary that scopes it).
     pub fn restore_graveyard(&mut self, graveyard: strop_core::document::Graveyard) {
         self.doc.set_graveyard(graveyard);
         self.word_count = self.manuscript_word_count();
+    }
+
+    /// Install the persisted provenance records at load.
+    pub fn restore_provenance(&mut self, provenance: strop_core::document::Provenance) {
+        self.doc.set_provenance(provenance);
+    }
+
+    /// The one recorded MIGRATION (time-persistence 4; 08 §2 path 2): a
+    /// shipped compost-at-top document flips to the tail era at open, before
+    /// the first edit. Layered record, exactly like restore's: a "Before
+    /// migration" checkpoint of the top-era present (its state is the
+    /// migration's inverse — Restore of it normalizes, idempotently), the
+    /// flip itself (journal-paused, one Seam event, undo stacks dropped in
+    /// core), a save, and a "Migrated" checkpoint of the new geometry.
+    pub fn migrate_scraps_geometry(&mut self) {
+        if self.doc.aside_boundary().is_none() {
+            return;
+        }
+        if let Some(store) = &self.store {
+            store.add_checkpoint("Before migration", false);
+        }
+        if !self.doc.migrate_top_to_tail() {
+            return;
+        }
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        self.save_now();
+        if let Some(store) = &self.store {
+            store.add_checkpoint("Migrated", false);
+        }
+        self.mark_dirty();
     }
 
     /// Record a named version snapshot in the document file.
@@ -1966,6 +2119,7 @@ impl Editor {
                 &entry.blocks,
             )
         };
+        let new_blocks_boundary = new_blocks.boundary();
 
         // Byte offsets of each '\n'-separated paragraph, plus char->byte
         // span conversion for each source (live spans are char-indexed).
@@ -2050,6 +2204,9 @@ impl Editor {
             deletes,
             spans_bytes,
             kinds,
+            // The diff of two geometries takes the NEWER side's seam
+            // (time-persistence 5, same rule as the block styles above).
+            boundary: new_blocks_boundary,
         });
     }
 
@@ -2335,7 +2492,14 @@ impl Editor {
                 let (words, chars) = cp
                     .state
                     .as_ref()
-                    .map(|s| (count_words(std::iter::once(s.text.as_str())), s.text.chars().count()))
+                    .map(|s| {
+                        // Each station's count rebases against ITS OWN
+                        // boundary (scopes-search 6) — accounting is
+                        // manuscript-only in every era.
+                        let rope = ropey::Rope::from_str(&s.text);
+                        let m = strop_core::document::manuscript_range_of(&rope, &s.blocks);
+                        (count_words(rope.slice(m).chunks()), s.text.chars().count())
+                    })
                     .unwrap_or((0, 0));
                 strip::StationSnap {
                     created_ms: cp.created_unix * 1000,
@@ -2517,8 +2681,11 @@ impl Editor {
                 None => (String::new(), SpanSet::default(), BlockMap::default()),
             });
             let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
-            let replay =
+            let mut replay =
                 strop_core::journal::ReplayDoc::new(&text, spans.clone(), blocks.clone(), applied);
+            // Seam events at or before the anchor are already reflected in
+            // the anchor state's own BlockMap — start the cursor past them.
+            replay.seams_applied = anchor_ms.map_or(0, |a| self.doc.journal().seams_until(a));
             self.strip.scratch = Some(strip::ScrubDoc {
                 replay,
                 anchor_ms: anchor_key,
@@ -2540,7 +2707,19 @@ impl Editor {
             return;
         };
         let text = scratch.replay.text();
-        let words = count_words(std::iter::once(text.as_str()));
+        // The readout counts against the STATE'S OWN boundary (scopes-search
+        // 6): park 2,000 words and the strip's report for that same moment
+        // drops by 2,000, exactly like the live chip.
+        let words = count_words(
+            scratch
+                .replay
+                .rope
+                .slice(strop_core::document::manuscript_range_of(
+                    &scratch.replay.rope,
+                    &scratch.replay.blocks,
+                ))
+                .chunks(),
+        );
         let spans_bytes: Vec<(Range<usize>, InlineAttr)> = {
             let mut idx: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
             idx.push(text.len());
@@ -2561,6 +2740,9 @@ impl Editor {
             deletes: Vec::new(),
             spans_bytes,
             kinds,
+            // The scrubbed moment's own seam (time-persistence 2/5), evolved
+            // by the replay's Seam events.
+            boundary: scratch.replay.blocks.boundary(),
         });
         self.strip.words_at = words;
     }
@@ -2652,8 +2834,18 @@ impl Editor {
         };
         let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
         let mut replay = strop_core::journal::ReplayDoc::new(&text, spans, blocks, applied);
+        replay.seams_applied = anchor_ms.map_or(0, |a| self.doc.journal().seams_until(a));
         replay.advance(self.doc.journal(), pos_ms);
-        count_words(std::iter::once(replay.text().as_str()))
+        // Against the state's own boundary (scopes-search 6), like words_at.
+        count_words(
+            replay
+                .rope
+                .slice(strop_core::document::manuscript_range_of(
+                    &replay.rope,
+                    &replay.blocks,
+                ))
+                .chunks(),
+        )
     }
 
     /// The strip's own Restore (spec §2): build a `CheckpointState`-shaped value
@@ -2720,13 +2912,11 @@ impl Editor {
         let mut md = strop_core::markdown::to_markdown(&mtext, &mspans, &mblocks);
         let path = store.path().with_extension("md");
         // Materialize in-file assets as a sidecar dir with relative links
-        // (document-model §6).
-        let asset_ids: Vec<String> = self
-            .doc
-            .blocks()
-            .asset_refs()
-            .map(str::to_owned)
-            .collect();
+        // (document-model §6). The MANUSCRIPT slice's blocks, not the full
+        // document's (scopes-search 4): an image living in the pile must not
+        // leak its file into the exported .assets/ dir the markdown never
+        // references — a live bug before the flip, load-bearing after it.
+        let asset_ids: Vec<String> = mblocks.asset_refs().map(str::to_owned).collect();
         if !asset_ids.is_empty() {
             let stem = path
                 .file_stem()
@@ -3145,19 +3335,7 @@ impl Editor {
                 self.margin_cards(true).cards.into_iter().find(|c| c.id == id)
         {
             self.departing.push((card, Instant::now()));
-            cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(CARD_RESOLVE + Duration::from_millis(50))
-                    .await;
-                this.update(cx, |editor: &mut Editor, cx| {
-                    editor
-                        .departing
-                        .retain(|(_, since)| since.elapsed() < CARD_RESOLVE);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+            self.schedule_departing_clear(cx);
         }
         self.doc.set_note_status(id, status);
         // Thread terminals on the strip: when a card left and by which door.
@@ -3176,6 +3354,25 @@ impl Editor {
         self.mark_dirty();
         self.bump_activity();
         cx.notify();
+    }
+
+    /// Retire the departing exit-fade ghosts once their light is spent —
+    /// shared by every writer-initiated departure (a resolved card, a parked
+    /// passage's retiring diagnosis, the provenance row's leave).
+    fn schedule_departing_clear(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(CARD_RESOLVE + Duration::from_millis(50))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor
+                    .departing
+                    .retain(|(_, since)| since.elapsed() < CARD_RESOLVE);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The thesis, running: an editorial pass that names problems as
@@ -3473,12 +3670,16 @@ impl Editor {
         // so suppression still matches. When there is no rail the base is 0 and
         // this is identical to anchoring against the whole document.
         let base = self.doc.manuscript_base_char();
+        let mrange = self.doc.manuscript_char_range();
         let mtext = self.doc.manuscript_slice().0;
         let mut existing = Annotations::default();
         for n in self.doc.notes().notes() {
-            if n.range.start >= base {
+            // Only MANUSCRIPT-anchored notes join the suppression set: the
+            // old `>= base` gate inverts under the tail era (scopes-search
+            // 4), where the manuscript is the document's head.
+            if n.range.start >= mrange.start && n.range.start <= mrange.end {
                 let mut n = n.clone();
-                n.range = (n.range.start - base)..(n.range.end - base);
+                n.range = (n.range.start - base)..(n.range.end.min(mrange.end) - base);
                 existing.push(n);
             }
         }
@@ -4123,15 +4324,21 @@ impl Editor {
             // "match hidden under the find field" bug).
             if matches!(omni_mode(&q).0, OmniMode::Find) {
                 editor.omni_apply_match(0, cx);
-            } else if let Some(sel) = editor.omni_return.clone() {
-                // Leaving find mode (a `>` or `@` prefix) would park the
-                // preview selection on the last match — and a command
-                // executed next would act on it (the cross-mode selection
-                // leak, extraction audit #23). Walk it home; deleting the
-                // prefix re-enters find and re-previews.
-                let max = editor.doc.len_bytes();
-                editor.selected_range = sel.start.min(max)..sel.end.min(max);
-                editor.selection_reversed = false;
+            } else {
+                // Selection restarted at row 0 (above): the list should
+                // follow it back to the top, not stay scrolled wherever the
+                // previous query's browsing left it.
+                editor.omni_scroll_into_view(0);
+                if let Some(sel) = editor.omni_return.clone() {
+                    // Leaving find mode (a `>` or `@` prefix) would park the
+                    // preview selection on the last match — and a command
+                    // executed next would act on it (the cross-mode selection
+                    // leak, extraction audit #23). Walk it home; deleting the
+                    // prefix re-enters find and re-previews.
+                    let max = editor.doc.len_bytes();
+                    editor.selected_range = sel.start.min(max)..sel.end.min(max);
+                    editor.selection_reversed = false;
+                }
             }
             cx.notify();
         })
@@ -4154,6 +4361,13 @@ impl Editor {
                     // Esc restores the selection the omnibar opened on (S3,
                     // P13): the find preview walked `selected_range` across
                     // matches; cancel walks it home and scrolls it back in.
+                    // This IS the excursion's Esc-home for a find that jumped
+                    // below the seam, so it clears the latch too (or a later
+                    // scroll-entered caret would teleport) — and remembers the
+                    // skim stop as `pile_end` when the preview was parked there.
+                    if editor.excursion.take().is_some() && editor.caret_in_scraps() {
+                        editor.pile_end = Some(editor.cursor_offset());
+                    }
                     if let Some(sel) = editor.omni_return.take() {
                         let max = editor.doc.len_bytes();
                         editor.selected_range = sel.start.min(max)..sel.end.min(max);
@@ -4172,6 +4386,10 @@ impl Editor {
         self.replace_input = None;
         self.palette_selected = 0;
         self.palette_query = initial.clone();
+        // The handle outlives any one open/close cycle (it lives on the
+        // Editor); a fresh open must not inherit wherever the last session
+        // left the list scrolled.
+        self.omni_scroll_into_view(0);
         // Read once per open, not per keystroke; executions write through to
         // disk AND to this copy, so the session stays self-consistent.
         self.palette_freq = crate::files::load_palette_freq();
@@ -4187,7 +4405,9 @@ impl Editor {
         let seed = if self.selected_range.is_empty() {
             String::new()
         } else {
-            self.doc.slice_bytes(self.selected_range.clone())
+            // The seam never enters the query (scopes-search 2): a spanning
+            // selection seeds the joined fragments, separator stripped.
+            self.selection_text(&self.selected_range.clone())
         };
         self.open_omni(seed, window, cx);
     }
@@ -4202,6 +4422,20 @@ impl Editor {
         }
     }
 
+    /// The find matches split by region (scopes-search 2): (in the piece,
+    /// in scraps, capped). `capped` = the 500-match cap was hit, so the true
+    /// totals are unknown — an announced split must degrade to "500+", never
+    /// state an exact lie.
+    fn find_split(&self, matches: &[Range<usize>]) -> (usize, usize, bool) {
+        let m = self.doc.manuscript_char_range();
+        let (ms, me) = (self.doc.char_to_byte(m.start), self.doc.char_to_byte(m.end));
+        let piece = matches
+            .iter()
+            .filter(|r| r.start >= ms && r.start < me)
+            .count();
+        (piece, matches.len() - piece, matches.len() >= 500)
+    }
+
     /// Move the document selection to the ix-th find match and scroll it into
     /// view (live preview for type / arrow / Enter / click). No-op off find
     /// mode or with no matches.
@@ -4212,8 +4446,28 @@ impl Editor {
         }
         let ix = ix.min(matches.len() - 1);
         self.palette_selected = ix;
+        self.omni_scroll_into_view(ix);
+        // A find jump landing below the seam is a TRAVEL: it arms the
+        // excursion latch (scopes-search 1) with home = the pre-find caret
+        // (omni_return) and the scroll before this jump — so Esc-Esc
+        // habituation works: Esc closes find, Esc travels home.
+        let scroll_before = f32::from(self.scroll_top);
         self.selected_range = matches[ix].clone();
         self.selection_reversed = false;
+        let start_ch = self
+            .doc
+            .rope()
+            .byte_to_char(self.selected_range.start.min(self.doc.len_bytes()));
+        if self.excursion.is_none()
+            && self.doc.region_of_char(start_ch) == strop_core::document::Region::Scraps
+        {
+            let home = self
+                .omni_return
+                .as_ref()
+                .map(|r| r.end)
+                .unwrap_or(self.last_manuscript_caret);
+            self.excursion = Some((home, scroll_before));
+        }
         self.bump_activity();
         cx.notify();
     }
@@ -4390,10 +4644,12 @@ impl Editor {
                 .into_iter()
                 .take(100)
                 .map(|range| {
-                    let line = self.doc.rope().byte_to_line(range.start.min(self.doc.len_bytes()));
+                    let start = range.start.min(self.doc.len_bytes());
+                    let line = self.doc.rope().byte_to_line(start);
                     OmniRow::Match {
                         line,
                         snippet: self.omni_line_snippet(line),
+                        scraps: self.byte_in_scraps(start),
                     }
                 })
                 .collect(),
@@ -4403,7 +4659,12 @@ impl Editor {
                 .filter(|(_, _, text, _)| {
                     rest.is_empty() || crate::commands::score_text(rest, text).is_some()
                 })
-                .map(|(_, level, text, byte)| OmniRow::Heading { byte, level, text })
+                .map(|(_, level, text, byte)| OmniRow::Heading {
+                    byte,
+                    level,
+                    text,
+                    scraps: self.byte_in_scraps(byte),
+                })
                 .collect(),
             OmniMode::Command => {
                 let mut rows: Vec<OmniRow> = Vec::new();
@@ -4488,7 +4749,16 @@ impl Editor {
             }
             OmniRow::Heading { byte, .. } => {
                 let byte = *byte;
+                // An @-jump below the seam is a latch-setting travel
+                // (scopes-search 7): home = the pre-jump caret and scroll.
+                let home = (self.cursor_offset(), f32::from(self.scroll_top));
+                let ch = self.doc.rope().byte_to_char(byte.min(self.doc.len_bytes()));
+                let into_pile = self.doc.region_of_char(ch)
+                    == strop_core::document::Region::Scraps;
                 self.close_palette(window, cx);
+                if into_pile && self.excursion.is_none() && !self.caret_in_scraps() {
+                    self.excursion = Some(home);
+                }
                 self.set_cursor(byte.min(self.doc.len_bytes()), false, cx);
             }
         }
@@ -4506,7 +4776,14 @@ impl Editor {
             return;
         }
         self.chord_whisper_shown = true;
-        self.chord_whisper = Some(format!("Chord: {keys} does this directly"));
+        self.whisper(format!("Chord: {keys} does this directly"), cx);
+    }
+
+    /// The status whisper (the muted bottom-right one-liner): one quiet
+    /// sentence that fades on the AI-note timer window. The chord reveal and
+    /// the replace-all announcement share this one surface.
+    fn whisper(&mut self, text: String, cx: &mut Context<Self>) {
+        self.chord_whisper = Some(text);
         self.chord_whisper_generation += 1;
         let generation = self.chord_whisper_generation;
         cx.spawn(async move |this, cx| {
@@ -4533,6 +4810,7 @@ impl Editor {
             self.omni_apply_match(sel, cx);
         } else {
             self.palette_selected = sel;
+            self.omni_scroll_into_view(sel);
             cx.notify();
         }
     }
@@ -4550,8 +4828,39 @@ impl Editor {
             self.omni_apply_match(sel, cx);
         } else {
             self.palette_selected = sel;
+            self.omni_scroll_into_view(sel);
             cx.notify();
         }
+    }
+
+    /// Nudge the omni-list to keep row `ix` visible (the fold bug this
+    /// closes: keyboard `palette_up`/`palette_down` used to move the
+    /// highlight past the visible window without scrolling — the writer
+    /// navigated blind). `ScrollHandle::scroll_to_item` requests the
+    /// *minimal* correction and is a no-op when `ix` is already on-screen,
+    /// so this never fights a manual mouse-wheel scroll that hasn't been
+    /// invalidated by a fresh selection.
+    fn omni_scroll_into_view(&self, ix: usize) {
+        let rows = self.omni_rows(&self.palette_query);
+        if rows.is_empty() {
+            return;
+        }
+        let ix = ix.min(rows.len() - 1);
+        if ix == 0 {
+            // A direct reset, not an item-based scroll: on the very first
+            // frame the omnibox ever opens, GPUI hasn't measured this div's
+            // own viewport bounds yet (`ScrollHandle::bounds` lags a frame
+            // behind the child bounds `scroll_to_item` math needs), so it
+            // can undershoot by a row on a cold open. Setting the offset
+            // straight to zero sidesteps that — and also reaches row 0's
+            // section header in grouped mode (bare `>`), which `scroll_to_
+            // item(0)` alone would only promise is "somewhere visible".
+            self.omni_scroll.set_offset(point(px(0.), px(0.)));
+            return;
+        }
+        let (mode, rest) = omni_mode(&self.palette_query);
+        let grouped = mode == OmniMode::Command && rest.trim().is_empty();
+        self.omni_scroll.scroll_to_item(omni_child_index(&rows, grouped, ix));
     }
 
     fn render_omni(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
@@ -4567,6 +4876,7 @@ impl Editor {
         let home = crate::paths::home_dir().to_string_lossy().into_owned();
         let mut list = div()
             .id("omni-list")
+            .track_scroll(&self.omni_scroll)
             .max_h(px(420.))
             .overflow_y_scroll()
             .flex()
@@ -4575,12 +4885,7 @@ impl Editor {
         let mut last_section = "";
         for (ix, row) in rows.iter().enumerate() {
             if grouped {
-                let section = match row {
-                    OmniRow::Cmd(cmd) => cmd.section,
-                    OmniRow::Frequent(_) => "Frequent",
-                    OmniRow::Recent(_) => "Recent Documents",
-                    _ => "",
-                };
+                let section = omni_row_section(row);
                 if section != last_section {
                     last_section = section;
                     list = list.child(
@@ -4608,12 +4913,24 @@ impl Editor {
                         .unwrap_or_default();
                     (stem, Some(dir), None)
                 }
-                OmniRow::Match { line, snippet, .. } => {
-                    (snippet.clone(), None, Some(format!("{}", line + 1)))
-                }
-                OmniRow::Heading { level, text, .. } => {
+                OmniRow::Match { line, snippet, scraps, .. } => (
+                    snippet.clone(),
+                    // The region as DATA, the find-split's register: a row
+                    // that jumps into the pile says so before the jump.
+                    scraps.then(|| "scraps".to_owned()),
+                    Some(format!("{}", line + 1)),
+                ),
+                OmniRow::Heading { level, text, scraps, .. } => {
                     let indent = "  ".repeat((*level as usize).saturating_sub(1));
-                    (format!("{indent}{text}"), Some(format!("H{level}")), None)
+                    (
+                        format!("{indent}{text}"),
+                        Some(if *scraps {
+                            format!("H{level} · scraps")
+                        } else {
+                            format!("H{level}")
+                        }),
+                        None,
+                    )
                 }
             };
             list = list.child(
@@ -4739,7 +5056,23 @@ impl Editor {
                                     .text_size(px(13.))
                                     .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Replace"))
                                     .child(div().flex_1().min_w(px(0.)).child(rep))
-                                    .child(
+                                    .child({
+                                        // The All button wears its scope
+                                        // (P12; scopes-search 2): the sweep
+                                        // is manuscript-only, and the button
+                                        // says so BEFORE the click.
+                                        let label = {
+                                            let matches = self.omni_match_ranges();
+                                            let (piece, scraps, capped) =
+                                                self.find_split(&matches);
+                                            if capped {
+                                                "All · 500+ in the piece".to_owned()
+                                            } else if scraps > 0 {
+                                                format!("All · {piece} in the piece")
+                                            } else {
+                                                "All".to_owned()
+                                            }
+                                        };
                                         div()
                                             .id("replace-all")
                                             .flex_shrink_0()
@@ -4757,8 +5090,8 @@ impl Editor {
                                                     editor.replace_all(cx);
                                                 }),
                                             )
-                                            .child("All"),
-                                    ),
+                                            .child(label)
+                                    }),
                             )
                         })
                         .child(list),
@@ -4823,6 +5156,7 @@ impl Editor {
         let matches = self.find_matches(&query);
         if !matches.is_empty() {
             self.palette_selected = ix % matches.len();
+            self.omni_scroll_into_view(self.palette_selected);
             self.selected_range = matches[self.palette_selected].clone();
         }
         self.bump_activity();
@@ -4847,16 +5181,40 @@ impl Editor {
         if matches.is_empty() {
             return;
         }
-        for m in matches.iter().rev() {
-            self.doc.edit_bytes(m.clone(), &replacement);
+        // Replace All sweeps the MANUSCRIPT only (08 §2; 07 R5): bulk
+        // mutation respects the seam like every other bulk operation. Single
+        // Replace (a watched, caret-precise edit — the writer's hands) works
+        // everywhere; classification is by match start. The announcement
+        // strings are Wave B; the count here stays honest meanwhile.
+        let (mstart, mend) = {
+            let r = self.doc.manuscript_char_range();
+            (self.doc.char_to_byte(r.start), self.doc.char_to_byte(r.end))
+        };
+        let (sweep, untouched): (Vec<&Range<usize>>, Vec<&Range<usize>>) = matches
+            .iter()
+            .partition(|m| m.start >= mstart && m.start < mend);
+        for m in sweep.iter().rev() {
+            self.doc.edit_bytes((*m).clone(), &replacement);
         }
-        let count = matches.len();
+        let count = sweep.len();
+        let skipped = untouched.len();
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.sync_mutations();
         self.mark_dirty();
         self.palette_selected = 0;
-        eprintln!("strop: replaced {count} matches");
+        self.omni_scroll_into_view(0);
+        // The refusal IS the announcement (scopes-search 2): after the sweep
+        // the status whisper names both halves; the scrap matches stay in
+        // the row list, each wearing its region.
+        if skipped > 0 {
+            self.whisper(
+                format!("Replaced {count} in the piece · {skipped} in scraps untouched"),
+                cx,
+            );
+        } else {
+            self.whisper(format!("Replaced {count} in the piece"), cx);
+        }
         self.bump_activity();
         cx.notify();
     }
@@ -4944,6 +5302,7 @@ impl Editor {
                 self.doc.notes(),
                 self.doc.journal(),
                 self.doc.graveyard(),
+                self.doc.provenance(),
             ) {
                 Ok(()) => self.store_dirty = false,
                 Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
@@ -5143,17 +5502,111 @@ impl Editor {
     /// Collapse the selection to `offset`. Keeps `goal_x`; non-vertical
     /// callers go through `move_to`, which clears it.
     fn set_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
+        // The caret never rests on the seam line (seam-mechanics 3): a landing
+        // there snaps past it in the direction of travel (approximated by
+        // where the caret came from; the click path maps by y before this).
+        let offset = self.snap_off_seam(offset, offset >= self.cursor_offset());
+        let prev_offset = self.cursor_offset();
+        let was_in_pile = self.caret_in_scraps();
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         self.cursor_affinity_down = affinity_down;
         self.caret_attrs.clear();
-        // Remember the manuscript caret so Esc from a compost caret returns
-        // exactly here (review B3). A no-rail doc is all manuscript.
-        if offset >= self.doc.char_to_byte(self.doc.manuscript_base_char()) {
+        // Remember the manuscript caret so Esc from a pile caret returns
+        // exactly here (review B3). A seamless doc is all manuscript.
+        let ch = self.doc.rope().byte_to_char(offset.min(self.doc.len_bytes()));
+        if self.doc.region_of_char(ch) == strop_core::document::Region::Manuscript {
             self.last_manuscript_caret = offset;
+        }
+        // The provenance one-liner's caret gate (surfaces-attention 5): the
+        // record under a RESTING caret shows after ~one caret-blink; leaving
+        // hides it instantly, a 150ms departing ghost carrying the light out.
+        let prov_now = self
+            .doc
+            .provenance()
+            .at(ch)
+            .filter(|_| self.caret_in_scraps())
+            .map(|r| r.id);
+        match (prov_now, self.prov_rest) {
+            (Some(id), Some((cur, _))) if cur == id => {} // still resting here
+            (Some(id), _) => {
+                self.prov_rest = Some((id, Instant::now()));
+                // One notify at the reveal moment (the appear fade starts
+                // then); a fresh rest supersedes a stale timer by the id+time
+                // check on arrival.
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(PROV_REST_DELAY).await;
+                    this.update(cx, |editor: &mut Editor, cx| {
+                        if editor
+                            .prov_rest
+                            .is_some_and(|(cur, s)| cur == id && s.elapsed() >= PROV_REST_DELAY)
+                        {
+                            editor.appearing.insert(PROV_ID_FLAG | id);
+                            cx.notify();
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(CARD_APPEAR + Duration::from_millis(150))
+                                    .await;
+                                this.update(cx, |editor: &mut Editor, cx| {
+                                    editor.appearing.remove(&(PROV_ID_FLAG | id));
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .detach();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            (None, Some((id, since))) => {
+                // Instant hide; the departing channel carries the echo.
+                if since.elapsed() >= PROV_REST_DELAY
+                    && let Some(card) = self
+                        .margin_cards(true)
+                        .cards
+                        .into_iter()
+                        .find(|c| c.provenance == Some(id))
+                {
+                    self.departing.push((card, Instant::now()));
+                    self.schedule_departing_clear(cx);
+                }
+                self.prov_rest = None;
+            }
+            (None, None) => {}
+        }
+        if was_in_pile && !self.caret_in_scraps() {
+            // The caret entering the manuscript by the writer's own act ends
+            // the excursion (scopes-search 1, clear (b)): the latch drops and
+            // `pile_end` remembers where the visit stopped, so the chip's
+            // next press resumes there.
+            self.excursion = None;
+            self.pile_end = Some(prev_offset);
+            // The retype-race guard's release (seam-mechanics 6): a textless
+            // pile held its seam while the caret stayed inside; the caret
+            // leaving is the evaporation moment — its own undoable step. The
+            // dissolved pile takes its resume point with it.
+            if self.doc.scraps_textless() && self.doc.evaporate_scraps() {
+                self.pile_end = None;
+                self.sync_mutations();
+            }
         }
         self.bump_activity();
         cx.notify();
+    }
+
+    /// Is a byte offset inside the Scraps region?
+    fn byte_in_scraps(&self, byte: usize) -> bool {
+        let ch = self.doc.rope().byte_to_char(byte.min(self.doc.len_bytes()));
+        self.doc.region_of_char(ch) == strop_core::document::Region::Scraps
+    }
+
+    /// Is the caret inside the Scraps region right now?
+    fn caret_in_scraps(&self) -> bool {
+        let len = self.doc.len_bytes();
+        let ch = self.doc.rope().byte_to_char(self.cursor_offset().min(len));
+        self.doc.region_of_char(ch) == strop_core::document::Region::Scraps
     }
 
     /// Extend the selection's moving end to `offset`. Keeps `goal_x`.
@@ -5182,12 +5635,41 @@ impl Editor {
         cx.notify();
     }
 
+    /// A selection's clipboard text. A seam-spanning selection copies as the
+    /// two fragments joined by ONE newline — the seam's own blank separator
+    /// line is stripped (it never enters the clipboard, not even as its
+    /// whitespace shadow; the pile's item-separating blank lines inside the
+    /// selection stay — they are honest text). Seam-mechanics 2.
+    fn selection_text(&self, range: &Range<usize>) -> String {
+        if !self.selection_spans_seam(range) {
+            return self.doc.slice_bytes(range.clone());
+        }
+        let m = self.doc.manuscript_char_range();
+        let s = self
+            .doc
+            .scraps_char_range()
+            .unwrap_or_else(|| m.clone());
+        // Positional order (tail era: manuscript above; top era: pile above).
+        let (above_end, below_start) = if s.start > m.end {
+            (self.doc.char_to_byte(m.end), self.doc.char_to_byte(s.start))
+        } else {
+            (self.doc.char_to_byte(s.end), self.doc.char_to_byte(m.start))
+        };
+        let above = self
+            .doc
+            .slice_bytes(range.start.min(above_end)..above_end.min(range.end));
+        let below = self
+            .doc
+            .slice_bytes(below_start.max(range.start)..range.end.max(below_start));
+        format!("{above}\n{below}")
+    }
+
     /// Linux PRIMARY-selection contract: any selection (mouse or keyboard)
     /// is published; middle-click pastes it. With auto_copy_selection
     /// (config), the regular clipboard gets it too — Kirill's habit.
     fn publish_primary(&self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            let text = self.doc.slice_bytes(self.selected_range.clone());
+            let text = self.selection_text(&self.selected_range.clone());
             if self.config.auto_copy_selection {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             }
@@ -5516,78 +5998,428 @@ impl Editor {
         }
     }
 
-    /// The outline rail (DESIGN §1.6): session-only, no config.
-    pub(crate) fn toggle_rail(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
-        self.rail_open = !self.rail_open;
+    /// "Scraps" — the travel verb (ctrl-shift-o / the footer chip; the old
+    /// rail toggle retargeted, adjudications "the rail dies"). Arms the
+    /// excursion latch with home captured NOW, then lands: the first press of
+    /// a session at the seam (caret at the pile's first character — the count
+    /// control flips to "scraps · N", the mid-pile screenshot self-identifies);
+    /// later presses resume `pile_end`, clamped into the current pile.
+    pub(crate) fn scraps_travel(&mut self, _: &ScrapsTravel, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() || self.strip.is_parked() {
+            return; // the past is a preview — no live travel over it
+        }
+        let Some(pile) = self.doc.scraps_char_range() else {
+            return; // no region, nothing to travel to (the chip doesn't exist)
+        };
+        if self.excursion.is_none() {
+            let home = if self.caret_in_scraps() {
+                self.last_manuscript_caret
+            } else {
+                self.cursor_offset()
+            };
+            self.excursion = Some((home, f32::from(self.scroll_top)));
+        }
+        let target = match self.pile_end {
+            Some(byte) => {
+                let ch = self
+                    .doc
+                    .rope()
+                    .byte_to_char(byte.min(self.doc.len_bytes()))
+                    .clamp(pile.start, pile.end);
+                self.doc.char_to_byte(ch)
+            }
+            None => self.doc.char_to_byte(pile.start),
+        };
+        self.move_to(target, cx);
+        // Land with the seam in frame (not pinned to a viewport edge): the
+        // caret's line sits a beat below the bar so the scrap line above it
+        // stays visible — the station the travel names.
+        if let Some(frame) = self.last_frame.as_ref()
+            && let Some(pos) = frame.position_of(target.min(self.doc.len_bytes()), false)
+        {
+            self.scroll_top = (pos.y - px(120.)).max(px(0.));
+            self.autoscroll_request = false;
+        } else {
+            self.autoscroll_request = true;
+        }
         cx.notify();
     }
 
-    // -- Asides: the compost rail and the graveyard -------------------------
+    // -- Scraps: the pile at the tail, and the graveyard ---------------------
 
-    /// `Set aside` (docs/impl/02-asides.md §2): move the selection — or, with
-    /// an empty selection, the caret's paragraph (review H25) — into the
-    /// compost. A MOVE, never a cut: `file_cut` is the only path that
-    /// files, so the graveyard is suppressed by construction (review H41).
-    /// The verb NEVER closes the rail (the writer issued a command and must
-    /// see compliance, not a vanishing panel — 06 §2): the arrival blinks
-    /// both the in-document region and, when the rail is open, its new row.
-    /// The caret stays at the collapse point — the writer parked a thought,
-    /// she did not travel.
+    /// `Set aside` — the park/jot verb (08 §2): move the selection — or,
+    /// with an empty selection, the caret's paragraph plus ONE adjoining
+    /// newline (the jot; seam-mechanics 6d) — to just under the scrap line.
+    /// A MOVE, never a cut (review H41). The whole atom lives in
+    /// `Document::set_aside`: spans/kinds travel, notes re-anchor inside the
+    /// atom, diagnosis cards retire; here we journal the retirements
+    /// (CardClosed), clear a retired card's focus, place the caret at the
+    /// collapse point (the writer parked a thought, she did not travel), and
+    /// blink the receipt. Seam-spanning selections are refused (region verbs
+    /// are single-region; seam-mechanics 2).
     fn set_aside(&mut self, _: &SetAside, _: &mut Window, cx: &mut Context<Self>) {
         if self.history_view.is_some() {
             return;
         }
-        let range = if self.selected_range.is_empty() {
+        let jot = self.selected_range.is_empty();
+        let range = if jot {
             let (start, end) = self.paragraph_bounds(self.cursor_offset());
-            start..end
+            // One adjoining newline travels with the paragraph so no empty
+            // block strands at the join: the trailing one when it exists,
+            // else the leading one (the last-paragraph case).
+            if end < self.doc.len_bytes() {
+                start..end + 1
+            } else if start > 0 {
+                start - 1..end
+            } else {
+                start..end
+            }
         } else {
-            self.selected_range.clone()
+            let sel = self.selected_range.clone();
+            // A selection covering WHOLE paragraphs takes its adjoining
+            // separator too (the jot's rule, widened to the blank-line
+            // grammar): the prose closes up beneath the departing ghost —
+            // the mockup's after-still is "the paragraph closed", never a
+            // stranded blank the writer must sweep herself. A partial
+            // selection stays exact (the remnant is untouched). Mirrors the
+            // model's own separator absorption in move_to_manuscript.
+            let whole_blocks = !sel.is_empty()
+                && sel.start == self.paragraph_bounds(sel.start).0
+                && sel.end == self.paragraph_bounds(sel.end.max(sel.start)).1;
+            if whole_blocks {
+                let bytes = self.doc.rope();
+                // Widen only WITHIN the manuscript: the join above the seam
+                // belongs to the boundary, and a widened range crossing it
+                // would be refused as seam-spanning (the second-park bug the
+                // rig caught).
+                let m = self.doc.manuscript_char_range();
+                let m_end = self.doc.char_to_byte(m.end);
+                let m_start = self.doc.char_to_byte(m.start);
+                let at = |i: usize| (i < m_end).then(|| bytes.byte(i));
+                if sel.end + 2 <= m_end
+                    && at(sel.end) == Some(b'\n')
+                    && at(sel.end + 1) == Some(b'\n')
+                {
+                    sel.start..sel.end + 2 // the trailing blank-line separator
+                } else if sel.end < m_end && at(sel.end) == Some(b'\n') {
+                    sel.start..sel.end + 1 // a plain block join
+                } else if sel.start >= m_start + 2
+                    && at(sel.start - 1) == Some(b'\n')
+                    && at(sel.start - 2) == Some(b'\n')
+                {
+                    sel.start - 2..sel.end // the leading separator (tail case)
+                } else if sel.start > m_start {
+                    sel.start - 1..sel.end
+                } else {
+                    sel
+                }
+            } else {
+                sel
+            }
         };
-        let first_birth = self.doc.aside_boundary().is_none();
-        let Some(caret_char) = self.doc.set_aside(range) else {
-            return; // empty, or the range is compost already
-        };
-        // The compost's first birth opens the rail once (S2/N1) — the writer
-        // must SEE where the passage went; a relocation that shows nothing
-        // reads as destruction. Later arrivals only blink: the toggle when
-        // the rail is closed, the newest row when it's open.
-        if first_birth {
-            self.rail_open = true;
+        if self.selection_spans_seam(&range) {
+            return; // never offered on a spanning selection
         }
-        self.rail_flash = Some(Instant::now());
+        // Freeze the origin ghost + the about-to-retire cards BEFORE the
+        // model commits (afterwards there is nothing left to snapshot). Both
+        // ride writer-initiated receipt channels, exempt from the lane's
+        // burst snap (surfaces-attention 3 — every park is "mid-burst").
+        let ghost = self.freeze_park_ghost(&range);
+        let doomed_cards: Vec<MarginCard> = self
+            .margin_cards(true)
+            .cards
+            .into_iter()
+            .filter(|c| c.kind == NoteKind::Diagnosis)
+            .collect();
+        let quote = self.origin_quote_before(range.start);
+        let Some(outcome) = self.doc.set_aside(range, quote, now_unix(), jot) else {
+            return; // empty, scraps-side, or a top-era doc (migration owns those)
+        };
+        // Card retirement happened inside the atom; journal each terminal,
+        // release focus if the retired card was active, and let its light
+        // leave through the exit-fade ghost (never the burst-gated slide).
+        let mut ghosts_pushed = false;
+        for id in &outcome.retired {
+            self.doc
+                .journal_mut()
+                .record_event(strop_core::journal::JournalEvent::CardClosed {
+                    t: strop_core::journal::now_ms(),
+                    id: *id,
+                    resolved: false,
+                });
+            if self.focus.active_id() == Some(*id) {
+                self.focus = CardFocus::Idle;
+            }
+            if let Some(card) = doomed_cards.iter().find(|c| c.id == *id) {
+                self.departing.push((card.clone(), Instant::now()));
+                ghosts_pushed = true;
+            }
+        }
+        if ghosts_pushed {
+            self.schedule_departing_clear(cx);
+        }
+        if let Some(g) = ghost {
+            self.park_ghost = Some((g, Instant::now()));
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(CARD_RESOLVE + Duration::from_millis(50))
+                    .await;
+                this.update(cx, |editor: &mut Editor, cx| {
+                    if editor
+                        .park_ghost
+                        .as_ref()
+                        .is_some_and(|(_, t)| t.elapsed() >= CARD_RESOLVE)
+                    {
+                        editor.park_ghost = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        // The destination receipt (surfaces-attention 4): the landed block
+        // flashes when the seam is on screen; the Scraps chip pulses when it
+        // is not — mutually exclusive by the chip-hiding law, so both signals
+        // are set and visibility picks the honest one.
+        self.arrival_flash = Some(Instant::now());
+        self.pulse_chip(cx);
         self.sync_mutations();
-        let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
+        let caret = self
+            .doc
+            .char_to_byte(outcome.caret.min(self.doc.rope().len_chars()));
         self.set_cursor(caret, false, cx);
         self.schedule_flash_clear(cx);
-        // The asided passage may have carried a margin note / diagnosis; its
-        // anchor just died. Migrate the note to the compost, close a dead
-        // diagnosis (Bug C).
-        self.reconcile_dead_anchors(cx);
+        self.mark_dirty();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// Does a byte range cross the seam (its ends fall in different
+    /// regions)? Region verbs are never offered on spanning selections
+    /// (seam-mechanics 2); the editing verbs split at the seam instead.
+    fn selection_spans_seam(&self, range: &Range<usize>) -> bool {
+        if self.doc.boundary().is_none() || range.is_empty() {
+            return false;
+        }
+        let rope = self.doc.rope();
+        let s = self.doc.region_of_char(rope.byte_to_char(range.start));
+        let e = self.doc.region_of_char(rope.byte_to_char(range.end));
+        s != e
     }
 
     /// `Send to the graveyard` (selection menu / palette): file the selection
-    /// as a cut, any size. Only a manuscript selection is a cut — a compost
-    /// selection would be a move, and the boundary clamp keeps selections
-    /// single-region anyway.
+    /// as a cut, any size — on EITHER side of the seam (one capture law,
+    /// graveyard-interplay 5; Exile works below the seam, 08 §2). Refused on
+    /// a seam-spanning selection (region verbs are single-region).
     fn send_to_graveyard(&mut self, _: &SendToGraveyard, _: &mut Window, cx: &mut Context<Self>) {
         if self.history_view.is_some() || self.selected_range.is_empty() {
             return;
         }
-        let start_char = self.doc.rope().byte_to_char(self.selected_range.start);
-        if start_char < self.doc.manuscript_base_char() {
-            return; // compost selection — not a cut
+        if self.selection_spans_seam(&self.selected_range.clone()) {
+            return;
         }
         let range = self.selected_range.clone();
-        self.file_cut(range, cx);
+        // The deliberate verb collapses an emptied pile in the same atom
+        // (graveyard-interplay 4).
+        self.file_cut(range, true, cx);
+    }
+
+    /// `Move to the manuscript` — the retrieval verb's SURFACE half (08 §2):
+    /// a Scraps selection lands at the writing position the latch remembers
+    /// (else the last manuscript caret), ARRIVING SELECTED — the selection is
+    /// the feedback and the immediate undo/move handle (verso graft). One
+    /// model atom (`Document::move_to_manuscript`: spans/kinds/notes travel
+    /// home, the provenance record dies with its text, an emptied pile
+    /// evaporates). The writer's text came home, and so does she: the
+    /// excursion ends, `pile_end` remembering the spot it left.
+    fn move_to_manuscript(
+        &mut self,
+        _: &MoveToManuscript,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.history_view.is_some() || self.selected_range.is_empty() {
+            return;
+        }
+        let range = self.selected_range.clone();
+        let dest_byte = self
+            .excursion
+            .map(|(home, _)| home)
+            .unwrap_or(self.last_manuscript_caret);
+        let dest_char = self
+            .doc
+            .rope()
+            .byte_to_char(dest_byte.min(self.doc.len_bytes()));
+        self.land_from_pile(range, dest_char, cx);
+    }
+
+    /// `Put back` — the parity verb for a parked scrap (08 §2): the
+    /// caret-block's provenance text returns to its ORIGIN — the paragraph
+    /// after its origin quote, found by content (provenance is a
+    /// range-anchored side record; the origin lives on as a quote). Lives
+    /// inside the provenance one-liner and as this palette verb (the
+    /// narrow-width fallback). Degrades to the retrieval landing when the
+    /// quote was edited away — loudly selected either way, never silent.
+    fn put_back_scrap(&mut self, _: &PutBackScrap, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_view.is_some() {
+            return;
+        }
+        let ch = self
+            .doc
+            .rope()
+            .byte_to_char(self.cursor_offset().min(self.doc.len_bytes()));
+        let Some(rec) = self.doc.provenance().at(ch).cloned() else {
+            return;
+        };
+        self.put_back_scrap_record(rec.id, cx);
+    }
+
+    /// Put a provenance record's text back at its origin (shared by the
+    /// one-liner's verb and the palette verb).
+    fn put_back_scrap_record(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(rec) = self
+            .doc
+            .provenance()
+            .records()
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        let sb = self.doc.char_to_byte(rec.range.start);
+        let eb = self
+            .doc
+            .char_to_byte(rec.range.end.min(self.doc.rope().len_chars()));
+        let dest_char = self.scrap_origin_dest(&rec.origin_quote);
+        self.land_from_pile(sb..eb, dest_char, cx);
+    }
+
+    /// Where a scrap's origin return lands: the start of the line after the
+    /// paragraph holding its origin quote (the spot the park cut from —
+    /// content-anchored, so it follows the paragraph through edits); the
+    /// last manuscript caret when the quote no longer exists.
+    fn scrap_origin_dest(&self, quote: &str) -> usize {
+        let rope = self.doc.rope();
+        let m = self.doc.manuscript_char_range();
+        if !quote.is_empty() {
+            let hay = rope.slice(m.clone()).to_string();
+            if let Some(b) = hay.find(quote) {
+                let q_end = m.start + hay[..b + quote.len()].chars().count();
+                let line = rope.char_to_line(q_end.min(rope.len_chars()));
+                if line + 1 < rope.len_lines() {
+                    return rope.line_to_char(line + 1).min(m.end);
+                }
+                return m.end;
+            }
+        }
+        rope.byte_to_char(self.last_manuscript_caret.min(self.doc.len_bytes()))
+            .min(m.end)
+    }
+
+    /// The shared landing for both pile-return verbs: run the model atom,
+    /// arrive SELECTED at the destination, end the excursion (the writer's
+    /// own verb brought her home) and remember `pile_end`.
+    fn land_from_pile(&mut self, byte_range: Range<usize>, dest_char: usize, cx: &mut Context<Self>) {
+        let pile_pos = byte_range.start;
+        let Some(landed) = self.doc.move_to_manuscript(byte_range, dest_char) else {
+            return;
+        };
+        self.sync_mutations();
+        let s = self.doc.char_to_byte(landed.start.min(self.doc.rope().len_chars()));
+        let e = self.doc.char_to_byte(landed.end.min(self.doc.rope().len_chars()));
+        self.selected_range = s..e;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.selection_popover = false;
+        self.excursion = None;
+        self.pile_end = self
+            .doc
+            .boundary()
+            .is_some()
+            .then(|| pile_pos.min(self.doc.len_bytes()));
+        self.last_manuscript_caret = e;
+        self.publish_primary(cx);
+        self.mark_dirty();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// Snapshot the departing block's window-space geometry + text for the
+    /// park receipt's origin ghost. `None` when no frame exists yet (a park
+    /// before first paint — the receipt degrades to the chip pulse alone).
+    fn freeze_park_ghost(&self, range: &Range<usize>) -> Option<ParkGhost> {
+        let frame = self.last_frame.as_ref()?;
+        let par = frame
+            .paragraphs
+            .iter()
+            .find(|p| range.start <= p.range.end && p.range.start <= range.end)?;
+        let mut park_seq = 0usize;
+        if let Some((g, _)) = &self.park_ghost {
+            park_seq = g.seq + 1;
+        }
+        Some(ParkGhost {
+            text: self
+                .doc
+                .slice_bytes(range.clone())
+                .trim_matches('\n')
+                .replace('\n', " "),
+            left: f32::from(frame.bounds.origin.x + par.indent),
+            top: f32::from(frame.bounds.origin.y) + f32::from(par.top)
+                - f32::from(frame.scroll_top),
+            width: f32::from(frame.bounds.size.width - par.indent),
+            font_size: f32::from(par.font_size),
+            line_height: f32::from(par.line_height),
+            seq: park_seq,
+        })
+    }
+
+    /// The origin ghost's overlay (see `ParkGhost`): non-interactive, fading
+    /// over CARD_RESOLVE with a short downward drift — the motion vector that
+    /// says *down*, toward the pile. reduce_motion drops the drift.
+    fn render_park_ghost(&self) -> Option<gpui::AnyElement> {
+        let (g, _) = self.park_ghost.as_ref()?;
+        let reduce = self.config.reduce_motion;
+        let (top, left) = (g.top, g.left);
+        Some(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(g.width))
+                .font_family("PT Serif")
+                .text_size(px(g.font_size))
+                .line_height(px(g.line_height))
+                .text_color(rgb(TEXT_COLOR))
+                .child(g.text.clone())
+                .with_animation(
+                    ("park-ghost", g.seq),
+                    Animation::new(CARD_RESOLVE).with_easing(|t| t * t),
+                    move |el, t| {
+                        let el = el.opacity(1. - t);
+                        if reduce {
+                            el
+                        } else {
+                            el.top(px(top + 6. * t))
+                        }
+                    },
+                )
+                .into_any_element(),
+        )
     }
 
     /// File `byte_range` in the graveyard and collapse the caret to the cut
     /// point. Shared by the auto-cut trigger and the explicit verb — the one
-    /// site that ever files a corpse.
-    fn file_cut(&mut self, byte_range: Range<usize>, cx: &mut Context<Self>) {
+    /// site that ever files a corpse. `collapse_emptied` folds a last-scrap
+    /// exile's seam evaporation into the same transaction (the auto-capture
+    /// path passes false: the retype-race guard governs it instead).
+    fn file_cut(&mut self, byte_range: Range<usize>, collapse_emptied: bool, cx: &mut Context<Self>) {
         let quote = self.origin_quote_before(byte_range.start);
-        self.doc.cut_to_graveyard(byte_range.clone(), quote, now_unix());
-        self.selected_range = byte_range.start..byte_range.start;
+        self.doc
+            .cut_to_graveyard(byte_range.clone(), quote, now_unix(), collapse_emptied);
+        let caret = byte_range.start.min(self.doc.len_bytes());
+        self.selected_range = caret..caret;
         self.selection_reversed = false;
         self.cursor_affinity_down = false;
         self.goal_x = None;
@@ -5598,7 +6430,7 @@ impl Editor {
         self.schedule_flash_clear(cx);
         cx.notify();
         // The cut passage may have carried a margin note / diagnosis; its anchor
-        // just collapsed. Migrate the note to the compost, close a dead
+        // just collapsed. Migrate the note to the pile, close a dead
         // diagnosis (Bug C) — the one site that ever files a corpse is also the
         // one that must tidy the anchors the corpse leaves behind.
         self.reconcile_dead_anchors(cx);
@@ -5613,13 +6445,23 @@ impl Editor {
     fn origin_quote_before(&self, byte_pos: usize) -> String {
         let rope = self.doc.rope();
         let mut at = rope.byte_to_char(byte_pos.min(self.doc.len_bytes()));
-        if at > 0 && rope.char(at - 1) == '\n' {
+        // The quote never crosses the seam (graveyard-interplay 2: one law
+        // with counts/export): a cut at the pile's top quotes nothing rather
+        // than the manuscript's last paragraph — the entry's `region` field
+        // carries the "from scraps" honesty instead.
+        let floor = match self.doc.region_of_char(at) {
+            strop_core::document::Region::Scraps => {
+                self.doc.scraps_char_range().map(|r| r.start).unwrap_or(0)
+            }
+            _ => self.doc.manuscript_char_range().start,
+        };
+        if at > floor && rope.char(at - 1) == '\n' {
             at -= 1; // the cut sits at a line start: name the paragraph above it
         }
-        let end = at;
-        let mut from = at;
+        let end = at.max(floor);
+        let mut from = end;
         let mut taken = 0;
-        while from > 0 && taken < 48 {
+        while from > floor && taken < 48 {
             if rope.char(from - 1) == '\n' {
                 break;
             }
@@ -5705,15 +6547,22 @@ impl Editor {
         self.schedule_flash_clear(cx);
     }
 
-    /// Move the caret to an entry's re-anchored origin (clamped into the
-    /// manuscript) and flash that line — "show origin" reveals where the cut
-    /// came from without re-inserting anything (the `originflash` idiom).
+    /// Move the caret to an entry's re-anchored origin — clamped into the
+    /// REGION the text was cut from (graveyard-interplay 1: one seam-aware
+    /// region law with capture/exile/put-back) — and flash that line;
+    /// "show origin" reveals where the cut came from without re-inserting.
     fn show_grave_origin(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(e) = self.doc.graveyard().get(id) else {
             return;
         };
-        let base = self.doc.manuscript_base_char();
-        let at = e.origin_pos.clamp(base, self.doc.rope().len_chars());
+        let region = match e.region {
+            strop_core::document::GraveRegion::Scraps => self
+                .doc
+                .scraps_char_range()
+                .unwrap_or_else(|| self.doc.manuscript_char_range()),
+            strop_core::document::GraveRegion::Manuscript => self.doc.manuscript_char_range(),
+        };
+        let at = e.origin_pos.clamp(region.start, region.end);
         let byte = self.doc.char_to_byte(at);
         self.para_flash = Some((at, Instant::now()));
         self.autoscroll_request = true;
@@ -5787,7 +6636,6 @@ impl Editor {
         if doomed.is_empty() {
             return;
         }
-        let first_birth = self.doc.aside_boundary().is_none();
         let mut migrated = false;
         for id in doomed {
             let anchor = self
@@ -5798,19 +6646,44 @@ impl Editor {
                 .unwrap_or(0);
             let quote = self.origin_quote_before(anchor);
             if self.doc.migrate_note_to_compost(id, &quote) {
-                self.rail_flash = Some(Instant::now());
+                self.arrival_flash = Some(Instant::now());
                 migrated = true;
             }
         }
-        // The compost's first birth opens the rail once (S2/N1): the writer
-        // must SEE where the note went, not deduce it. Later arrivals only
-        // blink — the toggle when the rail is closed, the row when open.
-        if migrated && first_birth {
-            self.rail_open = true;
+        // The arrival receipt (the rail's first-birth auto-open died with
+        // it): the landed block flashes when the seam is on screen; the
+        // Scraps chip pulses when it is not.
+        if migrated {
+            self.pulse_chip(cx);
         }
         self.sync_mutations();
         self.schedule_flash_clear(cx);
         cx.notify();
+    }
+
+    /// Fire the Scraps chip's arrival pulse (the ring; reduce_motion renders
+    /// the 420ms ARRIVAL_FLASH blink instead, gated at the chip's render).
+    /// The seq keys each ring animation to its own arrival; the timer retires
+    /// the pulse after the ring's two beats.
+    fn pulse_chip(&mut self, cx: &mut Context<Self>) {
+        self.chip_pulse = Some(Instant::now());
+        self.chip_pulse_seq += 1;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(CHIP_PULSE_MS + 60))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor
+                    .chip_pulse
+                    .is_some_and(|t| t.elapsed().as_millis() as u64 >= CHIP_PULSE_MS)
+                {
+                    editor.chip_pulse = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// After a structural removal — a graveyard cut or a set-aside — reconcile
@@ -5885,7 +6758,7 @@ impl Editor {
                 .timer(Duration::from_millis(420))
                 .await;
             this.update(cx, |editor: &mut Editor, cx| {
-                editor.rail_flash = None;
+                editor.arrival_flash = None;
                 editor.grave_flash = None;
                 editor.para_flash = None;
                 cx.notify();
@@ -5897,69 +6770,96 @@ impl Editor {
 
     // -- Region geometry (byte offsets) -------------------------------------
 
-    /// Byte bounds of the region the caret is in: the manuscript, the compost,
-    /// or the whole document when there is no rail. Ctrl+A scopes to this so a
-    /// select-all in prose never nukes the compost (spec §1, review #110).
+    /// Byte bounds of the region the caret is in: the manuscript, the pile,
+    /// or the whole document when there is no seam. Ctrl+A scopes to this so a
+    /// select-all in prose never sweeps up the pile (spec §1, review #110;
+    /// era-aware via the core's one region source). A caret ON the seam
+    /// (transiently possible mid-gesture) scopes to the manuscript.
     fn caret_region_bytes(&self) -> (usize, usize) {
         let len = self.doc.len_bytes();
-        let Some(b) = self.doc.aside_boundary() else {
+        if self.doc.boundary().is_none() {
             return (0, len);
-        };
-        let compost_edge = self.doc.rope().line_to_byte(b);
-        let manuscript_base = self.doc.char_to_byte(self.doc.manuscript_base_char());
-        if self.cursor_offset() >= manuscript_base {
-            (manuscript_base, len)
-        } else {
-            (0, compost_edge)
         }
+        let cursor = self.doc.rope().byte_to_char(self.cursor_offset().min(len));
+        let range = match self.doc.region_of_char(cursor) {
+            strop_core::document::Region::Scraps => {
+                self.doc.scraps_char_range().unwrap_or(0..0)
+            }
+            _ => self.doc.manuscript_char_range(),
+        };
+        (
+            self.doc.char_to_byte(range.start),
+            self.doc.char_to_byte(range.end),
+        )
     }
 
-    /// Clamp a selection's moving end so it never crosses the boundary from the
-    /// anchor's region (review B4): every verb's input is single-region by
-    /// construction. Applies to keyboard AND drag selection (both go through
-    /// `extend_cursor`).
+    /// Selections SPAN the seam now (seam-mechanics 2 legalizes them; the
+    /// old review-B4 clamp is gone) — but the moving end must never REST on
+    /// the seam's own line: it snaps past it in the direction of travel, so
+    /// a selection holds the seam only as an interior, never as an endpoint.
     fn clamp_to_region(&self, anchor: usize, target: usize) -> usize {
-        let Some(b) = self.doc.aside_boundary() else {
-            return target;
+        self.snap_off_seam(target, target >= anchor)
+    }
+
+    /// Map a byte offset OFF the seam line (seam-mechanics 3: the caret
+    /// never rests there; the position is zero-width for caret purposes).
+    /// `down` picks the landing side when the offset is exactly on the seam:
+    /// toward the pile (true) or back to the manuscript end (false).
+    fn snap_off_seam(&self, byte: usize, down: bool) -> usize {
+        let Some(_) = self.doc.boundary() else {
+            return byte;
         };
-        let compost_edge = self.doc.rope().line_to_byte(b);
-        let manuscript_base = self.doc.char_to_byte(self.doc.manuscript_base_char());
-        if anchor >= manuscript_base {
-            target.max(manuscript_base)
-        } else if anchor < compost_edge {
-            target.min(compost_edge)
+        let ch = self.doc.rope().byte_to_char(byte.min(self.doc.len_bytes()));
+        if self.doc.region_of_char(ch) != strop_core::document::Region::Seam {
+            return byte;
+        }
+        let m = self.doc.manuscript_char_range();
+        let s = self.doc.scraps_char_range().unwrap_or(m.clone());
+        let target = if down {
+            // Downward: the first position of the region below the seam
+            // (tail era: the pile; top era: the manuscript).
+            if s.start > m.end { s.start } else { m.start }
         } else {
-            target
-        }
+            // Upward: the last position of the region above.
+            if s.start > m.end { m.end } else { s.end }
+        };
+        self.doc.char_to_byte(target)
     }
 
-    /// Is `byte` the first manuscript position (just after the boundary line)?
-    /// Backspace there must be a no-op (the boundary is removed only via the
-    /// aside machinery — spec §1 guard).
+    /// Is `byte` at the position just past the seam (the start of whichever
+    /// region follows it)? Backspace there must be a no-op — the boundary is
+    /// removed only via the park machinery (spec §1 guard), era-aware.
     fn at_manuscript_start(&self, byte: usize) -> bool {
-        self.doc.aside_boundary().is_some()
-            && byte == self.doc.char_to_byte(self.doc.manuscript_base_char())
+        let Some(_) = self.doc.boundary() else {
+            return false;
+        };
+        let m = self.doc.manuscript_char_range();
+        let s = self.doc.scraps_char_range().unwrap_or(m.clone());
+        let below_start = if s.start > m.end { s.start } else { m.start };
+        byte == self.doc.char_to_byte(below_start)
     }
 
-    /// Is `byte` the end of the last compost line (the newline before the
-    /// boundary line)? Forward-delete there would merge the boundary away.
+    /// Is `byte` at the end of the region ABOVE the seam (forward-delete
+    /// there would merge the boundary away)? Era-aware.
     fn at_compost_tail(&self, byte: usize) -> bool {
-        match self.doc.aside_boundary() {
-            Some(b) => byte == self.doc.rope().line_to_byte(b).saturating_sub(1),
-            None => false,
-        }
+        let Some(_) = self.doc.boundary() else {
+            return false;
+        };
+        let m = self.doc.manuscript_char_range();
+        let s = self.doc.scraps_char_range().unwrap_or(m.clone());
+        let above_end = if s.start > m.end { m.end } else { s.end };
+        byte == self.doc.char_to_byte(above_end)
     }
 
     /// Caret at the START of the boundary's own empty line. Forward-delete
-    /// here would eat the separator's newline and merge block b into b+1 —
-    /// the boundary index stays pinned at b, so the first MANUSCRIPT
-    /// paragraph silently becomes compost (excluded from export, the count,
-    /// and passes) with no visible change to the text. Wave-1 review,
-    /// correctness/high: the separator's newline is removable only by the
-    /// aside machinery, like the other two edges.
+    /// here would eat the separator's newline and merge the seam into the
+    /// pile's first block — the boundary index stays pinned, so a block
+    /// silently changes regions with no visible change to the text. Wave-1
+    /// review, correctness/high: the separator's newline is removable only
+    /// by the park machinery, like the other two edges.
     fn at_separator_start(&self, byte: usize) -> bool {
-        match self.doc.aside_boundary() {
-            Some(b) => byte == self.doc.rope().line_to_byte(b),
+        match self.doc.boundary() {
+            Some((_, b)) => byte == self.doc.rope().line_to_byte(b),
             None => false,
         }
     }
@@ -6071,15 +6971,24 @@ impl Editor {
             cx.notify();
             return;
         }
-        // Esc from a compost caret returns to the last manuscript caret (review
-        // B3): the rail is a hard edge to drift INTO, soft to leave.
-        if let Some(b) = self.doc.aside_boundary() {
-            let compost_edge = self.doc.rope().line_to_byte(b);
-            if self.cursor_offset() < compost_edge {
-                let target = self.last_manuscript_caret.min(self.doc.len_bytes());
-                self.move_to(target, cx);
-                return;
-            }
+        // Esc-home ends a LATCHED excursion (08 §2; scopes-search 1): only a
+        // tail entered by travel — chip, ctrl-shift-o, a find/@ jump — travels
+        // back; a caret the writer walked in herself (scroll-and-click) makes
+        // the pile plain text and Esc falls through. Both caret and scroll
+        // return to their travel-time values; `pile_end` is written by the
+        // pile-leaving transition in `set_cursor`, so the next chip press
+        // resumes exactly here.
+        if self.caret_in_scraps() && let Some((home, home_scroll)) = self.excursion {
+            let target = home.min(self.doc.len_bytes());
+            self.move_to(target, cx);
+            // Force-drop the latch even when "home" itself sits in the pile
+            // (a find opened from a pile caret): the excursion is over either
+            // way, and Esc must fall through on the next press.
+            self.excursion = None;
+            self.scroll_top = px(home_scroll);
+            self.autoscroll_request = false;
+            cx.notify();
+            return;
         }
         // (No second palette check here: the one at the top of this fn already
         // returned — the duplicate was unreachable, extraction audit #24.)
@@ -6645,9 +7554,19 @@ impl Editor {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        // Scope to the caret's REGION (spec §1): the writer selecting-all in the
-        // manuscript must not sweep up the private compost, and vice versa.
+        // Scope to the caret's REGION (spec §1; adjudicated seam-mechanics 8):
+        // the writer selecting-all in the manuscript must not sweep up the
+        // pile, and vice versa. A SECOND ctrl-A widens to the whole document
+        // (the recorded exception: ctrl-A+ctrl-C is a de-facto export path —
+        // an audience surface wearing a hand's glove).
         let (start, end) = self.caret_region_bytes();
+        if self.selected_range == (start..end) && self.doc.boundary().is_some() {
+            self.selected_range = 0..self.doc.len_bytes();
+            self.selection_reversed = false;
+            self.publish_primary(cx);
+            cx.notify();
+            return;
+        }
         self.move_to(start, cx);
         self.select_to(end, cx);
     }
@@ -6739,6 +7658,9 @@ impl Editor {
     }
 
     /// Toggle a block kind over the selected block range, one transaction.
+    /// Formatting spans the seam (the writer's hands, seam-mechanics 10) —
+    /// but kinds NEVER stamp the seam line itself: it renders as the seam
+    /// regardless, and a kinded seam was the "tiny grey heading" bug.
     fn toggle_block(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
         if self.strip.is_parked() {
             self.pulse_strip(cx);
@@ -6747,6 +7669,7 @@ impl Editor {
         if self.history_view.is_some() {
             return;
         }
+        let seam = self.doc.boundary().map(|(_, b)| b);
         let start_block = self.doc.block_of_byte(self.selected_range.start);
         let end_block = self.doc.block_of_byte(self.selected_range.end);
         let target = if *self.doc.blocks().kind(start_block) == kind {
@@ -6754,8 +7677,17 @@ impl Editor {
         } else {
             kind
         };
-        self.doc.set_block_kind(start_block, target.clone());
+        if Some(start_block) != seam {
+            self.doc.set_block_kind(start_block, target.clone());
+        } else {
+            // Open the transaction the loop below rides even when the first
+            // block is the seam (skipped).
+            self.doc.set_block_kind(start_block, BlockKind::Paragraph);
+        }
         for block in start_block + 1..=end_block {
+            if Some(block) == seam {
+                continue;
+            }
             self.doc.set_block_kind_in_current_tx(block, target.clone());
         }
         self.mark_dirty();
@@ -6841,7 +7773,9 @@ impl Editor {
                     ..self.selected_range.end.min(p.text.len());
                 p.text.get(r).unwrap_or("").to_owned()
             }
-            None => self.doc.slice_bytes(self.selected_range.clone()),
+            // Live copy strips the seam from a spanning selection
+            // (seam-mechanics 2 — the fragments join with one newline).
+            None => self.selection_text(&self.selected_range.clone()),
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
@@ -6854,7 +7788,10 @@ impl Editor {
             return;
         }
         if !self.selected_range.is_empty() {
-            let text = self.doc.slice_bytes(self.selected_range.clone());
+            // Cut = copy + delete (seam-mechanics 2): the clipboard joins a
+            // spanning selection's fragments; the delete path below splits
+            // at the seam and leaves it between the remnants.
+            let text = self.selection_text(&self.selected_range.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.replace_text_in_range(None, "", window, cx);
         }
@@ -7093,7 +8030,8 @@ impl Editor {
         let Some(frame) = self.last_frame.as_ref() else {
             return (0, false);
         };
-        let (ix, aff) = frame.index_for_point(frame.doc_point(position));
+        let doc_pt = frame.doc_point(position);
+        let (ix, aff) = frame.index_for_point(doc_pt);
         // Stale-frame guard: never hand out offsets beyond the text the frame
         // laid out. While parked that text is the PREVIEW (a past revision that
         // may be longer or shorter than the live doc), so the selection clamps
@@ -7102,7 +8040,24 @@ impl Editor {
             .history_preview
             .as_ref()
             .map_or_else(|| self.doc.len_bytes(), |p| p.text.len());
-        (ix.min(max), aff)
+        let ix = ix.min(max);
+        // A click landing ON the seam line maps BY Y (seam-mechanics 3): the
+        // row's upper half places the caret at the manuscript end, the lower
+        // half at the first scrap — insertion into the seam is impossible by
+        // construction. (Live doc only; a preview places no caret.)
+        if self.history_preview.is_none()
+            && let Some((_, b)) = self.doc.boundary()
+            && self.doc.block_of_byte(ix) == b
+            && ix == self.doc.rope().line_to_byte(b)
+        {
+            let down = frame
+                .paragraphs
+                .get(b)
+                .map(|par| doc_pt.y >= par.top + par.height / 2.)
+                .unwrap_or(true);
+            return (self.snap_off_seam(ix, down), aff);
+        }
+        (ix, aff)
     }
 
     /// Footnote click routing (DESIGN §2-footnotes): a point on an in-text
@@ -7282,7 +8237,10 @@ impl Editor {
             && self
                 .last_frame
                 .as_ref()
-                .and_then(|f| f.grave_section_top.map(|t| f.doc_point(ev.position).y >= t - px(22.)))
+                // No slop band above the header (retuned, seam-mechanics 9):
+                // after the flip the LAST SCRAP's final line abuts the slab
+                // directly, and a 22px band stole its clicks.
+                .and_then(|f| f.grave_section_top.map(|t| f.doc_point(ev.position).y >= t))
                 .unwrap_or(false)
         {
             cx.stop_propagation();
@@ -7559,6 +8517,22 @@ impl Editor {
         // no two VISIBLE cards overlap (the never-overlap rule); a selected card
         // is actually in the visible set (the displacement fix); and the pill
         // counts are what the lane reports. `null` when there is no frame yet.
+        // Scraps latch/chip/count bits, hoisted out of the json! call below
+        // (the macro's recursion budget is finite and the dump is large).
+        let latched = self.excursion.is_some();
+        let caret_scraps = self.caret_in_scraps();
+        let scraps_words = self.scraps_word_count();
+        let scraps_chip_exists = matches!(
+            self.doc.boundary(),
+            Some((strop_core::document::BoundaryEra::Tail, _))
+        );
+        let scraps_chip_hidden = self.scraps_region_on_screen();
+        let chip_pulse = self.chip_pulse.is_some();
+        let count_label = self.count_label();
+        let prov_visible = self
+            .prov_rest
+            .is_some_and(|(_, since)| since.elapsed() >= PROV_REST_DELAY);
+        let park_ghost = self.park_ghost.is_some();
         let margin = self.last_frame.as_ref().map(|_| {
             let layout = self.margin_cards(true);
             let mut spans: Vec<(f32, f32)> =
@@ -7587,6 +8561,25 @@ impl Editor {
             "field_cursor": field_cursor,
             "field_sel": field_sel,
             "margin": margin,
+            // The omnibox results list (palette-scroll): `selected` is the
+            // highlighted row, `rows` the list length, `scroll_y`/`max_scroll_y`
+            // the list's own scroll (not the document's) — the rig asserts
+            // keyboard nav past the fold actually moves this, and that mouse
+            // wheel still does too. `null` when the omnibox is closed.
+            "omni": self.palette_input.as_ref().map(|_| {
+                // The find split (scopes-search 2): the announced
+                // "N in the piece · M in scraps" halves, as data.
+                let (piece, scraps, capped) = self.find_split(&self.omni_match_ranges());
+                serde_json::json!({
+                    "selected": self.palette_selected,
+                    "rows": self.omni_rows(&self.palette_query).len(),
+                    "scroll_y": f32::from(self.omni_scroll.offset().y),
+                    "max_scroll_y": f32::from(self.omni_scroll.max_offset().y),
+                    "find_piece": piece,
+                    "find_scraps": scraps,
+                    "find_capped": capped,
+                })
+            }),
             // A completed pass parked behind the reveal clock (mid-burst
             // arrival) — the rig asserts park-then-land timing against this.
             "ai_deferred": self.deferred_pass.is_some(),
@@ -7637,15 +8630,22 @@ impl Editor {
             // history surface is previewing (review H36) — the model above is
             // ungated, so the rig asserts THIS bit for hide/show.
             "margin_hidden": self.history_view.is_some() || self.strip.is_parked(),
-            // Asides (docs/impl/02-asides.md §6): the rail's compost block
-            // count (0 = no rail), the graveyard entry count, and the
-            // MANUSCRIPT-only word count (compost excluded — asides.md §1).
-            "compost_blocks": self.doc.aside_boundary().unwrap_or(0),
+            // Scraps: the pile's block count (0 = no seam; era-aware — the
+            // key keeps its name so rig assertions carry), the seam's block
+            // index, the graveyard entry count, and the MANUSCRIPT-only word
+            // count (the pile excluded — one scope law).
+            "compost_blocks": match self.doc.boundary() {
+                Some((strop_core::document::BoundaryEra::Tail, b)) =>
+                    self.doc.blocks().len().saturating_sub(b + 1),
+                Some((strop_core::document::BoundaryEra::Top, b)) => b,
+                None => 0,
+            },
+            "seam": self.doc.scrap_line(),
             "grave_entries": self.doc.graveyard().len(),
             // Arrival/exile blinks (one-shot), and the open-card census so the
             // rig can watch a dangling note migrate (writer notes drop, the
             // compost gains an item) or a dead diagnosis close (Bug C).
-            "compost_flash": self.rail_flash.is_some(),
+            "compost_flash": self.arrival_flash.is_some(),
             "grave_flash": self.grave_flash.is_some(),
             "open_notes": self.doc.notes().open().filter(|n| n.kind == NoteKind::Note).count(),
             "open_diagnoses": self.doc.notes().open().filter(|n| n.kind == NoteKind::Diagnosis).count(),
@@ -7654,7 +8654,20 @@ impl Editor {
             // asserts THIS bit for the bar's hide/show, like `margin_hidden`.
             "grave_bar_hidden": self.grave_tail_on_screen(),
             "manuscript_words": self.manuscript_word_count(),
-            "rail": self.rail_open,
+            // The excursion latch + both-ends memory (scopes-search 1), the
+            // caret's region, the footer chips' existence/hide bits, and the
+            // caret-scoped count label — the rig's latch/chip assertions
+            // read these (hoisted above: the json! macro has a depth budget).
+            "latched": latched,
+            "pile_end": self.pile_end,
+            "caret_scraps": caret_scraps,
+            "scraps_words": scraps_words,
+            "scraps_chip_exists": scraps_chip_exists,
+            "scraps_chip_hidden": scraps_chip_hidden,
+            "chip_pulse": chip_pulse,
+            "count_label": count_label,
+            "prov_visible": prov_visible,
+            "park_ghost": park_ghost,
             "sel": [self.selected_range.start, self.selected_range.end],
             // The selection flanks (docs/impl/03-flanks.md §3): presence of each
             // (`left` false only under a history surface; `right` false for a
@@ -7740,64 +8753,84 @@ impl Editor {
         }
     }
 
-    /// Rig hook (`seed:aside`): a fixture with BOTH piles — a compost rail
-    /// (one asided item) and a graveyard (one filed cut). Replaces the doc so
-    /// the geometry is deterministic, then drives the real verbs.
+    /// Rig hook (`seed:aside`): a fixture with BOTH piles — Scraps (one
+    /// parked item, at the TAIL now) and a graveyard (one filed cut).
+    /// Replaces the doc so the geometry is deterministic, then drives the
+    /// real verbs.
     pub fn debug_seed_aside(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let len = self.doc.len_bytes();
         self.doc.edit_bytes(
             0..len,
-            "A compost note to keep for later.\nThe manuscript opens here with its real first line.\nAnd a second manuscript sentence long enough — comfortably over the eighty-character graveyard cut threshold — to file automatically.",
+            "A scrap note to keep for later.\nThe manuscript opens here with its real first line.\nAnd a second manuscript sentence long enough — comfortably over the eighty-character graveyard cut threshold — to file automatically.",
         );
         self.sync_mutations();
         self.word_count = self.manuscript_word_count();
-        // Aside the first paragraph → births the rail.
+        // Park the first paragraph → births the seam at the tail.
         let end0 = self.doc.rope().line_to_byte(1).saturating_sub(1);
         self.selected_range = 0..end0;
         self.set_aside(&SetAside, window, cx);
-        // Send the last paragraph (well over the threshold) → a graveyard entry.
-        let lines = self.doc.rope().len_lines();
-        let start = self.doc.rope().line_to_byte(lines.saturating_sub(1));
-        let end = self.doc.len_bytes();
+        // Send the LAST MANUSCRIPT paragraph (well over the threshold) → a
+        // graveyard entry. After the flip the pile trails the manuscript, so
+        // the exile target is the manuscript's last block, not the doc's.
+        let m = self.doc.manuscript_char_range();
+        let end = self.doc.char_to_byte(m.end);
+        let last_line = self.doc.rope().byte_to_line(end.saturating_sub(1));
+        let start = self.doc.rope().line_to_byte(last_line);
         self.selected_range = start..end;
         self.send_to_graveyard(&SendToGraveyard, window, cx);
         cx.notify();
     }
 
-    /// Rig hook (`seed:demo`): a rich asides fixture for the visual rig — three
-    /// compost items (so the separators + tail mark show), the sidebar open (its
-    /// Compost section), and two graveyard entries: an older short one (receded)
-    /// and a newest multi-paragraph one (rendered full). Exercises Bugs A & B in
-    /// one frame.
+    /// Rig hook (`seed:demo`): a rich Scraps fixture for the visual rig —
+    /// the manuscript FIRST, then three scraps at the tail (separators +
+    /// seam mark), and two graveyard entries: an older short one (receded)
+    /// and a newest multi-paragraph one (rendered full).
     pub fn debug_seed_demo(&mut self, cx: &mut Context<Self>) {
         let len = self.doc.len_bytes();
-        // Blank lines separate the three compost items; the boundary is the
-        // separator before the manuscript (block 5). Building it directly keeps
-        // the fixture deterministic (repeated asides of the first paragraph would
-        // strand blank lines).
+        // The manuscript (blocks 0..4), the seam (block 4), then three
+        // scraps separated by blank lines. Building it directly keeps the
+        // fixture deterministic.
         self.doc.edit_bytes(
             0..len,
-            "Premise B (dead): generation ship, mutiny in cold storage.\n\nENDING \u{2014} she stays; the ferry leaves without her, and the light on the water is the last line.\n\n\u{201C}Salt on the railing like the river had been chewing it.\u{201D}\n\nMara took the night crossing because the day boats were full of people who still believed the far shore existed.\nThe stowaway appeared on the third night, casting two shadows in the single running light.\nThe dockmaster's daughter kept a ledger of everything the river had taken.\nThe customs officer had a theory about the fog, and he told it to anyone who would listen: that it was the river forgetting its banks, one memory at a time.\n\nHe had charts. He had dates. Nobody would ever listen to a word of it.",
+            "Mara took the night crossing because the day boats were full of people who still believed the far shore existed.\nThe stowaway appeared on the third night, casting two shadows in the single running light.\nThe dockmaster's daughter kept a ledger of everything the river had taken.\nThe customs officer had a theory about the fog, and he told it to anyone who would listen: that it was the river forgetting its banks, one memory at a time.\n\nPremise B (dead): generation ship, mutiny in cold storage.\n\nENDING \u{2014} she stays; the ferry leaves without her, and the light on the water is the last line.\n\n\u{201C}Salt on the railing like the river had been chewing it.\u{201D}\n\nHe had charts. He had dates. Nobody would ever listen to a word of it.",
         );
-        self.doc.set_aside_boundary(Some(5)); // blocks 0..5 = the compost rail
+        self.doc.set_scrap_line(Some(4)); // blocks 5.. = the Scraps pile
         self.sync_mutations();
-        // File two cuts: an older short one (recedes once a newer arrives), then
-        // the newest MULTI-paragraph one (renders full, no character cap).
+        // File two cuts from the manuscript: an older short one (recedes
+        // once a newer arrives), then the newest one (renders full).
         self.debug_cut_substring("The dockmaster's daughter kept a ledger of everything the river had taken.", cx);
         self.debug_cut_substring(
-            "The customs officer had a theory about the fog, and he told it to anyone who would listen: that it was the river forgetting its banks, one memory at a time.\n\nHe had charts. He had dates. Nobody would ever listen to a word of it.",
+            "The customs officer had a theory about the fog, and he told it to anyone who would listen: that it was the river forgetting its banks, one memory at a time.",
             cx,
         );
-        self.rail_open = true; // reveal the sidebar's Compost section
         self.word_count = self.manuscript_word_count();
         cx.notify();
     }
 
-    /// Cut the first occurrence of `needle` into the graveyard (rig helper).
+    /// Rig hook (`seed:topera`): rebuild the LIVE doc in the SHIPPED
+    /// compost-at-top shape and save — so the NEXT launch of this same file
+    /// exercises the one-time migration against a real store. The direct
+    /// boundary install mimics what an old build persisted; migration ran
+    /// at open (before smoke keys), so the live doc is boundary-less here.
+    pub fn debug_seed_top_era(&mut self, cx: &mut Context<Self>) {
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "an old compost thought kept at the top\n\nthe manuscript proper begins here",
+        );
+        self.doc.set_aside_boundary(Some(1));
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        self.save_now();
+        cx.notify();
+    }
+
+    /// Cut the first occurrence of `needle` into the graveyard (rig helper;
+    /// the deliberate form — collapses an emptied pile like the verb does).
     fn debug_cut_substring(&mut self, needle: &str, cx: &mut Context<Self>) {
         let text = self.doc.text();
         if let Some(byte) = text.find(needle) {
-            self.file_cut(byte..byte + needle.len(), cx);
+            self.file_cut(byte..byte + needle.len(), true, cx);
         }
     }
 
@@ -7840,6 +8873,101 @@ impl Editor {
         self.word_count = self.manuscript_word_count();
         self.mark_dirty();
         cx.notify();
+    }
+
+    /// Rig hook (`seed:mockup1|2|3`): the Gate-2 fidelity fixture — the
+    /// mockup's Sourdough scenes (docs/mockups/scraps-tail-2026-07.html)
+    /// built through the REAL verbs: one selection park (so the first scrap
+    /// carries provenance), typed scraps appended into the pile, one exile.
+    /// Scene 1 rests the caret inside the parked scrap (the provenance
+    /// one-liner after its delay); scene 2 parks the caret at the
+    /// "grandmother" paragraph for the selection-menu still; scene 3 grows
+    /// the pile (so the graveyard drops below the fold) and rests the caret
+    /// at the title-candidates scrap, typing-in-the-pile style.
+    pub fn debug_seed_mockup(&mut self, scene: u8, window: &mut Window, cx: &mut Context<Self>) {
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "The starter is older than my marriage and considerably more reliable. It has crossed two borders in a jam jar, wrapped in a sock, declared to no customs officer.\nMy grandmother would have said that bread rises on grief, which is the kind of sentence that sounds wise until you try to bake with it.\nFlour, water, salt, patience \u{2014} everyone recites the litany, and everyone lies about the fourth.\n\u{2026}and that is the whole secret: the loaf was never the point. The kitchen at six in the morning, the windows still black, the radio murmuring to itself \u{2014} that was the point, and the bread merely proved I had been there.\nThe neighbour's dog knows the smell of the starter and sits by my door on Fridays. Cut this, but the dog might open the next essay.\nThere was a longer version of this morning, with the neighbour, the dog, and a whole paragraph about the milkman that never earned its keep.",
+        );
+        self.sync_mutations();
+        if scene == 2 {
+            // Scene 2's piece runs long (the mockup's 1,842-word essay): the
+            // tail drops below the fold, so BOTH chips stand at the foot.
+            let after_c = self.doc.text().find("\u{2026}and that is").expect("fixture text");
+            self.doc.edit_bytes(
+                after_c..after_c,
+                "The first loaf of the week is a rehearsal, and we both know it; the oven forgives on Mondays what it will not forgive on Sundays.\nI have read that sourdough cultures carry the fingerprint of their kitchen, which would make mine a biography I never agreed to write.\nThe scale broke in March and the bread got better, which is either a lesson about instruments or a lesson about me, and I am not ready to know which.\nA neighbour once asked for a cup of the starter the way you would ask for a cup of sugar, and I have never felt so surveilled in my life.\nThere is a version of this essay that is only about the window above the sink, and some mornings I am writing that one instead.\n",
+            );
+            self.sync_mutations();
+        }
+        // Park the dog paragraph through the real verb (provenance + receipt).
+        let text = self.doc.text();
+        let dog = text.find("The neighbour's dog").expect("fixture text");
+        let (ds, de) = self.paragraph_bounds(dog);
+        self.selected_range = ds..de;
+        self.selection_reversed = false;
+        self.set_aside(&SetAside, window, cx);
+        // Two idea scraps, as typed-into-the-pile text (blank-line items).
+        let tail = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            tail..tail,
+            "\n\nwhat if the middle section runs backwards \u{2014} start with the burnt loaf, end with the flour bag unopened\n\ntitle candidates: Proof. / Crumb. / What the Oven Keeps.",
+        );
+        self.sync_mutations();
+        if scene == 3 {
+            // Scene 3's pile is deep enough that the record drops below the
+            // fold — the drained Graveyard chip is the frame's one chip.
+            let tail = self.doc.len_bytes();
+            self.doc.edit_bytes(
+                tail..tail,
+                "\n\nthe milkman detour could be its own piece \u{2014} three hundred words about the glass bottles nobody collects any more\n\nthe oven door hinge squeals in the same key as the gate; find out if that is a paragraph or a coincidence\n\ndoes the reader need the recipe at all, or is the recipe the part the piece exists to refuse\n\nbread as a clock: the whole essay told in rise times, nothing else allowed to mark the hours",
+            );
+            self.sync_mutations();
+        }
+        // Exile the milkman paragraph (the record's one entry).
+        let text = self.doc.text();
+        let milk = text.find("There was a longer version").expect("fixture text");
+        let (ms, me) = self.paragraph_bounds(milk);
+        // Take the leading newline so no empty block strands above the seam.
+        self.file_cut(ms.saturating_sub(1)..me, true, cx);
+        self.word_count = self.manuscript_word_count();
+        // Scene carets.
+        let text = self.doc.text();
+        match scene {
+            2 => {
+                let b = text.find("My grandmother").expect("fixture text");
+                self.set_cursor(b, false, cx);
+            }
+            3 => {
+                let t = text.find("What the Oven Keeps.").expect("fixture text");
+                self.set_cursor(t + "What the Oven Keeps.".len(), false, cx);
+            }
+            _ => {
+                let c = text.find("Cut this").expect("fixture text");
+                self.set_cursor(c, false, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Rig hook (`move:manuscript`): select the caret's paragraph in the
+    /// pile and run the retrieval verb — the flank row's path without pixel
+    /// coordinates. The landed range arrives SELECTED (the rig asserts sel).
+    pub fn debug_move_to_manuscript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (start, end) = self.paragraph_bounds(self.cursor_offset());
+        if start >= end {
+            return;
+        }
+        self.selected_range = start..end;
+        self.selection_reversed = false;
+        self.move_to_manuscript(&MoveToManuscript, window, cx);
+    }
+
+    /// Rig hook (`putback:scrap`): the provenance line's Put back at the
+    /// caret's record, without pixel coordinates.
+    pub fn debug_put_back_scrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.put_back_scrap(&PutBackScrap, window, cx);
     }
 
     /// Rig hook (`select:para`, docs/impl/03-flanks.md §3): select the caret's
@@ -8142,11 +9270,8 @@ impl Editor {
                 p.models.len()
             ),
         };
-        // F5 session tags: outline rail, word goal, open-time intent.
+        // F5 session tags: word goal, open-time intent.
         let mut session = String::new();
-        if self.rail_open {
-            session += " rail=open";
-        }
         // The door (DESIGN §4.4): drafting hides the editor's cards, reviewing
         // shows them; the held-back counts let smoke prove the rail's content.
         if self.drafting {
@@ -8242,23 +9367,68 @@ impl Editor {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // A seam-spanning selection (legalized by seam-mechanics 2): ONE
+        // transaction, TWO edits — above and below the separator, the seam
+        // between the remnants, the replacement landing manuscript-side.
+        // A spanning DELETION files up to two region-honest graveyard
+        // entries, threshold per side (graveyard-interplay 6); a type-over
+        // files nothing. Only the tail era has live spanning input (top-era
+        // docs migrate at open; the past is preview-only).
+        if !range.is_empty()
+            && matches!(
+                self.doc.boundary(),
+                Some((strop_core::document::BoundaryEra::Tail, _))
+            )
+            && self.selection_spans_seam(&range)
+        {
+            let m = self.doc.manuscript_char_range();
+            let s = self.doc.scraps_char_range().unwrap_or(m.clone());
+            let m_end = self.doc.char_to_byte(m.end);
+            let s_start = self.doc.char_to_byte(s.start);
+            let above = range.start.min(m_end)..m_end.min(range.end).max(range.start.min(m_end));
+            let below = s_start.max(range.start)..range.end.max(s_start.max(range.start));
+            let quote = self.origin_quote_before(above.start);
+            let caret_char = self.doc.delete_spanning_seam(
+                above,
+                below,
+                new_text,
+                new_text.is_empty(),
+                AUTO_CUT_MIN_CHARS,
+                quote,
+                now_unix(),
+            );
+            let caret = self
+                .doc
+                .char_to_byte(caret_char.min(self.doc.rope().len_chars()))
+                + new_text.len();
+            let caret = caret.min(self.doc.len_bytes());
+            self.selected_range = caret..caret;
+            self.selection_reversed = false;
+            self.marked_range = None;
+            self.sync_mutations();
+            self.bump_activity();
+            cx.notify();
+            // Collapsed anchors inside either fragment reconcile exactly as
+            // any structural removal's do (Bug C).
+            self.reconcile_dead_anchors(cx);
+            return;
+        }
+
         // The auto-cut trigger (docs/impl/02-asides.md §4): a SINGLE
-        // selection-deletion op of a manuscript passage ≥ AUTO_CUT_MIN_CHARS
-        // files itself in the graveyard. Only a real deletion of a real
-        // selection — a replace-by-typing keeps its text and never files; a
-        // backspace run is many one-char ops, none reaching the threshold
-        // (H24 + H43). The cut never straddles the boundary (selections are
-        // clamped, review B4). See `auto_cut_qualifies` for the pure predicate.
+        // selection-deletion op ≥ AUTO_CUT_MIN_CHARS files itself in the
+        // graveyard — on either side of the seam (one capture law,
+        // graveyard-interplay 5). Only a real deletion of a real selection —
+        // a replace-by-typing keeps its text and never files; a backspace
+        // run is many one-char ops, none reaching the threshold (H24 + H43).
+        // See `auto_cut_qualifies` for the pure predicate.
         if !range.is_empty() {
             let start_char = self.doc.rope().byte_to_char(range.start);
             let end_char = self.doc.rope().byte_to_char(range.end);
-            if auto_cut_qualifies(
-                new_text,
-                end_char - start_char,
-                start_char,
-                self.doc.manuscript_base_char(),
-            ) {
-                self.file_cut(range, cx);
+            if auto_cut_qualifies(new_text, end_char - start_char) {
+                // The auto path never collapses the seam itself: the caret
+                // ends inside the emptied pile, and the retype-race guard
+                // (seam-mechanics 6) owns the evaporation moment.
+                self.file_cut(range, false, cx);
                 return;
             }
         }
@@ -8464,11 +9634,15 @@ struct LayoutKey {
     marked: Option<(usize, usize)>,
     find_query: Option<String>,
     active_note: Option<u64>,
-    /// The compost arrival blink is a paint decoration baked into the
+    /// The Scraps arrival blink is a paint decoration baked into the
     /// paragraphs, but it is NOT captured by `revision` (clearing the flash
     /// bumps nothing). Keying on it forces a rebuild when it toggles, so the
     /// blink actually clears instead of sticking on the reuse fast-path.
-    compost_flash: bool,
+    scrap_flash: bool,
+    /// The seam row's live word count (seam-mechanics 10): the scrap line must
+    /// repaint on a count change even when no line count changed — the count
+    /// is shaped into the seam row at prepaint, so it is part of the layout.
+    scrap_words: usize,
     /// The graveyard tail section is painted after the last block; its content
     /// and the counter live outside `revision` too (a bar flash, an entry
     /// expand). Keying on a coarse fingerprint rebuilds when they change.
@@ -8479,6 +9653,7 @@ struct PrepaintState {
     paragraphs: Vec<ParagraphLayout>,
     grave_lines: Vec<GraveLine>,
     grave_section_top: Option<Pixels>,
+    seam_top: Option<Pixels>,
     cursor: Option<PaintQuad>,
     line_height: Pixels,
     scroll_top: Pixels,
@@ -8827,6 +10002,9 @@ struct GraveEntryView {
     /// Rendered full (whisper + full text): the newest, or one the writer
     /// expanded.
     full: bool,
+    /// Which side of the seam the text was cut from — the whisper's honest
+    /// "from scraps" (graveyard-interplay 2).
+    region: strop_core::document::GraveRegion,
 }
 
 const GRAVE_SECTION_GAP: f32 = 44.; // breathing room after the last prose block
@@ -8888,11 +10066,13 @@ fn shape_grave_section(
     }
     let mut top = start_top;
 
-    // Section header: the tombstone slab is drawn in paint; the label sits to
-    // its right (same idiom as the footer bar).
-    let header = grave_seg(window, format!("Graveyard · {}", entries.len()), 13., MUTED_COLOR, "PT Sans", false, false);
+    // Section header (the mockup's .gyhead): a bare 11px muted "Graveyard"
+    // label — the 3px STALE slab after it is drawn in paint. Subordinate to
+    // the seam row by size and ink (P11: one anchor per surface); the count
+    // lives on the footer chip, which hides exactly while this is on screen.
+    let header = grave_seg(window, "Graveyard", 11., MUTED_COLOR, "PT Sans", false, false);
     lines.push(GraveLine {
-        segments: vec![(px(18.), header)],
+        segments: vec![(px(0.), header)],
         body: None,
         top,
         height: px(GRAVE_HEADER_H),
@@ -8919,8 +10099,10 @@ fn shape_grave_section(
             let mut x = px(0.);
             let mut push =
                 |window: &mut Window, text: String, italic: bool, action: Option<GraveAction>| {
-                    let color = if action.is_some() { AI_ACCENT } else { MUTED_COLOR };
-                    let shaped = grave_seg(window, text, 11., color, "PT Sans", italic, action.is_some());
+                    // Verbs wear the one whisper dress (A5): muted ink; the
+                    // dotted underline is painted from the hit rects.
+                    let shaped =
+                        grave_seg(window, text, 11., MUTED_COLOR, "PT Sans", italic, false);
                     let w = shaped.width();
                     if let Some(a) = action {
                         hits.push((
@@ -8931,10 +10113,20 @@ fn shape_grave_section(
                     segments.push((x, shaped));
                     x += w;
                 };
+            // A scrap-origin entry whispers its region as a frozen past-tense
+            // fact (graveyard-interplay 2/6): "from scraps", never a live link.
+            let from_scraps =
+                e.region == strop_core::document::GraveRegion::Scraps;
             if e.origin_quote.is_empty() {
-                push(window, format!("cut · {date} · "), false, None);
+                let prefix = if from_scraps { "cut from scraps" } else { "cut" };
+                push(window, format!("{prefix} · {date} · "), false, None);
             } else {
-                push(window, "cut from after ".to_string(), false, None);
+                let prefix = if from_scraps {
+                    "cut from scraps, after "
+                } else {
+                    "cut from after "
+                };
+                push(window, prefix.to_string(), false, None);
                 push(window, format!("\u{201C}\u{2026}{}\u{201D}", e.origin_quote), true, None);
                 push(window, format!(" · {date} · "), false, None);
             }
@@ -9147,7 +10339,8 @@ impl Element for EditorElement {
                 None
             },
             active_note: editor.focus.active_id(),
-            compost_flash: editor.rail_flash.is_some(),
+            scrap_flash: editor.arrival_flash.is_some(),
+            scrap_words: editor.scraps_word_count(),
             grave_fingerprint: editor.grave_layout_fingerprint(),
         };
         let can_reuse = !in_history
@@ -9168,7 +10361,7 @@ impl Element for EditorElement {
             let mut scroll_top = editor.scroll_top;
             // `editor`'s immutable borrow ends here (last use above); the
             // mutable update_in_draw below is then free to run.
-            let (paragraphs, grave_lines, grave_section_top, content_height) =
+            let (paragraphs, grave_lines, grave_section_top, seam_top, content_height) =
                 self.editor.update_in_draw(cx, |ed| {
                     let f = ed
                         .last_frame
@@ -9178,6 +10371,7 @@ impl Element for EditorElement {
                         std::mem::take(&mut f.paragraphs),
                         std::mem::take(&mut f.grave_lines),
                         f.grave_section_top,
+                        f.seam_top,
                         f.content_height,
                     )
                 });
@@ -9226,6 +10420,7 @@ impl Element for EditorElement {
                 paragraphs,
                 grave_lines,
                 grave_section_top,
+                seam_top,
                 cursor,
                 line_height,
                 scroll_top,
@@ -9342,12 +10537,21 @@ impl Element for EditorElement {
             .collect();
         let scale = window.scale_factor();
 
-        // Asides state captured while the `editor` borrow is still live (it ends
-        // at the `prev` take below): the compost boundary + arrival-blink flag
-        // for the compost face (Bug A), and the graveyard entries for the tail
-        // section (Bug B). History mode shows neither.
-        let aside_boundary = if in_history { None } else { editor.doc.aside_boundary() };
-        let rail_flashing = editor.rail_flash.is_some();
+        // Scraps state captured while the `editor` borrow is still live (it
+        // ends at the `prev` take below): the boundary WITH ITS ERA for the
+        // pile face, the arrival-blink flag, and the graveyard entries for
+        // the tail section (Bug B). A history/strip PREVIEW draws the past
+        // state's OWN boundary read-only (time-persistence 5: past states
+        // keep their own geometry); the live doc draws its own.
+        let boundary = if in_history {
+            editor
+                .history_preview
+                .as_ref()
+                .and_then(|p| p.boundary)
+        } else {
+            editor.doc.boundary()
+        };
+        let scrap_flashing = editor.arrival_flash.is_some();
         let grave_render: Vec<GraveEntryView> = if in_history {
             Vec::new()
         } else {
@@ -9363,6 +10567,7 @@ impl Element for EditorElement {
                     cut_unix: e.cut_unix,
                     words: e.words,
                     full: Some(e.id) == newest_id || editor.grave_expanded.contains(&e.id),
+                    region: e.region,
                 })
                 .collect()
         };
@@ -9382,35 +10587,77 @@ impl Element for EditorElement {
                 }
                 _ => None,
             });
+        // The Scraps geometry for this frame's text, ERA-AWARE (the live doc
+        // is tail-era; a history/strip preview draws a past state's own
+        // boundary read-only). `pile` is the inclusive block range of the
+        // writer's pile; the seam row draws on the boundary block itself.
+        let last_block = text.bytes().filter(|b| *b == b'\n').count();
+        let (pile, seam_block, newest_block) = match boundary {
+            Some((strop_core::document::BoundaryEra::Top, b)) => {
+                (Some((0, b.saturating_sub(1))), Some(b), b.saturating_sub(1))
+            }
+            Some((strop_core::document::BoundaryEra::Tail, b)) => {
+                (Some((b + 1, last_block)), Some(b), b + 1)
+            }
+            None => (None, None, usize::MAX),
+        };
+        // The seam row's live datum: the region's own word count, from THIS
+        // frame's text (a preview counts its own past pile).
+        let seam_row: Option<(gpui::ShapedLine, gpui::ShapedLine)> = seam_block.map(|_| {
+            let (first, last) = pile.expect("a seam implies a pile range");
+            // Count per line and sum — feeding the split lines as one chunk
+            // stream would glue the last word of each line to the first of
+            // the next (the newline separator was consumed by the split).
+            let words: usize = text
+                .split('\n')
+                .enumerate()
+                .filter(|(ix, _)| *ix >= first && *ix <= last)
+                .map(|(_, l)| count_words([l].into_iter()))
+                .sum();
+            // P11: the seam is the tail's ONE anchor — label + count at 12px
+            // full ink, a step above the graveyard header's 11px muted, so
+            // the returning eye lands on the living boundary, not the record.
+            (
+                grave_seg(window, "Scraps", 12., TEXT_COLOR, "PT Sans", false, false),
+                grave_seg(
+                    window,
+                    format!("{} words", format_thousands(words)),
+                    12.,
+                    TEXT_COLOR,
+                    "PT Sans",
+                    false,
+                    false,
+                ),
+            )
+        });
         let mut paragraphs = Vec::new();
         let mut top = px(0.);
         let mut offset = 0;
         let mut ordered_no = 0usize;
+        let mut seam_row = seam_row; // moved into the boundary block below
         for (block_ix, par_text) in text.split('\n').enumerate() {
             let kind = kinds.get(block_ix).cloned().unwrap_or_default();
             let mut bstyle = block_style_scaled(&kind, font_scale);
-            // The compost face (Bug A, asides.md §1): blocks `0..=boundary` are
-            // the compost region — a mini-column, smaller and muted. Empty
-            // compost/boundary blocks draw a hairline at their midline (the item
-            // separator grammar); the boundary block also gets the tail anchor
-            // bar (P11). The first compost block carries a small "COMPOST"
-            // whisper above it. An absent boundary = no compost = none of this.
-            let in_compost = aside_boundary.is_some_and(|b| block_ix <= b);
-            let is_boundary = aside_boundary == Some(block_ix);
-            let compost_rule = in_compost && par_text.is_empty();
-            if in_compost {
+            // The pile face (08 §2; token audit A1): FULL ink at 0.8 size —
+            // the writer's living scraps never wear the dead muted face; the
+            // smaller size + the SCRAP_WASH region tint carry the register.
+            let in_pile = pile.is_some_and(|(f, l)| block_ix >= f && block_ix <= l);
+            let is_boundary = seam_block == Some(block_ix);
+            if in_pile {
                 bstyle.size = px((f32::from(bstyle.size) * 0.8).round());
                 bstyle.line_height = px((f32::from(bstyle.line_height) * 0.8 / 2.).round() * 2.);
-                bstyle.muted = true;
             }
-            let compost_header = (aside_boundary.is_some() && block_ix == 0).then(|| {
-                grave_seg(window, "COMPOST", 10.5, MUTED_COLOR, "PT Sans", false, false)
-            });
-            if compost_header.is_some() {
-                bstyle.extra_top += px(20.); // room for the whisper above block 0
+            let seam = if is_boundary { seam_row.take() } else { None };
+            if seam.is_some() {
+                bstyle.extra_top += px(8.); // the mockup's air above the scrap line
+                // The boundary is a structural row, not prose: compress its
+                // line box so seam-to-pile reads like the mockup's 16px
+                // padding, not two full paragraph gaps.
+                bstyle.line_height = px(16.);
             }
-            let compost_flash = rail_flashing
-                && aside_boundary.is_some_and(|b| block_ix + 1 == b && !par_text.is_empty());
+            // The arrival blink: the NEWEST item — under the tail era that is
+            // the first scrap (newest nearest the story, 08 §2).
+            let scrap_flash = scrap_flashing && block_ix == newest_block && !par_text.is_empty();
             // The footnote-definition run at the document end reads as one
             // "Footnotes" section: a hairline rule sits above its first
             // block (H4). Detected by neighbour, not by kind alone.
@@ -9641,22 +10888,34 @@ impl Element for EditorElement {
                 bg: bstyle.bg,
                 quote_rule: bstyle.quote_rule,
                 section_rule,
-                compost_rule,
-                compost_tail: is_boundary,
-                compost_header,
-                compost_flash,
+                scrap_wash: in_pile,
+                wash_edges: pile.map_or((false, false), |(f, l)| {
+                    (block_ix == f, block_ix == l)
+                }),
+                seam,
+                scrap_flash,
                 marker,
                 fn_marks,
                 font_size: bstyle.size,
                 image,
                 runs,
             });
-            top += height + paragraph_gap;
+            // The pile keeps a tighter vertical rhythm (the mockup's
+            // ~0.95em item spacing): its blank separator lines are honest
+            // text, so the gap halves instead.
+            top += height
+                + if in_pile {
+                    px((f32::from(paragraph_gap) * 0.5 / 2.).round() * 2.)
+                } else {
+                    paragraph_gap
+                };
             offset = range.end + 1; // step over '\n'
         }
 
         // `top` has accumulated one trailing gap past the last paragraph.
         let manuscript_bottom = top - paragraph_gap;
+        // The scrap line's doc-space top, for the Scraps chip's hide gate.
+        let seam_top = paragraphs.iter().find(|p| p.seam.is_some()).map(|p| p.top);
         // The graveyard tail section (Bug B) lives in the scroll flow, after the
         // last block — so `content_height` (and thus max_scroll) grows to reach
         // it. `grave_section_top` records the header's doc-space y for the
@@ -9722,6 +10981,7 @@ impl Element for EditorElement {
             paragraphs,
             grave_lines,
             grave_section_top,
+            seam_top,
             cursor,
             line_height,
             scroll_top,
@@ -9758,13 +11018,36 @@ impl Element for EditorElement {
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
         let viewport = bounds.size.height;
-        // The compost mini-column measure (asides.md §1: ~35ch, capped so it
-        // never runs the full prose width).
-        let compost_w = px(f32::from(bounds.size.width).min(340.));
         for par in &prepaint.paragraphs {
             let y = par.top - scroll_top;
-            if y + par.height <= px(0.) || y >= viewport {
+            // The wash tile bleeds one paragraph gap above its block (tiles
+            // must join), so cull with that much grace on both edges: a block
+            // just past the bottom still paints the tile that covers the gap
+            // above it.
+            if y + par.height + line_height <= px(0.) || y - line_height >= viewport {
                 continue; // outside the viewport
+            }
+            // Scraps decorations (08 §2). The region wash FIRST — the ground
+            // everything else sits on: SCRAP_WASH over the measure plus a
+            // ~14px bleed, tiled per block (each tile covers the gap above
+            // itself) so the pile reads as ONE washed region — and never
+            // viewport-wide: at 1600pt a full-width band would run under the
+            // margin lane and change every card's ground.
+            if par.scrap_wash {
+                // The tile's upward bleed covers exactly the pile's own
+                // (halved) gap, so tiles join without ever painting over the
+                // previous block's text.
+                let pile_gap = px((f32::from(line_height) * 0.5 / 2.).round() * 2.);
+                let wash_top = y - if par.wash_edges.0 { px(16.) } else { pile_gap };
+                let wash_bottom =
+                    y + par.height + if par.wash_edges.1 { px(10.) } else { px(0.) };
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(-14.), wash_top),
+                        size(bounds.size.width + px(28.), wash_bottom - wash_top),
+                    ),
+                    rgb(SCRAP_WASH),
+                ));
             }
             // Kind decorations: code-block panel, quote rule, list markers.
             if let Some(bg) = par.bg {
@@ -9796,47 +11079,44 @@ impl Element for EditorElement {
                     rgb(RULE_COLOR),
                 ));
             }
-            // Compost decorations (Bug A). The arrival blink first (behind the
-            // text): the tail item's background pulses on an aside/migration.
-            if par.compost_flash {
+            // The arrival blink (destination receipt, seam on screen): the
+            // landed block pulses once in the ONE warm (ARRIVAL_FLASH), over
+            // the wash, behind the text.
+            if par.scrap_flash {
                 window.paint_quad(fill(
                     Bounds::new(
                         bounds.origin + point(px(-6.), y - px(3.)),
-                        size(compost_w + px(12.), par.height + px(6.)),
+                        size(bounds.size.width + px(12.), par.height + px(6.)),
                     ),
-                    rgba(COMPOST_FLASH),
+                    rgba(ARRIVAL_FLASH),
                 ));
             }
-            // The "COMPOST" whisper above the first compost block.
-            if let Some(shaped) = &par.compost_header {
-                shaped
+            // The scrap line (08 §2): quiet label · hairline · the region's
+            // live word count, riding the measure at every width — centred at
+            // 1600, left at 800, count right-aligned to the measure so the
+            // seam arithmetic reads on one axis (surfaces-attention 9).
+            if let Some((label, count)) = &par.seam {
+                let mid = y + par.height / 2.;
+                let lw = label.width();
+                let cw = count.width();
+                label
+                    .paint(bounds.origin + point(px(0.), y), par.height, TextAlign::Left, None, window, cx)
+                    .ok();
+                count
                     .paint(
-                        bounds.origin + point(px(0.), y - px(16.)),
-                        px(14.),
+                        bounds.origin + point(bounds.size.width - cw, y),
+                        par.height,
                         TextAlign::Left,
                         None,
                         window,
                         cx,
                     )
                     .ok();
-            }
-            // An empty compost/boundary block is a separator: a hairline at its
-            // midline (asides.md §1). The boundary also gets the tail anchor bar.
-            if par.compost_rule {
-                let mid = y + par.height / 2.;
+                let rule_w = (bounds.size.width - cw - lw - px(20.)).max(px(0.));
                 window.paint_quad(fill(
-                    Bounds::new(bounds.origin + point(px(0.), mid), size(compost_w, px(1.))),
+                    Bounds::new(bounds.origin + point(lw + px(10.), mid), size(rule_w, px(1.))),
                     rgb(RULE_COLOR),
                 ));
-                if par.compost_tail {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            bounds.origin + point(px(0.), mid - px(1.)),
-                            size(px(26.), px(2.)),
-                        ),
-                        rgb(COMPOST_TAIL),
-                    ));
-                }
             }
             // The originflash / put-back paragraph blink (Bug B): tint the block
             // the caret was sent to. Painted live from `para_flash`, so it clears
@@ -9919,39 +11199,28 @@ impl Element for EditorElement {
                 continue; // culled
             }
             if gl.header {
-                // The tombstone slab + a flash tint on a fresh cut (live).
+                // A flash tint on a fresh cut (live) — the one arrival warm.
                 if grave_flashing {
                     window.paint_quad(fill(
                         Bounds::new(
                             bounds.origin + point(px(-6.), y - px(3.)),
                             size(bounds.size.width + px(12.), gl.height + px(6.)),
                         ),
-                        rgba(COMPOST_FLASH),
+                        rgba(ARRIVAL_FLASH),
                     ));
                 }
-                // The tombstone slab (a drawn glyph — ⚰ is outside PT). A narrow
-                // "neck" quad over a wider "base" reads as a headstone.
+                // The mockup's 3px STALE slab after the label (.gyhead) — the
+                // record's own boundary, deliberately QUIETER than the seam's
+                // full-ink hairline row (P11: the graveyard header
+                // subordinates; the seam is the tail's one anchor).
+                let label_w = gl.segments.first().map_or(px(0.), |(x, s)| *x + s.width());
+                let mid = y + gl.height / 2. - px(1.);
                 window.paint_quad(fill(
                     Bounds::new(
-                        bounds.origin + point(px(3.), y + px(5.)),
-                        size(px(7.), px(3.)),
+                        bounds.origin + point(label_w + px(10.), mid),
+                        size((bounds.size.width - label_w - px(10.)).max(px(0.)), px(3.)),
                     ),
-                    rgb(MUTED_COLOR),
-                ));
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(2.), y + px(7.)),
-                        size(px(9.), px(8.)),
-                    ),
-                    rgb(MUTED_COLOR),
-                ));
-                // A hairline above the whole section (the "record" boundary).
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(0.), y - px(20.)),
-                        size(bounds.size.width, px(1.)),
-                    ),
-                    rgb(RULE_COLOR),
+                    rgb(STALE_BG),
                 ));
             }
             if gl.left_rule {
@@ -9970,6 +11239,27 @@ impl Element for EditorElement {
                     .paint(bounds.origin + point(*x, y), gl.line_height, TextAlign::Left, None, window, cx)
                     .ok();
             }
+            // Record verbs wear one whisper dress (token audit A5): muted ink
+            // with a DOTTED underline — painted as dashes (gpui runs have no
+            // dotted style). Expand hits are whole receded rows, not verbs.
+            for (rect, action) in &gl.hits {
+                if matches!(action, GraveAction::Expand(_)) {
+                    continue;
+                }
+                let uy = rect.origin.y - scroll_top + rect.size.height - px(5.);
+                let mut dx = rect.origin.x;
+                let end = rect.origin.x + rect.size.width;
+                while dx < end {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            bounds.origin + point(dx, uy),
+                            size(px(1.5).min(end - dx), px(1.)),
+                        ),
+                        rgb(MUTED_COLOR),
+                    ));
+                    dx += px(4.);
+                }
+            }
         }
 
         if focus_handle.is_focused(window)
@@ -9981,6 +11271,7 @@ impl Element for EditorElement {
         let paragraphs = std::mem::take(&mut prepaint.paragraphs);
         let grave_lines = std::mem::take(&mut prepaint.grave_lines);
         let grave_section_top = prepaint.grave_section_top;
+        let seam_top = prepaint.seam_top;
         let content_height = prepaint.content_height;
         let layout_key = prepaint.layout_key.clone();
         // Overlays (margin lane, AI card/idle hint, selection popover)
@@ -10011,6 +11302,7 @@ impl Element for EditorElement {
                 paragraphs,
                 grave_lines,
                 grave_section_top,
+                seam_top,
                 layout_key,
             });
         });
@@ -10336,27 +11628,29 @@ impl Editor {
             + f32::from(par.line_height) * line as f32
             - f32::from(frame.scroll_top);
         let col_left = f32::from(frame.bounds.origin.x) - l_inset;
-        let rail_w = self.rail_width(window);
-        let left_gutter = col_left - rail_w;
+        let left_gutter = col_left;
         // A history surface (strip open, the panel, or a parked preview) claims
         // the right side AND freezes a read-only past — suppress both flanks so
         // neither offers live mutation over it (review H22).
         let history_up =
             self.history_view.is_some() || self.strip.open || self.history_preview.is_some();
-        // A compost-rail selection: the manuscript-only verbs don't apply, so the
-        // right menu stands down (spec §1, finding 108); the left flank still
-        // rises (the rail is the writer's text, and it renders as leading
-        // paragraphs in the SAME frame, so its coordinates are in hand).
-        let in_compost = self.doc.aside_boundary().is_some()
-            && self
+        // A pile selection (era-aware): the flank swaps Set aside for "Move to
+        // the manuscript" below the seam (08 §2). A seam-SPANNING selection
+        // gets no right menu (region verbs are never offered on spanning
+        // selections) — the left formatting flank still rises for both.
+        let sel = self.selected_range.clone();
+        let spanning = self.selection_spans_seam(&sel);
+        let pile_selection = !spanning && self.doc.boundary().is_some() && {
+            let start_ch = self
                 .doc
                 .rope()
-                .byte_to_char(self.selected_range.start.min(self.doc.len_bytes()))
-                < self.doc.manuscript_base_char();
+                .byte_to_char(sel.start.min(self.doc.len_bytes()));
+            self.doc.region_of_char(start_ch) == strop_core::document::Region::Scraps
+        };
         let lane_available = self.margin_fits(window);
         let gutter_ok = left_gutter >= FLANK_GRID_W + 12.;
         Some(FlankLayout {
-            gate: flank_gate(history_up, in_compost, lane_available, gutter_ok),
+            gate: flank_gate(history_up, spanning, lane_available, gutter_ok),
             left_top: raw_top - t_inset,
             right_top: raw_top,
             line_h: f32::from(par.line_height),
@@ -10364,8 +11658,8 @@ impl Editor {
             col_left,
             vw: self.content_width(window),
             vh: f32::from(window.viewport_size().height) - t_inset - b_inset,
-            rail_w,
             lane_left: self.column_right(window) + MARGIN_GAP,
+            pile_selection,
         })
     }
 
@@ -10400,16 +11694,20 @@ impl Editor {
         let top = layout
             .left_top
             .clamp(BAR_HEIGHT + 8., (layout.vh - FLANK_GRID_H - 8.).max(BAR_HEIGHT + 8.));
-        let left = (layout.col_left - 12. - FLANK_GRID_W).max(layout.rail_w + 6.);
+        let left = (layout.col_left - 12. - FLANK_GRID_W).max(6.);
         div()
             .absolute()
             .left(px(left))
             .top(px(top))
             .w(px(FLANK_GRID_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (the lab's .fmt/.selmenu:
+            // card fill, RULE hairline, 9px rounding): both flanks rise
+            // together, so they must wear one dress (P8) — this one wore the
+            // panel fill at a different radius than its right-hand partner.
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(8.))
+            .rounded(px(9.))
             .shadow_md()
             .py(px(5.))
             .px(px(3.))
@@ -10442,10 +11740,11 @@ impl Editor {
             .left(px(left))
             .top(px(top))
             .w(px(POPOVER_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (see render_flank_grid).
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(6.))
+            .rounded(px(9.))
             .shadow_md()
             .px(px(4.))
             .py(px(3.))
@@ -10480,10 +11779,11 @@ impl Editor {
             .left(px(left))
             .top(px(top))
             .w(px(LINK_W))
-            .bg(rgb(0xFCFAF4))
+            // The selection-flank family surface (see render_flank_grid).
+            .bg(rgb(CARD_BG))
             .border_1()
             .border_color(rgb(RULE_COLOR))
-            .rounded(px(6.))
+            .rounded(px(9.))
             .shadow_md()
             .px(px(8.))
             .py(px(4.))
@@ -10562,19 +11862,39 @@ impl Editor {
                         .text_size(px(12.5))
                         .py(px(2.))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(self.selection_menu_row("sel-note", SelVerb::Note, "Add a note", cx))
-                        .child(self.selection_menu_row(
-                            "sel-aside",
-                            SelVerb::Aside,
-                            "Set aside, out of the story",
-                            cx,
-                        ))
-                        .child(self.selection_menu_row(
-                            "sel-grave",
-                            SelVerb::Graveyard,
-                            "Send to the graveyard",
-                            cx,
-                        ))
+                        // The mockup's .vmenu order: Annotate, then the two
+                        // afterlife verbs grouped under a hairline — Set aside
+                        // (emphasized, the gentle verb) resting ONE ROW ABOVE
+                        // Exile (destructive red): this adjacency at the
+                        // hesitation over a deletion is the entire invitation
+                        // (08 §2, F8 — no tips, no tours). Below the seam the
+                        // gentle slot swaps to "Move to the manuscript" —
+                        // retrieval in the exact place parking lived; Exile
+                        // stays (one capture law on both sides of the seam).
+                        .child(self.selection_menu_row("sel-note", SelVerb::Note, "Annotate", cx))
+                        .child(
+                            div()
+                                .my(px(3.))
+                                .border_t_1()
+                                .border_color(rgb(RULE_COLOR)),
+                        )
+                        .child(if layout.pile_selection {
+                            self.selection_menu_row(
+                                "sel-move-home",
+                                SelVerb::MoveToManuscript,
+                                "Move to the manuscript",
+                                cx,
+                            )
+                        } else {
+                            self.selection_menu_row("sel-aside", SelVerb::Aside, "Set aside", cx)
+                        })
+                        .child(self.selection_menu_row("sel-grave", SelVerb::Graveyard, "Exile", cx))
+                        .child(
+                            div()
+                                .my(px(3.))
+                                .border_t_1()
+                                .border_color(rgb(RULE_COLOR)),
+                        )
                         .child(self.selection_menu_row(
                             "sel-ask",
                             SelVerb::Ask,
@@ -10585,13 +11905,13 @@ impl Editor {
         )
     }
 
-    /// One carrier-sentence row of the right verb menu. The icon is a small
-    /// color-language dot drawn as a div (no non-PT glyph — the ☰/✂/❋ of the
-    /// mockup would force a font fallback, and ☰ collides with outline/palette,
-    /// finding 109): warm amber for the writer's note, drained for the graveyard,
-    /// cool blue for the machine ask. Acting dismisses BOTH flanks first (H20),
-    /// THEN dispatches — the verb still sees the live `selected_range` (dismissal
-    /// only hides the flanks, it never clears the selection).
+    /// One carrier row of the right verb menu (the mockup's .vmenu row): the
+    /// label wears the verb's own dress — Set aside emphasized (the gentle
+    /// verb), Exile in destructive red, the machine ask keeps its cool dot
+    /// (the one row the mockup doesn't stage). Acting dismisses BOTH flanks
+    /// first (H20), THEN dispatches — the verb still sees the live
+    /// `selected_range` (dismissal only hides the flanks, never clears the
+    /// selection).
     fn selection_menu_row(
         &self,
         id: &'static str,
@@ -10599,14 +11919,12 @@ impl Editor {
         label: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Each verb's dress derives from the verb itself: the colour-language
-        // dot (warm = the writer's note, drained = the graveyard, cool = the
-        // machine ask), the chord it teaches, and whether the hover wash warns.
-        let (dot, chord, destructive) = match verb {
-            SelVerb::Note => (rgb(ACTIVE_BORDER), "ctrl-m", false),
-            SelVerb::Aside => (rgb(MUTED_COLOR), "ctrl-shift-a", false),
-            SelVerb::Graveyard => (rgb(0xC9C5BAu32), "ctrl-shift-g", true),
-            SelVerb::Ask => (rgb(AI_ACCENT), "ctrl-shift-d", false),
+        let (chord, destructive, emphasized) = match verb {
+            SelVerb::Note => ("ctrl-m", false, false),
+            SelVerb::Aside => ("ctrl-shift-a", false, true),
+            SelVerb::MoveToManuscript => ("", false, true),
+            SelVerb::Graveyard => ("ctrl-shift-g", true, false),
+            SelVerb::Ask => ("ctrl-shift-d", false, false),
         };
         div()
             .id(id)
@@ -10616,25 +11934,38 @@ impl Editor {
             .px(px(11.))
             .py(px(7.))
             .cursor(CursorStyle::PointingHand)
-            .hover(|d| d.bg(rgb(if destructive { STALE_BG } else { NOTE_CARD_BG })))
-            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(dot))
-            .child(div().text_color(rgb(TEXT_COLOR)).child(label))
-            // The chord chip (the lab's `.k` keycap): the menu teaches its own
-            // shortcuts in place, instead of a manual teaching them in prose.
+            // The documented interaction-state overlay (token audit A4/A7):
+            // hover is chrome, never a content meaning — the warm note cream
+            // said "mine" and the drained wash said "stale", both lies here.
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+            .when(matches!(verb, SelVerb::Ask), |d| {
+                d.child(div().w(px(7.)).h(px(7.)).rounded_full().bg(rgb(AI_ACCENT)))
+            })
             .child(
                 div()
-                    .ml_auto()
-                    .flex_shrink_0()
-                    .px(px(3.))
-                    .font_family(CODE_FONT)
-                    .text_size(px(9.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .rounded(px(4.))
-                    .bg(rgb(BG_COLOR))
-                    .child(chord),
+                    .text_color(rgb(if destructive { ERROR } else { TEXT_COLOR }))
+                    .when(emphasized, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .child(label),
             )
+            // The chord chip (the lab's `.k` keycap): the menu teaches its own
+            // shortcuts in place, instead of a manual teaching them in prose.
+            // A chordless verb (Move to the manuscript) wears no empty chip.
+            .when(!chord.is_empty(), |d| {
+                d.child(
+                    div()
+                        .ml_auto()
+                        .flex_shrink_0()
+                        .px(px(3.))
+                        .font_family(CODE_FONT)
+                        .text_size(px(9.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .border_1()
+                        .border_color(rgb(RULE_COLOR))
+                        .rounded(px(4.))
+                        .bg(rgb(BG_COLOR))
+                        .child(chord),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
@@ -10645,6 +11976,9 @@ impl Editor {
                     match verb {
                         SelVerb::Note => editor.add_note(&AddNote, window, cx),
                         SelVerb::Aside => editor.set_aside(&SetAside, window, cx),
+                        SelVerb::MoveToManuscript => {
+                            editor.move_to_manuscript(&MoveToManuscript, window, cx)
+                        }
                         SelVerb::Graveyard => {
                             editor.send_to_graveyard(&SendToGraveyard, window, cx)
                         }
@@ -10726,84 +12060,14 @@ impl Editor {
                     .items_center()
                 // macOS draws its native traffic-light buttons over the top-left of
                 // our (full-size-content) titlebar — recentred by `traffic_light_
-                // position` in main.rs. Reserve their width so the outline toggle and
-                // document name start to their right instead of underneath them.
+                // position` in main.rs. Reserve their width so the document name
+                // starts to their right instead of underneath them.
                 .when(cfg!(target_os = "macos"), |bar| {
                     bar.child(div().w(px(76.)).h_full())
                 })
-                // The compost rail opens on the LEFT, so its control lives
-                // at the far left — spatial honesty (the H2 papercut: it was
-                // on the right). Three stacked bars, drawn like every glyph.
-                .child(
-                    div()
-                        .id("outline-toggle")
-                        .occlude()
-                        .px(px(8.))
-                        .py(px(2.))
-                        .ml(px(8.))
-                        .rounded(px(5.))
-                        .cursor(CursorStyle::PointingHand)
-                        .when(self.rail_width(window) > 0., |d| d.bg(rgba(0x1A1A1812u32)))
-                        // Arrival blink (S2, P12 — the control is the
-                        // indicator): when a passage lands in a CLOSED rail,
-                        // the always-visible toggle carries the compliance
-                        // signal; an off-screen region flash can't.
-                        .map(|d| {
-                            let a = self.rail_flash.map_or(0., |t| {
-                                let e = t.elapsed().as_millis() as f32 / 1400.;
-                                (0.33 * (1. - e)).clamp(0., 0.33)
-                            });
-                            d.when(a > 0. && !self.rail_open, |d| d.bg(tint(0xC8A951, a)))
-                        })
-                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("Compost", Some("ctrl-shift-o")))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.toggle_rail(&ToggleOutline, window, cx);
-                            }),
-                        )
-                        .child({
-                            // Honest light (extraction audit #7): the toggle
-                            // reads active only when the rail actually shows —
-                            // history or a narrow window can suppress it while
-                            // rail_open stays latently true.
-                            let bar_color = if self.rail_width(window) > 0. {
-                                rgb(TEXT_COLOR)
-                            } else {
-                                rgb(MUTED_COLOR)
-                            };
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .items_start()
-                                        .gap(px(2.))
-                                        .children(
-                                            [11., 8., 5.]
-                                                .into_iter()
-                                                .map(|w| div().w(px(w)).h(px(1.5)).bg(bar_color)),
-                                        ),
-                                )
-                                // Presence, not a count (H5; asides.md §5
-                                // forbids gamified size): a non-empty compost
-                                // leaves a lasting dot on its control — the
-                                // residual trace a transient blink can't be.
-                                .when(self.doc.aside_boundary().is_some(), |d| {
-                                    d.child(
-                                        div()
-                                            .size(px(4.))
-                                            .rounded_full()
-                                            .bg(rgb(0xC9C5BAu32)),
-                                    )
-                                })
-                        }),
-                )
+                // (The compost-rail toggle + its presence dot lived here; the
+                // rail died with the Scraps flip — the footer chip is the
+                // pile's one control, and ctrl-shift-o is the travel verb.)
                 // Document name — click or F2 to rename in place, file and all.
                 .child(match (&self.doc_rename_input, &self.store) {
                     (Some(input), _) => div()
@@ -10865,13 +12129,17 @@ impl Editor {
                             }),
                         )
                         .child({
-                            let count = format_thousands(self.word_count);
+                            // Caret-scoped (P12; scopes-search 5): the label
+                            // names its region once a seam exists, and any
+                            // mid-pile screenshot self-identifies. In scraps
+                            // the goal delta HIDES (not recomputed) — the
+                            // goal is a piece instrument; mixing scopes in
+                            // one chip cuts P12 both ways. A seamed count
+                            // wears the mockup's emphasis (.count b).
+                            let label = self.count_label();
+                            let seamed = self.doc.boundary().is_some();
                             match self.session_goal {
-                                None => div()
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child(format!("{count} words"))
-                                    .into_any_element(),
-                                Some((goal, start)) => {
+                                Some((goal, start)) if !self.caret_in_scraps() => {
                                     let delta = self.word_count as i64 - start as i64;
                                     let reached = delta >= goal as i64;
                                     div()
@@ -10879,7 +12147,14 @@ impl Editor {
                                         .items_center()
                                         .gap(px(6.))
                                         .text_color(rgb(MUTED_COLOR))
-                                        .child(format!("{count} words"))
+                                        .child(
+                                            div()
+                                                .when(seamed, |d| {
+                                                    d.text_color(rgb(TEXT_COLOR))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                })
+                                                .child(label),
+                                        )
                                         .child(if reached {
                                             // Goal met: the separator quietly fills
                                             // in sage. No banner (§4b tension 3).
@@ -10894,6 +12169,14 @@ impl Editor {
                                         .child(format!("{delta:+}/{goal}"))
                                         .into_any_element()
                                 }
+                                _ => div()
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .when(seamed, |d| {
+                                        d.text_color(rgb(TEXT_COLOR))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                    })
+                                    .child(label)
+                                    .into_any_element(),
                             }
                         }),
                 )
@@ -10909,15 +12192,27 @@ impl Editor {
                 Some(input) => {
                     // The find-mode match counter rides right of the query —
                     // where the eye reads it (S7); the ranges are already
-                    // computed for the live preview.
-                    let counter = match omni_mode(&self.palette_query) {
+                    // computed for the live preview. With a seam it announces
+                    // its SPLIT — "7 in the piece · 2 in scraps" — both
+                    // counts data, the scraps half muted (scopes-search 2);
+                    // at the cap it degrades to "500+", never an exact lie.
+                    let counter: Option<String> = match omni_mode(&self.palette_query) {
                         (OmniMode::Find, rest) if !rest.trim().is_empty() => {
-                            let n = self.omni_match_ranges().len();
-                            Some(if n == 0 {
-                                "0".to_owned()
+                            let matches = self.omni_match_ranges();
+                            let n = matches.len();
+                            if n == 0 {
+                                Some("0".to_owned())
                             } else {
-                                format!("{}/{n}", self.palette_selected.min(n - 1) + 1)
-                            })
+                                let k = self.palette_selected.min(n - 1) + 1;
+                                let (piece, scraps, capped) = self.find_split(&matches);
+                                if capped {
+                                    Some(format!("{k}/500+"))
+                                } else if scraps > 0 {
+                                    Some(format!("{k}/{piece} in the piece · {scraps} in scraps"))
+                                } else {
+                                    Some(format!("{k}/{n}"))
+                                }
+                            }
                         }
                         _ => None,
                     };
@@ -11068,6 +12363,34 @@ impl Editor {
                                 editor.toggle_editor_menu(cx);
                             }),
                         )
+                        // The glue probe: the dropdown must sit right-edge-to-
+                        // right-edge with THIS control, so record where the
+                        // control actually painted (see editor_btn_right).
+                        // Plain shared-cell write, never an entity update
+                        // mid-draw. The menu renders BEFORE this runs, so when
+                        // the edge moved this frame (resize, a label change)
+                        // and the menu is up, schedule ONE follow-up frame —
+                        // the EditorElement's geometry-changed idiom; it
+                        // converges as soon as the edge holds still.
+                        .child({
+                            let cell = self.editor_btn_right.clone();
+                            capture_canvas(
+                                move |bounds, window, _| {
+                                    // inset_0 spans the button's PADDING box;
+                                    // add its border back, so the cell holds
+                                    // the control's true painted edge.
+                                    let edge = bounds.right() + px(1.);
+                                    let stale = cell.get() != Some(edge);
+                                    cell.set(Some(edge));
+                                    if stale && open {
+                                        window.request_animation_frame();
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0()
+                        })
                         .when_some(dot, |d, color| {
                             d.child(div().size(px(6.)).rounded_full().bg(rgb(color)))
                         })
@@ -11247,19 +12570,6 @@ impl Editor {
         (vw - DOC_MIN_WIDTH).clamp(180., HISTORY_PANEL_WIDTH)
     }
 
-    /// Width of the outline rail, 0 when closed. Push, not overlay, like
-    /// the history panel; it stands down while history is open (the canvas
-    /// shows a merged diff there — live-doc offsets wouldn't match) and in
-    /// windows too narrow to keep the prose at DOC_MIN_WIDTH.
-    fn rail_width(&self, window: &Window) -> f32 {
-        if !self.rail_open || self.history_view.is_some() {
-            return 0.;
-        }
-        let vw = f32::from(window.viewport_size().width);
-        let free = vw - DOC_MIN_WIDTH;
-        if free < 120. { 0. } else { free.min(RAIL_PANEL_WIDTH) }
-    }
-
     /// The document's headings: (block index, level, text, byte offset of
     /// the heading's start).
     fn outline_items(&self) -> Vec<(usize, u8, String, usize)> {
@@ -11281,186 +12591,183 @@ impl Editor {
         items
     }
 
-    /// The compost items for the sidebar (Bug A): one `(preview, byte_start)`
-    /// per item — a run of non-empty compost blocks (blank lines separate
-    /// items). The preview is the item's first line, ~60 chars. Empty when there
-    /// is no rail (the sidebar is then outline-only, unchanged).
-    fn compost_items(&self) -> Vec<(String, usize)> {
-        let Some(boundary) = self.doc.aside_boundary() else {
-            return Vec::new();
-        };
-        let mut items = Vec::new();
-        let mut byte = 0usize;
-        let mut prev_empty = true; // the first non-empty block opens an item
-        for (ix, line) in self.doc.rope().lines().enumerate() {
-            if ix >= boundary {
-                break;
-            }
-            let s: String = line.chars().filter(|c| *c != '\n').collect();
-            let empty = s.trim().is_empty();
-            if !empty && prev_empty {
-                items.push((s.trim().chars().take(60).collect(), byte));
-            }
-            prev_empty = empty;
-            byte += line.len_bytes();
-        }
-        items
+    /// Is the Scraps region — `[seam_top, grave_header_top)` — intersecting
+    /// the viewport? The Scraps chip's two-sided hide gate (surfaces-attention
+    /// 1): a writer deep in a long record, pile entirely ABOVE the viewport,
+    /// still gets her one-tap way back. Reads the last painted frame (the
+    /// shipped one-frame-lag idiom, like `grave_tail_on_screen`).
+    fn scraps_region_on_screen(&self) -> bool {
+        self.last_frame.as_ref().is_some_and(|f| {
+            f.seam_top.is_some_and(|top| {
+                let end = f.grave_section_top.unwrap_or(f.content_height);
+                top - f.scroll_top < f.bounds.size.height && end - f.scroll_top > px(0.)
+            })
+        })
     }
 
-    /// The compost rail (06 §2): the left panel IS the compost's navigator —
-    /// a header and a row per item; click scrolls to the block and flashes
-    /// it. The outline that used to live here is gone (third-time product
-    /// decision: nobody cares about a header tree in a three-page blogpost);
-    /// heading navigation survives as the palette's `@` mode. An empty
-    /// compost opens to the header and air — no hint, no lecture (P4).
-    fn render_rail(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.compost_items();
-        // Arrival blink (06 §2): the newest item is the compost tail — the
-        // same decaying seltint wash the parked banner's refusal pulse uses.
-        let flash_a = self.rail_flash.map_or(0., |t| {
-            let e = t.elapsed().as_millis() as f32 / 1400.;
-            (0.33 * (1. - e)).clamp(0., 0.33)
-        });
-        let last = items.len().saturating_sub(1);
-        let mut list = div()
-            .id("rail-list")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .px(px(8.))
-            .py(px(6.));
-        for (i, (preview, byte_start)) in items.iter().enumerate() {
-            let jump = *byte_start;
-            list = list.child(
-                div()
-                    .id(("compost-row", i))
-                    .px(px(8.))
-                    .py(px(3.))
-                    .rounded(px(4.))
-                    .cursor(CursorStyle::PointingHand)
-                    .when(i == last && flash_a > 0., |d| {
-                        d.bg(tint(0xC8A951, flash_a))
-                    })
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            editor.move_to(jump, cx); // caret + scroll-to
-                            let c = editor
-                                .doc
-                                .rope()
-                                .byte_to_char(jump.min(editor.doc.len_bytes()));
-                            editor.para_flash = Some((c, Instant::now()));
-                            editor.schedule_flash_clear(cx);
-                            window.focus(&editor.focus_handle, cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .font_family("PT Serif")
-                            .text_color(rgb(MUTED_COLOR))
-                            .child(preview.clone()),
-                    ),
-            );
-        }
-        div()
-            .id("rail-panel")
-            .absolute()
-            .top(px(BAR_HEIGHT))
-            .left_0()
-            .bottom_0()
-            .w(px(panel_w))
-            .bg(rgb(0xF4F1EA))
-            .border_r_1()
-            .border_color(rgb(RULE_COLOR))
-            .flex()
-            .flex_col()
-            .font_family("PT Sans")
-            .text_size(px(12.))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            // The rail owns its wheel (extraction audit #15): its list
-            // scrolls itself; the prose behind must not move with it.
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .px(px(14.))
-                    .py(px(6.))
-                    .border_b_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .text_color(rgb(MUTED_COLOR))
-                    .child("Compost"),
-            )
-            .child(list)
-    }
-
-    /// The sticky graveyard footer bar (docs/impl/02-asides.md §4; asides.md
-    /// §3): "Graveyard · N", the omnipresent navigator. It blinks on an exile
-    /// and, clicked, scrolls to the tail section (the record lives in the scroll
-    /// flow now — Bug B). It HIDES when the section header is on screen ("unsticks
-    /// into the section header"). Right after a cut it carries a transient "put
-    /// back" quick-verb for the just-filed entry (the mockup's gravebar). The ⚰
-    /// glyph is outside the PT fonts, so the coffin is a drawn div.
-    fn render_graveyard_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let n = self.doc.graveyard().len();
-        if n == 0 || self.history_view.is_some() || self.grave_tail_on_screen() {
+    /// The two rhymed footer chips (08 §2; the mockup's .foot), replacing the
+    /// full-width graveyard band: centred pills ordered Scraps → Graveyard —
+    /// the gradient's descent. Each hides while its own section is on screen;
+    /// neither exists before its section does.
+    ///
+    /// The warm Scraps chip carries the region's word count and pulses on
+    /// arrivals (an expanding ring — the mockup's chippulse; reduce_motion
+    /// swaps it for the 420ms ARRIVAL_FLASH blink: luminance, not travel);
+    /// click = the travel verb (latch + seam / pile_end).
+    ///
+    /// The drained Graveyard chip keeps the band's FULL shipped contract
+    /// (surfaces-attention 2): "Graveyard · N" + mark, the 420ms exile blink,
+    /// the transient put-back quick-verb in the flash window, click scrolls
+    /// to the record, hidden while the section header is on screen.
+    fn render_footer_chips(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.history_view.is_some() {
             return None;
         }
-        let flashing = self.grave_flash.is_some();
-        // The quick "put back" appears only in the flash window right after a cut
-        // — the newest entry (last filed). One verb everywhere (P8, P13).
-        let newest = flashing
+        let scraps_chip = matches!(
+            self.doc.boundary(),
+            Some((strop_core::document::BoundaryEra::Tail, _))
+        )
+        .then(|| self.scraps_word_count())
+        .filter(|_| !self.scraps_region_on_screen());
+        let n = self.doc.graveyard().len();
+        let grave_chip = (n > 0 && !self.grave_tail_on_screen()).then_some(n);
+        if scraps_chip.is_none() && grave_chip.is_none() {
+            return None;
+        }
+        let reduce_motion = self.config.reduce_motion;
+        let grave_flashing = self.grave_flash.is_some();
+        // The quick "put back" appears only in the flash window right after a
+        // cut — the newest entry (last filed). One verb everywhere (P8, P13).
+        let newest = grave_flashing
             .then(|| self.doc.graveyard().entries().last().map(|e| e.id))
             .flatten();
         Some(
             div()
-                .id("graveyard-bar")
                 .absolute()
-                .bottom_0()
+                .bottom(px(7.))
                 .left_0()
                 .right_0()
-                .h(px(28.))
                 .flex()
+                .justify_center()
                 .items_center()
-                .gap(px(8.))
-                .px(px(16.))
-                .bg(rgb(if flashing { 0xEFE6D0 } else { 0xF4F1EA }))
-                .border_t_1()
-                .border_color(rgb(RULE_COLOR))
+                .gap(px(10.))
                 .font_family("PT Sans")
-                .text_size(px(12.))
-                .text_color(rgb(if flashing { TEXT_COLOR } else { MUTED_COLOR }))
-                .cursor(CursorStyle::PointingHand)
-                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        editor.scroll_to_graveyard(cx);
-                    }),
-                )
-                .child(tombstone_icon())
-                .child(format!("Graveyard · {n}"))
-                .when_some(newest, |d, id| {
+                .text_size(px(11.5))
+                .when_some(scraps_chip, |d, words| {
+                    let blink = reduce_motion && self.arrival_flash.is_some();
+                    let pulsing = !reduce_motion && self.chip_pulse.is_some();
                     d.child(
                         div()
-                            .id("grave-quick-putback")
-                            .ml(px(4.))
-                            .text_color(rgb(AI_ACCENT))
+                            .relative()
+                            // The pulse ring: an expanding, fading border
+                            // BEHIND the chip — two beats (the mockup's
+                            // chippulse), an event, never a standing light.
+                            .when(pulsing, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .rounded(px(16.))
+                                        .border_2()
+                                        .with_animation(
+                                            ("scraps-chip-pulse", self.chip_pulse_seq),
+                                            Animation::new(Duration::from_millis(CHIP_PULSE_MS)),
+                                            |el, t| {
+                                                let beat = (t * 2.).fract();
+                                                let ease = 1. - (1. - beat).powi(3);
+                                                el.inset(px(-2. - 7. * ease)).border_color(
+                                                    tint(0xC8A951, 0.45 * (1. - ease)),
+                                                )
+                                            },
+                                        ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("scraps-chip")
+                                    .px(px(12.))
+                                    .py(px(2.))
+                                    .rounded(px(12.))
+                                    .border_1()
+                                    .border_color(rgb(0xE5D9B8))
+                                    .bg(if blink {
+                                        rgba(ARRIVAL_FLASH)
+                                    } else {
+                                        rgb(NOTE_CARD_BG)
+                                    })
+                                    .text_color(rgb(TEXT_COLOR))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|d| d.border_color(rgb(ACTIVE_BORDER)))
+                                    .tooltip(tip("Scraps", Some("ctrl-shift-o")))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            editor.scraps_travel(&ScrapsTravel, window, cx);
+                                        }),
+                                    )
+                                    .child(format!(
+                                        "Scraps · {}",
+                                        format_thousands(words)
+                                    )),
+                            ),
+                    )
+                })
+                .when_some(grave_chip, |d, n| {
+                    d.child(
+                        div()
+                            .id("graveyard-chip")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .px(px(12.))
+                            .py(px(2.))
+                            .rounded(px(12.))
+                            .border_1()
+                            .border_color(rgb(STALE_BG))
+                            .bg(if grave_flashing {
+                                rgba(ARRIVAL_FLASH)
+                            } else {
+                                rgb(STALE_BG)
+                            })
+                            .text_color(rgb(if grave_flashing {
+                                TEXT_COLOR
+                            } else {
+                                MUTED_COLOR
+                            }))
                             .cursor(CursorStyle::PointingHand)
                             .hover(|d| d.text_color(rgb(TEXT_COLOR)))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                                     cx.stop_propagation();
-                                    editor.put_back_entry(id, cx);
+                                    editor.scroll_to_graveyard(cx);
                                 }),
                             )
-                            .child("put back"),
+                            .child(tombstone_icon())
+                            .child(format!("Graveyard · {n}"))
+                            .when_some(newest, |d, id| {
+                                d.child(
+                                    div()
+                                        .id("grave-quick-putback")
+                                        .ml(px(2.))
+                                        .text_color(rgb(MUTED_COLOR))
+                                        .border_b_1()
+                                        .border_dashed()
+                                        .border_color(rgb(MUTED_COLOR))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |editor, _: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    editor.put_back_entry(id, cx);
+                                                },
+                                            ),
+                                        )
+                                        .child("put back"),
+                                )
+                            }),
                     )
                 }),
         )
@@ -12375,12 +13682,57 @@ enum OmniRow {
     Match {
         line: usize,
         snippet: String,
+        /// The match starts below the seam: the row wears a muted "scraps"
+        /// tag as data (scopes-search 2/7 — a row that teleports into the
+        /// pile must self-identify).
+        scraps: bool,
     },
     Heading {
         byte: usize,
         level: u8,
         text: String,
+        /// A heading typed inside the pile (in document order, tagged).
+        scraps: bool,
     },
+}
+
+/// The section a grouped-mode (bare `>`) row falls under — "" for rows that
+/// never group (find/heading/command-with-query). Shared by `render_omni`
+/// (to know when to insert a header) and `omni_child_index` (to know it did)
+/// so the two can't drift apart.
+fn omni_row_section(row: &OmniRow) -> &'static str {
+    match row {
+        OmniRow::Cmd(cmd) => cmd.section,
+        OmniRow::Frequent(_) => "Frequent",
+        OmniRow::Recent(_) => "Recent Documents",
+        _ => "",
+    }
+}
+
+/// Where row `ix` lands among the omni-list's direct children. Outside
+/// grouped mode this is just `ix`; grouped mode (the bare `>` browsing view)
+/// interleaves a section-header div ahead of each new section, so every row
+/// after the first section boundary sits one or more children further along
+/// than its index in `rows` — `render_omni` and `omni_scroll_into_view` both
+/// need this mapping to agree, since one lays the headers out and the other
+/// scrolls to a row assuming they're there.
+fn omni_child_index(rows: &[OmniRow], grouped: bool, ix: usize) -> usize {
+    let mut child = 0;
+    let mut last_section = "";
+    for (row_ix, row) in rows.iter().enumerate() {
+        if grouped {
+            let section = omni_row_section(row);
+            if section != last_section {
+                last_section = section;
+                child += 1;
+            }
+        }
+        if row_ix == ix {
+            return child;
+        }
+        child += 1;
+    }
+    child
 }
 
 /// The AI surface's state machine (PLAN.md E3). Status lives where the
@@ -12575,6 +13927,12 @@ struct PreviewDoc {
     deletes: Vec<Range<usize>>,
     spans_bytes: Vec<(Range<usize>, InlineAttr)>,
     kinds: Vec<BlockKind>,
+    /// The previewed state's OWN boundary + era (time-persistence 5: "past
+    /// states keep their own geometry" is about what the writer SEES). The
+    /// strip carries the reconstruction's exact seam; the panel's
+    /// two-geometry diff takes the newer side's (the same rule its block
+    /// styles follow). Drawn read-only; None = no seam at that moment.
+    boundary: Option<(strop_core::document::BoundaryEra, usize)>,
 }
 
 struct MarginLayout {
@@ -12632,6 +13990,10 @@ struct MarginCard {
     /// anchor (title only, muted) instead of the full card. Never true for
     /// writer notes or the selected card; `height` is COLLAPSED_CARD_H.
     collapsed: bool,
+    /// `Some(record_id)` = this is the caret-block's provenance one-liner
+    /// (08 §2): muted machine bookkeeping, no card fill, carrying the quiet
+    /// Put back verb. `body` holds the one-liner text.
+    provenance: Option<u64>,
 }
 
 /// A note card's header label: "Note" / a diagnosis level (or "Diagnosis"),
@@ -12921,6 +14283,22 @@ fn move_slide<E: Styled + IntoElement + 'static>(
 /// receded one-liner included — so the fading light reads as the same object,
 /// and a collapsed card's ghost never sprawls over its neighbours.
 fn ghost_card(card: &MarginCard) -> gpui::Div {
+    // The provenance one-liner's ghost: the same quiet row, no card fill —
+    // its leave is instant in the model, this echo is the 150ms light.
+    if card.provenance.is_some() {
+        return div()
+            .absolute()
+            .top(px(card.top.max(4.)))
+            .left(px(8.))
+            .w(px(MARGIN_WIDTH - 8.))
+            .h(px(PROV_CARD_H))
+            .flex()
+            .items_center()
+            .font_family("PT Sans")
+            .text_size(px(10.5))
+            .text_color(rgb(MUTED_COLOR))
+            .child(div().min_w(px(0.)).truncate().child(card.body.clone()));
+    }
     let is_diagnosis = card.kind == NoteKind::Diagnosis;
     let base = div()
         .absolute()
@@ -13195,7 +14573,55 @@ impl Editor {
                 unverified: n.unverified,
                 pass_id: n.pass_id,
                 collapsed: false,
+                provenance: None,
             });
+        }
+        // The caret-block's provenance one-liner (08 §2; surfaces-attention
+        // 5): a packer citizen beside the real cards, shown only after the
+        // caret has RESTED inside a parked block one caret-blink. Muted
+        // machine bookkeeping — no card fill — carrying the quiet Put back.
+        // Anchor order is kept so the placement pass stacks it honestly.
+        if let Some((rec_id, since)) = self.prov_rest
+            && since.elapsed() >= PROV_REST_DELAY
+            && let Some(rec) = self
+                .doc
+                .provenance()
+                .records()
+                .iter()
+                .find(|r| r.id == rec_id)
+        {
+            let byte = rope.char_to_byte(rec.range.start.min(rope.len_chars())).min(len);
+            if let Some(pos) = frame.position_of(byte, false) {
+                let desired = f32::from(frame.bounds.origin.y) + f32::from(pos.y)
+                    - f32::from(frame.scroll_top);
+                let date = strip::date_label(
+                    rec.parked_unix,
+                    strop_core::journal::now_ms() / 1000,
+                );
+                // The quote is a TRAILING fragment: keep its tail so the
+                // one-liner's date and verb survive the lane's width.
+                let quote: String = {
+                    let tail: Vec<char> = rec.origin_quote.chars().rev().take(24).collect();
+                    tail.into_iter().rev().collect()
+                };
+                cards.push(MarginCard {
+                    id: PROV_ID_FLAG | rec_id,
+                    top: desired,
+                    anchor_y: f32::from(pos.y),
+                    height: PROV_CARD_H,
+                    body: format!("from \u{201C}\u{2026}{quote}\u{201D} · {date}"),
+                    active: false,
+                    kind: NoteKind::Note,
+                    title: String::new(),
+                    level: String::new(),
+                    orphaned: false,
+                    unverified: false,
+                    pass_id: 0,
+                    collapsed: false,
+                    provenance: Some(rec_id),
+                });
+                cards.sort_by(|a, b| a.top.total_cmp(&b.top));
+            }
         }
         // The full-size budget (FULL_DIAGNOSIS_CAP): among the diagnoses that
         // made it into THIS lane, the newest few render full and older passes
@@ -13313,8 +14739,20 @@ impl Editor {
         self.moving
             .retain(|id, mv| present.contains(id) && mv.start.elapsed() < mv.total());
         self.lane_tops.retain(|id, _| present.contains(id));
-        let snap =
-            scrolled || resized || self.focus.composing_id().is_some() || self.typing_burst_live();
+        // A lane diff caused by CARET TRAVEL — the provenance row appearing,
+        // leaving, or re-anchoring to another scrap — snaps: never animate
+        // against the writer's own continuous movement (surfaces-attention 5).
+        let prov_now = layout
+            .cards
+            .iter()
+            .find_map(|c| c.provenance.map(|_| c.id));
+        let prov_changed = prov_now != self.lane_prov_last;
+        self.lane_prov_last = prov_now;
+        let snap = scrolled
+            || resized
+            || prov_changed
+            || self.focus.composing_id().is_some()
+            || self.typing_burst_live();
         if snap {
             self.moving.clear();
             self.lane_tops = now_tops.into_iter().collect();
@@ -13327,6 +14765,11 @@ impl Editor {
         let reduce = self.config.reduce_motion;
         let mut started = false;
         for (i, &(id, from, to)) in moves.iter().enumerate() {
+            // The provenance one-liner only FADES, never slides — a re-pack
+            // that would move it just re-places it (surfaces-attention 5).
+            if id & PROV_ID_FLAG != 0 {
+                continue;
+            }
             started = true;
             if let Some(mv) = self.moving.get_mut(&id) {
                 // Mid-flight and the pack moved again: head for the new
@@ -13935,11 +15378,54 @@ impl Editor {
                         orphaned,
                         unverified,
                         collapsed,
+                        provenance,
                         ..
                     } = card;
                     // Inside its entrance fade? (One fade per landed pass;
                     // never replayed — see appear_fade.)
                     let is_new = self.appearing.contains(&id);
+                    // The provenance one-liner (08 §2; the mockup's .prov):
+                    // muted machine bookkeeping, NO card fill, carrying the
+                    // quiet Put back in its one dress — muted ink, dotted
+                    // underline (token audit A5). Enters by the appear fade,
+                    // leaves by the departing ghost, never slides.
+                    if let Some(rec_id) = provenance {
+                        let row = div()
+                            .id(("prov-line", rec_id as usize))
+                            .absolute()
+                            .top(px(top.max(4.)))
+                            .left(px(8.))
+                            .w(px(MARGIN_WIDTH - 8.))
+                            .h(px(PROV_CARD_H))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .font_family("PT Sans")
+                            .text_size(px(10.5))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(div().min_w(px(0.)).truncate().child(body.clone()))
+                            .child(
+                                div()
+                                    .id(("prov-putback", rec_id as usize))
+                                    .flex_shrink_0()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .border_b_1()
+                                    .border_dashed()
+                                    .border_color(rgb(MUTED_COLOR))
+                                    .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |editor, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                editor.put_back_scrap_record(rec_id, cx);
+                                            },
+                                        ),
+                                    )
+                                    .child("Put back"),
+                            );
+                        return appear_fade(row, id, is_new);
+                    }
                     // Receded (over the full-size budget): one muted title line
                     // at the anchor — present and clickable, just smaller, the
                     // way dense marginalia shrink on paper. Clicking selects it,
@@ -14240,30 +15726,96 @@ impl Editor {
     /// unclickable (review H33: cooking or a history preview must not dispatch);
     /// a `gate` reason livens the copy row's `when` line — the only row that
     /// explains, because the gate is data (no "usually after…" advice anywhere).
+    ///
+    /// The dress is the lab's `.erow`/`.vq`: the read's VERB in a bold face,
+    /// its qualifier in small muted ink on the SAME line (never the wrapped
+    /// serif paragraph this replaced), a full-bleed cool hover wash (this is
+    /// the MACHINE's menu; the selection menu's writer verbs wash warm). P12
+    /// accents — the control is the indicator: the row whose read the machine
+    /// holds right now (cooking, or parked behind the reveal clock) wears the
+    /// same cool dot the button pulses, and the row ctrl-shift-d currently
+    /// aims at teaches its chord as a keycap chip (the chip FOLLOWS the
+    /// session depth, so the default read is always marked).
     fn editor_menu_row(
         &self,
         id: &'static str,
-        text: &'static str,
+        (verb, qualifier): (&'static str, &'static str),
         kind: PassKind,
         inert: bool,
         gate: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let disabled = inert || gate.is_some();
+        let held = self.last_pass == kind
+            && (matches!(self.ai_status, Some(AiStatus::Running { .. }))
+                || self.deferred_pass.is_some());
+        let chord = match &kind {
+            PassKind::Believing => Some("ctrl-shift-b"),
+            PassKind::Diagnostic(mode) if *mode == self.effective_mode() => Some("ctrl-shift-d"),
+            _ => None,
+        };
         let base = div()
             .id(id)
+            .relative()
             .px(px(12.))
-            .py(px(6.))
-            .rounded(px(5.))
+            .py(px(7.))
             .flex()
             .flex_col()
-            .gap(px(1.))
+            .gap(px(2.))
+            // The held dot rides the padding band as an overlay, so the verb
+            // column never shifts when a read starts or parks.
+            .when(held, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(px(3.))
+                        .top_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .child(div().size(px(6.)).rounded_full().bg(rgb(AI_ACCENT))),
+                )
+            })
             .child(
                 div()
-                    .text_size(px(13.))
-                    .font_family("PT Serif")
-                    .text_color(rgb(if disabled { MUTED_COLOR } else { TEXT_COLOR }))
-                    .child(text),
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(13.))
+                            .text_color(rgb(if disabled { MUTED_COLOR } else { TEXT_COLOR }))
+                            .child(verb),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(qualifier),
+                    )
+                    // The chord chip (the lab's `.k` keycap, the selection
+                    // menu's exact dress): the menu teaches its own shortcuts
+                    // in place, instead of a manual teaching them in prose.
+                    .when_some(chord, |d, chord| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .px(px(3.))
+                                .font_family(CODE_FONT)
+                                .text_size(px(9.))
+                                .text_color(rgb(MUTED_COLOR))
+                                .border_1()
+                                .border_color(rgb(RULE_COLOR))
+                                .rounded(px(4.))
+                                .bg(rgb(BG_COLOR))
+                                .child(chord),
+                        )
+                    }),
             );
         let base = match gate {
             Some(reason) => base.child(
@@ -14278,7 +15830,7 @@ impl Editor {
             base.into_any_element()
         } else {
             base.cursor(CursorStyle::PointingHand)
-                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                .hover(|d| d.bg(rgb(DIAGNOSIS_CARD_BG)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
@@ -14294,10 +15846,17 @@ impl Editor {
     }
 
     /// The editor button's dropdown (impl 04 §0): the AI subsystem's single
-    /// home, glued flush under the titlebar control (right edges aligned — the
-    /// lab's fix for the detached-dropdown sin), borrowing the narrow-notes
-    /// panel's anchoring idiom (a bool-toggled overlay, light-dismissed + Esc).
-    fn render_editor_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// home, glued flush under the titlebar control (right edges aligned, top
+    /// corners squared into the bar — the lab's fix for the detached-dropdown
+    /// sin), borrowing the narrow-notes panel's anchoring idiom (a bool-toggled
+    /// overlay, light-dismissed + Esc). Surface dress is the selection menu's
+    /// shipped values (CARD_BG, RULE hairline, 9px rounding), so the two verb
+    /// menus read as one family.
+    fn render_editor_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         if !self.editor_menu_open {
             return None;
         }
@@ -14314,17 +15873,27 @@ impl Editor {
         let copy_gate = self
             .copy_gated()
             .then_some("after the structural queries settle");
-        // Anchored flush under the button, right edges aligned. Everything to
-        // the button's right is fixed-width chrome: palette-toggle (27) +
-        // history-toggle (31) [+ the three drawn window controls, 3×34, on
-        // non-macOS — macOS keeps its traffic lights top-LEFT]. So the button's
-        // right edge — and thus the menu's — sits this far from the content edge.
-        let menu_right = if cfg!(target_os = "macos") { 58. } else { 160. };
+        // Anchored flush under the button, right edges aligned — against the
+        // button's PAINTED edge (the capture canvas inside the control), not
+        // a fixed-width estimate of the chrome right of it: those controls
+        // flex-shrink in a narrow bar, which left the estimate ~75px off its
+        // control. The estimate survives only as the first-frame fallback
+        // (palette-toggle 27 + history-toggle 4+31 [+ 3×34 drawn window
+        // controls off macOS — its traffic lights sit top-LEFT]).
+        let vw = f32::from(window.viewport_size().width);
+        let est = vw - if cfg!(target_os = "macos") { 62. } else { 164. };
+        let btn_right = self.editor_btn_right.get().map_or(est, f32::from);
+        let menu_right = (vw - btn_right).max(8.);
+        // The lab's one-line law (392 there, chipless): verb + qualifier +
+        // the keycap chip hold ONE line — 430 clears the longest row (the
+        // believing read's qualifier beside its ctrl-shift-b chip). A window
+        // too narrow for that cedes width, never the button's edge.
+        let menu_w = 430f32.min(vw - menu_right - 8.);
         let door_open = !self.drafting;
         let footer = div()
-            .pt(px(6.))
+            .pt(px(7.))
             .px(px(12.))
-            .pb(px(2.))
+            .pb(px(8.))
             .border_t_1()
             .border_color(rgb(RULE_COLOR))
             .flex()
@@ -14338,8 +15907,9 @@ impl Editor {
             )))
             .child(
                 // The presence pair (glossary): Reading (door open) / Away
-                // (drafting). A drawn toggle — the current pole is emphasized, a
-                // click flips it through toggle_door's flush semantics. No "⇄"
+                // (drafting). A drawn toggle — the current pole wears the ink
+                // AND the weight (never color alone, WCAG 1.4.1); a click
+                // flips it through toggle_door's flush semantics. No "⇄"
                 // glyph (not in the bundled PT fonts); a dot divides the poles.
                 div()
                     .id("editor-menu-door")
@@ -14359,26 +15929,37 @@ impl Editor {
                             editor.toggle_door(cx);
                         }),
                     )
-                    .child(div().text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR })).child("Reading"))
+                    .child(
+                        div()
+                            .text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR }))
+                            .when(door_open, |d| d.font_weight(FontWeight::BOLD))
+                            .child("Reading"),
+                    )
                     .child(div().size(px(3.)).rounded_full().bg(rgb(MUTED_COLOR)))
-                    .child(div().text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR })).child("Away")),
+                    .child(
+                        div()
+                            .text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR }))
+                            .when(!door_open, |d| d.font_weight(FontWeight::BOLD))
+                            .child("Away"),
+                    ),
             );
         Some(
             div()
                 .id("editor-menu")
                 .absolute()
-                .top(px(BAR_HEIGHT + 4.))
+                // Overlap the bar's own hairline by 1px: the menu's top border
+                // paints over it in the same RULE ink, so control and menu
+                // share ONE hairline — glued, with the top corners squared.
+                .top(px(BAR_HEIGHT - 1.))
                 .right(px(menu_right))
-                .w(px(292.))
-                .bg(rgb(0xFCFAF4))
+                .w(px(menu_w))
+                .bg(rgb(CARD_BG))
                 .border_1()
                 .border_color(rgb(RULE_COLOR))
-                .rounded(px(8.))
+                .rounded_b(px(9.))
                 .shadow_lg()
-                .py(px(6.))
                 .flex()
                 .flex_col()
-                .gap(px(1.))
                 .font_family("PT Sans")
                 .text_color(rgb(TEXT_COLOR))
                 // Contained like the palette/narrow panel: clicks/scroll stay in.
@@ -14387,14 +15968,15 @@ impl Editor {
                 .child(
                     div()
                         .px(px(12.))
-                        .py(px(4.))
+                        .pt(px(8.))
+                        .pb(px(3.))
                         .text_size(px(11.))
                         .text_color(rgb(MUTED_COLOR))
                         .child("Ask the editor for…"),
                 )
                 .child(self.editor_menu_row(
                     "er-believing",
-                    "A believing read — what's alive here, what it's secretly about",
+                    ("A believing read", "— what's alive here, what it's secretly about"),
                     PassKind::Believing,
                     inert,
                     None,
@@ -14402,7 +15984,7 @@ impl Editor {
                 ))
                 .child(self.editor_menu_row(
                     "er-developmental",
-                    "A developmental read — the structure: stakes, turns, the ending",
+                    ("A developmental read", "— the structure: stakes, turns, the ending"),
                     PassKind::Diagnostic("developmental".to_owned()),
                     inert,
                     None,
@@ -14410,7 +15992,7 @@ impl Editor {
                 ))
                 .child(self.editor_menu_row(
                     "er-line",
-                    "A line read — rhythm, imagery, dialogue",
+                    ("A line read", "— rhythm, imagery, dialogue"),
                     PassKind::Diagnostic("line".to_owned()),
                     inert,
                     None,
@@ -14418,7 +16000,7 @@ impl Editor {
                 ))
                 .child(self.editor_menu_row(
                     "er-copy",
-                    "A copy read — slips, typos, repetitions",
+                    ("A copy read", "— slips, typos, repetitions"),
                     PassKind::Diagnostic("copy".to_owned()),
                     inert,
                     copy_gate,
@@ -14426,7 +16008,7 @@ impl Editor {
                 ))
                 .child(self.editor_menu_row(
                     "er-doubting",
-                    "A doubting read — the strongest case against it",
+                    ("A doubting read", "— the strongest case against it"),
                     PassKind::Doubting,
                     inert,
                     None,
@@ -14602,6 +16184,40 @@ impl Editor {
     /// stacked (non-absolute) box. No inline composer — a writer's note opens
     /// the bottom strip on click; diagnoses are read-only here as everywhere.
     fn narrow_note_card(&self, card: &MarginCard, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The caret-block's provenance rides the narrow drawer exactly as
+        // cards do (surfaces-attention 6) — same quiet row, same Put back.
+        if let Some(rec_id) = card.provenance {
+            return div()
+                .id(("narrow-prov", rec_id as usize))
+                .px(px(8.))
+                .py(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .font_family("PT Sans")
+                .text_size(px(10.5))
+                .text_color(rgb(MUTED_COLOR))
+                .child(div().min_w(px(0.)).truncate().child(card.body.clone()))
+                .child(
+                    div()
+                        .id(("narrow-prov-putback", rec_id as usize))
+                        .flex_shrink_0()
+                        .cursor(CursorStyle::PointingHand)
+                        .border_b_1()
+                        .border_dashed()
+                        .border_color(rgb(MUTED_COLOR))
+                        .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                editor.put_back_scrap_record(rec_id, cx);
+                            }),
+                        )
+                        .child("Put back"),
+                )
+                .into_any_element();
+        }
         let MarginCard { id, body, kind, title, level, orphaned, .. } = card;
         let (id, kind) = (*id, *kind);
         let is_diagnosis = kind == NoteKind::Diagnosis;
@@ -14695,9 +16311,6 @@ impl Render for Editor {
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
         let hist_panel_w = self.history_panel_width(window);
-        // The outline rail OVERLAYS the reserved left margin now (no push) —
-        // rail_w is still its width, for the rail's own render.
-        let rail_w = self.rail_width(window);
         let in_history = self.history_view.is_some();
         // The column's left inset and width — a pure function of viewport width
         // (column_frame): the no-jump invariant. Used only outside history.
@@ -14749,7 +16362,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::save_copy_as))
             .on_action(cx.listener(Self::export_markdown))
             .on_action(cx.listener(Self::find))
-            .on_action(cx.listener(Self::toggle_rail))
+            .on_action(cx.listener(Self::scraps_travel))
             .on_action(cx.listener(Self::toggle_graveyard))
             .on_action(cx.listener(Self::run_diagnosis))
             .on_action(cx.listener(Self::run_believing))
@@ -14893,10 +16506,12 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::mode_copy))
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::open_welcome))
-                    .on_action(cx.listener(Self::toggle_rail))
+                    .on_action(cx.listener(Self::scraps_travel))
                     .on_action(cx.listener(Self::set_session_goal))
                     .on_action(cx.listener(Self::set_aside))
                     .on_action(cx.listener(Self::send_to_graveyard))
+                    .on_action(cx.listener(Self::move_to_manuscript))
+                    .on_action(cx.listener(Self::put_back_scrap))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -14938,7 +16553,6 @@ impl Render for Editor {
                 d.child(self.render_history_banner(hist_panel_w, cx))
                     .child(self.render_history_panel(hist_panel_w, cx))
             })
-            .when(rail_w > 0., |d| d.child(self.render_rail(rail_w, cx)))
             .map(|d| {
                 // The footnote zone keys off live-doc offsets; in history
                 // the canvas shows the merged diff, so it stands down.
@@ -15008,12 +16622,19 @@ impl Render for Editor {
                 Some(whisper) => d.child(whisper),
                 None => d,
             })
-            // The graveyard's sticky footer navigator (asides.md §3): a bottom
-            // overlay that scrolls to the tail section and unsticks (hides) once
-            // that section's header is on screen. The record itself is painted in
-            // the scroll flow by the EditorElement (Bug B) — no overlay panel.
-            .map(|d| match self.render_graveyard_bar(cx) {
-                Some(bar) => d.child(bar),
+            // The two rhymed footer chips (08 §2): warm Scraps + drained
+            // Graveyard, each a navigator that hides while its own section is
+            // on screen. The sections themselves are painted in the scroll
+            // flow by the EditorElement — no overlay panels.
+            .map(|d| match self.render_footer_chips(cx) {
+                Some(chips) => d.child(chips),
+                None => d,
+            })
+            // The park receipt's origin ghost: a brief viewport-frozen echo
+            // of the departed block over the closed-up prose (08 §2 — the
+            // receipt is an arrival, and the departure must be seen too).
+            .map(|d| match self.render_park_ghost() {
+                Some(ghost) => d.child(ghost),
                 None => d,
             })
             // Narrow-window notes: the count pill (low — just feedback) and,
@@ -15039,7 +16660,7 @@ impl Render for Editor {
                 None => d,
             })
             // The editor button's dropdown, glued under its titlebar control.
-            .map(|d| match self.render_editor_menu(cx) {
+            .map(|d| match self.render_editor_menu(window, cx) {
                 Some(menu) => d.child(menu),
                 None => d,
             })
@@ -15907,18 +17528,19 @@ mod tests {
     }
 
     #[test]
-    fn auto_cut_fires_only_on_a_big_manuscript_deletion() {
-        // At/over the threshold, a pure deletion inside the manuscript fires.
-        assert!(auto_cut_qualifies("", AUTO_CUT_MIN_CHARS, 100, 0));
-        assert!(auto_cut_qualifies("", 500, 100, 40));
-        // Just under the threshold does NOT (both sides of the boundary case).
-        assert!(!auto_cut_qualifies("", AUTO_CUT_MIN_CHARS - 1, 100, 0));
+    fn auto_cut_fires_only_on_a_big_selection_deletion() {
+        // At/over the threshold, a pure selection-deletion fires — on EITHER
+        // side of the seam (one capture law, graveyard-interplay 5; the old
+        // region gate is gone — capture is region-agnostic, the ENTRY is
+        // region-honest instead).
+        assert!(auto_cut_qualifies("", AUTO_CUT_MIN_CHARS));
+        assert!(auto_cut_qualifies("", 500));
+        // Just under the threshold does NOT.
+        assert!(!auto_cut_qualifies("", AUTO_CUT_MIN_CHARS - 1));
         // A replace-by-typing never files, however large the deleted run.
-        assert!(!auto_cut_qualifies("x", 500, 100, 0));
-        // A compost deletion (before the manuscript base) is a move, not a cut.
-        assert!(!auto_cut_qualifies("", 200, 5, 40));
+        assert!(!auto_cut_qualifies("x", 500));
         // An empty selection never fires.
-        assert!(!auto_cut_qualifies("", 0, 100, 0));
+        assert!(!auto_cut_qualifies("", 0));
     }
 
     #[test]

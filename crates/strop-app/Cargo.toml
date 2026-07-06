@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 strop-core = { workspace = true }
+ropey = { workspace = true }
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
 directories = "6"

@@ -308,17 +308,166 @@ expect "the preview walks the selection"     '[1,2]' "$(echo "$O2" | grep -oE '"
 expect "Esc returns focus to the prose"      '"Editor"' "$(field "$O3" focused)"
 expect "Esc walks the selection home"        '[6,6]' "$(echo "$O3" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')"
 
-echo "rig-check: set-aside shows compliance — the rail opens on first birth and never self-closes"
+echo "rig-check: keyboard nav past the fold scrolls the omni-list; wheel still works (palette-scroll)"
+# f10 opens the omnibox straight into command mode (bare `>`) — the grouped
+# Frequent/File/Edit/… browsing view, comfortably longer than the 420px
+# list, so 20 downs walks the highlight well past the visible window. The
+# bug: palette_up/down moved `palette_selected` but never scrolled, so the
+# writer navigated blind. The fix nudges a tracked ScrollHandle on every
+# selection change; a manual wheel scroll afterwards must still work AND
+# must not get snapped back by an unrelated redraw (the wait:200 with no
+# input in between).
+DOCP=$(mktemp --suffix=.md); : > "$DOCP"
+KEYS="f10"
+for _ in $(seq 1 20); do KEYS="$KEYS down"; done
+KEYS="$KEYS dump:ui wheel:800,300,300 dump:ui wait:200 dump:ui"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCP" "$KEYS" 2>/dev/null | grep -oE '"omni":\{[^}]*\}')
+P1=$(echo "$OUT" | sed -n 1p); P2=$(echo "$OUT" | sed -n 2p); P3=$(echo "$OUT" | sed -n 3p)
+[ -n "$P3" ] || { echo "  FAIL no omni dump"; exit 1; }
+rm -f "$DOCP" "$DOCP.strop"
+expect "20 downs select row 20" 20 "$(field "$P1" selected)"
+S1=$(field "$P1" scroll_y); S2=$(field "$P2" scroll_y); S3=$(field "$P3" scroll_y)
+if awk "BEGIN{exit !($S1 < -1)}" 2>/dev/null; then
+  echo "  ok   the list scrolled to keep row 20 visible (scroll_y=$S1)"
+else
+  echo "  FAIL row 20 selected but scroll_y=$S1 — navigation walked off-screen blind"; fail=1
+fi
+if [ "$S2" != "$S1" ]; then echo "  ok   the wheel still moves the list ($S1 -> $S2)"; else
+  echo "  FAIL wheel did not move scroll_y ($S1)"; fail=1; fi
+expect "selection is untouched by the wheel"            20  "$(field "$P2" selected)"
+expect "an unrelated redraw doesn't snap the wheel back" "$S2" "$S3"
+
+echo "rig-check: set-aside births the region — the chip exists, the receipt fires"
+# The pile lives at the TAIL (the Scraps flip): the first aside is the
+# ADOPTION of the trailing paragraph (its blank divider becomes the seam);
+# the second parks the manuscript's first paragraph. The rail is dead — the
+# compliance signal is the chip's existence + the arrival pulse.
 DOCR=$(mktemp --suffix=.md); : > "$DOCR"
-OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCR" "onexx enter enter twoxx ctrl-home select:para aside:selection wait:80 dump:ui ctrl-end select:para aside:selection wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCR" "onexx enter enter twoxx ctrl-end select:para aside:selection wait:80 dump:ui ctrl-home select:para aside:selection wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
 R1=$(echo "$OUT" | sed -n 1p); R2=$(echo "$OUT" | sed -n 2p)
 [ -n "$R2" ] || { echo "  FAIL no dump"; exit 1; }
 rm -f "$DOCR" "$DOCR.strop"
-expect "the first aside opens the rail"      true "$(field "$R1" rail)"
-expect "the second aside keeps it open"      true "$(field "$R2" rail)"
+expect "the first aside births the region"   true "$(field "$R1" scraps_chip_exists)"
+expect "the second park keeps it"            true "$(field "$R2" scraps_chip_exists)"
+expect "the park's chip receipt fired"       true "$(field "$R2" chip_pulse)"
 CBR=$(field "$R2" compost_blocks)
-if [ "${CBR:-0}" -gt 1 ] 2>/dev/null; then echo "  ok   both passages landed in the compost (compost_blocks=$CBR)"; else
+if [ "${CBR:-0}" -gt 1 ] 2>/dev/null; then echo "  ok   both passages landed in the scraps (compost_blocks=$CBR)"; else
   echo "  FAIL compost_blocks=$CBR"; fail=1; fi
+
+echo "rig-check: the excursion latch — travel latches, walked-in carets stay plain text"
+# scraps:travel (the chip / ctrl-shift-o) arms the latch; Esc returns exactly
+# home and writes pile_end; a later travel RESUMES pile_end (both ends). A
+# caret the writer walked in herself (ctrl-end) never latches — Esc is inert.
+DOCX=$(mktemp --suffix=.md); : > "$DOCX"
+OUT=$(WRUN_TAIL=120 scripts/wrun.sh "$DOCX" "seed:demo ctrl-home dump:ui scraps:travel dump:ui x dump:ui escape dump:ui scraps:travel dump:ui escape ctrl-end dump:ui escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
+X1=$(echo "$OUT" | sed -n 1p); X2=$(echo "$OUT" | sed -n 2p); X3=$(echo "$OUT" | sed -n 3p)
+X4=$(echo "$OUT" | sed -n 4p); X5=$(echo "$OUT" | sed -n 5p); X6=$(echo "$OUT" | sed -n 6p); X7=$(echo "$OUT" | sed -n 7p)
+[ -n "$X7" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCX" "$DOCX.strop"
+expect "at rest: unlatched"                    false "$(field "$X1" latched)"
+expect "travel arms the latch"                 true  "$(field "$X2" latched)"
+expect "travel enters the pile"                true  "$(field "$X2" caret_scraps)"
+expect "the count control flips to scraps"     '"scraps' "$(field "$X2" count_label | cut -d' ' -f1)"
+expect "typing INSIDE keeps the latch"         true  "$(field "$X3" latched)"
+expect "Esc travels home"                      false "$(field "$X4" caret_scraps)"
+expect "Esc drops the latch"                   false "$(field "$X4" latched)"
+PE=$(field "$X4" pile_end)
+if [ "${PE:-null}" != "null" ]; then echo "  ok   Esc wrote pile_end ($PE)"; else
+  echo "  FAIL pile_end=$PE — the skim stop was not remembered"; fail=1; fi
+S5=$(echo "$X5" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')
+if [ "$S5" = "[$PE,$PE]" ]; then echo "  ok   the next travel resumes pile_end ($S5)"; else
+  echo "  FAIL travel resumed at $S5, wanted [$PE,$PE]"; fail=1; fi
+expect "ctrl-end walks in unlatched"           false "$(field "$X6" latched)"
+expect "walked-in caret is in the pile"        true  "$(field "$X6" caret_scraps)"
+expect "Esc on a walked-in caret is inert"     true  "$(field "$X7" caret_scraps)"
+
+echo "rig-check: the chips exist with their sections and hide with them on screen"
+# A LONG doc with a park at its head: the pile lands at the far tail, off
+# screen, so the Scraps chip must SHOW; scrolled to the tail, the region is
+# on screen and it must hide (the two-sided gate, surfaces-attention 1).
+DOCY=$(mktemp --suffix=.md); cp "$DOC" "$DOCY"
+OUT=$(WRUN_TAIL=120 scripts/wrun.sh "$DOCY" "ctrl-home select:para aside:selection wait:80 dump:ui ctrl-end wait:80 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+Y1=$(echo "$OUT" | sed -n 1p); Y2=$(echo "$OUT" | sed -n 2p)
+[ -n "$Y2" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCY" "$DOCY.strop"
+expect "the chip exists once the region does"  true  "$(field "$Y1" scraps_chip_exists)"
+expect "seam off-screen: the chip shows"       false "$(field "$Y1" scraps_chip_hidden)"
+expect "the park's receipt pulsed the chip"    true  "$(field "$Y1" chip_pulse)"
+expect "seam on screen: the chip hides"        true  "$(field "$Y2" scraps_chip_hidden)"
+
+echo "rig-check: the park receipt — origin ghost now, gone after its fade"
+DOCG=$(mktemp --suffix=.md); cp "$DOC" "$DOCG"
+OUT=$(WRUN_TAIL=120 scripts/wrun.sh "$DOCG" "ctrl-home select:para aside:selection dump:ui wait:400 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+G1=$(echo "$OUT" | sed -n 1p); G2=$(echo "$OUT" | sed -n 2p)
+[ -n "$G2" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCG" "$DOCG.strop"
+expect "the origin ghost is up at commit"      true  "$(field "$G1" park_ghost)"
+expect "the ghost is gone after its fade"      false "$(field "$G2" park_ghost)"
+
+echo "rig-check: the retype-race guard — a textless pile holds its seam until the caret leaves"
+DOCE=$(mktemp --suffix=.md); : > "$DOCE"
+OUT=$(WRUN_TAIL=120 scripts/wrun.sh "$DOCE" "seed:demo scraps:travel ctrl-a delete dump:ui ctrl-home dump:ui" 2>/dev/null | grep 'UI-DUMP')
+E1=$(echo "$OUT" | sed -n 1p); E2=$(echo "$OUT" | sed -n 2p)
+[ -n "$E2" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCE" "$DOCE.strop"
+if [ "$(field "$E1" scraps_words)" = "0" ] && [ "$(field "$E1" seam)" != "null" ]; then
+  echo "  ok   the emptied pile holds its seam while the caret stays (count reads 0)"
+else
+  echo "  FAIL textless pile: seam=$(field "$E1" seam) words=$(field "$E1" scraps_words)"; fail=1
+fi
+expect "the caret leaving evaporates the seam" null "$(field "$E2" seam)"
+
+echo "rig-check: Move to the manuscript arrives SELECTED at home"
+DOCV=$(mktemp --suffix=.md); cp "$DOC" "$DOCV"
+OUT=$(WRUN_TAIL=120 scripts/wrun.sh "$DOCV" "ctrl-home select:para aside:selection wait:80 scraps:travel move:manuscript dump:ui" 2>/dev/null | grep 'UI-DUMP')
+V1=$(echo "$OUT" | sed -n 1p)
+[ -n "$V1" ] || { echo "  FAIL no dump"; exit 1; }
+rm -f "$DOCV" "$DOCV.strop"
+SV=$(echo "$V1" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')
+SVS=$(echo "$SV" | tr -d '[]' | cut -d, -f1); SVE=$(echo "$SV" | tr -d '[]' | cut -d, -f2)
+if [ "${SVE:-0}" -gt "${SVS:-0}" ] 2>/dev/null; then echo "  ok   the moved text arrived selected ($SV)"; else
+  echo "  FAIL selection empty after the move ($SV)"; fail=1; fi
+expect "it landed in the manuscript"           false "$(field "$V1" caret_scraps)"
+expect "the excursion ended with the return"   false "$(field "$V1" latched)"
+
+echo "rig-check: find announces its split — both region counts as data"
+# The long fixture + one parked paragraph: 'paragraph' matches land on both
+# sides of the seam, and the omni dump carries the split halves.
+DOCF=$(mktemp --suffix=.md); cp "$DOC" "$DOCF"
+# The query must match on BOTH sides: "in" hits the padding's "padding" and
+# the parked opener's "into" — and stays far under the 500 cap.
+OUT=$(WRUN_TAIL=120 scripts/wrun.sh "$DOCF" "ctrl-home select:para aside:selection wait:80 ctrl-f wait:80 i n wait:120 dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+OM=$(echo "$OUT" | grep -oE '"omni":\{[^}]*\}')
+[ -n "$OM" ] || { echo "  FAIL no omni dump"; exit 1; }
+rm -f "$DOCF" "$DOCF.strop"
+FP=$(field "$OM" find_piece); FS=$(field "$OM" find_scraps)
+if [ "${FP:-0}" -gt 0 ] 2>/dev/null && [ "${FS:-0}" -gt 0 ] 2>/dev/null; then
+  echo "  ok   the split names both regions ($FP in the piece · $FS in scraps)"
+else
+  echo "  FAIL find split piece=$FP scraps=$FS"; fail=1
+fi
+
+echo "rig-check: a shipped compost-at-top file migrates once, at open (Scraps Wave A)"
+# Run 1 writes a REAL top-era .strop (seed:topera installs the legacy
+# boundary and saves). Run 2 reopens it: the one-time migration flips the
+# geometry before the first edit — the tail seam exists, the pile counts,
+# and the manuscript-only word count is UNCHANGED (membership-preserving).
+DOCM=$(mktemp --suffix=.md); : > "$DOCM"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCM" "seed:topera dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+[ -n "$OUT" ] || { echo "  FAIL no dump (seed:topera)"; exit 1; }
+expect "run 1 is top-era (no tail seam yet)"   null "$(field "$OUT" seam)"
+MW1=$(field "$OUT" manuscript_words)
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCM" "dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+[ -n "$OUT" ] || { echo "  FAIL no dump (migration run)"; exit 1; }
+rm -f "$DOCM" "$DOCM.strop"
+SEAM=$(field "$OUT" seam)
+if [ "${SEAM:-null}" != "null" ] && [ "${SEAM:-0}" -ge 1 ] 2>/dev/null; then
+  echo "  ok   reopening migrated to the tail era (seam=$SEAM)"
+else
+  echo "  FAIL seam=$SEAM — the top-era file did not migrate"; fail=1
+fi
+expect "the pile survived the flip"            1 "$(field "$OUT" compost_blocks)"
+expect "the count never teleported (07 N3)"    "$MW1" "$(field "$OUT" manuscript_words)"
 
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

@@ -5768,6 +5768,7 @@ dependencies = [
  "gpui_platform",
  "interprocess",
  "proptest",
+ "ropey",
  "serde",
  "serde_json",
  "strop-core",
