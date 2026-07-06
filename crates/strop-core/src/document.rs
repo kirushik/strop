@@ -104,6 +104,53 @@ pub fn scraps_range_of(rope: &ropey::Rope, blocks: &BlockMap) -> Option<Range<us
     }
 }
 
+/// The manuscript region of a `(rope, spans, blocks)` state as a standalone
+/// `(text, spans, blocks)` triple with char offsets REBASED to 0 — the ONE
+/// slice function both books consume (cold-read adjudications F1):
+/// `Document::manuscript_slice` delegates here for the live document, and the
+/// Past book calls it directly over a checkpoint state's own triple, so the
+/// pile can never enter either rendering. Era-aware like
+/// `manuscript_range_of`; the seam line and the Scraps pile are excluded, and
+/// every span is clipped to the slice (no span end past the slice length —
+/// the regions-10 invariant).
+pub fn manuscript_slice_of(
+    rope: &ropey::Rope,
+    spans: &SpanSet,
+    blocks: &BlockMap,
+) -> (String, SpanSet, BlockMap) {
+    match blocks.boundary() {
+        None => (rope.to_string(), spans.clone(), blocks.clone()),
+        Some((BoundaryEra::Tail, b)) => {
+            let range = manuscript_range_of(rope, blocks);
+            let text = rope.slice(range.clone()).to_string();
+            // `slice` clips and rebases; start is 0 so this is a clip.
+            let spans = spans.slice(range);
+            let first = b.min(blocks.len());
+            let blocks = BlockMap::from_kinds(blocks.kinds()[..first].to_vec());
+            (text, spans, blocks)
+        }
+        Some((BoundaryEra::Top, b)) => {
+            let base = manuscript_range_of(rope, blocks).start;
+            let text = rope.slice(base..).to_string();
+            let mut sliced = SpanSet::default();
+            for s in spans.spans() {
+                if s.range.end <= base {
+                    continue; // entirely in compost
+                }
+                let start = s.range.start.saturating_sub(base);
+                let end = s.range.end - base;
+                if end > start {
+                    sliced.add(start..end, s.attr.clone());
+                }
+            }
+            // The manuscript's block kinds: everything after the separator.
+            let first = (b + 1).min(blocks.len());
+            let blocks = BlockMap::from_kinds(blocks.kinds()[first..].to_vec());
+            (text, sliced, blocks)
+        }
+    }
+}
+
 /// The one seam-aware region function (graveyard-interplay 1): which region
 /// a char position falls in. Region ends are INCLUSIVE for position
 /// classification — a caret at the very end of the last manuscript line is
@@ -1515,39 +1562,7 @@ impl Document {
     /// any range that must return to full-document coordinates (0 in tail era —
     /// the manuscript is the document's head).
     pub fn manuscript_slice(&self) -> (String, SpanSet, BlockMap) {
-        match self.blocks.boundary() {
-            None => (self.text(), self.spans.clone(), self.blocks.clone()),
-            Some((BoundaryEra::Tail, b)) => {
-                let range = self.manuscript_char_range();
-                let rope = self.buffer.rope();
-                let text = rope.slice(range.clone()).to_string();
-                // `slice` clips and rebases; start is 0 so this is a clip.
-                let spans = self.spans.slice(range);
-                let first = b.min(self.blocks.len());
-                let blocks = BlockMap::from_kinds(self.blocks.kinds()[..first].to_vec());
-                (text, spans, blocks)
-            }
-            Some((BoundaryEra::Top, b)) => {
-                let base = self.manuscript_base_char();
-                let rope = self.buffer.rope();
-                let text = rope.slice(base..).to_string();
-                let mut spans = SpanSet::default();
-                for s in self.spans.spans() {
-                    if s.range.end <= base {
-                        continue; // entirely in compost
-                    }
-                    let start = s.range.start.saturating_sub(base);
-                    let end = s.range.end - base;
-                    if end > start {
-                        spans.add(start..end, s.attr.clone());
-                    }
-                }
-                // The manuscript's block kinds: everything after the separator.
-                let first = (b + 1).min(self.blocks.len());
-                let blocks = BlockMap::from_kinds(self.blocks.kinds()[first..].to_vec());
-                (text, spans, blocks)
-            }
-        }
+        manuscript_slice_of(self.buffer.rope(), &self.spans, &self.blocks)
     }
 
     /// Delete the seam line and its blank leftovers within the CURRENTLY
@@ -3570,6 +3585,117 @@ mod tests {
         let md = crate::markdown::to_markdown(&text, &mspans, &mblocks);
         assert!(md.contains("MANU"));
         assert!(!md.contains("COMP"));
+    }
+
+    // ---- manuscript_slice_of: the ONE slice both books consume (F1) ----
+
+    /// Top-era state: the pile never enters, and the slice's first words are
+    /// the manuscript's true first words (the Past book renders pre-Scraps
+    /// checkpoint states through this exact function).
+    #[test]
+    fn manuscript_slice_of_top_era_pile_never_enters() {
+        let rope = ropey::Rope::from_str("pile alpha\n\nManuscript opens here\nsecond line");
+        let mut blocks = BlockMap::new(4);
+        blocks.set_aside_boundary(Some(1));
+        let (text, _, mblocks) = manuscript_slice_of(&rope, &SpanSet::default(), &blocks);
+        assert!(text.starts_with("Manuscript opens"), "true first words");
+        assert!(!text.contains("pile"), "the pile never enters");
+        assert_eq!(mblocks.len(), 2);
+        assert_eq!(mblocks.boundary(), None, "the slice carries no seam");
+    }
+
+    /// Tail era: the manuscript is the head, the seam and pile are clipped
+    /// off, and the joining line break never rides along.
+    #[test]
+    fn manuscript_slice_of_tail_era_clips_seam_and_pile() {
+        let rope = ropey::Rope::from_str("One two three\nmore prose\n\nscrap alpha\nscrap beta");
+        let mut blocks = BlockMap::new(5);
+        blocks.set_scrap_line(Some(2));
+        let (text, _, mblocks) = manuscript_slice_of(&rope, &SpanSet::default(), &blocks);
+        assert_eq!(text, "One two three\nmore prose");
+        assert_eq!(mblocks.len(), 2);
+        assert_eq!(mblocks.boundary(), None);
+    }
+
+    /// No boundary: the whole state passes through untouched.
+    #[test]
+    fn manuscript_slice_of_no_boundary_is_the_whole_doc() {
+        let rope = ropey::Rope::from_str("just prose\nand more");
+        let mut spans = SpanSet::default();
+        spans.add(0..4, InlineAttr::Strong);
+        let blocks = BlockMap::new(2);
+        let (text, mspans, mblocks) = manuscript_slice_of(&rope, &spans, &blocks);
+        assert_eq!(text, "just prose\nand more");
+        assert!(mspans.covers(0..4, &InlineAttr::Strong));
+        assert_eq!(mblocks.len(), 2);
+    }
+
+    /// Everything-compost Top state: the manuscript is empty, and the slice
+    /// says so honestly (the empty book renders one blank page — regions 4).
+    #[test]
+    fn manuscript_slice_of_everything_compost_is_empty() {
+        let rope = ropey::Rope::from_str("pile\n");
+        let mut blocks = BlockMap::new(2);
+        blocks.set_aside_boundary(Some(1));
+        let (text, mspans, mblocks) = manuscript_slice_of(&rope, &SpanSet::default(), &blocks);
+        assert_eq!(text, "");
+        assert!(mspans.spans().is_empty());
+        // from_kinds([]) falls back to the one-paragraph invariant, which is
+        // exactly what an empty text's rope reports (len_lines == 1).
+        assert_eq!(mblocks.len(), 1);
+    }
+
+    /// Blank-manuscript Tail doc (regions 15): a blank region slices to the
+    /// empty string, never to the seam or the pile.
+    #[test]
+    fn manuscript_slice_of_blank_tail_manuscript_is_empty() {
+        let rope = ropey::Rope::from_str("\n\nscrap text");
+        let mut blocks = BlockMap::new(3);
+        blocks.set_scrap_line(Some(1));
+        let (text, _, mblocks) = manuscript_slice_of(&rope, &SpanSet::default(), &blocks);
+        assert_eq!(text, "");
+        assert_eq!(mblocks.len(), 1, "one blank manuscript block");
+        assert!(!format!("{mblocks:?}").contains("scrap_line: Some"));
+    }
+
+    /// Spans straddling the boundary are clipped — the invariant the book's
+    /// styling relies on: no span end may exceed the slice length
+    /// (regions 10), in either era.
+    #[test]
+    fn manuscript_slice_of_clips_boundary_straddling_spans() {
+        // Tail: manuscript "abcde" (0..5), span 3..9 straddles into the pile.
+        let rope = ropey::Rope::from_str("abcde\n\nxyz");
+        let mut blocks = BlockMap::new(3);
+        blocks.set_scrap_line(Some(1));
+        let mut spans = SpanSet::default();
+        spans.add(3..9, InlineAttr::Emphasis);
+        let (text, mspans, _) = manuscript_slice_of(&rope, &spans, &blocks);
+        let len = text.chars().count();
+        assert!(mspans.spans().iter().all(|s| s.range.end <= len), "no span past the slice");
+        assert!(mspans.covers(3..5, &InlineAttr::Emphasis));
+        // Top: manuscript "story" at base 6, span 2..8 straddles in from the
+        // pile and clamps to 0..2; a pile-only span vanishes.
+        let rope = ropey::Rope::from_str("pile\n\nstory");
+        let mut blocks = BlockMap::new(3);
+        blocks.set_aside_boundary(Some(1));
+        let mut spans = SpanSet::default();
+        spans.add(2..8, InlineAttr::Emphasis);
+        spans.add(0..2, InlineAttr::Strong);
+        let (text, mspans, _) = manuscript_slice_of(&rope, &spans, &blocks);
+        let len = text.chars().count();
+        assert!(mspans.spans().iter().all(|s| s.range.end <= len));
+        assert!(mspans.covers(0..2, &InlineAttr::Emphasis));
+        assert!(!mspans.covers(0..2, &InlineAttr::Strong), "pile-only span dropped");
+        // And the Document method is the same function (F1: one slice, both
+        // books) — the triple matches the free function's exactly.
+        let mut b = BlockMap::new(3);
+        b.set_scrap_line(Some(1));
+        let doc = Document::new("abcde\n\nxyz", SpanSet::default(), b);
+        let via_doc = doc.manuscript_slice();
+        let rope = ropey::Rope::from_str("abcde\n\nxyz");
+        let mut b = BlockMap::new(3);
+        b.set_scrap_line(Some(1));
+        assert_eq!(via_doc, manuscript_slice_of(&rope, &SpanSet::default(), &b));
     }
 
     #[test]

@@ -1,0 +1,46 @@
+Hyphenation pattern data — attribution and licenses
+====================================================
+
+The two dictionary files in this directory are compiled (bincode) forms of
+TeX hyphenation patterns from the hyph-utf8 package
+(https://www.hyphenation.org/tex, https://github.com/hyphenation/tex-hyphen),
+as bundled by the `hyphenation` Rust crate v0.8.4
+(https://github.com/tapeinosyne/hyphenation, crate code Apache-2.0/MIT).
+
+They are distributed with Strop as SEPARATE, INDEPENDENT DATA FILES, loaded
+at runtime; each keeps its own license below (GPLv3 §5 "mere aggregation").
+They are never compiled into the Strop binary.
+
+----------------------------------------------------------------------------
+en-us.standard.bincode
+    Compiled from hyph-en-us.tex — "Hyphenation patterns for American
+    English" (the Kuiken ushyphmax lineage, version 2005-05-30).
+
+    Copyright (C) 1990, 2004, 2005 Gerard D.C. Kuiken
+
+    License (verbatim from the pattern file header):
+
+        Copying and distribution of this file, with or without
+        modification, are permitted in any medium without royalty
+        provided the copyright notice and this notice are preserved.
+
+----------------------------------------------------------------------------
+ru.standard.bincode
+    Compiled from hyph-ru.tex — "Hyphenation patterns for Russian"
+    (the ruhyphen patterns, version 2003/03/10; generated with patgen from
+    a 990,000-word list and manually corrected).
+
+    Copyright (C) 1999-2003 Alexander I. Lebedev
+    <swan (at) scon155.phys.msu.su>
+
+    License: LaTeX Project Public License, version 1.2 or later
+    (https://latex-project.org/lppl/). The LPPL is a free software license
+    that is not GPL-compatible, which is why this file ships as loose
+    runtime data rather than embedded in the (GPL-3.0-or-later) binary.
+    This compiled form is a renamed, format-shifted derivative of
+    hyph-ru.tex; the original pattern sources are available from the
+    hyph-utf8 repository above and from CTAN (ruhyphen).
+
+----------------------------------------------------------------------------
+The pattern files' own headers were fetched from
+https://github.com/hyphenation/tex-hyphen on 2026-07-06.

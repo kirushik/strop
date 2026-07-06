@@ -15,10 +15,17 @@
 // it past the default 128. A wider budget beats splitting the dump.
 #![recursion_limit = "256"]
 
+// The cold read's layout engine and hyphenation router ship one wave ahead
+// of their surface (impl 05 §8: Wave A = the engine, Wave B = the room), so
+// nothing calls them from the app yet — only their unit tests do.
+#[allow(dead_code)]
+mod bookpage;
 mod commands;
 mod config;
 mod draw_guard;
 mod editor;
+#[allow(dead_code)]
+mod hyphen;
 mod files;
 mod paths;
 mod single_instance;
@@ -129,6 +136,40 @@ fn main() {
                 PT_MONO.into(),
             ])
             .expect("failed to load bundled fonts");
+
+        // The cold read's book face: URW Bookman Light / Light Italic /
+        // Demi (urw-base35; full Cyrillic on every style). Loaded as
+        // RUNTIME DATA FILES — read from assets at startup, never
+        // include_bytes! — because the face is AGPL-3.0-with-exception in
+        // a GPL-3.0-or-later app and the mere-aggregation posture wants it
+        // an independent work on disk (impl 05 §3.1; license text lives
+        // beside the files). A missing file degrades honestly: the page
+        // falls through font_fallbacks to the bundled PT Serif backstop.
+        let book_fonts: Vec<std::borrow::Cow<'static, [u8]>> = [
+            "fonts/coldread/URWBookman-Light.otf",
+            "fonts/coldread/URWBookman-LightItalic.otf",
+            "fonts/coldread/URWBookman-Demi.otf",
+        ]
+        .iter()
+        .filter_map(|rel| match paths::asset_file(rel) {
+            Some(path) => match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes.into()),
+                Err(e) => {
+                    eprintln!("strop: cannot read {}: {e} — the cold read falls back to PT Serif", path.display());
+                    None
+                }
+            },
+            None => {
+                eprintln!("strop: {rel} not found — the cold read falls back to PT Serif");
+                None
+            }
+        })
+        .collect();
+        if !book_fonts.is_empty()
+            && let Err(e) = cx.text_system().add_fonts(book_fonts)
+        {
+            eprintln!("strop: failed to register URW Bookman: {e} — the cold read falls back to PT Serif");
+        }
 
         editor::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
