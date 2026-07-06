@@ -27,6 +27,16 @@ already owns warm amber for the writer, so the machine voice must be its **cool
 complement** — and blue beats purple (least-standardized, blue↔purple is a CVD
 confusion) and terracotta (collides with our amber; it's Claude's own brand).
 
+**The axis is ordered** (Scraps token audit, 2026-07-06): warm = living,
+cool = machine-live, drained = receding from life (stale → dead), red = error;
+labels, rules, and chrome are off-axis. So the writer's living pile wears a
+warm wash (`SCRAP_WASH`) in full ink while the graveyard's record drains
+(`STALE_BG`), and the one arrival warm (`ARRIVAL_FLASH`) means "something
+arrived over there" wherever it blinks. Put-back's returned-paragraph flash is
+deliberately the warm `SELECTION_COLOR`, not sage — retrieval arrives selected
+(amber = the writer acting); sage stays reserved for answered/resolved
+terminals and the reached goal.
+
 ## Hue → meaning
 
 | Meaning | Family | Tokens |

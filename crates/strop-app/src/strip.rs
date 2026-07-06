@@ -93,8 +93,10 @@ pub const ENVELOPE_ALPHA: f32 = 0.9;
 pub const VEIL: u32 = 0x86B0E6;
 pub const VEIL_ALPHA: f32 = 0.10;
 pub const THREAD: u32 = 0x86B0E6;
-/// Sage terminal dot for a resolved card / a restore tick (docs/color-language).
-pub const SAGE: u32 = 0x7D8C66;
+/// Sage terminal dot for a resolved card / a restore tick — the one theme
+/// token, re-exported under the strip's short name (token audit A6: no local
+/// re-declaration to drift from `theme::SAGE_COLOR`).
+pub use crate::theme::SAGE_COLOR as SAGE;
 pub const GREY: u32 = 0x8A8678;
 
 // ---- The working-time axis -------------------------------------------------
