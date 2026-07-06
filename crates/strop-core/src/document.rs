@@ -664,16 +664,19 @@ impl SpanSet {
 
 /// Margin annotation status; Done/Dismissed leave the margin but persist
 /// (the engine must not re-raise a dismissed diagnosis on the same span).
-/// `Retired` is the park terminal (scopes-search 3): a diagnosis whose
-/// passage was Set aside — its card leaves the margin, but unlike Dismissed
-/// it NEVER suppresses a future pass (the writer parked the text, she did
-/// not judge the diagnosis; Move to the manuscript re-arms by construction).
+///
+/// There is deliberately NO park terminal here (scopes-search 3, adjudicated
+/// alternative): retire-on-park DELETES the diagnosis record after journaling
+/// its `CardClosed` — a new enum variant would make every OLD build fail the
+/// whole annotations parse. Semantics are identical: a deleted record can't
+/// suppress, so returned text is re-flaggable (Move to the manuscript re-arms
+/// by construction), and ctrl-Z still resurrects the card via the park atom's
+/// notes snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NoteStatus {
     Open,
     Done,
     Dismissed,
-    Retired,
 }
 
 /// Annotation species: human ink vs machine query — visually and
@@ -1914,9 +1917,10 @@ impl Document {
     /// re-stamped so the text departs losslessly; margin notes whose anchors
     /// live inside the range re-anchor and travel WITH their block (no
     /// second orphan-migration atom); open diagnosis cards on the range
-    /// retire (`NoteStatus::Retired`, excluded from suppression) and writer
-    /// dismissal records inside it die (machine artifacts never travel with
-    /// writer text); a provenance record is filed for selection parks (jots
+    /// retire (record DELETED after the caller journals CardClosed — deleted
+    /// records can never suppress, so a returned passage is re-flaggable) and
+    /// writer dismissal records inside it die (machine artifacts never travel
+    /// with writer text); a provenance record is filed for selection parks (jots
     /// bear none); the seam's birth is journaled. The caret returns to `s` —
     /// the writer parked a thought, she did not travel.
     ///
@@ -2061,9 +2065,11 @@ impl Document {
         }
         self.notes.notes.sort_by_key(|n| n.range.start);
         // Card retirement rides the same atom (a notes mutation inside the
-        // open transaction — ctrl-Z resurrects the card for free).
+        // open transaction — ctrl-Z resurrects the card for free). The record
+        // is DELETED, not re-statused: deletion can never suppress a future
+        // pass, and old builds keep parsing the annotations whole.
         for id in &retired {
-            self.notes.set_status(*id, NoteStatus::Retired);
+            self.notes.remove(*id);
         }
         for id in &dead_dismissals {
             self.notes.remove(*id);
@@ -2252,7 +2258,7 @@ impl Document {
             .map(|n| n.id)
             .collect();
         for id in &retired {
-            self.notes.set_status(*id, NoteStatus::Retired);
+            self.notes.remove(*id);
         }
         self.journal_seam(before_seam);
         Some(ParkOutcome {
@@ -3362,13 +3368,14 @@ mod tests {
             "park",
             "the note re-anchored inside the pile"
         );
-        // The open diagnosis retired — and Retired never suppresses.
-        assert_eq!(doc.notes().get(open_diag).unwrap().status, NoteStatus::Retired);
+        // The open diagnosis retired — the record is DELETED (retire-on-park;
+        // a deleted record can never suppress, and old builds keep parsing).
+        assert!(doc.notes().get(open_diag).is_none(), "retirement deletes the record");
         assert_eq!(out.retired, vec![open_diag]);
-        assert!(!doc.notes().is_suppressed(&(15..18), "t"), "Retired must not suppress");
+        assert!(!doc.notes().is_suppressed(&(15..18), "t"), "retirement must not suppress");
         // The dismissal record died with the park.
         assert!(doc.notes().get(dismissed).is_none(), "dismissals die with the park");
-        // ctrl-Z resurrects everything (the atom).
+        // ctrl-Z resurrects everything (the atom's notes snapshot).
         doc.undo();
         assert_eq!(doc.text(), "keep this\npark me now");
         assert_eq!(doc.notes().get(note).unwrap().range, 10..14);
