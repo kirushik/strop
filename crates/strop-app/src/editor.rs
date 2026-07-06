@@ -6042,7 +6042,7 @@ impl Editor {
         if doomed.is_empty() {
             return;
         }
-        let first_birth = self.doc.aside_boundary().is_none();
+        let first_birth = self.doc.boundary().is_none();
         let mut migrated = false;
         for id in doomed {
             let anchor = self
@@ -7029,6 +7029,9 @@ impl Editor {
     }
 
     /// Toggle a block kind over the selected block range, one transaction.
+    /// Formatting spans the seam (the writer's hands, seam-mechanics 10) —
+    /// but kinds NEVER stamp the seam line itself: it renders as the seam
+    /// regardless, and a kinded seam was the "tiny grey heading" bug.
     fn toggle_block(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
         if self.strip.is_parked() {
             self.pulse_strip(cx);
@@ -7037,6 +7040,7 @@ impl Editor {
         if self.history_view.is_some() {
             return;
         }
+        let seam = self.doc.boundary().map(|(_, b)| b);
         let start_block = self.doc.block_of_byte(self.selected_range.start);
         let end_block = self.doc.block_of_byte(self.selected_range.end);
         let target = if *self.doc.blocks().kind(start_block) == kind {
@@ -7044,8 +7048,17 @@ impl Editor {
         } else {
             kind
         };
-        self.doc.set_block_kind(start_block, target.clone());
+        if Some(start_block) != seam {
+            self.doc.set_block_kind(start_block, target.clone());
+        } else {
+            // Open the transaction the loop below rides even when the first
+            // block is the seam (skipped).
+            self.doc.set_block_kind(start_block, BlockKind::Paragraph);
+        }
         for block in start_block + 1..=end_block {
+            if Some(block) == seam {
+                continue;
+            }
             self.doc.set_block_kind_in_current_tx(block, target.clone());
         }
         self.mark_dirty();

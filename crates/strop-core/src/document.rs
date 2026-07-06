@@ -2082,6 +2082,130 @@ impl Document {
         })
     }
 
+    /// `Move to the manuscript` — the retrieval verb's MODEL half (08 §2;
+    /// seam-mechanics 4: "Move to the manuscript carries them home the same
+    /// way"). Moves a Scraps selection to `dest_char` in the manuscript as
+    /// ONE atom: spans and kinds captured and re-stamped, contained writer
+    /// notes re-anchored to travel home, the provenance record covering the
+    /// moved text dying with it (its text left the pile — `apply_op`'s
+    /// collapse-drop runs inside the same transaction), one adjoining blank
+    /// separator absorbed so the pile strands no empty item slot, and an
+    /// emptied pile evaporating in the same transaction. Wave B wires the
+    /// verb surface, the latch destination, and arriving-selected. Returns
+    /// the landed char range (for the selection), or `None` when the range
+    /// is empty or not entirely pile-side.
+    pub fn move_to_manuscript(
+        &mut self,
+        byte_range: Range<usize>,
+        dest_char: usize,
+    ) -> Option<Range<usize>> {
+        let Some((BoundaryEra::Tail, _)) = self.blocks.boundary() else {
+            return None;
+        };
+        let rope = self.buffer.rope();
+        let s = rope.byte_to_char(byte_range.start);
+        let e = rope.byte_to_char(byte_range.end);
+        let pile = self.scraps_char_range()?;
+        if s >= e || s < pile.start || e > pile.end {
+            return None;
+        }
+        let is_break = |c: char| {
+            matches!(
+                c,
+                '\u{000A}' | '\u{000B}' | '\u{000C}' | '\u{000D}' | '\u{0085}' | '\u{2028}'
+                    | '\u{2029}'
+            )
+        };
+        let raw: String = rope.slice(s..e).to_string();
+        let lead = raw.chars().take_while(|c| is_break(*c)).count();
+        let trail = raw.chars().rev().take_while(|c| is_break(*c)).count();
+        let (s2, e2) = (s + lead, e - trail);
+        if s2 >= e2 {
+            return None;
+        }
+        let moved: String = rope.slice(s2..e2).to_string();
+        let spans = self.spans.slice(s2..e2);
+        let first_line = rope.char_to_line(s2);
+        let n_blocks = count_line_breaks(&moved) + 1;
+        let kinds: Vec<BlockKind> = self
+            .blocks
+            .kinds()
+            .iter()
+            .skip(first_line)
+            .take(n_blocks)
+            .cloned()
+            .collect();
+        // Widen the delete over the item's blank separator — the trailing
+        // one when a successor exists, else the leading one — so no empty
+        // slot strands between neighbours (asides §1's item grammar).
+        let (mut del_s, mut del_e) = (s.min(s2), e.max(e2));
+        if del_e + 2 <= pile.end && rope.char(del_e) == '\n' && rope.char(del_e + 1) == '\n' {
+            del_e += 2;
+        } else if del_s >= pile.start + 2
+            && rope.char(del_s - 1) == '\n'
+            && rope.char(del_s - 2) == '\n'
+        {
+            del_s -= 2;
+        }
+        let travelling: Vec<(u64, usize, usize)> = self
+            .notes
+            .notes
+            .iter()
+            .filter(|n| {
+                n.kind == NoteKind::Note
+                    && n.status == NoteStatus::Open
+                    && n.range.start >= s2
+                    && n.range.end <= e2
+                    && n.range.start < n.range.end
+            })
+            .map(|n| (n.id, n.range.start - s2, n.range.end - s2))
+            .collect();
+        let dest = dest_char.min(self.manuscript_char_range().end);
+
+        let before_seam = self.blocks.scrap_line();
+        self.revision += 1;
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        // Delete from the pile first (it sits AFTER the manuscript, so the
+        // destination's position is untouched), then insert at the home spot.
+        let del_sb = self.buffer.char_to_byte(del_s);
+        let del_eb = self.buffer.char_to_byte(del_e);
+        let (block, merged) = self.pre_edit_info(&(del_sb..del_eb));
+        self.buffer.edit_bytes_grouped(del_sb..del_eb, "");
+        self.blocks.on_edit(block, merged, 0);
+        let dest_b = self.buffer.char_to_byte(dest);
+        let (block, merged) = self.pre_edit_info(&(dest_b..dest_b));
+        self.buffer.edit_bytes_grouped(dest_b..dest_b, &moved);
+        self.blocks
+            .on_edit(block, merged, count_line_breaks(&moved));
+        self.absorb_buffer_ops();
+        // Re-stamp the captured structure at the landing.
+        let insert_block = self.buffer.rope().char_to_line(dest);
+        for (i, kind) in kinds.iter().enumerate() {
+            self.blocks.set_kind(insert_block + i, kind.clone());
+        }
+        for sp in spans.spans() {
+            self.spans
+                .add(dest + sp.range.start..dest + sp.range.end, sp.attr.clone());
+        }
+        // The notes travel home inside the atom.
+        for (id, rs, re) in &travelling {
+            if let Some(n) = self.notes.notes.iter_mut().find(|n| n.id == *id) {
+                n.range = dest + rs..dest + re;
+                n.orphaned = false;
+            }
+        }
+        self.notes.notes.sort_by_key(|n| n.range.start);
+        // A pile this move emptied dissolves in the same transaction.
+        if self.scraps_textless() {
+            self.evaporate_scraps_in_tx();
+        }
+        self.journal_seam(before_seam);
+        Some(dest..dest + moved.chars().count())
+    }
+
     /// The adoption gesture's mechanism (08 §2 "Adoption & migration" path
     /// 1): the writer's own trailing divider pile becomes Scraps in place —
     /// nothing moves; the seam is her own blank divider line above the
@@ -3873,6 +3997,42 @@ mod tests {
             hist.asset_refs().any(|a| a == "asset:img1"),
             "history reaches assets via its Graveyard elements"
         );
+    }
+
+    /// The retrieval verb's model half: a scrap moves home carrying its
+    /// notes and formatting, its provenance record dies with its departure,
+    /// the separator slot closes, and emptying the pile dissolves the seam —
+    /// all one atom (seam-mechanics 4; 08 §2 "Retrieve").
+    #[test]
+    fn move_to_manuscript_carries_notes_home_and_evaporates_an_emptied_pile() {
+        let mut doc = Document::new("the story so far", SpanSet::default(), BlockMap::default());
+        // Park "story " with a note on it.
+        let note = doc.add_note(4..9, "keep?".into(), 0); // "story"
+        doc.set_aside(4..10, "the".into(), 7, false).unwrap();
+        assert_eq!(doc.text(), "the so far\n\nstory ");
+        assert_eq!(doc.provenance().records().len(), 1);
+        let n = doc.notes().get(note).unwrap();
+        let pile = doc.scraps_char_range().unwrap();
+        assert!(n.range.start >= pile.start, "the note parked with its text");
+        // Move it home, to char 4 (after "the ").
+        let scrap_start = doc.char_to_byte(pile.start);
+        let scrap_end = doc.len_bytes();
+        let landed = doc.move_to_manuscript(scrap_start..scrap_end, 4).unwrap();
+        assert_eq!(doc.text(), "the story so far");
+        assert_eq!(landed, 4..10, "arrives at the writing position, range for the selection");
+        assert_eq!(doc.boundary(), None, "the emptied pile dissolved in the atom");
+        let n = doc.notes().get(note).unwrap();
+        assert_eq!(
+            &doc.text()[doc.char_to_byte(n.range.start)..doc.char_to_byte(n.range.end)],
+            "story",
+            "the note travelled home"
+        );
+        assert!(doc.provenance().is_empty(), "the record died with the departure");
+        // One undo returns the scrap to the pile, seam and record included.
+        doc.undo();
+        assert_eq!(doc.text(), "the so far\n\nstory ");
+        assert_eq!(doc.scrap_line(), Some(1));
+        assert_eq!(doc.provenance().records().len(), 1);
     }
 
     /// ReplayDoc applies Seam events interleaved by timestamp
