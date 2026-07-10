@@ -334,6 +334,40 @@ pub fn below_justification_floor(measure: f32, avg_en_char: f32, avg_ru_char: f3
         || measure / avg_ru_char < JUSTIFY_FLOOR_RU_CHARS
 }
 
+/// The current chapter's opening char, for the reading room's entry rule
+/// (the 2026-07-10 amendment to "always enter at page 1"): over the ritual
+/// threshold the read starts at the chapter the caret rests in. Chapter
+/// grain = the shallowest heading level with at least TWO occurrences — a
+/// manuscript's lone H1 is its title, and a title must not swallow the
+/// grain — else the shallowest present at all. Returns the char start of
+/// the nearest grain heading at-or-before `caret` (slice chars); None —
+/// no grain heading precedes the caret — means the top of the book.
+pub fn chapter_start(text: &str, blocks: &BlockMap, caret: usize) -> Option<usize> {
+    let rope = ropey::Rope::from_str(text);
+    let mut counts = [0usize; 6];
+    for i in 0..rope.len_lines() {
+        if let BlockKind::Heading(l) = blocks.kind(i) {
+            counts[usize::from(*l).clamp(1, 6) - 1] += 1;
+        }
+    }
+    let grain = counts
+        .iter()
+        .position(|&c| c >= 2)
+        .or_else(|| counts.iter().position(|&c| c >= 1))? as u8
+        + 1;
+    let mut start = None;
+    for i in 0..rope.len_lines() {
+        let c = rope.line_to_char(i);
+        if c > caret {
+            break;
+        }
+        if matches!(blocks.kind(i), BlockKind::Heading(l) if *l == grain) {
+            start = Some(c);
+        }
+    }
+    start
+}
+
 // ---- Pipeline entry ----------------------------------------------------------
 
 /// Paginate a manuscript slice triple (the output of `manuscript_slice_of` —
@@ -1650,6 +1684,47 @@ mod tests {
                 assert!(!matches!(l.role, Role::Heading(_)));
             }
         }
+    }
+
+    /// The entry rule's chapter grain: a lone H1 title must not swallow
+    /// it — the shallowest level with two or more occurrences carries the
+    /// chapters; before the first grain heading the top of the book wins.
+    #[test]
+    fn chapter_start_grain_skips_the_lone_title() {
+        let text = "Title\nintro intro\nOne\naa bb\nTwo\ncc dd";
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Heading(1),
+            BlockKind::Paragraph,
+            BlockKind::Heading(2),
+            BlockKind::Paragraph,
+            BlockKind::Heading(2),
+            BlockKind::Paragraph,
+        ]);
+        // Caret in the intro: no H2 precedes it — the top of the book.
+        assert_eq!(chapter_start(text, &blocks, 8), None);
+        // Caret in chapter 1's prose: its own H2 opens the read.
+        let ch1 = text.find("One").unwrap();
+        assert_eq!(chapter_start(text, &blocks, text.find("aa").unwrap()), Some(ch1));
+        // Caret at the end: the SECOND H2; on a heading line: that chapter.
+        let ch2 = text.find("Two").unwrap();
+        assert_eq!(chapter_start(text, &blocks, text.chars().count()), Some(ch2));
+        assert_eq!(chapter_start(text, &blocks, ch2), Some(ch2));
+    }
+
+    /// H1-chaptered books take H1 as the grain; a heading-less manuscript
+    /// has no chapter to find.
+    #[test]
+    fn chapter_start_h1_grain_and_headingless() {
+        let text = "One\naa\nTwo\nbb";
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Heading(1),
+            BlockKind::Paragraph,
+            BlockKind::Heading(1),
+            BlockKind::Paragraph,
+        ]);
+        let ch2 = text.find("Two").unwrap();
+        assert_eq!(chapter_start(text, &blocks, text.chars().count()), Some(ch2));
+        assert_eq!(chapter_start("aa bb\ncc", &BlockMap::new(2), 5), None);
     }
 
     /// A writer's blank line after a heading must not satisfy the keep:

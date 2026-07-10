@@ -17404,6 +17404,13 @@ const CR_LINE_H: f32 = 25.;
 /// x-height at equal point size shouts over Bookman Light (the 2026-07-06
 /// litmus page; book convention sizes mono ~0.85–0.9× the serif body).
 const CR_CODE_SIZE: f32 = 0.88;
+/// The ritual threshold (the 2026-07-10 amendment to "always enter at
+/// page 1"): at or under this many words — roughly a 40-minute read, the
+/// boundary of "one sitting from the top is plausible" — a Live read
+/// starts at page 1. Over it, at the chapter under the caret. In WORDS,
+/// not pages: the same manuscript must not flip behavior on a narrower
+/// window. A taste dial.
+const CR_RITUAL_MAX_WORDS: usize = 10_000;
 /// The small-window emergency type step (spec §3.2; S9 hysteresis):
 /// below ~12 lines drop once to 15px type / 420px measure.
 const CR_BODY_SIZE_SMALL: f32 = 15.;
@@ -17948,7 +17955,39 @@ impl Editor {
         // The snapshot: the ONE slice both books consume (F1).
         let (text, spans, blocks) = self.doc.manuscript_slice();
         let words = self.manuscript_word_count();
-        self.enter_cold_read(ColdReadSource::Live, text, spans, blocks, words, None, window, cx);
+        // Over the ritual threshold the read opens at the chapter under
+        // the caret — the caret survives quit (files::record_caret), so
+        // after a rest it still marks the last-worked chapter. A caret
+        // outside the manuscript claims no chapter; Home remains the
+        // one-key return to the ceremonial top.
+        let entry_char = if words > CR_RITUAL_MAX_WORDS {
+            let ch = self
+                .doc
+                .rope()
+                .byte_to_char(self.cursor_offset().min(self.doc.len_bytes()));
+            (self.doc.region_of_char(ch) == strop_core::document::Region::Manuscript)
+                .then(|| {
+                    crate::bookpage::chapter_start(
+                        &text,
+                        &blocks,
+                        ch.saturating_sub(self.doc.manuscript_base_char()),
+                    )
+                })
+                .flatten()
+        } else {
+            None
+        };
+        self.enter_cold_read(
+            ColdReadSource::Live,
+            text,
+            spans,
+            blocks,
+            words,
+            None,
+            entry_char,
+            window,
+            cx,
+        );
     }
 
     /// Entry, Past ("read this version", spec §4.7): the parked banner's
@@ -17979,6 +18018,7 @@ impl Editor {
             sblocks,
             words,
             Some((text, spans, blocks)),
+            None, // a Past read always starts from the top
             window,
             cx,
         );
@@ -17999,8 +18039,10 @@ impl Editor {
     }
 
     /// The shared tail of both entrances: paginate the snapshot, THEN set
-    /// the state (S17 atomicity — no bookless-desk frame), always page 1
-    /// (research-page §4.6: the performance starts from the top).
+    /// the state (S17 atomicity — no bookless-desk frame). Page 1 unless
+    /// `entry_char` names the current chapter's opening (the 2026-07-10
+    /// amendment; research-page §4.6's "the performance starts from the
+    /// top" holds under the ritual threshold and for every Past read).
     #[allow(clippy::too_many_arguments)]
     fn enter_cold_read(
         &mut self,
@@ -18010,6 +18052,7 @@ impl Editor {
         blocks: BlockMap,
         words: usize,
         restore_state: Option<(String, SpanSet, BlockMap)>,
+        entry_char: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -18068,6 +18111,7 @@ impl Editor {
         let ts = window.text_system().clone();
         let mut widths = HashMap::new();
         let book = cr_layout(&text, &spans, &blocks, &geom, &image_sizes, &mut widths, &ts);
+        let page = entry_char.map_or(0, |c| book.page_of_char(c));
         let paper = crate::paths::asset_file("paper-noise-256.png").and_then(|p| {
             std::fs::read(&p)
                 .ok()
@@ -18083,7 +18127,7 @@ impl Editor {
             geom,
             laid_for: (desk_w, desk_h),
             small,
-            page: 0,
+            page,
             words,
             station,
             fn_refs,
