@@ -553,12 +553,14 @@ expect "they live on after the room closes"   2 "$(field "$D3" open_notes)"
 
 echo "rig-check: cold read — Past-from-parked round trip (Time 7, regions 13)"
 DOCL=$(mktemp --suffix=.md); echo "A live line for the legacy litmus." > "$DOCL"
-OUT=$(WRUN_TAIL=300 scripts/wrun.sh "$DOCL" "seed:legacy dump:ui coldread:open dump:ui escape strip:open strip:scrub:0.5 coldread:past:6 dump:ui escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
+# The md import writes a "Started" birth checkpoint (index 0), so the seeded
+# legacy plan sits at indexes 1..7 — the Top-era tick is coldread:past:7.
+OUT=$(WRUN_TAIL=300 scripts/wrun.sh "$DOCL" "seed:legacy dump:ui coldread:open dump:ui escape strip:open strip:scrub:0.5 coldread:past:7 dump:ui escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
 D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
 rm -f "$DOCL" "$DOCL.strop"
 CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
 CR3=$(echo "$D3" | grep -oE '"coldread":\{[^}]*\}')
-expect "seed:legacy carries the Top-era tick" 7 "$(field "$D1" checkpoints)"
+expect "seed:legacy carries the Top-era tick" 8 "$(field "$D1" checkpoints)"
 expect "a Live read of a legacy file opens"   true "$(field "$CR2" open)"
 expect "the Past book reads the OLD state"    '"past"' "$(field "$CR3" source)"
 P1=$(field "$CR3" p1)

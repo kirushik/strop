@@ -266,6 +266,16 @@ fn main() {
                 None => match &md_import {
                     Some((text, spans, blocks)) => {
                         store.seed(text);
+                        // The import is the document's birth: a materialized
+                        // "Started" checkpoint. Without it the journal-era
+                        // strip believes the doc began EMPTY — its envelope
+                        // shrinks to today's churn, and a scrub past the
+                        // first keystroke replays an imported novel away.
+                        store.seal_session_with(
+                            "Started",
+                            false,
+                            (text.clone(), spans.clone(), blocks.clone()),
+                        );
                         (text.clone(), spans.clone(), blocks.clone(), None)
                     }
                     None if welcome => {
