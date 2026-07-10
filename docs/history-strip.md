@@ -5,7 +5,52 @@ corridor test killed its pedagogy: a first-time viewer refused to learn
 it. The fabric survives; the teaching inverted. Governed by
 `design-principles.md` — P4 show-don't-explain, P5 corridor floor,
 P8 grammar, P10 color-speaks-once. Panel texts:
-`docs/research/history-strip-panel-2026-07.md`.)*
+`docs/research/history-strip-panel-2026-07.md`. Amended 2026-07-10
+after the visits pass — §0.5, the wells, the rail-as-page-edge
+composition, the two hit lanes, and the §4 Raskin reversal are that
+round; the reassembly shipped on branch `strip-reassembly`.)*
+
+## 0.5 The visits — what the strip is FOR
+
+The same writer arrives in opposite emotional states, sometimes in the
+same hour, and the strip cannot ask why she came (P2). So one honest
+surface must read correctly at three tempos of attention:
+
+- **The glance** (2–5 s): *did it save? where was I? how is it going?*
+  Served by the resting face alone: the strip opens on the TAIL (the
+  writer's own morning already in the cloth — the trust visit is a
+  rehearsal for the panic visit), wells show time away, the envelope
+  arc shows the draft's shape, dates say when.
+- **The hunt** (30–90 s): *get it back.* Rescue (panic — zero reading,
+  one familiar control, big targets, reversible exits), passage
+  retrieval (memory is of sentences, not dates), region forensics.
+  Served by frame-rate scrubbing, arrow-stepping to stations and
+  big-cut shoulders, visible selection + copy out of any past frame
+  (the surgical rescue), and Restore for the wholesale one.
+- **The dwell** (minutes): *was it better before?* Compare pin, the
+  Past book ("read this version"), the panel's named-version work.
+  The strip hands off; it does not absorb these.
+
+Jurisdiction: the strip owns everything *when*-shaped. The graveyard
+owns deliberate cuts (first stop for "where is it" — the strip is the
+fallback). The checkpoints panel owns *what/why* — named versions,
+narrative rows, the foreign-edit diff, provenance. Undo owns the last
+seconds. Resist bolting compare views or stats pages onto the strip:
+the visits share one spine — a truthful material record, scrubbed by
+hand — and differ only in tempo and heat.
+
+**Red lines** (each one guards a visit):
+1. *The strip describes the manuscript, never the writer.* No rates,
+   streaks, comparisons, or verdicts; the fabric is material, not
+   metrics. The one number is the word count — a property of the
+   document.
+2. *No reproach.* A gap is a well, not a debt; a return finds the room
+   as it was left.
+3. *Never fabricate a mark.* The fabric is testimony (provenance):
+   legacy eras lay no flecks, and no expressiveness may add ink that
+   isn't derived from the record.
+4. *The strip never initiates.* Opened by hand, closed cheap, no state
+   worth managing.
 
 ## 0. The corridor floor
 
@@ -35,33 +80,66 @@ the readout is words.
 
 **x = working time, one fixed scale** (on the order of 1 px ≈ 30 s;
 the constant is chosen once, product-wide, after measurement — never
-per-document). Gaps over ~15 min fold into thin seams; session starts
-carry real dates ("Tue 1 Jul") in a quiet lane — dates are data, so
-they may be words (P4). **There is no zoom.** One scale means the
-texture is *learnable*: a glance's worth of amber always means the
-same amount of work.
+per-document). Gaps over ~15 min fold into **wells** — recessed
+full-height columns, the visible presence of time away (a re-entry
+after days reads the well first). Two fixed tiers only (overnight;
+days-away), never gap-proportional: the axis spends x on WORK, so
+absence is punctuation, not a bar chart. Session starts carry real
+dates ("Tue 1 Jul") in a quiet lane — dates are data, so they may be
+words (P4). **There is no zoom.** One scale means the texture is
+*learnable*: a glance's worth of amber always means the same amount of
+work.
+
+**The rail IS the page's top edge** (2026-07-10 recomposition, from
+the lab mockup the first build mistranslated): the chips live in their
+own row above; the envelope hangs from the rail itself, so the thumb
+literally rides along the top of the manuscript, and the rail is
+exactly as long as the history — at fitting scale it ends where the
+page ends (a rail drawn past the page read as unreachable future; a
+thumb at the rail's right end is always *now*).
 
 **The rail and the fabric split their jobs at scale.** A seek bar's
-contract is *the whole duration, always visible* — so the rail with
-the thumb is always full-extent: thumb x = position in the whole
-history, at a fortnight or at a novel. The fabric band below keeps the
-fixed quant and, when the history outgrows the viewport (an 80k-word
-novel is ~fifteen screenfuls), auto-scrolls to keep the playhead's
-neighborhood in view; the playhead line passes through both, binding
-them. At fitting scale the two coincide 1:1 and the split is
-invisible. This keeps the corridor contract honest at any length (P7)
-without ever re-scaling the texture.
+contract is *the whole duration, always visible* — so when the history
+outgrows the viewport the rail compresses the whole of it into full
+width: thumb x = position in the whole history, at a fortnight or at a
+novel. The fabric band keeps the fixed quant and follows under a
+**view lock**: view = work − frac·travel, the one formula under which
+the playhead line passes through the thumb AND the correct spot in the
+cloth at every scale (at fitting scale it reduces to view = 0; at now
+it lands the view on the tail — which is also where the strip OPENS:
+the writer's own morning is the first thing in sight). Rail seeks,
+stepping, open and Now lock; a fabric touch and the wheel do not — see
+§3. This keeps the corridor contract honest at any length (P7) without
+ever re-scaling the texture.
 
 **y = position in the document, start at the top** — the text grows
 downward, as text does. The cream **envelope** — document length over
-time — hangs from the top edge and steps downward as the story grows,
-upward at cuts, visibly at restores. The y-scale is set when the strip
-opens (current length fills the band, with ~10% headroom) and does not
-change while it is open: nothing re-scales under the viewer's eyes.
-The headroom exists because a restore can make *now* longer than the
-open-time length; if a restore exceeds even that, the re-scale happens
-at the restore — a data change, the one lawful re-layout — never
-during viewing.
+time — hangs from the rail and steps downward as the story grows,
+upward at cuts, visibly at restores. **Everything shares the
+envelope's chars axis**: a fleck paints at its edit's position on that
+same scale, so an append rides the growing edge and a mid-doc cut
+lands inside the page (the first build normalized by the instantaneous
+doc length over the full band — every append painted at the band
+floor, a dirt band the page never touched); threads and veils are
+bounded by the page too. The machine's marks stay inside the text it
+actually read. The y-scale is set when the strip opens (current length
+fills the band, with ~10% headroom) and does not change while it is
+open: nothing re-scales under the viewer's eyes. The headroom exists
+because a restore can make *now* longer than the open-time length; if
+a restore exceeds even that, the re-scale happens at the restore — a
+data change, the one lawful re-layout — never during viewing.
+
+**One truth per x.** Materialized checkpoint states are the envelope's
+ground anchors; run deltas accumulate *between* them and rebase at
+each (a restore's wholesale swap is journal-suppressed, so run deltas
+alone drift after one — two independent bookkeepings merge-sorted onto
+one polyline drew sawtooth spikes wherever they disagreed). For the
+same reason an import writes a materialized "Started" birth
+checkpoint: without it the strip believes an imported novel began
+empty, and a scrub past the first keystroke replays it away. (A
+birth record alone is not "a past": with nothing journaled yet,
+parking is refused until the axis outgrows the birth moment — but any
+real edit in the journal is a past, however brief.)
 
 **Density is emergent, not modal.** Real numbers, the contest story:
 a 4,188-word final draft at typical drafting churn (~1.8× total
@@ -93,10 +171,17 @@ Exactly three kinds of text exist:
    the honest automatics ("Started", "Restored", "Exported") — never
    "Saved": the product saves every keystroke, and a station named
    Saved would teach that unsaved states exist. Reflex checkpoints
-   (Ctrl+S) are deliberately unnamed — bare ticks, lowest rank. Ranked
-   omission on collision (writer-named > seal > before-restore > export
-   > manual > session-start > reflex); a label that doesn't fit is
-   omitted whole, its tick stays. Hover expands, never reveals (P9).
+   (Ctrl+S) are deliberately unnamed — bare ticks, lowest rank — and
+   so are session starts (2026-07-10): the date lane already says when
+   a sitting began, and a lane of "Session start" echoes was the
+   doubled-print smear; only the document's very first station keeps a
+   name ("Started" — its birth is data). Ranked omission on collision
+   (writer-named > seal > before-restore > export > session-start >
+   reflex; a "manual" tier isn't distinct — a manual checkpoint always
+   carries the writer's own name, so it ranks writer-named); a label
+   that doesn't fit is omitted whole, its tick stays, and a same-named
+   twin at the same x is omitted rather than stacked. Hover expands,
+   never reveals (P9).
 2. **Dates** — real ones. "Today", "Tue 1 Jul". Never "day 12". The
    year appears whenever it isn't the current one — histories never
    expire.
@@ -112,16 +197,29 @@ Exactly three kinds of text exist:
 
 ## 3. The controls
 
-- **The thumb.** Click the rail = park there; drag = scrub, anywhere,
-  continuously (both, because the borrowed widget does both — P7); the
-  document above live-renders at frame rate (Victor's bar: scrub at
-  frame rate or don't ship). Wheel/trackpad gestures pan the fabric
-  only, never move the thumb. **Scrub stability law:** while the
-  thumb moves, the only things that change are the thumb's x, the
-  readout numerals, the document above, the dimmed not-yet region right
-  of the thumb, and label brightening. No label re-ranks, re-flows, or
-  changes length mid-drag — layout is computed when data changes, never
-  while the viewer holds the thumb.
+- **The thumb.** Two hit lanes, matching what each looks like (P7):
+  the rail row and above is the *seek bar* — click = park at that
+  fraction of the whole, drag = scrub, continuously, with the view
+  locked so the playhead passes through the thumb; the fabric below is
+  the *cloth* — a click lands on the moment UNDER the cursor at the
+  current pan, and the view never yanks away from what was just
+  touched (after a fabric touch the thumb alone shows the global
+  position, until the next rail interaction re-binds them). The
+  document above live-renders at frame rate either way (Victor's bar:
+  scrub at frame rate or don't ship). Wheel/trackpad gestures pan the
+  fabric only, never move the thumb. **While parked, the arrow keys
+  step** to the previous/next station or big-cut shoulder — the rescue
+  ratchet: "just before the damage" is one keypress. **Scrub stability
+  law:** while the thumb moves, the only things that change are the
+  thumb's x, the readout numerals, the document above, the dimmed
+  not-yet region right of the playhead, and label brightening. No
+  label re-ranks, re-flows, or changes length mid-drag — layout is
+  computed when data changes, never while the viewer holds the thumb.
+- **The past is quotable.** Selection works and RENDERS in a parked
+  preview (a selection you can't see fails P6), and Copy lifts the
+  words out — the surgical rescue, beside Restore's wholesale one.
+  The live selection is saved at park and returns on Now/Esc/close
+  (a preview round-trip must give back the identical frame).
 - **Now** — the rightmost control, always. Click: back to the present.
   Esc does the same. At now the chip rests dim; **when parked it
   brightens in the same beat Restore appears** — the two exits from
@@ -141,10 +239,16 @@ Exactly three kinds of text exist:
 Unadvertised, resting where a curious hand falls, each one a *but of
 course* when found:
 
-- **Typing while parked restores.** Typing means one thing in this
-  product: it appends to the document as shown. So typing in the past
-  first appends the restore (the sage arc draws itself), then the
-  insertion. (Raskin's law, kept whole from v1.)
+- **Typing while parked refuses** — the banner's moment label pulses,
+  one uniform refusal for every mutation. *(Amended 2026-07-10; v1/v2
+  specced Raskin's law — typing in the past silently restores, then
+  appends. The emotional lens killed it: the parked writer is either
+  panicking, and wants the Restore verb the banner already offers, or
+  deliberating, and would be horrified that a stray keystroke
+  performed a compound verb on the whole document. Raskin's move
+  served a demo, not a state — and a read-only face that secretly
+  writes subverts P7. The litmus round's refusal ships; Restore stays
+  one visible act away.)*
 - **Hold the history key** — quasimode: strip rises, arrows scrub,
   Shift+arrows step station to station, release returns to now with
   nothing changed. Blind firing is always safe.

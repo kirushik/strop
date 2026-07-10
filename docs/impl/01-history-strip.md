@@ -1,7 +1,12 @@
 # Impl spec 01 — the history strip
 
 *(Design doc: `docs/history-strip.md` v2. Depends on: spec 00
-(journal). Status: SPEC — pre-review draft.)*
+(journal). Status: SHIPPED, then RECOMPOSED 2026-07-10 (branch
+`strip-reassembly`) — the design doc's §0.5/§1/§3 amendments of that
+date supersede this brief's layout numbers (the chips row is separate,
+the rail is the page's top edge at 26+30px, fabric 126) and its
+single-lane click mapping (now two hit lanes + view lock). The
+stability-law and readout sections below still bind.)*
 
 ## 0. Placement & entry
 

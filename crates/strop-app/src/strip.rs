@@ -17,19 +17,23 @@
 use strop_core::journal::{EditRun, Journal, JournalEvent};
 
 // ---- Layout ----------------------------------------------------------------
-// The band, top → bottom (design §1): a control row carrying the rail + thumb
-// + readout/Now/Restore, a label lane for the two rows of station names, the
-// fabric itself, and a thin date lane. The four sum to STRIP_H.
+// The band, top → bottom (design §1, restored to the lab-mockup composition):
+// a control row for the chips alone (readout/Restore … Now/×), a label lane
+// for the two rows of station names, then THE RAIL — the document's own top
+// edge, which the thumb rides and the cream page hangs from — the fabric
+// below it, and a thin date lane. The rows sum to STRIP_H.
 pub const STRIP_H: f32 = 196.;
-pub const TOP_ROW_H: f32 = 30.;
-pub const LABEL_LANE_H: f32 = 22.;
-pub const FABRIC_H: f32 = 130.;
+pub const TOP_ROW_H: f32 = 26.;
+pub const LABEL_LANE_H: f32 = 30.;
+pub const FABRIC_H: f32 = 126.;
 pub const DATE_LANE_H: f32 = 14.;
-/// Fabric top, measured from the strip's own top edge: the envelope hangs from
-/// here and the flecks fall below it.
-pub const FAB_Y0: f32 = TOP_ROW_H + LABEL_LANE_H;
-/// The rail line's y within the control row — the thumb rides it.
-pub const RAIL_Y: f32 = 20.;
+/// The rail's y from the strip's top edge. The rail IS the page's top edge:
+/// the envelope hangs from it, so the thumb literally rides along the top of
+/// the manuscript. (The v1 build parked the rail up in the control row, where
+/// the chips occluded it — and the thumb with it — on every short history.)
+pub const RAIL_Y: f32 = TOP_ROW_H + LABEL_LANE_H;
+/// Fabric top == the rail: the page hangs from the seek bar.
+pub const FAB_Y0: f32 = RAIL_Y;
 /// Horizontal breathing room at each end of the band (the readout/Now chips
 /// live inside this margin at the far ends; the rail and fabric span between).
 pub const SIDE_PAD: f32 = 28.;
@@ -42,9 +46,16 @@ pub const PX_PER_MS: f32 = 1. / 30_000.;
 /// A gap longer than this (15 min) is not working time — it folds to a thin
 /// seam instead of stretching the axis with dead air (design §1, spec §1).
 pub const GAP_FOLD_MS: i64 = 15 * 60 * 1000;
-/// The working-time width a folded gap collapses to (a "seam"): enough to read
-/// as a break, small enough that a fortnight of overnight gaps costs ~pixels.
+/// The working-time width a folded gap collapses to — a WELL: a recessed
+/// full-height column, the visible presence of time away (the lab mockup had
+/// these; v1 shrank them to invisible hairlines). Two fixed tiers, not a
+/// gap-proportional scale: the axis spends x on WORK, so absence is
+/// punctuation, never a bar chart — an overnight break and a long
+/// interruption just read as two different marks.
 pub const SEAM_PX: f32 = 10.;
+pub const SEAM_WIDE_PX: f32 = 20.;
+/// A gap at or past this (2 days) earns the wide well.
+pub const SEAM_WIDE_MS: i64 = 2 * 86_400_000;
 /// Every run gets at least this much x, so even a one-op run has somewhere to
 /// hang its flecks (a run is seconds long — below a pixel at the fixed scale —
 /// so the density that reads as flow/deliberation is emergent from run
@@ -88,10 +99,12 @@ pub const READOUT_CHIP: u32 = 0x111009;
 pub const CREAM: u32 = 0xE9E2D0;
 pub const CREAM_FILL_ALPHA: f32 = 0.13;
 pub const ENVELOPE_ALPHA: f32 = 0.9;
-/// Cool veil for an AI pass (the machine read everything → a full-height
-/// translucent column) and the cool thread for a card's open life.
+/// Cool veil for an AI pass (the machine read everything → a translucent
+/// column over the page, rail to envelope) and the cool thread for a card's
+/// open life. Bounded by the page, the veil affords a little more presence
+/// than the v1 full-band wash did.
 pub const VEIL: u32 = 0x86B0E6;
-pub const VEIL_ALPHA: f32 = 0.10;
+pub const VEIL_ALPHA: f32 = 0.16;
 pub const THREAD: u32 = 0x86B0E6;
 /// Sage terminal dot for a resolved card / a restore tick — the one theme
 /// token, re-exported under the strip's short name (token audit A6: no local
@@ -122,6 +135,11 @@ pub struct Timeline {
     pub total_work: f32,
     pub start_ms: i64,
     pub end_ms: i64,
+}
+
+/// A folded gap's well width — the two-tier rule.
+fn seam_width(gap_ms: i64) -> f32 {
+    if gap_ms >= SEAM_WIDE_MS { SEAM_WIDE_PX } else { SEAM_PX }
 }
 
 impl Timeline {
@@ -209,7 +227,7 @@ impl Timeline {
                     _ => {
                         let folded = t0 - prev > GAP_FOLD_MS;
                         let span = if folded {
-                            SEAM_PX
+                            seam_width(t0 - prev)
                         } else {
                             (t0 - prev) as f32 * PX_PER_MS
                         };
@@ -237,7 +255,7 @@ impl Timeline {
         if end_ms > prev {
             let folded = end_ms - prev > GAP_FOLD_MS;
             let span = if folded {
-                SEAM_PX
+                seam_width(end_ms - prev)
             } else {
                 (end_ms - prev) as f32 * PX_PER_MS
             };
@@ -327,8 +345,9 @@ pub struct StationSnap {
 pub struct CardSnap {
     pub raised_ms: i64,
     pub closed_ms: Option<i64>,
-    /// The anchor's depth in the document, 0 (top) .. 1 (bottom).
-    pub depth: f32,
+    /// The anchor's position in chars (today's text) — mapped through the
+    /// envelope's own y-scale at bake, so the thread sits inside the page.
+    pub anchor: usize,
     pub resolved: bool,
 }
 
@@ -344,10 +363,12 @@ pub struct Fleck {
     pub del: bool,
 }
 
-/// A cool full-height column: the machine read here (a `Pass` event).
+/// A cool column: the machine read here (a `Pass` event). Spans the page —
+/// rail down to `y1`, the envelope's level at that moment — not the void.
 #[derive(Clone, Copy, Debug)]
 pub struct Veil {
     pub x: f32,
+    pub y1: f32,
 }
 
 /// A card's open life as a 1-px cool thread; `sage` terminal when resolved,
@@ -389,10 +410,12 @@ pub struct EnvPoint {
     pub y: f32,
 }
 
-/// A folded-gap marker (a >15 min break): a hairline at the seam's x.
+/// A folded-gap WELL (a >15 min break): a recessed full-height column over the
+/// folded span — time away, given the presence a hairline never had.
 #[derive(Clone, Copy, Debug)]
 pub struct Seam {
     pub x: f32,
+    pub w: f32,
 }
 
 /// A quiet date in the bottom lane ("Today" / "Tue 1 Jul").
@@ -418,6 +441,11 @@ pub struct StripBake {
     /// Materialized-checkpoint anchor times (ms), sorted — the reconstruction
     /// anchor is the latest ≤ pos_ms (the editor holds the states themselves).
     pub anchor_ms: Vec<i64>,
+    /// Step destinations (ms), sorted+deduped: every station, both shoulders
+    /// of every big cut/paste (the envelope's corners — "just before the
+    /// damage" is where a rescue lands), the start, and now. Arrow keys walk
+    /// this list while parked.
+    pub snap_ms: Vec<i64>,
     pub now_ms: i64,
 }
 
@@ -435,85 +463,126 @@ impl StripBake {
     ) -> Self {
         let timeline = Timeline::build(journal, stations, now_ms);
 
-        // --- Envelope y-scale, fixed ONCE (design §1) ------------------------
-        // Cumulative length, seeded at the journal-start anchor length so the
-        // envelope reflects the true document, not just journaled churn.
+        // --- One rebased walk: runs and materialized checkpoints, merged in
+        // time order. Checkpoint STATES are ground truth wherever they exist —
+        // a restore's wholesale swap is journal-suppressed, so run deltas
+        // alone drift after one, and the v1 build (which kept two independent
+        // bookkeepings and merge-sorted their points) drew a one-px sawtooth
+        // spike wherever they disagreed. Here the walk REBASES at each state
+        // and accumulates run deltas between them: one envelope, one truth.
+        enum Step<'a> {
+            Run(usize, &'a EditRun),
+            St(&'a StationSnap),
+        }
+        let mut walk: Vec<(i64, Step)> = journal
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.t0, Step::Run(i, r)))
+            .collect();
+        walk.extend(
+            stations
+                .iter()
+                .filter(|s| s.has_state)
+                .map(|s| (s.created_ms, Step::St(s))),
+        );
+        walk.sort_by_key(|w| w.0);
+
+        // --- Envelope y-scale, fixed ONCE (design §1), from the same walk ----
         let mut len: i64 = seed_len as i64;
         let mut max_len: i64 = len.max(1);
-        for run in &journal.runs {
-            len = (len + run.delta_chars()).max(0);
-            max_len = max_len.max(len);
-        }
-        // The legacy era's lengths live in the checkpoint states, not the runs
-        // (Bug A): fold them into the scale so the y-axis fits the WHOLE
-        // history, not just today's churn — else a legacy doc's tall envelope
-        // would clip through the band floor.
-        for st in stations {
-            if st.has_state {
-                max_len = max_len.max(st.chars as i64);
+        for (_, step) in &walk {
+            match step {
+                Step::Run(_, r) => len = (len + r.delta_chars()).max(0),
+                Step::St(s) => len = s.chars as i64,
             }
+            max_len = max_len.max(len);
         }
         let scale = max_len as f32 * 1.1; // headroom for a restore past now-length
         let depth_y = |chars: i64| -> f32 { FAB_Y0 + (chars as f32 / scale) * FABRIC_H };
 
-        // --- Flecks + envelope: one walk over the runs -----------------------
+        // --- Flecks + envelope ------------------------------------------------
         let mut flecks: Vec<Fleck> = Vec::new();
         let mut envelope: Vec<EnvPoint> = Vec::new();
         len = seed_len as i64;
-        for (i, run) in journal.runs.iter().enumerate() {
-            let x0 = timeline.work_at(run.t0);
-            let x1 = timeline.work_at(run.t1.max(run.t0 + 1)).max(x0 + MIN_RUN_PX);
-            // Fleck depth: the edit's position within the document as it stood.
-            let doc_depth = if len > 0 {
-                (run.pos as f32 / len.max(1) as f32).clamp(0., 1.)
-            } else {
-                0.
-            };
-            let band_y = FAB_Y0 + doc_depth * FABRIC_H;
-            let ins = run.ins_words();
-            // Deleted words are estimated from del_chars (the text itself is
-            // not stored — forward replay never needs it): ~5.5 chars/word.
-            let del = (run.del_chars as f32 / 5.5).round() as usize;
-            let n = (ins + del).min(FLECK_CAP);
-            for k in 0..n {
-                let (jx, jy) = jitter(i as u64, k);
-                let x = x0 + jx * (x1 - x0);
-                // Spread within a small vertical band around the edit's depth.
-                let y = (band_y + (jy - 0.5) * 14.).clamp(FAB_Y0, FAB_Y0 + FABRIC_H - FLECK);
-                flecks.push(Fleck {
-                    x,
-                    y,
-                    del: k >= ins,
-                });
+        for (_, step) in &walk {
+            match step {
+                Step::St(s) => {
+                    // The rebase: a step to the state's own length. The legacy
+                    // era's envelope is nothing but these (no keystroke record
+                    // → no flecks fabricated); in a run era the step also
+                    // corrects any suppressed-swap drift.
+                    len = s.chars as i64;
+                    envelope.push(EnvPoint {
+                        x: timeline.work_at(s.created_ms),
+                        y: depth_y(len),
+                    });
+                }
+                Step::Run(i, run) => {
+                    let x0 = timeline.work_at(run.t0);
+                    let x1 = timeline.work_at(run.t1.max(run.t0 + 1)).max(x0 + MIN_RUN_PX);
+                    let after = (len + run.delta_chars()).max(0);
+                    // The run's text extent on the SAME chars axis the envelope
+                    // uses — a grain lives inside the page it was typed into,
+                    // and an append rides the growing edge. (v1 normalized by
+                    // the instantaneous doc length over the full band height:
+                    // every append painted at the band FLOOR, a dirt band the
+                    // envelope never touched.)
+                    let ins_chars = run.ins.chars().count();
+                    let page_bot = depth_y(len.max(after)).max(FAB_Y0 + FLECK);
+                    let pos = run.pos.min(len.max(after) as usize);
+                    let y0 = depth_y(pos as i64).min(page_bot - FLECK);
+                    let y1 = depth_y((pos + run.del_chars.max(ins_chars)) as i64).min(page_bot);
+                    let ins = run.ins_words();
+                    // Deleted words are estimated from del_chars (the text
+                    // itself is not stored — forward replay never needs it):
+                    // ~5.5 chars/word.
+                    let del = (run.del_chars as f32 / 5.5).round() as usize;
+                    let n = (ins + del).min(FLECK_CAP);
+                    for k in 0..n {
+                        let (jx, jy) = jitter(*i as u64, k);
+                        let (jb, _) = jitter((*i as u64) ^ 0x9E37_79B9, k);
+                        // ±1.2 px of x-bleed across run adjacency: sub-pixel
+                        // runs at metronome spacing otherwise alias into a
+                        // picket fence that reads as machine output. ±1.2 px
+                        // is ±36 s — texture moves, testimony doesn't (the
+                        // count stays exact: one fleck, one word).
+                        let x = (x0 + jx * (x1 - x0) + (jb - 0.5) * 2.4).max(0.);
+                        let y = (y0 + jy * (y1 - y0).max(3.)).clamp(FAB_Y0, page_bot - FLECK);
+                        flecks.push(Fleck {
+                            x,
+                            y,
+                            del: k >= ins,
+                        });
+                    }
+                    len = after;
+                    envelope.push(EnvPoint {
+                        x: x1,
+                        y: depth_y(len),
+                    });
+                }
             }
-            len = (len + run.delta_chars()).max(0);
-            envelope.push(EnvPoint {
-                x: x1,
-                y: depth_y(len),
-            });
         }
-        // Checkpoint steps: the legacy era's envelope (Bug A). Each materialized
-        // checkpoint is a step to its state's char length; merged with the run
-        // steps and sorted by x, the merged axis carries ONE continuous
-        // document-length envelope — a step at each checkpoint, no flecks (there
-        // is no keystroke record to fabricate quanta from). Stateless
-        // checkpoints draw a tick but no step (no state to measure).
-        for st in stations {
-            if st.has_state {
-                envelope.push(EnvPoint {
-                    x: timeline.work_at(st.created_ms),
-                    y: depth_y(st.chars as i64),
-                });
-            }
-        }
-        envelope.sort_by(|a, b| a.x.total_cmp(&b.x));
+        // The x-bleed can nudge a grain past a neighbour; re-sort so the
+        // painter's window (a partition_point + early break) stays honest.
+        flecks.sort_by(|a, b| a.x.total_cmp(&b.x));
 
-        // --- Veils (Pass events) & seams -------------------------------------
+        // --- Veils (Pass events) & wells --------------------------------------
+        // A veil spans the PAGE, not the void: rail down to the envelope as it
+        // stood — the machine read the whole text, and only the text.
+        let env_at = |x: f32| -> f32 {
+            match envelope.partition_point(|p| p.x <= x).checked_sub(1) {
+                Some(i) => envelope[i].y,
+                None => envelope.first().map_or(FAB_Y0, |p| p.y),
+            }
+        };
         let mut veils: Vec<Veil> = Vec::new();
         for ev in &journal.events {
             if let JournalEvent::Pass { t, .. } = ev {
+                let x = timeline.work_at(*t);
                 veils.push(Veil {
-                    x: timeline.work_at(*t),
+                    x,
+                    y1: env_at(x).max(FAB_Y0 + 8.),
                 });
             }
         }
@@ -521,10 +590,17 @@ impl StripBake {
             .segs
             .iter()
             .filter(|s| s.folded)
-            .map(|s| Seam { x: s.work0 })
+            .map(|s| Seam {
+                x: s.work0,
+                w: s.work1 - s.work0,
+            })
             .collect();
 
         // --- Threads (card lifespans) ----------------------------------------
+        // Anchor depth on the chars axis (inside the page, like everything
+        // else). `anchor` is the note's position in TODAY'S text — the
+        // historical offset isn't recorded — an honest approximation that
+        // stays within the page because pos ≤ len ≤ max.
         let threads: Vec<Thread> = cards
             .iter()
             .map(|c| {
@@ -536,7 +612,7 @@ impl StripBake {
                 Thread {
                     x0,
                     x1,
-                    y: FAB_Y0 + c.depth.clamp(0., 1.) * FABRIC_H,
+                    y: depth_y(c.anchor as i64).clamp(FAB_Y0 + 2., FAB_Y0 + FABRIC_H),
                     resolved: c.resolved,
                     open,
                 }
@@ -544,11 +620,22 @@ impl StripBake {
             .collect();
 
         // --- Stations (checkpoints) + Restore/Export ticks -------------------
+        // Session starts are bare ticks — the date lane carries the day, and
+        // the words "Session start" taught nothing while colliding with
+        // themselves on every sitting (spec §2: the honest automatics are
+        // Started/Restored/Exported). The one exception: the document's very
+        // first station keeps a name — its birth is data.
+        let first_ms = stations.iter().map(|s| s.created_ms).min();
         let mut baked: Vec<Station> = Vec::new();
         for st in stations {
+            let label = if st.name == "Session start" && Some(st.created_ms) == first_ms {
+                "Started".into()
+            } else {
+                station_display(&st.name)
+            };
             baked.push(Station {
                 x: timeline.work_at(st.created_ms),
-                label: station_display(&st.name),
+                label,
                 rank: station_rank(&st.name, st.manual),
                 restore: st.name == "Restored",
                 arc_to: None,
@@ -612,6 +699,23 @@ impl StripBake {
             v
         };
 
+        // Step destinations: stations, the shoulders of every ≥150-word run
+        // (a big cut's corners), the two ends.
+        let snap_ms: Vec<i64> = {
+            let mut v: Vec<i64> = stations.iter().map(|s| s.created_ms).collect();
+            for run in &journal.runs {
+                if run.delta_chars().unsigned_abs() >= 800 {
+                    v.push(run.t0);
+                    v.push(run.t1.max(run.t0 + 1));
+                }
+            }
+            v.push(timeline.start_ms);
+            v.push(now_ms);
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+
         Self {
             timeline,
             flecks,
@@ -622,6 +726,7 @@ impl StripBake {
             seams,
             dates,
             anchor_ms,
+            snap_ms,
             now_ms,
         }
     }
@@ -659,6 +764,14 @@ fn build_dates(
             });
             last_day = day;
         }
+    }
+    // A document with nothing recorded yet still stands on today — the one
+    // honest word an empty strip can say (the axis does extend to now).
+    if dates.is_empty() {
+        dates.push(DateTick {
+            x: timeline.work_at(now_ms),
+            label: "Today".into(),
+        });
     }
     dates
 }
@@ -699,9 +812,11 @@ fn station_rank(name: &str, manual: bool) -> u8 {
 }
 
 /// Reflex checkpoints are deliberately unnamed on the strip (bare ticks,
-/// lowest rank — design §2); everything else shows its own name.
+/// lowest rank — design §2), and so are session starts: the date lane already
+/// says when a sitting began, and a lane full of "Session start" echoes was
+/// the doubled-print smear. Everything else shows its own name.
 fn station_display(name: &str) -> String {
-    if name.starts_with("Checkpoint ") {
+    if name.starts_with("Checkpoint ") || name == "Session start" {
         String::new()
     } else {
         name.to_owned()
@@ -736,22 +851,37 @@ fn layout_labels(stations: &mut [Station], total_work: f32) {
             .cmp(&stations[b].rank)
             .then(stations[a].x.total_cmp(&stations[b].x))
     });
-    // Each row records the occupied x-intervals already claimed on it.
+    // Each row records the occupied x-intervals already claimed on it;
+    // `claimed` remembers who claimed them, for the same-name rule.
     let mut rows: [Vec<(f32, f32)>; 2] = [Vec::new(), Vec::new()];
+    let mut claimed: Vec<(usize, f32, f32)> = Vec::new();
     for &i in &order {
         let w = label_width(&stations[i].label);
-        // Near the right edge a label would overflow — flip it left of its tick.
-        let flip = stations[i].x + w > total_work + 4.;
+        // Near the right edge a label would overflow — flip it left of its
+        // tick, but only when there IS a left to flip into: on a minutes-old
+        // history every x "overflows" a 2px axis, and flipping threw the
+        // young document's own "Started" off the world's left edge.
+        let flip = stations[i].x + w > total_work + 4. && stations[i].x >= w + 8.;
         let (start, end) = if flip {
             (stations[i].x - w, stations[i].x)
         } else {
             (stations[i].x, stations[i].x + w)
         };
+        // A same-named twin overlapping an already-placed label adds nothing:
+        // omit it whole instead of stacking the lane with an echo (the
+        // doubled-print smear). Different names still compete for row two.
+        if claimed.iter().any(|&(j, s, e)| {
+            stations[j].label == stations[i].label && start < e + 4. && s < end + 4.
+        }) {
+            stations[i].show = false;
+            continue;
+        }
         let mut placed = false;
         for (r, occ) in rows.iter_mut().enumerate() {
             let clear = occ.iter().all(|&(s, e)| end + 4. <= s || start >= e + 4.);
             if clear {
                 occ.push((start, end));
+                claimed.push((i, start, end));
                 stations[i].row = r as u8;
                 stations[i].flip_left = flip;
                 placed = true;
@@ -922,6 +1052,10 @@ pub struct Strip {
     pub parked: bool,
     /// A drag is in flight (mousedown-hold): moves update the playhead.
     pub scrubbing: bool,
+    /// The in-flight drag started in the FABRIC (direct touch on the cloth:
+    /// moment-under-cursor mapping, view never yanks) rather than on the rail
+    /// (fraction-of-the-whole seek, view locked to the thumb).
+    pub scrub_fabric: bool,
     /// Fabric horizontal pan (px) — auto-scroll keeps the playhead in view at
     /// novel scale; wheel pans it. NOT part of the bake (review B7).
     pub view_offset: f32,
@@ -937,6 +1071,11 @@ pub struct Strip {
     /// The Compare pin's word count, computed once when the pin is set, so the
     /// readout's folded delta needs no per-frame reconstruction.
     pub pin_words: usize,
+    /// The live document's selection, saved at park and restored at Now/close
+    /// (its byte offsets mean nothing against a preview's text, and Esc must
+    /// return the identical frame). A Restore drops it instead — the text
+    /// changed for real.
+    pub saved_sel: Option<std::ops::Range<usize>>,
 }
 
 impl Default for Strip {
@@ -947,12 +1086,14 @@ impl Default for Strip {
             pin_ms: None,
             parked: false,
             scrubbing: false,
+            scrub_fabric: false,
             view_offset: 0.,
             bakes: 0,
             bake: None,
             scratch: None,
             words_at: 0,
             pin_words: 0,
+            saved_sel: None,
         }
     }
 }
@@ -1106,6 +1247,177 @@ mod tests {
         assert_eq!(date_label(now - 86_400, now), "Yesterday");
         let older = date_label(now - 5 * 86_400, now);
         assert!(!older.contains("day"), "real dates, never 'day 12': {older}");
+    }
+
+    #[test]
+    fn flecks_ride_the_envelope_not_the_floor() {
+        // Pure drafting (appends at the end): the grains hug the growing edge.
+        // The v1 mapping normalized by the instantaneous doc length over the
+        // full band height, so every append painted at the band FLOOR — a
+        // dirt band the page never touched.
+        let j = fixture();
+        let now = j.runs.last().unwrap().t1 + 1000;
+        let bake = StripBake::build(&j, &[], &[], 0, now);
+        let page_bottom = bake.envelope.last().unwrap().y;
+        assert!(
+            bake.flecks.iter().all(|f| f.y <= page_bottom + 0.01),
+            "no grain below the deepest page edge"
+        );
+        // The stroke follows the envelope down as the story grows.
+        let n = bake.flecks.len();
+        assert!(n >= 20, "enough grains to compare ends: {n}");
+        let avg = |fs: &[Fleck]| fs.iter().map(|f| f.y).sum::<f32>() / fs.len() as f32;
+        assert!(
+            avg(&bake.flecks[..n / 5]) + 20. < avg(&bake.flecks[n - n / 5..]),
+            "early grains sit high, late grains ride deep"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_rebases_the_envelope_instead_of_spiking() {
+        // A materialized checkpoint mid-run-era claiming a length the run
+        // deltas never saw — the shape a journal-suppressed restore swap
+        // leaves behind. v1 merge-sorted two bookkeepings into one polyline:
+        // a one-px spike to the state's length and straight back. The rebased
+        // walk steps to the truth and CONTINUES from it.
+        let j = fixture();
+        let mid = (j.runs[j.runs.len() / 2 - 1].t1 + j.runs[j.runs.len() / 2].t0) / 2;
+        let st = vec![station(mid, "Restored", 700, 4000)];
+        let now = j.runs.last().unwrap().t1 + 1000;
+        let bake = StripBake::build(&j, &st, &[], 0, now);
+        let sx = bake.timeline.work_at(mid);
+        let step_y = bake.envelope.iter().find(|p| p.x >= sx).unwrap().y;
+        for p in bake.envelope.iter().filter(|p| p.x > sx) {
+            assert!(
+                p.y >= step_y - 0.01,
+                "no snap back to the stale sum after the rebase: {} vs {step_y}",
+                p.y
+            );
+        }
+    }
+
+    #[test]
+    fn wells_have_two_tiers() {
+        let mut j = Journal::default();
+        let day = 86_400_000i64;
+        let base = 1_700_000_000_000i64;
+        let mut pos = 0usize;
+        for t0 in [base, base + day, base + 5 * day] {
+            for k in 0..5i64 {
+                j.record(&ins(pos, "word "), t0 + k * 400);
+                pos += 5;
+            }
+            j.settle();
+        }
+        let tl = Timeline::build(&j, &[], base + 5 * day + 10_000);
+        let widths: Vec<f32> = tl
+            .segs
+            .iter()
+            .filter(|s| s.folded)
+            .map(|s| s.work1 - s.work0)
+            .collect();
+        assert_eq!(widths.len(), 2, "two folded gaps: {widths:?}");
+        assert_eq!(widths[0], SEAM_PX, "an overnight break is the thin well");
+        assert_eq!(widths[1], SEAM_WIDE_PX, "days away earn the wide well");
+    }
+
+    #[test]
+    fn session_starts_are_bare_ticks_except_the_first() {
+        let day = 86_400_000i64;
+        let base = 1_700_000_000_000i64;
+        let stations = vec![
+            station(base, "Session start", 10, 60),
+            station(base + day, "Session start", 200, 1200),
+            station(base + 2 * day, "Session start", 400, 2400),
+        ];
+        let j = Journal::default();
+        let bake = StripBake::build(&j, &stations, &[], 0, base + 3 * day);
+        assert_eq!(bake.stations[0].label, "Started", "the birth keeps a name");
+        assert!(
+            bake.stations[1].label.is_empty() && bake.stations[2].label.is_empty(),
+            "later session starts are bare ticks — the date lane carries the day"
+        );
+    }
+
+    #[test]
+    fn duplicate_adjacent_labels_collapse_to_one() {
+        let mk = |x: f32, label: &str| Station {
+            x,
+            label: label.into(),
+            rank: RANK_WRITER,
+            restore: false,
+            arc_to: None,
+            row: 0,
+            flip_left: false,
+            show: true,
+            at_ms: 0,
+        };
+        let mut sts = vec![mk(100., "Draft complete"), mk(103., "Draft complete")];
+        layout_labels(&mut sts, 1000.);
+        let shown = sts.iter().filter(|s| s.show).count();
+        assert_eq!(shown, 1, "the echo is omitted, not stacked into row two");
+        // Distinct names at the same x still get the second row.
+        let mut sts = vec![mk(100., "Draft complete"), mk(103., "Line pass done")];
+        layout_labels(&mut sts, 1000.);
+        assert_eq!(sts.iter().filter(|s| s.show).count(), 2);
+    }
+
+    #[test]
+    fn veils_span_the_page_not_the_void() {
+        use strop_core::journal::JournalEvent;
+        let j = fixture();
+        let t = j.runs.last().unwrap().t1 + 30_000;
+        let j = Journal::from_parts(
+            j.runs.clone(),
+            vec![JournalEvent::Pass {
+                t,
+                mode: "developmental".into(),
+                cards: 3,
+            }],
+        );
+        let bake = StripBake::build(&j, &[], &[], 0, t + 1000);
+        assert_eq!(bake.veils.len(), 1);
+        let page = bake.envelope.last().unwrap().y;
+        assert!(
+            (bake.veils[0].y1 - page).abs() < 0.5,
+            "the veil ends at the envelope, not the band floor: {} vs {page}",
+            bake.veils[0].y1
+        );
+    }
+
+    #[test]
+    fn snap_points_cover_stations_and_big_cut_shoulders() {
+        let day = 86_400_000i64;
+        let base = 1_700_000_000_000i64;
+        let mut j = Journal::default();
+        let mut pos = 0usize;
+        for k in 0..40i64 {
+            j.record(&ins(pos, "word "), base + k * 400);
+            pos += 5;
+        }
+        j.settle();
+        // One big cut (≥ 800 chars) a day later — its shoulders become steps.
+        let cut_t = base + day;
+        j.record(
+            &TextOp {
+                pos: 20,
+                delete: 900,
+                insert: String::new(),
+            },
+            cut_t,
+        );
+        j.settle();
+        let st = vec![station(base - day, "Started", 5, 30)];
+        let now = cut_t + 100_000;
+        let bake = StripBake::build(&j, &st, &[], 1000, now);
+        assert!(bake.snap_ms.contains(&(base - day)), "stations are steps");
+        assert!(
+            bake.snap_ms.iter().any(|&t| (t - cut_t).abs() < 2),
+            "the big cut's shoulder is a step: {:?}",
+            bake.snap_ms
+        );
+        assert!(bake.snap_ms.contains(&now), "now is the last step");
+        assert!(bake.snap_ms.windows(2).all(|w| w[0] < w[1]), "sorted, deduped");
     }
 
     #[test]

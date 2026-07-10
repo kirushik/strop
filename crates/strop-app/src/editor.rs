@@ -2080,6 +2080,14 @@ impl Editor {
         if !entries[selected].manual {
             expanded.insert(auto_group_start(&entries, selected));
         }
+        // The panel preview shares the strip's law: a live selection's byte
+        // offsets mean nothing against a checkpoint's text — save it for the
+        // exit and collapse it, or the wash paints the wrong words (P6).
+        if self.strip.saved_sel.is_none() {
+            self.strip.saved_sel = Some(self.selected_range.clone());
+            let c = self.selected_range.end;
+            self.selected_range = c..c;
+        }
         self.history_view = Some(HistoryView {
             entries,
             selected,
@@ -2142,6 +2150,11 @@ impl Editor {
     fn exit_history(&mut self, cx: &mut Context<Self>) {
         self.history_view = None;
         self.history_preview = None;
+        // Leaving the panel returns the live selection (the document is
+        // unchanged by a preview round-trip, so its offsets hold).
+        if let Some(s) = self.strip.saved_sel.take() {
+            self.selected_range = s;
+        }
         cx.notify();
     }
 
@@ -2464,6 +2477,9 @@ impl Editor {
         // promise belongs to Esc, not to a document swap).
         self.cold_read = None;
         *self.cr_page_bounds.borrow_mut() = None;
+        // The text changed for real — a selection saved at any preview's
+        // entrance is void, and must not be re-applied by the exits below.
+        self.strip.saved_sel = None;
         // Drops any preview (panel `history_view` OR the strip's
         // `history_preview`) so the live restored document is what shows.
         self.exit_history(cx);
@@ -2498,6 +2514,7 @@ impl Editor {
             self.strip.pin_ms = None;
             self.strip.pos_ms = now;
             self.strip.scratch = None;
+            self.strip.view_offset = f32::MAX; // back to the tail with the new data
             self.history_preview = None;
             self.strip_bake(now);
             cx.notify();
@@ -2535,7 +2552,11 @@ impl Editor {
         self.strip.parked = false;
         self.strip.pin_ms = None;
         self.strip.pos_ms = now;
-        self.strip.view_offset = 0.;
+        // Pin the view to the TAIL: the strip opens where the writer just was
+        // (v1 opened on the oldest screenful, playhead off-screen right). The
+        // sentinel resolves against the rail width at paint — the geometry Rc
+        // is only written then.
+        self.strip.view_offset = f32::MAX;
         self.strip_bake(now);
         cx.notify();
     }
@@ -2548,6 +2569,10 @@ impl Editor {
         self.strip.scratch = None;
         self.strip.bake = None;
         self.strip_pulse = None;
+        // Closing from a park is a return too: the live selection comes back.
+        if let Some(s) = self.strip.saved_sel.take() {
+            self.selected_range = s;
+        }
         // Drop any preview so the live document returns.
         self.history_preview = None;
         *self.strip_rail.borrow_mut() = None;
@@ -2618,7 +2643,6 @@ impl Editor {
                 _ => None,
             })
             .collect();
-        let doc_len = self.doc.rope().len_chars().max(1) as f32;
         self.doc
             .notes()
             .notes()
@@ -2628,7 +2652,7 @@ impl Editor {
                 strip::CardSnap {
                     raised_ms: n.created_unix * 1000,
                     closed_ms: closed.map(|(t, _)| *t),
-                    depth: (n.range.start as f32 / doc_len).clamp(0., 1.),
+                    anchor: n.range.start,
                     resolved: closed.map_or(n.status == NoteStatus::Done, |(_, r)| *r),
                 }
             })
@@ -2675,17 +2699,34 @@ impl Editor {
     /// Is there any PAST to view? False for a document with no journal and no
     /// checkpoints beyond the present (a zero-width axis) — parking there would
     /// preview "now" and needlessly enter read-only mode (P13: no view without
-    /// content). `total_work == 0` captures both the truly-empty doc and the
-    /// only-a-now-checkpoint one (its extend-to-now span has no width).
+    /// content). Any journaled run IS a past, however brief (the pre-floor
+    /// behavior — a flat px floor also blocked real sub-minute edits, review:
+    /// five-lens pass); without runs, the 1.5px floor covers the seconds-old
+    /// birth checkpoint an import writes: a document born moments ago has a
+    /// birth record, not a past (a legacy checkpoint era clears it at
+    /// CKPT_MIN_PX per span).
     fn strip_has_past(&self) -> bool {
-        self.strip
-            .bake
-            .as_ref()
-            .is_some_and(|b| b.timeline.total_work > 0.)
+        let has_runs = !self.doc.journal().runs.is_empty();
+        self.strip.bake.as_ref().is_some_and(|b| {
+            let w = b.timeline.total_work;
+            if has_runs { w > 0. } else { w > 1.5 }
+        })
     }
 
-    fn strip_park_at_x(&mut self, x: f32, pin: bool, cx: &mut Context<Self>) {
-        let Some(pos) = self.strip_pos_at_x(x) else {
+    fn strip_park_at_x(&mut self, x: f32, y: f32, pin: bool, cx: &mut Context<Self>) {
+        // Two hit lanes, matching what each looks like (P7): the rail row and
+        // everything above it is the seek bar — a click maps a FRACTION of the
+        // whole history; the fabric below is the cloth itself — a click lands
+        // on the moment UNDER the cursor, however the view is panned, and the
+        // view never yanks away from what was just touched.
+        let fabric = (*self.strip_rail.borrow())
+            .is_some_and(|g| y - g.band_top > strip::RAIL_Y + 8.);
+        let pos = if fabric {
+            self.strip_pos_at_fabric_x(x)
+        } else {
+            self.strip_pos_at_rail_x(x)
+        };
+        let Some(pos) = pos else {
             return;
         };
         // No history → never park (the reported guard).
@@ -2696,17 +2737,27 @@ impl Editor {
             self.strip_toggle_pin(pos, cx);
             return;
         }
+        // A live-doc selection's offsets mean nothing against the preview
+        // text — save it for the return and collapse, rather than wash the
+        // wrong words (P6).
+        if !self.strip.parked {
+            self.strip.saved_sel = Some(self.selected_range.clone());
+            let c = self.selected_range.end;
+            self.selected_range = c..c;
+        }
         self.strip.parked = true;
         self.strip.scrubbing = true;
-        self.strip_scrub_to(pos, cx);
+        self.strip.scrub_fabric = fabric;
+        self.strip_scrub_to(pos, !fabric, cx);
     }
 
-    /// Map a rail x (window coords) → working px → wall-clock ms. The thumb
-    /// travels `min(total_work, rail_width)` (design §1): when the history fits,
-    /// the rail and the fixed-scale fabric coincide 1:1; when it overflows, the
-    /// thumb compresses the whole duration into the rail while the fabric
-    /// auto-scrolls. Both this input map and the painted thumb use `strip_travel`.
-    fn strip_pos_at_x(&self, x: f32) -> Option<i64> {
+    /// Map a rail x (window coords) → fraction of the WHOLE history → wall ms.
+    /// The thumb travels `min(total_work, rail_width)` (design §1): when the
+    /// history fits, the rail and the fixed-scale fabric coincide 1:1; when it
+    /// overflows, the thumb compresses the whole duration into the rail while
+    /// the fabric follows under it. Both this input map and the painted thumb
+    /// use `strip_travel`.
+    fn strip_pos_at_rail_x(&self, x: f32) -> Option<i64> {
         let geom = (*self.strip_rail.borrow())?;
         let bake = self.strip.bake.as_ref()?;
         let travel = strip_travel(geom.rail_x1 - geom.rail_x0, bake.timeline.total_work);
@@ -2714,27 +2765,81 @@ impl Editor {
         Some(bake.timeline.wall_at(frac * bake.timeline.total_work))
     }
 
-    /// One scrub step: move the playhead, reconstruct the past, and auto-scroll
-    /// the fabric to keep the playhead in view (the mutable half of the
-    /// stability law — the bake never moves; only these do).
-    fn strip_scrub_to(&mut self, pos_ms: i64, cx: &mut Context<Self>) {
+    /// The effective fabric pan: the stored offset clamped to the current
+    /// geometry. Open stores f32::MAX to pin the view to the tail — the clamp
+    /// resolves the sentinel against a rail width the strip only learns at
+    /// paint (the geometry Rc is written per-frame).
+    fn strip_view(&self) -> f32 {
+        let Some(geom) = *self.strip_rail.borrow() else {
+            return 0.;
+        };
+        let Some(bake) = self.strip.bake.as_ref() else {
+            return 0.;
+        };
+        let max = (bake.timeline.total_work - (geom.rail_x1 - geom.rail_x0)).max(0.);
+        self.strip.view_offset.clamp(0., max)
+    }
+
+    /// Map a fabric x (window coords) → the working px under the cursor at the
+    /// CURRENT pan → wall ms. Direct manipulation of the visible cloth.
+    fn strip_pos_at_fabric_x(&self, x: f32) -> Option<i64> {
+        let geom = (*self.strip_rail.borrow())?;
+        let bake = self.strip.bake.as_ref()?;
+        let work = (x - geom.rail_x0 + self.strip_view()).clamp(0., bake.timeline.total_work);
+        Some(bake.timeline.wall_at(work))
+    }
+
+    /// One scrub step: move the playhead and reconstruct the past (the mutable
+    /// half of the stability law — the bake never moves; only these do).
+    ///
+    /// `lock` binds the fabric to the thumb: view = work − frac·travel, the
+    /// one formula under which the playhead line passes through the thumb AND
+    /// the correct spot in the cloth at every scale (at fitting scale it
+    /// reduces to view = 0; at now it lands the view on the tail). Rail seeks,
+    /// stepping, open and Now all lock; a fabric touch does NOT — the moment
+    /// just clicked stays under the cursor, and the thumb alone shows the
+    /// global position until the next rail interaction re-binds them.
+    fn strip_scrub_to(&mut self, pos_ms: i64, lock: bool, cx: &mut Context<Self>) {
         self.strip.pos_ms = pos_ms;
         self.strip_reconstruct(pos_ms);
-        let view = {
-            let geom = *self.strip_rail.borrow();
-            match (geom, self.strip.bake.as_ref()) {
-                (Some(g), Some(b)) => {
-                    let rail_w = (g.rail_x1 - g.rail_x0).max(1.);
-                    let work = b.timeline.work_at(pos_ms);
-                    Some((work - rail_w / 2.).clamp(0., (b.timeline.total_work - rail_w).max(0.)))
+        if lock {
+            let view = {
+                let geom = *self.strip_rail.borrow();
+                match (geom, self.strip.bake.as_ref()) {
+                    (Some(g), Some(b)) => {
+                        let rail_w = (g.rail_x1 - g.rail_x0).max(1.);
+                        let total = b.timeline.total_work.max(f32::EPSILON);
+                        let travel = strip_travel(rail_w, b.timeline.total_work);
+                        let work = b.timeline.work_at(pos_ms);
+                        Some((work - work / total * travel).max(0.))
+                    }
+                    _ => None,
                 }
-                _ => None,
+            };
+            if let Some(v) = view {
+                self.strip.view_offset = v;
             }
-        };
-        if let Some(v) = view {
-            self.strip.view_offset = v;
         }
         cx.notify();
+    }
+
+    /// Arrow keys while parked: step the playhead to the previous/next snap
+    /// point — stations, the shoulders of big cuts, the ends. The rescue
+    /// ratchet: "just before the damage" is one keypress, not a tremor.
+    fn strip_step(&mut self, dir: i64, cx: &mut Context<Self>) {
+        let Some(bake) = self.strip.bake.as_ref() else {
+            return;
+        };
+        let pos = self.strip.pos_ms;
+        let next = if dir < 0 {
+            bake.snap_ms.iter().rev().find(|&&t| t < pos).copied()
+        } else {
+            bake.snap_ms.iter().find(|&&t| t > pos).copied()
+        };
+        if let Some(t) = next {
+            self.strip.parked = true;
+            self.strip_scrub_to(t, true, cx);
+        }
     }
 
     /// Reconstruct the document as it stood at `pos_ms` (spec §2). Anchors on
@@ -2852,6 +2957,14 @@ impl Editor {
         self.strip.pin_ms = None;
         self.strip.pos_ms = now;
         self.strip.scratch = None;
+        // Re-pin the view to the tail — returning to now also returns the eye.
+        self.strip.view_offset = f32::MAX;
+        // Esc returns the identical frame: the live selection comes back (a
+        // preview round-trip never mutates the document, so its offsets hold);
+        // the preview's own selection dies with the preview.
+        if let Some(s) = self.strip.saved_sel.take() {
+            self.selected_range = s;
+        }
         self.history_preview = None;
         cx.notify();
     }
@@ -2980,7 +3093,11 @@ impl Editor {
             }
         };
         let Some(max) = max else { return };
-        self.strip.view_offset = (self.strip.view_offset - d).clamp(0., max);
+        // Resolve the pin-to-tail sentinel BEFORE the arithmetic: f32::MAX
+        // absorbs the delta (MAX - d == MAX), which would eat the first wheel
+        // tick after an open (review: five-lens pass, geometry).
+        let base = self.strip.view_offset.clamp(0., max);
+        self.strip.view_offset = (base - d).clamp(0., max);
         cx.notify();
     }
 
@@ -6105,6 +6222,14 @@ impl Editor {
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        // Parked in the past, the arrows walk the strip's snap points —
+        // stations and the shoulders of big cuts. The rescue ratchet: "just
+        // before the damage" is one keypress. (At now the strip is passive
+        // and the caret keeps its keys.)
+        if self.strip.is_parked() {
+            self.strip_step(-1, cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
@@ -6113,6 +6238,10 @@ impl Editor {
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.strip.is_parked() {
+            self.strip_step(1, cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.cursor_offset()), cx);
         } else {
@@ -7964,8 +8093,8 @@ impl Editor {
         // of a past revision. The selection's byte offsets index the laid-out
         // text — which IS the preview while previewing — so the slice comes from
         // the preview string, not the live doc (`index_for_mouse` clamps to the
-        // same source). Selection highlight is suppressed in preview, but the
-        // range is honest, so ctrl-c carries the past's words.
+        // same source). The selection RENDERS in preview too (the reassembly's
+        // surgical-rescue law), so what ctrl-c carries is what the eye saw.
         let text = match &self.history_preview {
             Some(p) => {
                 let r = self.selected_range.start.min(p.text.len())
@@ -9528,7 +9657,7 @@ impl Editor {
                     .map(|c| c.created_unix),
             };
             if let Some(secs) = target {
-                self.strip_scrub_to(secs * 1000, cx);
+                self.strip_scrub_to(secs * 1000, true, cx);
             }
         }
         match self.strip_read_target() {
@@ -9581,9 +9710,17 @@ impl Editor {
             .as_ref()
             .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
         if let Some(pos) = pos {
+            // The same park entrance the click path takes: the live selection
+            // is saved+collapsed, so the rig exercises the real invariants
+            // (review: five-lens pass, interaction).
+            if !self.strip.parked {
+                self.strip.saved_sel = Some(self.selected_range.clone());
+                let c = self.selected_range.end;
+                self.selected_range = c..c;
+            }
             self.strip.parked = true;
             self.strip.scrubbing = false;
-            self.strip_scrub_to(pos, cx);
+            self.strip_scrub_to(pos, true, cx);
         }
     }
 
@@ -10741,8 +10878,12 @@ impl Element for EditorElement {
                 .map_or(1f32, |s| (s / 20.).clamp(0.6, 2.))
                 .to_bits(),
             selection: {
+                // Selection renders in history too: lifting a paragraph out
+                // of a past revision is the surgical rescue, and a selection
+                // you can't see fails the screenshot test (P6). The wash is
+                // the writer's own — selecting is a live act on any text.
                 let s = &editor.selected_range;
-                (!in_history && s.start != s.end).then_some((s.start, s.end))
+                (s.start != s.end).then_some((s.start, s.end))
             },
             marked: editor
                 .marked_range
@@ -10855,11 +10996,10 @@ impl Element for EditorElement {
             Some(p) => (p.text, p.inserts, p.deletes, Some(p.spans_bytes), Some(p.kinds)),
             None => (editor.doc.text(), Vec::new(), Vec::new(), None, None),
         };
-        let selection = if in_history {
-            0..0
-        } else {
-            editor.selected_range.clone()
-        };
+        // The selection survives into history frames (offsets index the
+        // laid-out text, which IS the preview while previewing — the same
+        // source `copy` slices; see that comment).
+        let selection = editor.selected_range.clone();
         let marked = if in_history {
             None
         } else {
@@ -17360,6 +17500,9 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
 pub struct StripGeom {
     rail_x0: f32,
     rail_x1: f32,
+    /// The strip band's top edge (window coords) — the click-lane split
+    /// (rail seek vs fabric touch) is a y-decision.
+    band_top: f32,
 }
 
 /// The thumb's travel: `min(total_work, rail_width)` (design §1). When the
@@ -19765,6 +19908,10 @@ impl Editor {
         let readout_chip = chip(readout.into(), true)
             .id("strip-readout")
             .occlude()
+            .text_size(px(12.))
+            // Reserved width: scrubbing may only change the numerals, never
+            // re-flow the chip's neighbours (the stability law, §3).
+            .min_w(px(220.))
             // The readout is fixed at the left end and NEVER parks (design §3).
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
@@ -19840,19 +19987,32 @@ impl Editor {
                 .occlude()
                 // Scrub: mousedown parks (shift = Compare pin), drag scrubs
                 // continuously, up/up_out end — the selection-drag pattern.
+                // The y decides the lane: rail = seek the whole, fabric =
+                // touch the moment under the cursor; a drag stays in the lane
+                // it started in.
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|editor, ev: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        editor.strip_park_at_x(f32::from(ev.position.x), ev.modifiers.shift, cx);
+                        editor.strip_park_at_x(
+                            f32::from(ev.position.x),
+                            f32::from(ev.position.y),
+                            ev.modifiers.shift,
+                            cx,
+                        );
                     }),
                 )
                 .on_mouse_move(cx.listener(|editor, ev: &MouseMoveEvent, _, cx| {
-                    if editor.strip.scrubbing
-                        && ev.pressed_button == Some(MouseButton::Left)
-                        && let Some(pos) = editor.strip_pos_at_x(f32::from(ev.position.x))
-                    {
-                        editor.strip_scrub_to(pos, cx);
+                    if editor.strip.scrubbing && ev.pressed_button == Some(MouseButton::Left) {
+                        let fabric = editor.strip.scrub_fabric;
+                        let pos = if fabric {
+                            editor.strip_pos_at_fabric_x(f32::from(ev.position.x))
+                        } else {
+                            editor.strip_pos_at_rail_x(f32::from(ev.position.x))
+                        };
+                        if let Some(pos) = pos {
+                            editor.strip_scrub_to(pos, !fabric, cx);
+                        }
                     }
                 }))
                 .on_mouse_up(
@@ -19973,16 +20133,21 @@ impl Element for StripElement {
         let rail_x0 = f32::from(bounds.origin.x) + strip::SIDE_PAD;
         let rail_x1 = f32::from(bounds.origin.x + bounds.size.width) - strip::SIDE_PAD;
         let band_top = f32::from(bounds.origin.y);
-        let view = editor.strip.view_offset;
         let Some(bake) = editor.strip.bake.as_ref() else {
             return StripPrepaint {
                 rail_x0,
                 rail_x1,
                 band_top,
-                view,
+                view: 0.,
                 ..Default::default()
             };
         };
+        // The effective pan: the stored offset clamped to THIS frame's
+        // geometry (open stores f32::MAX = "pin to the tail").
+        let view = editor
+            .strip
+            .view_offset
+            .clamp(0., (bake.timeline.total_work - (rail_x1 - rail_x0)).max(0.));
         let fab_x = |work: f32| rail_x0 + work - view;
         let shape = |text: &str, size: f32, color: u32, w: &mut Window| {
             let run = TextRun {
@@ -19997,6 +20162,11 @@ impl Element for StripElement {
                 .shape_line(SharedString::from(text.to_owned()), px(size), &[run], None)
         };
         // Station labels — only the ones the bake kept, and only within view.
+        // Two rows at a 13px pitch (an 11px face needs ~13px of line — the v1
+        // 11px pitch overprinted row two into row one's descenders). The label
+        // near the playhead brightens with its tick (association by light,
+        // design §2) — legal here because prepaint re-shapes every frame.
+        let pos = editor.strip.pos_ms;
         let mut labels = Vec::new();
         for st in &bake.stations {
             if !st.show || st.label.is_empty() {
@@ -20006,13 +20176,14 @@ impl Element for StripElement {
             if wx < rail_x0 - 60. || wx > rail_x1 + 60. {
                 continue;
             }
-            let line = shape(&st.label, 11., 0xB8B2A2, window);
+            let near = (st.at_ms - pos).abs() < 45_000;
+            let line = shape(&st.label, 11., if near { 0xEAE4D2 } else { 0xC1BBA9 }, window);
             let lx = if st.flip_left {
                 wx - f32::from(line.width) - 3.
             } else {
                 wx + 3.
             };
-            let ly = band_top + strip::TOP_ROW_H + 1. + (st.row as f32) * 11.;
+            let ly = band_top + strip::TOP_ROW_H + 2. + (st.row as f32) * 13.;
             labels.push(StripText {
                 origin: point(px(lx), px(ly)),
                 line,
@@ -20030,7 +20201,7 @@ impl Element for StripElement {
             if wx < rail_x0 - 40. || wx > rail_x1 + 40. {
                 continue;
             }
-            let line = shape(&dt.label, 10., 0x87826F, window);
+            let line = shape(&dt.label, 10.5, 0x9C9684, window);
             if wx < last_right + 14. {
                 if i + 1 != bake.dates.len() {
                     continue;
@@ -20072,9 +20243,13 @@ impl Element for StripElement {
         let rail_x0 = prepaint.rail_x0;
         let rail_x1 = prepaint.rail_x1;
         let band_top = prepaint.band_top;
-        // Hand the rail geometry to the scrub mouse handlers (interior
-        // mutability through the shared Rc — never an entity write).
-        *editor.strip_rail.borrow_mut() = Some(StripGeom { rail_x0, rail_x1 });
+        // Hand the geometry to the scrub mouse handlers (interior mutability
+        // through the shared Rc — never an entity write).
+        *editor.strip_rail.borrow_mut() = Some(StripGeom {
+            rail_x0,
+            rail_x1,
+            band_top,
+        });
 
         let rail_y = band_top + strip::RAIL_Y;
         let rail_w = (rail_x1 - rail_x0).max(1.);
@@ -20102,8 +20277,14 @@ impl Element for StripElement {
         let total = bake.timeline.total_work;
         let pos = editor.strip.pos_ms;
         let fab_x = |work: f32| rail_x0 + work - view;
-        let fab_top = band_top + strip::FAB_Y0;
+        let fab_top = rail_y; // the page hangs from the rail
         let fab_bot = fab_top + strip::FABRIC_H;
+
+        // --- Wells first: a folded gap is a recessed full-height column ------
+        for s in &bake.seams {
+            let x = fab_x(s.x);
+            rect(window, x, fab_top, s.w, strip::FABRIC_H, tint(0x1D1C17, 1.));
+        }
 
         // --- Cream page-fill + stepwise envelope stroke ----------------------
         if !bake.envelope.is_empty() {
@@ -20113,12 +20294,12 @@ impl Element for StripElement {
             };
             for p in bake.envelope.iter().chain(std::iter::once(&strip::EnvPoint {
                 x: total,
-                y: bake.envelope.last().map_or(fab_top, |e| e.y),
+                y: bake.envelope.last().map_or(strip::FAB_Y0, |e| e.y),
             })) {
                 let xa = fab_x(prev.x);
                 let xb = fab_x(p.x);
                 let level = band_top + prev.y;
-                // The faint cream page under the line.
+                // The faint cream page hanging from the rail down to the line.
                 rect(window, xa, fab_top, xb - xa, level - fab_top, tint(strip::CREAM, strip::CREAM_FILL_ALPHA));
                 // The envelope stroke: a horizontal cap + the vertical step.
                 rect(window, xa, level - 0.65, xb - xa, 1.3, tint(strip::CREAM, strip::ENVELOPE_ALPHA));
@@ -20128,35 +20309,17 @@ impl Element for StripElement {
             }
         }
 
-        // --- Veils: the machine read here (a full-height cool column) --------
+        // --- Veils: the machine read here — a cool wash over the PAGE, rail
+        // down to the envelope as it stood, never the void below.
         for v in &bake.veils {
             let x = fab_x(v.x);
-            rect(window, x - 2., fab_top, 4., strip::FABRIC_H, tint(strip::VEIL, strip::VEIL_ALPHA));
-        }
-
-        // --- Threads: a card's open life (cool), sage/grey terminal dot ------
-        for t in &bake.threads {
-            let x0 = fab_x(t.x0);
-            let x1 = fab_x(t.x1);
-            let y = band_top + t.y;
-            rect(window, x0, y, x1 - x0, 1., tint(strip::THREAD, 0.5));
-            if !t.open {
-                let dot = if t.resolved { strip::SAGE } else { strip::GREY };
-                rect(window, x1 - 1.5, y - 1.5, 3., 3., tint(dot, 0.9));
-            }
-        }
-
-        // --- Seams: a folded >15 min gap ------------------------------------
-        for s in &bake.seams {
-            let x = fab_x(s.x);
-            rect(window, x, fab_top, 1., strip::FABRIC_H, tint(strip::GREY, 0.35));
+            rect(window, x - 2., fab_top, 4., (band_top + v.y1) - fab_top, tint(strip::VEIL, strip::VEIL_ALPHA));
         }
 
         // --- Flecks: the fabric (2×2 amber grains; thousands = one batch).
-        // Windowed: flecks are baked in time order (x non-decreasing), so the
-        // visible range is one partition_point + an early break — paint cost
-        // is O(visible), not O(journal) (wave-1 review, perf/mid; a year of
-        // history would otherwise walk every grain per frame).
+        // Windowed: flecks are baked in x order, so the visible range is one
+        // partition_point + an early break — paint cost is O(visible), not
+        // O(journal) (wave-1 review, perf/mid).
         let lo = view;
         let hi = view + (rail_x1 - rail_x0);
         let start = bake.flecks.partition_point(|f| f.x < lo);
@@ -20176,22 +20339,47 @@ impl Element for StripElement {
             ));
         }
 
+        // --- Threads: a card's open life — a cool hairline at anchor depth
+        // inside the page, an origin ring where it was raised, a sage/grey
+        // terminal where it closed. Open threads run quieter than closed
+        // ones ended: eight open questions must not grid the cloth.
+        for t in &bake.threads {
+            let x0 = fab_x(t.x0);
+            let x1 = fab_x(t.x1);
+            let y = band_top + t.y;
+            rect(window, x0, y, x1 - x0, 1., tint(strip::THREAD, if t.open { 0.28 } else { 0.42 }));
+            if x0 >= rail_x0 && x0 <= rail_x1 {
+                let mut ring = fill(
+                    Bounds::new(point(px(x0 - 2.), px(y - 2.)), size(px(4.), px(4.))),
+                    tint(strip::THREAD, 0.),
+                );
+                ring.corner_radii = Corners::all(px(2.));
+                ring.border_widths = gpui::Edges::all(px(1.));
+                ring.border_color = tint(strip::THREAD, 0.7).into();
+                window.paint_quad(ring);
+            }
+            if !t.open {
+                let dot = if t.resolved { strip::SAGE } else { strip::GREY };
+                rect(window, x1 - 1.5, y - 1.5, 3., 3., tint(dot, 0.9));
+            }
+        }
+
         // --- Station ticks (+ restore arcs), brightened near the playhead ----
         let play_x = fab_x(bake.timeline.work_at(pos));
         for st in &bake.stations {
             let x = fab_x(st.x);
             // Brighten by TIME distance to the playhead (association by light,
-            // design §2) — stable under the fabric's zoom, unlike pixel distance.
+            // design §2) — stable under the fabric's pan, unlike pixel distance.
             let near = (st.at_ms - pos).abs() < 45_000;
             let base = if st.restore { strip::SAGE } else { strip::GREY };
-            let a = if near { 0.95 } else { 0.5 };
-            rect(window, x, band_top + strip::TOP_ROW_H, 1., strip::FABRIC_H + strip::LABEL_LANE_H, tint(base, a));
+            let a = if near { 0.95 } else { 0.3 };
+            rect(window, x, band_top + strip::TOP_ROW_H, 1., strip::LABEL_LANE_H + strip::FABRIC_H, tint(base, a));
             // Restore arc: a dashed connector back to the source station, ridden
             // in the label lane (design §1).
             if let Some(src) = st.arc_to {
                 let sx = fab_x(src);
                 let (a0, a1) = (sx.min(x), sx.max(x));
-                let ay = band_top + strip::TOP_ROW_H + strip::LABEL_LANE_H - 3.;
+                let ay = band_top + strip::TOP_ROW_H + strip::LABEL_LANE_H - 5.;
                 let mut dash = a0;
                 while dash < a1 {
                     rect(window, dash, ay, 3., 1., tint(strip::SAGE, 0.55));
@@ -20199,6 +20387,12 @@ impl Element for StripElement {
                 }
             }
         }
+
+        // --- The rail: the page's top edge, exactly as long as the history —
+        // the thumb at its right end IS "now" (a rail drawn past the page's
+        // end read as unreachable future).
+        let travel = strip_travel(rail_w, total);
+        rect(window, rail_x0, rail_y - 1., travel, 2., tint(strip::GREY, 0.55));
 
         // --- The not-yet: everything right of a parked playhead dims one
         // alpha step — a STATIC encoding of position, so any paused frame
@@ -20208,49 +20402,57 @@ impl Element for StripElement {
             rect(
                 window,
                 play_x,
-                band_top,
+                band_top + strip::TOP_ROW_H,
                 rail_x1 - play_x,
-                strip::TOP_ROW_H + strip::LABEL_LANE_H + strip::FABRIC_H,
+                strip::LABEL_LANE_H + strip::FABRIC_H,
                 tint(strip::GROUND, 0.55),
             );
         }
 
-        // --- The rail, the thumb, the playhead, and the Compare pin ----------
-        rect(window, rail_x0, rail_y, rail_w, 2., tint(strip::GREY, 0.55));
-        let travel = strip_travel(rail_w, total);
+        // --- The thumb, the playhead, and the Compare pin ---------------------
         let frac = if total > 0. {
             bake.timeline.work_at(pos) / total
         } else {
             1.
         };
         let thumb_x = rail_x0 + frac * travel;
-        // The thumb carries the highest contrast in the strip (design §0).
+        // The playhead line drops through the cloth at the moment's own x;
+        // under the lock (rail seeks, stepping, open, Now) it passes through
+        // the thumb — one x for one moment. After a fabric touch or a wheel
+        // pan the thumb alone keeps the global position.
+        if play_x >= rail_x0 && play_x <= rail_x1 {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(px(play_x - 0.5), px(band_top + strip::TOP_ROW_H + 4.)),
+                    size(px(1.), px(fab_bot - (band_top + strip::TOP_ROW_H + 4.))),
+                ),
+                tint(0xEDE7D6, if editor.strip.parked { 0.85 } else { 0.4 }),
+            ));
+        }
+        if let Some(pin) = editor.strip.pin_ms {
+            let px_pin = fab_x(bake.timeline.work_at(pin));
+            // Dashed, so a still frame never shows two identical playheads
+            // (the pin is a bookmark, not a second present).
+            if px_pin >= rail_x0 && px_pin <= rail_x1 {
+                let mut y = band_top + strip::TOP_ROW_H + 4.;
+                while y < fab_bot {
+                    rect(window, px_pin - 0.5, y, 1., 3., tint(0xEDE7D6, 0.5));
+                    y += 6.;
+                }
+            }
+        }
+        // The thumb carries the highest contrast in the strip (design §0),
+        // riding the page's top edge.
         let mut thumb = fill(
             Bounds::new(point(px(thumb_x - 5.), px(rail_y - 5.)), size(px(10.), px(10.))),
             rgb(0xEDE7D6),
         );
         thumb.corner_radii = Corners::all(px(5.));
         window.paint_quad(thumb);
-        // The playhead line binds the rail to the fabric.
-        if play_x >= rail_x0 && play_x <= rail_x1 {
-            window.paint_quad(fill(
-                Bounds::new(point(px(play_x - 0.5), px(rail_y)), size(px(1.), px(fab_bot - rail_y))),
-                tint(0xEDE7D6, if editor.strip.parked { 0.85 } else { 0.4 }),
-            ));
-        }
-        if let Some(pin) = editor.strip.pin_ms {
-            let px_pin = fab_x(bake.timeline.work_at(pin));
-            if px_pin >= rail_x0 && px_pin <= rail_x1 {
-                window.paint_quad(fill(
-                    Bounds::new(point(px(px_pin - 0.5), px(rail_y)), size(px(1.), px(fab_bot - rail_y))),
-                    tint(0xEDE7D6, 0.3),
-                ));
-            }
-        }
 
         // --- Shaped text: station labels + the date lane ---------------------
         for t in prepaint.labels.drain(..) {
-            t.line.paint(t.origin, px(12.), TextAlign::Left, None, window, cx).ok();
+            t.line.paint(t.origin, px(13.), TextAlign::Left, None, window, cx).ok();
         }
         for t in prepaint.dates.drain(..) {
             t.line.paint(t.origin, px(12.), TextAlign::Left, None, window, cx).ok();
