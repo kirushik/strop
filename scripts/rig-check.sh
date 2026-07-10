@@ -480,7 +480,7 @@ rm -f "$DOCR" "$DOCR.strop"
 SY1=$(field "$D1" scroll_y); SY3=$(field "$D3" scroll_y)
 CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
 expect "the room is up with a real book"      true "$(field "$CR2" open)"
-expect "always page 1 (research-page 4.6)"    0 "$(field "$CR2" page)"
+expect "page 1 under the ritual threshold"    0 "$(field "$CR2" page)"
 expect "the takeover holds focus (F8)"        '"ColdRead"' "$(field "$D2" focused)"
 expect "the margin sleeps under the desk"     true "$(field "$D2" margin_hidden)"
 expect "entry checkpointed once (L3)"         1 "$(field "$D2" checkpoints)"
@@ -588,6 +588,31 @@ CR1=$(echo "$D1" | grep -oE '"coldread":\{[^}]*\}')
 CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
 expect "a flip from rest fades in (S5)"        true "$(field "$CR1" fading)"
 expect "reduce_motion flips instantly (S12)"   false "$(field "$CR2" fading)"
+
+echo "rig-check: cold read — over the ritual threshold the read opens at the caret's chapter"
+DOCT=$(mktemp --suffix=.md)
+{
+  for c in $(seq 1 12); do
+    printf '## Chapter %s\n\n' "$c"
+    for p in 1 2 3 4 5; do
+      for r in $(seq 1 20); do printf 'again the ferry held its line against the dark water and the far shore '; done
+      printf '\n\n'
+    done
+  done
+} > "$DOCT"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCT" "ctrl-end coldread:open dump:ui escape ctrl-home coldread:open dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p)
+[ -n "$D2" ] || { echo "  FAIL missing dumps (threshold fixture)"; exit 1; }
+rm -f "$DOCT" "$DOCT.strop"
+CR1=$(echo "$D1" | grep -oE '"coldread":\{[^}]*\}')
+CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
+W=$(field "$CR1" words)
+if [ "${W:-0}" -gt 10000 ] 2>/dev/null; then echo "  ok   the fixture crosses the ritual threshold ($W words)"; else
+  echo "  FAIL fixture too small (words=$W)"; fail=1; fi
+P1=$(field "$CR1" page)
+if [ "${P1:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   a caret in the last chapter opens the read mid-book (page $((P1+1)))"; else
+  echo "  FAIL over-threshold entry stayed at page 1 (page=$P1)"; fail=1; fi
+expect "a caret at the top reads from page 1"  0 "$(field "$CR2" page)"
 
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

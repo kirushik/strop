@@ -256,9 +256,23 @@ table.
   function.)
 - Entry: `save_now()` → `add_checkpoint_if_changed("Cold read",
   false)` (a new `station_rank` arm ranks the name at reflex tier —
-  bare tick), snapshot `manuscript_slice`, paginate, **always page
-  1** (research-page §4.6 argues this; re-entry = the performance
-  starts from the top), focus the takeover.
+  bare tick), snapshot `manuscript_slice`, paginate, set the entry
+  page, focus the takeover.
+- Entry page (AMENDED 2026-07-10; supersedes "always page 1"): at or
+  under **10,000 words** (`CR_RITUAL_MAX_WORDS`; ≈ a 40-minute read —
+  one sitting from the top is plausible) the performance starts from
+  the top, as research-page §4.6 argues. Over it, the read opens at
+  the page of the **current chapter's** start: the nearest heading
+  at-or-before the caret at the chapter grain = the shallowest
+  heading level with ≥ 2 occurrences (a lone H1 is the title and
+  must not swallow the grain), else the shallowest present
+  (`bookpage::chapter_start`). The caret survives quit
+  (files.rs intents sidecar), so after a rest it still marks the
+  last-worked chapter. No grain heading before the caret, a caret
+  outside the manuscript, or any Past read → page 1. The threshold
+  is in WORDS, not pages — behavior must not flip with window size.
+  Dividers are scene grain and never chapter marks. **Home remains
+  the one-key return to the ceremonial top.**
 - Strip open at now: a Live entry closes it first. Canvas showing
   the PAST (parked strip or history panel): the Live verb guards with
   the pulse (adjudications Time 1). The omnibar/menu/popover close;
