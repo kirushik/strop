@@ -2080,6 +2080,14 @@ impl Editor {
         if !entries[selected].manual {
             expanded.insert(auto_group_start(&entries, selected));
         }
+        // The panel preview shares the strip's law: a live selection's byte
+        // offsets mean nothing against a checkpoint's text — save it for the
+        // exit and collapse it, or the wash paints the wrong words (P6).
+        if self.strip.saved_sel.is_none() {
+            self.strip.saved_sel = Some(self.selected_range.clone());
+            let c = self.selected_range.end;
+            self.selected_range = c..c;
+        }
         self.history_view = Some(HistoryView {
             entries,
             selected,
@@ -2142,6 +2150,11 @@ impl Editor {
     fn exit_history(&mut self, cx: &mut Context<Self>) {
         self.history_view = None;
         self.history_preview = None;
+        // Leaving the panel returns the live selection (the document is
+        // unchanged by a preview round-trip, so its offsets hold).
+        if let Some(s) = self.strip.saved_sel.take() {
+            self.selected_range = s;
+        }
         cx.notify();
     }
 
@@ -2464,6 +2477,9 @@ impl Editor {
         // promise belongs to Esc, not to a document swap).
         self.cold_read = None;
         *self.cr_page_bounds.borrow_mut() = None;
+        // The text changed for real — a selection saved at any preview's
+        // entrance is void, and must not be re-applied by the exits below.
+        self.strip.saved_sel = None;
         // Drops any preview (panel `history_view` OR the strip's
         // `history_preview`) so the live restored document is what shows.
         self.exit_history(cx);
@@ -2499,8 +2515,6 @@ impl Editor {
             self.strip.pos_ms = now;
             self.strip.scratch = None;
             self.strip.view_offset = f32::MAX; // back to the tail with the new data
-            // The text changed for real — the saved selection is void.
-            self.strip.saved_sel = None;
             self.history_preview = None;
             self.strip_bake(now);
             cx.notify();
@@ -2685,14 +2699,18 @@ impl Editor {
     /// Is there any PAST to view? False for a document with no journal and no
     /// checkpoints beyond the present (a zero-width axis) — parking there would
     /// preview "now" and needlessly enter read-only mode (P13: no view without
-    /// content). The 1.5px floor (under a minute of work at the fixed quant)
-    /// covers the seconds-old birth checkpoint an import writes: a document
-    /// born moments ago has a birth record, not a past.
+    /// content). Any journaled run IS a past, however brief (the pre-floor
+    /// behavior — a flat px floor also blocked real sub-minute edits, review:
+    /// five-lens pass); without runs, the 1.5px floor covers the seconds-old
+    /// birth checkpoint an import writes: a document born moments ago has a
+    /// birth record, not a past (a legacy checkpoint era clears it at
+    /// CKPT_MIN_PX per span).
     fn strip_has_past(&self) -> bool {
-        self.strip
-            .bake
-            .as_ref()
-            .is_some_and(|b| b.timeline.total_work > 1.5)
+        let has_runs = !self.doc.journal().runs.is_empty();
+        self.strip.bake.as_ref().is_some_and(|b| {
+            let w = b.timeline.total_work;
+            if has_runs { w > 0. } else { w > 1.5 }
+        })
     }
 
     fn strip_park_at_x(&mut self, x: f32, y: f32, pin: bool, cx: &mut Context<Self>) {
@@ -3075,7 +3093,11 @@ impl Editor {
             }
         };
         let Some(max) = max else { return };
-        self.strip.view_offset = (self.strip.view_offset - d).clamp(0., max);
+        // Resolve the pin-to-tail sentinel BEFORE the arithmetic: f32::MAX
+        // absorbs the delta (MAX - d == MAX), which would eat the first wheel
+        // tick after an open (review: five-lens pass, geometry).
+        let base = self.strip.view_offset.clamp(0., max);
+        self.strip.view_offset = (base - d).clamp(0., max);
         cx.notify();
     }
 
@@ -8071,8 +8093,8 @@ impl Editor {
         // of a past revision. The selection's byte offsets index the laid-out
         // text — which IS the preview while previewing — so the slice comes from
         // the preview string, not the live doc (`index_for_mouse` clamps to the
-        // same source). Selection highlight is suppressed in preview, but the
-        // range is honest, so ctrl-c carries the past's words.
+        // same source). The selection RENDERS in preview too (the reassembly's
+        // surgical-rescue law), so what ctrl-c carries is what the eye saw.
         let text = match &self.history_preview {
             Some(p) => {
                 let r = self.selected_range.start.min(p.text.len())
@@ -9688,6 +9710,14 @@ impl Editor {
             .as_ref()
             .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
         if let Some(pos) = pos {
+            // The same park entrance the click path takes: the live selection
+            // is saved+collapsed, so the rig exercises the real invariants
+            // (review: five-lens pass, interaction).
+            if !self.strip.parked {
+                self.strip.saved_sel = Some(self.selected_range.clone());
+                let c = self.selected_range.end;
+                self.selected_range = c..c;
+            }
             self.strip.parked = true;
             self.strip.scrubbing = false;
             self.strip_scrub_to(pos, true, cx);
@@ -20133,7 +20163,10 @@ impl Element for StripElement {
         };
         // Station labels — only the ones the bake kept, and only within view.
         // Two rows at a 13px pitch (an 11px face needs ~13px of line — the v1
-        // 11px pitch overprinted row two into row one's descenders).
+        // 11px pitch overprinted row two into row one's descenders). The label
+        // near the playhead brightens with its tick (association by light,
+        // design §2) — legal here because prepaint re-shapes every frame.
+        let pos = editor.strip.pos_ms;
         let mut labels = Vec::new();
         for st in &bake.stations {
             if !st.show || st.label.is_empty() {
@@ -20143,7 +20176,8 @@ impl Element for StripElement {
             if wx < rail_x0 - 60. || wx > rail_x1 + 60. {
                 continue;
             }
-            let line = shape(&st.label, 11., 0xC1BBA9, window);
+            let near = (st.at_ms - pos).abs() < 45_000;
+            let line = shape(&st.label, 11., if near { 0xEAE4D2 } else { 0xC1BBA9 }, window);
             let lx = if st.flip_left {
                 wx - f32::from(line.width) - 3.
             } else {
