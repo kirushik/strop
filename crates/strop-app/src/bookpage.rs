@@ -1077,9 +1077,12 @@ impl Asm {
     }
 
     /// A heading never sets last on a page and keeps lines of its next
-    /// block (spec 05 §2.7) — evaluated on the SLICE's block sequence only,
-    /// so a slice-final heading never reaches here (regions 9).
-    fn reserve_heading(&mut self, lines: &[Line], next: &Flow) {
+    /// VISIBLE block (spec 05 §2.7) — evaluated on the SLICE's block
+    /// sequence only, so a slice-final heading never reaches here (regions
+    /// 9). `lead` is the height standing between them: intervening blank
+    /// lines, or the para_gap when text follows directly — a kept line the
+    /// reader can't see satisfies nothing.
+    fn reserve_heading(&mut self, lines: &[Line], next: &Flow, lead: f32) {
         let own: f32 = lines.iter().map(|l| l.height).sum();
         let mut level = self.base;
         loop {
@@ -1087,7 +1090,7 @@ impl Asm {
             if keep == 0 {
                 return; // S8: keep-with-next dropped last
             }
-            let needed = own + head_height(next, keep);
+            let needed = own + lead + head_height(next, keep);
             if self.y + needed <= self.page_h + EPS {
                 return;
             }
@@ -1224,9 +1227,9 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
         measure: metrics.measure,
         base: usize::from(capacity < RELAX_CAPACITY),
     };
-    let mut it = flows.into_iter().peekable();
+    let mut q: VecDeque<Flow> = flows.into();
     let mut prev_text = false;
-    while let Some(flow) = it.next() {
+    while let Some(flow) = q.pop_front() {
         // Inter-paragraph air (`para_gap`, the lab mock's `margin: 0 0 1em`
         // — scene 1 CSS): between two consecutive TEXT blocks only; a
         // writer's own blank line (or a divider's empty line) is already
@@ -1241,8 +1244,32 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
         prev_text = is_text;
         match flow {
             Flow::Para { lines, heading } => {
-                if heading && let Some(next) = it.peek() {
-                    asm.reserve_heading(&lines, next);
+                if heading {
+                    // The keep must look PAST invisible flows: a writer's
+                    // blank line after a chapter heading would otherwise
+                    // satisfy it with a line the reader can't see, and the
+                    // page would visually end on the heading.
+                    let mut lead = 0.0f32;
+                    let mut next_vis = None;
+                    for f in &q {
+                        if let Flow::Para { lines, .. } = f
+                            && lines.iter().all(|l| l.frags.is_empty())
+                        {
+                            lead += lines.iter().map(|l| l.height).sum::<f32>();
+                            continue;
+                        }
+                        next_vis = Some(f);
+                        break;
+                    }
+                    if let Some(next) = next_vis {
+                        if lead == 0.0 {
+                            // Text directly after the heading takes the
+                            // gap; an intervening blank suppresses it (the
+                            // loop's own prev_text rule above).
+                            lead = metrics.para_gap;
+                        }
+                        asm.reserve_heading(&lines, next, lead);
+                    }
                 }
                 asm.place_para(lines);
             }
@@ -1620,6 +1647,38 @@ mod tests {
         // And no page in the book ends on a heading.
         for p in &book.pages {
             if let Some(PageItem::Line(l)) = p.items.last() {
+                assert!(!matches!(l.role, Role::Heading(_)));
+            }
+        }
+    }
+
+    /// A writer's blank line after a heading must not satisfy the keep:
+    /// the kept lines have to be ones the reader can SEE (litmus
+    /// 2026-07-06: "New part" set visually last on its page, its keep
+    /// spent on the blank paragraph that followed it).
+    #[test]
+    fn heading_keep_looks_past_a_blank_line() {
+        // prose(7) + heading + blank = 229 ≤ 250: the blank-blind reserve
+        // was satisfied and the page visually ended on the heading. The
+        // seeing reserve needs the blank AND two text lines — 279 > 250.
+        let text = format!("{}\nHeading here\n\n{}", prose(7), prose(4));
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Paragraph,
+            BlockKind::Heading(2),
+            BlockKind::Paragraph, // the writer's own blank line
+            BlockKind::Paragraph,
+        ]);
+        let book = lay(&text, blocks, 170.0, 10);
+        assert_eq!(book.pages[0].items.len(), 7, "the heading moved off page 1");
+        let PageItem::Line(l) = &book.pages[1].items[0] else { panic!("a line") };
+        assert!(matches!(l.role, Role::Heading(_)), "the heading opens page 2");
+        // No page's last VISIBLE line is a heading.
+        for p in &book.pages {
+            let last_vis = p.items.iter().rev().find_map(|i| match i {
+                PageItem::Line(l) if !l.frags.is_empty() => Some(l),
+                _ => None,
+            });
+            if let Some(l) = last_vis {
                 assert!(!matches!(l.role, Role::Heading(_)));
             }
         }
