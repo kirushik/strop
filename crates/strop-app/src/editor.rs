@@ -17400,6 +17400,10 @@ const CR_MARGIN_TOP: f32 = 48.;
 const CR_MARGIN_BOTTOM: f32 = 64.;
 const CR_BODY_SIZE: f32 = 16.5;
 const CR_LINE_H: f32 = 25.;
+/// Code (inline spans and code blocks) sets at 0.88× body: PT Mono's
+/// x-height at equal point size shouts over Bookman Light (the 2026-07-06
+/// litmus page; book convention sizes mono ~0.85–0.9× the serif body).
+const CR_CODE_SIZE: f32 = 0.88;
 /// The small-window emergency type step (spec §3.2; S9 hysteresis):
 /// below ~12 lines drop once to 15px type / 420px measure.
 const CR_BODY_SIZE_SMALL: f32 = 15.;
@@ -17572,10 +17576,20 @@ fn cr_font(role: crate::bookpage::Role, st: crate::bookpage::Style) -> gpui::Fon
     f
 }
 
-fn cr_font_size(role: crate::bookpage::Role, body: f32) -> f32 {
+/// The point size of one FRAG — frags shape and paint individually, so
+/// size can follow the frag's own runs. Only a frag whose every run is
+/// code shrinks; a mixed frag keeps body size so its serif part doesn't
+/// shrink with it.
+fn cr_frag_size(
+    role: crate::bookpage::Role,
+    runs: &[(usize, crate::bookpage::Style)],
+    body: f32,
+) -> f32 {
     match role {
         // Headings set in Demi at ~1.15× body (spec §2.7).
         crate::bookpage::Role::Heading(_) => (body * 1.15).round(),
+        crate::bookpage::Role::Code => body * CR_CODE_SIZE,
+        _ if !runs.is_empty() && runs.iter().all(|(_, st)| st.code) => body * CR_CODE_SIZE,
         _ => body,
     }
 }
@@ -17632,7 +17646,7 @@ impl crate::bookpage::Measure for CrMeasure<'_> {
             runs.iter().map(|&(len, st)| cr_text_run(len, role, st)).collect();
         let line = self.ts.shape_line(
             SharedString::from(text.to_owned()),
-            px(cr_font_size(role, self.body)),
+            px(cr_frag_size(role, runs, self.body)),
             &truns,
             None,
         );
@@ -19560,7 +19574,7 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                         .collect();
                     let shaped = ts.shape_line(
                         SharedString::from(frag.text.clone()),
-                        px(cr_font_size(line.role, g.body)),
+                        px(cr_frag_size(line.role, &frag.runs, g.body)),
                         &runs,
                         None,
                     );
