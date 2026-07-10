@@ -12574,6 +12574,7 @@ impl Editor {
             // Clickable, not a drag handle: occlude so the Windows titlebar
             // hit-test resolves to this control rather than HTCAPTION.
             .occlude()
+            .flex_shrink_0()
             .w(px(34.))
             .h_full()
             .flex()
@@ -12948,7 +12949,12 @@ impl Editor {
                     div()
                         .id("editor-btn")
                         .occlude()
-                        .flex_shrink_0()
+                        // The one elastic control in the cluster: when the bar
+                        // tightens, THIS label truncates — the OS verbs and the
+                        // toggles right of it are shrink-proof, so the wide
+                        // "Reading · …" face can never crush them into a
+                        // clipped clump at the window edge.
+                        .min_w(px(0.))
                         .ml(px(4.))
                         // Dressed as a control (the lab's .ebtn): border, shape,
                         // an arrow — the one dropdown in the bar must read as
@@ -13006,15 +13012,16 @@ impl Editor {
                             .inset_0()
                         })
                         .when_some(dot, |d, color| {
-                            d.child(div().size(px(6.)).rounded_full().bg(rgb(color)))
+                            d.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(rgb(color)))
                         })
-                        .child(div().child(label))
+                        .child(div().min_w(px(0.)).truncate().child(label))
                         // The dropdown wedge — contiguous decreasing bars fuse
                         // into a solid ▾ (the app's own drawn-glyph idiom; the
                         // real "▾" isn't in the PT fonts). It wears the label's
                         // ink, not a second colour.
                         .child(
                             div()
+                                .flex_shrink_0()
                                 .flex()
                                 .flex_col()
                                 .items_center()
@@ -13037,6 +13044,7 @@ impl Editor {
                     div()
                         .id("palette-toggle")
                         .occlude()
+                        .flex_shrink_0()
                         .px(px(8.))
                         .py(px(2.))
                         .rounded(px(5.))
@@ -13078,6 +13086,7 @@ impl Editor {
                     div()
                         .id("history-toggle")
                         .occlude()
+                        .flex_shrink_0()
                         .px(px(8.))
                         .py(px(2.))
                         .ml(px(4.))
@@ -13145,6 +13154,7 @@ impl Editor {
                         div()
                             .id("win-zoom")
                             .occlude()
+                            .flex_shrink_0()
                             .w(px(34.))
                             .h_full()
                             .flex()
