@@ -10,15 +10,23 @@
 // are banned crate-wide; clippy.toml points each ban at its draw_guard
 // wrapper. Deny, not warn — a mid-draw notify is a corruption bug, not style.
 #![deny(clippy::disallowed_methods)]
+// The rig's UI dump is one large serde_json::json! literal (editor.rs,
+// debug_ui_dump); json_internal! recurses per key and the Scraps keys pushed
+// it past the default 128. A wider budget beats splitting the dump.
+#![recursion_limit = "256"]
 
+mod bookpage;
 mod commands;
 mod config;
 mod draw_guard;
 mod editor;
+mod hyphen;
+mod icons;
 mod files;
 mod paths;
 mod single_instance;
 mod smoke;
+mod strip;
 mod text_field;
 mod theme;
 mod tutorial;
@@ -109,8 +117,9 @@ fn data_file() -> (PathBuf, bool) {
 
 fn main() {
     // gpui_platform::application() replaced gpui::Application::new() after
-    // the facade/platform crate split.
-    gpui_platform::application().run(|cx: &mut App| {
+    // the facade/platform crate split. The asset source feeds gpui's svg()
+    // pipeline the embedded icon plate (docs/iconography.md).
+    gpui_platform::application().with_assets(icons::StropAssets).run(|cx: &mut App| {
         cx.text_system()
             .add_fonts(vec![
                 PT_SERIF.into(),
@@ -124,6 +133,40 @@ fn main() {
                 PT_MONO.into(),
             ])
             .expect("failed to load bundled fonts");
+
+        // The cold read's book face: URW Bookman Light / Light Italic /
+        // Demi (urw-base35; full Cyrillic on every style). Loaded as
+        // RUNTIME DATA FILES — read from assets at startup, never
+        // include_bytes! — because the face is AGPL-3.0-with-exception in
+        // a GPL-3.0-or-later app and the mere-aggregation posture wants it
+        // an independent work on disk (impl 05 §3.1; license text lives
+        // beside the files). A missing file degrades honestly: the page
+        // falls through font_fallbacks to the bundled PT Serif backstop.
+        let book_fonts: Vec<std::borrow::Cow<'static, [u8]>> = [
+            "fonts/coldread/URWBookman-Light.otf",
+            "fonts/coldread/URWBookman-LightItalic.otf",
+            "fonts/coldread/URWBookman-Demi.otf",
+        ]
+        .iter()
+        .filter_map(|rel| match paths::asset_file(rel) {
+            Some(path) => match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes.into()),
+                Err(e) => {
+                    eprintln!("strop: cannot read {}: {e} — the cold read falls back to PT Serif", path.display());
+                    None
+                }
+            },
+            None => {
+                eprintln!("strop: {rel} not found — the cold read falls back to PT Serif");
+                None
+            }
+        })
+        .collect();
+        if !book_fonts.is_empty()
+            && let Err(e) = cx.text_system().add_fonts(book_fonts)
+        {
+            eprintln!("strop: failed to register URW Bookman: {e} — the cold read falls back to PT Serif");
+        }
 
         editor::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
@@ -225,6 +268,16 @@ fn main() {
                 None => match &md_import {
                     Some((text, spans, blocks)) => {
                         store.seed(text);
+                        // The import is the document's birth: a materialized
+                        // "Started" checkpoint. Without it the journal-era
+                        // strip believes the doc began EMPTY — its envelope
+                        // shrinks to today's churn, and a scrub past the
+                        // first keystroke replays an imported novel away.
+                        store.seal_session_with(
+                            "Started",
+                            false,
+                            (text.clone(), spans.clone(), blocks.clone()),
+                        );
                         (text.clone(), spans.clone(), blocks.clone(), None)
                     }
                     None if welcome => {
@@ -321,6 +374,9 @@ fn main() {
                     }
                     if let Some((_, Some(loaded))) = &store {
                         editor.restore_annotations(loaded.annotations.clone());
+                        editor.restore_journal(loaded.journal.clone());
+                        editor.restore_graveyard(loaded.graveyard.clone());
+                        editor.restore_provenance(loaded.provenance.clone());
                     }
                     if let Some(notes) = tutorial_notes {
                         editor.restore_annotations(notes);
@@ -329,11 +385,11 @@ fn main() {
                         // are visible on first run, not collapsed to the rail.
                         editor.enter_reviewing();
                     }
-                    // The if-then ritual's open half (DESIGN §4.1): caret
-                    // restored, last close's intent surfaced — and nothing
-                    // is ever asked at open (the §4 invariant).
+                    // Re-entry (DESIGN §4): the caret is restored where the last
+                    // session left it — nothing is ever asked at open (the §4
+                    // invariant). The intent question was retired (impl 04 §1).
                     if let Some((store, _)) = &store
-                        && let Some(entry) = files::load_intent(store.path())
+                        && let Some(entry) = files::load_session(store.path())
                     {
                         editor.restore_session(entry);
                     }
@@ -341,6 +397,11 @@ fn main() {
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);
                     }
+                    // A shipped compost-at-top document migrates ONCE, here —
+                    // after every channel is restored, before the first edit
+                    // (docs/impl/08-compost-fresh.md §2 "Adoption &
+                    // migration"; adjudications time-persistence 4).
+                    editor.migrate_scraps_geometry();
                     editor
                 });
                 window.focus(&editor.focus_handle(cx), cx);

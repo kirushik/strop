@@ -1,0 +1,8 @@
+<!-- Pictorial family. The margin-note mini-card: a bordered card with two
+     text bars. Authored on the 13px display grid; every stroke centered on
+     half-pixels so the card's edges are device-crisp. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="1.5" y="2.5" width="10" height="8" rx="1.5"/>
+  <path d="M4 5.5h5"/>
+  <path d="M4 7.5h3"/>
+</svg>

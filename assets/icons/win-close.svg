@@ -1,0 +1,6 @@
+<!-- Window family: the saltire, butt caps — closes the WINDOW. Authored
+     on the 13px display grid; pure 45° diagonals anti-alias symmetrically. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1" stroke-linecap="butt">
+  <path d="M3 3l7 7"/>
+  <path d="M10 3l-7 7"/>
+</svg>

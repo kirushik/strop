@@ -210,7 +210,7 @@ proptest! {
         }
 
         store
-            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200), doc.notes())
+            .save_with_state(doc.spans(), doc.blocks(), &doc.export_history(200), doc.notes(), &strop_core::journal::Journal::default(), doc.graveyard(), doc.provenance())
             .unwrap();
 
         let (_s2, loaded) = Store::open(&path).unwrap();

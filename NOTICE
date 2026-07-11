@@ -26,12 +26,41 @@ zlog, ztracing, ztracing_macro  —  GPL-3.0-or-later
     into the binary, the assembled Strop application is GPL-3.0-or-later as a
     whole. (This is the same situation as the Zed editor itself.)
 
+Icon geometry (history.svg, link.svg, menu.svg)  —  ISC
+    Three icons in assets/icons/ derive their geometry from Lucide
+    (https://lucide.dev), restroked to Strop's house weight; the remaining
+    icons are Strop's own drawings. Full ISC text in
+    assets/icons/LICENSES/LICENSE-lucide.txt.
+
 PT Serif, PT Sans, PT Mono  —  SIL Open Font License 1.1
     Copyright (C) ParaType. Bundled in assets/fonts/; license text in
     assets/fonts/PTSerif-OFL.txt, PTSans-OFL.txt, and PTMono-OFL.txt.
 
-ropey (MIT), loro (MIT), pulldown-cmark (MIT), image (MIT OR Apache-2.0), and
-the remaining direct dependencies are permissively licensed.
+URW Bookman  —  AGPL-3.0 with font-embedding exception
+    Copyright (C) 2015 URW Software; 2013, 2014 (URW)++ Design & Development
+    (the urw-base35 set, https://github.com/ArtifexSoftware/urw-base35-fonts).
+    The cold read's book face, shipped as RUNTIME DATA FILES in
+    assets/fonts/coldread/ (read at startup, never compiled into the
+    binary); full license text beside the fonts in
+    assets/fonts/coldread/LICENSE. AGPLv3 and GPLv3 are one-way compatible
+    (each license's §13), and the fonts remain independent works on disk.
+
+Hyphenation pattern data (runtime data files, assets/hyphenation/):
+  en-us.standard.bincode  —  Copyright (C) 1990, 2004, 2005 Gerard D.C.
+    Kuiken. "Copying and distribution of this file, with or without
+    modification, are permitted in any medium without royalty provided the
+    copyright notice and this notice are preserved."
+  ru.standard.bincode  —  Copyright (C) 1999-2003 Alexander I. Lebedev,
+    LPPL 1.2-or-later (the ruhyphen patterns). The LPPL is GPL-incompatible,
+    which is why this dictionary ships as a loose runtime file and is never
+    embedded in the binary.
+    Both compiled from hyph-utf8 (https://www.hyphenation.org/tex) via the
+    `hyphenation` crate v0.8.4; full notices in
+    assets/hyphenation/ATTRIBUTION.txt.
+
+ropey (MIT), loro (MIT), pulldown-cmark (MIT), image (MIT OR Apache-2.0),
+hyphenation (Apache-2.0 OR MIT), and the remaining direct dependencies are
+permissively licensed.
 
 A complete, machine-generated per-crate license inventory can be produced with
 `cargo about generate`, or inspected with `cargo deny list`.

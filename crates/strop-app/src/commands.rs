@@ -9,13 +9,13 @@ use gpui::Action;
 
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
-    DiagnosisModeDevelopmental, DiagnosisModeLine, EndSession, ExportMarkdown, Find, Heading1,
-    Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, Redo,
+    DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1,
+    Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, ReadItCold, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
-    SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList, ToggleCode,
-    ToggleCodeBlock, ToggleEmphasis, ToggleHighlight, ToggleHistory, ToggleOrderedList,
-    ToggleOutline, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview,
-    ToggleStrikethrough, ToggleStrong, ToggleUnderline, Undo,
+    MoveToManuscript, PutBackScrap, SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
+    ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleGraveyard, ToggleHighlight, ToggleHistory,
+    ToggleOrderedList, TogglePalette, TogglePopover, ToggleQuoteBlock, ToggleReview, ToggleStrip,
+    ToggleStrikethrough, ToggleStrong, ToggleUnderline, ScrapsTravel, Undo,
 };
 
 pub struct Command {
@@ -41,7 +41,11 @@ impl Command {
     /// the "App" and "Editor" key contexts respectively.
     pub fn global(&self) -> bool {
         match self.section {
-            "Format" | "Structure" => false,
+            // Scraps' verbs (Set aside / Exile / Move to the manuscript /
+            // Put back) act on the document selection or caret, so they stay
+            // editor-scoped like Format/Structure — a chord typed into a
+            // field never reaches the document behind it.
+            "Format" | "Structure" | "Scraps" => false,
             "Edit" => matches!(self.label, "Find in Document" | "Find and Replace"),
             "Margin & AI" => self.label != "Add Margin Note",
             // File, View, History, Session, Help.
@@ -189,14 +193,66 @@ pub fn all() -> &'static [Command] {
             InsertFootnote,
             ["сноска"]
         ),
-        // The outline rail (DESIGN §1.6): externalized structure at the
-        // point of performance — the biggest structural gap, per research.
+        // "Scraps" is the TRAVEL verb (08 §2; the rail it replaced is gone):
+        // it arms the excursion latch and lands at the seam — the next press
+        // resumes where the last visit stopped; Esc returns exactly home.
         cmd!(
-            "Toggle Outline",
+            "Scraps",
             "View",
             Some("ctrl-shift-o"),
-            ToggleOutline,
-            ["headings", "beats", "оглавление", "план", "структура"]
+            ScrapsTravel,
+            ["compost", "asides", "компост", "отложенное"]
+        ),
+        // Scraps (08 §2): the writer's deliberate pile at the tail; the
+        // graveyard is the automatic record of cuts. "Scraps live; the
+        // graveyard remembers."
+        cmd!(
+            "Set Aside",
+            "Scraps",
+            Some("ctrl-shift-a"),
+            SetAside,
+            ["scraps", "park", "shelf", "отложить", "компост"]
+        ),
+        // The pile-return verbs: chordless (the flank and the provenance
+        // line are their homes; the palette is the narrow-width fallback).
+        cmd!(
+            "Move to the Manuscript",
+            "Scraps",
+            None,
+            MoveToManuscript,
+            ["retrieve", "bring back", "в рукопись", "вернуть в текст"]
+        ),
+        cmd!(
+            "Put Back",
+            "Scraps",
+            None,
+            PutBackScrap,
+            ["return to origin", "unpark", "вернуть на место"]
+        ),
+        cmd!(
+            "Send to the Graveyard",
+            "Scraps",
+            Some("ctrl-shift-g"),
+            SendToGraveyard,
+            ["cut", "exile", "delete to graveyard", "в могилу", "вырезать"]
+        ),
+        cmd!(
+            "Toggle Graveyard",
+            "View",
+            Some("ctrl-alt-g"),
+            ToggleGraveyard,
+            ["cuts", "restore cut", "put back", "кладбище", "могила"]
+        ),
+        // The cold read (impl 05 §4.6, arbitration O7): the estrangement
+        // ritual's one entry verb. "Cold read" is a carried term — the
+        // Russian aliases translate the function, never the metaphor
+        // (ux-glossary). Inside the room the same chord is the toggle-exit.
+        cmd!(
+            "Read it cold",
+            "View",
+            Some("ctrl-shift-l"),
+            ReadItCold,
+            ["cold read", "reading", "book", "свежим взглядом", "перечитать"]
         ),
         cmd!(
             "Run Editorial Diagnosis",
@@ -271,12 +327,22 @@ pub fn all() -> &'static [Command] {
             CancelAiRun,
             ["stop", "отменить"]
         ),
+        // ctrl-alt-h and the titlebar clock open the STRIP (P1, the new first
+        // history surface). The right-side panel lives on as its own palette
+        // verb; the strip and the panel never open together.
         cmd!(
-            "Toggle History & Rewind",
+            "History",
             "History",
             Some("ctrl-alt-h"),
+            ToggleStrip,
+            ["timeline", "strip", "rewind", "scrub", "история", "лента"]
+        ),
+        cmd!(
+            "History panel",
+            "History",
+            None,
             ToggleHistory,
-            ["versions", "rewind", "история", "версии"]
+            ["versions", "rewind", "sidebar", "checkpoints", "версии", "панель истории"]
         ),
         cmd!(
             "Name a Checkpoint",
@@ -285,22 +351,15 @@ pub fn all() -> &'static [Command] {
             AddCheckpoint,
             ["snapshot", "version", "чекпоинт"]
         ),
-        // The finish-your-story layer (DESIGN §4): per-session progress
-        // and the close-time if-then ritual. Scaffolds prompt at CLOSE,
-        // never at open (§4b tension 6) — both are pull-only.
+        // The finish-your-story layer (DESIGN §4): per-session progress.
+        // Scaffolds prompt at CLOSE, never at open (§4b tension 6) — pull-only.
+        // (The re-entry intent question / End Session was retired: impl 04 §1.)
         cmd!(
             "Set Session Goal…",
             "Session",
             None,
             SetSessionGoal,
             ["words", "target", "progress", "цель", "норма слов"]
-        ),
-        cmd!(
-            "End Session…",
-            "Session",
-            None,
-            EndSession,
-            ["quit", "next session", "intent", "закончить сессию", "намерение"]
         ),
         cmd!(
             "Open Command Palette",
@@ -529,11 +588,12 @@ mod tests {
             "Find in Document",
             "Find and Replace",
             "Run Editorial Diagnosis",
-            "Toggle History & Rewind",
-            "Toggle Outline",
+            "History",
+            "History panel",
+            "Scraps",
             "Set Up AI Provider…",
             "New Document",
-            "End Session…",
+            "Set Session Goal…",
         ] {
             assert!(by_label(l).global(), "{l} should be global");
         }

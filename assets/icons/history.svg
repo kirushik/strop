@@ -1,0 +1,10 @@
+<!-- Pictorial family. The versions convention: a clock swept counter-
+     clockwise (Google Docs, Time Machine); geometry after Lucide "history"
+     (ISC), re-plotted on the 13px display grid. The bracket's straight
+     strokes sit on half-pixel lines (crisp); the dial and hands take their
+     anti-aliasing as curves should. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M2 7a4.5 4.5 0 1 0 4.5-4.5 4.9 4.9 0 0 0-3.4 1.4L1.5 4.5"/>
+  <path d="M1.5 1.5v3h3"/>
+  <path d="M6.5 4.5V7l1.9 1"/>
+</svg>

@@ -1,0 +1,8 @@
+<!-- Pictorial family. The headstone on its ground, filled slab (mass is
+     what reads at chip size). Authored on the 12px display grid: the
+     slab's fill edges sit on integer pixels, the ground stroke on a
+     half-pixel row — device-crisp at 1x and 2x. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12" fill="none" stroke="#000" stroke-width="1" stroke-linecap="round">
+  <path d="M3 9.5V4a3 3 0 0 1 6 0v5.5z" fill="#000" stroke="none"/>
+  <path d="M2 10.5h8"/>
+</svg>

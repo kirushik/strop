@@ -8,3 +8,4 @@
 # Working documents (Loro snapshots) — never commit a user's file
 *.strop
 *.strop.tmp
+target-main/

@@ -1,0 +1,7 @@
+<!-- Pictorial family. The chain (after Lucide "link", ISC), re-plotted on
+     the 13px display grid. All curves and diagonals — anti-aliasing is
+     correct here; there is no straight run to snap. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5.4 7a2.7 2.7 0 0 0 4.1.3l1.6-1.6a2.7 2.7 0 0 0-3.8-3.8l-.9.9"/>
+  <path d="M7.6 6a2.7 2.7 0 0 0-4.1-.3L1.9 7.3a2.7 2.7 0 0 0 3.8 3.8l.9-.9"/>
+</svg>

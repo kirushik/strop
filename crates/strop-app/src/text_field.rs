@@ -208,6 +208,8 @@ pub struct TextField {
     /// Soft-wrap across rows and grow downward, instead of single-line scroll.
     /// Only the in-card note composer sets this (its lane is ~5 words wide).
     multiline: bool,
+    /// No own frame/fill — the host draws the one frame (the omnibar).
+    bare: bool,
     /// Geometry of the last paint, for click hit-testing and vertical motion.
     /// Maps over the DISPLAY string; caret↔geometry conversions go through char
     /// index so a masked field (dots ≠ real bytes) still lands the caret right.
@@ -316,6 +318,7 @@ impl TextField {
             key_context,
             masked: false,
             multiline: false,
+            bare: false,
             geometry: None,
             is_selecting: false,
             drag_unit: DragUnit::Char,
@@ -329,6 +332,17 @@ impl TextField {
         Self::base(cx, content, "NoteInput")
     }
 
+    /// A single-line field that opens with its content selected — the
+    /// prefilled-datum idiom (the goal chip): the current value is shown,
+    /// typing replaces it, and erasing it erases the datum.
+    pub(crate) fn single_selected(cx: &mut Context<Self>, content: String) -> Self {
+        let mut field = Self::base(cx, content, "NoteInput");
+        if !field.content.is_empty() {
+            field.anchor = Some(0);
+        }
+        field
+    }
+
     /// The in-card note composer: a multi-line, soft-wrapping field. Its own key
     /// context carries the extras single-line fields don't want: up/down caret
     /// rows and shift/ctrl-enter line breaks.
@@ -340,9 +354,14 @@ impl TextField {
         }
     }
 
-    /// The command palette's query field: editing chords plus up/down row motion.
+    /// The command palette's query field: editing chords plus up/down row
+    /// motion. `bare` — the omnibar pill draws the one frame (06 §1: never a
+    /// frame inside a frame); the field brings only its text and caret.
     pub(crate) fn palette(cx: &mut Context<Self>, content: String) -> Self {
-        Self::base(cx, content, "PaletteInput")
+        Self {
+            bare: true,
+            ..Self::base(cx, content, "PaletteInput")
+        }
     }
 
     /// A field of the AI settings panel (F4): its own context so tab/up/down/
@@ -967,12 +986,17 @@ impl Render for TextField {
             .on_action(cx.listener(|this, a: &FieldMove, _, cx| this.do_move(a.motion, a.select, cx)))
             .w_full()
             .min_h(px(22.))
-            .px(px(6.))
-            .py(px(2.))
-            .rounded(px(4.))
-            .bg(rgb(0xFFFFFF))
-            .border_1()
-            .border_color(rgb(RULE_COLOR))
+            // A bare field brings no chrome of its own — its host draws the
+            // one frame (the omnibar pill). Everything else keeps the classic
+            // inset-box dress.
+            .when(!self.bare, |d| {
+                d.px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .bg(rgb(0xFFFFFF))
+                    .border_1()
+                    .border_color(rgb(RULE_COLOR))
+            })
             .text_size(px(13.))
             .text_color(rgb(TEXT_COLOR))
             // Single-line fields clip and the element scrolls itself to keep the

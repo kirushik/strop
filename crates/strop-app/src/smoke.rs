@@ -25,6 +25,17 @@ pub fn clipboard_override() -> Option<String> {
     CLIP_OVERRIDE.lock().ok()?.clone()
 }
 
+/// Mirror an app-side clipboard WRITE into the shim so the rig can read it
+/// back (the wayland write is dropped without real seat focus — see above).
+/// A no-op outside STROP_SMOKE runs.
+pub fn mirror_clipboard(text: &str) {
+    if std::env::var("STROP_SMOKE").is_ok()
+        && let Ok(mut slot) = CLIP_OVERRIDE.lock()
+    {
+        *slot = Some(text.to_owned());
+    }
+}
+
 use crate::editor::Editor;
 
 pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
@@ -93,16 +104,18 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE {key}: {state}");
                 continue;
             }
-            if key == "toggle:outline" {
+            // `scraps:travel` — the travel verb (the chip / ctrl-shift-o):
+            // arms the excursion latch and lands at the seam or `pile_end`.
+            if key == "scraps:travel" {
                 window
                     .update(cx, |editor, window, cx| {
-                        editor.toggle_outline(&crate::editor::ToggleOutline, window, cx)
+                        editor.scraps_travel(&crate::editor::ScrapsTravel, window, cx)
                     })
                     .ok();
                 cx.background_executor()
                     .timer(Duration::from_millis(80))
                     .await;
-                eprintln!("SMOKE toggle:outline");
+                eprintln!("SMOKE scraps:travel");
                 continue;
             }
             if key == "seed:diag" {
@@ -113,6 +126,144 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(120))
                     .await;
                 eprintln!("SMOKE seed:diag: demo diagnosis cards seeded");
+                continue;
+            }
+            // Asides (docs/impl/02-asides.md §6). `seed:aside` builds a doc
+            // with a compost rail and a graveyard entry; `aside:selection` /
+            // `exile:selection` run the verbs on the current selection;
+            // `putback:last` restores the newest cut.
+            if key == "seed:aside" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_seed_aside(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:aside: compost rail + graveyard entry seeded");
+                continue;
+            }
+            if key == "aside:selection" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_aside_selection(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE aside:selection: selection moved to compost");
+                continue;
+            }
+            // `seed:topera` rebuilds the live doc in the SHIPPED
+            // compost-at-top shape and saves it — the NEXT launch of the
+            // same file then exercises the one-time Scraps migration against
+            // a real store (rig-check's migration section).
+            if key == "seed:topera" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_top_era(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:topera: top-era compost file written");
+                continue;
+            }
+            // `seed:demo` seeds the rich asides fixture for the VISUAL rig:
+            // three compost items + sidebar + a full multi-paragraph grave entry
+            // and a receded one (Bugs A & B in one frame).
+            if key == "seed:demo" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_demo(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                eprintln!("SMOKE seed:demo: compost items + graveyard section seeded");
+                continue;
+            }
+            // `seed:annotated` seeds a paragraph carrying a writer note + a
+            // diagnosis, selected — so a following `exile:selection` exercises
+            // the dead-anchor reconcile (note migrates, diagnosis closes — Bug C).
+            if key == "seed:annotated" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_annotated(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE seed:annotated: annotated paragraph seeded + selected");
+                continue;
+            }
+            // Flanks (docs/impl/03-flanks.md §3): select the caret paragraph and
+            // raise the popover so `dump:ui`'s `flanks` object is observable.
+            if key == "select:para" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_select_para(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE select:para: caret paragraph selected + flanks raised");
+                continue;
+            }
+            if key == "exile:selection" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_exile_selection(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE exile:selection: selection filed in the graveyard");
+                continue;
+            }
+            // `seed:mockup1|2|3` — the Gate-2 fidelity scenes, built
+            // through the real verbs (park / typed scraps / exile).
+            if let Some(n) = key.strip_prefix("seed:mockup") {
+                let scene: u8 = n.parse().expect("bad seed:mockup scene");
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_seed_mockup(scene, window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                eprintln!("SMOKE {key}: sourdough scene seeded");
+                continue;
+            }
+            // `move:manuscript` selects the caret's pile paragraph and runs
+            // the retrieval verb; `putback:scrap` runs the provenance line's
+            // Put back at the caret's record.
+            if key == "move:manuscript" {
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_move_to_manuscript(window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE move:manuscript: scrap moved home");
+                continue;
+            }
+            if key == "putback:scrap" {
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_put_back_scrap(window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE putback:scrap: scrap returned to origin");
+                continue;
+            }
+            if key == "putback:last" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_putback_last(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE putback:last: newest cut put back");
                 continue;
             }
             if key == "seed:many" {
@@ -136,6 +287,191 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(120))
                     .await;
                 eprintln!("SMOKE seed:deliver: demo pass sent through the arrival gate");
+                continue;
+            }
+            // `ebtn:open` opens the editor button's dropdown; `ebtn:door`
+            // flips the door through the menu footer's presence verb. Together
+            // they let the rig assert the door law (cards rest while drafting
+            // even with the menu open) and the face's transitions.
+            if key == "ebtn:open" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_open_editor_menu(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ebtn:open: editor menu opened");
+                continue;
+            }
+            if key == "ebtn:door" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_toggle_door(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ebtn:door: door toggled");
+                continue;
+            }
+            // History strip (P1): `seed:journal` installs a synthetic fortnight;
+            // `strip:open` opens the surface; `strip:scrub:<0..1>` /
+            // `strip:pin:<0..1>` park/pin at a fraction of the whole history;
+            // `strip:restore` / `strip:now` are the two exits from the past.
+            if key == "seed:journal" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_journal(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE seed:journal: synthetic fortnight installed");
+                continue;
+            }
+            // `seed:legacy` — the legacy litmus (Bug A): six materialized
+            // checkpoints across two weeks, EMPTY journal. The strip's axis must
+            // come from the checkpoint states, not the (absent) journal.
+            if key == "seed:legacy" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_legacy(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE seed:legacy: legacy checkpoint history installed");
+                continue;
+            }
+            if key == "strip:open" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_strip_open(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE strip:open");
+                continue;
+            }
+            if let Some(frac) = key.strip_prefix("strip:scrub:") {
+                let f: f32 = frac.parse().expect("bad strip:scrub fraction");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_scrub(f, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:scrub:{f}");
+                continue;
+            }
+            if let Some(frac) = key.strip_prefix("strip:pin:") {
+                let f: f32 = frac.parse().expect("bad strip:pin fraction");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_pin(f, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:pin:{f}");
+                continue;
+            }
+            if key == "strip:restore" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_restore(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                eprintln!("SMOKE strip:restore");
+                continue;
+            }
+            if key == "strip:now" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_strip_now(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE strip:now");
+                continue;
+            }
+            // The cold read (impl 05 Wave B). `coldread:open` toggles the
+            // room through the real verb; `coldread:flip:N` flips to page N;
+            // `coldread:select:F,T` sets a word-snapped page selection;
+            // `coldread:react:<glyph>` files a chip reaction;
+            // `coldread:past[:N]` enters the history variant through the
+            // parked banner's own gate; `coldread:copycheck` runs the F5
+            // copy golden through the clipboard shim.
+            if key == "coldread:open" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_coldread_open(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                eprintln!("SMOKE coldread:open");
+                continue;
+            }
+            if let Some(n) = key.strip_prefix("coldread:flip:") {
+                let page: usize = n.parse().expect("bad coldread:flip page");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_coldread_flip(page, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if let Some(spec) = key.strip_prefix("coldread:select:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .expect("bad coldread:select range")
+                };
+                let (from, to) = (next(), next());
+                window
+                    .update(cx, |editor, _, cx| editor.debug_coldread_select(from, to, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if let Some(glyph) = key.strip_prefix("coldread:react:") {
+                let glyph = glyph.to_owned();
+                window
+                    .update(cx, |editor, _, cx| editor.debug_coldread_react(&glyph, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if key == "coldread:past" || key.starts_with("coldread:past:") {
+                let pick = key
+                    .strip_prefix("coldread:past:")
+                    .and_then(|n| n.parse::<usize>().ok());
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_coldread_past(pick, window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if key == "coldread:copycheck" {
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_coldread_copycheck(window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
                 continue;
             }
             // `reduce:motion` flips the config's motion-sensitivity switch
@@ -225,6 +561,33 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .update(cx, |editor, _, _| editor.debug_cursor())
                     .unwrap_or_default();
                 eprintln!("SMOKE {key}: {state}");
+                continue;
+            }
+            // `move:X,Y` — a plain pointer move (no button): hover states
+            // (the cold read's flip-zone shading, tooltips-by-position).
+            if let Some(spec) = key.strip_prefix("move:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .expect("bad move in STROP_SMOKE")
+                };
+                let (x, y) = (next(), next());
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: point(px(x), px(y)),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
                 continue;
             }
             // `drag:X1,Y1,X2,Y2` — press at the start, move in steps to the end,

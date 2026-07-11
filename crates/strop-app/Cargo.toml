@@ -11,9 +11,20 @@ path = "src/main.rs"
 
 [dependencies]
 strop-core = { workspace = true }
+ropey = { workspace = true }
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
 directories = "6"
+# Cold read (impl 05 §2.4): TeX-pattern hyphenation, runtime-loaded
+# dictionaries only — NO embed features, ever: hyph-ru is LPPL 1.2+
+# (GPL-incompatible; the mere-aggregation posture wants the data as loose
+# files in assets/hyphenation/, read via Standard::from_path). The crate
+# code itself is Apache-2.0/MIT (verified, research-linebreak §1.4).
+hyphenation = "0.8.4"
+# F2: hyphenation looks up an NFC COPY of each word and skips the word
+# when its NFC form differs from the raw form — the slice string itself
+# is never transformed.
+unicode-normalization = "0.1"
 unicode-segmentation = "1"
 serde_json = { workspace = true }
 serde = { workspace = true }
