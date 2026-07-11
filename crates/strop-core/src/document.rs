@@ -1691,8 +1691,12 @@ impl Document {
     /// REGION so the return can never cross the seam. `collapse_emptied`
     /// (the explicit Exile verb) folds the seam's evaporation into the same
     /// atom when the cut empties the pile; the auto-capture path passes
-    /// false and leaves that to the editor's retype-race guard. Returns the
-    /// new entry id.
+    /// false and leaves that to the editor's retype-race guard. The DELETION
+    /// is always exact-bytes (two verbs, two contracts — only exile widens),
+    /// but the ENTRY records `whole_blocks: true` when the normalized range
+    /// covered complete blocks, so a backspaced paragraph still returns as a
+    /// standing paragraph, never a splice glued to its neighbour (papercuts
+    /// follow-up, report 3). Returns the new entry id.
     pub fn cut_to_graveyard(
         &mut self,
         byte_range: Range<usize>,
@@ -1703,7 +1707,34 @@ impl Document {
         let rope = self.buffer.rope();
         let start_char = rope.byte_to_char(byte_range.start);
         let end_char = rope.byte_to_char(byte_range.end);
-        let text: String = rope.slice(start_char..end_char).to_string();
+        // Plain delete KEEPS exact-byte deletion — that ruling stands — but
+        // the ENTRY records block-ness when the writer's selection was in
+        // fact one-or-more complete blocks (papercuts follow-up, report 3):
+        // otherwise a backspaced paragraph returns as a splice and glues to
+        // its neighbour. Reuse §B1's normalization (a range ending at a
+        // block's char 0 reclassifies as ending at the previous block's text
+        // end) for the DETECTION only; the deletion below is untouched.
+        let mut norm_end = end_char;
+        if norm_end > start_char && rope.char(norm_end - 1) == '\n' {
+            norm_end -= 1;
+        }
+        let first_line = rope.char_to_line(start_char);
+        let last_line = rope.char_to_line(norm_end);
+        let text_end_of_last = if last_line + 1 < rope.len_lines() {
+            rope.line_to_char(last_line + 1) - 1
+        } else {
+            rope.len_chars()
+        };
+        let whole = start_char < norm_end
+            && start_char == rope.line_to_char(first_line)
+            && norm_end == text_end_of_last
+            && region_of_char(rope, &self.blocks, start_char)
+                == region_of_char(rope, &self.blocks, norm_end);
+        // A whole-block entry stores the NORMALIZED text (bounding separator
+        // excluded — put_back rebuilds exactly one), so both doors feed §B2
+        // the same shape; a fragment stores the exact deleted bytes as ever.
+        let entry_end = if whole { norm_end } else { end_char };
+        let text: String = rope.slice(start_char..entry_end).to_string();
         let region = match region_of_char(rope, &self.blocks, start_char) {
             Region::Manuscript => GraveRegion::Manuscript,
             // A cut can't start ON the seam via any verb; the never-panic
@@ -1714,8 +1745,7 @@ impl Document {
         // them away, so Put back is lossless (Bug D / P1). One block kind per
         // line the text will re-create (`count_line_breaks + 1`), so put_back
         // can re-stamp them onto exactly the re-inserted blocks.
-        let spans = self.spans.slice(start_char..end_char);
-        let first_line = rope.char_to_line(start_char);
+        let spans = self.spans.slice(start_char..entry_end);
         let n_blocks = count_line_breaks(&text) + 1;
         let kinds: Vec<BlockKind> = self
             .blocks
@@ -1737,7 +1767,7 @@ impl Document {
             spans,
             kinds,
             region,
-            false,
+            whole,
         );
         if collapse_emptied && self.scraps_textless() {
             self.evaporate_scraps_in_tx();
@@ -2003,11 +2033,17 @@ impl Document {
             let at_end = boundary >= rope.len_chars();
             // A trailing separator when a block follows the landing; a leading
             // one when the returned block is the last of the document; none at
-            // all into an empty document (no phantom blank block).
+            // all into an empty document (no phantom blank block) — or into a
+            // trailing EMPTY block (the grave a plain delete leaves standing):
+            // the return fills that block rather than opening a second blank.
             let (payload, text_offset) = if rope.len_chars() == 0 {
                 (entry.text.clone(), 0)
             } else if at_end {
-                (format!("\n{}", entry.text), 1)
+                if rope.char(rope.len_chars() - 1) == '\n' {
+                    (entry.text.clone(), 0)
+                } else {
+                    (format!("\n{}", entry.text), 1)
+                }
             } else {
                 (format!("{}\n", entry.text), 0)
             };
@@ -3987,6 +4023,85 @@ mod tests {
         assert_eq!(doc.text(), "AAA\nBBB\nCCC");
         assert_eq!(doc.blocks().len(), 3);
         assert_eq!(caret, 8, "caret at CCC's start");
+    }
+
+    // ---- papercuts follow-up (2026-07-11 owner round): reports 3 & 4 ----
+
+    #[test]
+    fn plain_deleted_whole_paragraph_returns_standing_not_spliced() {
+        // Report 3: select a full middle paragraph with the mouse (text only,
+        // no bounding \n), plain-delete it (auto-files, exact bytes), sweep
+        // the leftover empty line with a second Backspace, put back. The
+        // text must stand as its own paragraph wearing its own kind and
+        // spans — glued to nobody.
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Paragraph,
+            BlockKind::Heading(2),
+            BlockKind::Paragraph,
+        ]);
+        let mut spans = SpanSet::default();
+        spans.add(4..7, InlineAttr::Strong); // "BBB" bold
+        let mut doc = Document::new("AAA\nBBB\nCCC", spans, blocks);
+        let id = doc.cut_to_graveyard(4..7, String::new(), 0, false); // plain delete
+        // The exact-byte ruling stands: the empty grave line remains.
+        assert_eq!(doc.text(), "AAA\n\nCCC");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.whole_blocks, "a complete-block plain delete records block-ness");
+        assert_eq!(e.text, "BBB");
+        // The second Backspace sweeps the leftover empty line.
+        doc.edit_bytes(3..4, "");
+        assert_eq!(doc.text(), "AAA\nCCC");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC", "stands as its own paragraph");
+        assert_eq!(caret, 4, "caret at the returned block's start");
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Heading(2), "its own kind restored");
+        assert!(doc.spans().covers(4..7, &InlineAttr::Strong), "its own bold, nobody else's");
+        assert!(!doc.spans().covers(0..3, &InlineAttr::Strong));
+        assert!(!doc.spans().covers(8..11, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn plain_delete_with_trailing_newline_normalizes_and_returns_standing() {
+        // The reversed order: the selection grabbed the trailing separator
+        // too (shift+down / triple-click shape), so ONE Backspace leaves no
+        // empty line. B1's normalization classifies it; the entry sheds the
+        // separator so put back rebuilds exactly one, never two.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.cut_to_graveyard(4..8, String::new(), 0, false); // "BBB\n"
+        assert_eq!(doc.text(), "AAA\nCCC", "exact bytes: no leftover line this way");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.whole_blocks);
+        assert_eq!(e.text, "BBB", "the entry sheds the bounding separator");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert_eq!(caret, 4);
+        assert_eq!(doc.blocks().len(), 3);
+    }
+
+    #[test]
+    fn plain_deleted_last_paragraph_put_back_fills_the_leftover_grave() {
+        // Put back BEFORE the writer sweeps the empty line: the return fills
+        // the standing grave block rather than opening a second blank.
+        let mut doc = Document::new("AAA\nBBB", SpanSet::default(), BlockMap::default());
+        let id = doc.cut_to_graveyard(4..7, String::new(), 0, false); // "BBB"
+        assert_eq!(doc.text(), "AAA\n");
+        assert!(doc.graveyard().get(id).unwrap().whole_blocks);
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB", "fills the grave, no doubled blank");
+        assert_eq!(caret, 4);
+        assert_eq!(doc.blocks().len(), 2);
+    }
+
+    #[test]
+    fn partial_selection_plain_delete_still_splices() {
+        // Anything short of complete blocks keeps today's fragment contract.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.cut_to_graveyard(5..7, String::new(), 0, false); // "BB" mid-block
+        assert!(!doc.graveyard().get(id).unwrap().whole_blocks);
+        assert_eq!(doc.text(), "AAA\nB\nCCC");
+        doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC", "a fragment splices back in place");
+        assert_eq!(doc.blocks().len(), 3);
     }
 
     #[test]
