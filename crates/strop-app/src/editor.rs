@@ -8946,6 +8946,22 @@ impl Editor {
     /// the window root — the layers themselves stop propagation, so only
     /// genuinely-outside clicks arrive here.
     fn light_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // LAW 2 / C4 — no dead zones ANYWHERE: the margin lane, the titlebar
+        // blank and the gutters all live OUTSIDE the editor column's hitbox,
+        // so the column's own `on_mouse_down` (which resolves fields for
+        // prose clicks) never fires out there — the report-1 bug: a click
+        // right beside a composing card closed nothing. The root handler is
+        // the one listener every unclaimed click reaches, so the field family
+        // resolves HERE with the dead-zone exit: commit (an empty composer
+        // discards) and restore the caret saved at open. A prose click
+        // already resolved everything in the column handler, and every
+        // field's own chrome stops propagation — both paths make this a
+        // no-op, never a double-commit.
+        let composer_return = self.composer_return.clone();
+        if self.commit_or_discard_composer(window, cx) {
+            self.apply_composer_return(composer_return, cx);
+        }
+        self.commit_transient_fields_on_gesture(cx);
         if self.palette_input.is_some() {
             self.close_palette(window, cx);
         }
@@ -9108,9 +9124,13 @@ impl Editor {
                 }
             }
             2 => {
-                // Double-click on an image block edits its alt text.
+                // Double-click on an image block edits its alt text. The
+                // gesture is CLAIMED: without the stop it would bubble on to
+                // the root's no-dead-zones resolver (C4) and commit the very
+                // field it just opened.
                 let block = self.doc.block_of_byte(ix.min(self.doc.len_bytes()));
                 if matches!(self.doc.blocks().kind(block), BlockKind::Image { .. }) {
+                    cx.stop_propagation();
                     self.edit_image_alt(block, window, cx);
                     return;
                 }
@@ -16321,6 +16341,10 @@ impl Editor {
                 .bg(rgb(0xF4F1EA))
                 .border_t_1()
                 .border_color(rgb(RULE_COLOR))
+                // The strip IS the composer's surface: its clicks must never
+                // bubble to the root's no-dead-zones resolver (C4) and commit
+                // the very field the writer is clicking into.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .px(px(28.))
                 .py(px(8.))
                 .flex()

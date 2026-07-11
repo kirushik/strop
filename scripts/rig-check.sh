@@ -122,6 +122,31 @@ expect "its ghost lingers for the fade"    1 "$(field "$D1" departing)"
 expect "the ghost is gone after the fade"  0 "$(field "$D2" departing)"
 expect "the lane stands re-packed"         3 "$(field "$D2" visible)"
 
+# C4 / LAW 2 — no dead zones: a click in the margin BESIDE a composing card
+# resolves the composer (report 1: the lane lives outside the editor column's
+# hitbox, so only the ROOT handler sees the click — light_dismiss carries the
+# resolution). An empty draft is discarded (no stray blank card); a typed
+# draft commits; both exits restore the caret/selection saved at open.
+echo "rig-check: a click beside the card still lands — the composer resolves (C4)"
+DOCC4=$(mktemp --suffix=.md); cp "$DOC2" "$DOCC4"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCC4" "select:para ctrl-m dump:ui click:1274,700 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+C1=$(echo "$OUT" | sed -n 1p); C2=$(echo "$OUT" | sed -n 2p)
+[ -n "$C2" ] || { echo "  FAIL no dump (composer C4)"; exit 1; }
+rm -f "$DOCC4" "$DOCC4.strop"
+expect "ctrl-m opens the composer"            '"NoteComposer"' "$(field "$C1" focused)"
+expect "a margin-blank click closes it"       '"Editor"' "$(field "$C2" focused)"
+expect "the empty draft is discarded"         0 "$(field "$C2" open_notes)"
+DOCC5=$(mktemp --suffix=.md); cp "$DOC2" "$DOCC5"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCC5" "select:para dump:ui ctrl-m h i click:1274,700 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+C1=$(echo "$OUT" | sed -n 1p); C2=$(echo "$OUT" | sed -n 2p)
+[ -n "$C2" ] || { echo "  FAIL no dump (composer C4 commit)"; exit 1; }
+rm -f "$DOCC5" "$DOCC5.strop"
+expect "a typed draft commits on the click"   1 "$(field "$C2" open_notes)"
+expect "focus returns to the prose"           '"Editor"' "$(field "$C2" focused)"
+SEL1=$(echo "$C1" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')
+SEL2=$(echo "$C2" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')
+expect "the dead-zone exit restores the saved caret" "$SEL1" "$SEL2"
+
 echo "rig-check: off-screen cards land in exactly one honest bucket"
 # Scroll the anchors far off the top: culled cards count as 'above' — EXCEPT
 # the selected card, which is exempt from the cull (you're working it) and
