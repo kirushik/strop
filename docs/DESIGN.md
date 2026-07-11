@@ -151,19 +151,28 @@ control exactly when it must wear its open state (P12), and the footer
 lane is the writer's warm territory (P3); left-cluster placement — ↺
 beside the document name reads as "revert this document", and on macOS
 it would move into the traffic lights' shadow.)
-(3) *The count chip's emphasis is caret-scoped* — ink lifts only while
-the caret IS in the pile ("scraps · 86", the one state the chip must
-interrupt), never all day because a seam merely exists; the semibold
-died (the region word + the ink are two cues; the tinted scraps page
-is the loud warning). The doc name alone wears full ink at rest — the
-bar's anchor object (P11).
+(3) *The count chip counts the PIECE, always* (owner's call, same day,
+superseding the round's first cut): the caret-scoped "piece · N" /
+"scraps · N" label spent always-visible bar space on a fact the page
+already shows — the Scraps delineation header carries the pile's own
+live count — and it hid the session goal whenever the caret wandered
+below the seam. One region, one instrument, no emphasis states. The
+doc name alone wears full ink at rest — the bar's anchor object (P11).
 (4) *The session goal is set INLINE in the count chip* (the rename
 idiom — P8, one grammar): the field swaps in beside the still-visible
 count, prefilled with the current goal selected; **erasing it erases
 the goal** (P13 — the inverse lives in the verb's own grammar), so the
 old bottom strip and its "enter sets · 0 clears · esc cancels" legend
-(a P4 conviction) are dead. In scraps the chip is a readout, not a
-control — a "scraps · N" click must not open a piece-goal editor.
+(a P4 conviction) are dead.
+(5) *Situational popups exclude each other* (§0.6): the omnibar
+dropdown and the editor menu never stand together; the menu's right
+edge anchors by arithmetic (moat + window cells), not a captured paint
+edge — deterministic on the first frame, immune to the one-frame lag
+that let it drift.
+(6) *Dashed underline = "this text is clickable"* — the put-back
+idiom generalized (`inline_action`): the omnibar's empty-state hint
+sigils type what they name ("> for commands" types ">"), and the
+door's inactive pole wears the dash (state in ink, action dashed).
 
 H3 completes the popover into three hairline-divided groups: inline
 marks `[B I S {} ==]` | headings `[H1 H2 H3]` | footnote `[¹]`. Each

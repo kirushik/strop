@@ -367,7 +367,9 @@ rm -f "$DOCX" "$DOCX.strop"
 expect "at rest: unlatched"                    false "$(field "$X1" latched)"
 expect "travel arms the latch"                 true  "$(field "$X2" latched)"
 expect "travel enters the pile"                true  "$(field "$X2" caret_scraps)"
-expect "the count control flips to scraps"     '"scraps' "$(field "$X2" count_label | cut -d' ' -f1)"
+# The chip counts the PIECE in every state (2026-07-11: the caret-scoped
+# region label was retired — the Scraps header names the pile itself).
+expect "the count control never flips"         'words"' "$(field "$X2" count_label | cut -d' ' -f2)"
 expect "typing INSIDE keeps the latch"         true  "$(field "$X3" latched)"
 expect "Esc travels home"                      false "$(field "$X4" caret_scraps)"
 expect "Esc drops the latch"                   false "$(field "$X4" latched)"

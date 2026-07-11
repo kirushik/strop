@@ -70,6 +70,15 @@ const OMNI_MENU_W: f32 = 31.;
 fn omni_field_width(window: &Window) -> f32 {
     (f32::from(window.viewport_size().width) / 3.).clamp(191., OMNI_FIELD_W) - OMNI_MENU_W
 }
+
+/// The drag-surface moat between the app verbs and the OS window controls
+/// (the ordering round's law: no app verb adjacent to window controls).
+/// Wide when the bar can afford it; 890 is where the wide moat and the
+/// resting "Ask the editor" first fit together. Shared by the titlebar and
+/// the editor menu's right-edge anchor — they can never disagree.
+fn titlebar_moat_width(window: &Window) -> f32 {
+    if f32::from(window.viewport_size().width) >= 890. { 56. } else { 24. }
+}
 /// Margin-card box metrics, shared by the height MEASUREMENT
 /// (`refresh_card_heights`) and the RENDER (`render_margin`) so a card's packed
 /// extent equals its painted one. Text wraps at the card's inner width; the
@@ -331,6 +340,26 @@ fn tip(
 /// popover (H3): inline marks | headings | footnote.
 fn popover_divider() -> gpui::Div {
     div().w(px(1.)).h(px(16.)).mx(px(3.)).bg(rgb(RULE_COLOR))
+}
+
+/// An inline text action — the "put back" idiom, generalized: a phrase that
+/// does what it says, wearing the product's one "this text is clickable"
+/// mark, the dashed underline (gpui's shader-side dashed border; dashed =
+/// actionable, never emphasis). Muted at rest, ink on hover. The caller
+/// chains its own on_mouse_down.
+fn inline_action(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .cursor(CursorStyle::PointingHand)
+        .text_color(rgb(MUTED_COLOR))
+        .border_b_1()
+        .border_dashed()
+        .border_color(rgb(MUTED_COLOR))
+        .hover(|d| d.text_color(rgb(TEXT_COLOR)).border_color(rgb(TEXT_COLOR)))
+        .child(label.into())
 }
 
 /// One client-side resize handle (H2): an invisible edge/corner strip that
@@ -1172,14 +1201,6 @@ pub struct Editor {
     /// glued flush under the titlebar control. A bool-toggled overlay, light-
     /// dismissed like the narrow-notes panel it borrows its anchoring from.
     editor_menu_open: bool,
-    /// The editor button's PAINTED right edge (window coords), written by a
-    /// bounds canvas inside the control each frame (the zone_row_bounds
-    /// idiom — a plain shared cell, never an entity write mid-draw). The
-    /// dropdown reads it to stay glued right-edge-to-right-edge with its
-    /// button: the fixed-width estimate it replaced assumed the chrome right
-    /// of the button never changes, but those controls flex-shrink in a
-    /// narrow bar, which left the menu floating ~75px off its control.
-    editor_btn_right: std::rc::Rc<std::cell::Cell<Option<Pixels>>>,
     /// Selection popover (DESIGN §2-toolbar): formatting rides the
     /// selection. Shown on mouse-up over a selection or via ctrl-.;
     /// dismissed by mousedown, typing, scrolling, or escape.
@@ -1685,7 +1706,6 @@ impl Editor {
             active_card_height: None,
             narrow_notes_open: false,
             editor_menu_open: false,
-            editor_btn_right: std::rc::Rc::default(),
             selection_popover: false,
             link_input: None,
             excursion: None,
@@ -1793,15 +1813,14 @@ impl Editor {
     /// "piece ·" prefix exists only once a seam does (no vocabulary before
     /// its referent, P4): a seamless doc says "N words" as it always has.
     /// The chrome count and the seam count visibly sum.
+    /// The chip counts the PIECE, always (owner's call, 2026-07-11): the
+    /// caret-scoped "piece · N"/"scraps · N" label spent always-visible bar
+    /// space on a fact the page already shows — the Scraps delineation
+    /// header carries the pile's own live count — and it hid the session
+    /// goal whenever the caret wandered below the seam. One region, one
+    /// instrument: the chip shows and edits the same datum in every state.
     fn count_label(&self) -> String {
-        if self.doc.boundary().is_none() {
-            return format!("{} words", format_thousands(self.word_count));
-        }
-        if self.caret_in_scraps() {
-            format!("scraps · {}", format_thousands(self.scraps_word_count()))
-        } else {
-            format!("piece · {}", format_thousands(self.word_count))
-        }
+        format!("{} words", format_thousands(self.word_count))
     }
 
     fn sync_mutations(&mut self) {
@@ -3735,6 +3754,13 @@ impl Editor {
     /// pulse and the door verb stay reachable.
     fn toggle_editor_menu(&mut self, cx: &mut Context<Self>) {
         self.editor_menu_open = !self.editor_menu_open;
+        // One situational popup at a time (§0.6 layer discipline): the
+        // editor menu and the omnibar dropdown never stand together.
+        if self.editor_menu_open {
+            self.palette_input = None;
+            self.replace_input = None;
+            self.omni_return = None;
+        }
         cx.notify();
     }
 
@@ -4564,6 +4590,9 @@ impl Editor {
     /// shared across all three modes. `initial` seeds the query (and so the
     /// mode): "" = find, ">" = command, "@" = heading.
     fn open_omni(&mut self, initial: String, window: &mut Window, cx: &mut Context<Self>) {
+        // One situational popup at a time (§0.6): summoning the omnibar
+        // stands the editor menu down.
+        self.close_editor_menu(cx);
         // A fresh field every open (the old entity drops); PaletteInput
         // context gives it up/down row motion and the editing chords.
         let input = cx.new(|cx| TextField::palette(cx, initial.clone()));
@@ -5247,22 +5276,49 @@ impl Editor {
             );
         }
         if rows.is_empty() {
-            let msg = match mode {
-                OmniMode::Find if rest.is_empty() => {
-                    "Type to find · > for commands · @ for headings"
-                }
-                OmniMode::Find => "No matches",
-                OmniMode::Heading => "No headings",
-                OmniMode::Command => "No matching command",
-            };
-            list = list.child(
+            list = list.child(if mode == OmniMode::Find && rest.is_empty() {
+                // The hint row IS the controls it names (the ordering
+                // round's Birman note: a button that types ">" is labelled
+                // ">"): each sigil phrase is an inline action that types
+                // its sigil into the field — the hint teaches by doing.
+                let sigil = |id: &'static str, label: &'static str, seed: &'static str| {
+                    inline_action(id, label).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.open_omni(seed.into(), window, cx);
+                        }),
+                    )
+                };
                 div()
                     .px(px(12.))
                     .py(px(8.))
                     .text_size(px(13.))
                     .text_color(rgb(MUTED_COLOR))
-                    .child(msg),
-            );
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .child("Type to find")
+                    .child("·")
+                    .child(sigil("omni-hint-cmd", "> for commands", ">"))
+                    .child("·")
+                    .child(sigil("omni-hint-head", "@ for headings", "@"))
+                    .into_any_element()
+            } else {
+                let msg = match mode {
+                    OmniMode::Find => "No matches",
+                    OmniMode::Heading => "No headings",
+                    OmniMode::Command => "No matching command",
+                };
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .text_size(px(13.))
+                    .text_color(rgb(MUTED_COLOR))
+                    .child(msg)
+                    .into_any_element()
+            });
         }
         // The query input lives in the TITLEBAR now (06 §1) — the card is the
         // field's dropdown: results (+ the replace row, a sanctioned distinct
@@ -5282,7 +5338,10 @@ impl Editor {
                 // The dropdown wears the field's own width (06 §1): equal
                 // boxes on the same centre line — every edge agrees, and the
                 // card reads as the field's shadow, not a second object.
-                div().w(px(field_w)).child(
+                // The left margin mirrors the titlebar's ensemble geometry
+                // (menu button + gap ride the field's left flank), so the
+                // centring math lands this card exactly under the field.
+                div().w(px(field_w)).ml(px(OMNI_MENU_W)).child(
                     div()
                         .w(px(field_w))
                         .bg(rgb(0xFCFAF4))
@@ -7186,11 +7245,6 @@ impl Editor {
     fn set_session_goal(&mut self, _: &SetSessionGoal, window: &mut Window, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
-        }
-        // The goal is a piece instrument (the chip hides the delta in
-        // scraps); a "scraps · N" chip must not open a piece-goal editor.
-        if self.caret_in_scraps() {
-            return;
         }
         if self.goal_input.is_some() {
             return;
@@ -12702,22 +12756,16 @@ impl Editor {
                 // Clickable: sets or changes the goal for this sitting.
                 // Hidden in the reading room — the count lives in the banner
                 // (L16).
-                .when(!in_cold, |bar| bar.child({
-                    let in_pile = self.caret_in_scraps();
+                .when(!in_cold, |bar| bar.child(
                     div()
                         .id("word-count")
                         .occlude()
                         .ml(px(12.))
                         .px(px(4.))
                         .rounded(px(4.))
-                        // In scraps the chip is a readout, not a control —
-                        // the goal is a piece instrument, and a "scraps · N"
-                        // click must not open a piece-goal editor (P12).
-                        .when(!in_pile, |d| {
-                            d.cursor(CursorStyle::PointingHand)
-                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                                .tooltip(tip("Set session goal", None))
-                        })
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Set session goal", None))
                         .when(self.goal_input.is_none(), |d| {
                             d.on_mouse_down(
                                 MouseButton::Left,
@@ -12728,18 +12776,9 @@ impl Editor {
                             )
                         })
                         .child({
-                            // Caret-scoped (P12; scopes-search 5): the label
-                            // names its region once a seam exists, and any
-                            // mid-pile screenshot self-identifies. In scraps
-                            // the goal delta HIDES (not recomputed) — the
-                            // goal is a piece instrument; mixing scopes in
-                            // one chip cuts P12 both ways. The emphasis is
-                            // caret-scoped too (2026-07-11 ordering round):
-                            // ink lifts only while the caret IS in the pile —
-                            // the one state the chip must interrupt — never
-                            // all day because a seam merely exists. Two cues
-                            // (the region word + the ink), no bold: the
-                            // tinted scraps page itself is the loud warning.
+                            // The piece's count and goal, in every state
+                            // (see count_label — the caret-scoped region
+                            // label was retired 2026-07-11).
                             let label = self.count_label();
                             match (&self.goal_input, self.session_goal) {
                                 // The goal editor, INLINE in the chip (the
@@ -12755,7 +12794,7 @@ impl Editor {
                                     .child("·")
                                     .child(div().w(px(72.)).child(input.clone()))
                                     .into_any_element(),
-                                (None, Some((goal, start))) if !in_pile => {
+                                (None, Some((goal, start))) => {
                                     let delta = self.word_count as i64 - start as i64;
                                     let reached = delta >= goal as i64;
                                     div()
@@ -12779,16 +12818,12 @@ impl Editor {
                                         .into_any_element()
                                 }
                                 _ => div()
-                                    .text_color(if in_pile {
-                                        rgb(TEXT_COLOR)
-                                    } else {
-                                        rgb(MUTED_COLOR)
-                                    })
+                                    .text_color(rgb(MUTED_COLOR))
                                     .child(label)
                                     .into_any_element(),
                             }
                         })
-                }))
+                ))
             )
             // The omnibar (06 §1): the centre control IS the palette's input —
             // a real type-able field whose dropdown is the results card, never
@@ -13107,34 +13142,6 @@ impl Editor {
                                 editor.toggle_editor_menu(cx);
                             }),
                         )
-                        // The glue probe: the dropdown must sit right-edge-to-
-                        // right-edge with THIS control, so record where the
-                        // control actually painted (see editor_btn_right).
-                        // Plain shared-cell write, never an entity update
-                        // mid-draw. The menu renders BEFORE this runs, so when
-                        // the edge moved this frame (resize, a label change)
-                        // and the menu is up, schedule ONE follow-up frame —
-                        // the EditorElement's geometry-changed idiom; it
-                        // converges as soon as the edge holds still.
-                        .child({
-                            let cell = self.editor_btn_right.clone();
-                            capture_canvas(
-                                move |bounds, window, _| {
-                                    // inset_0 spans the button's PADDING box;
-                                    // add its border back, so the cell holds
-                                    // the control's true painted edge.
-                                    let edge = bounds.right() + px(1.);
-                                    let stale = cell.get() != Some(edge);
-                                    cell.set(Some(edge));
-                                    if stale && open {
-                                        window.request_animation_frame();
-                                    }
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .inset_0()
-                        })
                         .when_some(dot, |d, color| {
                             d.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(rgb(color)))
                         })
@@ -13169,13 +13176,7 @@ impl Editor {
                         // moat spent its give. The 24px floor still buffers
                         // a missed reach; 890 is where the wide moat plus
                         // the resting "Ask the editor" both fit.
-                        div().h_full().flex_shrink_0().w(px(
-                            if f32::from(window.viewport_size().width) >= 890. {
-                                56.
-                            } else {
-                                24.
-                            },
-                        )),
+                        div().h_full().flex_shrink_0().w(px(titlebar_moat_width(window))),
                     )
                     .child(self.window_button(icons::WIN_MINIMIZE, "Minimize", None, |window, _| {
                         window.minimize_window()
@@ -16567,17 +16568,20 @@ impl Editor {
         let copy_gate = self
             .copy_gated()
             .then_some("after the structural queries settle");
-        // Anchored flush under the button, right edges aligned — against the
-        // button's PAINTED edge (the capture canvas inside the control), not
-        // a fixed-width estimate of the chrome right of it: those controls
-        // flex-shrink in a narrow bar, which left the estimate ~75px off its
-        // control. The estimate survives only as the first-frame fallback
-        // (the editor button is the cluster's right edge on macOS; off
-        // macOS the 56px moat + 3×28 window controls sit right of it).
+        // Anchored flush under the button, right edges aligned. Since the
+        // ordering round everything right of the button is shrink-proof
+        // with known widths — the stepped moat plus 3×28 window controls
+        // off macOS; the button IS the cluster's right edge on macOS — so
+        // the anchor is arithmetic, not a captured paint edge. (The old
+        // capture-canvas glue probe is gone: it lagged one frame behind a
+        // moving edge, which is exactly when a menu must not drift.)
         let vw = f32::from(window.viewport_size().width);
-        let est = vw - if cfg!(target_os = "macos") { 0. } else { 140. };
-        let btn_right = self.editor_btn_right.get().map_or(est, f32::from);
-        let menu_right = (vw - btn_right).max(8.);
+        let chrome_right = if cfg!(target_os = "macos") {
+            0.
+        } else {
+            84. + titlebar_moat_width(window)
+        };
+        let menu_right = chrome_right.max(8.);
         // The lab's one-line law (392 there, chipless): verb + qualifier +
         // the keycap chip hold ONE line — 430 clears the longest row (the
         // believing read's qualifier beside its ctrl-shift-b chip). A window
@@ -16602,9 +16606,12 @@ impl Editor {
             .child(
                 // The presence pair (glossary): Reading (door open) / Away
                 // (drafting). A drawn toggle — the current pole wears the ink
-                // AND the weight (never color alone, WCAG 1.4.1); a click
-                // flips it through toggle_door's flush semantics. No "⇄"
-                // glyph (not in the bundled PT fonts); a dot divides the poles.
+                // AND the weight (never color alone, WCAG 1.4.1), and the
+                // OTHER pole — the one a click flips to — wears the dashed
+                // underline, the product's "this text is clickable" mark
+                // (state in ink, action dashed). A click anywhere flips
+                // through toggle_door's flush semantics. No "⇄" glyph (not
+                // in the bundled PT fonts); a dot divides the poles.
                 div()
                     .id("editor-menu-door")
                     .cursor(CursorStyle::PointingHand)
@@ -16627,6 +16634,11 @@ impl Editor {
                         div()
                             .text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR }))
                             .when(door_open, |d| d.font_weight(FontWeight::BOLD))
+                            .when(!door_open, |d| {
+                                d.border_b_1()
+                                    .border_dashed()
+                                    .border_color(rgb(MUTED_COLOR))
+                            })
                             .child("Reading"),
                     )
                     .child(div().size(px(3.)).rounded_full().bg(rgb(MUTED_COLOR)))
@@ -16634,6 +16646,11 @@ impl Editor {
                         div()
                             .text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR }))
                             .when(!door_open, |d| d.font_weight(FontWeight::BOLD))
+                            .when(door_open, |d| {
+                                d.border_b_1()
+                                    .border_dashed()
+                                    .border_color(rgb(MUTED_COLOR))
+                            })
                             .child("Away"),
                     ),
             );
