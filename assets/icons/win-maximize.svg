@@ -1,5 +1,6 @@
-<!-- Window family: the outline square, drawn to the same optical box as
-     the minimize line and the close saltire. -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.1" stroke-linecap="butt" stroke-linejoin="miter">
-  <rect x="4.5" y="4.5" width="15" height="15" rx="1.5"/>
+<!-- Window family: the outline square, same optical box as the minimize
+     line. Authored on the 13px display grid; all four stroke centers on
+     half-pixel lines — device-crisp at 1x and 2x. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1" stroke-linecap="butt" stroke-linejoin="miter">
+  <rect x="2.5" y="2.5" width="8" height="8" rx="1"/>
 </svg>

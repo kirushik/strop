@@ -38,16 +38,43 @@ draw what stacked rectangles cannot: the one icon that matters most
 
 ## The two families
 
-One grid (24-unit viewBox), one ink discipline, two formal classes that
-must never borrow from each other:
+One ink discipline, two formal classes that must never borrow from each
+other:
 
 | | **Pictorial** | **Window** |
 |---|---|---|
 | means | a *document* thing | the *window* (OS verbs) |
 | forms | pictures: clock, card, headstone, chain | pure geometry: line, square, saltire |
 | caps | round (humanist warmth, pairs with PT's low-contrast stems) | butt (drafting-table neutrality) |
-| stroke (24 grid) | 2.25 (≈1.2px at the 13px canonical size) | 2.1 — a shade lighter |
+| stroke | 1px, both families (see the pixel-honesty rule) | 1px |
 | members | `history`, `menu`, `note`, `grave`, `link`, `dismiss`, `caret-down` (the one filled form) | `win-minimize`, `win-maximize`, `win-close` |
+
+## The pixel-honesty rule
+
+**Each icon is authored on the grid it displays at** — viewBox equals
+the canonical display size, so one SVG unit is one logical pixel
+(revised 2026-07-11; the first cut used a 24-unit viewBox with tuned
+stroke widths and shipped blurry).
+
+Why: gpui rasterizes an SVG at device size × 2 and paints it back at
+exactly 2:1 — a phase-aligned box filter. That preserves crispness *if
+and only if* the geometry's edges land on device-pixel boundaries, and
+a 24-grid shown at 13px puts one grid unit at 2.17 texels — nothing
+ever lands. On the display-size grid the discipline is mechanical:
+
+- **Axis-aligned strokes are 1px wide, centered on half-integers**
+  (`y="6.5"`): both edges land on device pixels at 1× and 2×.
+- **Fills edge on integers or halves** (the headstone's slab).
+- **Curves and diagonals float free** — anti-aliasing is correct for
+  them; it is the fuzzy *double-gray bar* that reads as blur, never a
+  softened circle.
+- The old weight distinction between the families (2.25 vs 2.1 on the
+  24 grid) could not survive pixel-honesty — a crisp stroke is 1px or
+  2px, nothing between. The families now ride form and caps, which
+  was always the stronger signal.
+- A new display size therefore means a new drawing, not a scale
+  (Octicons' per-size discipline). Current grids: 13 (titlebar,
+  note, link), 12 (grave), 11 (dismiss), 9 (caret).
 
 The separation answers a real confusion risk: custom-drawn window
 controls sit in the same bar as the app's own toggles. Pictures mean the
@@ -130,9 +157,9 @@ palette rows (WordPress's testing showed palette icons don't help).
   no text-color cascade into `svg()`. For hover brightening use
   `.group(...)` on the control and `.group_hover(...)` on the icon (see
   `window_button`).
-- SVG sources: 24-unit viewBox, `stroke` kept as strokes (usvg outlines
-  them at bake time; keeping them editable is the point), family stroke
-  widths as in the table above, `#000` placeholder color (ignored —
+- SVG sources: viewBox = display size (the pixel-honesty rule above),
+  `stroke` kept as strokes (usvg outlines them at bake time; keeping
+  them editable is the point), `#000` placeholder color (ignored —
   alpha mask). A comment at the top of each file names its family and
   derivation.
 - Licensing: Lucide-derived geometry is ISC — full text in

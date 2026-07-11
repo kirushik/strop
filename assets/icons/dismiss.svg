@@ -1,7 +1,7 @@
-<!-- Pictorial family. The dismiss ×: round caps, house weight — the verb
-     that closes a CARD (a document thing). The window's saltire is the
-     lighter, butt-capped close.svg; the two families never borrow. -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
-  <path d="M6 6l12 12"/>
-  <path d="M18 6L6 18"/>
+<!-- Pictorial family. The dismiss saltire (closes a CARD or chrome panel;
+     the window's is the butt-capped win-close). Authored on the 11px
+     display grid; pure 45° diagonals anti-alias symmetrically. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 11 11" fill="none" stroke="#000" stroke-width="1" stroke-linecap="round">
+  <path d="M2.5 2.5l6 6"/>
+  <path d="M8.5 2.5l-6 6"/>
 </svg>

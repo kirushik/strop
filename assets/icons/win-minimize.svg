@@ -1,5 +1,6 @@
-<!-- Window family: pure geometry, butt caps, a shade lighter than the
-     pictorial stroke — OS verbs must not read as document controls. -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.1" stroke-linecap="butt">
-  <path d="M4.5 12h15"/>
+<!-- Window family: pure geometry, butt caps. Authored on the 13px display
+     grid: one 1px stroke on a half-pixel row, ends on integers —
+     device-crisp at 1x and 2x. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1" stroke-linecap="butt">
+  <path d="M2.5 6.5h8"/>
 </svg>

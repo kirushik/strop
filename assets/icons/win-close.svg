@@ -1,6 +1,6 @@
-<!-- Window family: the saltire, butt caps, light — closes the WINDOW.
-     Cards are dismissed by the round-capped pictorial dismiss.svg. -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.1" stroke-linecap="butt">
-  <path d="M5.25 5.25l13.5 13.5"/>
-  <path d="M18.75 5.25L5.25 18.75"/>
+<!-- Window family: the saltire, butt caps — closes the WINDOW. Authored
+     on the 13px display grid; pure 45° diagonals anti-alias symmetrically. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1" stroke-linecap="butt">
+  <path d="M3 3l7 7"/>
+  <path d="M10 3l-7 7"/>
 </svg>
