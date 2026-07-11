@@ -441,11 +441,14 @@ mod tests {
 
         // An old file still carrying the retired intent keys loads fine
         // (serde ignores unknown fields) and keeps the caret.
+        // Use serde_json::to_string to properly escape the key (backslashes
+        // in Windows paths must be JSON-escaped; a raw format!() does not do
+        // that, producing invalid JSON that fails to parse).
+        let key_json = serde_json::to_string(&intent_key(&doc_a)).unwrap();
         std::fs::write(
             &file,
             format!(
-                "{{\"{}\":{{\"intent\":\"finish the scene\",\"set_unix\":123,\"caret\":5}}}}",
-                intent_key(&doc_a)
+                "{{{key_json}:{{\"intent\":\"finish the scene\",\"set_unix\":123,\"caret\":5}}}}",
             ),
         )
         .unwrap();
