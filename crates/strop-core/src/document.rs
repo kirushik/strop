@@ -1157,6 +1157,13 @@ pub struct GraveEntry {
     /// a round trip; the whisper can honestly say "from scraps".
     #[serde(default)]
     pub region: GraveRegion,
+    /// Whether the exile verb read this cut as WHOLE paragraph block(s): the
+    /// cut took its bounding separator along (no empty grave in the prose,
+    /// papercuts-2026-07 §B1) and Put back rebuilds it as its own standing
+    /// block(s) rather than splicing it mid-paragraph (§B2). `serde` default
+    /// false keeps every pre-papercuts entry loading as a plain fragment.
+    #[serde(default)]
+    pub whole_blocks: bool,
 }
 
 /// The graveyard record: a side structure mirroring `Annotations` in every way
@@ -1194,6 +1201,8 @@ impl Graveyard {
     /// back is lossless (Bug D); a plain-text caller passes the defaults.
     /// `region` records which side of the seam the text left (Put back
     /// returns through the same door — graveyard-interplay 1/2).
+    /// `whole_blocks` records whether the exile verb read the cut as complete
+    /// paragraph block(s), so Put back rebuilds a paragraph, not a splice.
     #[allow(clippy::too_many_arguments)]
     pub fn file(
         &mut self,
@@ -1204,6 +1213,7 @@ impl Graveyard {
         spans: SpanSet,
         kinds: Vec<BlockKind>,
         region: GraveRegion,
+        whole_blocks: bool,
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
@@ -1218,6 +1228,7 @@ impl Graveyard {
             spans,
             kinds,
             region,
+            whole_blocks,
         });
         id
     }
@@ -1718,9 +1729,122 @@ impl Document {
         // pre-cut snapshot is always taken and the filing below rides it.
         self.edit_bytes(byte_range, "");
         self.revision += 1;
-        let id = self
-            .graveyard
-            .file(text, origin_quote, start_char, cut_unix, spans, kinds, region);
+        let id = self.graveyard.file(
+            text,
+            origin_quote,
+            start_char,
+            cut_unix,
+            spans,
+            kinds,
+            region,
+            false,
+        );
+        if collapse_emptied && self.scraps_textless() {
+            self.evaporate_scraps_in_tx();
+        }
+        id
+    }
+
+    /// The exile verb's capture (papercuts-2026-07 §B1): interpret the
+    /// selection before cutting. A WHOLE-block selection — normalized, running
+    /// from a block's text start to a block's text end over one or more
+    /// complete blocks — takes its bounding separator along, so the prose is
+    /// left with exactly the separator that joined the neighbours and NO empty
+    /// grave; the entry records `whole_blocks: true` so Put back rebuilds a
+    /// paragraph (§B2). Anything else (a partial or mixed selection) falls
+    /// through to `cut_to_graveyard`'s exact-byte semantics — two verbs, two
+    /// contracts (plain delete stays exact-bytes; only exile interprets
+    /// intent). Cut and its consumed separator are ONE transaction, so plain
+    /// Ctrl+Z restores text + separator and removes the entry in one step.
+    /// Returns the new entry id.
+    pub fn exile_to_graveyard(
+        &mut self,
+        byte_range: Range<usize>,
+        origin_quote: String,
+        cut_unix: i64,
+        collapse_emptied: bool,
+    ) -> u64 {
+        let rope = self.buffer.rope();
+        let s = rope.byte_to_char(byte_range.start);
+        let mut e = rope.byte_to_char(byte_range.end);
+        // Normalize: a selection ending at a block's char 0 (triple-click and
+        // shift+down already include the trailing newline) is reclassified as
+        // ending at the previous block's text end — otherwise "consume one
+        // more" would eat two separators and fuse the neighbours.
+        if e > s && e > 0 && rope.char(e - 1) == '\n' {
+            e -= 1;
+        }
+        // Whole-block detection on the normalized range: both ends sit on a
+        // block edge, and the two ends live in the same region (the exile verb
+        // never spans the seam — its separator math would otherwise chew the
+        // seam's own blank line).
+        let first_line = rope.char_to_line(s);
+        let last_line = rope.char_to_line(e);
+        let len_chars = rope.len_chars();
+        let text_start_of = |line: usize| rope.line_to_char(line);
+        let text_end_of = |line: usize| {
+            if line + 1 < rope.len_lines() {
+                rope.line_to_char(line + 1) - 1
+            } else {
+                len_chars
+            }
+        };
+        let whole = s < e
+            && s == text_start_of(first_line)
+            && e == text_end_of(last_line)
+            && region_of_char(rope, &self.blocks, s) == region_of_char(rope, &self.blocks, e);
+        if !whole {
+            // Restore any normalization: the exact-byte path owns the raw
+            // selection so a partial cut behaves exactly as today.
+            return self.cut_to_graveyard(byte_range, origin_quote, cut_unix, collapse_emptied);
+        }
+
+        // Whole-block: the entry holds the block texts (internal separators
+        // kept) MINUS the bounding one; the delete takes that bounding
+        // separator too. Trailing when a same-region block follows; leading
+        // when this is the last block(s) of the region/document.
+        let region = match region_of_char(rope, &self.blocks, s) {
+            Region::Manuscript => GraveRegion::Manuscript,
+            Region::Seam | Region::Scraps => GraveRegion::Scraps,
+        };
+        let entry_text: String = rope.slice(s..e).to_string();
+        let n_blocks = last_line - first_line + 1;
+        let kinds: Vec<BlockKind> = self
+            .blocks
+            .kinds()
+            .iter()
+            .skip(first_line)
+            .take(n_blocks)
+            .cloned()
+            .collect();
+        let spans = self.spans.slice(s..e);
+        // A same-region block follows iff the char at `e` is a separator whose
+        // next line stays in this region.
+        let trailing_sep = e < len_chars
+            && rope.char(e) == '\n'
+            && region_of_char(rope, &self.blocks, e + 1) == region_of_char(rope, &self.blocks, s);
+        let (del_start, del_end, origin) = if trailing_sep {
+            (s, e + 1, s)
+        } else if s > 0 && rope.char(s - 1) == '\n' {
+            // Leading separator: eat the newline joining us to the block above.
+            (s - 1, e, s - 1)
+        } else {
+            // A lone block that is the entire region: no separator to take.
+            (s, e, s)
+        };
+        let del_byte = self.char_to_byte(del_start)..self.char_to_byte(del_end);
+        self.edit_bytes(del_byte, "");
+        self.revision += 1;
+        let id = self.graveyard.file(
+            entry_text,
+            origin_quote,
+            origin,
+            cut_unix,
+            spans,
+            kinds,
+            region,
+            true,
+        );
         if collapse_emptied && self.scraps_textless() {
             self.evaporate_scraps_in_tx();
         }
@@ -1799,6 +1923,7 @@ impl Document {
                 above_spans,
                 above_kinds,
                 GraveRegion::Manuscript,
+                false,
             );
         }
         if capture && b_e - b_s >= capture_threshold && !below_text.is_empty() {
@@ -1813,6 +1938,7 @@ impl Document {
                 below_spans,
                 below_kinds,
                 GraveRegion::Scraps,
+                false,
             );
         }
         if self.scraps_textless() {
@@ -3488,7 +3614,7 @@ mod tests {
     #[test]
     fn graveyard_apply_op_shifts_and_clamps_origin() {
         let mut g = Graveyard::default();
-        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript);
+        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
         assert_eq!(g.get(id).unwrap().words, 1);
         // Insert before the origin → shifts right (10 → 12).
         g.apply_op(&op(0, 0, "xx"));
@@ -3549,7 +3675,7 @@ mod tests {
         let base = doc.manuscript_base_char();
         assert!(base > 0);
         let mut g = Graveyard::default();
-        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript); // origin drifted into the pile
+        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false); // origin drifted into the pile
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
         assert!(doc.text().starts_with("cc\n\n"), "compost untouched: {}", doc.text());
@@ -3622,6 +3748,9 @@ mod tests {
         assert_eq!(e.origin_pos, 4);
         assert!(e.spans.spans().is_empty());
         assert!(e.kinds.is_empty());
+        // A pre-papercuts entry has no `whole_blocks` key: serde-default false,
+        // so it loads and puts back as a plain fragment (§B1).
+        assert!(!e.whole_blocks);
         // The whole record round-trips too.
         let g: Graveyard = serde_json::from_str(
             r#"{"entries":[{"id":1,"text":"x","origin_quote":"","origin_pos":0,"cut_unix":0,"words":1}],"next_id":1}"#,
@@ -4090,6 +4219,7 @@ mod tests {
             SpanSet::default(),
             Vec::new(),
             GraveRegion::Manuscript,
+            false,
         );
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
@@ -4133,7 +4263,7 @@ mod tests {
         let pile_note = doc.add_note(4..7, "pile note".into(), 0); // "one"
         let manu_note = doc.add_note(22..27, "manu note".into(), 0); // "piece"
         let mut g = Graveyard::default();
-        let gid = g.file("corpse".into(), String::new(), 22, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript);
+        let gid = g.file("corpse".into(), String::new(), 22, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
         doc.set_graveyard(g);
         // Give it an undo stack that could reach back across the flip.
         doc.edit_bytes(0..0, "Z");

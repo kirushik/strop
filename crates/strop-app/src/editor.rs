@@ -6582,8 +6582,8 @@ impl Editor {
         }
         let range = self.selected_range.clone();
         // The deliberate verb collapses an emptied pile in the same atom
-        // (graveyard-interplay 4).
-        self.file_cut(range, true, cx);
+        // (graveyard-interplay 4) AND interprets whole-block intent (§B1).
+        self.file_cut(range, true, true, cx);
     }
 
     /// `Move to the manuscript` — the retrieval verb's SURFACE half (08 §2):
@@ -6781,10 +6781,25 @@ impl Editor {
     /// site that ever files a corpse. `collapse_emptied` folds a last-scrap
     /// exile's seam evaporation into the same transaction (the auto-capture
     /// path passes false: the retype-race guard governs it instead).
-    fn file_cut(&mut self, byte_range: Range<usize>, collapse_emptied: bool, cx: &mut Context<Self>) {
+    fn file_cut(
+        &mut self,
+        byte_range: Range<usize>,
+        collapse_emptied: bool,
+        interpret_blocks: bool,
+        cx: &mut Context<Self>,
+    ) {
         let quote = self.origin_quote_before(byte_range.start);
-        self.doc
-            .cut_to_graveyard(byte_range.clone(), quote, now_unix(), collapse_emptied);
+        // The explicit exile verb interprets intent (papercuts §B1): a
+        // whole-block selection takes its bounding separator, leaving no empty
+        // grave. The auto-cut path (a plain type-over/backspace deletion) stays
+        // exact-bytes — two verbs, two contracts.
+        if interpret_blocks {
+            self.doc
+                .exile_to_graveyard(byte_range.clone(), quote, now_unix(), collapse_emptied);
+        } else {
+            self.doc
+                .cut_to_graveyard(byte_range.clone(), quote, now_unix(), collapse_emptied);
+        }
         let caret = byte_range.start.min(self.doc.len_bytes());
         self.selected_range = caret..caret;
         self.selection_reversed = false;
@@ -9301,7 +9316,7 @@ impl Editor {
     fn debug_cut_substring(&mut self, needle: &str, cx: &mut Context<Self>) {
         let text = self.doc.text();
         if let Some(byte) = text.find(needle) {
-            self.file_cut(byte..byte + needle.len(), true, cx);
+            self.file_cut(byte..byte + needle.len(), true, false, cx);
         }
     }
 
@@ -9401,7 +9416,7 @@ impl Editor {
         let milk = text.find("There was a longer version").expect("fixture text");
         let (ms, me) = self.paragraph_bounds(milk);
         // Take the leading newline so no empty block strands above the seam.
-        self.file_cut(ms.saturating_sub(1)..me, true, cx);
+        self.file_cut(ms.saturating_sub(1)..me, true, false, cx);
         self.word_count = self.manuscript_word_count();
         // Scene carets.
         let text = self.doc.text();
@@ -10036,8 +10051,9 @@ impl Editor {
             if auto_cut_qualifies(new_text, end_char - start_char) {
                 // The auto path never collapses the seam itself: the caret
                 // ends inside the emptied pile, and the retype-race guard
-                // (seam-mechanics 6) owns the evaporation moment.
-                self.file_cut(range, false, cx);
+                // (seam-mechanics 6) owns the evaporation moment. Plain delete
+                // stays exact-bytes — only the exile verb interprets blocks.
+                self.file_cut(range, false, false, cx);
                 return;
             }
         }
