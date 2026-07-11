@@ -19459,25 +19459,33 @@ impl Editor {
         // FieldCommit still emits Commit, FieldCancel still emits Cancel.
         let input = cx.new(|cx| TextField::multiline(cx, String::new()));
         let handle = input.read(cx).focus_handle.clone();
-        cx.subscribe(&input, move |editor, _, ev: &TextFieldEvent, cx| match ev {
-            TextFieldEvent::Commit(text) => {
-                let t = text.trim().to_owned();
-                if t.is_empty() {
-                    return; // Enter on empty = no-op (Scopes 5)
+        // subscribe_IN: both exits must hand keyboard focus back to the DESK
+        // (report 2). The field's Commit/Cancel remove it from the tree; if
+        // focus stays on the dead handle, every later keystroke — the second
+        // Esc included — dispatches into a void outside the ColdRead context,
+        // and the room can never be left by keyboard.
+        cx.subscribe_in(
+            &input,
+            window,
+            move |editor, _, ev: &TextFieldEvent, window, cx| match ev {
+                TextFieldEvent::Commit(text) => {
+                    let t = text.trim().to_owned();
+                    if t.is_empty() {
+                        return; // Enter on empty = no-op (Scopes 5)
+                    }
+                    editor.cr_file_reaction(t, cx);
+                    if let Some(cr) = editor.cold_read.as_ref() {
+                        let handle = cr.focus_handle.clone();
+                        window.focus(&handle, cx);
+                    }
                 }
-                editor.cr_file_reaction(t, cx);
-            }
-            TextFieldEvent::Cancel => {
-                // Esc: the ONLY discard (N1) — close + collapse.
-                if let Some(cr) = editor.cold_read.as_mut() {
-                    cr.input = None;
-                    cr.input_range = None;
-                    cr.input_at = None;
-                    cr.selection = None;
-                    cx.notify();
+                TextFieldEvent::Cancel => {
+                    // Esc: the ONLY discard (N1) — close + collapse + refocus
+                    // the desk (one exit, cr_escape_impl's own path).
+                    editor.cr_discard_input(window, cx);
                 }
-            }
-        })
+            },
+        )
         .detach();
         // The commit-on-blur law (N1): a focus loss files non-empty trimmed
         // text exactly as Enter would — but only a WRITER'S gesture is a real

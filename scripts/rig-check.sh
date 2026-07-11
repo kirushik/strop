@@ -591,6 +591,25 @@ expect "the space typed INTO the note"        '"hi there"' "$(field "$CR" last_b
 expect "one note carries the whole phrase"    1 "$(field "$CR" lane)"
 expect "the page never flipped mid-note"      0 "$(field "$CR" page)"
 expect "the input closed on commit"           false "$(field "$CR" input)"
+# Report 2's sibling: the commit exit must hand the keys back to the DESK —
+# focus stranded on the removed field left the room Esc-proof.
+expect "commit hands the keys back to the desk" '"ColdRead"' "$(field "$D" focused)"
+
+# Report 2 — two-level Esc with the pencil up: the first Esc discards the
+# note (FieldCancel at the NoteComposer context) and refocuses the desk; the
+# second leaves the room. Pre-fix, the field's exits left focus on the dead
+# field, so the second Esc dispatched into a void and the room never closed.
+echo "rig-check: cold read — Esc closes the note, Esc again leaves the room"
+DOCK3=$(mktemp --suffix=.md); cp "$DOC" "$DOCK3"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCK3" "coldread:open coldread:select:5,40 coldread:raise h i escape dump:ui escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p)
+[ -n "$D2" ] || { echo "  FAIL no dump (two-level Esc)"; exit 1; }
+rm -f "$DOCK3" "$DOCK3.strop"
+CR1=$(echo "$D1" | grep -oE '"coldread":\{[^}]*\}')
+expect "the first Esc closes the note input"  false "$(field "$CR1" input)"
+expect "…and discards the draft"              0 "$(field "$CR1" lane)"
+expect "…and the desk holds the keys again"   '"ColdRead"' "$(field "$D1" focused)"
+expect "the second Esc leaves the room"       null "$(field "$D2" coldread)"
 
 # D1 mouse — a click that resolves an open note commits it but must NOT also
 # flip the page (commit-only, the one carve-out in C4's commit-AND-act rule).
