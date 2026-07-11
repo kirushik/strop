@@ -153,6 +153,10 @@ impl Buffer {
         self.rope.insert(char_range.start, text);
         self.version += 1;
         self.group_open = false;
+        // A forward edit invalidates redo history; the transaction-open
+        // usually cleared it already, but the None arm below tolerates
+        // callers that never opened one.
+        self.redo_stack.clear();
         match self.undo_stack.last_mut() {
             Some(tx) => tx.edits.push(edit),
             None => self.undo_stack.push(Transaction { edits: vec![edit] }),
