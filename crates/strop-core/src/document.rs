@@ -2784,6 +2784,45 @@ impl Document {
         self.blocks.set_kind(block, kind);
     }
 
+    /// Insert a dropped/pasted image as its OWN standing block after the
+    /// block holding `cursor_byte` (papercuts follow-up, report 4): an image
+    /// is never spliced mid-paragraph, and the caret must never land ON it —
+    /// typing at the image's line would write invisible text into the image
+    /// block. Separators are ensured (a trailing empty paragraph is opened
+    /// when the image lands last) and the returned caret BYTE is the start
+    /// of the block FOLLOWING the image. One transaction: the separator
+    /// insert and the kind stamp undo together.
+    pub fn insert_image_block(&mut self, cursor_byte: usize, src: String) -> usize {
+        let rope = self.buffer.rope();
+        let cursor_char = rope.byte_to_char(cursor_byte.min(self.len_bytes()));
+        let line = rope.char_to_line(cursor_char);
+        let par_end_char = if line + 1 < rope.len_lines() {
+            rope.line_to_char(line + 1) - 1
+        } else {
+            rope.len_chars()
+        };
+        let has_following = par_end_char < rope.len_chars();
+        let par_end_byte = rope.char_to_byte(par_end_char);
+        // "\n" opens the image's own block between this paragraph and the
+        // next; when nothing follows, "\n\n" opens the image block AND the
+        // empty paragraph the caret needs to stand in.
+        let payload = if has_following { "\n" } else { "\n\n" };
+        self.edit_bytes(par_end_byte..par_end_byte, payload);
+        let image_block = line + 1;
+        self.set_block_kind_in_current_tx(
+            image_block,
+            BlockKind::Image {
+                src,
+                alt: String::new(),
+                caption: String::new(),
+            },
+        );
+        // Start of the block after the image: past the paragraph's end, the
+        // separator that opened the image block, and the image block's own
+        // (empty) line — all ASCII, so chars step to bytes 1:1 here.
+        self.buffer.rope().char_to_byte(par_end_char + 2)
+    }
+
     /// Apply/clear an attribute inside the *current* transaction (sticky
     /// caret formatting riding a typing transaction) — undone together
     /// with the typed text.
@@ -4102,6 +4141,40 @@ mod tests {
         doc.put_back(id).unwrap();
         assert_eq!(doc.text(), "AAA\nBBB\nCCC", "a fragment splices back in place");
         assert_eq!(doc.blocks().len(), 3);
+    }
+
+    #[test]
+    fn image_insert_stands_alone_and_carets_the_following_block() {
+        // Report 4: an image is its own block; the caret lands at the START
+        // of the following block, never on the image.
+        let mut doc = Document::new("AAA\nBBB", SpanSet::default(), BlockMap::default());
+        let caret = doc.insert_image_block(1, "asset:img1".into()); // cursor inside AAA
+        assert_eq!(doc.text(), "AAA\n\nBBB");
+        assert_eq!(doc.blocks().len(), 3);
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:img1")
+        );
+        assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
+        assert_eq!(caret, 5, "caret at the start of the FOLLOWING block");
+        assert_eq!(doc.block_of_byte(caret), 2, "typing lands after the image, never in it");
+        // Undo removes the block and its kind stamp in one step.
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\nBBB");
+        assert_eq!(doc.blocks().len(), 2);
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn image_insert_at_document_end_opens_a_paragraph_after() {
+        // The image landing last opens an empty paragraph for the caret.
+        let mut doc = Document::new("AAA", SpanSet::default(), BlockMap::default());
+        let caret = doc.insert_image_block(2, "asset:img2".into());
+        assert_eq!(doc.text(), "AAA\n\n");
+        assert_eq!(doc.blocks().len(), 3);
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
+        assert_eq!(caret, 5);
+        assert_eq!(doc.block_of_byte(caret), 2);
     }
 
     #[test]

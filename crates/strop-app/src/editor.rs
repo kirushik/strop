@@ -8611,18 +8611,11 @@ impl Editor {
         let src = store.put_asset(imported.bytes, imported.ext);
         self.mark_dirty();
         let cursor = self.cursor_offset().min(self.doc.len_bytes());
-        let (_, par_end) = self.paragraph_bounds(cursor);
-        self.doc.edit_bytes(par_end..par_end, "\n");
-        let block = self.doc.block_of_byte((par_end + 1).min(self.doc.len_bytes()));
-        self.doc.set_block_kind_in_current_tx(
-            block,
-            BlockKind::Image {
-                src,
-                alt: String::new(),
-                caption: String::new(),
-            },
-        );
-        let cursor = par_end + 1;
+        // The image stands as its OWN block and the caret lands at the START
+        // of the block after it (report 4) — never ON the image, where typing
+        // would write invisible text into the image block. The document owns
+        // the shape (separators, trailing paragraph, kind stamp, one tx).
+        let cursor = self.doc.insert_image_block(cursor, src);
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.sync_mutations();
