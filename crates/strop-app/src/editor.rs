@@ -13666,6 +13666,40 @@ impl Editor {
                             ),
                         ),
                 )
+                // The reading room's doorknob (spec D4): a resting place, not an
+                // advertisement (P2/P5). `ReadItCold` already toggles, so the
+                // control IS the indicator (P12) — muted at rest, lit inside the
+                // room, and a click leaves. It is the ONE right-cluster control
+                // that stays LIVE in the cold read (the word pill and editor
+                // button hide there), so every still of the room shows the lit
+                // mark that exits it (P6). An open book, the reader's mark —
+                // the pictorial family's newest member (docs/iconography.md).
+                .child(
+                    div()
+                        .id("cold-read-toggle")
+                        .occlude()
+                        .flex_shrink_0()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .mr(px(2.))
+                        .rounded(px(5.))
+                        .cursor(CursorStyle::PointingHand)
+                        .when(in_cold, |d| d.bg(rgba(0x1A1A1812u32)))
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Read it cold", Some("ctrl-shift-l")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.read_it_cold(&ReadItCold, window, cx);
+                            }),
+                        )
+                        .child(icon(
+                            icons::BOOK,
+                            13.,
+                            if in_cold { TEXT_COLOR } else { MUTED_COLOR },
+                        )),
+                )
                 // The editor button (impl 04 §0): the AI subsystem's single home,
                 // where its results live — just left of the margin side. The old
                 // drawn mini-card is gone; the control now WEARS its state (a
@@ -19041,12 +19075,10 @@ impl Editor {
 
     fn cr_noop(&mut self, _: &CrNoop, _: &mut Window, cx: &mut Context<Self>) {
         // up/down inside the read: inert, without a pulse (Scopes 1). While a
-        // note is open the field owns them (D1) — the multiline composer binds
-        // up/down at a deeper context so this is belt, but it keeps the
-        // carve-out uniform across every ambient nav key.
-        if self.cr_field_owns_keys(cx) {
-            return;
-        }
+        // note is open the field owns them (D1) — `cr_field_owns_keys`
+        // propagates so up/down reach the field (the multiline composer binds
+        // them at a deeper context, so this is belt), else the no-op stands.
+        self.cr_field_owns_keys(cx);
     }
 
     fn pulse_cold_read(&mut self, cx: &mut Context<Self>) {

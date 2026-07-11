@@ -1,0 +1,10 @@
+<!-- Pictorial family. An open book: two pages splayed from a center spine —
+     the reader's mark for the cold read. Authored on the 13px display grid:
+     the spine and each page's outer edge are axis-aligned strokes centered on
+     half-pixels (device-crisp at 1x and 2x); the page curves float free, as
+     curves should. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M6.5 3.5V10"/>
+  <path d="M6.5 3.5C5 2.7 3.3 2.7 1.5 3V9.5C3.3 9.2 5 9.2 6.5 10"/>
+  <path d="M6.5 3.5C8 2.7 9.7 2.7 11.5 3V9.5C9.7 9.2 8 9.2 6.5 10"/>
+</svg>
