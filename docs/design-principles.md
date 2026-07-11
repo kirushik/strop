@@ -5,7 +5,8 @@ design failure caught in review, not deduced in the abstract. The
 born-from stories stay attached because a principle without its wound
 drifts into slogan. Companion docs apply these: `golden-path.md` (the
 arc), `color-language.md` (provenance), `attention-motion.md` (timing),
-`history-strip.md`, `asides.md`. When a new design contradicts one of
+`iconography.md` (the marks), `history-strip.md`, `asides.md`. When a
+new design contradicts one of
 these, the design is wrong or the principle gets amended here — never
 silently.)*
 

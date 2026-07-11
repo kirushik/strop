@@ -21,6 +21,7 @@ mod config;
 mod draw_guard;
 mod editor;
 mod hyphen;
+mod icons;
 mod files;
 mod paths;
 mod single_instance;
@@ -116,8 +117,9 @@ fn data_file() -> (PathBuf, bool) {
 
 fn main() {
     // gpui_platform::application() replaced gpui::Application::new() after
-    // the facade/platform crate split.
-    gpui_platform::application().run(|cx: &mut App| {
+    // the facade/platform crate split. The asset source feeds gpui's svg()
+    // pipeline the embedded icon plate (docs/iconography.md).
+    gpui_platform::application().with_assets(icons::StropAssets).run(|cx: &mut App| {
         cx.text_system()
             .add_fonts(vec![
                 PT_SERIF.into(),

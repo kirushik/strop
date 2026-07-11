@@ -332,6 +332,17 @@ impl TextField {
         Self::base(cx, content, "NoteInput")
     }
 
+    /// A single-line field that opens with its content selected — the
+    /// prefilled-datum idiom (the goal chip): the current value is shown,
+    /// typing replaces it, and erasing it erases the datum.
+    pub(crate) fn single_selected(cx: &mut Context<Self>, content: String) -> Self {
+        let mut field = Self::base(cx, content, "NoteInput");
+        if !field.content.is_empty() {
+            field.anchor = Some(0);
+        }
+        field
+    }
+
     /// The in-card note composer: a multi-line, soft-wrapping field. Its own key
     /// context carries the extras single-line fields don't want: up/down caret
     /// rows and shift/ctrl-enter line breaks.
