@@ -553,6 +553,34 @@ expect "a second reaction joins the lane"     2 "$(field "$CR2" lane)"
 expect "both are ordinary open notes"         2 "$(field "$D2" open_notes)"
 expect "they live on after the room closes"   2 "$(field "$D3" open_notes)"
 
+# D1 — the open note owns its keys. The original bug: a space mid-note flipped
+# the page (which files the note first), so a two-word reaction became "one word
+# per note". Typed through REAL key dispatch: `space` must land IN the field.
+echo "rig-check: cold read — a multi-word note owns the keyboard (D1)"
+DOCK=$(mktemp --suffix=.md); cp "$DOC" "$DOCK"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCK" "coldread:open coldread:select:5,40 coldread:raise h i space t h e r e enter dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D=$(echo "$OUT" | tail -1)
+rm -f "$DOCK" "$DOCK.strop"
+CR=$(echo "$D" | grep -oE '"coldread":\{[^}]*\}')
+expect "the space typed INTO the note"        '"hi there"' "$(field "$CR" last_body)"
+expect "one note carries the whole phrase"    1 "$(field "$CR" lane)"
+expect "the page never flipped mid-note"      0 "$(field "$CR" page)"
+expect "the input closed on commit"           false "$(field "$CR" input)"
+
+# D1 mouse — a click that resolves an open note commits it but must NOT also
+# flip the page (commit-only, the one carve-out in C4's commit-AND-act rule).
+echo "rig-check: cold read — a resolving click never flips (D1 mouse)"
+DOCK2=$(mktemp --suffix=.md); cp "$DOC" "$DOCK2"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCK2" "coldread:open coldread:select:5,40 coldread:raise h i dump:ui coldread:pageclick:1 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p)
+rm -f "$DOCK2" "$DOCK2.strop"
+CR1=$(echo "$D1" | grep -oE '"coldread":\{[^}]*\}')
+CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
+expect "the input is up before the click"     true "$(field "$CR1" input)"
+expect "a right-zone click resolves the note" false "$(field "$CR2" input)"
+expect "…files it as an ordinary note"        '"hi"' "$(field "$CR2" last_body)"
+expect "…and does NOT flip the page"          0 "$(field "$CR2" page)"
+
 echo "rig-check: cold read — Past-from-parked round trip (Time 7, regions 13)"
 DOCL=$(mktemp --suffix=.md); echo "A live line for the legacy litmus." > "$DOCL"
 # The md import writes a "Started" birth checkpoint (index 0), so the seeded

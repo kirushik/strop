@@ -10106,6 +10106,46 @@ impl Editor {
         self.cr_react_chip(body, cx);
     }
 
+    /// Rig hook (`coldread:raise`): raise the reaction input on the current
+    /// selection — the mouseup path minus the drag. Follow it with real
+    /// keystroke tokens (`h i space t h e r e enter`) to drive the D1
+    /// regression: a multi-word note typed through REAL key dispatch, where a
+    /// space must land IN the note, never flip the page.
+    pub fn debug_coldread_raise(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cr_raise_input(window, cx);
+    }
+
+    /// Rig hook (`coldread:pageclick:Z`): synthesize a real page click in flip
+    /// zone Z (`-1` left, `0` mid, `1` right) through the actual mouse
+    /// handlers. Drives D1's mouse carve-out: a click that resolves an open
+    /// note commits it but must NOT also flip the page.
+    pub fn debug_coldread_pageclick(&mut self, zone: i8, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.cr_page_bounds.borrow() else { return };
+        let Some(cr) = self.cold_read.as_ref() else { return };
+        let (page_w, page_h) = (cr.geom.page_w, cr.geom.page_h);
+        let x = match zone {
+            -1 => page_w * 0.05,
+            1 => page_w * 0.95,
+            _ => page_w * 0.5,
+        };
+        let pos = point(bounds.origin.x + px(x), bounds.origin.y + px(page_h * 0.5));
+        let down = MouseDownEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        self.cr_page_mouse_down(&down, window, cx);
+        let up = MouseUpEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+        };
+        self.cr_page_mouse_up(&up, window, cx);
+    }
+
     /// Rig hook (`coldread:past[:N]`): park the strip exactly ON a
     /// materialized tick (checkpoint N, or the newest with a state), then
     /// enter the Past read through the banner verb's own gate.
@@ -18232,6 +18272,12 @@ const CR_RESIZE_SETTLE_MS: u64 = 250;
 /// The reaction input card (L20): ~250px, chips over one line.
 const CR_INPUT_W: f32 = 250.;
 const CR_INPUT_H: f32 = 62.;
+/// D2 / LAW 2 — the transient-blur grace. A keyboard-layout / input-source
+/// switch fires a focus-out then a focus-in on the SAME field; committing on
+/// the bare focus-out would file the note mid-word (every switch, for a
+/// bilingual writer). Defer the blur commit this long and cancel it if focus
+/// has returned. ~100 ms is below perception yet clears the switch round-trip.
+const CR_FIELD_GRACE_MS: u64 = 100;
 /// The anchor quote in a lane card: ≤42 graphemes + an ellipsis (N9).
 const CR_QUOTE_GRAPHEMES: usize = 42;
 
@@ -18493,6 +18539,13 @@ struct CrDrag {
     zone: i8,
     selecting: bool,
     anchor: Option<Range<usize>>,
+    /// D1 — this press resolved an open note (the mousedown committed it). A
+    /// click that did so is CONSUMED: on mouseup it must not ALSO flip the
+    /// page (the one place C4's commit-AND-act becomes commit-only, because
+    /// the "act" would be a page turn the reader never asked for). A drag that
+    /// grows out of it still selects new words; only the in-place click is
+    /// swallowed.
+    resolved_input: bool,
 }
 
 /// One shaped, positioned paint op of the current page (page-local coords —
@@ -18984,8 +19037,14 @@ impl Editor {
         self.pulse_cold_read(cx);
     }
 
-    fn cr_noop(&mut self, _: &CrNoop, _: &mut Window, _: &mut Context<Self>) {
-        // up/down inside the read: inert, without a pulse (Scopes 1).
+    fn cr_noop(&mut self, _: &CrNoop, _: &mut Window, cx: &mut Context<Self>) {
+        // up/down inside the read: inert, without a pulse (Scopes 1). While a
+        // note is open the field owns them (D1) — the multiline composer binds
+        // up/down at a deeper context so this is belt, but it keeps the
+        // carve-out uniform across every ambient nav key.
+        if self.cr_field_owns_keys(cx) {
+            return;
+        }
     }
 
     fn pulse_cold_read(&mut self, cx: &mut Context<Self>) {
@@ -19069,8 +19128,27 @@ impl Editor {
             .is_some_and(|cr| cr.drag.as_ref().is_some_and(|d| d.selecting))
     }
 
+    /// D1 — the open note owns ALL keys, structurally. An ambient cold-read
+    /// navigation binding (space, and any flip chord a future round adds)
+    /// that still fires while the reaction input is open hands the keystroke
+    /// BACK: `cx.propagate()` lets the char fall through to the focused
+    /// field's text input (`space` becomes a typed space, never a page flip),
+    /// and non-text chords simply die at the field. Every ambient nav handler
+    /// calls this FIRST, so the comment at the takeover's `on_key_down` ("the
+    /// open reaction input owns its keystrokes") is now true for the NEXT
+    /// binding too, not just today's two keys (spec §4 D1, Raskin's structural
+    /// reading).
+    fn cr_field_owns_keys(&self, cx: &mut Context<Self>) -> bool {
+        if self.cold_read.as_ref().is_some_and(|cr| cr.input.is_some()) {
+            cx.propagate();
+            true
+        } else {
+            false
+        }
+    }
+
     fn cr_next_page(&mut self, _: &CrNextPage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_mid_drag() {
+        if self.cr_field_owns_keys(cx) || self.cr_mid_drag() {
             return;
         }
         self.cr_commit_input(window, cx); // a flip files first (N1)
@@ -19081,7 +19159,7 @@ impl Editor {
     }
 
     fn cr_prev_page(&mut self, _: &CrPrevPage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_mid_drag() {
+        if self.cr_field_owns_keys(cx) || self.cr_mid_drag() {
             return;
         }
         self.cr_commit_input(window, cx);
@@ -19092,7 +19170,7 @@ impl Editor {
     }
 
     fn cr_first_page(&mut self, _: &CrFirstPage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_mid_drag() {
+        if self.cr_field_owns_keys(cx) || self.cr_mid_drag() {
             return;
         }
         self.cr_commit_input(window, cx);
@@ -19100,7 +19178,7 @@ impl Editor {
     }
 
     fn cr_last_page(&mut self, _: &CrLastPage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_mid_drag() {
+        if self.cr_field_owns_keys(cx) || self.cr_mid_drag() {
             return;
         }
         self.cr_commit_input(window, cx);
@@ -19190,14 +19268,16 @@ impl Editor {
     fn cr_page_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(bounds) = *self.cr_page_bounds.borrow() else { return };
         // A page mousedown is a blur of the open input: file-or-close first
-        // (N1), then act.
+        // (N1), then act. If a note WAS open, this click resolved it — mark the
+        // drag so the mouseup swallows the flip (D1 commit-only carve-out).
+        let resolved_input = self.cold_read.as_ref().is_some_and(|cr| cr.input.is_some());
         self.cr_commit_input(window, cx);
         let Some(cr) = self.cold_read.as_mut() else { return };
         let handle = cr.focus_handle.clone();
         let local = point(ev.position.x - bounds.origin.x, ev.position.y - bounds.origin.y);
         let zone = Self::cr_zone_at(cr, local);
         let anchor = cr.hit_token(local);
-        cr.drag = Some(CrDrag { start: local, zone, selecting: false, anchor });
+        cr.drag = Some(CrDrag { start: local, zone, selecting: false, anchor, resolved_input });
         window.focus(&handle, cx);
     }
 
@@ -19258,6 +19338,15 @@ impl Editor {
                 self.cr_publish_primary(cx);
                 self.cr_raise_input(window, cx);
             }
+            cx.notify();
+            return;
+        }
+        // D1 — a click that resolved an open note is CONSUMED: the mousedown
+        // already committed it, and this in-place click must not also turn the
+        // page (the reader was closing the note, not asking for the next
+        // spread). A drag off the press still selects; only the bare click is
+        // swallowed here.
+        if drag.resolved_input {
             cx.notify();
             return;
         }
@@ -19334,22 +19423,50 @@ impl Editor {
             }
         })
         .detach();
-        // The universal commit-on-blur law (N1): any focus loss files
-        // non-empty trimmed text exactly as Enter would.
+        // The commit-on-blur law (N1): a focus loss files non-empty trimmed
+        // text exactly as Enter would — but only a WRITER'S gesture is a real
+        // departure. LAW 2 (spec D2): a keyboard-layout / input-source switch
+        // fires a transient focus-out+focus-in on the same field; defer the
+        // commit ~100 ms and cancel it if focus has returned, and an app
+        // deactivation (alt-tab mid-note) never commits. Kept local and
+        // minimal at this ONE call site — assembly unifies this into the
+        // shared TextField machinery (the margin composer / rename / goal /
+        // checkpoint fields all fire the same transient blur, and this is the
+        // unification point). LAW 2.
         let this_input = input.clone();
+        let grace_handle = handle.clone();
         let weak = cx.entity().downgrade();
         window
-            .on_focus_out(&handle, cx, move |_, _window, cx| {
-                let Some(editor) = weak.upgrade() else { return };
-                editor.update_checked(cx, |editor, cx| {
-                    if editor
-                        .cold_read
-                        .as_ref()
-                        .is_some_and(|cr| cr.input.as_ref() == Some(&this_input))
-                    {
-                        editor.cr_commit_input_inner(cx);
-                    }
-                });
+            .on_focus_out(&handle, cx, move |_, window, cx| {
+                let this_input = this_input.clone();
+                let grace_handle = grace_handle.clone();
+                let weak = weak.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(CR_FIELD_GRACE_MS))
+                            .await;
+                        cx.update(|window, app| {
+                            // Focus came back to THIS field (the layout switch's
+                            // round-trip), or the app lost activation — no
+                            // departure, the note stays open.
+                            if grace_handle.is_focused(window) || !window.is_window_active() {
+                                return;
+                            }
+                            let Some(editor) = weak.upgrade() else { return };
+                            editor.update_checked(app, |editor, cx| {
+                                if editor
+                                    .cold_read
+                                    .as_ref()
+                                    .is_some_and(|cr| cr.input.as_ref() == Some(&this_input))
+                                {
+                                    editor.cr_commit_input_inner(cx);
+                                }
+                            });
+                        })
+                        .ok();
+                    })
+                    .detach();
             })
             .detach();
         window.focus(&handle, cx);

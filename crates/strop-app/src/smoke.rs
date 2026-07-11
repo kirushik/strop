@@ -462,6 +462,34 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE {key}");
                 continue;
             }
+            // `coldread:raise` opens the reaction input on the current
+            // selection (drive the D1 multi-word regression by following it
+            // with real keystroke tokens, e.g. `h i space t h e r e enter`).
+            if key == "coldread:raise" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_coldread_raise(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            // `coldread:pageclick:Z` — a real page click in flip zone Z (-1/0/1)
+            // through the actual mouse handlers (D1's commit-only carve-out).
+            if let Some(z) = key.strip_prefix("coldread:pageclick:") {
+                let zone: i8 = z.parse().expect("bad coldread:pageclick zone");
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_coldread_pageclick(zone, window, cx)
+                    })
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
             if key == "coldread:past" || key.starts_with("coldread:past:") {
                 let pick = key
                     .strip_prefix("coldread:past:")
