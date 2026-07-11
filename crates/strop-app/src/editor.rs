@@ -19,7 +19,8 @@ use gpui::{
     AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
     Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad,
     Pixels, Point, ResizeEdge, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
     Style, TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
     WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
@@ -285,6 +286,17 @@ const PROV_CARD_H: f32 = 22.;
 /// blink): traversing a 60-scrap pile must not strobe the margin
 /// (surfaces-attention 5). Hide on leave is instant.
 const PROV_REST_DELAY: Duration = Duration::from_millis(1000);
+/// LAW 1 (papercuts-2026-07 §1): the flanks rise one settle beat — 250 ms since
+/// the last selection extension — after a non-empty selection settles. One
+/// constant for mouse and keyboard alike (no dialect the hand must learn); it
+/// gates only the FIRST rise, and once risen the flanks track growth without
+/// lowering (no strobing).
+const FLANK_SETTLE_MS: u64 = 250;
+/// LAW 2 (papercuts-2026-07 §3): a bare focus-out (a keyboard-layout switch,
+/// app deactivation, window churn) is not a departure. A blurred field commits
+/// only if focus has NOT returned within this grace; a real gesture (a click, a
+/// chord, an invoked command) resolves the field at once, never through here.
+const FIELD_BLUR_GRACE_MS: u64 = 100;
 
 /// A small hover tooltip: a control's name and, optionally, its chord in a
 /// mono chip (DESIGN §0 — every titlebar control should teach its shortcut).
@@ -942,6 +954,20 @@ enum FlankLeft {
     Horizontal,
 }
 
+/// LAW 1 (papercuts-2026-07 §1) as a pure predicate: the flanks are visible iff
+/// a settled non-empty selection exists, the prose owns keyboard focus (no
+/// transient field is open), and the offer is not latched — never mid-drag.
+/// Pure over booleans so the state transitions test without a live frame.
+fn flanks_visible_pred(
+    sel_empty: bool,
+    is_selecting: bool,
+    risen: bool,
+    latched: bool,
+    field_open: bool,
+) -> bool {
+    !sel_empty && !is_selecting && risen && !latched && !field_open
+}
+
 /// Which flanks rise, as one decision (docs/impl/03-flanks.md §1-2). Both are a
 /// consequence of chirality: tools left, the conversation right (asides.md §4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1008,6 +1034,16 @@ struct FlankLayout {
 
 pub struct Editor {
     focus_handle: FocusHandle,
+    /// The raised flank's own keyboard focus (A1, the ctrl-. deliberate path):
+    /// focus lands here so arrows navigate cells and Enter fires. Passive raise
+    /// never touches it — it claims no focus and reroutes no keystroke.
+    flank_focus_handle: FocusHandle,
+    /// Is focus currently INSIDE the flank (ctrl-. entered)? Drives the cell
+    /// focus ring and the on-key navigation; Escape (`exit_flank`) clears it.
+    flank_focused: bool,
+    /// The focused cell index within the flank grid's flat cell order
+    /// (`flank_cells`) while `flank_focused`.
+    flank_focus_cell: usize,
     /// Text + formatting with unified transaction history. Marks persist
     /// via Store::save_with_marks at save time.
     doc: Document,
@@ -1190,6 +1226,11 @@ pub struct Editor {
     rename_input: Option<(usize, Entity<TextField>)>,
     /// Alt-text composer for an image block: (block index, composer).
     alt_input: Option<(usize, Entity<TextField>)>,
+    /// The writer's caret/selection saved at composer-open (LAW 2 / C4 split
+    /// exit): `(range, reversed)`. A keyboard commit or a dead-zone click-away
+    /// restores it so the exit lands where thought left off; a click INTO the
+    /// prose overrides it with the caret at the click point.
+    composer_return: Option<(Range<usize>, bool)>,
     /// Self-baseline from the [voice] corpus (None until >=3 docs load).
     pub voice_baseline: Option<strop_core::voice::Baseline>,
     /// Narrow-window notes drawer (DESIGN §narrow-margin): below ~932px even
@@ -1201,10 +1242,26 @@ pub struct Editor {
     /// glued flush under the titlebar control. A bool-toggled overlay, light-
     /// dismissed like the narrow-notes panel it borrows its anchoring from.
     editor_menu_open: bool,
-    /// Selection popover (DESIGN §2-toolbar): formatting rides the
-    /// selection. Shown on mouse-up over a selection or via ctrl-.;
-    /// dismissed by mousedown, typing, scrolling, or escape.
-    selection_popover: bool,
+    /// LAW 1 (papercuts-2026-07 §1): flank visibility is a DERIVED predicate
+    /// (`flanks_visible`), never a mouse-up-only flag. These three facts feed it:
+    ///
+    /// `flank_risen` — the settle latch: true once a non-empty selection has sat
+    /// still for one `FLANK_SETTLE_MS` beat (`arm_flank_settle`). Sticky: it
+    /// gates only the FIRST rise, so once up the flanks track growth without
+    /// re-gating; it drops only when the selection collapses to empty.
+    flank_risen: bool,
+    /// The LATCH: set by focus-/text-moving verbs (annotate, aside, exile) and by
+    /// Escape/collapse; cleared ONLY when the selection genuinely CHANGES (an
+    /// unchanged restored selection keeps it — no post-commit re-offer). Style
+    /// toggles never set it, so the flanks stay up over a styled selection.
+    flank_latched: bool,
+    /// The pending settle beat: `Some(t)` while a fresh non-empty selection is
+    /// waiting out its 250 ms. Only the timer whose captured `t` still matches
+    /// flips `flank_risen`, so a later extension's beat supersedes a stale one.
+    flank_settle: Option<Instant>,
+    /// The selection range last seen by the flank logic — the change detector for
+    /// the latch (a restore to the identical range is not a change).
+    flank_sel: Range<usize>,
     /// The left flank's link argument-field (docs/impl/03-flanks.md §0.1,
     /// review B2 + findings 59/88): the URL editor opened from the grid's link
     /// cell. It CAPTURES the target CHAR range at open — never a re-read of
@@ -1637,6 +1694,9 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            flank_focus_handle: cx.focus_handle(),
+            flank_focused: false,
+            flank_focus_cell: 0,
             word_count: count_words([text].into_iter()),
             doc: Document::new(text, spans, blocks),
             caret_attrs: Vec::new(),
@@ -1701,12 +1761,16 @@ impl Editor {
             replace_input: None,
             rename_input: None,
             alt_input: None,
+            composer_return: None,
             voice_baseline: None,
             card_heights: HashMap::new(),
             active_card_height: None,
             narrow_notes_open: false,
             editor_menu_open: false,
-            selection_popover: false,
+            flank_risen: false,
+            flank_latched: false,
+            flank_settle: None,
+            flank_sel: 0..0,
             link_input: None,
             excursion: None,
             pile_end: None,
@@ -2328,14 +2392,45 @@ impl Editor {
     ) {
         let handle = input.read(cx).focus_handle.clone();
         let weak = cx.entity().downgrade();
+        // LAW 2 / D2: a bare focus-out is not a departure. This field's own
+        // focus-in disarms the pending commit, so a keyboard-layout switch or an
+        // alt-tab that returns focus within the grace never resolves the field —
+        // only a real departure (focus gone and not returned) commits.
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let armed = armed.clone();
+            window
+                .on_focus_in(&handle, cx, move |_window, _cx| {
+                    armed.store(false, std::sync::atomic::Ordering::Relaxed);
+                })
+                .detach();
+        }
+        let still = std::rc::Rc::new(still);
         window
             .on_focus_out(&handle, cx, move |_, _window, cx| {
                 let Some(editor) = weak.upgrade() else { return };
-                editor.update_checked(cx, |editor, cx| {
-                    if let Some(field) = still(editor) {
-                        let text = field.read(cx).content.clone();
-                        field.update_checked(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
-                    }
+                armed.store(true, std::sync::atomic::Ordering::Relaxed);
+                let armed = armed.clone();
+                let still = still.clone();
+                editor.update_checked(cx, |_editor, cx| {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(FIELD_BLUR_GRACE_MS))
+                            .await;
+                        if !armed.load(std::sync::atomic::Ordering::Relaxed) {
+                            return; // focus returned within the grace — not a departure
+                        }
+                        this.update(cx, |editor: &mut Editor, cx| {
+                            if let Some(field) = still(editor) {
+                                let text = field.read(cx).content.clone();
+                                field.update_checked(cx, |_, fcx| {
+                                    fcx.emit(TextFieldEvent::Commit(text))
+                                });
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
                 });
             })
             .detach();
@@ -3458,7 +3553,18 @@ impl Editor {
             .unwrap_or(0);
         let id = self.doc.add_note(char_range, String::new(), now);
         self.mark_dirty();
+        let saved = (self.selected_range.clone(), self.selection_reversed);
         self.open_composer(id, String::new(), window, cx);
+        // Save the writer's selection so the composer's exit lands where thought
+        // left off (LAW 2 split-exit; the keyboard/dead-zone exits restore it).
+        // AFTER open_composer, whose internal resolve of any prior composer would
+        // otherwise clear it.
+        self.composer_return = Some(saved);
+        // A focus-moving verb LATCHES the flanks down (LAW 1 / C2): the selection
+        // persists but the offer withdraws, so the composer is never overpainted
+        // and no re-offer fires when the composer commits and the selection
+        // returns unchanged.
+        self.flank_latched = true;
         self.bump_activity();
         cx.notify();
     }
@@ -3473,6 +3579,7 @@ impl Editor {
             CardFocus::Composing { id, input } => (*id, input.read(cx).content.clone()),
             _ => return,
         };
+        self.composer_return = None; // this exit does not restore; keyboard/dead-zone took it first
         self.doc.set_note_body(id, body);
         self.focus = CardFocus::Selected(id);
         self.mark_dirty();
@@ -3486,11 +3593,92 @@ impl Editor {
         window.focus(&self.focus_handle, cx);
     }
 
-    /// Leave the composer (Enter, Escape, or any focus loss). The draft is
-    /// already the note's text and focus is restored by `resolve_composer`, so
-    /// the card just stays selected, now showing what was written.
+    /// Commit (or C4 empty-DISCARD) the open composer WITHOUT moving focus — the
+    /// LAW 2 blur path, where focus has already genuinely left the field, so
+    /// stealing it back to the document would be wrong. Returns nothing; a no-op
+    /// unless a composer is open.
+    fn commit_composer_no_focus(&mut self, cx: &mut Context<Self>) {
+        let (id, body) = match &self.focus {
+            CardFocus::Composing { id, input } => (*id, input.read(cx).content.clone()),
+            _ => return,
+        };
+        self.composer_return = None;
+        if body.trim().is_empty() {
+            // A never-written note the writer left must not persist as a blank
+            // card (C4 empty-discard: no card manufactured from a stray blur).
+            self.doc.remove_note(id);
+            self.focus = CardFocus::Idle;
+        } else {
+            self.doc.set_note_body(id, body);
+            self.focus = CardFocus::Selected(id);
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Commit (or C4 empty-discard) the open composer and hand focus back to the
+    /// prose — the LAW 2 GESTURE path (a click resolves the field at once). Does
+    /// NOT restore the saved caret; the caller decides (a prose click places the
+    /// caret at the click point; a dead-zone click restores). `true` if a
+    /// composer was open.
+    fn commit_or_discard_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.focus.composing_id() else {
+            return false;
+        };
+        let body = self
+            .focus
+            .input()
+            .map(|i| i.read(cx).content.clone())
+            .unwrap_or_default();
+        self.composer_return = None;
+        if body.trim().is_empty() {
+            self.doc.remove_note(id);
+            self.focus = CardFocus::Idle;
+        } else {
+            self.doc.set_note_body(id, body);
+            self.focus = CardFocus::Selected(id);
+        }
+        self.mark_dirty();
+        window.focus(&self.focus_handle, cx);
+        true
+    }
+
+    /// Restore the caret/selection saved at composer-open (LAW 2 / C4 split
+    /// exit): the keyboard-commit and dead-zone-click exits land where thought
+    /// left off. The restored selection is unchanged, so it keeps the flank latch.
+    fn apply_composer_return(&mut self, ret: Option<(Range<usize>, bool)>, cx: &mut Context<Self>) {
+        let Some((range, reversed)) = ret else { return };
+        let len = self.doc.len_bytes();
+        self.selected_range = range.start.min(len)..range.end.min(len);
+        self.selection_reversed = reversed;
+        self.flank_sel = self.selected_range.clone();
+        self.flank_latched = true;
+        cx.notify();
+    }
+
+    /// Commit every open single-line transient field on a writer GESTURE (LAW 2:
+    /// a click resolves the field family at once, not on the delayed blur). Each
+    /// field's own Commit subscription closes it — the durable write rides that
+    /// path. A no-op when nothing is open.
+    fn commit_transient_fields_on_gesture(&mut self, cx: &mut Context<Self>) {
+        let fields = [
+            self.doc_rename_input.clone(),
+            self.goal_input.clone(),
+            self.rename_input.as_ref().map(|(_, f)| f.clone()),
+            self.alt_input.as_ref().map(|(_, f)| f.clone()),
+        ];
+        for field in fields.into_iter().flatten() {
+            let text = field.read(cx).content.clone();
+            field.update_checked(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
+        }
+    }
+
+    /// Leave the composer by KEYBOARD (Enter/Escape). The draft is already the
+    /// note's text; the exit restores the writer's saved caret (LAW 2).
     fn finish_composing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ret = self.composer_return.take();
         self.resolve_composer(window, cx);
+        self.apply_composer_return(ret, cx);
         cx.notify();
     }
 
@@ -3529,20 +3717,45 @@ impl Editor {
             },
         )
         .detach();
-        // Click-away commits immediately (low-latency: the input becomes a label
-        // the instant focus leaves, not when some later click happens to resolve
-        // it). Guarded on THIS composer still being open — switching to another
-        // card or clicking the document already resolved it through its own path,
-        // so the stale handle must not double-commit.
+        // Click-away commits — but only on a real DEPARTURE (LAW 2 / D2): a
+        // transient focus-out (keyboard-layout switch, app deactivation) that
+        // returns focus within the grace is never a commit. The `armed` flag is
+        // shared with this field's own focus-in, which disarms on return; the
+        // grace timer commits only if still armed. Empty ⇒ discard (C4). Guarded
+        // on THIS composer still being open so a switch/click that already
+        // resolved it can't double-commit.
         let handle = input.read(cx).focus_handle.clone();
         let weak = cx.entity().downgrade();
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let armed = armed.clone();
+            window
+                .on_focus_in(&handle, cx, move |_window, _cx| {
+                    armed.store(false, std::sync::atomic::Ordering::Relaxed);
+                })
+                .detach();
+        }
         window
-            .on_focus_out(&handle, cx, move |_, window, cx| {
+            .on_focus_out(&handle, cx, move |_, _window, cx| {
                 let Some(editor) = weak.upgrade() else { return };
-                editor.update_checked(cx, |editor, cx| {
-                    if editor.focus.composing_id() == Some(id) {
-                        editor.finish_composing(window, cx);
-                    }
+                armed.store(true, std::sync::atomic::Ordering::Relaxed);
+                let armed = armed.clone();
+                editor.update_checked(cx, |_editor, cx| {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(FIELD_BLUR_GRACE_MS))
+                            .await;
+                        if !armed.load(std::sync::atomic::Ordering::Relaxed) {
+                            return; // focus returned within the grace — not a departure
+                        }
+                        this.update(cx, |editor: &mut Editor, cx| {
+                            if editor.focus.composing_id() == Some(id) {
+                                editor.commit_composer_no_focus(cx);
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
                 });
             })
             .detach();
@@ -5762,14 +5975,101 @@ impl Editor {
         cx.notify();
     }
 
-    /// Tear down BOTH flanks (review H20): acting on any right-menu row clears
-    /// them before its result (a composer card, a pass, an aside) takes the lane,
-    /// so only one pinned object ever sits at the selection's y. Also drops a
-    /// half-typed link argument.
+    /// Take BOTH flanks down by LATCHING (LAW 1; review H20): a focus-/text-
+    /// moving verb (annotate, aside, exile) leaves the selection standing but the
+    /// offer withdrawn, so only one pinned object sits at the selection's y and
+    /// the predicate can never re-raise the flanks over the composer a settle
+    /// beat later. The latch clears itself the moment the selection changes; an
+    /// unchanged restored selection keeps it (no post-commit re-offer, P2). Also
+    /// drops a half-typed link argument.
     fn dismiss_flanks(&mut self, cx: &mut Context<Self>) {
-        self.selection_popover = false;
+        self.flank_latched = true;
         self.link_input = None;
         cx.notify();
+    }
+
+    /// LAW 1 (papercuts-2026-07 §1) — flank visibility as a per-frame derived
+    /// predicate: visible iff a settled non-empty selection exists, the prose
+    /// owns keyboard focus (no transient field open), and the offer is not
+    /// latched. The mouse-drag and off-screen/history/cold-read conjuncts live
+    /// in `flank_layout` (they also need the frame geometry); this is the core
+    /// LAW that the render path, the debug dump, and the rig all read.
+    fn flanks_visible(&self) -> bool {
+        flanks_visible_pred(
+            self.selected_range.is_empty(),
+            self.is_selecting,
+            self.flank_risen,
+            self.flank_latched,
+            self.transient_field_open(),
+        )
+    }
+
+    /// Is a transient single-line/composer field open? Its presence means the
+    /// prose no longer owns keyboard focus, so the flanks yield to it (LAW 1's
+    /// no-transient-field conjunct — the C2 composer-occlusion fix). The link
+    /// argument-field is EXCLUDED: it is the flank's own inner surface, and while
+    /// it is up `render_selection_popover` paints it in the flank's place.
+    fn transient_field_open(&self) -> bool {
+        self.focus.composing_id().is_some()
+            || self.doc_rename_input.is_some()
+            || self.goal_input.is_some()
+            || self.rename_input.is_some()
+            || self.alt_input.is_some()
+            || self.replace_input.is_some()
+            || self.palette_input.is_some()
+    }
+
+    /// The single selection-change hook feeding LAW 1 (called from the caret
+    /// funnels `set_cursor`/`extend_cursor` and the other genuine selection
+    /// verbs). Clears the latch on a real change, drops the flanks when the
+    /// selection collapses, and arms the settle beat for a fresh non-empty
+    /// selection — while a risen flank tracks growth untouched.
+    fn on_selection_moved(&mut self, cx: &mut Context<Self>) {
+        if self.selected_range == self.flank_sel {
+            return; // a restored/identical selection keeps the latch (LAW 1)
+        }
+        // A selection move leaves the ctrl-. flank navigation (the cells no
+        // longer describe the same extent); focus returns to the prose naturally.
+        self.flank_focused = false;
+        self.flank_sel = self.selected_range.clone();
+        self.flank_latched = false; // a genuine selection change clears the latch
+        if self.selected_range.is_empty() {
+            // Collapse lowers the flanks as a consequence (they are never their
+            // own layer) — the empty selection alone suffices for the predicate.
+            self.flank_risen = false;
+            self.flank_settle = None;
+            return;
+        }
+        if self.flank_risen {
+            return; // growth: stay up, never re-gate mid-extension (no strobe)
+        }
+        self.arm_flank_settle(cx);
+    }
+
+    /// Arm the settle beat (LAW 1): after `FLANK_SETTLE_MS` of no further
+    /// extension, a still-live, no-longer-dragging selection raises the flanks.
+    /// The captured instant guards against a stale timer firing after a newer
+    /// extension re-armed the beat.
+    fn arm_flank_settle(&mut self, cx: &mut Context<Self>) {
+        let at = Instant::now();
+        self.flank_settle = Some(at);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(FLANK_SETTLE_MS))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.flank_settle == Some(at)
+                    && !editor.selected_range.is_empty()
+                    && !editor.is_selecting
+                {
+                    editor.flank_risen = true;
+                    editor.flank_settle = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Start the cursor-blink heartbeat. GNOME-style: solid while typing,
@@ -5919,6 +6219,7 @@ impl Editor {
             }
         }
         self.bump_activity();
+        self.on_selection_moved(cx); // LAW 1: a collapse/caret-move lowers the flanks
         cx.notify();
     }
 
@@ -5958,6 +6259,7 @@ impl Editor {
         self.caret_attrs.clear();
         self.bump_activity();
         self.publish_primary(cx);
+        self.on_selection_moved(cx); // LAW 1: keyboard/drag extension feeds the flank predicate
         cx.notify();
     }
 
@@ -6547,6 +6849,7 @@ impl Editor {
             .doc
             .char_to_byte(outcome.caret.min(self.doc.rope().len_chars()));
         self.set_cursor(caret, false, cx);
+        self.flank_latched = true; // a text-moving verb latches the flanks (LAW 1)
         self.schedule_flash_clear(cx);
         self.mark_dirty();
         self.bump_activity();
@@ -6584,6 +6887,7 @@ impl Editor {
         // The deliberate verb collapses an emptied pile in the same atom
         // (graveyard-interplay 4) AND interprets whole-block intent (§B1).
         self.file_cut(range, true, true, cx);
+        self.flank_latched = true; // a text-moving verb latches the flanks (LAW 1)
     }
 
     /// `Move to the manuscript` — the retrieval verb's SURFACE half (08 §2):
@@ -6699,7 +7003,13 @@ impl Editor {
         self.selected_range = s..e;
         self.selection_reversed = false;
         self.marked_range = None;
-        self.selection_popover = false;
+        // The text arrives SELECTED as its own move handle — but the offer is a
+        // text-moving verb's aftermath, so latch the flanks down (LAW 1); the
+        // next genuine selection change lifts the latch.
+        self.flank_latched = true;
+        self.flank_risen = false;
+        self.flank_settle = None;
+        self.flank_sel = self.selected_range.clone();
         self.excursion = None;
         self.pile_end = self
             .doc
@@ -7359,9 +7669,13 @@ impl Editor {
             self.cancel_link(window, cx);
             return;
         }
-        if self.selection_popover {
-            self.selection_popover = false;
-            cx.notify();
+        // The flanks are NEVER their own Escape layer (LAW 1): with no field to
+        // cancel, Escape collapses a live selection to a caret, which lowers the
+        // flanks as a consequence. Latch so a restore can't re-raise them.
+        if !self.selected_range.is_empty() {
+            let caret = self.cursor_offset();
+            self.set_cursor(caret, self.cursor_affinity_down, cx);
+            self.flank_latched = true;
             return;
         }
         // Esc-home ends a LATCHED excursion (08 §2; scopes-search 1): only a
@@ -7400,10 +7714,38 @@ impl Editor {
         }
     }
 
-    /// ctrl-.: summon the selection popover by keyboard (the ARIA-toolbar
-    /// requirement — no capability reachable by only one modality).
-    fn toggle_popover(&mut self, _: &TogglePopover, _: &mut Window, cx: &mut Context<Self>) {
-        self.selection_popover = !self.selection_popover && !self.selected_range.is_empty();
+    /// ctrl-.: the deliberate keyboard summon (LAW 1 / A1 — the ARIA-toolbar
+    /// requirement, no capability reachable by only one modality). Unlike the
+    /// passive settle-gated raise, this forces the flanks up NOW (past the beat
+    /// and any latch) and moves focus INTO the flank, where arrows navigate cells
+    /// and Enter fires; Escape (`exit_flank`) returns to the prose caret.
+    fn toggle_popover(&mut self, _: &TogglePopover, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            return;
+        }
+        self.flank_latched = false;
+        self.flank_risen = true;
+        self.flank_settle = None;
+        self.flank_sel = self.selected_range.clone();
+        self.enter_flank(window, cx);
+    }
+
+    /// Move keyboard focus into the raised flank (the ctrl-. deliberate path).
+    /// The saved caret is the selection's own live range, restored by
+    /// `exit_flank`. Passive raise never calls this — it claims no focus.
+    fn enter_flank(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flank_focus_cell = 0;
+        self.flank_focused = true;
+        window.focus(&self.flank_focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Return focus to the prose at the live selection (Escape from a focused
+    /// flank). The selection was never disturbed, so the caret lands where it
+    /// left off.
+    fn exit_flank(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flank_focused = false;
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -8380,8 +8722,9 @@ impl Editor {
         let target = (self.scroll_top - delta.y).clamp(px(0.), frame.max_scroll());
         if target != self.scroll_top {
             self.scroll_top = target;
-            // Anchored to stale geometry once the text moves — dismiss.
-            self.selection_popover = false;
+            // The flanks FOLLOW the selection (LAW 1): `flank_layout` recomputes
+            // geometry each frame and its off-screen gate hides them when the
+            // selection scrolls out of view — so scrolling no longer dismisses.
             cx.notify();
         }
     }
@@ -8416,7 +8759,6 @@ impl Editor {
             let t = px(reveal_scroll(target.anchor_y, vp_h, max_scroll, below));
             if t != self.scroll_top {
                 self.scroll_top = t;
-                self.selection_popover = false;
                 cx.notify();
             }
         } else {
@@ -8624,8 +8966,10 @@ impl Editor {
         if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
             self.commit_link(url, window, cx);
         }
-        if self.selection_popover {
-            self.selection_popover = false;
+        // A light-dismiss click is a gesture on chrome outside the flank; latch
+        // the offer down (LAW 1) — a later selection change lifts the latch.
+        if self.flank_risen && !self.flank_latched {
+            self.flank_latched = true;
             cx.notify();
         }
         if self.narrow_notes_open {
@@ -8647,12 +8991,25 @@ impl Editor {
         if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
             self.commit_link(url, window, cx);
         }
+        // LAW 2 / C4 — no dead zones: a mouse-down is a GESTURE, so it resolves
+        // any open transient field at once (never waiting on a blur the dead-zone
+        // click would never deliver). Capture the saved caret first: a dead-zone
+        // landing restores it (land where thought left off); a prose landing
+        // overrides it with the caret at the click point. Empty ⇒ discard.
+        let composer_return = self.composer_return.clone();
+        let resolved_composer = self.commit_or_discard_composer(window, cx);
+        self.commit_transient_fields_on_gesture(cx);
         // A click in the right note lane is NOT a document click — the lane's
         // own cards and pills handle it. The lane is a sibling element painted
         // over this (full-width) column, so a card/pill's stop_propagation
         // doesn't reach this handler; without this guard, clicking any margin
         // card or off-screen pill also jumped the text caret.
         if f32::from(ev.position.x) > self.column_right(window) + MARGIN_GAP {
+            // A true dead zone (the margin blank): the click resolved the field;
+            // restore the saved caret so the exit lands where thought left off.
+            if resolved_composer {
+                self.apply_composer_return(composer_return, cx);
+            }
             return;
         }
         // A click in the graveyard tail section (Bug B). The section is painted
@@ -8691,13 +9048,13 @@ impl Editor {
             && let Some(target) = self.footnote_jump_target(ev.position)
         {
             self.goal_x = None;
-            self.selection_popover = false;
-            self.set_cursor(target, false, cx);
+            self.set_cursor(target, false, cx); // collapses → LAW 1 lowers the flanks
             return;
         }
         self.goal_x = None;
         self.is_selecting = true;
-        self.selection_popover = false;
+        // The click's own set_cursor/extend below feeds LAW 1 (`on_selection_moved`);
+        // and `is_selecting` keeps the flanks down for the whole drag regardless.
         self.drag_point = Some(ev.position);
         if !self.autoscroll_active {
             self.autoscroll_active = true;
@@ -8797,14 +9154,16 @@ impl Editor {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // Medium lineage: the popover appears when the button releases over
-        // a live selection — never mid-drag.
-        if self.is_selecting && !self.selected_range.is_empty() {
-            self.selection_popover = true;
-            cx.notify();
-        }
+        // The release ends the drag; LAW 1's settle beat now runs from HERE (the
+        // last extension), the same 250 ms a keyboard selection waits — no
+        // mouse-up-only flag any more. `arm_flank_settle` gates the first rise;
+        // once risen, further extension never lowers.
+        let settled_selection = self.is_selecting && !self.selected_range.is_empty();
         self.is_selecting = false;
         self.drag_point = None;
+        if settled_selection && !self.flank_risen && !self.flank_latched {
+            self.arm_flank_settle(cx);
+        }
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -8892,7 +9251,7 @@ impl Editor {
         if self.shortcuts_open {
             overlays.push("shortcuts");
         }
-        if self.selection_popover {
+        if self.flanks_visible() {
             overlays.push("popover");
         }
         if self.replace_input.is_some() {
@@ -9473,9 +9832,11 @@ impl Editor {
     }
 
     /// Rig hook (`select:para`, docs/impl/03-flanks.md §3): select the caret's
-    /// paragraph deterministically AND raise the popover — programmatic selection
-    /// alone never sets `selection_popover` (only mouse-up does), so without this
-    /// the flanks would never render for the dump to observe (finding 117).
+    /// paragraph deterministically AND force it PAST the settle beat, so the dump
+    /// observes a settled selection without waiting out the 250 ms timer. Under
+    /// LAW 1 the flanks are DERIVED (`flanks_visible`): a settled non-empty
+    /// selection with prose focus, no field open, and no latch — which is exactly
+    /// the state this leaves. (Was: a mouse-up-only `selection_popover` flag.)
     pub fn debug_select_para(&mut self, cx: &mut Context<Self>) {
         let (start, end) = self.paragraph_bounds(self.cursor_offset());
         if start >= end {
@@ -9484,7 +9845,36 @@ impl Editor {
         self.selected_range = start..end;
         self.selection_reversed = false;
         self.is_selecting = false;
-        self.selection_popover = true;
+        self.flank_latched = false;
+        self.flank_settle = None;
+        self.flank_sel = self.selected_range.clone();
+        self.flank_risen = true;
+        cx.notify();
+    }
+
+    /// Rig hook (`select:kbd`): a KEYBOARD selection (shift+right ×n over the
+    /// caret's paragraph) driven through the real `extend_cursor` path, then
+    /// forced past the settle beat — the proof that keyboard selections raise the
+    /// flanks exactly like mouse ones (LAW 1 / A1).
+    pub fn debug_select_kbd(&mut self, cx: &mut Context<Self>) {
+        let (start, end) = self.paragraph_bounds(self.cursor_offset());
+        if start >= end {
+            return;
+        }
+        self.set_cursor(start, false, cx); // collapse to the paragraph start
+        while self.cursor_offset() < end {
+            let next = self.next_boundary(self.cursor_offset());
+            if next <= self.cursor_offset() {
+                break;
+            }
+            self.select_to(next, cx); // extend_cursor → on_selection_moved (the keyboard path)
+        }
+        // The settle beat is async; force it here so the headless dump can see
+        // the post-settle state the timer would have produced.
+        if !self.selected_range.is_empty() {
+            self.flank_risen = true;
+            self.flank_settle = None;
+        }
         cx.notify();
     }
 
@@ -10000,7 +10390,8 @@ impl Editor {
         if self.history_view.is_some() {
             return; // history preview is read-only
         }
-        self.selection_popover = false;
+        // Typing replaces the selection with a caret; the empty selection alone
+        // lowers the flanks (LAW 1's predicate), so no explicit dismissal here.
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -12193,22 +12584,30 @@ impl Editor {
     /// Two columns halve pointer travel versus the old 1×N stack (Fitts).
     fn format_grid(&self, cx: &mut Context<Self>) -> gpui::Div {
         let seam = || div().h(px(1.)).w_full().my(px(3.)).bg(rgb(RULE_COLOR));
-        // Fixed cells so the two columns align regardless of glyph width.
-        let cell = |el: gpui::AnyElement| {
+        // The keyboard-focused cell (ctrl-. deliberate path): a ring marks it so
+        // a surface summoned for the keyboard is operable BY it (A1 / WAI-ARIA).
+        let focused = self.flank_focused.then_some(self.flank_focus_cell);
+        // Fixed cells so the two columns align regardless of glyph width; `ix`
+        // gives the cell its place in the flat navigation order (`flank_cells`).
+        let cell = move |ix: usize, el: gpui::AnyElement| {
             div()
                 .w(px(30.))
                 .flex()
                 .items_center()
                 .justify_center()
+                .rounded(px(5.))
+                .when(focused == Some(ix), |d| {
+                    d.border_1().border_color(rgb(ACTIVE_BORDER))
+                })
                 .child(el)
         };
-        let row = |a: gpui::AnyElement, b: gpui::AnyElement| {
+        let row = move |ia: usize, a: gpui::AnyElement, ib: usize, b: gpui::AnyElement| {
             div()
                 .flex()
                 .items_center()
                 .gap(px(2.))
-                .child(cell(a))
-                .child(cell(b))
+                .child(cell(ia, a))
+                .child(cell(ib, b))
         };
         div()
             .flex()
@@ -12216,14 +12615,18 @@ impl Editor {
             .items_center()
             .gap(px(2.))
             .child(row(
+                0,
                 self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx)
                     .into_any_element(),
+                1,
                 self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx)
                     .into_any_element(),
             ))
             .child(row(
+                2,
                 self.format_button("U", InlineAttr::Underline, "Underline", Some("ctrl-u"), cx)
                     .into_any_element(),
+                3,
                 self.format_button(
                     "S",
                     InlineAttr::Strikethrough,
@@ -12234,15 +12637,19 @@ impl Editor {
                 .into_any_element(),
             ))
             .child(row(
+                4,
                 self.format_button("==", InlineAttr::Highlight, "Highlight", Some("ctrl-shift-h"), cx)
                     .into_any_element(),
+                5,
                 self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx)
                     .into_any_element(),
             ))
             .child(seam())
             // The argument-takers, below the first seam.
             .child(row(
+                6,
                 self.link_button(cx).into_any_element(),
+                7,
                 self.footnote_button(cx).into_any_element(),
             ))
             .child(seam())
@@ -12253,25 +12660,80 @@ impl Editor {
                     .items_center()
                     .gap(px(2.))
                     .child(cell(
+                        8,
                         self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx)
                             .into_any_element(),
                     ))
                     .child(cell(
+                        9,
                         self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx)
                             .into_any_element(),
                     ))
                     .child(cell(
+                        10,
                         self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx)
                             .into_any_element(),
                     )),
             )
     }
 
+    /// The flat cell order of the format grid (A1 keyboard navigation): the ctrl-.
+    /// entry moves `flank_focus_cell` through these and Enter fires one. Kept in
+    /// lockstep with `format_grid`'s indices.
+    const FLANK_CELL_COUNT: usize = 11;
+
+    /// Fire the flank cell at `ix` (Enter on the focused cell, or a direct call).
+    fn fire_flank_cell(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match ix {
+            0 => self.toggle_span(InlineAttr::Strong, cx),
+            1 => self.toggle_span(InlineAttr::Emphasis, cx),
+            2 => self.toggle_span(InlineAttr::Underline, cx),
+            3 => self.toggle_span(InlineAttr::Strikethrough, cx),
+            4 => self.toggle_span(InlineAttr::Highlight, cx),
+            5 => self.toggle_span(InlineAttr::Code, cx),
+            6 => self.open_link_input(window, cx),
+            7 => self.insert_footnote(&InsertFootnote, window, cx),
+            8 => self.toggle_block(BlockKind::Heading(1), cx),
+            9 => self.toggle_block(BlockKind::Heading(2), cx),
+            10 => self.toggle_block(BlockKind::Heading(3), cx),
+            _ => {}
+        }
+    }
+
+    /// Handle a keystroke while focus is INSIDE the flank (A1 raise-and-enter).
+    /// Returns true if consumed. Arrows/Tab roam the cells, Enter fires the
+    /// focused one, Escape returns focus to the prose caret.
+    fn flank_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let n = Self::FLANK_CELL_COUNT;
+        match key {
+            "escape" => {
+                self.exit_flank(window, cx);
+                true
+            }
+            "enter" => {
+                self.fire_flank_cell(self.flank_focus_cell, window, cx);
+                true
+            }
+            "right" | "down" | "tab" => {
+                self.flank_focus_cell = (self.flank_focus_cell + 1) % n;
+                cx.notify();
+                true
+            }
+            "left" | "up" => {
+                self.flank_focus_cell = (self.flank_focus_cell + n - 1) % n;
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The per-frame flank geometry + gating (docs/impl/03-flanks.md §1-2).
     /// `None` when there's no live selection to flank. Computed ONCE so the left
     /// popover, the right menu, and the rig dump all agree on presence and y.
     fn flank_layout(&self, window: &Window) -> Option<FlankLayout> {
-        if !self.selection_popover || self.selected_range.is_empty() || self.is_selecting {
+        // LAW 1 (papercuts-2026-07 §1): visibility is the derived predicate.
+        if !self.flanks_visible() {
             return None;
         }
         // The reading room suppresses both flanks (spec §4.4): the page's
@@ -12281,8 +12743,37 @@ impl Editor {
             return None;
         }
         let frame = self.last_frame.as_ref()?;
-        let (par_ix, line, x) =
-            frame.cursor_position(self.selected_range.start.min(frame.doc_len()), false)?;
+        let viewport_h = f32::from(window.viewport_size().height);
+        // The RAW (lane) y of a byte's visual line — co-registers with the margin
+        // CARDS (`margin_cards` uses the bare origin.y + pos.y - scroll_top).
+        let anchor_line = |byte: usize, down: bool| -> Option<(usize, f32, f32)> {
+            let (pix, ln, x) = frame.cursor_position(byte.min(frame.doc_len()), down)?;
+            let p = &frame.paragraphs[pix];
+            let top = f32::from(frame.bounds.origin.y) + f32::from(p.top)
+                + f32::from(p.line_height) * ln as f32
+                - f32::from(frame.scroll_top);
+            Some((pix, f32::from(x), top))
+        };
+        let on_screen =
+            |top: f32, lh: f32| top + lh > BAR_HEIGHT && top < viewport_h;
+        // Off-screen selections raise NOTHING (LAW 1 geometry): rise beside the
+        // VISIBLE end. Prefer the selection's start line; if it scrolled out of
+        // view, fall back to the end line; if neither is on screen, don't rise.
+        let start_a = anchor_line(self.selected_range.start, false);
+        let (par_ix, x, raw_top) = match start_a {
+            Some((pix, xx, top))
+                if on_screen(top, f32::from(frame.paragraphs[pix].line_height)) =>
+            {
+                (pix, xx, top)
+            }
+            _ => {
+                let (pix, xx, top) = anchor_line(self.selected_range.end, true)?;
+                if !on_screen(top, f32::from(frame.paragraphs[pix].line_height)) {
+                    return None;
+                }
+                (pix, xx, top)
+            }
+        };
         let par = &frame.paragraphs[par_ix];
         // CSD insets (the old popover math): the `content` surface the flanks are
         // children of is inset by the shadow gutter on each untiled edge
@@ -12296,15 +12787,9 @@ impl Editor {
             ),
             Decorations::Server => (0., 0., 0.),
         };
-        // RAW (lane) y of the selection's first visual line — co-registers with
-        // the margin CARDS (which also skip the inset: `margin_cards` uses the
-        // bare `frame.bounds.origin.y + pos.y - scroll_top`). The LEFT flank
-        // subtracts the top inset to co-register with the prose column instead;
-        // sharing one basis would drift the menu a gutter off the cards it
-        // occludes on floating windows (review finding 89).
-        let raw_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
-            + f32::from(par.line_height) * line as f32
-            - f32::from(frame.scroll_top);
+        // The LEFT flank subtracts the top inset to co-register with the prose
+        // column; the RIGHT menu keeps the raw basis so it lines up with the
+        // cards it occludes on floating windows (review finding 89).
         let col_left = f32::from(frame.bounds.origin.x) - l_inset;
         let left_gutter = col_left;
         // A history surface (strip open, the panel, or a parked preview) claims
@@ -12332,7 +12817,7 @@ impl Editor {
             left_top: raw_top - t_inset,
             right_top: raw_top,
             line_h: f32::from(par.line_height),
-            x: f32::from(x),
+            x,
             col_left,
             vw: self.content_width(window),
             vh: f32::from(window.viewport_size().height) - t_inset - b_inset,
@@ -12394,6 +12879,15 @@ impl Editor {
             .items_center()
             .font_family("PT Serif")
             .text_size(px(13.))
+            // The ctrl-. deliberate path focuses this handle; on_key_down then
+            // roams the cells and fires (A1). Passive raise never focuses it, so
+            // arrow keys keep meaning caret motion in the prose.
+            .track_focus(&self.flank_focus_handle)
+            .on_key_down(cx.listener(|editor, ev: &KeyDownEvent, window, cx| {
+                if editor.flank_focused && editor.flank_key(&ev.keystroke.key, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(self.format_grid(cx))
     }
@@ -14750,20 +15244,54 @@ struct MarginCard {
     /// (08 §2): muted machine bookkeeping, no card fill, carrying the quiet
     /// Put back verb. `body` holds the one-liner text.
     provenance: Option<u64>,
+    /// When the note was created, UNIX seconds (`Annotation::created_unix`) — the
+    /// writer-note caption's data (C3, messenger grammar). 0 for provenance rows.
+    created_unix: i64,
 }
 
-/// A note card's header label: "Note" / a diagnosis level (or "Diagnosis"),
-/// with a quiet "· detached" when the anchor was lost in a restore.
-fn note_card_label(is_diagnosis: bool, level: &str, orphaned: bool) -> String {
-    let base = if is_diagnosis {
-        if level.is_empty() { "Diagnosis" } else { level }
+/// A writer note's creation MOMENT, messenger-style (C3, papercuts §3): the
+/// time of day for a note made today (a lane of "14:32"s reads at a glance),
+/// the strip's quiet relative date for older ones ("Yesterday", "Tue 1 Jul").
+/// Pure over its inputs so the caption formatter is unit-testable headlessly;
+/// the visual rig's STROP_TEST_STILL freezes it like every other timestamp.
+fn note_moment_label(created_unix: i64, now_secs: i64) -> String {
+    if std::env::var("STROP_TEST_STILL").is_ok() {
+        return "00:00".into();
+    }
+    let day = created_unix.div_euclid(86_400);
+    let today = now_secs.div_euclid(86_400);
+    if day == today {
+        let rem = created_unix.rem_euclid(86_400);
+        format!("{:02}:{:02}", rem / 3600, (rem % 3600) / 60)
     } else {
-        "Note"
+        strip::date_label(created_unix, now_secs)
+    }
+}
+
+/// A note card's header caption. A DIAGNOSIS keeps its level word (that *is*
+/// data); a WRITER NOTE shows its creation moment (C3 — the category noun
+/// "Note" told the writer nothing her warm card and own words didn't). A lost
+/// anchor adds the quiet "· detached" either way.
+fn note_card_label(
+    is_diagnosis: bool,
+    level: &str,
+    orphaned: bool,
+    created_unix: i64,
+    now_secs: i64,
+) -> String {
+    let base = if is_diagnosis {
+        if level.is_empty() {
+            "Diagnosis".to_owned()
+        } else {
+            level.to_owned()
+        }
+    } else {
+        note_moment_label(created_unix, now_secs)
     };
     if orphaned {
         format!("{base} · detached")
     } else {
-        base.to_owned()
+        base
     }
 }
 
@@ -15330,6 +15858,7 @@ impl Editor {
                 pass_id: n.pass_id,
                 collapsed: false,
                 provenance: None,
+                created_unix: n.created_unix,
             });
         }
         // The caret-block's provenance one-liner (08 §2; surfaces-attention
@@ -15375,6 +15904,7 @@ impl Editor {
                     pass_id: 0,
                     collapsed: false,
                     provenance: Some(rec_id),
+                    created_unix: 0,
                 });
                 cards.sort_by(|a, b| a.top.total_cmp(&b.top));
             }
@@ -16139,6 +16669,7 @@ impl Editor {
                         unverified,
                         collapsed,
                         provenance,
+                        created_unix,
                         ..
                     } = card;
                     // Inside its entrance fade? (One fade per landed pass;
@@ -16253,7 +16784,11 @@ impl Editor {
                         .then(|| self.focus.input().cloned())
                         .flatten();
                     let is_diagnosis = kind == NoteKind::Diagnosis;
-                    let label = note_card_label(is_diagnosis, &level, orphaned);
+                    let now_secs = strop_core::journal::now_ms() / 1000;
+                    let label = note_card_label(is_diagnosis, &level, orphaned, created_unix, now_secs);
+                    // The caption's hover expands the moment to the full timestamp
+                    // (P9 — hover only completes what is shown); writer notes only.
+                    let moment_full = (!is_diagnosis).then(|| format_unix(created_unix));
                     let card = div()
                         .id(("note-card", id as usize))
                         .absolute()
@@ -16323,15 +16858,30 @@ impl Editor {
                                 .justify_between()
                                 .text_size(px(11.))
                                 .text_color(rgb(MUTED_COLOR))
-                                .child(label)
+                                .child(
+                                    div()
+                                        .id(("note-moment", id as usize))
+                                        .when_some(moment_full, |d, full| {
+                                            d.tooltip(tip(full, None))
+                                        })
+                                        .child(label),
+                                )
                                 .child(
                                     div()
                                         .flex()
                                         .gap(px(6.))
+                                        .items_center()
                                         .child(
+                                            // A clickable WORD wears the house dress
+                                            // (C1, P8): the dashed underline that
+                                            // says "this text is clickable", like
+                                            // Put back and the door's inactive pole.
                                             div()
                                                 .id(("note-done", id as usize))
                                                 .cursor(CursorStyle::PointingHand)
+                                                .border_b_1()
+                                                .border_dashed()
+                                                .border_color(rgb(MUTED_COLOR))
                                                 .hover(|d| d.text_color(rgb(TEXT_COLOR)))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
@@ -16353,10 +16903,23 @@ impl Editor {
                                                 .child("done"),
                                         )
                                         .child(
+                                            // A clickable GLYPH is an icon button
+                                            // with the titlebar's hover plate (C1):
+                                            // the plate IS the hit region, ≥ the
+                                            // titlebar icons' target (no sub-Fitts
+                                            // card control), and the mark says
+                                            // "control", never "letter".
                                             div()
                                                 .id(("note-dismiss", id as usize))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .px(px(4.))
+                                                .py(px(2.))
+                                                .rounded(px(5.))
                                                 .cursor(CursorStyle::PointingHand)
-                                                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                                .tooltip(tip("Dismiss", None))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(
@@ -16374,7 +16937,7 @@ impl Editor {
                                                         },
                                                     ),
                                                 )
-                                                .child("×"),
+                                                .child(icon(icons::DISMISS, 11., MUTED_COLOR)),
                                         ),
                                 ),
                         )
@@ -16987,10 +17550,11 @@ impl Editor {
                 )
                 .into_any_element();
         }
-        let MarginCard { id, body, kind, title, level, orphaned, .. } = card;
+        let MarginCard { id, body, kind, title, level, orphaned, created_unix, .. } = card;
         let (id, kind) = (*id, *kind);
         let is_diagnosis = kind == NoteKind::Diagnosis;
-        let label = note_card_label(is_diagnosis, level, *orphaned);
+        let now_secs = strop_core::journal::now_ms() / 1000;
+        let label = note_card_label(is_diagnosis, level, *orphaned, *created_unix, now_secs);
         let body = body.clone();
         let title = title.clone();
         div()
@@ -18171,7 +18735,7 @@ impl Editor {
             self.close_palette(window, cx);
         }
         self.editor_menu_open = false;
-        self.selection_popover = false;
+        self.flank_risen = false; // the reading room suppresses the flanks; reset on exit
         // L3: entry quietly checkpoints — fingerprint-guarded, reflex tier.
         // (On a legacy file mid-backfill the store defers silently —
         // accepted and named, regions 13.)
@@ -20827,6 +21391,53 @@ mod tests {
         let r = g(false, false, false, true);
         assert_eq!(r.left, Grid);
         assert!(!r.right, "no lane, no right menu");
+    }
+
+    #[test]
+    fn flanks_visible_predicate_is_law_1() {
+        // (sel_empty, is_selecting, risen, latched, field_open)
+        let v = flanks_visible_pred;
+        // The one visible state: a settled, non-empty selection, prose focus,
+        // no field, no latch.
+        assert!(v(false, false, true, false, false), "settled selection raises the flanks");
+        // Each conjunct, negated in turn, takes them down — the derived predicate.
+        assert!(!v(true, false, true, false, false), "an empty selection lowers them");
+        assert!(!v(false, true, true, false, false), "never mid-drag");
+        assert!(!v(false, false, false, false, false), "not yet settled (the 250ms beat)");
+        assert!(!v(false, false, true, true, false), "a latch (annotate/aside/exile/collapse) hides them");
+        assert!(!v(false, false, true, false, true), "a transient field (the composer) hides them — C2");
+    }
+
+    #[test]
+    fn note_moment_label_is_time_today_date_older() {
+        // A fixed "now": 2026-07-11 12:00 UTC (day 20645 * 86400 + 43200).
+        let day = 20645i64;
+        let now = day * 86_400 + 12 * 3600;
+        // A note made today reads as its time of day, messenger-style.
+        assert_eq!(note_moment_label(day * 86_400 + 14 * 3600 + 32 * 60, now), "14:32");
+        assert_eq!(note_moment_label(day * 86_400 + 9 * 3600 + 5 * 60, now), "09:05");
+        // Older notes borrow the strip's relative date grammar.
+        assert_eq!(note_moment_label((day - 1) * 86_400 + 3600, now), "Yesterday");
+        // A diagnosis keeps its level word; a writer note shows the moment.
+        assert_eq!(
+            note_card_label(true, "Line", false, day * 86_400, now),
+            "Line",
+            "a diagnosis keeps its level word (that IS data)"
+        );
+        assert_eq!(
+            note_card_label(false, "", false, day * 86_400 + 14 * 3600 + 32 * 60, now),
+            "14:32",
+            "a writer note's caption is its creation moment"
+        );
+        // The detached marker survives on both families.
+        assert_eq!(
+            note_card_label(true, "Copy", true, day * 86_400, now),
+            "Copy · detached"
+        );
+        assert_eq!(
+            note_card_label(false, "", true, day * 86_400 + 14 * 3600 + 32 * 60, now),
+            "14:32 · detached"
+        );
     }
 
     #[test]

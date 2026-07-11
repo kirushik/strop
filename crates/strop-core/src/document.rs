@@ -2596,6 +2596,15 @@ impl Document {
         self.notes.get(id).map(|n| n.body.as_str())
     }
 
+    /// Remove a note outright (LAW 2 / C4 empty-discard: a never-written note the
+    /// writer clicked away from must not persist as a blank card). No undo
+    /// snapshot of its own — the `add_note` that created it already pushed one,
+    /// so the pair leaves the stack where it found it.
+    pub fn remove_note(&mut self, id: u64) -> Option<Annotation> {
+        self.revision += 1;
+        self.notes.remove(id)
+    }
+
     /// Add a batch of diagnoses as ONE undoable transaction (one ctrl-z
     /// clears a whole pass).
     pub fn add_diagnoses(&mut self, diagnoses: Vec<Annotation>) {

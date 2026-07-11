@@ -192,8 +192,12 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:annotated: annotated paragraph seeded + selected");
                 continue;
             }
-            // Flanks (docs/impl/03-flanks.md §3): select the caret paragraph and
-            // raise the popover so `dump:ui`'s `flanks` object is observable.
+            // Flanks (docs/impl/03-flanks.md §3, papercuts-2026-07 §1 LAW 1):
+            // `select:para` raises the flanks via a settled selection so
+            // `dump:ui`'s `flanks` object is observable; `select:kbd` proves a
+            // KEYBOARD selection (shift+arrows, through `extend_cursor`) raises
+            // them identically. Follow either with `ctrl-m dump:ui` to prove the
+            // composer takes them DOWN (transient field ⇒ hidden, C2).
             if key == "select:para" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_select_para(cx))
@@ -202,6 +206,16 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(80))
                     .await;
                 eprintln!("SMOKE select:para: caret paragraph selected + flanks raised");
+                continue;
+            }
+            if key == "select:kbd" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_select_kbd(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE select:kbd: keyboard selection made + flanks raised");
                 continue;
             }
             if key == "exile:selection" {
