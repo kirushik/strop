@@ -1,0 +1,7 @@
+<!-- Pictorial family. The hamburger — the one menu form the corridor already
+     knows. Three full-width bars, house stroke. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M4 6h16"/>
+  <path d="M4 12h16"/>
+  <path d="M4 18h16"/>
+</svg>

@@ -26,6 +26,12 @@ zlog, ztracing, ztracing_macro  —  GPL-3.0-or-later
     into the binary, the assembled Strop application is GPL-3.0-or-later as a
     whole. (This is the same situation as the Zed editor itself.)
 
+Icon geometry (history.svg, link.svg, menu.svg)  —  ISC
+    Three icons in assets/icons/ derive their geometry from Lucide
+    (https://lucide.dev), restroked to Strop's house weight; the remaining
+    icons are Strop's own drawings. Full ISC text in
+    assets/icons/LICENSES/LICENSE-lucide.txt.
+
 PT Serif, PT Sans, PT Mono  —  SIL Open Font License 1.1
     Copyright (C) ParaType. Bundled in assets/fonts/; license text in
     assets/fonts/PTSerif-OFL.txt, PTSans-OFL.txt, and PTMono-OFL.txt.

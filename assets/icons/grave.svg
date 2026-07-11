@@ -1,0 +1,9 @@
+<!-- Pictorial family. The headstone the app has always drawn for the
+     graveyard — the same filled round-topped slab, now standing on its
+     ground. Our own form (cf. Tabler grave-2, minus the cross). The slab
+     keeps its historical solid fill: at chip sizes (12px) a stroked arch
+     thins into a bell; mass is what reads. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.25" stroke-linecap="round">
+  <path d="M6.5 18.5v-7.25a5.5 5.5 0 0 1 11 0v7.25z" fill="#000" stroke="none"/>
+  <path d="M4 19.5h16"/>
+</svg>

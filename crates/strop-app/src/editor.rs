@@ -32,6 +32,7 @@ use strop_core::{Store, typograph};
 
 use crate::config::{Config, Language};
 use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
+use crate::icons::{self, icon};
 use crate::strip::{self, Strip, StripBake};
 use crate::text_field::{
     FieldBackspace, FieldBackspaceWord, FieldCancel, FieldCommit, FieldPaste, FieldTab, TextField,
@@ -1551,16 +1552,11 @@ fn auto_cut_qualifies(new_text: &str, range_chars: usize) -> bool {
     new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS
 }
 
-/// A drawn headstone for the graveyard bar: a small muted slab with rounded
-/// top corners. The ⚰/⚱ glyphs are outside the bundled PT fonts, so the icon
-/// is divs, never a glyph (the garbled-glyph bug class, editor comment at the
-/// titlebar-controls note).
+/// The headstone for the graveyard bar — the metaphor sits beside its
+/// referent (ux-glossary standing rule), drawn as the icon plate's stroke
+/// form (docs/iconography.md) instead of the old filled-div slab.
 fn tombstone_icon() -> impl IntoElement {
-    div()
-        .w(px(9.))
-        .h(px(12.))
-        .rounded_t(px(4.5))
-        .bg(rgb(MUTED_COLOR))
+    icon(icons::GRAVE, 12., MUTED_COLOR)
 }
 
 /// Wall clock in unix seconds (matching checkpoints and card raise-times).
@@ -11995,11 +11991,11 @@ impl Editor {
     }
 
     /// The link cell (docs/impl/03-flanks.md §0.1): the second argument-taker.
-    /// A link has no PT-covered glyph (⤴ would force a font fallback — the
-    /// garbled-glyph bug class), so it draws its own mark: a short LINK_COLOR
-    /// underline bar (blue = link, per the color language). Clicking opens the
-    /// URL argument-field (`open_link_input`) rather than toggling — a link needs
-    /// a target — and the cell lights when the selection already carries one.
+    /// The mark is the icon plate's chain in LINK_COLOR (blue = link, per the
+    /// color language) — the universal form, replacing the bare underline bar
+    /// whose meaning nothing taught. Clicking opens the URL argument-field
+    /// (`open_link_input`) rather than toggling — a link needs a target — and
+    /// the cell lights when the selection already carries one.
     fn link_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = if self.selected_range.is_empty() {
             false
@@ -12030,7 +12026,7 @@ impl Editor {
                     .flex()
                     .items_center()
                     .h(px(14.))
-                    .child(div().w(px(13.)).h(px(2.)).rounded(px(1.)).bg(rgb(LINK_COLOR))),
+                    .child(icon(icons::LINK, 13., LINK_COLOR)),
             )
     }
 
@@ -12560,34 +12556,46 @@ impl Editor {
 
     // UI chrome avoids glyphs outside the bundled PT fonts (arrows, circles,
     // checks): every such character forces a mid-session system-font fallback
-    // load, the exact path behind the garbled-glyph bugs. Indicators that
-    // have no PT-covered character are drawn as divs instead.
+    // load, the exact path behind the garbled-glyph bugs. Icons are embedded
+    // SVGs instead (docs/iconography.md) — resvg never consults a font. The
+    // window family wears pure geometry (line / square / saltire), a shade
+    // lighter than the pictorial marks, so the OS verbs never read as
+    // document controls.
     fn window_button(
         &self,
-        label: &'static str,
+        icon_path: &'static str,
         tip_label: &'static str,
         chord: Option<&'static str>,
         action: fn(&mut Window, &mut App),
     ) -> impl IntoElement {
         div()
-            .id(label)
+            .id(icon_path)
             // Clickable, not a drag handle: occlude so the Windows titlebar
             // hit-test resolves to this control rather than HTCAPTION.
             .occlude()
             .flex_shrink_0()
-            .w(px(34.))
+            // 28, not the old 34: the cells were sized for glyph labels;
+            // the matched 13px marks need less air, and the freed width is
+            // what lets "Ask the editor" rest untruncated in an 800px-
+            // logical window.
+            .w(px(28.))
             .h_full()
             .flex()
             .items_center()
             .justify_center()
-            .text_color(rgb(MUTED_COLOR))
-            .hover(|d| d.bg(rgba(0x1A1A180Au32)).text_color(rgb(TEXT_COLOR)))
+            // The svg's ink is its own (no text-color cascade), so the
+            // hover brightening rides a group.
+            .group(icon_path)
+            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
             .tooltip(tip(tip_label, chord))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 action(window, cx);
             })
-            .child(label)
+            .child(
+                icon(icon_path, 13., MUTED_COLOR)
+                    .group_hover(icon_path, |s| s.text_color(rgb(TEXT_COLOR))),
+            )
     }
 
     /// The one piece of chrome: title, word count, history, menu, window
@@ -12967,7 +12975,7 @@ impl Editor {
                         .cursor(CursorStyle::PointingHand)
                         .flex()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(px(5.))
                         .when(open, |d| d.bg(rgba(0x1A1A1812u32)))
                         .hover(|d| d.bg(rgb(CARD_BG)))
                         .text_color(rgb(if face == EditorFace::Reading {
@@ -13015,26 +13023,19 @@ impl Editor {
                             d.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(rgb(color)))
                         })
                         .child(div().min_w(px(0.)).truncate().child(label))
-                        // The dropdown wedge — contiguous decreasing bars fuse
-                        // into a solid ▾ (the app's own drawn-glyph idiom; the
-                        // real "▾" isn't in the PT fonts). It wears the label's
-                        // ink, not a second colour.
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .children([7., 5., 3., 1.].into_iter().map(|w| {
-                                    div().w(px(w)).h(px(1.)).bg(rgb(
-                                        if face == EditorFace::Reading {
-                                            TEXT_COLOR
-                                        } else {
-                                            MUTED_COLOR
-                                        },
-                                    ))
-                                })),
-                        )
+                        // The dropdown wedge — the pictorial family's one
+                        // filled form (a solid caret stays crisp where a
+                        // chevron stroke fuzzes). It wears the label's ink,
+                        // not a second colour.
+                        .child(icon(
+                            icons::CARET_DOWN,
+                            9.,
+                            if face == EditorFace::Reading {
+                                TEXT_COLOR
+                            } else {
+                                MUTED_COLOR
+                            },
+                        ))
                 }))
                 // The day-zero affordance: a user who knows nothing clicks the
                 // one unexplained button and lands in a searchable list of every
@@ -13045,7 +13046,7 @@ impl Editor {
                         .id("palette-toggle")
                         .occlude()
                         .flex_shrink_0()
-                        .px(px(8.))
+                        .px(px(6.))
                         .py(px(2.))
                         .rounded(px(5.))
                         .map(|d| {
@@ -13071,25 +13072,16 @@ impl Editor {
                                 editor.toggle_palette(&TogglePalette, window, cx);
                             }),
                         )
-                        .child(
-                            // Drawn hamburger (no PT-covered menu glyph).
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.))
-                                .children((0..3).map(|_| {
-                                    div().w(px(11.)).h(px(1.5)).bg(rgb(MUTED_COLOR))
-                                })),
-                        ),
+                        .child(icon(icons::MENU, 13., MUTED_COLOR)),
                 )
                 .child(
                     div()
                         .id("history-toggle")
                         .occlude()
                         .flex_shrink_0()
-                        .px(px(8.))
+                        .px(px(6.))
                         .py(px(2.))
-                        .ml(px(4.))
+                        .ml(px(2.))
                         .rounded(px(5.))
                         .text_color(if self.strip.open && !in_cold {
                             rgb(TEXT_COLOR)
@@ -13118,26 +13110,18 @@ impl Editor {
                             }),
                         )
                         .child(
-                            // History: drawn clock-face stand-in (↺ isn't in PT).
-                            div()
-                                .size(px(11.))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(if self.strip.open && !in_cold {
-                                    rgb(TEXT_COLOR)
+                            // History: the counter-clockwise clock — the one
+                            // "versions" form the corridor already knows
+                            // (docs/iconography.md).
+                            icon(
+                                icons::HISTORY,
+                                13.,
+                                if self.strip.open && !in_cold {
+                                    TEXT_COLOR
                                 } else {
-                                    rgb(MUTED_COLOR)
-                                })
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(div().size(px(3.)).rounded_full().bg(
-                                    if self.strip.open && !in_cold {
-                                        rgb(TEXT_COLOR)
-                                    } else {
-                                        rgb(MUTED_COLOR)
-                                    },
-                                )),
+                                    MUTED_COLOR
+                                },
+                            ),
                         ),
                 )
                 // Windows/Linux get our own drawn window controls. macOS keeps its
@@ -13146,35 +13130,13 @@ impl Editor {
                 // app, and sidesteps the fact that the "–"/"×" glyph labels are the
                 // very thing the macOS glyph bug hides (issue #10).
                 .when(!cfg!(target_os = "macos"), |bar| {
-                    bar.child(self.window_button("–", "Minimize", None, |window, _| {
+                    bar.child(self.window_button(icons::WIN_MINIMIZE, "Minimize", None, |window, _| {
                         window.minimize_window()
                     }))
-                    .child(
-                        // Zoom: drawn square (U+25A1 isn't in PT).
-                        div()
-                            .id("win-zoom")
-                            .occlude()
-                            .flex_shrink_0()
-                            .w(px(34.))
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                            .tooltip(tip("Maximize", None))
-                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                cx.stop_propagation();
-                                window.zoom_window();
-                            })
-                            .child(
-                                div()
-                                    .size(px(9.))
-                                    .border_1()
-                                    .border_color(rgb(MUTED_COLOR))
-                                    .rounded(px(1.)),
-                            ),
-                    )
-                    .child(self.window_button("×", "Close", Some("ctrl-q"), |_, cx| cx.quit()))
+                    .child(self.window_button(icons::WIN_MAXIMIZE, "Maximize", None, |window, _| {
+                        window.zoom_window()
+                    }))
+                    .child(self.window_button(icons::WIN_CLOSE, "Close", Some("ctrl-q"), |_, cx| cx.quit()))
                 })
             )
     }
@@ -16563,10 +16525,10 @@ impl Editor {
         // a fixed-width estimate of the chrome right of it: those controls
         // flex-shrink in a narrow bar, which left the estimate ~75px off its
         // control. The estimate survives only as the first-frame fallback
-        // (palette-toggle 27 + history-toggle 4+31 [+ 3×34 drawn window
-        // controls off macOS — its traffic lights sit top-LEFT]).
+        // (palette-toggle 25 + history-toggle 2+25 [+ 3×28 window controls
+        // off macOS — its traffic lights sit top-LEFT]).
         let vw = f32::from(window.viewport_size().width);
-        let est = vw - if cfg!(target_os = "macos") { 62. } else { 164. };
+        let est = vw - if cfg!(target_os = "macos") { 52. } else { 136. };
         let btn_right = self.editor_btn_right.get().map_or(est, f32::from);
         let menu_right = (vw - btn_right).max(8.);
         // The lab's one-line law (392 there, chipless): verb + qualifier +
@@ -16731,9 +16693,6 @@ impl Editor {
         }
         let open = self.narrow_notes_open;
         let noun = if count == 1 { "note" } else { "notes" };
-        // The diagnose feature's mini-card motif, so the pill rhymes with what
-        // it holds (a drawn outline — no PT-absent glyph, the atlas rule).
-        let mark = rgb(MUTED_COLOR);
         Some(
             div()
                 .id("narrow-notes-pill")
@@ -16763,21 +16722,8 @@ impl Editor {
                         cx.notify();
                     }),
                 )
-                .child(
-                    div()
-                        .w(px(12.))
-                        .h(px(10.))
-                        .rounded(px(2.))
-                        .border_1()
-                        .border_color(mark)
-                        .flex()
-                        .flex_col()
-                        .justify_center()
-                        .gap(px(1.5))
-                        .px(px(2.))
-                        .child(div().w(px(6.)).h(px(1.)).bg(mark))
-                        .child(div().w(px(4.)).h(px(1.)).bg(mark)),
-                )
+                // The note-card mark, so the pill rhymes with what it holds.
+                .child(icon(icons::NOTE, 13., MUTED_COLOR))
                 .child(format!("{count} {noun}"))
                 .into_any_element(),
         )
@@ -19963,19 +19909,22 @@ impl Editor {
                 }),
             );
 
-        // Close affordance (Bug C): a small '×' in the strip's top-right, the
-        // note-dismiss idiom (muted → bright on hover, pointing hand). Closes
-        // the strip from ANY state; click-away deliberately still does not.
+        // Close affordance (Bug C): the pictorial dismiss saltire in the
+        // strip's top-right (muted → bright on hover, pointing hand) — the
+        // strip is chrome, so it takes the drawn mark, not the type's "×"
+        // (docs/iconography.md). Closes the strip from ANY state; click-away
+        // deliberately still does not.
         let close_x = div()
             .id("strip-close")
             .occlude()
             .px(px(4.))
+            .py(px(2.))
             .cursor(CursorStyle::PointingHand)
-            .font_family("PT Sans")
-            .text_size(px(14.))
-            .text_color(rgb(0x8F8A7C))
-            .hover(|d| d.text_color(rgb(0xE7E1D0)))
-            .child("\u{d7}")
+            .group("strip-close")
+            .child(
+                icon(icons::DISMISS, 11., 0x8F8A7C)
+                    .group_hover("strip-close", |s| s.text_color(rgb(0xE7E1D0))),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|editor, _: &MouseDownEvent, _, cx| {

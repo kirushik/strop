@@ -1,0 +1,9 @@
+<!-- Pictorial family. The versions convention: a clock swept counter-
+     clockwise (Google Docs, Time Machine). Lucide "history" geometry (ISC),
+     restroked to the house weight: 2.25 on the 24 grid = ~1.3px at the 14px
+     canonical size. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+  <path d="M3 3v5h5"/>
+  <path d="M12 7v5l3.5 1.75"/>
+</svg>

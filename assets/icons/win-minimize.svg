@@ -1,0 +1,5 @@
+<!-- Window family: pure geometry, butt caps, a shade lighter than the
+     pictorial stroke — OS verbs must not read as document controls. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.1" stroke-linecap="butt">
+  <path d="M4.5 12h15"/>
+</svg>

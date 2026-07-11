@@ -1,0 +1,5 @@
+<!-- Pictorial family, the one filled form: a solid wedge stays crisp at
+     sizes where a chevron stroke fuzzes. Successor of the fused-bars ▾. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#000" stroke="none">
+  <path d="M5.5 8.25h13a1 1 0 0 1 .77 1.64l-6.5 7.8a1 1 0 0 1-1.54 0l-6.5-7.8a1 1 0 0 1 .77-1.64z"/>
+</svg>
