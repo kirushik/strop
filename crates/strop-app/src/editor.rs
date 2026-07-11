@@ -8016,6 +8016,13 @@ impl Editor {
                 self.doc.blocks().kind(block),
                 BlockKind::Heading(_) | BlockKind::Divider
             );
+        // Inline momentum dies at the paragraph seam (papercuts §A2): a new
+        // paragraph starts with clean inline state, exactly as it starts with a
+        // clean block kind. The span-side seam (SpanSet stops right-edge
+        // expansion across a newline) covers marks the caret sits at the edge
+        // of; this clears the sticky caret arm the writer toggled but hasn't
+        // yet spent — so the freshly opened paragraph is not still-armed.
+        self.caret_attrs.clear();
         self.replace_text_in_range(None, "\n", window, cx);
         if demote {
             let new_block = self.doc.block_of_byte(self.cursor_offset());
@@ -8180,7 +8187,7 @@ impl Editor {
             // present so a leak test CAN catch a field paste falling
             // through to the document — never set outside smoke runs.
             if let Some(text) = crate::smoke::clipboard_override() {
-                self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
+                self.apply_replace(None, &text.replace("\r\n", "\n"), false, true, cx);
             }
             return;
         };
@@ -8193,7 +8200,7 @@ impl Editor {
                 ClipboardEntry::String(text) => {
                     // Pasted text is never typographed — already authored.
                     let text = text.text().replace("\r\n", "\n");
-                    self.apply_replace(None, &text, false, cx);
+                    self.apply_replace(None, &text, false, true, cx);
                     return;
                 }
                 // New variant post-0.2.2; pasting file paths did nothing
@@ -8752,7 +8759,7 @@ impl Editor {
             let (ix, _) = self.index_for_mouse(ev.position);
             self.selected_range = ix..ix;
             self.selection_reversed = false;
-            self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
+            self.apply_replace(None, &text.replace("\r\n", "\n"), false, true, cx);
         }
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         let _ = (ev, cx);
@@ -9943,6 +9950,7 @@ impl Editor {
         range_utf16: Option<Range<usize>>,
         new_text: &str,
         typograph: bool,
+        machine: bool,
         cx: &mut Context<Self>,
     ) {
         if self.cr_guard(cx) {
@@ -10034,7 +10042,15 @@ impl Editor {
             }
         }
 
-        self.doc.edit_bytes_coalescing(range.clone(), new_text);
+        // A machine-performed insertion (paste) re-anchors spans verbatim: no
+        // right-edge expansion dresses it in a neighbour's mark (papercuts §A3
+        // machine-insertion law). The typing hand still extends via the
+        // coalescing path.
+        if machine {
+            self.doc.edit_bytes_verbatim(range.clone(), new_text);
+        } else {
+            self.doc.edit_bytes_coalescing(range.clone(), new_text);
+        }
         let mut cursor = range.start + new_text.len();
         let mut block_shortcut_fired = false;
 
@@ -10144,7 +10160,7 @@ impl EntityInputHandler for Editor {
         // Typograph only single typed characters — multi-char inserts are
         // IME commits or programmatic and arrive already authored.
         let typograph = new_text.chars().count() == 1;
-        self.apply_replace(range_utf16, new_text, typograph, cx);
+        self.apply_replace(range_utf16, new_text, typograph, false, cx);
     }
 
     fn replace_and_mark_text_in_range(

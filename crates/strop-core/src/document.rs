@@ -273,10 +273,17 @@ pub enum InlineAttr {
 }
 
 impl InlineAttr {
-    /// Peritext expansion: typing at the right edge continues the style.
-    /// Code and links must not grow under the caret.
+    /// Peritext expansion: typing at the right edge continues the style —
+    /// split by what the mark *means* (papercuts-2026-07 §1 A3, the
+    /// Peritext/ProseMirror `inclusive` distinction):
+    ///
+    /// - **Emphasis-class** (Strong, Emphasis, Underline): character styles a
+    ///   writer extends by typing — appending to a bold word keeps it bold.
+    /// - **Extent-class** (Highlight, Strikethrough, joining Code, Link,
+    ///   FootnoteRef): statements about a *fixed extent* of existing text —
+    ///   marked once, they do not grow by appending.
     pub fn expands(&self) -> bool {
-        !matches!(self, Self::Code | Self::Link(_) | Self::FootnoteRef(_))
+        matches!(self, Self::Strong | Self::Emphasis | Self::Underline)
     }
 }
 
@@ -671,11 +678,32 @@ impl SpanSet {
         out
     }
 
-    /// Keep all spans consistent across a text edit: delete `op.delete`
-    /// chars at `op.pos`, then insert `op.insert` there.
+    /// Keep all spans consistent across a text edit performed by the TYPING
+    /// hand: delete `op.delete` chars at `op.pos`, then insert `op.insert`
+    /// there, letting expanding styles absorb an appended insertion at their
+    /// right edge (the Peritext continuation).
     pub fn apply_op(&mut self, op: &TextOp) {
+        self.apply_op_inner(op, true);
+    }
+
+    /// Like `apply_op`, but for a MACHINE-performed insertion (put back,
+    /// paste): expansion never fires at a span's right edge (papercuts-2026-07
+    /// §1 A3 — "expansion is a typing affordance"). This is the belt that keeps
+    /// resurrected/pasted text from being dressed in a neighbour's bold before
+    /// its own spans re-add.
+    pub fn apply_op_verbatim(&mut self, op: &TextOp) {
+        self.apply_op_inner(op, false);
+    }
+
+    fn apply_op_inner(&mut self, op: &TextOp, by_typing: bool) {
         let del_end = op.pos + op.delete;
         let ins = op.insert.chars().count();
+        // The paragraph seam kills momentum (papercuts-2026-07 §1 A2): an
+        // expanding span never absorbs an insertion that OPENS a new
+        // paragraph, so a bold run does not stream onto the next paragraph.
+        // A newline typed strictly INSIDE a run still grows it (the split
+        // keeps both halves marked) — only the right-edge append is stopped.
+        let across_seam = op.insert.starts_with('\n');
         let clamp = |x: usize| {
             if x >= del_end {
                 x - op.delete
@@ -693,12 +721,16 @@ impl SpanSet {
             if ins > 0 {
                 // Typing at the left edge stays outside (start shifts);
                 // strictly inside grows the span; at the right edge only
-                // expanding styles absorb the insertion.
+                // expanding styles absorb the insertion, and only when the
+                // typing hand appends non-seam text.
                 if span.range.start >= op.pos {
                     span.range.start += ins;
                 }
                 if span.range.end > op.pos
-                    || (span.range.end == op.pos && span.attr.expands())
+                    || (span.range.end == op.pos
+                        && by_typing
+                        && !across_seam
+                        && span.attr.expands())
                 {
                     span.range.end += ins;
                 }
@@ -1371,10 +1403,26 @@ impl Document {
     }
 
     fn absorb_buffer_ops(&mut self) {
+        self.absorb_buffer_ops_inner(true);
+    }
+
+    /// Absorb a MACHINE insertion (put back, paste): spans re-anchor without
+    /// right-edge expansion (the A3 machine-insertion law), so the inserted
+    /// text is never dressed in a neighbour's mark. Every other side structure
+    /// shifts identically to the typing path.
+    fn absorb_buffer_ops_verbatim(&mut self) {
+        self.absorb_buffer_ops_inner(false);
+    }
+
+    fn absorb_buffer_ops_inner(&mut self, by_typing: bool) {
         let ops = self.buffer.take_ops();
         let now = crate::journal::now_ms();
         for op in &ops {
-            self.spans.apply_op(op);
+            if by_typing {
+                self.spans.apply_op(op);
+            } else {
+                self.spans.apply_op_verbatim(op);
+            }
             self.notes.apply_op(op);
             self.graveyard.apply_op(op);
             self.provenance.apply_op(op);
@@ -2392,6 +2440,22 @@ impl Document {
         self.blocks
             .on_edit(block, merged, count_line_breaks(text));
         self.absorb_buffer_ops();
+    }
+
+    /// Like `edit_bytes`, but the insertion is MACHINE-performed (put back,
+    /// paste): spans re-anchor verbatim, without right-edge expansion (the A3
+    /// machine-insertion law). Used so a resurrected passage lands wearing its
+    /// OWN marks, never the neighbour's.
+    pub fn edit_bytes_verbatim(&mut self, byte_range: Range<usize>, text: &str) {
+        self.revision += 1;
+        let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.buffer.edit_bytes(byte_range, text) {
+            self.undo_states.push(self.snapshot());
+            self.redo_states.clear();
+        }
+        self.blocks
+            .on_edit(block, merged, count_line_breaks(text));
+        self.absorb_buffer_ops_verbatim();
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
