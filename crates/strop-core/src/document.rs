@@ -1972,6 +1972,63 @@ impl Document {
             },
         };
         let before_seam = self.blocks.scrap_line();
+        if !rebirth && entry.whole_blocks {
+            // Rebuild the exile as its OWN standing block(s) (papercuts §B2):
+            // snap the drifted origin to the nearest block boundary (never
+            // mid-paragraph) and reconstruct the one bounding separator, so the
+            // text stands alone wearing its own kinds and spans, nothing of the
+            // neighbours'. The insertion is verbatim (no neighbour mark dresses
+            // it — the machine-insertion belt) and separators + text + kinds +
+            // spans ride ONE transaction (the atomic suspenders).
+            let region = match entry.region {
+                GraveRegion::Manuscript => manuscript_range_of(rope, &self.blocks),
+                GraveRegion::Scraps => scraps_range_of(rope, &self.blocks)
+                    .unwrap_or_else(|| manuscript_range_of(rope, &self.blocks)),
+            };
+            let clamped = entry.origin_pos.clamp(region.start, region.end);
+            let line = rope.char_to_line(clamped);
+            let line_start = rope.line_to_char(line);
+            let next_start = if line + 1 < rope.len_lines() {
+                rope.line_to_char(line + 1)
+            } else {
+                rope.len_chars()
+            };
+            // Nearest of the two block edges bracketing the origin.
+            let boundary = if clamped - line_start <= next_start.saturating_sub(clamped) {
+                line_start
+            } else {
+                next_start
+            }
+            .clamp(region.start, region.end);
+            let at_end = boundary >= rope.len_chars();
+            // A trailing separator when a block follows the landing; a leading
+            // one when the returned block is the last of the document; none at
+            // all into an empty document (no phantom blank block).
+            let (payload, text_offset) = if rope.len_chars() == 0 {
+                (entry.text.clone(), 0)
+            } else if at_end {
+                (format!("\n{}", entry.text), 1)
+            } else {
+                (format!("{}\n", entry.text), 0)
+            };
+            let at_byte = rope.char_to_byte(boundary);
+            self.edit_bytes_verbatim(at_byte..at_byte, &payload);
+            let text_start = boundary + text_offset;
+            let insert_block = self.buffer.rope().char_to_line(text_start);
+            for (i, kind) in entry.kinds.iter().enumerate() {
+                self.blocks.set_kind(insert_block + i, kind.clone());
+            }
+            for s in entry.spans.spans() {
+                self.spans.add(
+                    text_start + s.range.start..text_start + s.range.end,
+                    s.attr.clone(),
+                );
+            }
+            self.revision += 1;
+            self.graveyard.remove(id);
+            // Caret at the returned block's START (§B2: reveal the landing).
+            return Some(text_start);
+        }
         if rebirth {
             // "Emptying dissolves it" gets its inverse: returning re-creates
             // it. The entry lands as the sole scrap under a re-born seam, all
@@ -1979,7 +2036,7 @@ impl Document {
             let lines = self.buffer.rope().len_lines();
             let at_byte = self.buffer.len_bytes();
             let payload = format!("\n\n{}", entry.text);
-            self.edit_bytes(at_byte..at_byte, &payload);
+            self.edit_bytes_verbatim(at_byte..at_byte, &payload);
             let seam = lines;
             self.blocks.set_scrap_line(Some(seam));
             // The seam line is never kind-stamped; the payload re-stamps its
@@ -2001,7 +2058,10 @@ impl Document {
             return Some(text_start + entry.text.chars().count());
         }
         let at_byte = self.buffer.char_to_byte(at_char);
-        self.edit_bytes(at_byte..at_byte, &entry.text);
+        // Verbatim insert: the machine-insertion law protects partial entries
+        // too — the resurrected splice never absorbs into a neighbour's
+        // expanding span before its own spans re-add (papercuts §A3/§B2).
+        self.edit_bytes_verbatim(at_byte..at_byte, &entry.text);
         // Re-stamp the cut's block kinds and re-add its spans (Bug D / P1): a
         // heading comes back a heading, bold comes back bold. These ride the
         // transaction `edit_bytes` opened (no new snapshot), so one undo peels
@@ -3757,6 +3817,167 @@ mod tests {
         )
         .expect("legacy graveyard loads");
         assert_eq!(g.len(), 1);
+    }
+
+    // ---- papercuts-2026-07: A2 seam / A3 class split + machine law / B1 / B2 ----
+
+    #[test]
+    fn enter_ends_the_run_next_char_is_plain() {
+        // A2: an expanding span never absorbs an insertion across a newline —
+        // Enter at the end of a bold run opens a plain paragraph.
+        let mut doc = Document::new("", SpanSet::default(), BlockMap::default());
+        doc.edit_bytes_coalescing(0..0, "bold");
+        doc.toggle_format(0..4, InlineAttr::Strong);
+        // Caret at the right edge of the bold run; press Enter (typed).
+        doc.edit_bytes_coalescing(4..4, "\n");
+        // The seam did NOT swallow the newline: the run is still 0..4.
+        assert!(doc.spans().covers(0..4, &InlineAttr::Strong));
+        assert!(!doc.spans().covers(0..5, &InlineAttr::Strong));
+        // The next paragraph opens plain.
+        doc.edit_bytes_coalescing(5..5, "x");
+        assert_eq!(doc.text(), "bold\nx");
+        assert!(!doc.spans().covers(5..6, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn enter_inside_a_run_splits_it_intact_and_undoes() {
+        // A2 (the seam kills momentum, never marks): Enter INSIDE a bold run
+        // splits it into two intact spans — both halves stay bold — and one
+        // undo restores the single pre-split span.
+        let mut doc = Document::new("bold", SpanSet::default(), BlockMap::default());
+        doc.toggle_format(0..4, InlineAttr::Strong);
+        doc.edit_bytes_coalescing(2..2, "\n"); // "bo\nld"
+        assert_eq!(doc.text(), "bo\nld");
+        // Both halves are bold (the newline grew the run to keep them marked).
+        assert!(doc.spans().covers(0..2, &InlineAttr::Strong)); // "bo"
+        assert!(doc.spans().covers(3..5, &InlineAttr::Strong)); // "ld"
+        // Undo the Enter: one span restored, caret state returned.
+        assert!(matches!(doc.undo(), Some(Some(_))));
+        assert_eq!(doc.text(), "bold");
+        assert_eq!(doc.spans().spans().len(), 1);
+        assert!(doc.spans().covers(0..4, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn extent_marks_do_not_grow_by_appending() {
+        // A3: Highlight and Strikethrough are extent-class — marked once, they
+        // do not grow when the writer types at their right edge. Strong stays
+        // emphasis-class (the typing hand extends it).
+        for extent in [InlineAttr::Highlight, InlineAttr::Strikethrough] {
+            let mut doc = Document::new("word", SpanSet::default(), BlockMap::default());
+            doc.toggle_format(0..4, extent.clone());
+            doc.edit_bytes_coalescing(4..4, "s"); // type at the right edge
+            assert_eq!(doc.text(), "words");
+            assert!(!doc.spans().covers(4..5, &extent), "{extent:?} must not grow");
+            assert!(doc.spans().covers(0..4, &extent), "{extent:?} keeps its extent");
+        }
+        // Bold at the right edge still grows (the convention).
+        let mut doc = Document::new("word", SpanSet::default(), BlockMap::default());
+        doc.toggle_format(0..4, InlineAttr::Strong);
+        doc.edit_bytes_coalescing(4..4, "s");
+        assert!(doc.spans().covers(0..5, &InlineAttr::Strong), "bold extends by typing");
+    }
+
+    #[test]
+    fn machine_insertion_never_absorbs_into_a_neighbour_span() {
+        // A3 machine-insertion law: put back of a partial entry at the right
+        // edge of a neighbour's Strong span is NOT dressed in that bold.
+        let mut spans = SpanSet::default();
+        spans.add(0..4, InlineAttr::Strong); // "bold" bold; "X" plain
+        let mut doc = Document::new("boldX", spans, BlockMap::default());
+        // Cut the trailing plain "X" (a partial, non-block cut).
+        let id = doc.cut_to_graveyard(4..5, String::new(), 0, false);
+        assert_eq!(doc.text(), "bold");
+        assert!(!doc.graveyard().get(id).unwrap().whole_blocks);
+        // Put it back at the bold run's right edge: verbatim, so no expansion.
+        doc.put_back(id);
+        assert_eq!(doc.text(), "boldX");
+        assert!(doc.spans().covers(0..4, &InlineAttr::Strong));
+        assert!(!doc.spans().covers(4..5, &InlineAttr::Strong), "X not absorbed into bold");
+    }
+
+    #[test]
+    fn whole_paragraph_exile_leaves_no_grave_and_undoes_in_one_step() {
+        // B1: exiling a whole middle paragraph takes its bounding separator —
+        // no empty block — and Ctrl+Z restores text + separator and drops the
+        // entry in one step.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(4..7, String::new(), 0, false); // "BBB"
+        assert_eq!(doc.text(), "AAA\nCCC");
+        assert_eq!(doc.blocks().len(), 2, "no empty block strands");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.whole_blocks);
+        assert_eq!(e.text, "BBB");
+        // One undo restores the paragraph AND its separator, entry gone.
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert_eq!(doc.blocks().len(), 3);
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn whole_block_exile_normalizes_trailing_newline_selection() {
+        // B1 normalization: a triple-click-shaped selection ending at the next
+        // block's char 0 (includes the trailing \n) yields the identical
+        // outcome — one separator consumed, never two.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(4..8, String::new(), 0, false); // "BBB\n"
+        assert_eq!(doc.text(), "AAA\nCCC");
+        assert_eq!(doc.blocks().len(), 2);
+        assert_eq!(doc.graveyard().get(id).unwrap().text, "BBB");
+    }
+
+    #[test]
+    fn whole_block_put_back_rebuilds_its_own_paragraph() {
+        // B2: a whole-block entry returns as its own standing paragraph wearing
+        // its own kind + spans, neighbours untouched, even after edits shift
+        // the origin.
+        let mut spans = SpanSet::default();
+        spans.add(4..7, InlineAttr::Strong); // "BBB" bold
+        let mut doc = Document::new("AAA\nBBB\nCCC", spans, BlockMap::default());
+        let id = doc.exile_to_graveyard(4..7, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\nCCC");
+        // An edit before the origin drifts it; put back must still land as a
+        // block, not a splice.
+        doc.edit_bytes(0..0, "Z"); // "ZAAA\nCCC"
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "ZAAA\nBBB\nCCC");
+        assert_eq!(doc.blocks().len(), 3, "BBB is its own block");
+        // BBB wears its own bold; the neighbours do not.
+        let bbb_start = doc.rope().char_to_line(caret); // caret is at BBB's start
+        assert_eq!(bbb_start, 1);
+        assert!(doc.spans().covers(5..8, &InlineAttr::Strong), "BBB bold restored");
+        assert!(!doc.spans().covers(0..4, &InlineAttr::Strong), "ZAAA not bold");
+        assert!(!doc.spans().covers(9..12, &InlineAttr::Strong), "CCC not bold");
+        assert_eq!(caret, 5, "caret at the returned block's start");
+    }
+
+    #[test]
+    fn whole_document_exile_and_put_back_has_no_phantom_block() {
+        // The lone-block case: exiling the whole document takes no separator
+        // (there is none), and put back into the emptied doc lands bare — no
+        // phantom leading blank block.
+        let mut doc = Document::new("only", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(0..4, String::new(), 0, false);
+        assert_eq!(doc.text(), "");
+        assert_eq!(doc.blocks().len(), 1);
+        doc.put_back(id);
+        assert_eq!(doc.text(), "only");
+        assert_eq!(doc.blocks().len(), 1);
+    }
+
+    #[test]
+    fn last_block_exile_and_put_back_round_trip() {
+        // B1/B2: the last block of the document consumes its LEADING separator
+        // on exile and rebuilds as a trailing block on put back.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(8..11, String::new(), 0, false); // "CCC"
+        assert_eq!(doc.text(), "AAA\nBBB");
+        assert_eq!(doc.blocks().len(), 2, "no trailing empty block");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert_eq!(doc.blocks().len(), 3);
+        assert_eq!(caret, 8, "caret at CCC's start");
     }
 
     #[test]

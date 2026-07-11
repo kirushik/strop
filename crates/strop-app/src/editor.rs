@@ -6919,14 +6919,30 @@ impl Editor {
     /// the manuscript by the core; here we place the caret, flash the returned
     /// paragraph, and drop the now-stale expanded flag.
     fn put_back_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        // A whole-block entry returns the caret at the START of its rebuilt
+        // block (§B2 reveal-the-landing); a fragment splice returns it after
+        // the re-inserted text (unchanged).
+        let whole = self
+            .doc
+            .graveyard()
+            .get(id)
+            .map(|e| e.whole_blocks)
+            .unwrap_or(false);
         let Some(caret_char) = self.doc.put_back(id) else {
             return;
         };
         self.sync_mutations();
         let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
         self.grave_expanded.retain(|e| *e != id);
-        // Flash the paragraph the passage returned to (P13's visible inverse).
-        self.para_flash = Some((caret_char.saturating_sub(1), Instant::now()));
+        // Flash the paragraph the passage returned to (P13's visible inverse):
+        // the block itself for a whole-block return, the merged-into line for a
+        // fragment splice.
+        let flash_at = if whole {
+            caret_char
+        } else {
+            caret_char.saturating_sub(1)
+        };
+        self.para_flash = Some((flash_at, Instant::now()));
         self.autoscroll_request = true;
         self.set_cursor(caret, false, cx);
         self.schedule_flash_clear(cx);
@@ -10638,6 +10654,11 @@ struct GraveEntryView {
     /// Which side of the seam the text was cut from — the whisper's honest
     /// "from scraps" (graveyard-interplay 2).
     region: strop_core::document::GraveRegion,
+    /// Whether the cut was a whole paragraph block (papercuts §B2 — form shows
+    /// the contract): whole-block entries stand as paragraph blocks; fragments
+    /// wear the anchor-fragment quoted dress, so the entry's shape predicts its
+    /// return behaviour.
+    whole_blocks: bool,
 }
 
 const GRAVE_SECTION_GAP: f32 = 44.; // breathing room after the last prose block
@@ -10781,16 +10802,30 @@ fn shape_grave_section(
             top += px(GRAVE_WHISPER_H);
 
             // The full cut text, dimmed, ruled — one wrapped row per source
-            // paragraph, no character cap (P1: the record is verbatim).
+            // paragraph, no character cap (P1: the record is verbatim). Form
+            // shows the contract (§B2): a whole-block entry stands as paragraph
+            // block(s); a FRAGMENT wears the anchor-fragment quoted dress —
+            // italic, curly-quoted — the one grammar for "a piece of your text,
+            // quoted" (P8), so the shape predicts the return behaviour.
+            let fragment = !e.whole_blocks;
+            let mut body_font = gpui::font("PT Serif");
+            if fragment {
+                body_font.style = FontStyle::Italic;
+            }
             let body_run = TextRun {
                 len: 0,
-                font: gpui::font("PT Serif"),
+                font: body_font,
                 color: rgb(MUTED_COLOR).into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            for para in e.text.split('\n') {
+            let body_text = if fragment {
+                format!("\u{201C}\u{2026}{}\u{201D}", e.text)
+            } else {
+                e.text.clone()
+            };
+            for para in body_text.split('\n') {
                 let run = TextRun { len: para.len(), ..body_run.clone() };
                 let wrapped = window
                     .text_system()
@@ -11204,6 +11239,7 @@ impl Element for EditorElement {
                     words: e.words,
                     full: Some(e.id) == newest_id || editor.grave_expanded.contains(&e.id),
                     region: e.region,
+                    whole_blocks: e.whole_blocks,
                 })
                 .collect()
         };
