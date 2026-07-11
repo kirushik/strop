@@ -18269,7 +18269,9 @@ const CR_AVG_EN: f32 = 8.14;
 const CR_AVG_RU: f32 = 8.99;
 /// The S9 type-step re-evaluation runs at resize-end, not mid-drag.
 const CR_RESIZE_SETTLE_MS: u64 = 250;
-/// The reaction input card (L20): ~250px, chips over one line.
+/// The reaction input card (L20): ~250px, chips over a multi-line note (D3 —
+/// one pencil with the margin composer). The height token is only the
+/// above/below placement estimate; the card grows a line or two with content.
 const CR_INPUT_W: f32 = 250.;
 const CR_INPUT_H: f32 = 62.;
 /// D2 / LAW 2 — the transient-blur grace. A keyboard-layout / input-source
@@ -19401,7 +19403,12 @@ impl Editor {
             + if cr.geom.lane { CR_LANE_GAP + CR_LANE_W } else { 0. }
             - CR_INPUT_W;
         let x = anchor.0.clamp(0., max_x.max(0.));
-        let input = cx.new(|cx| TextField::single(cx, String::new()));
+        // D3 — one pencil: the reaction input is the margin composer's
+        // multiline field (NoteComposer context), so Enter files and
+        // Shift/Ctrl+Enter add a line break, one grammar for "writing a note
+        // to the text". The Commit/Cancel subscription below is unchanged —
+        // FieldCommit still emits Commit, FieldCancel still emits Cancel.
+        let input = cx.new(|cx| TextField::multiline(cx, String::new()));
         let handle = input.read(cx).focus_handle.clone();
         cx.subscribe(&input, move |editor, _, ev: &TextFieldEvent, cx| match ev {
             TextFieldEvent::Commit(text) => {
