@@ -31,6 +31,12 @@ ignore = [
     # when the gpui pin next moves.
     "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attributes
     "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-decl allocation (OOM)
+    # `bincode 1.3.3` unmaintained — the team ceased development and declared
+    # 1.3.3 complete. Transitive and build-time only: `hyphenation` uses it to
+    # embed its dictionaries at compile time, so nothing bincode ever touches
+    # runtime input. No upgrade exists. REVISIT if hyphenation moves off
+    # bincode, or when the gpui pin next moves.
+    "RUSTSEC-2025-0141",
 ]
 
 [licenses]
