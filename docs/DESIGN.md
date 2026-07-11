@@ -130,6 +130,41 @@ and its tooltip teaches `ctrl-shift-d`. It clears the "60-second
 capability enumeration" test for the core feature, which prose alone
 did not.
 
+**The bar's order (2026-07-11 ordering round; four critic lenses over
+a scenario map).** Left to right: `name · count [· ↺ on macOS-left
+platforms nothing changes]` — `≡ · Search` — `↺ · Ask the editor ▾ —
+moat — – □ ×`. The decisions, each earned against a critique round:
+(1) *The menu button rides the omnibar's left flank* — the palette IS
+the field's ">" mode, so its button lives on the field and the command
+list blooms under the click (P7 attachment; it used to sit across the
+bar in the window-controls corner, opening a menu in the middle of the
+screen). Its own button beside the field, never inside it — a field's
+interior belongs to the caret (P7). The field cedes the button's 31px
+so the ensemble claims exactly the old third (`OMNI_MENU_W`).
+(2) *History stays top-right* — the ↺-clock's corridor legibility was
+learned at that corner (Docs, Time Machine; iconography.md) — but the
+editor button and a moat of pure drag surface (56px, stepping to 24px
+in a narrow bar) now stand between it and the OS verbs. The extracted
+law: **no app verb adjacent to OS window controls.** (Rejected:
+footer placement — the strip covers the footer when open, hiding the
+control exactly when it must wear its open state (P12), and the footer
+lane is the writer's warm territory (P3); left-cluster placement — ↺
+beside the document name reads as "revert this document", and on macOS
+it would move into the traffic lights' shadow.)
+(3) *The count chip's emphasis is caret-scoped* — ink lifts only while
+the caret IS in the pile ("scraps · 86", the one state the chip must
+interrupt), never all day because a seam merely exists; the semibold
+died (the region word + the ink are two cues; the tinted scraps page
+is the loud warning). The doc name alone wears full ink at rest — the
+bar's anchor object (P11).
+(4) *The session goal is set INLINE in the count chip* (the rename
+idiom — P8, one grammar): the field swaps in beside the still-visible
+count, prefilled with the current goal selected; **erasing it erases
+the goal** (P13 — the inverse lives in the verb's own grammar), so the
+old bottom strip and its "enter sets · 0 clears · esc cancels" legend
+(a P4 conviction) are dead. In scraps the chip is a readout, not a
+control — a "scraps · N" click must not open a piece-goal editor.
+
 H3 completes the popover into three hairline-divided groups: inline
 marks `[B I S {} ==]` | headings `[H1 H2 H3]` | footnote `[¹]`. Each
 label demonstrates its own mark (B bold, I italic, S struck, {} mono,

@@ -58,11 +58,17 @@ const MARGIN_GAP: f32 = 16.;
 /// the window controls.
 const OMNI_FIELD_W: f32 = 400.;
 
+/// The menu button's footprint on the pill's left flank (icon 13 + 2×6
+/// padding + 6 gap): the ENSEMBLE [≡ · field] claims the third, so the
+/// field cedes this much — the side thirds keep the width they had when
+/// the field stood alone.
+const OMNI_MENU_W: f32 = 31.;
+
 /// The one omnibar width, shared by the titlebar field and its dropdown: a
-/// third of the window, capped. Both surfaces call this — they can never
-/// disagree.
+/// third of the window (minus the menu button riding the field's flank),
+/// capped. Both surfaces call this — they can never disagree.
 fn omni_field_width(window: &Window) -> f32 {
-    (f32::from(window.viewport_size().width) / 3.).clamp(160., OMNI_FIELD_W)
+    (f32::from(window.viewport_size().width) / 3.).clamp(191., OMNI_FIELD_W) - OMNI_MENU_W
 }
 /// Margin-card box metrics, shared by the height MEASUREMENT
 /// (`refresh_card_heights`) and the RENDER (`render_margin`) so a card's packed
@@ -7171,28 +7177,44 @@ impl Editor {
 
     /// "Set Session Goal…" (DESIGN §4.2): a number, a live delta in the
     /// titlebar, a quiet sage dot at the finish line. Session-only.
+    /// The goal editor swaps INLINE into the count chip (the rename idiom —
+    /// P8, one grammar for one meaning; the old bottom strip made the writer
+    /// click top-left and type at the bottom edge, and needed a legend). The
+    /// field opens prefilled with the current goal, selected: typing
+    /// replaces the datum, erasing it erases the goal — the inverse lives in
+    /// the same grammar as the verb (P13), so no "0 clears" caption exists.
     fn set_session_goal(&mut self, _: &SetSessionGoal, window: &mut Window, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
+        // The goal is a piece instrument (the chip hides the delta in
+        // scraps); a "scraps · N" chip must not open a piece-goal editor.
+        if self.caret_in_scraps() {
+            return;
+        }
         if self.goal_input.is_some() {
             return;
         }
-        let input = cx.new(|cx| TextField::single(cx, String::new()));
+        let seed = self
+            .session_goal
+            .map(|(goal, _)| goal.to_string())
+            .unwrap_or_default();
+        let input = cx.new(|cx| TextField::single_selected(cx, seed));
         cx.subscribe_in(
             &input,
             window,
             |editor, _, event: &TextFieldEvent, window, cx| {
                 match event {
                     TextFieldEvent::Commit(text) => {
-                        // A number sets, 0 clears, anything else is
-                        // ignored gracefully — the strip just closes.
-                        match text.trim().replace([',', ' '], "").parse::<usize>() {
-                            Ok(0) => editor.session_goal = None,
-                            Ok(goal) => {
+                        // A number sets; an ERASED field (or 0) clears;
+                        // garbage is ignored gracefully.
+                        let text = text.trim().replace([',', ' '], "");
+                        match (text.is_empty(), text.parse::<usize>()) {
+                            (true, _) | (_, Ok(0)) => editor.session_goal = None,
+                            (_, Ok(goal)) => {
                                 editor.session_goal = Some((goal, editor.word_count));
                             }
-                            Err(_) => {}
+                            (_, Err(_)) => {}
                         }
                     }
                     TextFieldEvent::Cancel => {}
@@ -7209,35 +7231,6 @@ impl Editor {
         window.focus(&input_focus, cx);
         self.goal_input = Some(input);
         cx.notify();
-    }
-
-    fn render_goal_strip(&self) -> Option<impl IntoElement> {
-        let input = self.goal_input.clone()?;
-        Some(
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .bg(rgb(0xF4F1EA))
-                .border_t_1()
-                .border_color(rgb(RULE_COLOR))
-                .px(px(28.))
-                .py(px(8.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .font_family("PT Serif")
-                .text_size(px(13.))
-                .child(div().text_color(rgb(MUTED_COLOR)).child("Session goal, words:"))
-                .child(div().flex_1().child(input))
-                .child(
-                    div()
-                        .text_color(rgb(MUTED_COLOR))
-                        .text_size(px(11.))
-                        .child("enter sets · 0 clears · esc cancels"),
-                ),
-        )
     }
 
     /// DESIGN §0.6 law 2: Esc dismisses exactly the TOPMOST layer, one per
@@ -12677,7 +12670,10 @@ impl Editor {
                             .ml(px(8.))
                             .px(px(4.))
                             .rounded(px(4.))
-                            .text_color(rgb(MUTED_COLOR))
+                            // The bar's anchor object (P11): the returning
+                            // eye asks "which document" — the name alone
+                            // wears full ink at rest.
+                            .text_color(rgb(TEXT_COLOR))
                             .cursor(CursorStyle::PointingHand)
                             .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                             .tooltip(tip("Rename", Some("f2")))
@@ -12706,35 +12702,60 @@ impl Editor {
                 // Clickable: sets or changes the goal for this sitting.
                 // Hidden in the reading room — the count lives in the banner
                 // (L16).
-                .when(!in_cold, |bar| bar.child(
+                .when(!in_cold, |bar| bar.child({
+                    let in_pile = self.caret_in_scraps();
                     div()
                         .id("word-count")
                         .occlude()
                         .ml(px(12.))
                         .px(px(4.))
                         .rounded(px(4.))
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("Set session goal", None))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.set_session_goal(&SetSessionGoal, window, cx);
-                            }),
-                        )
+                        // In scraps the chip is a readout, not a control —
+                        // the goal is a piece instrument, and a "scraps · N"
+                        // click must not open a piece-goal editor (P12).
+                        .when(!in_pile, |d| {
+                            d.cursor(CursorStyle::PointingHand)
+                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                .tooltip(tip("Set session goal", None))
+                        })
+                        .when(self.goal_input.is_none(), |d| {
+                            d.on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.set_session_goal(&SetSessionGoal, window, cx);
+                                }),
+                            )
+                        })
                         .child({
                             // Caret-scoped (P12; scopes-search 5): the label
                             // names its region once a seam exists, and any
                             // mid-pile screenshot self-identifies. In scraps
                             // the goal delta HIDES (not recomputed) — the
                             // goal is a piece instrument; mixing scopes in
-                            // one chip cuts P12 both ways. A seamed count
-                            // wears the mockup's emphasis (.count b).
+                            // one chip cuts P12 both ways. The emphasis is
+                            // caret-scoped too (2026-07-11 ordering round):
+                            // ink lifts only while the caret IS in the pile —
+                            // the one state the chip must interrupt — never
+                            // all day because a seam merely exists. Two cues
+                            // (the region word + the ink), no bold: the
+                            // tinted scraps page itself is the loud warning.
                             let label = self.count_label();
-                            let seamed = self.doc.boundary().is_some();
-                            match self.session_goal {
-                                Some((goal, start)) if !self.caret_in_scraps() => {
+                            match (&self.goal_input, self.session_goal) {
+                                // The goal editor, INLINE in the chip (the
+                                // rename idiom): the live count stays
+                                // visible beside the field the writer is
+                                // calibrating against.
+                                (Some(input), _) => div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child(label)
+                                    .child("·")
+                                    .child(div().w(px(72.)).child(input.clone()))
+                                    .into_any_element(),
+                                (None, Some((goal, start))) if !in_pile => {
                                     let delta = self.word_count as i64 - start as i64;
                                     let reached = delta >= goal as i64;
                                     div()
@@ -12742,14 +12763,7 @@ impl Editor {
                                         .items_center()
                                         .gap(px(6.))
                                         .text_color(rgb(MUTED_COLOR))
-                                        .child(
-                                            div()
-                                                .when(seamed, |d| {
-                                                    d.text_color(rgb(TEXT_COLOR))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                })
-                                                .child(label),
-                                        )
+                                        .child(label)
                                         .child(if reached {
                                             // Goal met: the separator quietly fills
                                             // in sage. No banner (§4b tension 3).
@@ -12765,16 +12779,16 @@ impl Editor {
                                         .into_any_element()
                                 }
                                 _ => div()
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .when(seamed, |d| {
-                                        d.text_color(rgb(TEXT_COLOR))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if in_pile {
+                                        rgb(TEXT_COLOR)
+                                    } else {
+                                        rgb(MUTED_COLOR)
                                     })
                                     .child(label)
                                     .into_any_element(),
                             }
-                        }),
-                ))
+                        })
+                }))
             )
             // The omnibar (06 §1): the centre control IS the palette's input —
             // a real type-able field whose dropdown is the results card, never
@@ -12783,6 +12797,56 @@ impl Editor {
             // and `find` focuses it, so the box types the moment it's touched.
             // The runway (fixed width, S4) is the affordance; the I-beam
             // confirms it. The space around it stays the window-drag handle.
+            //
+            // The menu button rides the pill's left flank (2026-07-11
+            // ordering round): the palette IS this field's ">" mode, so its
+            // button lives on the field and the command list blooms under
+            // the control that was clicked (P7 — the menu attaches; it used
+            // to sit across the bar in the window-controls corner). Its own
+            // button, never inside the field: a field's interior belongs to
+            // the caret (P7 again). Day-zero it stays the one unexplained
+            // button; the click answers with plain worded rows.
+            .child({
+                // Lit exactly while the palette (the ">" mode) is up — the
+                // control wears the mode it toggles (P12); find mode is the
+                // field's own state, not this button's.
+                let palette_up = self.palette_input.is_some()
+                    && matches!(omni_mode(&self.palette_query).0, OmniMode::Command);
+                div()
+                    .id("palette-toggle")
+                    .occlude()
+                    .flex_shrink_0()
+                    .px(px(6.))
+                    .py(px(4.))
+                    .mr(px(6.))
+                    .rounded(px(5.))
+                    .map(|d| {
+                        if in_cold {
+                            d.opacity(0.55).tooltip(tip("Command Palette", None))
+                        } else {
+                            d.cursor(CursorStyle::PointingHand)
+                                .when(palette_up, |d| d.bg(rgba(0x1A1A1812u32)))
+                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                .tooltip(tip("Command Palette", Some("ctrl-shift-p")))
+                        }
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            if editor.cold_read.is_some() {
+                                editor.pulse_cold_read(cx);
+                                return;
+                            }
+                            editor.toggle_palette(&TogglePalette, window, cx);
+                        }),
+                    )
+                    .child(icon(
+                        icons::MENU,
+                        13.,
+                        if palette_up { TEXT_COLOR } else { MUTED_COLOR },
+                    ))
+            })
             .child(match &self.palette_input {
                 Some(input) => {
                     // The find-mode match counter rides right of the query —
@@ -12904,7 +12968,8 @@ impl Editor {
                     .into_any_element(),
             })
             // Right third — mirrors the left (equal claims keep the centre
-            // still): the editor button, palette, history, window controls.
+            // still): history, the editor button, then the OS verbs behind
+            // a drag-surface moat (no app verb adjacent to window controls).
             .child(
                 div()
                     .flex_1()
@@ -12913,6 +12978,57 @@ impl Editor {
                     .flex()
                     .items_center()
                     .justify_end()
+                // History first in the cluster (2026-07-11 ordering round):
+                // the ↺-clock keeps the top-right residency where Docs and
+                // Time Machine taught it, but the editor button and the
+                // moat below now stand between it and the OS verbs — a
+                // misclick on its neighbour opens a menu (esc, free), never
+                // minimizes the window.
+                .child(
+                    div()
+                        .id("history-toggle")
+                        .occlude()
+                        .flex_shrink_0()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .mr(px(2.))
+                        .rounded(px(5.))
+                        .map(|d| {
+                            if in_cold {
+                                // Dimmed; the click pulses (Scopes 7).
+                                d.opacity(0.55).tooltip(tip("History", None))
+                            } else {
+                                d.cursor(CursorStyle::PointingHand)
+                                    .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
+                                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                    .tooltip(tip("History", Some("ctrl-alt-h")))
+                            }
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            // The clock toggles the STRIP (the new first history
+                            // surface); the right-side panel lives on in the palette
+                            // ("History panel"). The two never open together.
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.toggle_strip(&ToggleStrip, window, cx);
+                            }),
+                        )
+                        .child(
+                            // History: the counter-clockwise clock — the one
+                            // "versions" form the corridor already knows
+                            // (docs/iconography.md).
+                            icon(
+                                icons::HISTORY,
+                                13.,
+                                if self.strip.open && !in_cold {
+                                    TEXT_COLOR
+                                } else {
+                                    MUTED_COLOR
+                                },
+                            ),
+                        ),
+                )
                 // The editor button (impl 04 §0): the AI subsystem's single home,
                 // where its results live — just left of the margin side. The old
                 // drawn mini-card is gone; the control now WEARS its state (a
@@ -13037,100 +13153,31 @@ impl Editor {
                             },
                         ))
                 }))
-                // The day-zero affordance: a user who knows nothing clicks the
-                // one unexplained button and lands in a searchable list of every
-                // capability (GNOME primary-menu position). DIMMED in the
-                // reading room; a click pulses (Scopes 7).
-                .child(
-                    div()
-                        .id("palette-toggle")
-                        .occlude()
-                        .flex_shrink_0()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .rounded(px(5.))
-                        .map(|d| {
-                            if in_cold {
-                                d.opacity(0.55).tooltip(tip("Command Palette", None))
-                            } else {
-                                d.cursor(CursorStyle::PointingHand)
-                                    .when(self.palette_input.is_some(), |d| {
-                                        d.bg(rgba(0x1A1A1812u32))
-                                    })
-                                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                                    .tooltip(tip("Command Palette", Some("ctrl-shift-p")))
-                            }
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                if editor.cold_read.is_some() {
-                                    editor.pulse_cold_read(cx);
-                                    return;
-                                }
-                                editor.toggle_palette(&TogglePalette, window, cx);
-                            }),
-                        )
-                        .child(icon(icons::MENU, 13., MUTED_COLOR)),
-                )
-                .child(
-                    div()
-                        .id("history-toggle")
-                        .occlude()
-                        .flex_shrink_0()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .ml(px(2.))
-                        .rounded(px(5.))
-                        .text_color(if self.strip.open && !in_cold {
-                            rgb(TEXT_COLOR)
-                        } else {
-                            rgb(MUTED_COLOR)
-                        })
-                        .map(|d| {
-                            if in_cold {
-                                // Dimmed; the click pulses (Scopes 7).
-                                d.opacity(0.55).tooltip(tip("History", None))
-                            } else {
-                                d.cursor(CursorStyle::PointingHand)
-                                    .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
-                                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                                    .tooltip(tip("History", Some("ctrl-alt-h")))
-                            }
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            // The clock toggles the STRIP (the new first history
-                            // surface); the right-side panel lives on in the palette
-                            // ("History panel"). The two never open together.
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.toggle_strip(&ToggleStrip, window, cx);
-                            }),
-                        )
-                        .child(
-                            // History: the counter-clockwise clock — the one
-                            // "versions" form the corridor already knows
-                            // (docs/iconography.md).
-                            icon(
-                                icons::HISTORY,
-                                13.,
-                                if self.strip.open && !in_cold {
-                                    TEXT_COLOR
-                                } else {
-                                    MUTED_COLOR
-                                },
-                            ),
-                        ),
-                )
                 // Windows/Linux get our own drawn window controls. macOS keeps its
                 // native traffic lights (top-left) instead, so we omit these here —
                 // which also retires the macOS papercut that our "×" quit the whole
                 // app, and sidesteps the fact that the "–"/"×" glyph labels are the
                 // very thing the macOS glyph bug hides (issue #10).
                 .when(!cfg!(target_os = "macos"), |bar| {
-                    bar.child(self.window_button(icons::WIN_MINIMIZE, "Minimize", None, |window, _| {
+                    bar.child(
+                        // The moat: pure drag surface between the app verbs
+                        // and the OS verbs (no app verb adjacent to window
+                        // controls — the ordering round's extracted law).
+                        // Sized by the window, not by flex shrink — flex
+                        // distributes shortage proportionally, which would
+                        // truncate the editor button's label before the
+                        // moat spent its give. The 24px floor still buffers
+                        // a missed reach; 890 is where the wide moat plus
+                        // the resting "Ask the editor" both fit.
+                        div().h_full().flex_shrink_0().w(px(
+                            if f32::from(window.viewport_size().width) >= 890. {
+                                56.
+                            } else {
+                                24.
+                            },
+                        )),
+                    )
+                    .child(self.window_button(icons::WIN_MINIMIZE, "Minimize", None, |window, _| {
                         window.minimize_window()
                     }))
                     .child(self.window_button(icons::WIN_MAXIMIZE, "Maximize", None, |window, _| {
@@ -16525,10 +16572,10 @@ impl Editor {
         // a fixed-width estimate of the chrome right of it: those controls
         // flex-shrink in a narrow bar, which left the estimate ~75px off its
         // control. The estimate survives only as the first-frame fallback
-        // (palette-toggle 25 + history-toggle 2+25 [+ 3×28 window controls
-        // off macOS — its traffic lights sit top-LEFT]).
+        // (the editor button is the cluster's right edge on macOS; off
+        // macOS the 56px moat + 3×28 window controls sit right of it).
         let vw = f32::from(window.viewport_size().width);
-        let est = vw - if cfg!(target_os = "macos") { 52. } else { 136. };
+        let est = vw - if cfg!(target_os = "macos") { 0. } else { 140. };
         let btn_right = self.editor_btn_right.get().map_or(est, f32::from);
         let menu_right = (vw - btn_right).max(8.);
         // The lab's one-line law (392 there, chipless): verb + qualifier +
@@ -17245,10 +17292,6 @@ impl Render for Editor {
                 }
             })
             .map(|d| match self.render_alt_strip() {
-                Some(strip) => d.child(strip),
-                None => d,
-            })
-            .map(|d| match self.render_goal_strip() {
                 Some(strip) => d.child(strip),
                 None => d,
             })
