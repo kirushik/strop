@@ -1674,6 +1674,16 @@ fn count_words<'a>(chunks: impl Iterator<Item = &'a str>) -> usize {
     words
 }
 
+/// STROP_TEST_STILL (the visual rig, scripts/wflip.sh): freeze every clock so
+/// captures byte-compare across runs. Read ONCE into a static (V13b) — the env
+/// var can't change mid-process, so the per-card, per-frame `env::var` lookups
+/// this replaces were pure overhead.
+fn test_still() -> bool {
+    static STILL: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("STROP_TEST_STILL").is_some());
+    *STILL
+}
+
 /// `seed:legacy` prose: exactly `words` words of placeholder text, broken into
 /// ~40-word paragraphs so a checkpoint state reads like a real draft. Its word
 /// count is `words` and its char count is deterministic — the strip's legacy
@@ -6085,7 +6095,7 @@ impl Editor {
     /// cursor is nondeterminism. `cursor_visible` starts true and nothing
     /// ever toggles it, so the caret stays solid in every frame.
     pub fn start_blink(&self, cx: &mut Context<Self>) {
-        if std::env::var("STROP_TEST_STILL").is_ok() {
+        if test_still() {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -8420,10 +8430,17 @@ impl Editor {
         // paragraph starts with clean inline state, exactly as it starts with a
         // clean block kind. The span-side seam (SpanSet stops right-edge
         // expansion across a newline) covers marks the caret sits at the edge
-        // of; this clears the sticky caret arm the writer toggled but hasn't
-        // yet spent — so the freshly opened paragraph is not still-armed.
-        self.caret_attrs.clear();
+        // of; clearing the sticky caret arm here means the freshly opened
+        // paragraph is not still-armed. But `replace_text_in_range` may REFUSE
+        // the edit (cold read, parked past): clear only AFTER the seam actually
+        // opened (V5a), gauged by the revision bump — a refused Enter keeps the
+        // writer's unspent arm intact.
+        let rev = self.doc.revision();
         self.replace_text_in_range(None, "\n", window, cx);
+        if self.doc.revision() == rev {
+            return; // the edit was refused — arm and block kind untouched
+        }
+        self.caret_attrs.clear();
         if demote {
             let new_block = self.doc.block_of_byte(self.cursor_offset());
             self.doc
@@ -11226,7 +11243,7 @@ fn shape_grave_section(
         // The whisper speaks the strip's own date grammar ("Today",
         // "Fri 19 Jun") — one calendar voice per app (P8), never the machine's
         // ISO stamp. STROP_TEST_STILL keeps the frozen form for byte-compares.
-        let date = if std::env::var("STROP_TEST_STILL").is_ok() {
+        let date = if test_still() {
             format_unix(e.cut_unix)
         } else {
             strip::date_label(e.cut_unix, strop_core::journal::now_ms() / 1000)
@@ -11305,10 +11322,12 @@ fn shape_grave_section(
                 underline: None,
                 strikethrough: None,
             };
-            let body_text = if fragment {
-                format!("\u{201C}\u{2026}{}\u{201D}", e.text)
+            // A whole-block entry borrows its text straight through; only the
+            // fragment dress (the quoted-ellipsis wrapper) allocates (V16c).
+            let body_text: std::borrow::Cow<str> = if fragment {
+                format!("\u{201C}\u{2026}{}\u{201D}", e.text).into()
             } else {
-                e.text.clone()
+                std::borrow::Cow::Borrowed(e.text.as_str())
             };
             for para in body_text.split('\n') {
                 let run = TextRun { len: para.len(), ..body_run.clone() };
@@ -13884,7 +13903,7 @@ impl Editor {
 fn format_unix(secs: i64) -> String {
     // STROP_TEST_STILL (scripts/wflip.sh): captures are byte-compared, so
     // every rendered timestamp freezes to a fixed string.
-    if std::env::var("STROP_TEST_STILL").is_ok() {
+    if test_still() {
         return "0000-00-00 00:00".into();
     }
     let days = secs.div_euclid(86400);
@@ -15381,7 +15400,7 @@ struct MarginCard {
 /// Pure over its inputs so the caption formatter is unit-testable headlessly;
 /// the visual rig's STROP_TEST_STILL freezes it like every other timestamp.
 fn note_moment_label(created_unix: i64, now_secs: i64) -> String {
-    if std::env::var("STROP_TEST_STILL").is_ok() {
+    if test_still() {
         return "00:00".into();
     }
     let day = created_unix.div_euclid(86_400);
@@ -16773,6 +16792,10 @@ impl Editor {
         });
         let reduce_motion = self.config.reduce_motion;
         let lane_left = col_right + MARGIN_GAP;
+        // The wall-clock second, read ONCE for the whole lane (V13c) — every
+        // card's caption dates against the same "now", instead of each card
+        // re-reading the clock per frame.
+        let now_secs = strop_core::journal::now_ms() / 1000;
         Some(
             div()
                 .absolute()
@@ -16914,11 +16937,12 @@ impl Editor {
                         .then(|| self.focus.input().cloned())
                         .flatten();
                     let is_diagnosis = kind == NoteKind::Diagnosis;
-                    let now_secs = strop_core::journal::now_ms() / 1000;
                     let label = note_card_label(is_diagnosis, &level, orphaned, created_unix, now_secs);
                     // The caption's hover expands the moment to the full timestamp
                     // (P9 — hover only completes what is shown); writer notes only.
-                    let moment_full = (!is_diagnosis).then(|| format_unix(created_unix));
+                    // The stamp itself builds lazily, in the tooltip closure — a
+                    // card only pays for `format_unix` when actually hovered (V13c).
+                    let moment_full = !is_diagnosis;
                     let card = div()
                         .id(("note-card", id as usize))
                         .absolute()
@@ -16991,8 +17015,17 @@ impl Editor {
                                 .child(
                                     div()
                                         .id(("note-moment", id as usize))
-                                        .when_some(moment_full, |d, full| {
-                                            d.tooltip(tip(full, None))
+                                        .when(moment_full, |d| {
+                                            // Build the full timestamp only when
+                                            // the caption is actually hovered
+                                            // (V13c) — resting cards pay nothing.
+                                            d.tooltip(move |_window, cx| {
+                                                cx.new(|_| Tip {
+                                                    label: format_unix(created_unix).into(),
+                                                    chord: None,
+                                                })
+                                                .into()
+                                            })
                                         })
                                         .child(label),
                                 )
@@ -17048,6 +17081,12 @@ impl Editor {
                                                 .py(px(2.))
                                                 .rounded(px(5.))
                                                 .cursor(CursorStyle::PointingHand)
+                                                // The svg's ink is its own (no
+                                                // text-color cascade), so the
+                                                // hover ink-brighten rides a group
+                                                // — matching the titlebar dress
+                                                // fully (V16a).
+                                                .group("note-dismiss")
                                                 .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                                                 .tooltip(tip("Dismiss", None))
                                                 .on_mouse_down(
@@ -17067,7 +17106,12 @@ impl Editor {
                                                         },
                                                     ),
                                                 )
-                                                .child(icon(icons::DISMISS, 11., MUTED_COLOR)),
+                                                .child(
+                                                    icon(icons::DISMISS, 11., MUTED_COLOR)
+                                                        .group_hover("note-dismiss", |s| {
+                                                            s.text_color(rgb(TEXT_COLOR))
+                                                        }),
+                                                ),
                                         ),
                                 ),
                         )
