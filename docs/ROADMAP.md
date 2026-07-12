@@ -142,6 +142,16 @@ unless they'd be expensive to reverse.
 
 ## Backlog (researched properly, not squeezed in)
 
+- **Bounded-memory, unbounded exact history.** The 0.2 Arc/COW change removes
+  duplicate live side-state structures without capping in-session undo, but
+  the current persisted 50-entry tail still expands shared values into full
+  JSON snapshots. The post-0.2 design is an exact reversible transaction store:
+  a byte-budgeted hot window, immutable checksummed cold chunks, whole-timeline
+  summaries, boundary prefetch, and ultimately one versioned portable `.strop`
+  envelope. No depth cap and no “end of undo” at the RAM boundary. Measurements,
+  failure rules, migration, delivery order, and acceptance gates live in
+  [cold-history.md](cold-history.md).
+
 - **Startup/open/recovery failure UX — design for good.** The 0.2 standalone
   paper-styled error window is intentionally a contained stopgap: it never
   impersonates an editor and offers Try Again / Open Another / Close. The

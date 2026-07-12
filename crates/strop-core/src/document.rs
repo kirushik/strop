@@ -3037,6 +3037,19 @@ mod tests {
             "cow history: {steps} frames × {lines} blocks; 1 shared BlockMap allocation ({} BlockKind clones avoided)",
             steps * lines
         );
+        eprintln!(
+            "cow history: SideState handle = {} bytes/frame before Vec capacity and uniquely changed values",
+            std::mem::size_of::<SideState>()
+        );
+        for cap in [50, 200] {
+            let started = std::time::Instant::now();
+            let bytes = serde_json::to_vec(&doc.export_history(cap)).unwrap();
+            eprintln!(
+                "cow history: serialized cap {cap} = {} bytes in {:?}",
+                bytes.len(),
+                started.elapsed()
+            );
+        }
         let started = std::time::Instant::now();
         for _ in 0..steps { assert!(doc.undo().is_some()); }
         eprintln!("cow history: {steps} undos in {:?}", started.elapsed());
