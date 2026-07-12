@@ -697,6 +697,12 @@ impl Store {
         }
     }
 
+    /// Does `id` resolve in THIS document's store? The §9 paste precedence
+    /// asks existence only — no byte copy out of Loro for a yes/no.
+    pub fn has_asset(&self, id: &str) -> bool {
+        self.doc.get_map(ASSETS_CONTAINER).get(id).is_some()
+    }
+
     /// Record a named checkpoint at the current version. The state is
     /// materialized NOW — one cheap read of the live doc — so nothing ever
     /// has to time-travel back here (Checkpoint::state).

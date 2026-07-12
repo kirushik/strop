@@ -530,7 +530,7 @@ pub fn caption_from_title(title: &str) -> (String, SpanSet) {
     if title.is_empty() {
         return (String::new(), SpanSet::default());
     }
-    let oneline = title.replace('\r', " ").replace('\n', " ");
+    let oneline = title.replace(['\r', '\n'], " ");
     let (text, spans, _) = from_markdown(&oneline);
     (text.replace('\n', " "), spans)
 }

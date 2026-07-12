@@ -706,7 +706,7 @@ fn clamp_plan(rope: &ropey::Rope, blocks: &BlockMap, byte_range: &Range<usize>) 
     // last line).
     let line_start = |i: usize| rope.line_to_byte(i);
     let text_end = |i: usize| {
-        if i + 1 <= last_line {
+        if i < last_line {
             rope.char_to_byte(line_break_before(rope, rope.line_to_char(i + 1)))
         } else {
             rope.len_bytes()
@@ -757,15 +757,16 @@ fn clamp_plan(rope: &ropey::Rope, blocks: &BlockMap, byte_range: &Range<usize>) 
             // previous block's cover): demoted to a partial — both walls
             // stand, only the caption bytes in range go.
         }
-        if !consume_prec && !prec_claimed {
-            if let Some(sep) = &prec {
-                push_protected(sep);
-            }
+        if !consume_prec
+            && !prec_claimed
+            && let Some(sep) = &prec
+        {
+            push_protected(sep);
         }
-        if !consume_foll {
-            if let Some(sep) = &foll {
-                push_protected(sep);
-            }
+        if !consume_foll
+            && let Some(sep) = &foll
+        {
+            push_protected(sep);
         }
     }
     // The cuts: the range minus the standing walls.
@@ -3150,6 +3151,24 @@ impl Document {
     /// of the block FOLLOWING the image. One transaction: the separator
     /// insert and the kind stamp undo together.
     pub fn insert_image_block(&mut self, cursor_byte: usize, src: String) -> usize {
+        self.insert_image_block_full(cursor_byte, src, String::new(), "", &SpanSet::default())
+    }
+
+    /// `insert_image_block` carrying the §9 travelling form's luggage: the
+    /// rebuilt picture lands with its alt AND its caption — text and spans
+    /// both — in the same one transaction, so a cross-clipboard rebuild is
+    /// one undo step exactly like a bare insert. `caption` must be one
+    /// line (the paste grammar guarantees it); `caption_spans` are
+    /// char-based, rebased to the caption's own start.
+    pub fn insert_image_block_full(
+        &mut self,
+        cursor_byte: usize,
+        src: String,
+        alt: String,
+        caption: &str,
+        caption_spans: &SpanSet,
+    ) -> usize {
+        debug_assert!(!caption.contains('\n'), "a caption is one line by grammar");
         let rope = self.buffer.rope();
         let cursor_char = rope.byte_to_char(cursor_byte.min(self.len_bytes()));
         let line = rope.char_to_line(cursor_char);
@@ -3160,23 +3179,51 @@ impl Document {
         };
         let has_following = par_end_char < rope.len_chars();
         let par_end_byte = rope.char_to_byte(par_end_char);
-        // "\n" opens the image's own block between this paragraph and the
-        // next; when nothing follows, "\n\n" opens the image block AND the
-        // empty paragraph the caret needs to stand in.
-        let payload = if has_following { "\n" } else { "\n\n" };
-        self.edit_bytes(par_end_byte..par_end_byte, payload);
+        // "\n" opens the image's own block (its line text = the caption)
+        // between this paragraph and the next; when nothing follows, the
+        // trailing "\n" ALSO opens the empty paragraph the caret needs to
+        // stand in (§7: there is always an after).
+        let payload = if has_following {
+            format!("\n{caption}")
+        } else {
+            format!("\n{caption}\n")
+        };
+        self.edit_bytes(par_end_byte..par_end_byte, &payload);
         let image_block = line + 1;
+        self.set_block_kind_in_current_tx(image_block, BlockKind::Image { src, alt });
+        let cap_start = self.buffer.rope().line_to_char(image_block);
+        for s in caption_spans.spans() {
+            self.format_in_current_tx(
+                cap_start + s.range.start..cap_start + s.range.end,
+                s.attr.clone(),
+                true,
+            );
+        }
+        // Start of the block after the image: past the paragraph's end, the
+        // separator that opened the image block, and the caption line.
+        self.buffer.rope().line_to_byte(image_block + 1)
+    }
+
+    /// The §7 drop law's topmost gap: an image standing BEFORE the first
+    /// block. `insert_image_block` can only stand a block after the one
+    /// holding a byte, so the top gap gets its own splice: one "\n" opens
+    /// the new first line, then BOTH kinds are stamped deterministically —
+    /// the new line the picture, the pushed-down line its old kind — so
+    /// neither split law (flowing clones; furniture births Paragraph) can
+    /// misdress either side. One transaction; returns the byte after the
+    /// image block (the old first block's new start).
+    pub fn insert_image_block_before_first(&mut self, src: String) -> usize {
+        let old_kind = self.blocks.kind(0).clone();
+        self.edit_bytes(0..0, "\n");
         self.set_block_kind_in_current_tx(
-            image_block,
+            0,
             BlockKind::Image {
                 src,
                 alt: String::new(),
             },
         );
-        // Start of the block after the image: past the paragraph's end, the
-        // separator that opened the image block, and the image block's own
-        // (empty) line — all ASCII, so chars step to bytes 1:1 here.
-        self.buffer.rope().char_to_byte(par_end_char + 2)
+        self.set_block_kind_in_current_tx(1, old_kind);
+        1
     }
 
     /// Swap a picture's pixels in place (docs/inline-images.md §4's
@@ -4569,6 +4616,63 @@ mod tests {
         assert_eq!(doc.block_of_byte(caret), 2);
     }
 
+    #[test]
+    fn image_insert_full_lands_caption_alt_and_spans_in_one_step() {
+        // §9's rebuild: the travelling form's caption (text + spans) and
+        // alt land WITH the block, one transaction, one undo step.
+        let mut doc = Document::new("AAA\nBBB", SpanSet::default(), BlockMap::default());
+        let mut spans = SpanSet::default();
+        spans.add(0..4, InlineAttr::Emphasis);
+        let caret =
+            doc.insert_image_block_full(1, "asset:img1".into(), "a cat".into(), "look here", &spans);
+        assert_eq!(doc.text(), "AAA\nlook here\nBBB");
+        assert!(matches!(
+            doc.blocks().kind(1),
+            BlockKind::Image { src, alt } if src == "asset:img1" && alt == "a cat"
+        ));
+        assert_eq!(caret, 14, "caret at the start of the FOLLOWING block");
+        assert!(
+            doc.spans().attrs_at(4).any(|a| *a == InlineAttr::Emphasis),
+            "caption spans re-anchor onto the caption line"
+        );
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\nBBB", "one undo takes the whole rebuild back");
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        assert_eq!(doc.spans().spans().len(), 0);
+    }
+
+    #[test]
+    fn image_insert_before_first_stamps_both_sides() {
+        // §7's topmost gap: the new picture stands BEFORE block 0, and the
+        // pushed-down line keeps its old kind — for a flowing first block
+        // and for a furniture one alike (neither split law may misdress).
+        let mut doc = Document::new(
+            "Head\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Heading(1), BlockKind::Paragraph]),
+        );
+        let after = doc.insert_image_block_before_first("asset:top".into());
+        assert_eq!(doc.text(), "\nHead\nBBB");
+        assert!(matches!(doc.blocks().kind(0), BlockKind::Image { src, .. } if src == "asset:top"));
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Heading(1));
+        assert_eq!(after, 1, "byte after the image block = the old first block");
+        doc.undo();
+        assert_eq!(doc.text(), "Head\nBBB");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(1));
+
+        // Furniture first block: the old picture keeps its pixels on the
+        // pushed-down line; the new one stands above it.
+        let mut doc = Document::new(
+            "cap\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:old"), BlockKind::Paragraph]),
+        );
+        doc.insert_image_block_before_first("asset:new".into());
+        assert_eq!(doc.text(), "\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(0), BlockKind::Image { src, .. } if src == "asset:new"));
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:old"));
+    }
+
     // ---- the §2 wall law: furniture vs the edit path ------------------
 
     fn img(src: &str) -> BlockKind {
@@ -4615,6 +4719,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
     fn clamp_plan_takes_a_covered_block_whole() {
         let doc = cap_doc();
         // Separator + caption + separator: enclosed, taken by the PRECEDING
@@ -4633,6 +4738,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
     fn clamp_plan_empty_caption_demands_full_enclosure() {
         // "AAA\n\nBBB": empty caption at 4..4, seps 3..4 and 4..5. A lone
         // separator range must never drain the picture; both separators
@@ -4648,6 +4754,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
     fn clamp_plan_walls_between_adjacent_furniture() {
         // "AAA\nc1\nc2\nBBB", two images back to back: the shared separator
         // is a wall for both; a range across it clamps on both sides.
@@ -4668,6 +4775,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
     fn clamp_plan_furniture_at_document_edges() {
         // Image first: no preceding separator exists, so enclosure covers
         // content + the following one; the cover runs on into the flank.
@@ -4687,6 +4795,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
     fn clamp_plan_replacement_starting_in_a_wall_lands_left() {
         // A replacement whose range STARTS inside a surviving separator
         // steps back onto the wall's left face (the range start's side).

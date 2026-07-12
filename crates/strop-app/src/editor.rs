@@ -17,7 +17,8 @@ use std::sync::Arc;
 use gpui::{
     Animation, AnimationExt,
     AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
-    Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
+    Decorations, DragMoveEvent, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla,
+    RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PaintQuad,
@@ -1254,6 +1255,13 @@ pub struct Editor {
     /// capture-phase key-up listener on the editor column; the platform's
     /// own repeat flag (`is_held`) is never trusted — it lies on X11.
     image_stage_hold: Option<&'static str>,
+    /// §7's drag-over layer: while an external file drag is over the
+    /// window, the gap between blocks nearest the pointer — (gap index,
+    /// the insertion rule's doc-space y). Painted as the quiet rule ("it
+    /// will land here", P6), gated on `cx.has_active_drag()` so a drag
+    /// that Exited never leaves a stale rule; the LANDING law never reads
+    /// this — the drop's own position aims it (§7: unconditional).
+    drop_gap: Option<(usize, Pixels)>,
     /// The writer's caret/selection saved at composer-open (LAW 2 / C4 split
     /// exit): `(range, reversed)`. A keyboard commit or a dead-zone click-away
     /// restores it so the exit lands where thought left off; a click INTO the
@@ -1932,6 +1940,7 @@ impl Editor {
             alt_input: None,
             image_sel: None,
             image_stage_hold: None,
+            drop_gap: None,
             composer_return: None,
             voice_baseline: None,
             card_heights: HashMap::new(),
@@ -6519,12 +6528,76 @@ impl Editor {
         format!("{above}\n{below}")
     }
 
+    /// One fragment of `clipboard_text` (§9): the plain doc slice, with
+    /// every image block the range covers WHOLE swapped for its Markdown
+    /// line — the travelling form, so a range copy carries pictures. A
+    /// partially covered caption stays the plain fragment the writer
+    /// selected (only the whole block owns the Markdown form; a partial
+    /// range is just text). Prose pays one kind scan over the spanned
+    /// blocks and nothing more.
+    fn clipboard_slice(&self, range: Range<usize>) -> String {
+        let covered = self.covered_image_lines(&range);
+        if covered.is_empty() {
+            return self.doc.slice_bytes(range);
+        }
+        splice_image_markdown(&self.doc.slice_bytes(range.clone()), range.start, &covered)
+    }
+
+    /// Image blocks whose LINE TEXT `range` covers whole, with their §9
+    /// Markdown forms — ascending, ranges within `range` by construction.
+    fn covered_image_lines(&self, range: &Range<usize>) -> Vec<(Range<usize>, String)> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+        let rope = self.doc.rope();
+        let first = rope.byte_to_line(range.start);
+        let last = rope.byte_to_line(range.end.min(self.doc.len_bytes()));
+        let kinds = self.doc.blocks().kinds();
+        let mut out = Vec::new();
+        for block in first..=last.min(kinds.len().saturating_sub(1)) {
+            if !matches!(kinds.get(block), Some(BlockKind::Image { .. })) {
+                continue;
+            }
+            let (start, end) = self.image_block_bounds(block);
+            if range.start <= start
+                && end <= range.end
+                && let Some(md) = self.image_block_markdown(block)
+            {
+                out.push((start..end, md));
+            }
+        }
+        out
+    }
+
+    /// `selection_text`, dressed for the pasteboard (§9): the same seam
+    /// law, with every fragment passing the image splice. The find seed
+    /// and every other in-app reader keep `selection_text` — the Markdown
+    /// form exists for travel only.
+    fn clipboard_text(&self, range: &Range<usize>) -> String {
+        if !self.selection_spans_seam(range) {
+            return self.clipboard_slice(range.clone());
+        }
+        let m = self.doc.manuscript_char_range();
+        let s = self
+            .doc
+            .scraps_char_range()
+            .unwrap_or_else(|| m.clone());
+        let (above_end, below_start) = if s.start > m.end {
+            (self.doc.char_to_byte(m.end), self.doc.char_to_byte(s.start))
+        } else {
+            (self.doc.char_to_byte(s.end), self.doc.char_to_byte(m.start))
+        };
+        let above = self.clipboard_slice(range.start.min(above_end)..above_end.min(range.end));
+        let below = self.clipboard_slice(below_start.max(range.start)..range.end.max(below_start));
+        format!("{above}\n{below}")
+    }
+
     /// Linux PRIMARY-selection contract: any selection (mouse or keyboard)
     /// is published; middle-click pastes it. With auto_copy_selection
     /// (config), the regular clipboard gets it too — Kirill's habit.
     fn publish_primary(&self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            let text = self.selection_text(&self.selected_range.clone());
+            let text = self.clipboard_text(&self.selected_range.clone());
             if self.config.auto_copy_selection {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             }
@@ -6940,11 +7013,9 @@ impl Editor {
         (p.x >= img_x && p.x < img_x + sz.width).then_some(par_ix)
     }
 
-    /// Phase-5 seam (§9 copy/cut): the selected picture's travelling
-    /// Markdown form `![alt](src "caption")`, produced by the ONE exporter
-    /// so quoting and span flattening can never fork. Nothing wires the
-    /// clipboard yet — cut is copy + leave-whole and lands next phase.
-    #[allow(dead_code)]
+    /// §9 copy/cut: the selected picture's travelling Markdown form
+    /// `![alt](src "caption")`, produced by the ONE exporter so quoting
+    /// and span flattening can never fork.
     fn image_block_markdown(&self, block: usize) -> Option<String> {
         if !matches!(self.doc.blocks().kind(block), BlockKind::Image { .. }) {
             return None;
@@ -6961,6 +7032,26 @@ impl Editor {
                 .trim_end()
                 .to_owned(),
         )
+    }
+
+    /// §9's two-entry travelling form for a selected picture: the Markdown
+    /// line as text (caption and alt survive everywhere) and the stored
+    /// bytes as a bitmap (real pixels where the pasteboard carries them —
+    /// on Linux cross-app only the text half survives, the recorded
+    /// platform cost). Bytes leave the asset store exactly as imported,
+    /// so the bitmap entry's format is the asset's own extension.
+    fn image_clipboard_item(&self, block: usize) -> Option<ClipboardItem> {
+        let md = self.image_block_markdown(block)?;
+        let mut entries = vec![ClipboardEntry::String(gpui::ClipboardString::new(md))];
+        if let BlockKind::Image { src, .. } = self.doc.blocks().kind(block)
+            && let Some(bytes) = self.store.as_ref().and_then(|s| s.get_asset(src))
+        {
+            entries.push(ClipboardEntry::Image(gpui::Image::from_bytes(
+                image_format_for_src(src),
+                bytes,
+            )));
+        }
+        Some(ClipboardItem { entries })
     }
 
     // -- Actions -------------------------------------------------------------
@@ -9138,6 +9229,15 @@ impl Editor {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            // §9: the selected picture travels as TWO entries — the
+            // Markdown line (caption + alt, the honest text form) and the
+            // pixels — so elsewhere never gets a dead asset: link alone.
+            if let Some(sel) = self.image_sel_live()
+                && let Some(item) = self.image_clipboard_item(sel.block)
+            {
+                crate::smoke::mirror_clipboard_item(&item);
+                cx.write_to_clipboard(item);
+            }
             return;
         }
         // Copy MUST work while parked (Bug B): the writer wants to lift text out
@@ -9153,9 +9253,11 @@ impl Editor {
                 p.text.get(r).unwrap_or("").to_owned()
             }
             // Live copy strips the seam from a spanning selection
-            // (seam-mechanics 2 — the fragments join with one newline).
-            None => self.selection_text(&self.selected_range.clone()),
+            // (seam-mechanics 2 — the fragments join with one newline) and
+            // carries whole-covered pictures in their Markdown form (§9).
+            None => self.clipboard_text(&self.selected_range.clone()),
         };
+        crate::smoke::mirror_clipboard(&text);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
@@ -9169,37 +9271,175 @@ impl Editor {
             self.pulse_strip(cx);
             return;
         }
-        if !self.selected_range.is_empty() {
-            // Cut = copy + delete (seam-mechanics 2): the clipboard joins a
-            // spanning selection's fragments; the delete path below splits
-            // at the seam and leaves it between the remnants.
-            let text = self.selection_text(&self.selected_range.clone());
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.replace_text_in_range(None, "", window, cx);
+        if self.selected_range.is_empty() {
+            // §9 cut = copy + leave-whole: the same two entries, then the
+            // block exits by the §5 whole-block door — both halves of the
+            // verb in one gesture, inverse intact (P13: Put back, or paste
+            // it back — either door).
+            if let Some(sel) = self.resolve_image_sel()
+                && let Some(item) = self.image_clipboard_item(sel.block)
+            {
+                crate::smoke::mirror_clipboard_item(&item);
+                cx.write_to_clipboard(item);
+                self.exile_image_block(sel.block, cx);
+            }
+            return;
         }
+        // Cut = copy + delete (seam-mechanics 2): the clipboard joins a
+        // spanning selection's fragments (pictures in Markdown form, §9);
+        // the delete path below splits at the seam and leaves it between
+        // the remnants.
+        let text = self.clipboard_text(&self.selected_range.clone());
+        crate::smoke::mirror_clipboard(&text);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.replace_text_in_range(None, "", window, cx);
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
-        let Some(item) = cx.read_from_clipboard() else {
-            // Headless-rig transport shim (see smoke::clipboard_override):
-            // present so a leak test CAN catch a field paste falling
-            // through to the document — never set outside smoke runs.
-            if let Some(text) = crate::smoke::clipboard_override() {
-                self.apply_replace(None, &text.replace("\r\n", "\n"), false, true, cx);
-            }
+        // The or_else is the headless-rig transport shim (see
+        // smoke::clipboard_item_override) — never set outside smoke runs;
+        // it now carries whole items so the rig can round-trip §9's
+        // two-entry image form, not just text.
+        let Some(item) = cx
+            .read_from_clipboard()
+            .or_else(crate::smoke::clipboard_item_override)
+        else {
             return;
         };
-        for entry in item.into_entries() {
+        // §9's gates, priced for prose: one reference pass over the
+        // entries, and the image-line parse runs only when the text even
+        // contains "![" — an ordinary paste pays two finds and a substring
+        // scan, no allocation beyond what it always paid.
+        let mut entries = item.entries;
+        let text_entry: Option<String> = entries.iter().find_map(|e| match e {
+            ClipboardEntry::String(s) => Some(s.text().replace("\r\n", "\n")),
+            _ => None,
+        });
+        let bitmap_ix = entries
+            .iter()
+            .position(|e| matches!(e, ClipboardEntry::Image(_)));
+        let take_bitmap = |entries: &mut Vec<ClipboardEntry>, ix: usize| -> Vec<u8> {
+            match entries.swap_remove(ix) {
+                ClipboardEntry::Image(img) => img.bytes,
+                _ => unreachable!("bitmap_ix indexes an Image entry"),
+            }
+        };
+        let strop_line = text_entry
+            .as_deref()
+            .filter(|t| t.contains("!["))
+            .and_then(strop_core::markdown::parse_image_line);
+
+        if let Some(sel) = self.image_sel_live() {
+            // §4: a paste that MEANS a picture, aimed at the selected
+            // picture, replaces in place — same block, caption and alt
+            // untouched, one undo step. The §9 precedence still orders the
+            // pixel sources: the text form's asset: hash when it resolves
+            // here (no bytes touched at all), else the sibling bitmap
+            // through the §5b import. Text that isn't a picture falls
+            // through — apply_replace's §4 gate types it into the caption.
+            if let Some(line) = &strop_line {
+                if self.store.as_ref().is_some_and(|s| s.has_asset(&line.src)) {
+                    self.doc.replace_image_src(sel.block, line.src.clone());
+                    self.restamp_image_sel(sel.block);
+                    self.mark_dirty();
+                    self.sync_mutations();
+                    self.bump_activity();
+                    cx.notify();
+                } else if let Some(ix) = bitmap_ix {
+                    let bytes = take_bitmap(&mut entries, ix);
+                    self.replace_selected_image_pixels(sel, bytes, cx);
+                } else {
+                    // A picture-shaped paste whose pixels resolve nowhere:
+                    // refused, logged — a replace that cannot deliver
+                    // pixels must not degrade into caption text.
+                    eprintln!(
+                        "strop: paste aimed at the selected picture, \
+                         but its pixels resolve nowhere; nothing changed"
+                    );
+                }
+                return;
+            }
+            if let Some(ix) = bitmap_ix {
+                let bytes = take_bitmap(&mut entries, ix);
+                self.replace_selected_image_pixels(sel, bytes, cx);
+                return;
+            }
+        } else if let Some(line) = &strop_line {
+            // §9's precedence ladder, single image line: the text form
+            // wins — caption and alt come from it ALWAYS; pixels from the
+            // asset store when the hash resolves in this document, else
+            // from the sibling bitmap (blake3 dedupe keeps the re-import
+            // byte-honest), else the paste degrades to the literal
+            // Markdown line as visible text — the fall-through below.
+            if self.strip.is_parked() {
+                self.pulse_strip(cx);
+                return;
+            }
+            if self.history_view.is_some() {
+                return;
+            }
+            if self.store.as_ref().is_some_and(|s| s.has_asset(&line.src)) {
+                if self.selected_range.is_empty() && self.marked_range.is_none() {
+                    // The picture verb's shape (§7): its own block after
+                    // the caret's, caret parked past it.
+                    let (caption, spans) =
+                        strop_core::markdown::caption_from_title(&line.caption);
+                    let cursor = self.cursor_offset().min(self.doc.len_bytes());
+                    let cursor = self.doc.insert_image_block_full(
+                        cursor,
+                        line.src.clone(),
+                        line.alt.clone(),
+                        &caption,
+                        &spans,
+                    );
+                    self.selected_range = cursor..cursor;
+                    self.selection_reversed = false;
+                    self.mark_dirty();
+                    self.sync_mutations();
+                    self.bump_activity();
+                    cx.notify();
+                    return;
+                }
+                // Over a range selection the paste is the text verb: the
+                // rebuild splice replaces the selection in one step. A
+                // landing the splice can't honor (seam, wall) degrades to
+                // the literal line below — visible, never silent.
+                if self.paste_rebuild_lines(
+                    text_entry.as_deref().unwrap_or_default(),
+                    vec![(0, line.clone())],
+                    cx,
+                ) {
+                    return;
+                }
+            } else if let Some(ix) = bitmap_ix {
+                let bytes = take_bitmap(&mut entries, ix);
+                self.import_image_with_meta(bytes, line.alt.clone(), line.caption.clone(), cx);
+                return;
+            }
+        } else if let Some(text) = text_entry.as_deref().filter(|t| t.contains("![") && t.contains('\n')) {
+            // §9's range-paste: each LINE that parses as a Strop image
+            // line with a resolving asset rebuilds an image block; every
+            // other line stays literal visible text (the boundary rule).
+            let images = image_lines_in(text, &|src| {
+                self.store.as_ref().is_some_and(|s| s.has_asset(src))
+            });
+            if !images.is_empty() && self.paste_rebuild_lines(text, images, cx) {
+                return;
+            }
+        }
+        // The ordinary path, order-preserved from before §9: a foreign
+        // bitmap takes the bare §5b import; text pastes as text (never
+        // typographed — already authored).
+        for entry in entries {
             match entry {
                 ClipboardEntry::Image(image) => {
                     self.import_image_bytes(image.bytes, cx);
                     return;
                 }
                 ClipboardEntry::String(text) => {
-                    // Pasted text is never typographed — already authored.
                     let text = text.text().replace("\r\n", "\n");
                     self.apply_replace(None, &text, false, true, cx);
                     return;
@@ -9211,15 +9451,115 @@ impl Editor {
         }
     }
 
+    /// §9's multi-line rebuild: ONE verbatim splice carries the whole
+    /// paste — image lines travel as their caption text — and the image
+    /// kinds, alt and caption spans stamp inside the same transaction, so
+    /// undo takes the paste back in one step. Boundary separators are
+    /// added by the plan so a rebuilt picture always owns its whole line
+    /// (the §2 wall's insert-shape corollary: prose never fuses onto a
+    /// picture). Returns false — nothing mutated — when the landing
+    /// crosses a law this splice can't honor (a seam-spanning or
+    /// furniture-touching selection): the caller degrades to the literal
+    /// text paste, visible, never silent (recorded ruling).
+    fn paste_rebuild_lines(
+        &mut self,
+        text: &str,
+        images: Vec<(usize, strop_core::markdown::ImageLine)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return true; // consumed: the past is read-only
+        }
+        if self.history_view.is_some() {
+            return true;
+        }
+        let range = self
+            .marked_range
+            .clone()
+            .unwrap_or(self.selected_range.clone());
+        if self.selection_spans_seam(&range) {
+            return false;
+        }
+        if !range.is_empty() {
+            // The wall-clamped replace decomposes at furniture and lands
+            // the insert elsewhere than range.start — the stamp math below
+            // would misdress blocks. Degrade instead of guessing.
+            let rope = self.doc.rope();
+            let first = rope.byte_to_line(range.start);
+            let last = rope.byte_to_line(range.end.min(self.doc.len_bytes()));
+            let kinds = self.doc.blocks().kinds();
+            if kinds[first..=last.min(kinds.len().saturating_sub(1))]
+                .iter()
+                .any(BlockKind::is_furniture)
+            {
+                return false;
+            }
+        }
+        let rope = self.doc.rope();
+        let at_line_start = range.start == 0
+            || rope.char(rope.byte_to_char(range.start) - 1) == '\n';
+        let at_line_end = range.end < self.doc.len_bytes()
+            && rope.char(rope.byte_to_char(range.end)) == '\n';
+        let (final_text, stamps) =
+            plan_image_line_rebuild(text, images, at_line_start, at_line_end);
+        self.doc.edit_bytes_verbatim(range.clone(), &final_text);
+        let base_line = self.doc.rope().byte_to_line(range.start);
+        for (line_ix, line, spans) in &stamps {
+            let block = base_line + line_ix;
+            self.doc.set_block_kind_in_current_tx(
+                block,
+                BlockKind::Image {
+                    src: line.src.clone(),
+                    alt: line.alt.clone(),
+                },
+            );
+            let cap_start = self.doc.rope().line_to_char(block);
+            for s in spans.spans() {
+                self.doc.format_in_current_tx(
+                    cap_start + s.range.start..cap_start + s.range.end,
+                    s.attr.clone(),
+                    true,
+                );
+            }
+        }
+        let caret = (range.start + final_text.len()).min(self.doc.len_bytes());
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.goal_x = None;
+        self.mark_dirty();
+        self.sync_mutations();
+        self.bump_activity();
+        cx.notify();
+        // A replaced range may have carried margin anchors, exactly like
+        // any other structural removal.
+        self.reconcile_dead_anchors(cx);
+        true
+    }
+
     /// Run the §5b import pipeline off the UI thread, then insert a block.
     fn import_image_bytes(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.import_image_with_meta(bytes, String::new(), String::new(), cx);
+    }
+
+    /// §9's middle rung shares the §5b pipeline: the pixels re-import
+    /// (blake3 dedupe keeps it byte-honest) and the block lands wearing
+    /// the text form's caption and alt — empty for a bare bitmap.
+    fn import_image_with_meta(
+        &mut self,
+        bytes: Vec<u8>,
+        alt: String,
+        caption_md: String,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { strop_core::images::import_image(bytes) })
                 .await;
             this.update(cx, |editor: &mut Editor, cx| match result {
-                Ok(imported) => editor.insert_image_block(imported, cx),
+                Ok(imported) => editor.insert_imported_image(imported, &alt, &caption_md, cx),
                 Err(e) => eprintln!("strop: {e}"),
             })
             .ok();
@@ -9227,9 +9567,11 @@ impl Editor {
         .detach();
     }
 
-    fn insert_image_block(
+    fn insert_imported_image(
         &mut self,
         imported: strop_core::images::Imported,
+        alt: &str,
+        caption_md: &str,
         cx: &mut Context<Self>,
     ) {
         let Some(store) = &self.store else {
@@ -9243,7 +9585,10 @@ impl Editor {
         // of the block after it (report 4) — never ON the image, where typing
         // would write invisible text into the image block. The document owns
         // the shape (separators, trailing paragraph, kind stamp, one tx).
-        let cursor = self.doc.insert_image_block(cursor, src);
+        let (caption, spans) = strop_core::markdown::caption_from_title(caption_md);
+        let cursor =
+            self.doc
+                .insert_image_block_full(cursor, src, alt.to_owned(), &caption, &spans);
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.sync_mutations();
@@ -9251,13 +9596,262 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_file_drop(&mut self, paths: &ExternalPaths, _: &mut Window, cx: &mut Context<Self>) {
+    /// §4 replace-in-place, the async half: the §5b import runs
+    /// off-thread, and the SELECTION is re-checked on the UI thread after
+    /// it lands — block AND revision — because the writer may have
+    /// deselected or edited meanwhile. A decayed aim DROPS the operation
+    /// (recorded ruling): a replace is aimed at a selection; when the aim
+    /// is gone, materializing the picture at some caret the writer never
+    /// aimed would be a silent insertion elsewhere — §4's exact forbidden
+    /// outcome. Nothing destructive happened; one stderr line records the
+    /// drop.
+    fn replace_selected_image_pixels(
+        &mut self,
+        sel: ImageSel,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { strop_core::images::import_image(bytes) })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                let imported = match result {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("strop: {e}");
+                        return;
+                    }
+                };
+                if editor
+                    .image_sel_live()
+                    .is_none_or(|l| (l.block, l.revision) != (sel.block, sel.revision))
+                {
+                    eprintln!(
+                        "strop: replace-in-place aimed at a picture that is \
+                         no longer selected; dropped (nothing changed)"
+                    );
+                    return;
+                }
+                let Some(store) = &editor.store else { return };
+                let src = store.put_asset(imported.bytes, imported.ext);
+                // Same block, caption + alt untouched, ONE undo step (§4;
+                // the snapshot path inside replace_image_src) — then the
+                // legitimate in-state mutation re-stamps the revision
+                // guard through the one funnel (R3).
+                editor.doc.replace_image_src(sel.block, src);
+                editor.restamp_image_sel(sel.block);
+                editor.mark_dirty();
+                editor.sync_mutations();
+                editor.bump_activity();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// §7: the drop lands at the GAP between blocks nearest the pointer,
+    /// and the caret never moves — the hand aimed the drop; the caret
+    /// wasn't involved (the old caret-relative landing is the recorded
+    /// Norman gulf-of-evaluation failure). The pointer-targeted landing
+    /// is unconditional: it reads the drop's own position (Submit carries
+    /// it; `window.mouse_position()` holds it here), never the drag-over
+    /// rule, so a platform that withheld Pending still lands right.
+    /// Multi-file: each file in order at the same gap. ONE file dropped
+    /// onto the selected picture's pixels replaces in place (§4); a
+    /// multi-file drop always lands at the gap — spraying N pictures into
+    /// one replace slot has no honest meaning (recorded ruling).
+    fn on_file_drop(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_gap = None;
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse
+        }
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return; // the past is read-only
+        }
+        if self.history_view.is_some() {
+            return;
+        }
+        let position = window.mouse_position();
+        if let [path] = paths.paths()
+            && let Some(sel) = self.image_sel_live()
+            && self.image_pixel_hit(position) == Some(sel.block)
+        {
+            match std::fs::read(path) {
+                Ok(bytes) => self.replace_selected_image_pixels(sel, bytes, cx),
+                Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
+            }
+            return;
+        }
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let p = frame.doc_point(position);
+        let Some((gap, _)) = self.drop_gap_at(p) else {
+            return;
+        };
+        let mut files = Vec::new();
         for path in paths.paths() {
             match std::fs::read(path) {
-                Ok(bytes) => self.import_image_bytes(bytes, cx),
+                Ok(bytes) => files.push(bytes),
                 Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
             }
         }
+        if files.is_empty() {
+            return;
+        }
+        // Anchor the gap as a byte so the async import survives a stray
+        // edit: gap g > 0 means "after block g-1" (any byte of its line;
+        // its end names the gap). Gap 0 — before the first block — is the
+        // one splice `insert_image_block` can't express (None).
+        let anchor = (gap > 0).then(|| self.image_block_bounds(gap - 1).1);
+        cx.spawn(async move |this, cx| {
+            let imported = cx
+                .background_executor()
+                .spawn(async move {
+                    files
+                        .into_iter()
+                        .filter_map(|b| {
+                            strop_core::images::import_image(b)
+                                .map_err(|e| eprintln!("strop: {e}"))
+                                .ok()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor.land_dropped_images(imported, anchor, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The UI-thread half of a §7 drop: stand each picture at the gap, in
+    /// order, and leave the caret exactly where it stood — its offsets
+    /// shift with the insertion when it sits below the gap (same text
+    /// position, never a new one), and NO autoscroll fires: the writer is
+    /// looking at the drop, not the caret.
+    fn land_dropped_images(
+        &mut self,
+        imported: Vec<strop_core::images::Imported>,
+        anchor: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if imported.is_empty() {
+            return;
+        }
+        let Some(store) = &self.store else {
+            eprintln!("strop: image dropped, but no document store to keep it in");
+            return;
+        };
+        let srcs: Vec<String> = imported
+            .into_iter()
+            .map(|i| store.put_asset(i.bytes, i.ext))
+            .collect();
+        self.mark_dirty();
+        let caret = self.selected_range.clone();
+        let before_len = self.doc.len_bytes();
+        // Clamped in case an edit slipped in during the import (the gap
+        // was aimed at pixels; a moved wall still lands at a block end).
+        let mut at = anchor.map(|a| a.min(self.doc.len_bytes()));
+        for src in srcs {
+            let after = match at {
+                Some(a) => self.doc.insert_image_block(a, src),
+                None => self.doc.insert_image_block_before_first(src),
+            };
+            // The next file lands below this one: the new block's own
+            // line end names the gap under it.
+            at = Some(after.saturating_sub(1));
+        }
+        let delta = self.doc.len_bytes() - before_len;
+        let len = self.doc.len_bytes();
+        // A caret byte at the anchor itself is the end of the block ABOVE
+        // the gap — it stays; gap 0 has no block above, so everything
+        // shifts.
+        let shift = |o: usize| {
+            if anchor.is_none_or(|a| o > a) {
+                (o + delta).min(len)
+            } else {
+                o
+            }
+        };
+        self.selected_range = shift(caret.start)..shift(caret.end);
+        self.sync_mutations();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// §7's drag-over layer: while an external file drag crosses the
+    /// window, park the insertion rule at the gap nearest the pointer.
+    /// gpui synthesizes FileDropEvent::Pending into MouseMove with the
+    /// paths riding `cx.active_drag` (fork window.rs:4602), which is
+    /// exactly what `on_drag_move::<ExternalPaths>` keys on; a platform
+    /// that withholds Pending simply never paints the rule — the landing
+    /// law in `on_file_drop` does not depend on it.
+    fn on_external_drag_move(
+        &mut self,
+        ev: &DragMoveEvent<ExternalPaths>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // gpui's drop dispatch gates on `hitbox.is_hovered`, which reads
+        // the input-modality flag — and FileDropEvent never updates it
+        // (fork window.rs:4529 maps only KeyDown/MouseDown/MouseMove), so
+        // a drop right after TYPING would be silently refused: during a
+        // drag the pointer is grabbed and no real MouseMove ever arrives
+        // to flip the flag. Nudge it with exactly the event the platform
+        // would have sent — deferred, never re-entering dispatch mid-event.
+        // Rig-proven (dragenter after ctrl-end); the fork-side modality
+        // fix is a named follow-up on the pending fork-push ceremony.
+        if window.last_input_was_keyboard() {
+            let position = ev.event.position;
+            window.defer(cx, move |window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                        position,
+                        pressed_button: None,
+                        modifiers: gpui::Modifiers::default(),
+                    }),
+                    cx,
+                );
+            });
+        }
+        if self.history_view.is_some() || self.strip.is_parked() || self.cold_read.is_some() {
+            if self.drop_gap.take().is_some() {
+                cx.notify();
+            }
+            return; // surfaces where the drop would be refused show no rule
+        }
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let gap = self.drop_gap_at(frame.doc_point(ev.event.position));
+        if gap != self.drop_gap {
+            self.drop_gap = gap;
+            cx.notify();
+        }
+    }
+
+    /// The gap between blocks nearest a doc-space point, with the
+    /// insertion rule's doc-space y (`drop_gap_for_y` owns the math).
+    /// None on a stale frame — never trust geometry past the live rope.
+    fn drop_gap_at(&self, p: Point<Pixels>) -> Option<(usize, Pixels)> {
+        let frame = self.last_frame.as_ref()?;
+        let last = frame.paragraphs.last()?;
+        if last.range.end > self.doc.len_bytes() {
+            return None;
+        }
+        let rows: Vec<(f32, f32)> = frame
+            .paragraphs
+            .iter()
+            .map(|par| (f32::from(par.top), f32::from(par.height)))
+            .collect();
+        let (gap, y) = drop_gap_for_y(&rows, f32::from(p.y));
+        Some((gap, px(y)))
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
@@ -9816,7 +10410,20 @@ impl Editor {
             let (ix, _) = self.index_for_mouse(ev.position);
             self.selected_range = ix..ix;
             self.selection_reversed = false;
-            self.apply_replace(None, &text.replace("\r\n", "\n"), false, true, cx);
+            let text = text.replace("\r\n", "\n");
+            // PRIMARY is text-only, but a Strop image-spanning selection
+            // published its Markdown form (§9) — the same rebuild law as
+            // ctrl-v applies, so the two paste doors agree; anything that
+            // doesn't resolve stays literal visible text as ever.
+            if text.contains("![") {
+                let images = image_lines_in(&text, &|src| {
+                    self.store.as_ref().is_some_and(|s| s.has_asset(src))
+                });
+                if !images.is_empty() && self.paste_rebuild_lines(&text, images, cx) {
+                    return;
+                }
+            }
+            self.apply_replace(None, &text, false, true, cx);
         }
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         let _ = (ev, cx);
@@ -9836,6 +10443,13 @@ impl Editor {
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A drag that left the window (FileDropEvent::Exited) never tells
+        // the view — the first ordinary move sweeps the stale §7 rule.
+        // One is_some + one App read; prose motion pays nothing more.
+        if self.drop_gap.is_some() && !cx.has_active_drag() {
+            self.drop_gap = None;
+            cx.notify();
+        }
         if !self.is_selecting {
             return;
         }
@@ -10471,7 +11085,7 @@ impl Editor {
         let origin = frame.bounds.origin;
         let mut out = String::new();
         for (ix, kind) in self.doc.blocks().kinds().iter().enumerate() {
-            let BlockKind::Image { .. } = kind else { continue };
+            let BlockKind::Image { src, .. } = kind else { continue };
             let Some(par) = frame.paragraphs.get(ix) else { continue };
             let (w, h) = par
                 .image
@@ -10482,8 +11096,10 @@ impl Editor {
                 + ((f32::from(frame.bounds.size.width) - f32::from(par.indent) - w) / 2.)
                     .max(0.);
             let top = f32::from(par.top - frame.scroll_top);
+            // `src` rides along so the rig can assert content addressing:
+            // a pasted copy resolves to the SAME asset id, never a twin.
             out += &format!(
-                "img {ix} @{:.0},{:.0} w={w:.0} h={h:.0} cap@{:.0},{:.0}\n",
+                "img {ix} @{:.0},{:.0} w={w:.0} h={h:.0} cap@{:.0},{:.0} src={src}\n",
                 f32::from(origin.x) + img_x + w / 2.,
                 f32::from(origin.y) + top + h / 2.,
                 f32::from(origin.x) + f32::from(par.indent)
@@ -13070,13 +13686,19 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let _guard = DrawGuard::enter();
-        let (focus_handle, para_flash, grave_flashing, image_sel_block) = {
+        let (focus_handle, para_flash, grave_flashing, image_sel_block, drop_rule_y) = {
             let ed = self.editor.read(cx);
             (
                 ed.focus_handle.clone(),
                 ed.para_flash.map(|(c, _)| ed.doc.char_to_byte(c.min(ed.doc.rope().len_chars()))),
                 ed.grave_flash.is_some(),
                 ed.image_sel_live().map(|s| s.block),
+                // §7: the rule paints only while a drag is actually over
+                // the window — Exited drops active_drag, and with it the
+                // rule, even before the sweep in on_mouse_move runs.
+                ed.drop_gap
+                    .filter(|_| cx.has_active_drag())
+                    .map(|(_, y)| y),
             )
         };
         window.handle_input(
@@ -13084,6 +13706,7 @@ impl Element for EditorElement {
             ElementInputHandler::new(bounds, self.editor.clone()),
             cx,
         );
+
 
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
@@ -13357,6 +13980,22 @@ impl Element for EditorElement {
                     ));
                     dx += px(4.);
                 }
+            }
+        }
+
+        // The §7 insertion rule: a quiet 2px warm hairline across the
+        // measure at the drag-over gap — the still reads as "it will land
+        // here" (P6). Warm: the drop is the writer's own hand.
+        if let Some(gap_y) = drop_rule_y {
+            let y = gap_y - scroll_top;
+            if y > px(-4.) && y < viewport + px(4.) {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(0.), y - px(1.)),
+                        size(bounds.size.width, px(2.)),
+                    ),
+                    rgb(ACTIVE_BORDER),
+                ));
             }
         }
 
@@ -18993,6 +19632,13 @@ impl Render for Editor {
                     // whole document surface — see below); not here, or it would
                     // double-fire as the event bubbles up.
                     .on_drop(cx.listener(Self::on_file_drop))
+                    // §7's drag-over layer: Pending positions (synthesized
+                    // MouseMove while ExternalPaths ride active_drag) park
+                    // the insertion rule at the nearest gap. Capture-phase,
+                    // no hover gate — it also carries the input-modality
+                    // nudge that keeps the on_drop above alive after
+                    // typing (see on_external_drag_move).
+                    .on_drag_move(cx.listener(Self::on_external_drag_move))
                             // History recentres/rewraps in the remaining width;
                             // otherwise the column takes its width-only measure.
                             .map(|d| {
@@ -19376,6 +20022,124 @@ fn exile_press_is_fresh(stage_hold: Option<&'static str>, key: &str) -> bool {
 /// Paragraph (R6: no kind stamping here).
 fn caption_enter_opens_above(at_start: bool, caption_empty: bool) -> bool {
     at_start && !caption_empty
+}
+
+/// The asset's own extension names the clipboard bitmap's format (§9 copy):
+/// `put_asset` ids end ".png" / ".jpg" / ".webp" — the §5b import's whole
+/// output alphabet. Anything else (a legacy id) claims PNG and lets the
+/// paster's own sniffer disagree.
+fn image_format_for_src(src: &str) -> gpui::ImageFormat {
+    match src.rsplit('.').next() {
+        Some("jpg") | Some("jpeg") => gpui::ImageFormat::Jpeg,
+        Some("webp") => gpui::ImageFormat::Webp,
+        _ => gpui::ImageFormat::Png,
+    }
+}
+
+/// §9's range-copy serialization, pure: swap each whole-covered image
+/// line inside a copied slice for its Markdown form. `images` are
+/// (doc byte range of the line's text, Markdown form), ascending and
+/// inside `range_start..range_start + slice.len()` by construction.
+fn splice_image_markdown(
+    slice: &str,
+    range_start: usize,
+    images: &[(Range<usize>, String)],
+) -> String {
+    let mut out = String::with_capacity(slice.len());
+    let mut at = 0usize;
+    for (r, md) in images {
+        out.push_str(&slice[at..r.start - range_start]);
+        out.push_str(md);
+        at = r.end - range_start;
+    }
+    out.push_str(&slice[at..]);
+    out
+}
+
+/// §9's range-paste classification, pure: the lines of a normalized paste
+/// that parse as Strop image lines AND whose src resolves through the
+/// caller's oracle — only those rebuild; a non-resolving image line stays
+/// literal visible text (the boundary rule). Indices are `split('\n')`
+/// positions, matching `plan_image_line_rebuild`'s.
+fn image_lines_in(
+    text: &str,
+    resolves: &dyn Fn(&str) -> bool,
+) -> Vec<(usize, strop_core::markdown::ImageLine)> {
+    text.split('\n')
+        .enumerate()
+        .filter(|(_, l)| l.contains("!["))
+        .filter_map(|(ix, l)| strop_core::markdown::parse_image_line(l).map(|il| (ix, il)))
+        .filter(|(_, il)| resolves(&il.src))
+        .collect()
+}
+
+/// §9's multi-line rebuild plan, pure: each rebuilding image line is
+/// swapped for its caption TEXT (title → text + spans through the one
+/// importer), and the wall's boundary separators are added so a rebuilt
+/// picture owns its whole line — a leading image line gets its own line
+/// start when the landing sits mid-line (`at_line_start` false), a
+/// trailing one its own line end when nothing closes the line at the
+/// landing's end (`at_line_end` false — which is also how a picture
+/// landing last in the document earns its trailing empty paragraph, §7).
+/// Returns the final insert text and (FINAL line index, parsed line,
+/// caption spans) stamps.
+fn plan_image_line_rebuild(
+    text: &str,
+    images: Vec<(usize, strop_core::markdown::ImageLine)>,
+    at_line_start: bool,
+    at_line_end: bool,
+) -> (
+    String,
+    Vec<(usize, strop_core::markdown::ImageLine, SpanSet)>,
+) {
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    let last_line = lines.len() - 1;
+    let first_is_img = images.iter().any(|(ix, _)| *ix == 0);
+    let last_is_img = images.iter().any(|(ix, _)| *ix == last_line);
+    let shift = usize::from(first_is_img && !at_line_start);
+    let mut stamps = Vec::with_capacity(images.len());
+    for (ix, line) in images {
+        let (caption, spans) = strop_core::markdown::caption_from_title(&line.caption);
+        lines[ix] = caption;
+        stamps.push((ix + shift, line, spans));
+    }
+    let mut final_text = lines.join("\n");
+    if shift == 1 {
+        final_text.insert(0, '\n');
+    }
+    if last_is_img && !at_line_end {
+        final_text.push('\n');
+    }
+    (final_text, stamps)
+}
+
+/// §7's landing math, pure: the gap between blocks nearest a doc-space y.
+/// `rows` are (top, height) per block, ascending. Each block's vertical
+/// midline splits its gap-above from its gap-below; above the first
+/// block's midline is gap 0, below the last's is the after-the-end gap
+/// (== rows.len()). Also returns the insertion rule's y: the middle of
+/// the inter-block gap, or a hair outside the outermost block.
+fn drop_gap_for_y(rows: &[(f32, f32)], y: f32) -> (usize, f32) {
+    if rows.is_empty() {
+        return (0, 0.);
+    }
+    let ix = rows.partition_point(|(top, h)| top + h <= y);
+    let gap = match rows.get(ix) {
+        Some((top, h)) if y < top + h / 2. => ix,
+        Some(_) => ix + 1,
+        None => rows.len(),
+    };
+    let rule_y = if gap == 0 {
+        rows[0].0 - 3.
+    } else if gap == rows.len() {
+        let (top, h) = rows[gap - 1];
+        top + h + 3.
+    } else {
+        let (atop, ah) = rows[gap - 1];
+        let (btop, _) = rows[gap];
+        (atop + ah + btop) / 2.
+    };
+    (gap, rule_y)
 }
 
 // ---- The history strip: painting & the floor ------------------------------
@@ -23396,5 +24160,138 @@ mod tests {
             "the remnant line is born-again prose, not a second picture"
         );
         assert!(doc.graveyard().get(id).is_some());
+    }
+
+    // ---- Travel: copy, cut, paste (§9) --------------------------------------
+
+    #[test]
+    fn range_copy_splices_whole_covered_images_to_markdown() {
+        // "AAA\ncap\nBBB": the image line 4..7 covered whole swaps for its
+        // Markdown form; everything around it stays the plain slice.
+        let images = vec![(4..7usize, r#"![alt](asset:a "cap")"#.to_owned())];
+        assert_eq!(
+            splice_image_markdown("AAA\ncap\nBBB", 0, &images),
+            "AAA\n![alt](asset:a \"cap\")\nBBB"
+        );
+        // Range starting mid-slice: offsets rebase against range_start.
+        assert_eq!(
+            splice_image_markdown("A\ncap\nB", 2, &images),
+            "A\n![alt](asset:a \"cap\")\nB"
+        );
+        // Image line at the copy's very edges.
+        assert_eq!(
+            splice_image_markdown("cap\nBBB", 4, &images),
+            "![alt](asset:a \"cap\")\nBBB"
+        );
+        assert_eq!(
+            splice_image_markdown("AAA\ncap", 0, &images),
+            "AAA\n![alt](asset:a \"cap\")"
+        );
+        // Two pictures in one sweep.
+        let two = vec![
+            (0..3usize, "![](asset:a)".to_owned()),
+            (8..11usize, "![](asset:b)".to_owned()),
+        ];
+        assert_eq!(
+            splice_image_markdown("cap\nmid\ncap", 0, &two),
+            "![](asset:a)\nmid\n![](asset:b)"
+        );
+        // No covered image: the identity.
+        assert_eq!(splice_image_markdown("plain\nprose", 0, &[]), "plain\nprose");
+    }
+
+    #[test]
+    fn paste_classification_rebuilds_only_resolving_image_lines() {
+        // The §9 oracle: only asset:a resolves in "this document".
+        let resolves = |src: &str| src == "asset:a";
+        let text = "prose above\n![cat](asset:a \"cap\")\n![dog](asset:b)\nnot ![ an image\nprose below";
+        let found = image_lines_in(text, &resolves);
+        assert_eq!(found.len(), 1, "the non-resolving line stays literal");
+        assert_eq!(found[0].0, 1);
+        assert_eq!(found[0].1.src, "asset:a");
+        assert_eq!(found[0].1.alt, "cat");
+        assert_eq!(found[0].1.caption, "cap");
+        // No image lines at all: the ordinary paste's cheap exit.
+        assert!(image_lines_in("plain\nprose", &resolves).is_empty());
+    }
+
+    #[test]
+    fn rebuild_plan_substitutes_captions_and_guards_the_wall() {
+        let il = |src: &str, cap: &str| strop_core::markdown::ImageLine {
+            src: src.into(),
+            alt: String::new(),
+            caption: cap.into(),
+        };
+        // Mid-line landing, image first AND last: separators on both
+        // sides — a rebuilt picture owns its whole line (§2's corollary).
+        let (text, stamps) = plan_image_line_rebuild(
+            "![](asset:a \"cap\")",
+            vec![(0, il("asset:a", "cap"))],
+            false,
+            false,
+        );
+        assert_eq!(text, "\ncap\n");
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps[0].0, 1, "the prepended separator shifts the stamp");
+        // Landing already on its own line: no separators added.
+        let (text, stamps) = plan_image_line_rebuild(
+            "![](asset:a \"cap\")",
+            vec![(0, il("asset:a", "cap"))],
+            true,
+            true,
+        );
+        assert_eq!(text, "cap");
+        assert_eq!(stamps[0].0, 0);
+        // A mid-text image line needs nothing: its separators ride the
+        // pasted text itself. The caption title's inline syntax parses
+        // out to text + spans (Strop↔Strop round-trips whole, §10).
+        let (text, stamps) = plan_image_line_rebuild(
+            "above\n![](asset:a \"*look*\")\nbelow",
+            vec![(1, il("asset:a", "*look*"))],
+            false,
+            false,
+        );
+        assert_eq!(text, "above\nlook\nbelow");
+        assert_eq!(stamps[0].0, 1);
+        assert_eq!(stamps[0].2.spans().len(), 1, "the caption's emphasis survives");
+        // Trailing image at the paste's end, mid-line landing: the
+        // appended separator is also how a picture landing last in the
+        // document earns its trailing empty paragraph (§7).
+        let (text, _) = plan_image_line_rebuild(
+            "above\n![](asset:a)",
+            vec![(1, il("asset:a", ""))],
+            false,
+            false,
+        );
+        assert_eq!(text, "above\n\n");
+    }
+
+    #[test]
+    fn drop_gap_math_targets_the_nearest_gap_never_the_caret() {
+        // Three blocks: 0..100, 120..220, 240..340 (top, height).
+        let rows = [(0., 100.), (120., 100.), (240., 100.)];
+        // Above the first block's midline: the topmost gap.
+        assert_eq!(drop_gap_for_y(&rows, -20.).0, 0);
+        assert_eq!(drop_gap_for_y(&rows, 30.).0, 0);
+        // Below block 0's midline / in the inter-block gap / above block
+        // 1's midline: all the SAME gap 1.
+        assert_eq!(drop_gap_for_y(&rows, 80.).0, 1);
+        assert_eq!(drop_gap_for_y(&rows, 110.).0, 1);
+        assert_eq!(drop_gap_for_y(&rows, 140.).0, 1);
+        // The inter-block rule y sits mid-gap.
+        assert_eq!(drop_gap_for_y(&rows, 110.).1, 110.);
+        // Below the last block's midline: the after-the-end gap.
+        assert_eq!(drop_gap_for_y(&rows, 300.).0, 3);
+        assert_eq!(drop_gap_for_y(&rows, 900.).0, 3);
+        // Degenerate empty frame: gap 0, no panic.
+        assert_eq!(drop_gap_for_y(&[], 50.).0, 0);
+    }
+
+    #[test]
+    fn clipboard_bitmap_format_follows_the_asset_extension() {
+        assert_eq!(image_format_for_src("asset:ab.png"), gpui::ImageFormat::Png);
+        assert_eq!(image_format_for_src("asset:ab.jpg"), gpui::ImageFormat::Jpeg);
+        assert_eq!(image_format_for_src("asset:ab.webp"), gpui::ImageFormat::Webp);
+        assert_eq!(image_format_for_src("asset:legacy"), gpui::ImageFormat::Png);
     }
 }
