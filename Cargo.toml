@@ -21,6 +21,7 @@ toml_edit = "0.25"
 ureq = { version = "3", features = ["json"] }
 similar = { version = "3", features = ["unicode"] }
 glob = "0.3"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 # Pinned to a FORK of zed-industries/zed — github.com/kirushik/zed, branch
 # `strop-patches-on-main`, tip `c0a1cafa`: the two gpui-tree fixes below rebased

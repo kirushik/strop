@@ -17,4 +17,4 @@ pub mod typograph;
 pub mod voice;
 
 pub use buffer::Buffer;
-pub use store::Store;
+pub use store::{SaveCompletion, SaveGeneration, SaveWorker, Store};

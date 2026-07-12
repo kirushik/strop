@@ -456,7 +456,9 @@ fn main() {
         let window_for_quit = window;
         cx.on_app_quit(move |cx| {
             editor.update_checked(cx, |editor, _| {
-                editor.save_now();
+                if let Err(e) = editor.flush_saves() {
+                    eprintln!("strop: final save failed: {e}");
+                }
                 // Caret remembered for next open (resume mid-sentence);
                 // never a question, never a dialog (DESIGN §4b tension 6).
                 editor.record_exit_state();

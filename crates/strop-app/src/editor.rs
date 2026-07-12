@@ -28,7 +28,7 @@ use strop_core::document::{
     Annotation, Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus,
     SpanSet,
 };
-use strop_core::{Store, typograph};
+use strop_core::{SaveCompletion, SaveGeneration, SaveWorker, Store, typograph};
 
 use crate::config::{Config, Language};
 use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
@@ -46,6 +46,14 @@ use unicode_segmentation::UnicodeSegmentation;
 struct MarkdownExport {
     markdown: String,
     assets: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SaveRevision(u64);
+
+struct PendingSave {
+    generation: SaveGeneration,
+    revision: SaveRevision,
 }
 
 impl MarkdownExport {
@@ -1085,6 +1093,11 @@ pub struct Editor {
     /// Durable layer; edits mirror into it, a background task saves when idle.
     store: Option<Store>,
     store_dirty: bool,
+    /// Loro export stays on this thread; only immutable bytes cross into the
+    /// ordered filesystem worker.
+    save_worker: Option<SaveWorker>,
+    save_revision: SaveRevision,
+    latest_save: Option<PendingSave>,
     /// A failed autosave stays dirty but backs off instead of synchronously
     /// reserializing the document every one-second heartbeat.
     save_retry_at: Option<Instant>,
@@ -1704,6 +1717,9 @@ impl Editor {
             last_input: Instant::now(),
             store: None,
             store_dirty: false,
+            save_worker: None,
+            save_revision: SaveRevision(0),
+            latest_save: None,
             save_retry_at: None,
             save_retry_delay: Duration::from_secs(1),
             save_error: None,
@@ -1790,6 +1806,7 @@ impl Editor {
     pub fn attach_store(&mut self, store: Store, cx: &mut Context<Self>) {
         let legacy = !store.checkpoints_materialized();
         self.store = Some(store);
+        self.save_worker = Some(SaveWorker::new());
         // Heal a legacy file without waiting for the writer to open history:
         // materialize its checkpoint states in the background now, so the
         // sidebar is instant whenever it IS opened — and the next open of
@@ -1803,6 +1820,7 @@ impl Editor {
                     .timer(Duration::from_millis(1000))
                     .await;
                 let alive = this.update(cx, |editor: &mut Editor, cx| {
+                    editor.drain_save_completions();
                     // Keystroke-durability for the open note composer: mirror
                     // its live draft onto the note every tick so a crash never
                     // loses what's been typed. Every other field in the app is
@@ -1810,6 +1828,7 @@ impl Editor {
                     // RAM-only one (it wrote to the doc only on Enter-commit).
                     editor.sync_active_note_draft(cx);
                     if editor.store_dirty
+                        && editor.latest_save.is_none()
                         && editor.last_input.elapsed() >= Duration::from_secs(1)
                         && editor.save_retry_at.is_none_or(|at| Instant::now() >= at)
                     {
@@ -1839,6 +1858,11 @@ impl Editor {
     /// composer once did. Keep this the ONLY place that sets the flag true.
     fn mark_dirty(&mut self) {
         self.store_dirty = true;
+        self.save_revision.0 = self
+            .save_revision
+            .0
+            .checked_add(1)
+            .expect("document save revision overflow");
         // A fresh edit is useful new information: try it promptly after the
         // ordinary one-second idle lull, even if an older attempt backed off.
         self.save_retry_at = None;
@@ -4920,6 +4944,13 @@ impl Editor {
             cx.notify();
             return;
         };
+        // Pending snapshots capture their destination; drain before moving so
+        // a delayed write cannot recreate the old path after the rename.
+        if let Err(e) = self.flush_saves() {
+            eprintln!("strop: save before rename: {e}");
+            cx.notify();
+            return;
+        }
         if let Some(store) = &mut self.store {
             let old = store.path().to_owned();
             let new_path = old
@@ -5630,7 +5661,8 @@ impl Editor {
         // at ≥1s idle, a natural run boundary anyway.
         self.doc.journal_mut().settle();
         if let Some(store) = &self.store {
-            match store.save_with_state(
+            let path = store.path().to_owned();
+            match store.prepare_save_with_state(
                 self.doc.spans(),
                 self.doc.blocks(),
                 // 50, not 200: each persisted undo entry snapshots the FULL
@@ -5645,15 +5677,20 @@ impl Editor {
                 self.doc.graveyard(),
                 self.doc.provenance(),
             ) {
-                Ok(()) => {
-                    self.store_dirty = false;
-                    self.save_retry_at = None;
-                    self.save_retry_delay = Duration::from_secs(1);
-                    self.save_error = None;
+                Ok(save) => {
+                    let generation = self
+                        .save_worker
+                        .as_mut()
+                        .expect("attached Store has a save worker")
+                        .request(save);
+                    self.latest_save = Some(PendingSave {
+                        generation,
+                        revision: self.save_revision,
+                    });
                 }
                 Err(e) => {
                     let message = format!("Not saved: {e}");
-                    eprintln!("strop: failed to save {}: {e}", store.path().display());
+                    eprintln!("strop: failed to prepare save {}: {e}", path.display());
                     self.save_error = Some(message);
                     self.save_retry_at = Some(Instant::now() + self.save_retry_delay);
                     self.save_retry_delay = (self.save_retry_delay * 2).min(Duration::from_secs(60));
@@ -5663,6 +5700,70 @@ impl Editor {
         if let Some(t) = perf {
             eprintln!("strop-perf: save_now {:?}", t.elapsed());
         }
+    }
+
+    fn apply_save_completion(&mut self, completion: SaveCompletion) {
+        let Some(pending) = self.latest_save.as_ref() else {
+            return;
+        };
+        // Older completions cannot alter dirty/error state. The ordered worker
+        // will report the latest request after them.
+        if completion.generation != pending.generation {
+            return;
+        }
+        let saved_revision = pending.revision;
+        self.latest_save = None;
+        match completion.result {
+            Ok(()) => {
+                if self.save_revision == saved_revision {
+                    self.store_dirty = false;
+                }
+                self.save_retry_at = None;
+                self.save_retry_delay = Duration::from_secs(1);
+                self.save_error = None;
+            }
+            Err(e) => {
+                let path = self
+                    .store
+                    .as_ref()
+                    .map(|s| s.path().display().to_string())
+                    .unwrap_or_else(|| "document".into());
+                eprintln!("strop: failed to save {path}: {e}");
+                self.save_error = Some(format!("Not saved: {e}"));
+                self.save_retry_at = (self.save_revision == saved_revision)
+                    .then(|| Instant::now() + self.save_retry_delay);
+                self.save_retry_delay = (self.save_retry_delay * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+
+    fn drain_save_completions(&mut self) {
+        while let Some(completion) = self.save_worker.as_ref().and_then(SaveWorker::try_completion) {
+            self.apply_save_completion(completion);
+        }
+    }
+
+    /// Queue the newest snapshot and wait only at a shutdown/rename boundary.
+    pub fn flush_saves(&mut self) -> std::io::Result<()> {
+        self.save_now();
+        let Some(generation) = self.latest_save.as_ref().map(|pending| pending.generation) else {
+            return self
+                .save_error
+                .as_ref()
+                .map_or(Ok(()), |m| Err(std::io::Error::other(m.clone())));
+        };
+        let completion = self
+            .save_worker
+            .as_ref()
+            .expect("pending save has a worker")
+            .wait_for(generation);
+        let result = completion
+            .result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| std::io::Error::new(e.kind(), e.to_string()));
+        self.apply_save_completion(completion);
+        result
     }
 
     /// Would text typed at the caret inherit `attr` from the existing spans?
