@@ -538,6 +538,37 @@ Discoveries the build recorded against the spec:
   rebuild only resolving image lines and degrade seam-spanning
   landings to literal text rather than guess at clamp geometry;
   middle-click PRIMARY paste shares the rebuild law.
+- **The styled-block carve-out at the Backspace-below door**: when
+  the block below an image is a Heading/quote/code/list, Backspace
+  at its start strips the block's kind first (the house rule that
+  predates this round) and only the SECOND press reaches the §5
+  door and stages. Deliberate layering — the strip verb outranks
+  the door because it acts on the block the caret is in, not on
+  the neighbour — unit-tested as such.
+- **Cold-read captions set as one line, clamped to the measure**
+  with an ellipsis when long; the live editor wraps. N10
+  (cold-read caption lines carry no anchors) stands. Reopening
+  condition: a caption-heavy manuscript in the field — the fix is
+  running captions through the breaker as wrapped set lines.
+
+A same-day adversarial review round (three finder lenses over the
+branch diff, every finding verified by an agent instructed to
+refute it) yielded 14 candidates → 13 confirmed → all fixed. The
+serious four were wall-law breaches the build's own tests had not
+reached: the whole-cover rule silently voided between ADJACENT
+furniture blocks (the drained-ghost state); the whole-block exile
+restamp misfiring when the exiled block's neighbour is an
+empty-caption image (geometric ambiguity — an empty line's start
+IS its neighbour's separator); auto-cut filing graveyard entries
+for bytes the clamp never deleted (Put back could clone a
+picture); and the block-format verbs (heading/quote/code/list)
+overwriting an Image kind outright. The rest: middle-click paste
+skipping the §4 decay, word-delete reaching across the wall from
+styled blocks, the scroll-jump decay entry unwired, pixel clicks
+falling through to footnote jumps, the drop-gap rule painting
+over a replace-in-place target, and the caption migration
+counting only LF where the block metric counts all of ropey's
+breaks.
 
 ## 14. Panel record (2026-07-12)
 
