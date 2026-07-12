@@ -1495,6 +1495,19 @@ struct ParagraphLayout {
     font_size: Pixels,
     /// Decoded image for Image blocks, with its display size.
     image: Option<(Arc<RenderImage>, gpui::Size<Pixels>)>,
+    /// Y offset from `top` to the block's first text line. Zero for prose;
+    /// an Image block reserves the picture + a small gap above its caption
+    /// line (inline-images §11: the picture paints first, the caption lays
+    /// out BELOW it — the typover died here). Every line-y computation
+    /// (`position_of`, `index_for_point`, the caret quad, `fn_marks`) adds
+    /// this, so caret and hit-test can never land ON the pixels.
+    text_top: Pixels,
+    /// Center each visual line within the measure (image captions match the
+    /// cold-read caption's optics — inline-images §11). Paint passes
+    /// `TextAlign::Center`; the two x translators (`x_for`/`index_at`)
+    /// apply `center_shift`, the same per-line math gpui's aligner uses,
+    /// so painted glyphs and caret geometry cannot drift apart.
+    centered: bool,
     /// The input runs this line was shaped with. Compared on the next rebuild
     /// to decide whether the shaped line can be reused verbatim (per-block
     /// layout reuse) instead of re-shaping — a few `TextRun`s per block.
@@ -1526,11 +1539,41 @@ impl ParagraphLayout {
             .partition_point(|&b| if affinity_down { b <= local } else { b < local })
     }
 
+    /// Painted width of visual line `line`: boundary glyph to boundary
+    /// glyph, `layout.width` for the last — exactly what gpui's
+    /// `aligned_origin_x` measures (`boundaries` store those glyphs' byte
+    /// indices, and `x_for_index` of a glyph's index IS its position).
+    fn line_width(&self, line: usize) -> Pixels {
+        let layout = &self.line.unwrapped_layout;
+        let end = match self.boundaries.get(line) {
+            Some(&b) => layout.x_for_index(b),
+            None => layout.width,
+        };
+        end - layout.x_for_index(self.line_start(line))
+    }
+
+    /// Horizontal shift of visual line `line` under centering: gpui's
+    /// `TextAlign::Center` origin math verbatim (align width = the wrap
+    /// width the line was shaped to, no clamp — an overfull word overhangs
+    /// both in paint and here). Zero for left-set blocks, so prose pays
+    /// one branch.
+    fn center_shift(&self, line: usize) -> Pixels {
+        if !self.centered {
+            return px(0.);
+        }
+        let align_width = self
+            .line
+            .wrap_width
+            .unwrap_or(self.line.unwrapped_layout.width);
+        (align_width - self.line_width(line)) / 2.
+    }
+
     /// X position of a local index within its visual line, in frame
-    /// coordinates (block indent included).
+    /// coordinates (block indent and caption centering included).
     fn x_for(&self, local: usize, line: usize) -> Pixels {
         let layout = &self.line.unwrapped_layout;
-        self.indent + layout.x_for_index(local) - layout.x_for_index(self.line_start(line))
+        self.indent + self.center_shift(line) + layout.x_for_index(local)
+            - layout.x_for_index(self.line_start(line))
     }
 
     fn position(&self, local: usize, affinity_down: bool) -> (usize, Pixels) {
@@ -1543,12 +1586,22 @@ impl ParagraphLayout {
     fn index_at(&self, line: usize, x: Pixels) -> (usize, bool) {
         let line = line.min(self.line_count() - 1);
         let y = self.line_height * (line as f32) + self.line_height / 2.;
-        let local_x = (x - self.indent).max(px(0.));
+        let local_x = (x - self.indent - self.center_shift(line)).max(px(0.));
         let ix = self
             .line
             .closest_index_for_position(point(local_x, y), self.line_height)
             .unwrap_or_else(|ix| ix);
         (ix, line > 0 && ix == self.line_start(line))
+    }
+
+    /// Hit-test-only band below `height`: an image block's EMPTY caption
+    /// paints no chrome and adds no height (inline-images §3 —
+    /// manifestation costs no geometry), but the band one caret-height
+    /// beneath the pixels still routes to the caption caret — a click
+    /// door with zero painted chrome. Zero for every other block (their
+    /// text height always reaches `text_top + line_height`).
+    fn caption_band(&self) -> Pixels {
+        (self.text_top + self.line_height - self.height).max(px(0.))
     }
 }
 
@@ -1584,7 +1637,7 @@ impl TextFrame {
     fn position_of(&self, offset: usize, affinity_down: bool) -> Option<Point<Pixels>> {
         let (par_ix, line, x) = self.cursor_position(offset, affinity_down)?;
         let par = &self.paragraphs[par_ix];
-        Some(point(x, par.top + par.line_height * (line as f32)))
+        Some(point(x, par.top + par.text_top + par.line_height * (line as f32)))
     }
 
     /// Byte offset (and cursor affinity) closest to a point relative to
@@ -1599,7 +1652,14 @@ impl TextFrame {
             if p.y < par.top && i > 0 {
                 let prev = &self.paragraphs[i - 1];
                 let prev_bottom = prev.top + prev.height;
-                let (target, line) = if p.y - prev_bottom <= par.top - p.y {
+                // The empty-caption click band (inline-images §3): the band
+                // one caret-height beneath an image's pixels belongs to its
+                // caption even though the empty slot adds no height — it
+                // borrows the block's bottom margin. Then the ordinary
+                // nearest-edge rule for the rest of the gap.
+                let (target, line) = if p.y < prev_bottom + prev.caption_band()
+                    || p.y - prev_bottom <= par.top - p.y
+                {
                     (prev, prev.line_count() - 1)
                 } else {
                     (par, 0)
@@ -1608,7 +1668,12 @@ impl TextFrame {
                 return (target.range.start + ix, aff);
             }
             if p.y < par.top + par.height {
-                let line = ((p.y - par.top) / par.line_height) as usize;
+                // `text_top` keeps clicks on an image's pixels off any text
+                // line math: they resolve to the caption's first line (the
+                // only caret an image block owns — inline-images §3; Phase 4
+                // reroutes pixel clicks to picture selection upstream).
+                let line =
+                    ((p.y - par.top - par.text_top).max(px(0.)) / par.line_height) as usize;
                 let (ix, aff) = par.index_at(line, x);
                 return (par.range.start + ix, aff);
             }
@@ -1639,6 +1704,67 @@ fn format_thousands(n: usize) -> String {
 /// and the move-vs-cut distinction are unit-tested.
 fn auto_cut_qualifies(new_text: &str, range_chars: usize) -> bool {
     new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS
+}
+
+/// A tiny deterministic PNG for the rig (`seed:image`): 8-bit RGB, zlib
+/// STORED blocks — a few honest lines instead of an encoder dependency.
+/// `f` maps (x, y) to a pixel, so seeds draw gradients that make scaling
+/// and cropping errors visible on a screenshot.
+fn debug_png(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+    // Raw scanlines: filter byte 0, then RGB per pixel.
+    let mut raw = Vec::with_capacity((h * (1 + w * 3)) as usize);
+    for y in 0..h {
+        raw.push(0u8);
+        for x in 0..w {
+            raw.extend_from_slice(&f(x, y));
+        }
+    }
+    // zlib stream: header, STORED deflate blocks, adler32 of the raw data.
+    let mut z = vec![0x78, 0x01];
+    for (i, chunk) in raw.chunks(65535).enumerate() {
+        z.push(((i + 1) * 65535 >= raw.len()) as u8); // BFINAL on the last
+        z.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(chunk.len() as u16)).to_le_bytes());
+        z.extend_from_slice(chunk);
+    }
+    let adler = {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in &raw {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    };
+    z.extend_from_slice(&adler.to_be_bytes());
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut c: u32 = !0;
+        for &b in data {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(data);
+        let mut crc_input = tag.to_vec();
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    }
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit depth, RGB, no interlace
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &z);
+    chunk(&mut png, b"IEND", &[]);
+    png
 }
 
 /// The headstone for the graveyard bar — the metaphor sits beside its
@@ -6510,7 +6636,7 @@ impl Editor {
         let x = self.goal_x.unwrap_or(x);
         let page = (frame.bounds.size.height - frame.line_height).max(frame.line_height);
         let par = &frame.paragraphs[par_ix];
-        let y = par.top + par.line_height * (line_ix as f32) + par.line_height / 2.;
+        let y = par.top + par.text_top + par.line_height * (line_ix as f32) + par.line_height / 2.;
         let target = point(x, y + page * (direction as f32));
         let (offset, affinity) = frame.index_for_point(target);
 
@@ -8900,7 +9026,8 @@ impl Editor {
         }
         // A ref's carrier: jump forward to the def. Hit-test the span's
         // glyph band — a caret landing *next to* the ref must not teleport.
-        let line_ix = (((p.y - par.top) / par.line_height) as usize).min(par.line_count() - 1);
+        let line_ix = (((p.y - par.top - par.text_top).max(px(0.)) / par.line_height) as usize)
+            .min(par.line_count() - 1);
         for s in self.doc.spans().spans() {
             let InlineAttr::FootnoteRef(id) = &s.attr else {
                 continue;
@@ -9258,7 +9385,8 @@ impl Editor {
             let line = par.line_of(bs - par.range.start, true);
             let x0 = par.x_for(bs - par.range.start, line);
             let x1 = par.x_for(be - par.range.start, line);
-            let y = par.top + par.line_height * (line as f32) + par.line_height / 2.
+            let y = par.top + par.text_top + par.line_height * (line as f32)
+                + par.line_height / 2.
                 - frame.scroll_top;
             out += &format!(
                 "ref {id} @{:.0},{:.0}\n",
@@ -9753,6 +9881,61 @@ impl Editor {
         if let Some(byte) = text.find(needle) {
             self.file_cut(byte..byte + needle.len(), true, false, cx);
         }
+    }
+
+    /// Rig hook (`seed:image`, inline-images §11): the rig's first way to
+    /// SEE pictures. Built through the real verbs — `put_asset`,
+    /// `insert_image_block`, then TYPING into the block's own line (§10:
+    /// the line IS the caption) — never by hand-assembling block state.
+    /// Three stills in one document: a captioned picture (the caption
+    /// wraps, so the centered multi-line face shows), a tall portrait
+    /// (the two-thirds-viewport cap), and its EMPTY caption slot (no
+    /// chrome, but the click band under the pixels answers).
+    pub fn debug_seed_image(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else {
+            eprintln!("strop: seed:image needs a store-backed document");
+            return;
+        };
+        // Deterministic gradients — no assets on disk, no decoder deps.
+        let wide = store.put_asset(
+            debug_png(640, 360, |x, y| {
+                [(x / 3) as u8, 96u8.saturating_add((y / 3) as u8), 140]
+            }),
+            "png",
+        );
+        let tall = store.put_asset(
+            debug_png(300, 1800, |x, y| {
+                [180, (y / 8) as u8, 80u8.saturating_add((x / 2) as u8)]
+            }),
+            "png",
+        );
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "A paragraph of ordinary prose stands above the picture, so the wall between text and furniture is visible in one frame.",
+        );
+        // The captioned picture: insert, then type the caption into the
+        // image block's line — long enough to wrap at the measure.
+        let caret = self.doc.len_bytes();
+        let after_wide = self.doc.insert_image_block(caret, wide);
+        let img_block = self.doc.rope().byte_to_line(after_wide) - 1;
+        let cap_at = self.doc.rope().line_to_byte(img_block);
+        self.doc.edit_bytes(
+            cap_at..cap_at,
+            "The night crossing, seen from the pier \u{2014} the caption is the block's own line, quieter than body, and it wraps like any prose when it runs long.",
+        );
+        // Prose between the pictures, then the tall one — caption left
+        // EMPTY on purpose (the birth state of every inserted image).
+        let end = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            end..end,
+            "Between the pictures the manuscript keeps its voice; the tall portrait below must cap at two-thirds of the viewport instead of swallowing the page.",
+        );
+        let caret2 = self.doc.len_bytes();
+        let _ = self.doc.insert_image_block(caret2, tall);
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        cx.notify();
     }
 
     /// Rig hook (`seed:annotated`): a manuscript whose SECOND paragraph carries
@@ -10777,6 +10960,15 @@ struct LayoutKey {
     /// `Document::revision`.
     revision: u64,
     width_bits: u32,
+    /// Image display geometry is viewport-keyed (the §11 two-thirds height
+    /// cap), so a document holding pictures keys on the viewport height too
+    /// — or a vertical-only resize would carry stale image sizes. Kept at a
+    /// flat 0 for prose documents, whose layout is height-independent, so
+    /// their reuse still survives vertical resizes untouched. (Image
+    /// documents currently opt out of the fast-path wholesale — decode is
+    /// async and outside `revision`; see `can_reuse` — but the key stays
+    /// honest for when that loosens.)
+    viewport_bits: u32,
     font_scale_bits: u32,
     /// Non-empty selection only: an empty selection paints no highlight, so a
     /// collapsed-caret move leaves the layout identical.
@@ -10831,6 +11023,13 @@ struct BlockStyle {
     family: Option<&'static str>,
     weight: Option<FontWeight>,
     muted: bool,
+    /// The caption face slants (inline-images §11); inline Emphasis spans
+    /// already toggle the same font style, so italic-in-italic holds.
+    italic: bool,
+    /// Visual lines center in the measure (image captions). Carried into
+    /// `ParagraphLayout.centered` — paint alignment and the x translators
+    /// read the one flag.
+    centered: bool,
     bg: Option<gpui::Rgba>,
     quote_rule: bool,
 }
@@ -10845,6 +11044,8 @@ impl Default for BlockStyle {
             family: None,
             weight: None,
             muted: false,
+            italic: false,
+            centered: false,
             bg: None,
             quote_rule: false,
         }
@@ -10915,8 +11116,57 @@ fn block_style(kind: &BlockKind) -> BlockStyle {
             bg: Some(rgba(CODE_BG_COLOR)),
             ..Default::default()
         },
+        // The caption face (inline-images §11): quieter and smaller than
+        // body — the cold-read caption's ~0.8× muted italic, centered —
+        // so the two doors agree on what a caption looks like. The
+        // line height here is also the caption caret's height (the
+        // empty-slot click band is one of these).
+        BlockKind::Image { .. } => BlockStyle {
+            size: px(16.),
+            line_height: px(22.),
+            muted: true,
+            italic: true,
+            centered: true,
+            ..Default::default()
+        },
         _ => BlockStyle::default(),
     }
+}
+
+/// Gap between an image's pixels and its caption line (inline-images §11:
+/// under, never on). Small on purpose — the caption's own line box carries
+/// its leading, and the cold-read page sets its caption flush under the box.
+const IMAGE_CAPTION_GAP: f32 = 6.;
+
+/// Display-size law (inline-images §11): the picture fits the column width
+/// AND its display height caps at ~two-thirds of the viewport, proportional
+/// — a tall portrait never swallows the page. Natural size within those
+/// bounds (§5b already caps stored pixels). Pure, so the law is unit-tested.
+fn image_display_size(natural: (f32, f32), column_w: f32, viewport_h: f32) -> (f32, f32) {
+    let (nw, nh) = natural;
+    if nw <= 0. || nh <= 0. {
+        return (0., 0.);
+    }
+    let mut w = nw.min(column_w);
+    let mut h = nh * (w / nw);
+    let max_h = viewport_h * (2. / 3.);
+    if max_h > 0. && h > max_h {
+        w *= max_h / h;
+        h = max_h;
+    }
+    (w, h)
+}
+
+/// The image block's bottom gap (inline-images §3): the EMPTY caption slot
+/// borrows the block's bottom margin — the caret paints inside space
+/// already reserved, so caret travel never reflows the document. The margin
+/// must therefore hold the caption gap plus one caption caret-height; at
+/// the default scale that is exactly the ordinary paragraph gap (6 + 22 =
+/// 28), and small font scales, where the body gap shrinks faster than the
+/// caption line, bump it once here — a per-block-style constant, never a
+/// per-caret reflow.
+fn image_gap_below(paragraph_gap: f32, caption_line_height: f32) -> f32 {
+    paragraph_gap.max(IMAGE_CAPTION_GAP + caption_line_height)
 }
 
 /// Painted footnote numbers (DESIGN §2-footnotes): the Nth distinct ref in
@@ -11482,9 +11732,20 @@ impl Element for EditorElement {
         // the carried-forward paragraphs. History preview and image blocks opt
         // out: the preview text and async image decode aren't captured by the
         // document revision.
+        let has_images = editor
+            .doc
+            .blocks()
+            .kinds()
+            .iter()
+            .any(|k| matches!(k, BlockKind::Image { .. }));
         let layout_key = LayoutKey {
             revision: editor.doc.revision(),
             width_bits: f32::from(wrap_width).to_bits(),
+            viewport_bits: if has_images {
+                f32::from(viewport).to_bits()
+            } else {
+                0
+            },
             font_scale_bits: editor
                 .config
                 .font_size
@@ -11519,12 +11780,7 @@ impl Element for EditorElement {
             grave_fingerprint: editor.grave_layout_fingerprint(),
         };
         let can_reuse = !in_history
-            && !editor
-                .doc
-                .blocks()
-                .kinds()
-                .iter()
-                .any(|k| matches!(k, BlockKind::Image { .. }))
+            && !has_images
             && editor.last_frame.as_ref().is_some_and(|f| {
                 f.bounds.size.width == wrap_width && f.layout_key == layout_key
             });
@@ -11559,7 +11815,7 @@ impl Element for EditorElement {
                     let (line, x) =
                         par.position(cursor_offset - par.range.start, cursor_affinity);
                     (
-                        point(x, par.top + par.line_height * (line as f32)),
+                        point(x, par.top + par.text_top + par.line_height * (line as f32)),
                         par.line_height,
                     )
                 });
@@ -11876,6 +12132,9 @@ impl Element for EditorElement {
             if let Some(weight) = bstyle.weight {
                 block_font.weight = weight;
             }
+            if bstyle.italic {
+                block_font.style = FontStyle::Italic;
+            }
             let block_base = TextRun {
                 font: block_font,
                 color: if bstyle.muted {
@@ -12035,23 +12294,42 @@ impl Element for EditorElement {
             if section_rule {
                 top += px(24.);
             }
-            let mut height = line.size(bstyle.line_height).height;
+            let text_height = line.size(bstyle.line_height).height;
             let image = image_handles[block_ix].clone().and_then(|handle| {
                 let render = handle.use_render_image(window, cx)?;
                 let dev = render.size(0);
-                // Crisp at this DPI, capped to the column width.
-                let natural_w = dev.width.0 as f32 / scale;
-                let natural_h = dev.height.0 as f32 / scale;
-                let w = natural_w.min(f32::from(wrap_width));
-                let h = natural_h * (w / natural_w);
+                // Crisp at this DPI; the §11 law caps to the column width
+                // AND to two-thirds of the viewport, proportional — which
+                // is why image documents key their layout on the viewport
+                // height (`LayoutKey::viewport_bits`).
+                let (w, h) = image_display_size(
+                    (dev.width.0 as f32 / scale, dev.height.0 as f32 / scale),
+                    f32::from(wrap_width),
+                    f32::from(viewport),
+                );
                 Some((render, gpui::size(px(w), px(h))))
             });
-            if matches!(kind, BlockKind::Image { .. }) {
-                height = image
+            let is_image = matches!(kind, BlockKind::Image { .. });
+            // The image block's vertical anatomy (inline-images §11): the
+            // picture on top, a small gap, then the caption line — under,
+            // never on (the old paint at the shared origin was the typover,
+            // and it died this round). An EMPTY caption adds no height at
+            // all (§3: no chrome, no placeholder, no geometry — its caret
+            // borrows the block's bottom margin, sized below).
+            let (text_top, height) = if is_image {
+                let picture_h = image
                     .as_ref()
                     .map(|(_, sz)| sz.height)
                     .unwrap_or(px(56.)); // decoding placeholder
-            }
+                let text_top = picture_h + px(IMAGE_CAPTION_GAP);
+                if par_text.is_empty() {
+                    (text_top, picture_h)
+                } else {
+                    (text_top, text_top + text_height)
+                }
+            } else {
+                (px(0.), text_height)
+            };
             paragraphs.push(ParagraphLayout {
                 line,
                 range: range.clone(),
@@ -12073,6 +12351,8 @@ impl Element for EditorElement {
                 fn_marks,
                 font_size: bstyle.size,
                 image,
+                text_top,
+                centered: bstyle.centered,
                 runs,
             });
             // The pile keeps a tighter vertical rhythm (the mockup's
@@ -12081,6 +12361,14 @@ impl Element for EditorElement {
             top += height
                 + if in_pile {
                     px((f32::from(paragraph_gap) * 0.5 / 2.).round() * 2.)
+                } else if is_image && par_text.is_empty() {
+                    // The empty caption slot's borrowed margin (§3): must
+                    // hold one caption caret — a no-op at the default
+                    // scale, where 6 + 22 is exactly the paragraph gap.
+                    px(image_gap_below(
+                        f32::from(paragraph_gap),
+                        f32::from(bstyle.line_height),
+                    ))
                 } else {
                     paragraph_gap
                 };
@@ -12107,13 +12395,17 @@ impl Element for EditorElement {
         scroll_top = scroll_top.clamp(px(0.), max_scroll);
 
         // Cursor position in document space (needed for autoscroll + quad).
+        // `text_top` rides in: a caret entering a caption under a tall
+        // picture must scroll to where the caption actually IS, not to the
+        // picture's origin (inline-images §3 — never revealed below the
+        // fold).
         let cursor_pos = paragraphs
             .iter()
             .find(|p| cursor_offset <= p.range.end)
             .map(|par| {
                 let (line, x) = par.position(cursor_offset - par.range.start, cursor_affinity);
                 (
-                    point(x, par.top + par.line_height * (line as f32)),
+                    point(x, par.top + par.text_top + par.line_height * (line as f32)),
                     par.line_height,
                 )
             });
@@ -12305,17 +12597,24 @@ impl Element for EditorElement {
                     rgba(SELECTION_COLOR),
                 ));
             }
-            let origin = bounds.origin + point(par.indent, y);
-            if let Some((render, sz)) = &par.image
-                && let Err(e) = window.paint_image(
-                    Bounds::new(origin, *sz),
+            // The picture paints first, centered in the measure (matching
+            // the cold-read page's box), and the block's text line — the
+            // caption — lays out BELOW it at `text_top` (inline-images
+            // §11: under, never on; the old shared-origin paint was the
+            // typover). An empty caption paints nothing: no chrome, no
+            // placeholder (§3).
+            if let Some((render, sz)) = &par.image {
+                let img_x =
+                    par.indent + ((bounds.size.width - par.indent - sz.width) / 2.).max(px(0.));
+                if let Err(e) = window.paint_image(
+                    Bounds::new(bounds.origin + point(img_x, y), *sz),
                     Corners::default(),
                     render.clone(),
                     0,
                     false,
-                )
-            {
-                eprintln!("strop: paint image: {e}");
+                ) {
+                    eprintln!("strop: paint image: {e}");
+                }
             }
             if let Some(shaped) = &par.marker {
                 shaped
@@ -12329,11 +12628,16 @@ impl Element for EditorElement {
                     )
                     .ok();
             }
+            let origin = bounds.origin + point(par.indent, y + par.text_top);
+            // Centered captions align in paint with the SAME math the x
+            // translators mirror (`center_shift`), so glyphs, wash and
+            // caret agree to the pixel.
+            let align = if par.centered { TextAlign::Center } else { TextAlign::Left };
             par.line
-                .paint_background(origin, par.line_height, TextAlign::Left, None, window, cx)
+                .paint_background(origin, par.line_height, align, None, window, cx)
                 .expect("paint_background failed");
             par.line
-                .paint(origin, par.line_height, TextAlign::Left, None, window, cx)
+                .paint(origin, par.line_height, align, None, window, cx)
                 .expect("paint failed");
             // Footnote refs as painted superior figures (DESIGN
             // §2-footnotes): ~65% of the block size, baseline raised ~35%
@@ -12352,7 +12656,7 @@ impl Element for EditorElement {
                 let small_baseline =
                     (par.line_height - shaped.ascent - shaped.descent) / 2. + shaped.ascent;
                 let dy = body_baseline - small_baseline - par.font_size * 0.35;
-                let line_y = y + par.line_height * (line_ix as f32);
+                let line_y = y + par.text_top + par.line_height * (line_ix as f32);
                 shaped
                     .paint(
                         bounds.origin + point(x, line_y + dy),
@@ -22138,5 +22442,63 @@ mod tests {
         let cluster: String = "y\u{0301}".repeat(50);
         let qc = cr_quote(&cluster);
         assert!(qc.graphemes(true).count() <= 45);
+    }
+
+    // -- Inline images: the display-size law + the borrowed margin ---------
+    // (inline-images §11 / §3 — the geometry is pure, so the laws are
+    // pinned here; position and hit-test ride the rig.)
+
+    #[test]
+    fn image_fits_the_column_width_proportionally() {
+        // Wider than the column: width caps, height follows the ratio.
+        let (w, h) = image_display_size((1200., 600.), 600., 900.);
+        assert_eq!((w, h), (600., 300.));
+        // Natural size when it already fits both bounds.
+        let (w, h) = image_display_size((300., 200.), 600., 900.);
+        assert_eq!((w, h), (300., 200.));
+    }
+
+    #[test]
+    fn tall_image_caps_at_two_thirds_viewport_proportionally() {
+        // A tall portrait: 2/3 of a 900px viewport = 600px display height,
+        // and the width shrinks by the same factor — never a squeeze.
+        let (w, h) = image_display_size((300., 1800.), 600., 900.);
+        assert_eq!(h, 600.);
+        assert!((w - 100.).abs() < 1e-4, "proportional: {w}");
+        // Both caps at once: column first, then the height cap re-scales.
+        let (w, h) = image_display_size((1200., 2400.), 600., 900.);
+        assert_eq!(h, 600.);
+        assert!((w - 300.).abs() < 1e-4, "proportional through both: {w}");
+        // Degenerate inputs never divide by zero.
+        assert_eq!(image_display_size((0., 100.), 600., 900.), (0., 0.));
+        assert_eq!(image_display_size((100., 0.), 600., 900.), (0., 0.));
+    }
+
+    #[test]
+    fn empty_caption_slot_borrows_the_bottom_margin() {
+        // Default scale: gap 6 + caption line 22 = 28 = the paragraph gap
+        // exactly — manifestation costs no geometry (§3).
+        assert_eq!(image_gap_below(28., 22.), 28.);
+        // Small font scale: the body gap (16) runs under one caption caret
+        // (6 + 14 = 20) — the one-time bump makes room.
+        assert_eq!(image_gap_below(16., 14.), 20.);
+        // Large scale: the body gap (56) already hosts the caret (6 + 44).
+        assert_eq!(image_gap_below(56., 44.), 56.);
+    }
+
+    #[test]
+    fn debug_png_emits_wellformed_chunks() {
+        // The rig seed's generated PNG: signature, IHDR geometry, and the
+        // zlib stored-block framing that gpui's decoder will inflate.
+        let png = debug_png(3, 2, |x, y| [x as u8, y as u8, 7]);
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 3);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 2);
+        // One stored deflate block: BFINAL=1, LEN = 2 rows × (1 + 3·3).
+        let idat = &png[33 + 8..]; // past IHDR chunk + IDAT len/tag
+        assert_eq!(&png[37..41], b"IDAT");
+        assert_eq!(idat[2], 1, "final stored block");
+        assert_eq!(u16::from_le_bytes([idat[3], idat[4]]), 20);
     }
 }

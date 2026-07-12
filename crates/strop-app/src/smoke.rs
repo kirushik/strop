@@ -280,6 +280,22 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE putback:last: newest cut put back");
                 continue;
             }
+            // Inline images (docs/inline-images.md §11): `seed:image`
+            // builds a doc with a captioned picture, prose, and a tall
+            // uncaptioned portrait — through the real verbs (put_asset,
+            // insert_image_block, typing into the caption line) — so the
+            // rig can finally SEE pictures: caption under (never on),
+            // empty slot chrome-free, the two-thirds-viewport cap.
+            if key == "seed:image" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_image(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                eprintln!("SMOKE seed:image: captioned + tall pictures seeded");
+                continue;
+            }
             if key == "seed:many" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_seed_many(cx))

@@ -409,10 +409,19 @@ pub fn paginate(
                 // it, the editor's decoding placeholder otherwise
                 // (regions 12). Scale to the measure; move-or-scale onto a
                 // page is the assembler's call. The caption is the block's
-                // OWN line now (inline-images §10) — still rendered as one
-                // dead line under the box (N10) until the cold-read parity
-                // pass gives it real anchors; soft breaks flatten so the
-                // single set line never carries a break character.
+                // OWN line (inline-images §10), rendered as one dead line
+                // under the box — N10 KEPT, adjudicated at the Phase-3
+                // parity pass: real anchors would mean running the caption
+                // through the breaker as a new centered Role with
+                // keep-together pagination and teaching every anchor
+                // consumer (hit_token, range_boxes, resume anchors) a
+                // second item shape — a balloon, not a contained edit. The
+                // two doors agree on caption OPTICS instead (~0.8× muted
+                // italic centered, both sides); soft breaks flatten so the
+                // single set line never carries a break character. FLAGGED
+                // for the record: a long caption sets as ONE line here and
+                // can overflow the measure — the reopening condition for
+                // giving captions real set lines.
                 let caption = ptext.replace('\u{2028}', " ");
                 let (w, hpx) = match m.image_size(src) {
                     Some((nw, nh)) if nw > 0.0 && nh > 0.0 => {
