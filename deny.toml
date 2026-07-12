@@ -21,6 +21,12 @@ ignore = [
     # rustybuzz); no safe upgrade (upstream's own move to `skrifa` is the only
     # fix). REVISIT by 2027-01, or sooner when the gpui pin moves.
     "RUSTSEC-2026-0192",
+    # `rustybuzz 0.20.1` unmaintained — transitive through gpui's pinned
+    # `usvg`/`resvg` SVG stack. The advisory names `harfrust` as the maintained
+    # alternative but provides no safe upgrade; replacing the shaping engine
+    # requires an upstream migration, not a lockfile bump. REVISIT by 2027-01,
+    # or sooner when the gpui pin moves.
+    "RUSTSEC-2026-0206",
     # `quick-xml 0.39.4` DoS vulns (patched in 0.41) — the "explicit exception"
     # above. Purely transitive and UNREACHABLE as we use it: the only consumers
     # are `wayland-scanner` (parses TRUSTED build-time protocol XML, not runtime
