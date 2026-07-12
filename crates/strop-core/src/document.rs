@@ -699,11 +699,19 @@ impl SpanSet {
         let del_end = op.pos + op.delete;
         let ins = op.insert.chars().count();
         // The paragraph seam kills momentum (papercuts-2026-07 §1 A2): an
-        // expanding span never absorbs an insertion that OPENS a new
-        // paragraph, so a bold run does not stream onto the next paragraph.
-        // A newline typed strictly INSIDE a run still grows it (the split
-        // keeps both halves marked) — only the right-edge append is stopped.
-        let across_seam = op.insert.starts_with('\n');
+        // expanding span at its right edge absorbs a typed insertion only up to
+        // the FIRST newline in it — a bold run grows by the pre-seam text and
+        // stops at the seam, never streaming onto the next paragraph. An
+        // insertion that OPENS with a newline expands nothing (pre-seam is
+        // empty); one with no newline expands fully. A newline typed strictly
+        // INSIDE a run still grows it (the split keeps both halves marked) —
+        // only the right-edge append is clamped. Checking `starts_with('\n')`
+        // alone missed an embedded seam ("text\nmore" typed at an edge swallowed
+        // the whole insertion); the pre-seam char count is the belt.
+        let edge_grow = match op.insert.find('\n') {
+            Some(nl) => op.insert[..nl].chars().count(),
+            None => ins,
+        };
         let clamp = |x: usize| {
             if x >= del_end {
                 x - op.delete
@@ -726,13 +734,11 @@ impl SpanSet {
                 if span.range.start >= op.pos {
                     span.range.start += ins;
                 }
-                if span.range.end > op.pos
-                    || (span.range.end == op.pos
-                        && by_typing
-                        && !across_seam
-                        && span.attr.expands())
-                {
+                if span.range.end > op.pos {
                     span.range.end += ins;
+                } else if span.range.end == op.pos && by_typing && span.attr.expands() {
+                    // Right-edge append: absorb only the pre-seam segment.
+                    span.range.end += edge_grow;
                 }
             }
         }
@@ -3921,6 +3927,29 @@ mod tests {
         doc.edit_bytes_coalescing(5..5, "x");
         assert_eq!(doc.text(), "bold\nx");
         assert!(!doc.spans().covers(5..6, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn right_edge_append_with_an_embedded_seam_stops_at_the_newline() {
+        // A2 belt (papercuts finding 10): a typed insertion that CONTAINS a
+        // newline part-way through — "text\nmore" — is absorbed by an expanding
+        // right-edge span only up to the seam. `starts_with('\n')` alone would
+        // have let the whole thing stream onto the next paragraph.
+        let mut set = SpanSet::default();
+        set.add(0..4, InlineAttr::Strong);
+        set.apply_op(&op(4, 0, "text\nmore")); // typed at the right edge
+        // The span grew by "text" (4 chars) only, ending right at the seam.
+        assert_eq!(set.spans(), &[strong(0..8)]);
+        // An insertion that OPENS with the seam expands nothing.
+        let mut set = SpanSet::default();
+        set.add(0..4, InlineAttr::Strong);
+        set.apply_op(&op(4, 0, "\nmore"));
+        assert_eq!(set.spans(), &[strong(0..4)]);
+        // A machine insertion never expands at all, seam or no seam.
+        let mut set = SpanSet::default();
+        set.add(0..4, InlineAttr::Strong);
+        set.apply_op_verbatim(&op(4, 0, "text\nmore"));
+        assert_eq!(set.spans(), &[strong(0..4)]);
     }
 
     #[test]
