@@ -695,7 +695,9 @@ struct ClampPlan {
 /// (`edit_bytes_clamped`). Adjacent furniture chains resolve left to
 /// right: a following-separator cover claims the wall it shares with the
 /// next block, whose own cover then falls through to ITS following
-/// separator.
+/// separator. A wall the previous block left merely PROTECTED (standing
+/// partial, or spared by its own prec-side cover) is still consumable —
+/// the cover reclaims it from the protected set.
 fn clamp_plan(rope: &ropey::Rope, blocks: &BlockMap, byte_range: &Range<usize>) -> ClampPlan {
     let (s, e) = (byte_range.start, byte_range.end);
     let last_line = rope.len_lines() - 1;
@@ -719,7 +721,7 @@ fn clamp_plan(rope: &ropey::Rope, blocks: &BlockMap, byte_range: &Range<usize>) 
     // lands here unless a whole-cover consumed it; the cut subtraction
     // below clips to the range.
     let mut protected: Vec<Range<usize>> = Vec::new();
-    let mut push_protected = |sep: &Range<usize>| {
+    let push_protected = |protected: &mut Vec<Range<usize>>, sep: &Range<usize>| {
         if sep.start < e && sep.end > s && protected.last() != Some(sep) {
             protected.push(sep.clone());
         }
@@ -749,6 +751,18 @@ fn clamp_plan(rope: &ropey::Rope, blocks: &BlockMap, byte_range: &Range<usize>) 
         if enclosed || door {
             if prec_covered && !prec_claimed {
                 consume_prec = true;
+                // The consumed wall may already stand in `protected`: it is
+                // the previous furniture block's FOLLOWING separator, pushed
+                // while that block stood partial — or kept standing by its
+                // own prec-side cover. The whole-cover law (§2, §5's range
+                // door) outranks that push: reclaim the wall, or the cut
+                // subtraction below spares it and the enclosed picture
+                // drains to §0's ghost. Nothing of the neighbour is harmed —
+                // `on_edit`'s merge-keeps-first hands the merged line to the
+                // STANDING block's kind.
+                if protected.last() == prec.as_ref() {
+                    protected.pop();
+                }
             } else if foll_covered {
                 consume_foll = true;
                 foll_claimed_by = Some(f);
@@ -761,12 +775,12 @@ fn clamp_plan(rope: &ropey::Rope, blocks: &BlockMap, byte_range: &Range<usize>) 
             && !prec_claimed
             && let Some(sep) = &prec
         {
-            push_protected(sep);
+            push_protected(&mut protected, sep);
         }
         if !consume_foll
             && let Some(sep) = &foll
         {
-            push_protected(sep);
+            push_protected(&mut protected, sep);
         }
     }
     // The cuts: the range minus the standing walls.
@@ -1944,57 +1958,57 @@ impl Document {
         cut_unix: i64,
         collapse_emptied: bool,
     ) -> u64 {
+        let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.crosses_furniture_wall(block, merged) {
+            // §2 ("no text mechanic may move, clone, or absorb" furniture):
+            // the edit below CLAMPS, so walls and spared blocks inside
+            // `byte_range` survive the delete. Filing the raw slice would
+            // grave bytes still standing in the document — Put back then
+            // re-inserts the surviving separator and stamps the picture's
+            // kind onto a fresh line: a plain range delete minting a second
+            // picture. File the clamp's ACTUAL cuts instead, one
+            // region-honest entry per surviving sub-deletion; they all ride
+            // `edit_bytes`' one pre-cut snapshot, so a single undo still
+            // removes every entry with the text's return.
+            let cuts = clamp_plan(self.buffer.rope(), &self.blocks, &byte_range).cuts;
+            let mut pending = Vec::with_capacity(cuts.len());
+            let mut removed = 0usize;
+            for cut in &cuts {
+                let rope = self.buffer.rope();
+                let (s, e) = (rope.byte_to_char(cut.start), rope.byte_to_char(cut.end));
+                // Origins are POST-delete positions: each cut's start, less
+                // the chars the earlier cuts take (the walls between them
+                // stand, so nothing else shifts).
+                pending.push((self.grave_capture(s, e), s - removed));
+                removed += e - s;
+            }
+            self.edit_bytes(byte_range, ""); // re-plans identically; the clamped executor
+            self.revision += 1;
+            // A separator-only range plans no cuts and files nothing; the
+            // returned 0 is never a live entry id (`Graveyard::file` starts
+            // at 1) and every caller ignores it.
+            let mut id = 0;
+            for ((text, spans, kinds, region, whole), origin) in pending {
+                id = self.graveyard.file(
+                    text,
+                    origin_quote.clone(),
+                    origin,
+                    cut_unix,
+                    spans,
+                    kinds,
+                    region,
+                    whole,
+                );
+            }
+            if collapse_emptied && self.scraps_textless() {
+                self.evaporate_scraps_in_tx();
+            }
+            return id;
+        }
         let rope = self.buffer.rope();
         let start_char = rope.byte_to_char(byte_range.start);
         let end_char = rope.byte_to_char(byte_range.end);
-        // Plain delete KEEPS exact-byte deletion — that ruling stands — but
-        // the ENTRY records block-ness when the writer's selection was in
-        // fact one-or-more complete blocks (papercuts follow-up, report 3):
-        // otherwise a backspaced paragraph returns as a splice and glues to
-        // its neighbour. Reuse §B1's normalization (a range ending at a
-        // block's char 0 reclassifies as ending at the previous block's text
-        // end) for the DETECTION only; the deletion below is untouched.
-        let mut norm_end = end_char;
-        if norm_end > start_char && rope.char(norm_end - 1) == '\n' {
-            norm_end -= 1;
-        }
-        let first_line = rope.char_to_line(start_char);
-        let last_line = rope.char_to_line(norm_end);
-        let text_end_of_last = if last_line + 1 < rope.len_lines() {
-            rope.line_to_char(last_line + 1) - 1
-        } else {
-            rope.len_chars()
-        };
-        let whole = start_char < norm_end
-            && start_char == rope.line_to_char(first_line)
-            && norm_end == text_end_of_last
-            && region_of_char(rope, &self.blocks, start_char)
-                == region_of_char(rope, &self.blocks, norm_end);
-        // A whole-block entry stores the NORMALIZED text (bounding separator
-        // excluded — put_back rebuilds exactly one), so both doors feed §B2
-        // the same shape; a fragment stores the exact deleted bytes as ever.
-        let entry_end = if whole { norm_end } else { end_char };
-        let text: String = rope.slice(start_char..entry_end).to_string();
-        let region = match region_of_char(rope, &self.blocks, start_char) {
-            Region::Manuscript => GraveRegion::Manuscript,
-            // A cut can't start ON the seam via any verb; the never-panic
-            // mapping says the payload lies below it.
-            Region::Seam | Region::Scraps => GraveRegion::Scraps,
-        };
-        // Capture the cut's formatting and structure BEFORE the delete shifts
-        // them away, so Put back is lossless (Bug D / P1). One block kind per
-        // line the text will re-create (`count_line_breaks + 1`), so put_back
-        // can re-stamp them onto exactly the re-inserted blocks.
-        let spans = self.spans.slice(start_char..entry_end);
-        let n_blocks = count_line_breaks(&text) + 1;
-        let kinds: Vec<BlockKind> = self
-            .blocks
-            .kinds()
-            .iter()
-            .skip(first_line)
-            .take(n_blocks)
-            .cloned()
-            .collect();
+        let (text, spans, kinds, region, whole) = self.grave_capture(start_char, end_char);
         // The non-coalescing edit always opens a fresh transaction, so the
         // pre-cut snapshot is always taken and the filing below rides it.
         self.edit_bytes(byte_range, "");
@@ -2013,6 +2027,65 @@ impl Document {
             self.evaporate_scraps_in_tx();
         }
         id
+    }
+
+    /// The capture half of a graveyard filing, read BEFORE the delete
+    /// shifts anything: entry text, its formatting and per-line block
+    /// kinds (Bug D / P1 — Put back is lossless), the region it leaves,
+    /// and §B1's whole-block detection. Plain delete KEEPS exact-byte
+    /// deletion — that ruling stands — but the ENTRY records block-ness
+    /// when the selection was in fact one-or-more complete blocks
+    /// (papercuts follow-up, report 3): otherwise a backspaced paragraph
+    /// returns as a splice and glues to its neighbour. Reuses §B1's
+    /// normalization (a range ending at a block's char 0 reclassifies as
+    /// ending at the previous block's text end) for the DETECTION only —
+    /// a whole-block entry stores the NORMALIZED text (bounding separator
+    /// excluded, put_back rebuilds exactly one) so both doors feed §B2
+    /// the same shape; a fragment stores the exact deleted chars as ever.
+    fn grave_capture(
+        &self,
+        start_char: usize,
+        end_char: usize,
+    ) -> (String, SpanSet, Vec<BlockKind>, GraveRegion, bool) {
+        let rope = self.buffer.rope();
+        let mut norm_end = end_char;
+        if norm_end > start_char && rope.char(norm_end - 1) == '\n' {
+            norm_end -= 1;
+        }
+        let first_line = rope.char_to_line(start_char);
+        let last_line = rope.char_to_line(norm_end);
+        let text_end_of_last = if last_line + 1 < rope.len_lines() {
+            rope.line_to_char(last_line + 1) - 1
+        } else {
+            rope.len_chars()
+        };
+        let whole = start_char < norm_end
+            && start_char == rope.line_to_char(first_line)
+            && norm_end == text_end_of_last
+            && region_of_char(rope, &self.blocks, start_char)
+                == region_of_char(rope, &self.blocks, norm_end);
+        let entry_end = if whole { norm_end } else { end_char };
+        let text: String = rope.slice(start_char..entry_end).to_string();
+        let region = match region_of_char(rope, &self.blocks, start_char) {
+            Region::Manuscript => GraveRegion::Manuscript,
+            // A cut can't start ON the seam via any verb; the never-panic
+            // mapping says the payload lies below it.
+            Region::Seam | Region::Scraps => GraveRegion::Scraps,
+        };
+        // One block kind per line the text will re-create
+        // (`count_line_breaks + 1`), so put_back can re-stamp them onto
+        // exactly the re-inserted blocks.
+        let spans = self.spans.slice(start_char..entry_end);
+        let n_blocks = count_line_breaks(&text) + 1;
+        let kinds: Vec<BlockKind> = self
+            .blocks
+            .kinds()
+            .iter()
+            .skip(first_line)
+            .take(n_blocks)
+            .cloned()
+            .collect();
+        (text, spans, kinds, region, whole)
     }
 
     /// The exile verb's capture (papercuts-2026-07 §B1): interpret the
@@ -2109,7 +2182,7 @@ impl Document {
             (s, e, s)
         };
         let del_byte = self.char_to_byte(del_start)..self.char_to_byte(del_end);
-        self.delete_bytes_whole_block(del_byte);
+        self.delete_bytes_whole_block(del_byte, first_line);
         // A lone block that is the entire document leaves its LINE standing
         // (the rope's one-line floor): furniture must not survive its own
         // exile as a kind on the empty remnant — the picture would stand
@@ -2923,9 +2996,18 @@ impl Document {
     /// its following separator leaves the furniture kind on the merged
     /// line under `on_edit`'s merge-keeps-first, and the first surviving
     /// block's kind is restamped over it, captured before the drain.
-    fn delete_bytes_whole_block(&mut self, byte_range: Range<usize>) {
+    ///
+    /// `taken` is the exiled block's own line, known to the door — the
+    /// restamp fires only when the cut STARTS on that block (the
+    /// trailing-separator form). Geometry alone cannot decide: a
+    /// leading-separator cut starts on the separator byte, and when the
+    /// block above is furniture with an EMPTY caption that byte IS its
+    /// line's start too — the geometric guard misread the neighbour as
+    /// the taken block and restamped the surviving picture away (§5).
+    fn delete_bytes_whole_block(&mut self, byte_range: Range<usize>, taken: usize) {
         let (block, merged) = self.pre_edit_info(&byte_range);
         let restamp = (merged > 0
+            && block == taken
             && self.blocks.kind(block).is_furniture()
             && byte_range.start == self.buffer.rope().line_to_byte(block))
             .then(|| self.blocks.kind(block + merged).clone());
@@ -4776,6 +4858,37 @@ mod tests {
 
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
+    fn clamp_plan_whole_cover_reclaims_a_wall_the_neighbour_left_standing() {
+        // Two images back to back, the SECOND fully enclosed (content plus
+        // both bounding separators): the shared wall was already pushed as
+        // img1's protected FOLLOWING separator one iteration earlier, so
+        // consume_prec must reclaim it — or the cover is silently void and
+        // the enclosed picture drains to the §0 ghost (§2 whole cover,
+        // §5's range door).
+        let doc = Document::new(
+            "c1\nc2\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:a"), img("asset:b"), BlockKind::Paragraph]),
+        );
+        assert_eq!(plan(&doc, 2..6), ClampPlan { cuts: vec![2..5], insert_at: 2 });
+        // A chain of enclosed EMPTY captions resolves left to right: each
+        // cover consumes its own preceding separator — including the wall
+        // the previous cover just left protected.
+        let chain = Document::new(
+            "AAA\n\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                img("asset:a"),
+                img("asset:b"),
+                BlockKind::Paragraph,
+            ]),
+        );
+        assert_eq!(plan(&chain, 3..6), ClampPlan { cuts: vec![3..5], insert_at: 3 });
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
     fn clamp_plan_furniture_at_document_edges() {
         // Image first: no preceding separator exists, so enclosure covers
         // content + the following one; the cover runs on into the flank.
@@ -4835,6 +4948,31 @@ mod tests {
     }
 
     #[test]
+    fn wall_crossing_cut_files_only_the_deleted_bytes_and_put_back_never_clones() {
+        // A range cut from mid-paragraph into mid-caption: the clamp spares
+        // the wall and the picture, so the graveyard must record only what
+        // actually left — filing the raw slice graved a separator that
+        // still stands plus the Image kind, and Put back then re-inserted
+        // the separator and stamped a SECOND picture from a plain text
+        // gesture (§2: no text mechanic may move, clone, or absorb).
+        let mut doc = cap_doc();
+        doc.cut_to_graveyard(1..6, String::new(), 0, false);
+        assert_eq!(doc.text(), "A\np\nBBB", "the clamp spared the wall");
+        let images =
+            |doc: &Document| doc.blocks().kinds().iter().filter(|k| k.is_furniture()).count();
+        assert_eq!(images(&doc), 1);
+        let ids: Vec<u64> = doc.graveyard().entries().iter().map(|e| e.id).collect();
+        for id in ids {
+            doc.put_back(id).expect("every filed entry returns");
+        }
+        assert_eq!(doc.text(), "AAA\ncap\nBBB", "put back restores exactly the cut");
+        assert_eq!(images(&doc), 1, "a text mechanic must never clone the picture");
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:a")
+        );
+    }
+
+    #[test]
     fn wall_refused_range_leaves_no_undo_step() {
         // A separator-only deletion at the wall is refused whole: nothing
         // changes and no empty transaction pollutes the undo stack.
@@ -4872,6 +5010,44 @@ mod tests {
         doc.undo();
         assert_eq!(doc.text(), "cap\nBBB");
         assert!(matches!(doc.blocks().kind(0), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn wall_whole_cover_beside_a_standing_twin_takes_the_enclosed_picture() {
+        // The executor run of the reclaim rule above: deleting the enclosed
+        // second image of an adjacent pair must take it WHOLE — never leave
+        // it standing with a drained caption (§2's forbidden ghost).
+        let mut doc = Document::new(
+            "c1\nc2\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:a"), img("asset:b"), BlockKind::Paragraph]),
+        );
+        doc.edit_bytes(2..6, "");
+        assert_eq!(doc.text(), "c1\nBBB");
+        assert!(
+            matches!(doc.blocks().kind(0), BlockKind::Image { src, .. } if src == "asset:a"),
+            "the standing twin keeps its caption and kind"
+        );
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        // The empty-caption chain: both enclosed pictures go, the flanks
+        // stand apart on the surviving wall.
+        let mut chain = Document::new(
+            "AAA\n\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                img("asset:a"),
+                img("asset:b"),
+                BlockKind::Paragraph,
+            ]),
+        );
+        chain.edit_bytes(3..6, "");
+        assert_eq!(chain.text(), "AAA\nBBB");
+        assert_eq!(
+            chain.blocks().kinds(),
+            &[BlockKind::Paragraph, BlockKind::Paragraph],
+            "no drained ghost survives the enclosure"
+        );
     }
 
     #[test]

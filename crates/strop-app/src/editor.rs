@@ -9142,6 +9142,19 @@ impl Editor {
         let seam = self.doc.boundary().map(|(_, b)| b);
         let start_block = self.doc.block_of_byte(self.selected_range.start);
         let end_block = self.doc.block_of_byte(self.selected_range.end);
+        // §2: the picture changes only by whole-block verbs, and a format
+        // verb is not one of them — stamping over BlockKind::Image drops
+        // src/alt and the pixels with them. Anchored ON the furniture
+        // (caret in the caption, or the picture selected — ImageSel parks
+        // the caret at the caption start), the verb refuses whole; the
+        // selection decays without harm (§4's plain decay, nothing moves).
+        if self.doc.blocks().kind(start_block).is_furniture() {
+            if self.image_sel.is_some() {
+                self.decay_image_sel();
+                cx.notify();
+            }
+            return;
+        }
         let target = if *self.doc.blocks().kind(start_block) == kind {
             BlockKind::Paragraph
         } else {
@@ -9155,7 +9168,10 @@ impl Editor {
             self.doc.set_block_kind(start_block, BlockKind::Paragraph);
         }
         for block in start_block + 1..=end_block {
-            if Some(block) == seam {
+            // A range that merely CROSSES furniture skips it — the same
+            // lane the seam line rides (§2: the wall law holds inside a
+            // sweep too).
+            if Some(block) == seam || self.doc.blocks().kind(block).is_furniture() {
                 continue;
             }
             self.doc.set_block_kind_in_current_tx(block, target.clone());
@@ -10408,6 +10424,14 @@ impl Editor {
                 return;
             };
             let (ix, _) = self.index_for_mouse(ev.position);
+            // A middle-click is a click elsewhere: plain decay (§4), BEFORE
+            // the caret lands — with the state left live, apply_replace's
+            // §4 typing gate re-aimed the paste at the caption's end / the
+            // door caret instead of the click point ("dropped, never
+            // re-aimed", §5).
+            if self.image_sel.is_some() {
+                self.decay_image_sel();
+            }
             self.selected_range = ix..ix;
             self.selection_reversed = false;
             let text = text.replace("\r\n", "\n");
@@ -22587,7 +22611,7 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                     };
                     let shaped = ts.shape_line(
                         SharedString::from(caption.clone()),
-                        px(g.body * 0.8),
+                        px(g.body * crate::bookpage::CAPTION_SCALE),
                         &[run],
                         None,
                     );
@@ -24125,6 +24149,57 @@ mod tests {
         doc.put_back(id).expect("returns");
         assert_eq!(doc.text(), "above\n\nbelow");
         assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn exiling_the_block_below_an_empty_caption_image_spares_the_picture() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        // [P, Image{empty}, P], exile the LAST paragraph: its whole-block
+        // cut eats the LEADING separator, whose start byte coincides with
+        // the empty caption line's own start — the restamp must know which
+        // block the door is taking, or it stamps the picture away (§5).
+        let mut doc = Document::new(
+            "AAA\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), BlockKind::Paragraph]),
+        );
+        doc.exile_to_graveyard(5..8, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\n");
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { .. }),
+            "the neighbour's exile must not destroy the picture"
+        );
+    }
+
+    #[test]
+    fn exiling_an_image_below_an_empty_caption_twin_takes_only_itself() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        // [P, img1{empty}, img2]: exiling img2 (leading-separator cut)
+        // must leave img1 standing AS img1 — the geometric restamp used to
+        // stamp img2's kind onto img1's line, so img2 stood live AND in
+        // the grave (Put back would clone it) while img1 died (§5).
+        let img2 = BlockKind::Image { src: "asset:two.png".into(), alt: String::new() };
+        let mut doc = Document::new(
+            "AAA\n\ncap2",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), img2]),
+        );
+        let id = doc.exile_to_graveyard(5..9, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\n");
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:x.png"),
+            "img1 survives as img1, not as a restamped img2"
+        );
+        let entry = doc.graveyard().get(id).expect("filed");
+        assert!(
+            matches!(&entry.kinds[..], [BlockKind::Image { src, .. }] if src == "asset:two.png"),
+            "img2 lives in the grave"
+        );
+        assert_eq!(
+            doc.blocks().kinds().iter().filter(|k| k.is_furniture()).count(),
+            1,
+            "img2 must not ALSO stand live"
+        );
     }
 
     #[test]

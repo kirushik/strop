@@ -308,23 +308,25 @@ fn migrate_image_captions(
     if legacy.is_empty() {
         return false;
     }
-    // (byte, char) offsets of `line`'s start in `text`, None past the end.
+    // (byte, char) offsets of `line`'s start in `text`, None past the end —
+    // resolved by ropey, the SAME break metric the block indices were
+    // minted under (CR/CRLF/VT/FF/NEL/U+2028/2029 all split; see
+    // pre_edit_info's doc comment). A hand-rolled '\n' counter drifted one
+    // line per earlier non-LF break, so a legacy classic-Mac/PDF paste
+    // above the picture migrated the caption onto the WRONG block — and
+    // the one-way clear below made the misplacement permanent.
     let line_start = |text: &str, line: usize| -> Option<(usize, usize)> {
-        if line == 0 {
-            return Some((0, 0));
-        }
-        let (mut byte, mut chars, mut ix) = (0usize, 0usize, 0usize);
-        for c in text.chars() {
-            byte += c.len_utf8();
-            chars += 1;
-            if c == '\n' {
-                ix += 1;
-                if ix == line {
-                    return Some((byte, chars));
-                }
-            }
-        }
-        None
+        let rope = ropey::Rope::from_str(text);
+        (line < rope.len_lines()).then(|| (rope.line_to_byte(line), rope.line_to_char(line)))
+    };
+    // Any of the rope's break set ends an empty line (the line's own
+    // terminator is its first char exactly when it holds no words).
+    let is_break = |c: char| {
+        matches!(
+            c,
+            '\u{000A}' | '\u{000B}' | '\u{000C}' | '\u{000D}' | '\u{0085}' | '\u{2028}'
+                | '\u{2029}'
+        )
     };
     let ltext = doc.get_text(TEXT_CONTAINER);
     let mut migrated = false;
@@ -332,8 +334,10 @@ fn migrate_image_captions(
         let Some((byte, chars)) = line_start(text, block) else {
             continue; // a desynced map: never guess, never touch text
         };
-        if !matches!(text[byte..].chars().next(), None | Some('\n')) {
-            continue; // the line already has words — spec: empty lines only
+        match text[byte..].chars().next() {
+            None => {}
+            Some(c) if is_break(c) => {}
+            _ => continue, // the line already has words — spec: empty lines only
         }
         let flat: String = caption
             .replace("\r\n", "\n")
@@ -2085,6 +2089,56 @@ manuscript opens here");
             loaded.spans.spans()
         );
         assert_eq!(loaded.annotations.notes()[0].range, 13..18);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn caption_migration_resolves_blocks_by_the_rope_metric_not_lf_count() {
+        use crate::document::BlockKind;
+        // Block indices are ropey lines — CR/VT/FF/NEL/U+2028/2029 all
+        // split (pre_edit_info's own doc comment) — so a legacy file with
+        // any non-LF separator ABOVE the picture must still land the
+        // caption on the picture's own line. The hand-rolled '\n' counter
+        // drifted one line down per earlier non-LF break: onto a full line
+        // (silent skip, the caption never migrates) or onto the empty
+        // paragraph BELOW the picture (permanent misplacement — the
+        // one-way migration clears the wire value).
+        let path = temp_path("cap-u2028");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("be\u{2028}fore\n\nafter");
+        write_legacy_kinds(
+            &store,
+            r#"["Paragraph","Paragraph",{"Image":{"src":"asset:x.png","alt":"","caption":"fig 1"}},"Paragraph"]"#,
+        );
+        let (_s2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(
+            loaded.text, "be\u{2028}fore\nfig 1\nafter",
+            "the caption lands on the picture's own line"
+        );
+        assert_eq!(
+            loaded.blocks.kinds()[2],
+            BlockKind::Image { src: "asset:x.png".into(), alt: String::new() }
+        );
+        let _ = fs::remove_file(&path);
+        // The classic-Mac paste shape: a lone CR above, and TWO empty
+        // lines — the drifted counter used to pass the empty-line guard on
+        // the wrong one and caption the paragraph below the picture.
+        let path = temp_path("cap-cr");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("A\rB\n\n\nafter");
+        write_legacy_kinds(
+            &store,
+            r#"["Paragraph","Paragraph",{"Image":{"src":"asset:x.png","alt":"","caption":"fig 1"}},"Paragraph","Paragraph"]"#,
+        );
+        let (_s2, loaded) = Store::open(&path).unwrap();
+        assert_eq!(
+            loaded.unwrap().text,
+            "A\rB\nfig 1\n\nafter",
+            "the caption must not slide onto the paragraph below"
+        );
         let _ = fs::remove_file(&path);
     }
 

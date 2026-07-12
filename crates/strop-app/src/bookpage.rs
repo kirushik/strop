@@ -79,6 +79,12 @@ pub const MARKER_GAP_EM: f32 = 0.5;
 /// wants the same input to paginate identically every time.
 pub const IMAGE_PLACEHOLDER_HEIGHT: f32 = 56.0;
 
+/// The caption face relative to body (~0.8× muted italic, both doors —
+/// inline-images §11's caption-optics parity). The paginator's measure
+/// clamp and the paint's font size share this one number, so the width
+/// the clamp reasons about IS the width the ink takes.
+pub const CAPTION_SCALE: f32 = 0.8;
+
 const EPS: f32 = 0.01;
 
 // ---- The abstract oracles --------------------------------------------------
@@ -416,13 +422,26 @@ pub fn paginate(
                 // keep-together pagination and teaching every anchor
                 // consumer (hit_token, range_boxes, resume anchors) a
                 // second item shape — a balloon, not a contained edit. The
-                // two doors agree on caption OPTICS instead (~0.8× muted
-                // italic centered, both sides); soft breaks flatten so the
-                // single set line never carries a break character. FLAGGED
-                // for the record: a long caption sets as ONE line here and
-                // can overflow the measure — the reopening condition for
-                // giving captions real set lines.
-                let caption = ptext.replace('\u{2028}', " ");
+                // two doors agree on caption OPTICS instead (CAPTION_SCALE
+                // muted italic centered, both sides); soft breaks flatten
+                // so the single set line never carries a break character.
+                // A long caption CLAMPS to the measure with an ellipsis —
+                // the one dead line must not run past the page edges
+                // (§11's parity floor); real wrapped set lines stay the
+                // recorded reopening condition.
+                let mut caption = ptext.replace('\u{2028}', " ");
+                let cap_style = Style { italic: true, ..Style::default() };
+                let cap_w = |m: &mut dyn Measure, s: &str| {
+                    m.width(s, Role::Body, &[(s.len(), cap_style)]) * CAPTION_SCALE
+                };
+                if !caption.trim().is_empty() && cap_w(m, &caption) > metrics.measure {
+                    while !caption.is_empty()
+                        && cap_w(m, &format!("{}…", caption.trim_end())) > metrics.measure
+                    {
+                        caption.pop();
+                    }
+                    caption = format!("{}…", caption.trim_end());
+                }
                 let (w, hpx) = match m.image_size(src) {
                     Some((nw, nh)) if nw > 0.0 && nh > 0.0 => {
                         let w = nw.min(metrics.measure);
@@ -1967,6 +1986,39 @@ mod tests {
         };
         assert_eq!(*height, IMAGE_PLACEHOLDER_HEIGHT);
         assert_eq!(*width, 170.0);
+    }
+
+    /// A long caption still sets as ONE dead line (N10 kept) — but clamped
+    /// to the measure with an ellipsis, never run off the page edges; real
+    /// wrapped set lines stay the recorded reopening.
+    #[test]
+    fn long_image_caption_clamps_to_the_measure_with_an_ellipsis() {
+        // Measure 200 at FakeM's 10 px/char and CAPTION_SCALE: 25 caption
+        // chars fit; a 41-char caption must ellipsize.
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "known.png".into(),
+            alt: String::new(),
+        }]);
+        let long = "a caption far too long for the measure!!";
+        let book = lay(long, blocks, 200.0, 10);
+        let PageItem::Image { caption, .. } = &book.pages[0].items[0] else {
+            panic!("an image box")
+        };
+        assert!(caption.ends_with('…'), "clamped with an ellipsis: {caption:?}");
+        assert!(
+            caption.chars().count() as f32 * 10.0 * CAPTION_SCALE <= 200.0,
+            "the set line fits the measure: {caption:?}"
+        );
+        // A caption that fits stays verbatim.
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "known.png".into(),
+            alt: String::new(),
+        }]);
+        let book = lay("fits", blocks, 200.0, 10);
+        let PageItem::Image { caption, .. } = &book.pages[0].items[0] else {
+            panic!("an image box")
+        };
+        assert_eq!(caption, "fits");
     }
 
     /// Blank in-slice paragraphs keep their line; the empty slice sets one
