@@ -8,7 +8,7 @@ caret, deletion, splitting, selection, and travel around one. Cites
 `design-principles.md` by number. `document-model.md` §5b stays
 authoritative for the import pipeline; this doc amends its §2 Image
 row and §6's image export. Revised once through a six-lens panel —
-record in §13.)*
+record in §14; build record in §13.)*
 
 ## 0. The wound
 
@@ -487,7 +487,59 @@ hover needed — and alt stays luggage.
   covers it now); no Strop-private multi-image clipboard flavour
   (§9; reopens on cross-document move reports).
 
-## 13. Panel record (2026-07-12)
+## 13. Build record (2026-07-12)
+
+Built in six phases on branch `inline-images` (spec+plan 3b1c6fa):
+two parallel worktree agents for the model (THE WALL, 3b49968; THE
+CAPTION COMES HOME, b61774e; merged c457d38), then three sequential
+editor phases (UNDER, NEVER ON 5c1b58e; STANDING AND LEAVING
+f3f213c; ARRIVALS AND DEPARTURES 1217dba). The field repro that
+opened the round is rig-verified dead: Delete above an image stages
+instead of fusing, Enter never clones, held Backspace stops at the
+stage, the refused-press stills are byte-identical, and Put back
+restores picture + caption.
+
+Discoveries the build recorded against the spec:
+
+- **§6's soft-break sentence has no substrate**: Shift+Enter binds
+  to the same Newline action, and U+2028 is a block *splitter* in
+  the live model (ropey's line-break set), not an in-block soft
+  break — the document-model §1 soft-break design is unbuilt. A
+  caption Shift+Enter therefore splits lawfully (tail born
+  Paragraph). The sentence stands as intent for whenever soft
+  breaks arrive.
+- **Whole-cover tightened for empty captions**: content + one
+  bounding separator takes a block whole only when the caption is
+  non-empty; an empty caption demands full enclosure (the
+  bare-separator range is exactly the old Backspace-drain bug).
+  The deliberate exile verb got its own model door
+  (`delete_bytes_whole_block`) because the clamp — correctly —
+  refuses to release an empty furniture line to arbitrary ranges.
+- **One R6 exception**: room-above at a document-leading image
+  stamps both fragments in one transaction (the furniture-keeps-
+  first split law points the wrong way at offset 0 of block 0).
+- **A fork bug found by §7's rig work**: gpui's drop dispatch gates
+  on `is_hovered`, which stays false while the last input was
+  keyboard — and file-drag events never flip the modality, so any
+  drop right after typing was silently refused (pre-existing,
+  affects real usage). A defer-dispatched synthetic MouseMove works
+  around it; the one-arm fork fix rides the pending fork-push
+  ceremony.
+- **Pre-migration checkpoint previews**: no released build ever
+  wrote a non-empty caption field (all constructors emitted empty),
+  so §10's restore-re-runs-migration clause has, in practice,
+  nothing to migrate; the wire mirror drops legacy values at parse
+  and the raw-JSON re-read hook is recorded should that ever prove
+  wrong.
+- **Paste rulings** (§9, recorded in code): a replace aimed at a
+  selection that decayed is dropped, never re-aimed; a
+  picture-shaped paste with unresolvable pixels while selected is
+  refused, never degraded into caption text; multi-line pastes
+  rebuild only resolving image lines and degrade seam-spanning
+  landings to literal text rather than guess at clamp geometry;
+  middle-click PRIMARY paste shares the rebuild law.
+
+## 14. Panel record (2026-07-12)
 
 Six lenses (Raskin, Cooper, Norman, Tognazzini, corridor stranger +
 borrowed conventions, internal consistency), 55 findings, all six
