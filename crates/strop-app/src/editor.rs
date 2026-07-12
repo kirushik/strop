@@ -2392,16 +2392,20 @@ impl Editor {
     ) {
         let handle = input.read(cx).focus_handle.clone();
         let weak = cx.entity().downgrade();
-        // LAW 2 / D2: a bare focus-out is not a departure. This field's own
-        // focus-in disarms the pending commit, so a keyboard-layout switch or an
-        // alt-tab that returns focus within the grace never resolves the field —
-        // only a real departure (focus gone and not returned) commits.
-        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // LAW 2 / D2: a bare focus-out is not a departure. A GENERATION counter
+        // (V7b) — bumped by every focus-out AND every focus-in — supersedes the
+        // old shared AtomicBool: each blur captures its own generation and its
+        // timer commits only if the count is still current. A keyboard-layout
+        // switch or alt-tab that returns focus bumps the count (focus-in), so
+        // the pending commit is stale; and a blur/focus/blur BOUNCE can no
+        // longer let the first blur's timer commit on the second blur's behalf
+        // before that blur's own grace has elapsed (the AtomicBool did).
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
-            let armed = armed.clone();
+            let generation = generation.clone();
             window
                 .on_focus_in(&handle, cx, move |_window, _cx| {
-                    armed.store(false, std::sync::atomic::Ordering::Relaxed);
+                    generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 })
                 .detach();
         }
@@ -2409,16 +2413,16 @@ impl Editor {
         window
             .on_focus_out(&handle, cx, move |_, _window, cx| {
                 let Some(editor) = weak.upgrade() else { return };
-                armed.store(true, std::sync::atomic::Ordering::Relaxed);
-                let armed = armed.clone();
+                let my_gen = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let generation = generation.clone();
                 let still = still.clone();
                 editor.update_checked(cx, |_editor, cx| {
                     cx.spawn(async move |this, cx| {
                         cx.background_executor()
                             .timer(Duration::from_millis(FIELD_BLUR_GRACE_MS))
                             .await;
-                        if !armed.load(std::sync::atomic::Ordering::Relaxed) {
-                            return; // focus returned within the grace — not a departure
+                        if generation.load(std::sync::atomic::Ordering::Relaxed) != my_gen {
+                            return; // a later focus-in/out superseded this blur
                         }
                         this.update(cx, |editor: &mut Editor, cx| {
                             if let Some(field) = still(editor) {
@@ -3593,19 +3597,17 @@ impl Editor {
         window.focus(&self.focus_handle, cx);
     }
 
-    /// Commit (or C4 empty-DISCARD) the open composer WITHOUT moving focus — the
-    /// LAW 2 blur path, where focus has already genuinely left the field, so
-    /// stealing it back to the document would be wrong. Returns nothing; a no-op
-    /// unless a composer is open.
-    fn commit_composer_no_focus(&mut self, cx: &mut Context<Self>) {
+    /// The shared resolve (V15a): apply an open composer's draft to the doc —
+    /// empty trimmed body → C4 empty-DISCARD (no blank card manufactured), else
+    /// commit — and settle CardFocus accordingly. Focus and notify are the
+    /// callers' to own; returns whether a composer was actually open.
+    fn resolve_composer_draft(&mut self, cx: &mut Context<Self>) -> bool {
         let (id, body) = match &self.focus {
             CardFocus::Composing { id, input } => (*id, input.read(cx).content.clone()),
-            _ => return,
+            _ => return false,
         };
         self.composer_return = None;
         if body.trim().is_empty() {
-            // A never-written note the writer left must not persist as a blank
-            // card (C4 empty-discard: no card manufactured from a stray blur).
             self.doc.remove_note(id);
             self.focus = CardFocus::Idle;
         } else {
@@ -3613,7 +3615,17 @@ impl Editor {
             self.focus = CardFocus::Selected(id);
         }
         self.mark_dirty();
-        cx.notify();
+        true
+    }
+
+    /// Commit (or C4 empty-DISCARD) the open composer WITHOUT moving focus — the
+    /// LAW 2 blur path, where focus has already genuinely left the field, so
+    /// stealing it back to the document would be wrong. A no-op unless a
+    /// composer is open.
+    pub(crate) fn commit_composer_no_focus(&mut self, cx: &mut Context<Self>) {
+        if self.resolve_composer_draft(cx) {
+            cx.notify();
+        }
     }
 
     /// Commit (or C4 empty-discard) the open composer and hand focus back to the
@@ -3622,25 +3634,12 @@ impl Editor {
     /// caret at the click point; a dead-zone click restores). `true` if a
     /// composer was open.
     fn commit_or_discard_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.focus.composing_id() else {
-            return false;
-        };
-        let body = self
-            .focus
-            .input()
-            .map(|i| i.read(cx).content.clone())
-            .unwrap_or_default();
-        self.composer_return = None;
-        if body.trim().is_empty() {
-            self.doc.remove_note(id);
-            self.focus = CardFocus::Idle;
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+            true
         } else {
-            self.doc.set_note_body(id, body);
-            self.focus = CardFocus::Selected(id);
+            false
         }
-        self.mark_dirty();
-        window.focus(&self.focus_handle, cx);
-        true
     }
 
     /// Restore the caret/selection saved at composer-open (LAW 2 / C4 split
@@ -3660,7 +3659,7 @@ impl Editor {
     /// a click resolves the field family at once, not on the delayed blur). Each
     /// field's own Commit subscription closes it — the durable write rides that
     /// path. A no-op when nothing is open.
-    fn commit_transient_fields_on_gesture(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn commit_transient_fields_on_gesture(&mut self, cx: &mut Context<Self>) {
         let fields = [
             self.doc_rename_input.clone(),
             self.goal_input.clone(),
@@ -5083,22 +5082,13 @@ impl Editor {
         )
         .detach();
         // Click-away commits the rename (the title is a real edit, like the
-        // note composer's body — losing focus should save it, not drop it).
-        // Guarded on the field still being open so an Enter-then-blur, which
-        // already finished, doesn't rename a second time.
-        let handle = input.read(cx).focus_handle.clone();
-        let weak = cx.entity().downgrade();
-        window
-            .on_focus_out(&handle, cx, move |_, window, cx| {
-                let Some(editor) = weak.upgrade() else { return };
-                editor.update_checked(cx, |editor, cx| {
-                    if let Some(field) = editor.doc_rename_input.clone() {
-                        let title = field.read(cx).content.clone();
-                        editor.finish_rename(title, window, cx);
-                    }
-                });
-            })
-            .detach();
+        // note composer's body — losing focus should save it, not drop it). Via
+        // the SHARED blur grace (finding 6 / LAW 2): a bare focus-out — the
+        // transient blur a keyboard-layout switch fires — must not commit
+        // mid-rename; only a real departure does. The Commit it emits routes
+        // through the subscription above (finish_rename), which no-ops if the
+        // field already closed.
+        self.commit_field_on_blur(&input, window, cx, |e| e.doc_rename_input.clone());
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.doc_rename_input = Some(input);
@@ -5802,6 +5792,11 @@ impl Editor {
                 .bg(rgb(0xF4F1EA))
                 .border_t_1()
                 .border_color(rgb(RULE_COLOR))
+                // The strip IS the alt field's surface: its clicks must never
+                // bubble to the root's no-dead-zones resolver (C4) and commit
+                // the very field the writer is clicking into (twin of
+                // render_composer_strip).
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .px(px(28.))
                 .py(px(8.))
                 .flex()
