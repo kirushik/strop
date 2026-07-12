@@ -1569,8 +1569,13 @@ impl TextFrame {
 
     /// (paragraph index, visual line, x) of a byte offset.
     fn cursor_position(&self, offset: usize, affinity_down: bool) -> Option<(usize, usize, Pixels)> {
-        let par_ix = self.paragraphs.iter().position(|p| offset <= p.range.end)?;
-        let par = &self.paragraphs[par_ix];
+        // Paragraphs are sorted and contiguous by byte range, so binary-search
+        // the owning paragraph instead of a linear scan (finding 9a — this rides
+        // the scroll and flank-geometry hot paths). `partition_point` returns the
+        // first paragraph whose end is at/after `offset`, matching the old
+        // `position(|p| offset <= p.range.end)`.
+        let par_ix = self.paragraphs.partition_point(|p| p.range.end < offset);
+        let par = self.paragraphs.get(par_ix)?;
         let (line, x) = par.position(offset - par.range.start, affinity_down);
         Some((par_ix, line, x))
     }
@@ -12923,21 +12928,20 @@ impl Editor {
     /// horizontal popover above the line.
     fn render_selection_popover(
         &self,
-        window: &Window,
+        layout: &FlankLayout,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
-        let layout = self.flank_layout(window)?;
         // The link argument-field OWNS the flank while open (spec §0.1): a wide
         // URL field at the selection line — the grid is far too narrow to type a
         // URL into. The field holds keyboard focus, so "typing dismisses" (an
         // EDITOR-focus rule) never fires over the URL; Enter commits, Esc cancels.
         if let Some((_, input)) = &self.link_input {
-            return Some(self.render_link_field(&layout, input.clone()));
+            return Some(self.render_link_field(layout, input.clone()));
         }
         match layout.gate.left {
             FlankLeft::None => None,
-            FlankLeft::Grid => Some(self.render_flank_grid(&layout, cx)),
-            FlankLeft::Horizontal => Some(self.render_flank_horizontal(&layout, cx)),
+            FlankLeft::Grid => Some(self.render_flank_grid(layout, cx)),
+            FlankLeft::Horizontal => Some(self.render_flank_horizontal(layout, cx)),
         }
     }
 
@@ -13073,10 +13077,9 @@ impl Editor {
     /// `flank_layout` (compost-rail and history both stand it down).
     fn render_selection_menu(
         &self,
-        window: &Window,
+        layout: &FlankLayout,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let layout = self.flank_layout(window)?;
         if !layout.gate.right {
             return None;
         }
@@ -17767,6 +17770,22 @@ impl Render for Editor {
         // Then diff the packed lane against last frame: a discrete re-pack
         // starts the card slides; scroll/composer/burst frames snap instead.
         self.update_lane_motion(cx);
+        // The flank geometry, computed ONCE per frame (finding 9b) and shared by
+        // both selection-flank renders below. It also drives the focus-couples-
+        // to-paint guard (finding 3): keyboard focus must not outlive the painted
+        // grid. If focus is inside the flank but the grid stopped painting — the
+        // offer latched (light_dismiss / dismiss_flanks), the selection scrolled
+        // off-screen (layout None), or the window narrowed to the horizontal
+        // fallback (gate.left != Grid) — hand focus back to the prose. This one
+        // per-frame check covers all three hide-while-focused paths at once.
+        let flank_layout = self.flank_layout(window);
+        if self.flank_focused
+            && flank_layout
+                .as_ref()
+                .is_none_or(|l| l.gate.left != FlankLeft::Grid)
+        {
+            self.exit_flank(window, cx);
+        }
         // History mode pushes the document aside (DESIGN §2-history: push,
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
@@ -18119,13 +18138,20 @@ impl Render for Editor {
             // The two selection flanks rise together (docs/impl/03-flanks.md).
             // The RIGHT verb menu paints AFTER render_margin (above), so it
             // OCCLUDES the cards at its y (review B8); the LEFT formatting flank
-            // lives in the opposite gutter.
-            .map(|d| match self.render_selection_menu(window, cx) {
-                Some(menu) => d.child(menu),
+            // lives in the opposite gutter. The geometry is computed ONCE here
+            // (finding 9b) and shared by both, instead of each recomputing it.
+            .map(|d| match flank_layout.as_ref() {
+                Some(layout) => match self.render_selection_menu(layout, cx) {
+                    Some(menu) => d.child(menu),
+                    None => d,
+                },
                 None => d,
             })
-            .map(|d| match self.render_selection_popover(window, cx) {
-                Some(popover) => d.child(popover),
+            .map(|d| match flank_layout.as_ref() {
+                Some(layout) => match self.render_selection_popover(layout, cx) {
+                    Some(popover) => d.child(popover),
+                    None => d,
+                },
                 None => d,
             })
             .map(|d| match self.render_narrow_notes_panel(window, cx) {
