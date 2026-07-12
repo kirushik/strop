@@ -6043,7 +6043,12 @@ impl Editor {
         if self.flank_risen {
             return; // growth: stay up, never re-gate mid-extension (no strobe)
         }
-        self.arm_flank_settle(cx);
+        // A mouse DRAG extends the selection on every mousemove — arming here
+        // would spawn a settle timer per move (V8b). Mouse-up re-arms once the
+        // drag settles; only keyboard selections (is_selecting == false) arm here.
+        if !self.is_selecting {
+            self.arm_flank_settle(cx);
+        }
     }
 
     /// Arm the settle beat (LAW 1): after `FLANK_SETTLE_MS` of no further
@@ -7669,15 +7674,13 @@ impl Editor {
             self.cancel_link(window, cx);
             return;
         }
-        // The flanks are NEVER their own Escape layer (LAW 1): with no field to
-        // cancel, Escape collapses a live selection to a caret, which lowers the
-        // flanks as a consequence. Latch so a restore can't re-raise them.
-        if !self.selected_range.is_empty() {
-            let caret = self.cursor_offset();
-            self.set_cursor(caret, self.cursor_affinity_down, cx);
-            self.flank_latched = true;
-            return;
-        }
+        // The travel-home and history/strip layers run BEFORE the
+        // collapse-selection fallback (finding 5): a find/@/chip jump often
+        // leaves the matched text SELECTED under a latched excursion, and the
+        // documented contract ("Esc closes find, Esc travels home", ~4947) must
+        // cost two presses, not three. Field-cancel still comes first (spec §1
+        // A1 — the field layers above already returned).
+        //
         // Esc-home ends a LATCHED excursion (08 §2; scopes-search 1): only a
         // tail entered by travel — chip, ctrl-shift-o, a find/@ jump — travels
         // back; a caret the writer walked in herself (scroll-and-click) makes
@@ -7711,6 +7714,16 @@ impl Editor {
         }
         if self.history_view.is_some() {
             self.exit_history(cx);
+            return;
+        }
+        // The flanks are NEVER their own Escape layer (LAW 1): with nothing
+        // bigger to dismiss, Escape collapses a live selection to a caret, which
+        // lowers the flanks as a consequence. Latch so a restore can't re-raise
+        // them. Last, so a match-selection never shadows travel-home above.
+        if !self.selected_range.is_empty() {
+            let caret = self.cursor_offset();
+            self.set_cursor(caret, self.cursor_affinity_down, cx);
+            self.flank_latched = true;
         }
     }
 
@@ -7727,7 +7740,21 @@ impl Editor {
         self.flank_risen = true;
         self.flank_settle = None;
         self.flank_sel = self.selected_range.clone();
-        self.enter_flank(window, cx);
+        // Only ENTER the flank when the grid form actually paints in a real
+        // gutter (finding 2). The horizontal fallback is formatting-only display
+        // with no cell navigation, and the link field owns the flank when open —
+        // focusing `flank_focus_handle` in either case would strand the keyboard
+        // on an unpainted target. Where there's no grid, raise the flank as pure
+        // display and keep prose focus.
+        let grid = self.link_input.is_none()
+            && self
+                .flank_layout(window)
+                .is_some_and(|l| l.gate.left == FlankLeft::Grid);
+        if grid {
+            self.enter_flank(window, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// Move keyboard focus into the raised flank (the ctrl-. deliberate path).
@@ -9264,7 +9291,11 @@ impl Editor {
         if self.shortcuts_open {
             overlays.push("shortcuts");
         }
-        if self.flanks_visible() {
+        // Key on the RENDER gate, not the bare predicate (V9b): a settled
+        // selection scrolled off-screen passes `flanks_visible` but paints
+        // nothing, so `flank_layout` (which folds in the geometry) is the honest
+        // signal — matching what `render_selection_popover` actually draws.
+        if self.flank_layout(window).is_some() {
             overlays.push("popover");
         }
         if self.replace_input.is_some() {
@@ -10489,6 +10520,10 @@ impl Editor {
             self.selected_range = caret..caret;
             self.selection_reversed = false;
             self.marked_range = None;
+            // Re-arm the settle gate (finding 8 / LAW 1): this collapse bypasses
+            // the caret funnel, so the next selection must wait its full beat.
+            self.flank_risen = false;
+            self.flank_settle = None;
             self.sync_mutations();
             self.bump_activity();
             cx.notify();
@@ -10572,6 +10607,12 @@ impl Editor {
         self.cursor_affinity_down = false;
         self.goal_x = None;
         self.marked_range = None;
+        // A type-over collapses the selection outside the caret funnel, so
+        // `on_selection_moved` never runs — re-arm the settle gate by hand
+        // (finding 8 / LAW 1) so the writer's NEXT selection waits the full
+        // 250ms beat instead of inheriting this stale risen state.
+        self.flank_risen = false;
+        self.flank_settle = None;
         self.sync_mutations();
 
         // Sticky caret formatting applies to what was just inserted (after
@@ -19061,9 +19102,17 @@ impl Editor {
     /// restores by predicate; caret and scroll were never touched. A Past
     /// read returns to the untouched parked frame (Time 7).
     fn exit_cold_read(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cold_read.take().is_none() {
+        if self.cold_read.is_none() {
             return;
         }
+        // Leaving the room is a writer gesture (LAW 2 / C4): an open note is
+        // committed, not dropped. Mirrors `cr_escape_impl`'s input-open check —
+        // Esc discards the note, but every OTHER exit (the doorknob toggle,
+        // ctrl-shift-l, ReadItCold) files its non-empty trimmed text first.
+        if self.cold_read.as_ref().is_some_and(|cr| cr.input.is_some()) {
+            self.cr_commit_input_inner(cx);
+        }
+        self.cold_read = None;
         *self.cr_page_bounds.borrow_mut() = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
