@@ -646,6 +646,10 @@ impl SpanSet {
                 merged.push(span);
             }
         }
+        // `sort_by_key` is stable: equal-start spans retain the deterministic
+        // attribute order established by the grouping sort above. Do not use
+        // `sort_unstable_by_key` here; equal-start order controls Markdown
+        // marker nesting and is observable in undo snapshots.
         merged.sort_by_key(|s| s.range.start);
         self.spans = merged;
     }
@@ -3472,6 +3476,48 @@ mod tests {
         assert_eq!(at3.len(), 2);
         assert_eq!(set.attrs_at(5).count(), 1);
         assert_eq!(set.attrs_at(6).count(), 0); // end-exclusive
+    }
+
+    #[test]
+    fn span_normalization_has_deterministic_ties() {
+        // Repair first groups by attribute so same-attribute overlaps can be
+        // merged in one sweep. Its final stable start-sort must retain that
+        // canonical attribute order for equal starts; Markdown nesting and
+        // persisted undo snapshots both observe it.
+        let mut set = SpanSet {
+            spans: vec![
+                Span { range: 2..5, attr: InlineAttr::Strong },
+                Span { range: 0..3, attr: InlineAttr::Underline },
+                Span { range: 0..2, attr: InlineAttr::Emphasis },
+                Span { range: 0..2, attr: InlineAttr::Strong },
+            ],
+        };
+
+        set.normalize(5);
+
+        assert_eq!(
+            set.spans(),
+            &[
+                Span { range: 0..2, attr: InlineAttr::Emphasis },
+                Span { range: 0..5, attr: InlineAttr::Strong },
+                Span { range: 0..3, attr: InlineAttr::Underline },
+            ]
+        );
+    }
+
+    #[test]
+    fn span_normalization_does_not_reorder_an_already_valid_set() {
+        // Equal-start ordering can encode the user's marker nesting. A load
+        // that needs no repair must not rewrite that otherwise-valid state.
+        let original = vec![
+            Span { range: 0..3, attr: InlineAttr::Underline },
+            Span { range: 0..3, attr: InlineAttr::Emphasis },
+        ];
+        let mut set = SpanSet { spans: original.clone() };
+
+        set.normalize(3);
+
+        assert_eq!(set.spans(), original);
     }
 
     #[test]

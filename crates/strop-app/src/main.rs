@@ -47,6 +47,17 @@ use editor::Editor;
 
 actions!(strop, [Quit]);
 
+fn register_unhandled_quit(
+    cx: &mut App,
+    listener: impl Fn(&mut App) + 'static,
+) {
+    // Action handlers in a rendered window stop propagation by default. The
+    // editor therefore keeps ownership of its durable-save preflight, while
+    // this app-level fallback makes Ctrl-Q work in startup/recovery and any
+    // future auxiliary window that has no document lifecycle to protect.
+    cx.on_action(move |_: &Quit, cx| listener(cx));
+}
+
 // The PT superfamily (ParaType, OFL): serif body, sans headings, mono code —
 // drawn as independent fonts with the four canonical styles per family, and
 // metrically harmonized with full Cyrillic. Replaced Literata after its
@@ -171,6 +182,7 @@ fn main() {
 
         editor::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
+        register_unhandled_quit(cx, |cx| cx.quit());
 
         // Smoke runs must not steal the user's OS focus — keystroke dispatch
         // uses GPUI's internal focus, which we set explicitly below. They
@@ -502,4 +514,95 @@ fn main() {
             cx.activate(true);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{
+        FocusHandle, Focusable, IntoElement, Render, TestAppContext, VisualTestContext, Window, div,
+    };
+
+    use super::*;
+
+    struct QuitSurface {
+        local_quits: Option<Rc<Cell<usize>>>,
+        focus_handle: FocusHandle,
+    }
+
+    impl Focusable for QuitSurface {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for QuitSurface {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut root = div();
+            if let Some(local_quits) = self.local_quits.clone() {
+                root = root.on_action(move |_: &Quit, _, _| {
+                    local_quits.set(local_quits.get() + 1);
+                });
+            }
+            root.track_focus(&self.focus_handle)
+        }
+    }
+
+    fn quit_window(
+        cx: &mut TestAppContext,
+        local_quits: Option<Rc<Cell<usize>>>,
+    ) -> VisualTestContext {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let surface = cx.new(|cx| QuitSurface {
+                    local_quits,
+                    focus_handle: cx.focus_handle(),
+                });
+                window.focus(&surface.focus_handle(cx), cx);
+                surface
+            })
+            .unwrap()
+        });
+        VisualTestContext::from_window(window.into(), cx)
+    }
+
+    #[gpui::test]
+    fn unhandled_quit_reaches_the_app_fallback(cx: &mut TestAppContext) {
+        let fallback_quits = Rc::new(Cell::new(0));
+        cx.update({
+            let fallback_quits = fallback_quits.clone();
+            move |cx| {
+                register_unhandled_quit(cx, move |_| {
+                    fallback_quits.set(fallback_quits.get() + 1);
+                });
+            }
+        });
+        let mut window = quit_window(cx, None);
+
+        window.dispatch_action(Quit);
+
+        assert_eq!(fallback_quits.get(), 1);
+    }
+
+    #[gpui::test]
+    fn window_quit_handler_keeps_ownership_of_preflight(cx: &mut TestAppContext) {
+        let fallback_quits = Rc::new(Cell::new(0));
+        let local_quits = Rc::new(Cell::new(0));
+        cx.update({
+            let fallback_quits = fallback_quits.clone();
+            move |cx| {
+                register_unhandled_quit(cx, move |_| {
+                    fallback_quits.set(fallback_quits.get() + 1);
+                });
+            }
+        });
+        let mut window = quit_window(cx, Some(local_quits.clone()));
+
+        window.dispatch_action(Quit);
+
+        assert_eq!(local_quits.get(), 1);
+        assert_eq!(fallback_quits.get(), 0);
+    }
 }
