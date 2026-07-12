@@ -60,6 +60,11 @@ pub struct Loaded {
 pub struct Checkpoint {
     pub name: String,
     pub created_unix: i64,
+    /// Exact journal-axis timestamp for checkpoints written by current
+    /// builds. Older files only have `created_unix`; `timestamp_ms` provides
+    /// the backward-compatible seconds fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_ms: Option<i64>,
     pub frontiers: Vec<u8>,
     /// Named-by-the-author (vs automatic session markers).
     #[serde(default)]
@@ -75,6 +80,13 @@ pub struct Checkpoint {
     /// rewind feature no longer needs any oplog history at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<CheckpointState>,
+}
+
+impl Checkpoint {
+    pub fn timestamp_ms(&self) -> i64 {
+        self.created_ms
+            .unwrap_or_else(|| self.created_unix.saturating_mul(1000))
+    }
 }
 
 /// A checkpoint's frozen document state (see `Checkpoint::state`).
@@ -132,6 +144,7 @@ const STYLE_KEYS: [&str; 8] = [
 /// `Store` so the backfill can read a private background-thread doc.
 fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
     let text = doc.get_text(TEXT_CONTAINER);
+    let text_string = text.to_string();
     // Formatting: the spans JSON when present (one map read), else derive it
     // from the legacy Peritext marks. The marks path is `to_delta()`, and on
     // a file that lived through months of unmark-everything/remark-everything
@@ -139,7 +152,7 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
     // measured 4.7 s for a 5.7 KB text, the dominant cost of open, of every
     // historical checkout, and of sealing a checkpoint. Spans persist as
     // JSON now (save_with_state); marks are read-only legacy.
-    let spans = match doc.get_map(BLOCKS_CONTAINER).get("spans") {
+    let mut spans = match doc.get_map(BLOCKS_CONTAINER).get("spans") {
         Some(v) => match v.into_value() {
             Ok(LoroValue::String(s)) => serde_json::from_str(&s).unwrap_or_default(),
             _ => SpanSet::default(),
@@ -197,7 +210,8 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
     {
         blocks.set_scrap_line(boundary);
     }
-    (text.to_string(), spans, blocks)
+    spans.normalize(text_string.chars().count());
+    (text_string, spans, blocks)
 }
 
 /// Compaction only makes sense once the oplog dwarfs the state; below this
@@ -264,6 +278,12 @@ fn checkpoints_of(doc: &LoroDoc) -> Vec<Checkpoint> {
         .filter_map(|v| match v.into_value() {
             Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
             _ => None,
+        })
+        .map(|mut cp: Checkpoint| {
+            if let Some(state) = &mut cp.state {
+                state.spans.normalize(state.text.chars().count());
+            }
+            cp
         })
         .collect()
 }
@@ -435,7 +455,7 @@ impl Store {
                 let journal = journal_of(&store.doc);
                 *store.journal_saved.borrow_mut() =
                     (journal.runs.len(), journal.events.len());
-                let graveyard = match store.doc.get_map(GRAVEYARD_CONTAINER).get("list") {
+                let mut graveyard = match store.doc.get_map(GRAVEYARD_CONTAINER).get("list") {
                     Some(v) => match v.into_value() {
                         Ok(LoroValue::String(json)) => {
                             serde_json::from_str(&json).unwrap_or_default()
@@ -444,7 +464,7 @@ impl Store {
                     },
                     None => Graveyard::default(),
                 };
-                let provenance = match store.doc.get_map(PROVENANCE_CONTAINER).get("list") {
+                let mut provenance = match store.doc.get_map(PROVENANCE_CONTAINER).get("list") {
                     Some(v) => match v.into_value() {
                         Ok(LoroValue::String(json)) => {
                             serde_json::from_str(&json).unwrap_or_default()
@@ -460,7 +480,7 @@ impl Store {
                     },
                     None => None,
                 };
-                let annotations = match store.doc.get_map(ANNOTATIONS_CONTAINER).get("list") {
+                let mut annotations = match store.doc.get_map(ANNOTATIONS_CONTAINER).get("list") {
                     Some(v) => match v.into_value() {
                         Ok(LoroValue::String(json)) => {
                             serde_json::from_str(&json).unwrap_or_default()
@@ -469,6 +489,10 @@ impl Store {
                     },
                     None => Annotations::default(),
                 };
+                let len_chars = text.chars().count();
+                annotations.normalize(len_chars);
+                graveyard.normalize(len_chars);
+                provenance.normalize(len_chars);
                 // Seed the save guards with what the file already holds, so
                 // the session's first unchanged save rewrites nothing.
                 *store.saved.borrow_mut() = SavedHashes {
@@ -570,12 +594,14 @@ impl Store {
         (text, spans, blocks): (String, SpanSet, BlockMap),
     ) {
         self.doc.commit();
+        let created_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
         let checkpoint = Checkpoint {
             name: name.to_owned(),
-            created_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
+            created_unix: created_ms / 1000,
+            created_ms: Some(created_ms),
             frontiers: self.doc.oplog_frontiers().encode(),
             manual,
             state: Some(CheckpointState { text, spans, blocks }),
@@ -608,6 +634,7 @@ impl Store {
         let checkpoint = Checkpoint {
             name: name.to_owned(),
             created_unix,
+            created_ms: None,
             frontiers: self.doc.oplog_frontiers().encode(),
             manual,
             state: Some(state),
@@ -1072,6 +1099,26 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("strop-test-{}-{tag}.strop", std::process::id()))
+    }
+
+    #[test]
+    fn checkpoint_millisecond_timestamp_round_trips_with_legacy_fallback() {
+        let legacy: Checkpoint = serde_json::from_str(
+            r#"{"name":"old","created_unix":7,"frontiers":[],"manual":false}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.timestamp_ms(), 7_000);
+
+        let exact = Checkpoint {
+            name: "new".into(),
+            created_unix: 7,
+            created_ms: Some(7_654),
+            frontiers: Vec::new(),
+            manual: false,
+            state: None,
+        };
+        let back: Checkpoint = serde_json::from_str(&serde_json::to_string(&exact).unwrap()).unwrap();
+        assert_eq!(back.timestamp_ms(), 7_654);
     }
 
     /// Simulate a LEGACY file: strip the materialized state off every

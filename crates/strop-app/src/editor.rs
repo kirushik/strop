@@ -40,6 +40,47 @@ use crate::text_field::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+/// A manuscript-only Markdown export detached from the live editor so Save a
+/// Copy can finish after the asynchronous path prompt. Embedded assets travel
+/// with it; destination-specific relative links are written in `write_to`.
+struct MarkdownExport {
+    markdown: String,
+    assets: Vec<(String, Vec<u8>)>,
+}
+
+impl MarkdownExport {
+    fn prepare(doc: &Document, store: &Store) -> Self {
+        let (text, spans, blocks) = doc.manuscript_slice();
+        let markdown = strop_core::markdown::to_markdown(&text, &spans, &blocks);
+        let assets = blocks
+            .asset_refs()
+            .filter_map(|id| store.get_asset(id).map(|bytes| (id.to_owned(), bytes)))
+            .collect();
+        Self { markdown, assets }
+    }
+
+    fn write_to(mut self, path: &std::path::Path) -> std::io::Result<()> {
+        if !self.assets.is_empty() {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("doc")
+                .to_owned();
+            let dir = path.with_file_name(format!("{stem}.assets"));
+            std::fs::create_dir_all(&dir)?;
+            for (id, bytes) in self.assets {
+                let file = id.trim_start_matches("asset:");
+                std::fs::write(dir.join(file), bytes)?;
+                let rel = format!("{stem}.assets/{file}");
+                self.markdown = self
+                    .markdown
+                    .replace(&format!("]({id})"), &format!("]({rel})"));
+            }
+        }
+        std::fs::write(path, self.markdown)
+    }
+}
+
 // The semantic color language lives in `theme`; everything below is layout.
 pub use crate::theme::{BG_COLOR, TEXT_COLOR};
 use crate::theme::{
@@ -1044,6 +1085,13 @@ pub struct Editor {
     /// Durable layer; edits mirror into it, a background task saves when idle.
     store: Option<Store>,
     store_dirty: bool,
+    /// A failed autosave stays dirty but backs off instead of synchronously
+    /// reserializing the document every one-second heartbeat.
+    save_retry_at: Option<Instant>,
+    save_retry_delay: Duration,
+    /// Visible durability warning; stderr is often invisible for a desktop
+    /// launch and must never be the only sign that edits are not landing.
+    save_error: Option<String>,
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
@@ -1656,6 +1704,9 @@ impl Editor {
             last_input: Instant::now(),
             store: None,
             store_dirty: false,
+            save_retry_at: None,
+            save_retry_delay: Duration::from_secs(1),
+            save_error: None,
             history_view: None,
             history_preview: None,
             history_backfill_running: false,
@@ -1758,7 +1809,9 @@ impl Editor {
                     // already keystroke-durable; the composer was the lone
                     // RAM-only one (it wrote to the doc only on Enter-commit).
                     editor.sync_active_note_draft(cx);
-                    if editor.store_dirty && editor.last_input.elapsed() >= Duration::from_secs(1)
+                    if editor.store_dirty
+                        && editor.last_input.elapsed() >= Duration::from_secs(1)
+                        && editor.save_retry_at.is_none_or(|at| Instant::now() >= at)
                     {
                         editor.save_now();
                     }
@@ -1786,6 +1839,9 @@ impl Editor {
     /// composer once did. Keep this the ONLY place that sets the flag true.
     fn mark_dirty(&mut self) {
         self.store_dirty = true;
+        // A fresh edit is useful new information: try it promptly after the
+        // ordinary one-second idle lull, even if an older attempt backed off.
+        self.save_retry_at = None;
     }
 
     /// Fan buffer changes out to every offset-tracking consumer (formatting
@@ -2614,8 +2670,9 @@ impl Editor {
         self.strip.scratch = None; // re-anchor against the new bake
     }
 
-    /// Checkpoints reduced to draw/anchor metadata (created_unix SECONDS ×1000
-    /// at the boundary — the unit law). Word/char counts come from the ALREADY
+    /// Checkpoints reduced to draw/anchor metadata (`timestamp_ms`; legacy
+    /// second-resolution entries fall back inside that accessor). Word/char
+    /// counts come from the ALREADY
     /// materialized state (a cheap in-memory read — no time-travel; a stateless
     /// legacy checkpoint reports 0/0 and sizes no span, per Bug A).
     fn strip_stations(&self) -> Vec<strip::StationSnap> {
@@ -2639,7 +2696,7 @@ impl Editor {
                     })
                     .unwrap_or((0, 0));
                 strip::StationSnap {
-                    created_ms: cp.created_unix * 1000,
+                    created_ms: cp.timestamp_ms(),
                     name: cp.name,
                     manual: cp.manual,
                     has_state: cp.state.is_some(),
@@ -2693,7 +2750,7 @@ impl Editor {
         store
             .checkpoints()
             .iter()
-            .rfind(|cp| cp.created_unix * 1000 <= first && cp.state.is_some())
+            .rfind(|cp| cp.timestamp_ms() <= first && cp.state.is_some())
             .and_then(|cp| cp.state.as_ref())
             .map(|s| s.text.chars().count())
             .unwrap_or(0)
@@ -2711,7 +2768,7 @@ impl Editor {
         let cp = cps
             .iter()
             .rev()
-            .find(|cp| cp.created_unix * 1000 == ms && cp.state.is_some())?;
+            .find(|cp| cp.timestamp_ms() == ms && cp.state.is_some())?;
         store.checkpoint_state(cp)
     }
 
@@ -3131,40 +3188,8 @@ impl Editor {
             eprintln!("strop: no document file to export next to");
             return;
         };
-        // Export the MANUSCRIPT only — the compost rail is the writer's private
-        // scrap box, never part of the exported document (asides.md §1). The
-        // slice rebases span/block offsets to 0 (review H40, TRAP 14).
-        let (mtext, mspans, mblocks) = self.doc.manuscript_slice();
-        let mut md = strop_core::markdown::to_markdown(&mtext, &mspans, &mblocks);
         let path = store.path().with_extension("md");
-        // Materialize in-file assets as a sidecar dir with relative links
-        // (document-model §6). The MANUSCRIPT slice's blocks, not the full
-        // document's (scopes-search 4): an image living in the pile must not
-        // leak its file into the exported .assets/ dir the markdown never
-        // references — a live bug before the flip, load-bearing after it.
-        let asset_ids: Vec<String> = mblocks.asset_refs().map(str::to_owned).collect();
-        if !asset_ids.is_empty() {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("doc")
-                .to_owned();
-            let dir = path.with_file_name(format!("{stem}.assets"));
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                eprintln!("strop: export assets dir: {e}");
-            } else {
-                for id in asset_ids {
-                    let Some(bytes) = store.get_asset(&id) else { continue };
-                    let file = id.trim_start_matches("asset:").to_owned();
-                    let rel = format!("{stem}.assets/{file}");
-                    if let Err(e) = std::fs::write(dir.join(&file), bytes) {
-                        eprintln!("strop: export asset {file}: {e}");
-                    }
-                    md = md.replace(&format!("]({id})"), &format!("]({rel})"));
-                }
-            }
-        }
-        match std::fs::write(&path, md) {
+        match MarkdownExport::prepare(&self.doc, store).write_to(&path) {
             Ok(()) => {
                 eprintln!("strop: exported {}", path.display());
                 // A ship-shaped moment — the strip marks it.
@@ -3410,15 +3435,11 @@ impl Editor {
             store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
         );
         let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
-        let md = strop_core::markdown::to_markdown(
-            &self.doc.text(),
-            self.doc.spans(),
-            self.doc.blocks(),
-        );
+        let markdown = MarkdownExport::prepare(&self.doc, store);
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 if path.extension().is_some_and(|e| e == "md") {
-                    if let Err(e) = std::fs::write(&path, md) {
+                    if let Err(e) = markdown.write_to(&path) {
                         eprintln!("strop: save copy: {e}");
                     }
                 } else {
@@ -5624,8 +5645,19 @@ impl Editor {
                 self.doc.graveyard(),
                 self.doc.provenance(),
             ) {
-                Ok(()) => self.store_dirty = false,
-                Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
+                Ok(()) => {
+                    self.store_dirty = false;
+                    self.save_retry_at = None;
+                    self.save_retry_delay = Duration::from_secs(1);
+                    self.save_error = None;
+                }
+                Err(e) => {
+                    let message = format!("Not saved: {e}");
+                    eprintln!("strop: failed to save {}: {e}", store.path().display());
+                    self.save_error = Some(message);
+                    self.save_retry_at = Some(Instant::now() + self.save_retry_delay);
+                    self.save_retry_delay = (self.save_retry_delay * 2).min(Duration::from_secs(60));
+                }
             }
         }
         if let Some(t) = perf {
@@ -10248,6 +10280,10 @@ struct LayoutKey {
     /// and the counter live outside `revision` too (a bar flash, an entry
     /// expand). Keying on a coarse fingerprint rebuilds when they change.
     grave_fingerprint: u64,
+    /// Resolved image geometry. Async decode changes `None` to a device-pixel
+    /// size and invalidates layout exactly once; thereafter an image document
+    /// can use the same scroll/blink/caret fast path as plain prose.
+    image_sizes: Vec<(String, Option<(i32, i32)>)>,
 }
 
 struct PrepaintState {
@@ -10856,22 +10892,19 @@ impl Element for EditorElement {
         let perf_start = std::env::var_os("STROP_PERF").map(|_| Instant::now());
         // Ensure encoded-image handles exist for every Image block (the
         // actual decode is async inside GPUI's asset cache).
-        let needed: Vec<String> = {
+        let (image_ids, needed): (Vec<String>, Vec<String>) = {
             let editor = self.editor.read(cx);
-            editor
-                .doc
-                .blocks()
-                .kinds()
-                .iter()
-                .filter_map(|k| match k {
-                    BlockKind::Image { src, .. }
-                        if !editor.image_assets.contains_key(src) =>
-                    {
-                        Some(src.clone())
+            let mut ids = Vec::new();
+            let mut missing = Vec::new();
+            for kind in editor.doc.blocks().kinds() {
+                if let BlockKind::Image { src, .. } = kind {
+                    ids.push(src.clone());
+                    if !editor.image_assets.contains_key(src) {
+                        missing.push(src.clone());
                     }
-                    _ => None,
-                })
-                .collect()
+                }
+            }
+            (ids, missing)
         };
         if !needed.is_empty() {
             self.editor.update_in_draw(cx, |editor| {
@@ -10891,6 +10924,31 @@ impl Element for EditorElement {
                 }
             });
         }
+
+        // Clone handles out of the entity borrow before asking GPUI for their
+        // async render state (`use_render_image` itself needs mutable `cx`).
+        let keyed_images: Vec<(String, Option<Arc<gpui::Image>>)> = {
+            let editor = self.editor.read(cx);
+            image_ids
+                .into_iter()
+                .map(|src| {
+                    let handle = editor.image_assets.get(&src).cloned();
+                    (src, handle)
+                })
+                .collect()
+        };
+        let image_sizes = keyed_images
+            .into_iter()
+            .map(|(src, handle)| {
+                let size = handle
+                    .and_then(|image| image.use_render_image(window, cx))
+                    .map(|render| {
+                        let size = render.size(0);
+                        (size.width.0, size.height.0)
+                    });
+                (src, size)
+            })
+            .collect();
 
         let editor = self.editor.read(cx);
         let style = window.text_style();
@@ -10947,14 +11005,9 @@ impl Element for EditorElement {
             scrap_flash: editor.arrival_flash.is_some(),
             scrap_words: editor.scraps_word_count(),
             grave_fingerprint: editor.grave_layout_fingerprint(),
+            image_sizes,
         };
         let can_reuse = !in_history
-            && !editor
-                .doc
-                .blocks()
-                .kinds()
-                .iter()
-                .any(|k| matches!(k, BlockKind::Image { .. }))
             && editor.last_frame.as_ref().is_some_and(|f| {
                 f.bounds.size.width == wrap_width && f.layout_key == layout_key
             });
@@ -12751,6 +12804,18 @@ impl Editor {
                 // "— reading" / "— viewing “Draft complete”".
                 .when_some(cr_mode_label, |bar, label| {
                     bar.child(div().ml(px(6.)).text_color(rgb(MUTED_COLOR)).child(label))
+                })
+                .when_some(self.save_error.clone(), |bar, message| {
+                    bar.child(
+                        div()
+                            .id("save-error")
+                            .ml(px(8.))
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(ERROR))
+                            .tooltip(tip(message, None))
+                            .child("Not saved · retrying"),
+                    )
                 })
                 // Word count + the session goal's live delta (DESIGN §4.2).
                 // Clickable: sets or changes the goal for this sitting.
@@ -18192,7 +18257,7 @@ impl Editor {
         let store = self.store.as_ref()?;
         store.checkpoints().iter().enumerate().find_map(|(i, cp)| {
             (cp.state.is_some()
-                && (b.timeline.work_at(cp.created_unix * 1000) - play).abs() < 5.)
+                && (b.timeline.work_at(cp.timestamp_ms()) - play).abs() < 5.)
                 .then_some(i)
         })
     }
@@ -20483,6 +20548,44 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn markdown_copy_excludes_scraps_and_materializes_assets() {
+        let root = std::env::temp_dir().join(format!(
+            "strop-markdown-copy-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (store, _) = Store::open(root.join("doc.strop")).unwrap();
+        let bytes = b"image bytes".to_vec();
+        let id = store.put_asset(bytes.clone(), "png");
+        let mut blocks = BlockMap::new(3);
+        blocks.set_kind(
+            0,
+            BlockKind::Image {
+                src: id,
+                alt: "cover".into(),
+                caption: String::new(),
+            },
+        );
+        blocks.set_scrap_line(Some(1));
+        let doc = Document::new("\n\nprivate scrap", SpanSet::default(), blocks);
+        let path = root.join("copy.md");
+        MarkdownExport::prepare(&doc, &store).write_to(&path).unwrap();
+
+        let markdown = std::fs::read_to_string(&path).unwrap();
+        assert!(!markdown.contains("private scrap"));
+        assert!(markdown.contains("copy.assets/"));
+        let asset = std::fs::read_dir(root.join("copy.assets"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(asset).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     // Margin packer invariants, against random card stacks. Floor and viewport
     // are fixed; cards are sorted by anchor (the order margin_cards feeds).
