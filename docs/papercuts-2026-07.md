@@ -534,3 +534,35 @@ unless noted. The record:)*
   click-while-note-open is commit-only (Cooper, Norman, Tognazzini);
   D1 before D4 in build order (Raskin); off-screen selection raises
   no flanks (Cooper).
+
+## 7. Post-build record (2026-07-12)
+
+Built by three parallel worktree agents (document model; editor
+surface; cold read), assembled, then hardened by two waves:
+
+- **Owner field reports (round 2), all fixed:** the margin lane is a
+  *sibling overlay* outside the editor column's hitbox, so the C4
+  dead-zone law had to move to the root `light_dismiss`; the
+  cold-read note's exits must refocus the desk or keyboard focus
+  strands on a removed field; plain delete now *records* block-ness
+  (exact-byte deletion unchanged) so Put back rebuilds a paragraph
+  from either door — the two-verbs-two-contracts ruling survives,
+  the round trip is honest through both; a dropped image stands as
+  its own block with the caret beyond it
+  (`Document::insert_image_block`). **Named next wound, own round:**
+  the image caption model (caption sub-block traveling with its
+  image, caption-optical face — PT Caption is the candidate).
+- **Review wave:** 8 finder angles → 38 candidates → 16 themed
+  verifiers → 16 confirmed + 8 plausible, all confirmed items fixed
+  (one refactor consciously skipped: the flank grid's cell table).
+  The catches worth remembering: every cold-read exit must file the
+  open note (only Esc discards); keyboard focus may never be sent
+  to, or stranded on, a handle no frame paints — focus is coupled
+  to paint; Escape's layers run field → excursion/strip → collapse,
+  in that order; the rename field joins the shared blur grace, and
+  quit flushes open fields before the final save; the seam clamps a
+  typed insertion at its first newline, not only at its head.
+- Deferred, recorded: unifying the three blur-grace implementations
+  into the TextField layer (LAW 2's letter; the behavior is
+  uniform, the code is not); restoring an armed-but-unspent sticky
+  attr on undo of Enter; the flank-cell table.
