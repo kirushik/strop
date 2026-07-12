@@ -1302,14 +1302,16 @@ impl Store {
     /// Write a snapshot copy (full history) to another path; the open
     /// document keeps saving to its own.
     pub fn save_copy_to(&self, path: &Path) -> io::Result<()> {
-        let bytes = self
-            .doc
-            .export(ExportMode::Snapshot)
-            .map_err(io::Error::other)?;
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        fs::write(path, bytes)
+        self.prepare_copy_to(path)?.write()
+    }
+
+    /// Prepare a full snapshot for another path without moving the open
+    /// document. Export stays with the Loro owner; the immutable result may
+    /// be written by a filesystem worker.
+    pub fn prepare_copy_to(&self, path: &Path) -> io::Result<PreparedSave> {
+        stamp_schema_version(&self.doc)?;
+        let bytes = self.doc.export(ExportMode::Snapshot).map_err(io::Error::other)?;
+        Ok(PreparedSave { path: path.to_owned(), bytes })
     }
 }
 

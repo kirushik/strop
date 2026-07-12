@@ -56,6 +56,16 @@ struct PendingSave {
     revision: SaveRevision,
 }
 
+#[derive(Default)]
+enum QuitGuard {
+    #[default]
+    Idle,
+    Saving,
+    Failed(String),
+    SavingCopy,
+    Bypass,
+}
+
 impl MarkdownExport {
     fn prepare(doc: &Document, store: &Store) -> Self {
         let (text, spans, blocks) = doc.manuscript_slice();
@@ -645,6 +655,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-2", Heading2, ctx),
         KeyBinding::new("ctrl-alt-3", Heading3, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
+        KeyBinding::new("escape", EscapeMode, Some("QuitGuard")),
         // GNOME's menu key opens the palette — it IS the menu.
         KeyBinding::new("f10", TogglePalette, ctx),
         KeyBinding::new("enter", FieldCommit, Some("NoteInput")),
@@ -1057,6 +1068,7 @@ struct FlankLayout {
 
 pub struct Editor {
     focus_handle: FocusHandle,
+    quit_focus: FocusHandle,
     /// Text + formatting with unified transaction history. Marks persist
     /// via Store::save_with_marks at save time.
     doc: Document,
@@ -1105,6 +1117,9 @@ pub struct Editor {
     /// Visible durability warning; stderr is often invisible for a desktop
     /// launch and must never be the only sign that edits are not landing.
     save_error: Option<String>,
+    /// A close request is a small state machine, not an irrevocable event:
+    /// the window remains alive until the newest generation reaches disk.
+    quit_guard: QuitGuard,
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
@@ -1698,6 +1713,7 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            quit_focus: cx.focus_handle(),
             word_count: count_words([text].into_iter()),
             doc: Document::new(text, spans, blocks),
             caret_attrs: Vec::new(),
@@ -1723,6 +1739,7 @@ impl Editor {
             save_retry_at: None,
             save_retry_delay: Duration::from_secs(1),
             save_error: None,
+            quit_guard: QuitGuard::Idle,
             history_view: None,
             history_preview: None,
             history_backfill_running: false,
@@ -1821,6 +1838,7 @@ impl Editor {
                     .await;
                 let alive = this.update(cx, |editor: &mut Editor, cx| {
                     editor.drain_save_completions();
+                    editor.finish_quit_if_ready(cx);
                     // Keystroke-durability for the open note composer: mirror
                     // its live draft onto the note every tick so a crash never
                     // loses what's been typed. Every other field in the app is
@@ -5766,6 +5784,107 @@ impl Editor {
         result
     }
 
+    /// Keep the window alive until the newest save generation reaches disk.
+    pub fn request_quit(
+        &mut self,
+        _: &crate::Quit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.quit_guard, QuitGuard::Bypass | QuitGuard::Saving | QuitGuard::SavingCopy) {
+            return;
+        }
+        self.sync_active_note_draft(cx);
+        self.quit_guard = QuitGuard::Saving;
+        window.focus(&self.quit_focus, cx);
+        self.save_now();
+        self.finish_quit_if_ready(cx);
+        cx.notify();
+    }
+
+    fn finish_quit_if_ready(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.quit_guard, QuitGuard::Saving) || self.latest_save.is_some() {
+            return;
+        }
+        // A background result can legitimately mutate the document while the
+        // save is in flight. Chase that newer revision instead of either
+        // closing over stale bytes or making the writer press Retry.
+        if self.store_dirty && self.save_error.is_none() {
+            self.save_now();
+            return;
+        }
+        if self.store_dirty || self.save_error.is_some() {
+            self.quit_guard = QuitGuard::Failed(
+                self.save_error.clone().unwrap_or_else(|| "The newest changes have not reached disk.".into()),
+            );
+            cx.notify();
+            return;
+        }
+        self.record_exit_state();
+        self.quit_guard = QuitGuard::Bypass;
+        cx.quit();
+    }
+
+    fn cancel_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.quit_guard, QuitGuard::Failed(_)) {
+            self.quit_guard = QuitGuard::Idle;
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    fn quit_anyway(&mut self, cx: &mut Context<Self>) {
+        self.quit_guard = QuitGuard::Bypass;
+        cx.quit();
+    }
+
+    fn save_quit_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let QuitGuard::Failed(previous_error) = &self.quit_guard else { return };
+        let previous_error = previous_error.clone();
+        let Some(store) = &self.store else { return };
+        let dir = store.path().parent().map(ToOwned::to_owned)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let suggested = format!(
+            "{} recovery.strop",
+            store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
+        );
+        self.quit_guard = QuitGuard::SavingCopy;
+        let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let path = match rx.await {
+                Ok(Ok(Some(path))) => path,
+                _ => {
+                    this.update(cx, |editor: &mut Editor, cx| {
+                        editor.quit_guard = QuitGuard::Failed(previous_error);
+                        cx.notify();
+                    }).ok();
+                    return;
+                }
+            };
+            let prepared = this.update(cx, |editor: &mut Editor, _| {
+                editor.store.as_ref()
+                    .ok_or_else(|| std::io::Error::other("document store is no longer open"))?
+                    .prepare_copy_to(&path)
+            }).unwrap_or_else(|_| Err(std::io::Error::other("document window closed")));
+            let result = match prepared {
+                Ok(save) => cx.background_executor().spawn(async move { save.write() }).await,
+                Err(e) => Err(e),
+            };
+            this.update(cx, |editor: &mut Editor, cx| match result {
+                Ok(()) => {
+                    editor.quit_guard = QuitGuard::Bypass;
+                    cx.quit();
+                }
+                Err(e) => {
+                    editor.quit_guard = QuitGuard::Failed(format!("Could not save the copy: {e}"));
+                    cx.notify();
+                }
+            }).ok();
+        }).detach();
+        window.focus(&self.quit_focus, cx);
+        cx.notify();
+    }
+
     /// Would text typed at the caret inherit `attr` from the existing spans?
     /// Mirrors `SpanSet::apply_op` insertion rules: strictly inside any
     /// span, or at the right edge of an expanding one.
@@ -7426,6 +7545,10 @@ impl Editor {
     /// which closes the same layer. Order: AI settings → palette →
     /// shortcuts → selection popover → find/replace → history takeover.
     fn escape_mode(&mut self, _: &EscapeMode, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.quit_guard, QuitGuard::Failed(_)) {
+            self.cancel_quit(window, cx);
+            return;
+        }
         // The cold read's belt for focus loss (F4): its own key context owns
         // Esc while focused; this branch catches an Esc that reached the
         // editor context while the takeover is somehow up.
@@ -13350,7 +13473,12 @@ impl Editor {
                     .child(self.window_button(icons::WIN_MAXIMIZE, "Maximize", None, |window, _| {
                         window.zoom_window()
                     }))
-                    .child(self.window_button(icons::WIN_CLOSE, "Close", Some("ctrl-q"), |_, cx| cx.quit()))
+                    .child(self.window_button(
+                        icons::WIN_CLOSE,
+                        "Close",
+                        Some("ctrl-q"),
+                        |window, cx| window.dispatch_action(Box::new(crate::Quit), cx),
+                    ))
                 })
             )
     }
@@ -17166,6 +17294,48 @@ impl Editor {
     }
 }
 
+impl Editor {
+    fn render_quit_guard(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (title, detail, working) = match &self.quit_guard {
+            QuitGuard::Idle | QuitGuard::Bypass => return None,
+            QuitGuard::Saving => ("Saving before closing", "The window will close as soon as the newest changes are safely on disk.".into(), true),
+            QuitGuard::SavingCopy => ("Saving a recovery copy", "The original file is unchanged. The window will close when the copy is safe.".into(), true),
+            QuitGuard::Failed(message) => ("Your changes could not be saved", message.clone(), false),
+        };
+        let button = |id: &'static str, label: &'static str| div()
+            .id(id).occlude().px(px(13.)).py(px(7.)).rounded(px(5.))
+            .border_1().border_color(rgb(RULE_COLOR)).bg(rgb(CARD_BG))
+            .font_family("PT Sans").text_size(px(12.)).cursor(CursorStyle::PointingHand)
+            .hover(|d| d.border_color(rgb(ACTIVE_BORDER))).child(label);
+        Some(div().absolute().inset_0().occlude().track_focus(&self.quit_focus)
+            .key_context("QuitGuard").bg(rgba(0x1A1A1842)).flex().items_center().justify_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(div().w(px(430.)).bg(rgb(BG_COLOR)).border_1().border_color(rgb(RULE_COLOR))
+                .rounded(px(9.)).px(px(24.)).py(px(22.)).font_family("PT Serif")
+                .text_color(rgb(TEXT_COLOR)).child(div().text_size(px(18.)).child(title))
+                .child(div().mt(px(9.)).text_size(px(13.)).line_height(px(19.))
+                    .text_color(rgb(MUTED_COLOR)).child(detail))
+                .when(working, |d| d.child(div().mt(px(18.)).font_family("PT Sans")
+                    .text_size(px(12.)).text_color(rgb(MUTED_COLOR)).child("Please keep this window open…")))
+                .when(!working, |d| d.child(div().mt(px(20.)).flex().items_center().gap(px(8.))
+                    .child(button("quit-retry", "Try again").on_mouse_down(MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation(); editor.request_quit(&crate::Quit, window, cx);
+                        })))
+                    .child(button("quit-copy", "Save a copy…").on_mouse_down(MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation(); editor.save_quit_copy(window, cx);
+                        })))
+                    .child(div().flex_1())
+                    .child(button("quit-anyway", "Quit anyway").text_color(rgb(ERROR))
+                        .on_mouse_down(MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation(); editor.quit_anyway(cx);
+                            })))))).into_any_element())
+    }
+}
+
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Measure-and-cache margin-card heights up front (the window's text
@@ -17249,6 +17419,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::show_shortcuts))
             .on_action(cx.listener(Self::open_welcome))
             .on_action(cx.listener(Self::read_it_cold))
+            .on_action(cx.listener(Self::request_quit))
             // §0.6 law 3 (click-outside) lives on the root so the whole
             // window counts as "outside", gutters and titlebar included.
             .on_mouse_down(
@@ -17552,7 +17723,8 @@ impl Render for Editor {
             .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
             .when(self.ai_settings.is_some(), |d| {
                 d.child(self.render_ai_settings(cx))
-            });
+            })
+            .when_some(self.render_quit_guard(cx), |d, guard| d.child(guard));
 
         // CSD chrome (window-decorations-csd.md): the content sits in an inner
         // surface inset by the shadow gutter on each untiled edge, with a soft

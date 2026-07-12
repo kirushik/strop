@@ -171,7 +171,6 @@ fn main() {
 
         editor::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
 
         // Smoke runs must not steal the user's OS focus — keystroke dispatch
         // uses GPUI's internal focus, which we set explicitly below. They
@@ -435,28 +434,19 @@ fn main() {
                 // Single-window app: route an OS-driven close request (the macOS
                 // traffic-light close — now our only window control there since we
                 // hide our own; or a compositor/WM close on Linux/Windows) to
-                // quit, so `on_app_quit` (below) flushes the document + exit state.
+                // the same save preflight as ctrl-q and the drawn close control.
                 // macOS does NOT terminate on last-window-close by default, so
-                // without this the native close would just hide the window. Our own
-                // "×" (shown off-macOS) calls cx.quit() directly.
+                // without this the native close would just hide the window.
                 //
                 // Return `false` to VETO the platform's synchronous window close
-                // and let cx.quit() be the sole teardown driver — mirroring Zed's
-                // own handler (crates/zed/src/zed.rs). Returning `true` would let
-                // the platform close and DROP the Editor entity *before* quit's
-                // shutdown() runs `on_app_quit`, turning its save_now()/
-                // record_exit_state() into a silent no-op (the handler below uses
-                // update_checked). shutdown() runs on_app_quit *before* clearing
-                // windows, so vetoing keeps the Editor alive until it's saved.
-                //
-                // Calling cx.quit() synchronously here is fine — a clean close of a
-                // normal document exits in ~0.1s. A *slow* close is a separate
-                // problem: the `on_app_quit` save below is synchronous, so a large
-                // document (a multi-MB Loro doc with mark churn) can block teardown
-                // for several seconds and trip the compositor's not-responding
-                // watchdog. That's an engine save-perf issue, not a quit-path one.
-                window.on_window_should_close(cx, |_, cx| {
-                    cx.quit();
+                // until the ordered worker reports the newest generation durable.
+                // Returning `true` would drop the Editor — and its recovery UI —
+                // before a failed final write could be handled.
+                let close_editor = editor.clone();
+                window.on_window_should_close(cx, move |window, cx| {
+                    close_editor.update_checked(cx, |editor, cx| {
+                        editor.request_quit(&Quit, window, cx);
+                    });
                     false
                 });
                 editor
@@ -464,16 +454,14 @@ fn main() {
         )
         .expect("failed to open window");
 
-        // Flush the document on quit; the idle-save loop covers the rest.
+        // Normal quit paths preflight the newest save generation while the
+        // window is still alive. Quit observers cannot veto shutdown.
         let editor = window
             .update(cx, |_, _, cx| cx.entity())
             .expect("window just opened");
         let window_for_quit = window;
         cx.on_app_quit(move |cx| {
             editor.update_checked(cx, |editor, _| {
-                if let Err(e) = editor.flush_saves() {
-                    eprintln!("strop: final save failed: {e}");
-                }
                 // Caret remembered for next open (resume mid-sentence);
                 // never a question, never a dialog (DESIGN §4b tension 6).
                 editor.record_exit_state();
