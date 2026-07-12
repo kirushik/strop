@@ -391,6 +391,19 @@ impl From<WireBlockKind> for BlockKind {
     }
 }
 
+impl BlockKind {
+    /// The §2 class split (docs/inline-images.md, "the wall law"): block
+    /// kinds divide into **flowing** — made of words, following the
+    /// merge-keeps-first / split-clones-both rule — and **furniture**
+    /// (Image, Divider): things that stand in the column but are not made
+    /// of words, which no text mechanic may move, clone, or absorb. Every
+    /// wall law reads this predicate, nowhere else (build plan, "the
+    /// refactor, shaped").
+    pub fn is_furniture(&self) -> bool {
+        matches!(self, Self::Image { .. } | Self::Divider)
+    }
+}
+
 /// Which geometry a boundary index describes (the Scraps build,
 /// docs/impl/compost-fresh/adjudications.md, "the foundation"). The era is
 /// NOT stored as its own field: it is derived from WHICH boundary field a
@@ -573,16 +586,26 @@ impl BlockMap {
 
     /// Repair after a text edit. `block` is the block containing the edit
     /// start (pre-edit), `merged` how many newlines the edit deleted,
-    /// `splits` how many it inserted. Merges keep the first block's kind;
-    /// splits inherit it (Enter-at-heading-end is special-cased upstream).
+    /// `splits` how many it inserted. Merges keep the first block's kind,
+    /// and FLOWING splits inherit it (Enter-at-heading-end is special-cased
+    /// upstream). Furniture never clones (§2 wall law, docs/inline-images.md):
+    /// when the split-source block is furniture, the first fragment keeps
+    /// the kind and every inserted fragment is born a Paragraph. Merges
+    /// across a furniture wall never reach here unclamped — the Document
+    /// edit path decomposes them at the wall first (build plan R1).
     pub fn on_edit(&mut self, block: usize, merged: usize, splits: usize) {
         let block = block.min(self.kinds.len().saturating_sub(1));
         let drain_end = (block + 1 + merged).min(self.kinds.len());
         let removed = drain_end - (block + 1); // blocks actually spliced out
         self.kinds.drain(block + 1..drain_end);
         let kind = self.kinds[block].clone();
+        let born = if kind.is_furniture() {
+            BlockKind::Paragraph
+        } else {
+            kind
+        };
         for _ in 0..splits {
-            self.kinds.insert(block + 1, kind.clone());
+            self.kinds.insert(block + 1, born.clone());
         }
         self.adjust_boundary(block, removed, splits);
     }
@@ -632,6 +655,138 @@ impl BlockMap {
             };
         }
     }
+}
+
+/// A wall-clamped deletion, planned (§2 wall law, docs/inline-images.md;
+/// build plan R1). `cuts` are the surviving sub-deletions in ascending byte
+/// order over the PRE-EDIT rope — the executor runs them right-to-left so
+/// the earlier ranges stay valid — and `insert_at` is where a replacement's
+/// inserted text lands: the range start's side, stepped out of a surviving
+/// separator.
+#[derive(Debug, PartialEq, Eq)]
+struct ClampPlan {
+    cuts: Vec<Range<usize>>,
+    insert_at: usize,
+}
+
+/// Plan the §2 range clamp: decompose a deletion whose byte range crosses a
+/// furniture wall. The caller has already established the gate (the range
+/// deletes at least one line break and some block in its line span is
+/// furniture); this is pure geometry so the law is headlessly testable.
+///
+/// - A separator bounding a furniture block survives unless the deletion
+///   takes that block WHOLE: the bytes on each side go, the separator at
+///   the wall stands, both blocks stand (possibly emptied).
+/// - Whole cover (§5's range door): the range encloses the block's full
+///   line span — content plus every bounding separator it has — or covers
+///   a NON-EMPTY caption plus at least one bounding separator. An empty
+///   caption demands full enclosure, so a lone Backspace/Delete range at
+///   its wall can never silently drain the picture (§0, the today-bug).
+/// - Whole cover plus partial flanks decomposes into left-partial +
+///   whole-cover + right-partial in ONE transaction (adjudicated pushback
+///   5): the flanks do NOT fuse — the surviving separator stands between
+///   them.
+///
+/// Taking a block whole consumes exactly one bounding separator: the
+/// preceding one when it is coverable and unclaimed (`on_edit`'s
+/// merge-keeps-first then drains the furniture kind for free), else the
+/// following one — that form keeps the furniture kind on the merged line,
+/// so the executor restamps it to the first surviving block's kind
+/// (`edit_bytes_clamped`). Adjacent furniture chains resolve left to
+/// right: a following-separator cover claims the wall it shares with the
+/// next block, whose own cover then falls through to ITS following
+/// separator.
+fn clamp_plan(rope: &ropey::Rope, blocks: &BlockMap, byte_range: &Range<usize>) -> ClampPlan {
+    let (s, e) = (byte_range.start, byte_range.end);
+    let last_line = rope.len_lines() - 1;
+    let start_line = rope.byte_to_line(s);
+    let end_line = rope.byte_to_line(e).min(last_line);
+    // Byte geometry of line `i`: [line_start, text_end) is the content,
+    // [text_end, next line_start) its trailing separator (empty on the
+    // last line).
+    let line_start = |i: usize| rope.line_to_byte(i);
+    let text_end = |i: usize| {
+        if i + 1 <= last_line {
+            rope.char_to_byte(line_break_before(rope, rope.line_to_char(i + 1)))
+        } else {
+            rope.len_bytes()
+        }
+    };
+    // Separators the wall keeps standing, ascending, UNCLIPPED — a range
+    // starting mid-separator (a char-aligned start between CR and LF) must
+    // still land its replacement on the wall's left face, never inside the
+    // break. A bounding separator of every furniture block in the span
+    // lands here unless a whole-cover consumed it; the cut subtraction
+    // below clips to the range.
+    let mut protected: Vec<Range<usize>> = Vec::new();
+    let mut push_protected = |sep: &Range<usize>| {
+        if sep.start < e && sep.end > s && protected.last() != Some(sep) {
+            protected.push(sep.clone());
+        }
+    };
+    // The line whose FOLLOWING separator a whole-cover consumed — the wall
+    // it shares with the next block is spoken for.
+    let mut foll_claimed_by: Option<usize> = None;
+    for f in start_line..=end_line {
+        if !blocks.kind(f).is_furniture() {
+            continue;
+        }
+        let (cs, ce) = (line_start(f), text_end(f));
+        let prec = (f > 0).then(|| text_end(f - 1)..cs);
+        let foll = (f < last_line).then(|| ce..line_start(f + 1));
+        let covers = |sep: &Range<usize>| s <= sep.start && e >= sep.end;
+        let prec_covered = prec.as_ref().is_some_and(&covers);
+        let foll_covered = foll.as_ref().is_some_and(&covers);
+        let prec_claimed = f > 0 && foll_claimed_by == Some(f - 1);
+        let content_covered = s <= cs && e >= ce;
+        let enclosed = content_covered
+            && (prec.is_some() || foll.is_some())
+            && prec.as_ref().is_none_or(&covers)
+            && foll.as_ref().is_none_or(&covers);
+        let door = content_covered && ce > cs && ((prec_covered && !prec_claimed) || foll_covered);
+        let mut consume_prec = false;
+        let mut consume_foll = false;
+        if enclosed || door {
+            if prec_covered && !prec_claimed {
+                consume_prec = true;
+            } else if foll_covered {
+                consume_foll = true;
+                foll_claimed_by = Some(f);
+            }
+            // Neither consumable (its one coverable wall was claimed by the
+            // previous block's cover): demoted to a partial — both walls
+            // stand, only the caption bytes in range go.
+        }
+        if !consume_prec && !prec_claimed {
+            if let Some(sep) = &prec {
+                push_protected(sep);
+            }
+        }
+        if !consume_foll {
+            if let Some(sep) = &foll {
+                push_protected(sep);
+            }
+        }
+    }
+    // The cuts: the range minus the standing walls.
+    let mut cuts: Vec<Range<usize>> = Vec::new();
+    let mut at = s;
+    for sep in &protected {
+        if sep.start > at {
+            cuts.push(at..sep.start);
+        }
+        at = at.max(sep.end);
+    }
+    if at < e {
+        cuts.push(at..e);
+    }
+    // Replacement text lands at the range start's side; a start inside a
+    // surviving separator steps back onto the wall's left face.
+    let insert_at = protected
+        .iter()
+        .find(|sep| sep.start <= s && s < sep.end)
+        .map_or(s, |sep| sep.start);
+    ClampPlan { cuts, insert_at }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2741,9 +2896,72 @@ impl Document {
         }
     }
 
-    pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
+    /// The §2 wall gate, priced for the hot path: an edit clamps only when
+    /// it deletes at least one line break AND some block in its pre-edit
+    /// line span is furniture. The common keystroke pays one `merged == 0`
+    /// branch; only multi-line deletions pay the kind scan.
+    fn crosses_furniture_wall(&self, block: usize, merged: usize) -> bool {
+        if merged == 0 {
+            return false;
+        }
+        let kinds = self.blocks.kinds();
+        let lo = block.min(kinds.len());
+        let hi = (block + merged + 1).min(kinds.len());
+        kinds[lo..hi].iter().any(BlockKind::is_furniture)
+    }
+
+    /// Execute a wall-clamped edit (§2 wall law; build plan R1): the
+    /// deletion decomposes per `clamp_plan` and runs as grouped sub-edits
+    /// in ONE transaction — undo restores the pre-edit state in a single
+    /// step, exactly like the aside move — with the replacement text (if
+    /// any) landing at the range start's side. A cut that takes a
+    /// furniture line by its FOLLOWING separator keeps that line's kind
+    /// under `on_edit`'s merge-keeps-first, so the merged line is
+    /// restamped to the first surviving block's kind, captured before the
+    /// drain. A fully refused range (separators only) mutates nothing and
+    /// leaves no undo step behind.
+    fn edit_bytes_clamped(&mut self, byte_range: &Range<usize>, text: &str, by_typing: bool) {
+        let plan = clamp_plan(self.buffer.rope(), &self.blocks, byte_range);
+        if plan.cuts.is_empty() && text.is_empty() {
+            return;
+        }
         self.revision += 1;
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        for cut in plan.cuts.iter().rev() {
+            let (block, merged) = self.pre_edit_info(cut);
+            let restamp = (merged > 0
+                && self.blocks.kind(block).is_furniture()
+                && cut.start == self.buffer.rope().line_to_byte(block))
+                .then(|| self.blocks.kind(block + merged).clone());
+            self.buffer.edit_bytes_grouped(cut.clone(), "");
+            self.blocks.on_edit(block, merged, 0);
+            if let Some(kind) = restamp {
+                self.blocks.set_kind(block, kind);
+            }
+        }
+        if !text.is_empty() {
+            let at = plan.insert_at..plan.insert_at;
+            let (block, _) = self.pre_edit_info(&at);
+            self.buffer.edit_bytes_grouped(at, text);
+            self.blocks.on_edit(block, 0, count_line_breaks(text));
+        }
+        if by_typing {
+            self.absorb_buffer_ops();
+        } else {
+            self.absorb_buffer_ops_verbatim();
+        }
+    }
+
+    pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
         let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.crosses_furniture_wall(block, merged) {
+            self.edit_bytes_clamped(&byte_range, text, true);
+            return;
+        }
+        self.revision += 1;
         if self.buffer.edit_bytes(byte_range, text) {
             // The buffer edit mutates only the rope + its own undo stack;
             // spans/blocks/notes stay pre-edit until on_edit/absorb_buffer_ops
@@ -2762,8 +2980,12 @@ impl Document {
     /// machine-insertion law). Used so a resurrected passage lands wearing its
     /// OWN marks, never the neighbour's.
     pub fn edit_bytes_verbatim(&mut self, byte_range: Range<usize>, text: &str) {
-        self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.crosses_furniture_wall(block, merged) {
+            self.edit_bytes_clamped(&byte_range, text, false);
+            return;
+        }
+        self.revision += 1;
         if self.buffer.edit_bytes(byte_range, text) {
             self.undo_states.push(self.snapshot());
             self.redo_states.clear();
@@ -2774,8 +2996,13 @@ impl Document {
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
-        self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.crosses_furniture_wall(block, merged) {
+            // A wall IS a run boundary: the clamped edit never coalesces.
+            self.edit_bytes_clamped(&byte_range, text, true);
+            return;
+        }
+        self.revision += 1;
         if self.buffer.edit_bytes_coalescing(byte_range, text) {
             // Snapshot only when a new transaction actually opens. While
             // typing inside a word the buffer coalesces and returns false, so
@@ -4294,6 +4521,275 @@ mod tests {
         assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
         assert_eq!(caret, 5);
         assert_eq!(doc.block_of_byte(caret), 2);
+    }
+
+    // ---- the §2 wall law: furniture vs the edit path ------------------
+
+    fn img(src: &str) -> BlockKind {
+        BlockKind::Image {
+            src: src.into(),
+            alt: String::new(),
+            caption: String::new(),
+        }
+    }
+
+    /// "AAA\ncap\nBBB" with the middle line an image whose caption is its
+    /// own text (the §1 ontology): AAA 0..3, sep 3, cap 4..7, sep 7,
+    /// BBB 8..11.
+    fn cap_doc() -> Document {
+        Document::new(
+            "AAA\ncap\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a"), BlockKind::Paragraph]),
+        )
+    }
+
+    fn plan(doc: &Document, range: Range<usize>) -> ClampPlan {
+        clamp_plan(doc.rope(), doc.blocks(), &range)
+    }
+
+    #[test]
+    fn clamp_plan_stops_partial_ranges_at_the_wall() {
+        let doc = cap_doc();
+        // Mid-paragraph into mid-caption: bytes on each side go, the
+        // separator at the wall survives.
+        assert_eq!(
+            plan(&doc, 1..5),
+            ClampPlan { cuts: vec![1..3, 4..5], insert_at: 1 }
+        );
+        // From inside the caption out below: same wall, other polarity.
+        assert_eq!(
+            plan(&doc, 5..9),
+            ClampPlan { cuts: vec![5..7, 8..9], insert_at: 5 }
+        );
+        // A separator-only range is refused whole — no cuts at all. Both
+        // walls, both polarities (the today-bug's Backspace drain, §0).
+        assert_eq!(plan(&doc, 3..4).cuts, Vec::<Range<usize>>::new());
+        assert_eq!(plan(&doc, 7..8).cuts, Vec::<Range<usize>>::new());
+    }
+
+    #[test]
+    fn clamp_plan_takes_a_covered_block_whole() {
+        let doc = cap_doc();
+        // Separator + caption + separator: enclosed, taken by the PRECEDING
+        // separator (merge-keeps-first then drains the image kind); the
+        // following separator stands.
+        assert_eq!(plan(&doc, 3..8), ClampPlan { cuts: vec![3..7], insert_at: 3 });
+        // Whole-cover plus both partial flanks: left-partial + whole-cover
+        // + right-partial (adjudicated pushback 5). The flanks do NOT fuse —
+        // the surviving separator stands between them.
+        assert_eq!(
+            plan(&doc, 1..10),
+            ClampPlan { cuts: vec![1..7, 8..10], insert_at: 1 }
+        );
+        // A non-empty caption plus ONE separator is the §5 range door too.
+        assert_eq!(plan(&doc, 4..8), ClampPlan { cuts: vec![4..8], insert_at: 4 });
+    }
+
+    #[test]
+    fn clamp_plan_empty_caption_demands_full_enclosure() {
+        // "AAA\n\nBBB": empty caption at 4..4, seps 3..4 and 4..5. A lone
+        // separator range must never drain the picture; both separators
+        // covered takes it whole (consuming the preceding one).
+        let doc = Document::new(
+            "AAA\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a"), BlockKind::Paragraph]),
+        );
+        assert_eq!(plan(&doc, 3..4).cuts, Vec::<Range<usize>>::new());
+        assert_eq!(plan(&doc, 4..5).cuts, Vec::<Range<usize>>::new());
+        assert_eq!(plan(&doc, 3..5), ClampPlan { cuts: vec![3..4], insert_at: 3 });
+    }
+
+    #[test]
+    fn clamp_plan_walls_between_adjacent_furniture() {
+        // "AAA\nc1\nc2\nBBB", two images back to back: the shared separator
+        // is a wall for both; a range across it clamps on both sides.
+        let doc = Document::new(
+            "AAA\nc1\nc2\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                img("asset:a"),
+                img("asset:b"),
+                BlockKind::Paragraph,
+            ]),
+        );
+        assert_eq!(
+            plan(&doc, 5..8),
+            ClampPlan { cuts: vec![5..6, 7..8], insert_at: 5 }
+        );
+    }
+
+    #[test]
+    fn clamp_plan_furniture_at_document_edges() {
+        // Image first: no preceding separator exists, so enclosure covers
+        // content + the following one; the cover runs on into the flank.
+        let start = Document::new(
+            "cap\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:a"), BlockKind::Paragraph]),
+        );
+        assert_eq!(plan(&start, 0..6), ClampPlan { cuts: vec![0..6], insert_at: 0 });
+        // Image last: no following separator; the preceding one is the take.
+        let end = Document::new(
+            "AAA\ncap",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a")]),
+        );
+        assert_eq!(plan(&end, 1..7), ClampPlan { cuts: vec![1..7], insert_at: 1 });
+    }
+
+    #[test]
+    fn clamp_plan_replacement_starting_in_a_wall_lands_left() {
+        // A replacement whose range STARTS inside a surviving separator
+        // steps back onto the wall's left face (the range start's side).
+        let doc = cap_doc();
+        assert_eq!(plan(&doc, 3..6), ClampPlan { cuts: vec![4..6], insert_at: 3 });
+        // A CRLF wall: '\r' and '\n' are separate chars, so a char-aligned
+        // range CAN start between them — the landing steps back onto the
+        // break's first byte, and the cut spares the break whole.
+        let crlf = Document::new(
+            "AAA\r\ncap\r\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a"), BlockKind::Paragraph]),
+        );
+        assert_eq!(plan(&crlf, 4..7), ClampPlan { cuts: vec![5..7], insert_at: 3 });
+    }
+
+    #[test]
+    fn wall_clamped_delete_spares_both_blocks_and_undoes_in_one_step() {
+        let mut doc = cap_doc();
+        doc.take_ops();
+        doc.edit_bytes(1..5, "");
+        assert_eq!(doc.text(), "A\nap\nBBB", "bytes on each side go, the wall stands");
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:a"),
+            "the picture never rides a text edit"
+        );
+        // The grouped cuts mirror to the store as ordinary ops.
+        let mut mirror: Vec<char> = "AAA\ncap\nBBB".chars().collect();
+        for op in doc.take_ops() {
+            mirror.splice(op.pos..op.pos + op.delete, op.insert.chars());
+        }
+        assert_eq!(mirror.iter().collect::<String>(), doc.text(), "Loro mirror diverged");
+        // One ctrl-z restores text AND kinds together.
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn wall_refused_range_leaves_no_undo_step() {
+        // A separator-only deletion at the wall is refused whole: nothing
+        // changes and no empty transaction pollutes the undo stack.
+        let mut doc = cap_doc();
+        doc.edit_bytes(7..8, "");
+        assert_eq!(doc.text(), "AAA\ncap\nBBB");
+        assert_eq!(doc.undo(), None, "a refusal must not be undoable");
+    }
+
+    #[test]
+    fn wall_whole_cover_takes_the_picture_and_flanks_stand_apart() {
+        let mut doc = cap_doc();
+        doc.edit_bytes(1..10, "");
+        assert_eq!(doc.text(), "A\nB", "flanks do NOT fuse across the taken block");
+        assert_eq!(doc.blocks().kinds(), &[BlockKind::Paragraph, BlockKind::Paragraph]);
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn wall_whole_cover_at_document_start_restamps_the_merged_line() {
+        // The document-start image has no preceding separator, so the take
+        // consumes the FOLLOWING one — on_edit's merge-keeps-first would
+        // strand the image kind on the survivor's text; the restamp hands
+        // the line to the first surviving block's kind.
+        let mut doc = Document::new(
+            "cap\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:a"), BlockKind::Paragraph]),
+        );
+        doc.edit_bytes(0..6, "");
+        assert_eq!(doc.text(), "B");
+        assert_eq!(doc.blocks().kinds(), &[BlockKind::Paragraph]);
+        doc.undo();
+        assert_eq!(doc.text(), "cap\nBBB");
+        assert!(matches!(doc.blocks().kind(0), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn wall_replacement_clamps_the_delete_and_inserts_at_the_start_side() {
+        let mut doc = cap_doc();
+        doc.edit_bytes(1..5, "XY");
+        assert_eq!(doc.text(), "AXY\nap\nBBB", "text lands on the range start's side");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\ncap\nBBB");
+    }
+
+    #[test]
+    fn caption_edits_and_wall_insertions_never_clamp() {
+        // Entirely inside the caption: ordinary text mechanics, the image
+        // kind stays put (P3 — the caption IS text).
+        let mut doc = cap_doc();
+        doc.edit_bytes(4..6, "");
+        assert_eq!(doc.text(), "AAA\np\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        // A pure insertion at the wall is not a crossing: no clamp, and the
+        // separator count grows as typed.
+        let mut doc = cap_doc();
+        doc.edit_bytes(3..3, "x");
+        assert_eq!(doc.text(), "AAAx\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn split_never_clones_furniture() {
+        // §2 split law: the first fragment keeps the furniture kind; every
+        // further fragment is born a Paragraph — an Enter inside a caption
+        // can never mint a second picture (repro step 8).
+        let mut b = BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a"), BlockKind::Paragraph]);
+        b.on_edit(1, 0, 1);
+        assert!(matches!(b.kind(1), BlockKind::Image { .. }));
+        assert_eq!(b.kind(2), &BlockKind::Paragraph);
+        assert_eq!(b.kinds().iter().filter(|k| k.is_furniture()).count(), 1);
+        // The divider is the same furniture class, same law.
+        let mut b = BlockMap::from_kinds(vec![BlockKind::Divider]);
+        b.on_edit(0, 0, 2);
+        assert_eq!(
+            b.kinds(),
+            &[BlockKind::Divider, BlockKind::Paragraph, BlockKind::Paragraph]
+        );
+    }
+
+    #[test]
+    fn splitting_a_caption_yields_image_plus_paragraph() {
+        // Enter at caption end: the image keeps the head, the tail is a new
+        // Paragraph below (§6).
+        let mut doc = cap_doc();
+        doc.edit_bytes(7..7, "\n");
+        assert_eq!(doc.text(), "AAA\ncap\n\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
+        // Enter at caption START: the first fragment (now the empty line)
+        // keeps the picture; the caption text rides the new Paragraph. The
+        // editor's direction rule (§6, a later phase) will route around
+        // this, but the model law must hold on its own.
+        let mut doc = cap_doc();
+        doc.edit_bytes(4..4, "\n");
+        assert_eq!(doc.text(), "AAA\n\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
+        assert_eq!(doc.blocks().kinds().iter().filter(|k| k.is_furniture()).count(), 1);
+        // A multi-line paste into the caption: every inserted fragment is
+        // born a Paragraph — one picture, however many lines arrive.
+        let mut doc = cap_doc();
+        doc.edit_bytes(5..5, "x\ny\nz");
+        assert_eq!(doc.text(), "AAA\ncx\ny\nzap\nBBB");
+        assert_eq!(doc.blocks().kinds().iter().filter(|k| k.is_furniture()).count(), 1);
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
     }
 
     #[test]
