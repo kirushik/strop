@@ -7120,7 +7120,15 @@ impl Editor {
             if self.at_manuscript_start(self.cursor_offset()) {
                 return;
             }
-            let prev = self.previous_word_boundary(self.cursor_offset());
+            let cursor = self.cursor_offset();
+            let block = self.doc.block_of_byte(cursor);
+            let (par_start, _) = self.paragraph_bounds(cursor);
+            let prev = image_word_left_boundary(
+                self.doc.blocks().kinds(),
+                block,
+                par_start,
+                self.previous_word_boundary(cursor),
+            );
             self.select_to(prev, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
@@ -9842,6 +9850,18 @@ impl Editor {
             }
             return; // surfaces where the drop would be refused show no rule
         }
+        // A one-file drop ON the selected pixels replaces in place (§4),
+        // so §7's insertion rule would lie about the landing. The paths
+        // ride active_drag during Pending; keep the still honest.
+        if matches!(ev.drag(cx).paths(), [_])
+            && let Some(sel) = self.image_sel_live()
+            && self.image_pixel_hit(ev.event.position) == Some(sel.block)
+        {
+            if self.drop_gap.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
@@ -9953,6 +9973,10 @@ impl Editor {
         let target = (self.scroll_top - delta.y).clamp(px(0.), frame.max_scroll());
         if target != self.scroll_top {
             self.scroll_top = target;
+            // §5's decay table: looking elsewhere abandons both a clicked
+            // picture selection and a staged exile before it can complete
+            // destructively against furniture now off-screen.
+            self.decay_image_sel();
             // The flanks FOLLOW the selection (LAW 1): `flank_layout` recomputes
             // geometry each frame and its off-screen gate hides them when the
             // selection scrolls out of view — so scrolling no longer dismisses.
@@ -10076,6 +10100,12 @@ impl Editor {
         // Stale-frame guard (compositor throttling): offsets beyond the
         // live rope never leave this function.
         if par.range.end > self.doc.len_bytes() {
+            return None;
+        }
+        // An image's pixels are not its caption text (§4). This router runs
+        // before image_pixel_hit, so refusing the picture band here lets the
+        // click reach the picture-selection door below.
+        if !footnote_text_band_contains(par.top, par.text_top, p.y) {
             return None;
         }
         let rope = self.doc.rope();
@@ -19953,6 +19983,34 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
     }
 }
 
+/// Ctrl+Backspace's §5 verb clamp. A styled block deliberately passes the
+/// ordinary Backspace door so it can shed its kind, but its WORD form must
+/// not use that pass to reach through the picture wall into the caption.
+/// Caret word-motion keeps the free boundary unchanged and may cross.
+fn image_word_left_boundary(
+    kinds: &[BlockKind],
+    block: usize,
+    paragraph_start: usize,
+    boundary: usize,
+) -> usize {
+    if boundary < paragraph_start
+        && kinds.get(block).is_some_and(|k| !matches!(k, BlockKind::Paragraph))
+        && block > 0
+        && matches!(kinds.get(block - 1), Some(BlockKind::Image { .. }))
+    {
+        paragraph_start
+    } else {
+        boundary
+    }
+}
+
+/// Footnote routing begins only at a paragraph's text band. For ordinary
+/// blocks `text_top` is zero; for a picture it excludes the pixels above
+/// the caption so §4's picture click can win.
+fn footnote_text_band_contains(top: Pixels, text_top: Pixels, y: Pixels) -> bool {
+    y >= top + text_top
+}
+
 // ---- The picture's doors (inline-images §5), as pure decisions ------------
 
 /// Where a collapsed-caret Backspace/Delete press stands relative to the
@@ -23825,6 +23883,27 @@ mod tests {
         let len = doc2.len_bytes();
         assert_eq!(next_word_boundary(&doc2, 0), 4); // selects "word"
         assert_eq!(next_word_boundary(&doc2, 4), len); // blank run -> doc end
+    }
+
+    #[test]
+    fn word_delete_left_clamps_at_picture_below_styled_block() {
+        use BlockKind::*;
+        let kinds = vec![img(), Heading(2)];
+        assert_eq!(image_word_left_boundary(&kinds, 1, 9, 3), 9);
+        // The free word boundary remains available to caret motion, and a
+        // styled block without picture furniture keeps its ordinary reach.
+        assert_eq!(image_word_left_boundary(&[Paragraph, Heading(2)], 1, 9, 3), 3);
+        assert_eq!(image_word_left_boundary(&[img(), Paragraph], 1, 9, 3), 3);
+    }
+
+    #[test]
+    fn footnote_jump_excludes_picture_pixels_above_caption() {
+        let top = px(40.);
+        let text_top = px(120.);
+        assert!(!footnote_text_band_contains(top, text_top, px(159.)));
+        assert!(footnote_text_band_contains(top, text_top, px(160.)));
+        // Prose has no picture band, so its existing routing is unchanged.
+        assert!(footnote_text_band_contains(top, px(0.), top));
     }
 
     // --- Margin-card interaction FSM (CardFocus) -------------------------
