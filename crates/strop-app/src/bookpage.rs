@@ -404,11 +404,16 @@ pub fn paginate(
             // Definitions stay off-page (v1 law; regions 11): the paginator
             // skips the block entirely — refs superscript at paint.
             BlockKind::FootnoteDef { .. } => continue,
-            BlockKind::Image { src, caption, .. } => {
+            BlockKind::Image { src, .. } => {
                 // Deterministic box: natural size when the measurer knows
                 // it, the editor's decoding placeholder otherwise
                 // (regions 12). Scale to the measure; move-or-scale onto a
-                // page is the assembler's call.
+                // page is the assembler's call. The caption is the block's
+                // OWN line now (inline-images §10) — still rendered as one
+                // dead line under the box (N10) until the cold-read parity
+                // pass gives it real anchors; soft breaks flatten so the
+                // single set line never carries a break character.
+                let caption = ptext.replace('\u{2028}', " ");
                 let (w, hpx) = match m.image_size(src) {
                     Some((nw, nh)) if nw > 0.0 && nh > 0.0 => {
                         let w = nw.min(metrics.measure);
@@ -416,12 +421,13 @@ pub fn paginate(
                     }
                     _ => (metrics.measure, IMAGE_PLACEHOLDER_HEIGHT),
                 };
+                let caption_h = if caption.trim().is_empty() { 0.0 } else { body_h };
                 flows.push(Flow::Image(ImageFlow {
                     src: src.clone(),
-                    caption: caption.clone(),
+                    caption,
                     w,
                     h: hpx,
-                    caption_h: if caption.trim().is_empty() { 0.0 } else { body_h },
+                    caption_h,
                     block: i,
                     anchor: cstart,
                 }));
@@ -1888,7 +1894,6 @@ mod tests {
             BlockKind::Image {
                 src: "known.png".into(),
                 alt: String::new(),
-                caption: "cap".into(),
             },
             BlockKind::Paragraph,
         ];
@@ -1916,7 +1921,7 @@ mod tests {
         let (w, h, x, caption) = img.expect("the image box exists");
         assert_eq!((w, h), (300.0, 150.0), "natural size fits the measure");
         assert_eq!(x, 150.0, "centered");
-        assert_eq!(caption, "cap");
+        assert_eq!(caption, "image-line", "the caption is the block's own line");
     }
 
     /// Images keep whole: move to the next page when the room is short,
@@ -1930,7 +1935,6 @@ mod tests {
             BlockKind::Image {
                 src: "known.png".into(),
                 alt: String::new(),
-                caption: "cap".into(),
             },
         ]);
         let book = lay(&text, blocks, 170.0, 4);
@@ -1942,10 +1946,11 @@ mod tests {
         assert_eq!(*y, 0.0);
         assert!(*width < 170.0, "aspect kept while scaling");
         // Unknown src: the editor's 56 px placeholder at full measure.
-        let text = format!("{}\nimg", prose(1));
+        // (Empty image line — an uncaptioned picture, the birth state.)
+        let text = format!("{}\n", prose(1));
         let blocks = BlockMap::from_kinds(vec![
             BlockKind::Paragraph,
-            BlockKind::Image { src: "missing.png".into(), alt: String::new(), caption: String::new() },
+            BlockKind::Image { src: "missing.png".into(), alt: String::new() },
         ]);
         let book = lay(&text, blocks, 170.0, 4);
         let PageItem::Image { height, width, .. } = &book.pages[0].items[1] else {

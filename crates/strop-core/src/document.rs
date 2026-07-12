@@ -288,7 +288,16 @@ impl InlineAttr {
 }
 
 /// Per-block kind; lives beside the text, keyed by block index.
+///
+/// Serialization goes through `WireBlockKind` (docs/inline-images.md §10):
+/// the runtime `Image` variant lost its vestigial `caption` field — the
+/// block's own line IS the caption now — but the wire keeps the key in
+/// both directions, because a released build's strict serde errors on a
+/// missing field and falls back to the legacy token parser, which
+/// collapses every kind in the file and persists the wreck on its next
+/// save (same class as the boundary-key era rule).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "WireBlockKind", into = "WireBlockKind")]
 pub enum BlockKind {
     #[default]
     Paragraph,
@@ -306,11 +315,80 @@ pub enum BlockKind {
     Image {
         src: String,
         alt: String,
+    },
+    FootnoteDef {
+        id: String,
+    },
+}
+
+/// The persistence shape of `BlockKind` — identical to the runtime enum
+/// except that `Image` still carries the retired `caption` key. Writers
+/// emit it empty forever (until an era flip once pre-migration builds are
+/// extinct); readers accept it present or absent, and the open-time
+/// migration (`store`'s `migrate_image_captions`) is what moves a
+/// surviving non-empty value into the block's line. ~13 bytes per image
+/// block is the price of a released build never misreading our output
+/// (docs/inline-images.md §10; build plan, adjudicated pushback 2).
+#[derive(Serialize, Deserialize)]
+enum WireBlockKind {
+    Paragraph,
+    Heading(u8),
+    Blockquote,
+    ListItem {
+        ordered: bool,
+        depth: u8,
+    },
+    Divider,
+    CodeBlock {
+        info: String,
+    },
+    Image {
+        src: String,
+        alt: String,
+        #[serde(default)]
         caption: String,
     },
     FootnoteDef {
         id: String,
     },
+}
+
+impl From<BlockKind> for WireBlockKind {
+    fn from(kind: BlockKind) -> Self {
+        match kind {
+            BlockKind::Paragraph => Self::Paragraph,
+            BlockKind::Heading(n) => Self::Heading(n),
+            BlockKind::Blockquote => Self::Blockquote,
+            BlockKind::ListItem { ordered, depth } => Self::ListItem { ordered, depth },
+            BlockKind::Divider => Self::Divider,
+            BlockKind::CodeBlock { info } => Self::CodeBlock { info },
+            BlockKind::Image { src, alt } => Self::Image {
+                src,
+                alt,
+                caption: String::new(),
+            },
+            BlockKind::FootnoteDef { id } => Self::FootnoteDef { id },
+        }
+    }
+}
+
+impl From<WireBlockKind> for BlockKind {
+    fn from(kind: WireBlockKind) -> Self {
+        match kind {
+            WireBlockKind::Paragraph => Self::Paragraph,
+            WireBlockKind::Heading(n) => Self::Heading(n),
+            WireBlockKind::Blockquote => Self::Blockquote,
+            WireBlockKind::ListItem { ordered, depth } => Self::ListItem { ordered, depth },
+            WireBlockKind::Divider => Self::Divider,
+            WireBlockKind::CodeBlock { info } => Self::CodeBlock { info },
+            // The caption is dropped HERE, not migrated: this conversion
+            // also decodes checkpoint/history states, which are read-only
+            // past (build plan, pushback 3). Only the live document's
+            // open path moves a legacy caption into the line.
+            WireBlockKind::Image { src, alt, caption: _ } => Self::Image { src, alt },
+            WireBlockKind::FootnoteDef { id } => Self::FootnoteDef { id },
+        }
+    }
 }
 
 /// Which geometry a boundary index describes (the Scraps build,
@@ -2820,13 +2898,25 @@ impl Document {
             BlockKind::Image {
                 src,
                 alt: String::new(),
-                caption: String::new(),
             },
         );
         // Start of the block after the image: past the paragraph's end, the
         // separator that opened the image block, and the image block's own
         // (empty) line — all ASCII, so chars step to bytes 1:1 here.
         self.buffer.rope().char_to_byte(par_end_char + 2)
+    }
+
+    /// Swap a picture's pixels in place (docs/inline-images.md §4's
+    /// replace-in-place, plan R4) — the "better export" verb. Same block,
+    /// alt untouched; the caption is the block's own line, so it is
+    /// untouched by construction. One undo step, via the `set_block_kind`
+    /// snapshot path. A non-image block is a no-op: the caller's picture
+    /// selection may have decayed under an async import.
+    pub fn replace_image_src(&mut self, block: usize, src: String) {
+        let BlockKind::Image { alt, .. } = self.blocks.kind(block).clone() else {
+            return;
+        };
+        self.set_block_kind(block, BlockKind::Image { src, alt });
     }
 
     /// Apply/clear an attribute inside the *current* transaction (sticky
@@ -4207,6 +4297,85 @@ mod tests {
     }
 
     #[test]
+    fn replace_image_src_swaps_pixels_keeps_alt_and_caption_one_undo() {
+        // Spec inline-images §4: replace-in-place is a whole-block verb —
+        // new pixels, same block, alt untouched, the caption line never
+        // even enters the transaction. One undo step returns the old src.
+        let mut doc = Document::new("AAA\na caption\nBBB", SpanSet::default(), {
+            let mut b = BlockMap::new(3);
+            b.set_kind(1, BlockKind::Image { src: "asset:old.png".into(), alt: "cat".into() });
+            b
+        });
+        doc.replace_image_src(1, "asset:new.png".into());
+        assert_eq!(
+            doc.blocks().kind(1),
+            &BlockKind::Image { src: "asset:new.png".into(), alt: "cat".into() }
+        );
+        assert_eq!(doc.text(), "AAA\na caption\nBBB", "the caption line is untouched");
+        doc.undo();
+        assert_eq!(
+            doc.blocks().kind(1),
+            &BlockKind::Image { src: "asset:old.png".into(), alt: "cat".into() },
+            "one undo step restores the old pixels"
+        );
+        // A decayed selection (the block is no longer an image) is a no-op.
+        doc.replace_image_src(0, "asset:other.png".into());
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn image_kind_wire_keeps_the_caption_key_for_released_builds() {
+        // Build plan, adjudicated pushback 2: a released build's enum
+        // REQUIRES `caption`, and its serde error path falls back to the
+        // legacy token parser — collapsing the whole BlockMap. So the wire
+        // must keep emitting the key. This replica IS the released shape.
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum OldBlockKind {
+            #[allow(dead_code)]
+            Paragraph,
+            #[allow(dead_code)]
+            Heading(u8),
+            #[allow(dead_code)]
+            Blockquote,
+            #[allow(dead_code)]
+            ListItem { ordered: bool, depth: u8 },
+            #[allow(dead_code)]
+            Divider,
+            #[allow(dead_code)]
+            CodeBlock { info: String },
+            Image { src: String, alt: String, caption: String },
+            #[allow(dead_code)]
+            FootnoteDef { id: String },
+        }
+        let kinds = vec![
+            BlockKind::Paragraph,
+            BlockKind::Image { src: "asset:abc.png".into(), alt: "a]b".into() },
+        ];
+        let json = serde_json::to_string(&kinds).unwrap();
+        assert!(json.contains(r#""caption":"""#), "the wire keeps the key: {json}");
+        let old: Vec<OldBlockKind> = serde_json::from_str(&json)
+            .expect("a released build's REQUIRED-caption serde must parse our output");
+        assert_eq!(
+            old[1],
+            OldBlockKind::Image {
+                src: "asset:abc.png".into(),
+                alt: "a]b".into(),
+                caption: String::new(),
+            }
+        );
+        // The reverse door: an old build's output (caption present, maybe
+        // non-empty) parses into the two-field runtime enum, value dropped
+        // here (the open-time migration owns the value, not serde).
+        let legacy = r#"[{"Image":{"src":"asset:x.png","alt":"","caption":"fig 1"}}]"#;
+        let new: Vec<BlockKind> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(new[0], BlockKind::Image { src: "asset:x.png".into(), alt: String::new() });
+        // And a future captionless wire parses too (the era flip's far side).
+        let future = r#"[{"Image":{"src":"asset:y.png","alt":"a"}}]"#;
+        let new: Vec<BlockKind> = serde_json::from_str(future).unwrap();
+        assert_eq!(new[0], BlockKind::Image { src: "asset:y.png".into(), alt: "a".into() });
+    }
+
+    #[test]
     fn manuscript_slice_excludes_compost_and_rebases_span_offsets() {
         let mut b = BlockMap::new(3);
         b.set_aside_boundary(Some(1)); // "COMP","", "MANU tail"
@@ -4757,7 +4926,7 @@ mod tests {
             let mut b = BlockMap::new(3);
             b.set_kind(
                 1,
-                BlockKind::Image { src: "asset:img1".into(), alt: String::new(), caption: String::new() },
+                BlockKind::Image { src: "asset:img1".into(), alt: String::new() },
             );
             b
         });

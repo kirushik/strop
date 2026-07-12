@@ -112,10 +112,11 @@ fn kind() -> impl Strategy<Value = BlockKind> {
         Just(BlockKind::CodeBlock { info: "rust".into() }),
         // Metadata with a ']' and an embedded newline — the exact shapes the
         // token format used to corrupt; JSON persistence must carry them.
+        // (The caption is the block's own line now — inline-images §10 —
+        // so alt carries the newline torture the field used to.)
         Just(BlockKind::Image {
             src: "asset:x.png".into(),
-            alt: "a]b".into(),
-            caption: "c\nd".into(),
+            alt: "a]b\nc".into(),
         }),
         Just(BlockKind::FootnoteDef { id: "1".into() }),
     ]

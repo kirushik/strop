@@ -110,7 +110,6 @@ fn kind_from_token(token: &str) -> BlockKind {
         t if t.starts_with("img:") => BlockKind::Image {
             src: t[4..].into(),
             alt: String::new(),
-            caption: String::new(),
         },
         _ => BlockKind::Paragraph,
     }
@@ -254,6 +253,123 @@ fn compact_on_open(doc: LoroDoc, original: &[u8], path: &Path) -> LoroDoc {
         bak.display()
     );
     fresh
+}
+
+/// Open-time caption migration (docs/inline-images.md §10). The runtime
+/// enum dropped `Image.caption` — the block's own line IS the caption —
+/// so a surviving non-empty stored caption on a block whose line is still
+/// empty moves INTO the line, here, before the `Document` exists: one-way,
+/// never undoable, never journaled — an open-time normalization of the
+/// LIVE doc only, placed like `compact_on_open`. Checkpoint and history
+/// states are read-only past and are never rewritten (build plan,
+/// adjudicated pushback 3): a pre-migration checkpoint's preview simply
+/// shows the picture without its legacy caption, the recorded cost.
+///
+/// Positions are resolved at APPLY time, one insertion at a time — an
+/// earlier caption shifts every later line, so nothing captured up front
+/// can be trusted (the index-drift trap). Line-break characters in a
+/// legacy caption flatten to spaces: any of ropey's break set would split
+/// the image block and desync the whole map, and the Markdown boundary
+/// flattens caption breaks to spaces anyway. Every in-memory anchor
+/// family shifts through its own `apply_op`; the caller zeroes the save
+/// guards so the shifted JSON actually reaches disk, and drops the
+/// persisted undo stacks (their positions predate the inserted text —
+/// the History arity guard set the one-time-loss precedent).
+#[allow(clippy::too_many_arguments)]
+fn migrate_image_captions(
+    doc: &LoroDoc,
+    text: &mut String,
+    spans: &mut SpanSet,
+    blocks: &BlockMap,
+    annotations: &mut Annotations,
+    graveyard: &mut Graveyard,
+    provenance: &mut Provenance,
+) -> bool {
+    // Captions live only in the raw kinds JSON — the runtime deserializer
+    // drops the field — so read the wire itself. Token-format files carry
+    // no captions and fail this parse: nothing to migrate.
+    let Some(v) = doc.get_map(BLOCKS_CONTAINER).get("kinds") else {
+        return false;
+    };
+    let Ok(LoroValue::String(raw)) = v.into_value() else {
+        return false;
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) else {
+        return false;
+    };
+    let legacy: Vec<(usize, String)> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, e)| {
+            let cap = e.get("Image")?.get("caption")?.as_str()?;
+            (!cap.is_empty()).then(|| (ix, cap.to_owned()))
+        })
+        .collect();
+    if legacy.is_empty() {
+        return false;
+    }
+    // (byte, char) offsets of `line`'s start in `text`, None past the end.
+    let line_start = |text: &str, line: usize| -> Option<(usize, usize)> {
+        if line == 0 {
+            return Some((0, 0));
+        }
+        let (mut byte, mut chars, mut ix) = (0usize, 0usize, 0usize);
+        for c in text.chars() {
+            byte += c.len_utf8();
+            chars += 1;
+            if c == '\n' {
+                ix += 1;
+                if ix == line {
+                    return Some((byte, chars));
+                }
+            }
+        }
+        None
+    };
+    let ltext = doc.get_text(TEXT_CONTAINER);
+    let mut migrated = false;
+    for (block, caption) in legacy {
+        let Some((byte, chars)) = line_start(text, block) else {
+            continue; // a desynced map: never guess, never touch text
+        };
+        if !matches!(text[byte..].chars().next(), None | Some('\n')) {
+            continue; // the line already has words — spec: empty lines only
+        }
+        let flat: String = caption
+            .replace("\r\n", "\n")
+            .chars()
+            .map(|c| match c {
+                '\u{000A}' | '\u{000B}' | '\u{000C}' | '\u{000D}' | '\u{0085}'
+                | '\u{2028}' | '\u{2029}' => ' ',
+                c => c,
+            })
+            .collect();
+        if ltext.insert(chars, &flat).is_err() {
+            continue;
+        }
+        text.insert_str(byte, &flat);
+        let op = TextOp { pos: chars, delete: 0, insert: flat };
+        spans.apply_op_verbatim(&op);
+        annotations.apply_op(&op);
+        graveyard.apply_op(&op);
+        provenance.apply_op(&op);
+        migrated = true;
+    }
+    if migrated {
+        // Clear the vestigial stored values (the new serializer emits the
+        // key as "" — wire compat holds), so a caption line the writer
+        // later empties can never resurrect its legacy text on a reopen.
+        match serde_json::to_string(blocks.kinds()) {
+            Ok(kinds) => {
+                if let Err(e) = doc.get_map(BLOCKS_CONTAINER).insert("kinds", kinds) {
+                    eprintln!("strop: migrate captions: {e}");
+                }
+            }
+            Err(e) => eprintln!("strop: encode migrated kinds: {e}"),
+        }
+        doc.commit();
+    }
+    migrated
 }
 
 /// The checkpoint list of `doc` (see `Store::checkpoints`).
@@ -431,11 +547,11 @@ impl Store {
                 // ignores it — compost folds into the manuscript, nothing
                 // resets. `read_state_of` applies it, HERE and for every
                 // materialized checkpoint state alike.
-                let (text, spans, blocks) = store.read_state();
+                let (mut text, mut spans, blocks) = store.read_state();
                 let journal = journal_of(&store.doc);
                 *store.journal_saved.borrow_mut() =
                     (journal.runs.len(), journal.events.len());
-                let graveyard = match store.doc.get_map(GRAVEYARD_CONTAINER).get("list") {
+                let mut graveyard = match store.doc.get_map(GRAVEYARD_CONTAINER).get("list") {
                     Some(v) => match v.into_value() {
                         Ok(LoroValue::String(json)) => {
                             serde_json::from_str(&json).unwrap_or_default()
@@ -444,7 +560,7 @@ impl Store {
                     },
                     None => Graveyard::default(),
                 };
-                let provenance = match store.doc.get_map(PROVENANCE_CONTAINER).get("list") {
+                let mut provenance = match store.doc.get_map(PROVENANCE_CONTAINER).get("list") {
                     Some(v) => match v.into_value() {
                         Ok(LoroValue::String(json)) => {
                             serde_json::from_str(&json).unwrap_or_default()
@@ -460,7 +576,7 @@ impl Store {
                     },
                     None => None,
                 };
-                let annotations = match store.doc.get_map(ANNOTATIONS_CONTAINER).get("list") {
+                let mut annotations = match store.doc.get_map(ANNOTATIONS_CONTAINER).get("list") {
                     Some(v) => match v.into_value() {
                         Ok(LoroValue::String(json)) => {
                             serde_json::from_str(&json).unwrap_or_default()
@@ -469,6 +585,22 @@ impl Store {
                     },
                     None => Annotations::default(),
                 };
+                // Open-time caption migration (docs/inline-images.md §10):
+                // a legacy non-empty caption moves into the block's line.
+                // The persisted undo stacks predate the inserted text and
+                // their positions cannot be trusted across it, so a
+                // migrating open drops them — the one-time loss the
+                // History arity guard already set precedent for.
+                let migrated = migrate_image_captions(
+                    &store.doc,
+                    &mut text,
+                    &mut spans,
+                    &blocks,
+                    &mut annotations,
+                    &mut graveyard,
+                    &mut provenance,
+                );
+                let history = if migrated { None } else { history };
                 // Seed the save guards with what the file already holds, so
                 // the session's first unchanged save rewrites nothing.
                 *store.saved.borrow_mut() = SavedHashes {
@@ -498,6 +630,18 @@ impl Store {
                         0
                     },
                 };
+                if migrated {
+                    // The file still holds the PRE-shift anchors: zero every
+                    // guard (0 = "unknown, next save writes") so the shifted
+                    // spans/notes/graveyard/provenance and the emptied
+                    // history all reach disk — except blocks, whose cleared
+                    // kinds the migration already wrote itself.
+                    let blocks_hash = store.saved.borrow().blocks;
+                    *store.saved.borrow_mut() = SavedHashes {
+                        blocks: blocks_hash,
+                        ..Default::default()
+                    };
+                }
                 Ok((
                     store,
                     Some(Loaded {
@@ -1618,7 +1762,6 @@ manuscript opens here");
             BlockKind::Image {
                 src: kept_id.clone(),
                 alt: String::new(),
-                caption: String::new(),
             },
             BlockKind::Paragraph,
         ]);
@@ -1660,7 +1803,6 @@ manuscript opens here");
             BlockKind::Image {
                 src: cp_only.clone(),
                 alt: String::new(),
-                caption: String::new(),
             },
             BlockKind::Paragraph,
         ]);
@@ -1741,10 +1883,12 @@ manuscript opens here");
     }
 
     #[test]
-    fn image_alt_and_caption_survive_roundtrip() {
+    fn image_alt_survives_roundtrip() {
         use crate::document::BlockKind;
-        // The token format dropped alt/caption; JSON persistence keeps the
-        // author-entered alt (a shipped editor writes it).
+        // The token format dropped alt; JSON persistence keeps the
+        // author-entered alt (a shipped editor writes it). The caption is
+        // the block's own LINE now (docs/inline-images.md §10) — its
+        // persistence is the text container's, not the kind's.
         let path = temp_path("img-alt");
         let _ = fs::remove_file(&path);
         let (store, _) = Store::open(&path).unwrap();
@@ -1752,7 +1896,6 @@ manuscript opens here");
         let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
             src: "asset:abc.png".into(),
             alt: "a kitten on a mat".into(),
-            caption: "fig 1".into(),
         }]);
         store
             .save_with_state(
@@ -1771,7 +1914,6 @@ manuscript opens here");
             BlockKind::Image {
                 src: "asset:abc.png".into(),
                 alt: "a kitten on a mat".into(),
-                caption: "fig 1".into(),
             }
         );
         let _ = fs::remove_file(&path);
@@ -1789,7 +1931,6 @@ manuscript opens here");
             BlockKind::Image {
                 src: "asset:abc.png".into(),
                 alt: String::new(),
-                caption: String::new(),
             }
         );
         assert_eq!(
@@ -1798,6 +1939,210 @@ manuscript opens here");
         );
         // Unknown tokens degrade to Paragraph (never panic).
         assert_eq!(kind_from_token("???"), BlockKind::Paragraph);
+    }
+
+    /// A pre-migration file, exactly as a released build saved it: raw
+    /// old-shape kinds JSON in the blocks container (the runtime enum can
+    /// no longer express a non-empty caption, which is the point).
+    fn write_legacy_kinds(store: &Store, kinds_json: &str) {
+        store
+            .doc
+            .get_map(BLOCKS_CONTAINER)
+            .insert("kinds", kinds_json)
+            .unwrap();
+        store.doc.commit();
+        store.save().unwrap();
+    }
+
+    #[test]
+    fn legacy_caption_migrates_into_the_line_once() {
+        use crate::document::BlockKind;
+        // docs/inline-images.md §10: a non-empty stored caption on a block
+        // whose line is empty moves INTO the line at open — one-way, and
+        // the vestigial wire value is cleared so an emptied caption line
+        // can never resurrect it on a later open.
+        let path = temp_path("cap-mig");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("before\n\nafter");
+        // Persist a history so the migration's drop-the-stacks rule shows.
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &BlockMap::new(3),
+                &History::default(),
+                &Annotations::default(),
+                &Journal::default(),
+                &Graveyard::default(),
+                &Provenance::default(),
+            )
+            .unwrap();
+        write_legacy_kinds(
+            &store,
+            r#"["Paragraph",{"Image":{"src":"asset:x.png","alt":"","caption":"fig 1"}},"Paragraph"]"#,
+        );
+        let (s2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.text, "before\nfig 1\nafter", "the caption is the line now");
+        assert_eq!(
+            loaded.blocks.kinds()[1],
+            BlockKind::Image { src: "asset:x.png".into(), alt: String::new() }
+        );
+        assert!(
+            loaded.history.is_none(),
+            "persisted undo stacks predate the inserted text — dropped"
+        );
+        // Persist the migrated state, reopen: once means once.
+        s2.save_with_state(
+            &loaded.spans,
+            &loaded.blocks,
+            &History::default(),
+            &Annotations::default(),
+            &loaded.journal,
+            &loaded.graveyard,
+            &loaded.provenance,
+        )
+        .unwrap();
+        let (s3, reloaded) = Store::open(&path).unwrap();
+        assert_eq!(reloaded.unwrap().text, "before\nfig 1\nafter", "no double insert");
+        let raw = match s3.doc.get_map(BLOCKS_CONTAINER).get("kinds").unwrap().into_value() {
+            Ok(LoroValue::String(j)) => j.to_string(),
+            _ => panic!("kinds must be a string"),
+        };
+        assert!(
+            !raw.contains("fig 1") && raw.contains(r#""caption":"""#),
+            "the wire keeps the key but the migrated value is cleared: {raw}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn caption_migration_survives_brackets_quotes_newlines() {
+        // The store.rs metadata-robustness precedent, extended: the exact
+        // shapes the token format used to corrupt must migrate intact —
+        // except line breaks, which flatten to spaces (any of ropey's
+        // break set would split the image block and desync the map).
+        let path = temp_path("cap-torture");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("before\n\nafter");
+        let cap = "fig ]1 \"q\" *s*\r\nsecond\nthird\u{2028}soft";
+        let legacy = serde_json::json!([
+            "Paragraph",
+            {"Image": {"src": "asset:x.png", "alt": "a]b", "caption": cap}},
+            "Paragraph"
+        ])
+        .to_string();
+        write_legacy_kinds(&store, &legacy);
+        let (_s2, loaded) = Store::open(&path).unwrap();
+        assert_eq!(
+            loaded.unwrap().text,
+            "before\nfig ]1 \"q\" *s* second third soft\nafter"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn caption_migration_shifts_spans_and_notes_past_the_insertion() {
+        use crate::document::InlineAttr;
+        // The inserted caption is a real text edit: every persisted anchor
+        // family after it must shift, or formatting and margin notes land
+        // on the wrong words (and would persist wrong on the next save).
+        let path = temp_path("cap-shift");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("before\n\nafter");
+        let mut spans = SpanSet::default();
+        spans.add(8..13, InlineAttr::Strong); // "after"
+        store
+            .doc
+            .get_map(BLOCKS_CONTAINER)
+            .insert("spans", serde_json::to_string(&spans).unwrap())
+            .unwrap();
+        let mut notes = Annotations::default();
+        notes.add(8..13, "on after".into(), 0);
+        store
+            .doc
+            .get_map(ANNOTATIONS_CONTAINER)
+            .insert("list", serde_json::to_string(&notes).unwrap())
+            .unwrap();
+        write_legacy_kinds(
+            &store,
+            r#"["Paragraph",{"Image":{"src":"asset:x.png","alt":"","caption":"fig 1"}},"Paragraph"]"#,
+        );
+        let (_s2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.text, "before\nfig 1\nafter");
+        assert!(
+            loaded.spans.covers(13..18, &InlineAttr::Strong),
+            "the span still covers \"after\": {:?}",
+            loaded.spans.spans()
+        );
+        assert_eq!(loaded.annotations.notes()[0].range, 13..18);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn caption_migration_skips_a_line_that_already_has_words() {
+        use crate::document::BlockKind;
+        // Spec: only "a non-empty stored caption with an empty block line"
+        // migrates. Words already on the line (a wrecked file) win — the
+        // migration never overwrites or appends to the writer's text.
+        let path = temp_path("cap-skip");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("before\nwords here\nafter");
+        write_legacy_kinds(
+            &store,
+            r#"["Paragraph",{"Image":{"src":"asset:x.png","alt":"","caption":"fig 1"}},"Paragraph"]"#,
+        );
+        let (_s2, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.text, "before\nwords here\nafter", "text untouched");
+        assert_eq!(
+            loaded.blocks.kinds()[1],
+            BlockKind::Image { src: "asset:x.png".into(), alt: String::new() }
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn caption_migration_never_touches_checkpoint_states() {
+        // Build plan, adjudicated pushback 3: checkpoint states are
+        // read-only past. The live doc migrates; the stored state's text
+        // gains nothing and its raw JSON keeps the legacy value verbatim.
+        let path = temp_path("cap-ckpt");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("before\n\nafter");
+        let cp = serde_json::json!({
+            "name": "old", "created_unix": 5, "frontiers": [], "manual": true,
+            "state": {
+                "text": "x\n\ny",
+                "spans": {"spans": []},
+                "blocks": {"kinds": [
+                    "Paragraph",
+                    {"Image": {"src": "asset:c.png", "alt": "", "caption": "old cap"}},
+                    "Paragraph"
+                ]}
+            }
+        })
+        .to_string();
+        store.doc.get_list(CHECKPOINTS_CONTAINER).push(cp).unwrap();
+        write_legacy_kinds(
+            &store,
+            r#"["Paragraph",{"Image":{"src":"asset:x.png","alt":"","caption":"live cap"}},"Paragraph"]"#,
+        );
+        let (s2, loaded) = Store::open(&path).unwrap();
+        assert_eq!(loaded.unwrap().text, "before\nlive cap\nafter", "the live doc migrates");
+        let cps = s2.checkpoints();
+        assert_eq!(cps[0].state.as_ref().unwrap().text, "x\n\ny", "no injection into the past");
+        let raw = match s2.doc.get_list(CHECKPOINTS_CONTAINER).get(0).unwrap().into_value() {
+            Ok(LoroValue::String(j)) => j.to_string(),
+            _ => panic!("checkpoint must be a string"),
+        };
+        assert!(raw.contains("old cap"), "the stored state keeps its legacy value verbatim");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

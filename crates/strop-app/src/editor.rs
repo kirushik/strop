@@ -2456,7 +2456,7 @@ impl Editor {
     }
 
     fn edit_image_alt(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let BlockKind::Image { src, alt, caption } = self.doc.blocks().kind(block).clone()
+        let BlockKind::Image { src, alt } = self.doc.blocks().kind(block).clone()
         else {
             return;
         };
@@ -2471,7 +2471,6 @@ impl Editor {
                         BlockKind::Image {
                             src: src.clone(),
                             alt: new_alt.clone(),
-                            caption: caption.clone(),
                         },
                     );
                     editor.mark_dirty();
