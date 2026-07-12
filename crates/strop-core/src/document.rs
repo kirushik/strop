@@ -260,7 +260,7 @@ pub fn flip_char_map(rope: &ropey::Rope, b: usize) -> FlipCharMap {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum InlineAttr {
     Emphasis,
     Strong,
@@ -566,6 +566,51 @@ impl SpanSet {
         &self.spans
     }
 
+    /// Repair spans loaded from an untrusted/older file against the text
+    /// they describe. Serde itself accepts inverted, unsorted, overlapping,
+    /// and out-of-range intervals; the editor's char→byte conversion does
+    /// not. The repair sorts once and merges same-attribute intervals in a
+    /// linear sweep after grouping, avoiding quadratic open time.
+    pub fn normalize(&mut self, len_chars: usize) {
+        let already_safe = self
+            .spans
+            .iter()
+            .all(|s| s.range.start < s.range.end && s.range.end <= len_chars)
+            && self
+                .spans
+                .windows(2)
+                .all(|pair| pair[0].range.start <= pair[1].range.start);
+        if already_safe {
+            // Preserve equal-start attribute ordering: it is observable in
+            // undo snapshots and controls deterministic Markdown nesting.
+            return;
+        }
+        for span in &mut self.spans {
+            span.range.start = span.range.start.min(len_chars);
+            span.range.end = span.range.end.min(len_chars);
+        }
+        self.spans.retain(|s| s.range.start < s.range.end);
+        // Group equal attributes, merge their intervals in one sweep, then
+        // restore the public start-sorted invariant. This avoids feeding a
+        // loaded set through `add` one span at a time (quadratic on a richly
+        // formatted long document).
+        self.spans
+            .sort_by(|a, b| a.attr.cmp(&b.attr).then(a.range.start.cmp(&b.range.start)));
+        let mut merged: Vec<Span> = Vec::with_capacity(self.spans.len());
+        for span in self.spans.drain(..) {
+            if let Some(last) = merged.last_mut()
+                && last.attr == span.attr
+                && span.range.start <= last.range.end
+            {
+                last.range.end = last.range.end.max(span.range.end);
+            } else {
+                merged.push(span);
+            }
+        }
+        merged.sort_by_key(|s| s.range.start);
+        self.spans = merged;
+    }
+
     pub fn attrs_at(&self, pos: usize) -> impl Iterator<Item = &InlineAttr> {
         self.spans
             .iter()
@@ -780,6 +825,17 @@ pub struct Annotations {
 }
 
 impl Annotations {
+    pub fn normalize(&mut self, len_chars: usize) {
+        for note in &mut self.notes {
+            note.range.start = note.range.start.min(len_chars);
+            note.range.end = note.range.end.min(len_chars).max(note.range.start);
+        }
+        self.notes.sort_by_key(|n| n.range.start);
+        self.next_id = self
+            .next_id
+            .max(self.notes.iter().map(|n| n.id).max().unwrap_or(0));
+    }
+
     pub fn add(&mut self, range: Range<usize>, body: String, created_unix: i64) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
@@ -988,6 +1044,18 @@ pub struct Provenance {
 }
 
 impl Provenance {
+    pub fn normalize(&mut self, len_chars: usize) {
+        for record in &mut self.records {
+            record.range.start = record.range.start.min(len_chars);
+            record.range.end = record.range.end.min(len_chars).max(record.range.start);
+        }
+        self.records.retain(|r| r.range.start < r.range.end);
+        self.records.sort_by_key(|r| r.range.start);
+        self.next_id = self
+            .next_id
+            .max(self.records.iter().map(|r| r.id).max().unwrap_or(0));
+    }
+
     pub fn records(&self) -> &[ProvenanceRecord] {
         &self.records
     }
@@ -1139,6 +1207,16 @@ pub struct Graveyard {
 }
 
 impl Graveyard {
+    pub fn normalize(&mut self, document_len: usize) {
+        for entry in &mut self.entries {
+            entry.origin_pos = entry.origin_pos.min(document_len);
+            entry.spans.normalize(entry.text.chars().count());
+        }
+        self.next_id = self
+            .next_id
+            .max(self.entries.iter().map(|e| e.id).max().unwrap_or(0));
+    }
+
     /// Entries in filing order (oldest first). The footer renders newest-first;
     /// that is a view concern, so storage keeps the honest insertion order.
     pub fn entries(&self) -> &[GraveEntry] {
@@ -1297,13 +1375,20 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn new(text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
+    pub fn new(text: &str, mut spans: SpanSet, blocks: BlockMap) -> Self {
         let buffer = Buffer::new(text);
         let mut blocks = blocks;
+        spans.normalize(buffer.rope().len_chars());
         // Repair a stale/foreign block map against the actual text.
         let lines = buffer.rope().len_lines();
         if blocks.len() != lines {
-            blocks = BlockMap::new(lines);
+            let mut repaired = BlockMap::new(lines);
+            // Keep a still-valid serialized region boundary. Dropping it
+            // silently reclassifies private Scraps as manuscript; the
+            // restore/replay repair paths already preserve it the same way.
+            repaired.set_aside_boundary(blocks.aside_boundary());
+            repaired.set_scrap_line(blocks.scrap_line());
+            blocks = repaired;
         }
         Self {
             buffer,
@@ -1439,12 +1524,28 @@ impl Document {
         )
     }
 
+    fn normalize_side_structures(&mut self) {
+        let len = self.buffer.rope().len_chars();
+        self.spans.normalize(len);
+        self.notes.normalize(len);
+        self.graveyard.normalize(len);
+        self.provenance.normalize(len);
+        let lines = self.buffer.rope().len_lines();
+        if self.blocks.len() != lines {
+            let mut repaired = BlockMap::new(lines);
+            repaired.set_aside_boundary(self.blocks.aside_boundary());
+            repaired.set_scrap_line(self.blocks.scrap_line());
+            self.blocks = repaired;
+        }
+    }
+
     pub fn notes(&self) -> &Annotations {
         &self.notes
     }
 
-    pub fn set_notes(&mut self, notes: Annotations) {
+    pub fn set_notes(&mut self, mut notes: Annotations) {
         self.revision += 1;
+        notes.normalize(self.buffer.rope().len_chars());
         self.notes = notes;
     }
 
@@ -1453,8 +1554,9 @@ impl Document {
     }
 
     /// Install the persisted graveyard at load (like `set_notes`).
-    pub fn set_graveyard(&mut self, graveyard: Graveyard) {
+    pub fn set_graveyard(&mut self, mut graveyard: Graveyard) {
         self.revision += 1;
+        graveyard.normalize(self.buffer.rope().len_chars());
         self.graveyard = graveyard;
     }
 
@@ -1463,8 +1565,9 @@ impl Document {
     }
 
     /// Install the persisted provenance at load (like `set_notes`).
-    pub fn set_provenance(&mut self, provenance: Provenance) {
+    pub fn set_provenance(&mut self, mut provenance: Provenance) {
         self.revision += 1;
+        provenance.normalize(self.buffer.rope().len_chars());
         self.provenance = provenance;
     }
 
@@ -2379,6 +2482,9 @@ impl Document {
     }
 
     pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
+        if byte_range.is_empty() && text.is_empty() {
+            return;
+        }
         self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes(byte_range, text) {
@@ -2395,6 +2501,9 @@ impl Document {
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
+        if byte_range.is_empty() && text.is_empty() {
+            return;
+        }
         self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes_coalescing(byte_range, text) {
@@ -2515,6 +2624,7 @@ impl Document {
                 std::mem::replace(&mut self.graveyard, graveyard),
                 std::mem::replace(&mut self.provenance, provenance),
             ));
+            self.normalize_side_structures();
         }
         // Buffer inverse ops still mirror to the store, but must NOT be
         // re-applied to spans/blocks (the snapshot is the correct state).
@@ -2543,6 +2653,7 @@ impl Document {
                 std::mem::replace(&mut self.graveyard, graveyard),
                 std::mem::replace(&mut self.provenance, provenance),
             ));
+            self.normalize_side_structures();
         }
         let ops = self.buffer.take_ops();
         let now = crate::journal::now_ms();
@@ -3696,6 +3807,42 @@ mod tests {
         let mut b = BlockMap::new(3);
         b.set_scrap_line(Some(1));
         assert_eq!(via_doc, manuscript_slice_of(&rope, &SpanSet::default(), &b));
+    }
+
+    #[test]
+    fn new_repairs_untrusted_spans_before_char_to_byte_use() {
+        let spans: SpanSet = serde_json::from_str(
+            r#"{"spans":[
+                {"range":{"start":9,"end":2},"attr":"Strong"},
+                {"range":{"start":0,"end":999},"attr":"Emphasis"},
+                {"range":{"start":1,"end":3},"attr":"Emphasis"}
+            ]}"#,
+        )
+        .unwrap();
+        let doc = Document::new("x", spans, BlockMap::default());
+        assert_eq!(doc.spans().spans().len(), 1);
+        assert_eq!(doc.spans().spans()[0].range, 0..1);
+        // This is the renderer's formerly-panicking conversion.
+        assert_eq!(doc.rope().char_to_byte(doc.spans().spans()[0].range.end), 1);
+    }
+
+    #[test]
+    fn block_count_repair_preserves_a_still_valid_scrap_line() {
+        let mut stale = BlockMap::new(5);
+        stale.set_scrap_line(Some(2));
+        let doc = Document::new("one\ntwo\n\nscrap", SpanSet::default(), stale);
+        assert_eq!(doc.blocks().len(), 4);
+        assert_eq!(doc.scrap_line(), Some(2));
+    }
+
+    #[test]
+    fn empty_document_edit_changes_neither_revision_nor_undo() {
+        let mut doc = Document::new("abc", SpanSet::default(), BlockMap::default());
+        let revision = doc.revision();
+        doc.edit_bytes(1..1, "");
+        assert_eq!(doc.revision(), revision);
+        assert!(doc.take_ops().is_empty());
+        assert!(doc.undo().is_none());
     }
 
     #[test]

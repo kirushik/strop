@@ -106,11 +106,10 @@ final. Absent on older files → `Journal::default()` (§5).
 Tests: `journal_persists_appends_only_the_tail` (roundtrip, unchanged
 saves append nothing, tails land once).
 
-**The unit law:** every journal time is unix MILLISECONDS.
-`Checkpoint.created_unix` is SECONDS and is multiplied by 1000 at
-every comparison boundary — a mixed comparison silently anchors every
-reconstruction at the newest checkpoint (review B11). Field doc
-comments carry their unit.
+**The unit law:** every journal comparison is unix MILLISECONDS. New
+checkpoints carry an exact `created_ms`; legacy entries fall back to
+`created_unix × 1000` through `Checkpoint::timestamp_ms`. Comparing raw
+seconds silently anchors reconstruction at the wrong checkpoint (review B11).
 
 **Size budget** (the bloat saga must not restart): a fortnight story's
 churn ≈ 45k chars of `ins` text + ~60 bytes/run overhead × ~4k runs ≈
@@ -128,7 +127,7 @@ anchor). The lever is DESIGNED but not built in v1.
 pub fn text_at(&self, t: i64, checkpoints: &[Checkpoint]) -> String
 ```
 
-1. Anchor: the latest checkpoint with `created_unix × 1000 ≤ t` and a
+1. Anchor: the latest checkpoint with `timestamp_ms() ≤ t` and a
    materialized `state`. No checkpoint ≤ t → anchor = empty doc at
    journal start. **Anchors are guaranteed correct by two rules the
    editor enforces:** the journal SETTLES at every checkpoint creation

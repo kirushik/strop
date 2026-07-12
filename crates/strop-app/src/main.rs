@@ -227,7 +227,13 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("strop: cannot open {}: {e}", p.display());
-                        None
+                        // `None` is reserved for the intentional storeless
+                        // smoke fixture below. Falling through used to open
+                        // SAMPLE under the requested filename; every edit was
+                        // then RAM-only, a dangerously convincing wrong-doc
+                        // fallback. Never open an editor when its durable
+                        // document could not be loaded.
+                        std::process::exit(1);
                     }
                 }
             }
@@ -237,10 +243,16 @@ fn main() {
         let md_import: Option<(String, SpanSet, BlockMap)> = doc_path.as_ref().and_then(|arg| {
             if arg.extension().is_some_and(|e| e == "md") && !arg.with_extension("strop").exists()
             {
-                std::fs::read_to_string(arg).ok().map(|md| {
-                    let (text, spans, blocks) = strop_core::markdown::from_markdown(&md);
-                    (text, spans, blocks)
-                })
+                match std::fs::read_to_string(arg) {
+                    Ok(md) => {
+                        let (text, spans, blocks) = strop_core::markdown::from_markdown(&md);
+                        Some((text, spans, blocks))
+                    }
+                    Err(e) => {
+                        eprintln!("strop: cannot import {}: {e}", arg.display());
+                        std::process::exit(1);
+                    }
+                }
             } else {
                 None
             }
