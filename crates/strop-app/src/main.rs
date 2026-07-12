@@ -27,6 +27,7 @@ mod paths;
 mod single_instance;
 mod smoke;
 mod strip;
+mod startup_error;
 mod text_field;
 mod theme;
 mod tutorial;
@@ -218,7 +219,7 @@ fn main() {
                         Err(e) => eprintln!("strop: single-instance check failed: {e}"),
                     }
                 }
-                match Store::open(store_path) {
+                match Store::open(&store_path) {
                     Ok(opened) => {
                         if !smoke {
                             files::push_recent(opened.0.path());
@@ -227,36 +228,50 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("strop: cannot open {}: {e}", p.display());
-                        // `None` is reserved for the intentional storeless
-                        // smoke fixture below. Falling through used to open
-                        // SAMPLE under the requested filename; every edit was
-                        // then RAM-only, a dangerously convincing wrong-doc
-                        // fallback. Never open an editor when its durable
-                        // document could not be loaded.
-                        std::process::exit(1);
+                        // Release the rendezvous before Try Again launches a
+                        // fresh process for the same path.
+                        drop(instance_guard.take());
+                        startup_error::show(
+                            startup_error::OpenFailure::from_io(
+                                startup_error::OpenOperation::Open,
+                                store_path,
+                                &e,
+                            ),
+                            cx,
+                        );
+                        return;
                     }
                 }
             }
         };
         // Opening a .md imports it into a sibling .strop (existing .strop
         // wins — the durable file is the source of truth once it exists).
-        let md_import: Option<(String, SpanSet, BlockMap)> = doc_path.as_ref().and_then(|arg| {
-            if arg.extension().is_some_and(|e| e == "md") && !arg.with_extension("strop").exists()
-            {
-                match std::fs::read_to_string(arg) {
-                    Ok(md) => {
-                        let (text, spans, blocks) = strop_core::markdown::from_markdown(&md);
-                        Some((text, spans, blocks))
-                    }
-                    Err(e) => {
-                        eprintln!("strop: cannot import {}: {e}", arg.display());
-                        std::process::exit(1);
-                    }
+        let md_import: Option<(String, SpanSet, BlockMap)> = if let Some(arg) = &doc_path
+            && arg.extension().is_some_and(|e| e == "md")
+            && !arg.with_extension("strop").exists()
+        {
+            match std::fs::read_to_string(arg) {
+                Ok(md) => {
+                    let (text, spans, blocks) = strop_core::markdown::from_markdown(&md);
+                    Some((text, spans, blocks))
                 }
-            } else {
-                None
+                Err(e) => {
+                    eprintln!("strop: cannot import {}: {e}", arg.display());
+                    drop(instance_guard.take());
+                    startup_error::show(
+                        startup_error::OpenFailure::from_io(
+                            startup_error::OpenOperation::Import,
+                            arg.clone(),
+                            &e,
+                        ),
+                        cx,
+                    );
+                    return;
+                }
             }
-        });
+        } else {
+            None
+        };
 
         let mut tutorial_notes = None;
         let (initial_text, initial_spans, initial_blocks, initial_history) = match &store {
