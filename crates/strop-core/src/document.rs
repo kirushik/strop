@@ -2058,7 +2058,13 @@ impl Document {
                 len_chars
             }
         };
-        let whole = s < e
+        // `s <= e`, not `s < e`: an EMPTY line that IS a whole block — an
+        // image with an empty caption (inline-images §5: the block's text
+        // is the caption, and every picture is born captionless) — must go
+        // through this door too, or its exile would fall to the byte-range
+        // cut below, no-op, and strand the picture. The kind rides the
+        // entry, so Put back rebuilds the picture from an empty-text grave.
+        let whole = s <= e
             && s == text_start_of(first_line)
             && e == text_end_of(last_line)
             && region_of_char(rope, &self.blocks, s) == region_of_char(rope, &self.blocks, e);
@@ -2102,7 +2108,16 @@ impl Document {
             (s, e, s)
         };
         let del_byte = self.char_to_byte(del_start)..self.char_to_byte(del_end);
-        self.edit_bytes(del_byte, "");
+        self.delete_bytes_whole_block(del_byte);
+        // A lone block that is the entire document leaves its LINE standing
+        // (the rope's one-line floor): furniture must not survive its own
+        // exile as a kind on the empty remnant — the picture would stand
+        // twice, live and in the grave (inline-images §5). The remnant is
+        // born-again prose; the pre-edit snapshot already covers the kind,
+        // so one undo restores text and furniture together.
+        if del_start == s && del_end == e && self.blocks.kind(first_line).is_furniture() {
+            self.blocks.set_kind(first_line, BlockKind::Paragraph);
+        }
         self.revision += 1;
         let id = self.graveyard.file(
             entry_text,
@@ -2894,6 +2909,37 @@ impl Document {
         for d in diagnoses {
             self.notes.push(d);
         }
+    }
+
+    /// The whole-block doors' own splice (the exile verb's delete): the §2
+    /// clamp gates ARBITRARY ranges — and deliberately demands full
+    /// enclosure before it lets an EMPTY furniture line go, so a stray
+    /// range can never silently drain a captionless picture. A door that
+    /// has already resolved its range to a whole block plus exactly ONE
+    /// bounding separator (inline-images §5) is the deliberate verb that
+    /// law protects, so it splices past the gate — keeping the clamped
+    /// executor's restamp discipline: a cut that takes a furniture line by
+    /// its following separator leaves the furniture kind on the merged
+    /// line under `on_edit`'s merge-keeps-first, and the first surviving
+    /// block's kind is restamped over it, captured before the drain.
+    fn delete_bytes_whole_block(&mut self, byte_range: Range<usize>) {
+        let (block, merged) = self.pre_edit_info(&byte_range);
+        let restamp = (merged > 0
+            && self.blocks.kind(block).is_furniture()
+            && byte_range.start == self.buffer.rope().line_to_byte(block))
+            .then(|| self.blocks.kind(block + merged).clone());
+        self.revision += 1;
+        if self.buffer.edit_bytes(byte_range, "") {
+            // Snapshot AFTER the buffer edit, BEFORE on_edit: spans/blocks/
+            // notes are still pre-edit here (edit_bytes' own pattern).
+            self.undo_states.push(self.snapshot());
+            self.redo_states.clear();
+        }
+        self.blocks.on_edit(block, merged, 0);
+        if let Some(kind) = restamp {
+            self.blocks.set_kind(block, kind);
+        }
+        self.absorb_buffer_ops();
     }
 
     /// The §2 wall gate, priced for the hot path: an edit clamps only when

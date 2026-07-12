@@ -1032,6 +1032,22 @@ struct FlankLayout {
     pile_selection: bool,
 }
 
+/// The single picture-selected state (inline-images §4; plan R3): one
+/// contract whether click-born or reached through a §5 door — "typing types
+/// text, deletion completes, everything else decays". `door_caret` is the
+/// keyboard door's origin memory (§12: origin, not mode): `Some` iff the
+/// state was staged from a caret, which Esc and typing restore. `revision`
+/// is the decay guard: the positional `block` index is the identity, so any
+/// document mutation this state didn't make (an unseen splice) invalidates
+/// it — legitimate in-state mutations (the alt commit; Phase 5's
+/// replace-in-place) re-stamp through `restamp_image_sel`, the one funnel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ImageSel {
+    block: usize,
+    door_caret: Option<usize>,
+    revision: u64,
+}
+
 pub struct Editor {
     focus_handle: FocusHandle,
     /// The raised flank's own keyboard focus (A1, the ctrl-. deliberate path):
@@ -1226,6 +1242,18 @@ pub struct Editor {
     rename_input: Option<(usize, Entity<TextField>)>,
     /// Alt-text composer for an image block: (block index, composer).
     alt_input: Option<(usize, Entity<TextField>)>,
+    /// The picture-selected state (inline-images §4/§5, plan R3) — staged
+    /// exile IS this state reached through a door, not a second state.
+    /// Always read through `image_sel_live` / `resolve_image_sel` (the
+    /// revision guard lives there, nowhere else).
+    image_sel: Option<ImageSel>,
+    /// §5's freshness law (R5): the staging key ("backspace"/"delete")
+    /// whose key-up has NOT yet been observed since the stage. While set,
+    /// presses of that key are the staging press's own autorepeat and are
+    /// refused — key autorepeat never crosses the stage. Cleared by the
+    /// capture-phase key-up listener on the editor column; the platform's
+    /// own repeat flag (`is_held`) is never trusted — it lies on X11.
+    image_stage_hold: Option<&'static str>,
     /// The writer's caret/selection saved at composer-open (LAW 2 / C4 split
     /// exit): `(range, reversed)`. A keyboard commit or a dead-zone click-away
     /// restores it so the exit lands where thought left off; a click INTO the
@@ -1902,6 +1930,8 @@ impl Editor {
             replace_input: None,
             rename_input: None,
             alt_input: None,
+            image_sel: None,
+            image_stage_hold: None,
             composer_return: None,
             voice_baseline: None,
             card_heights: HashMap::new(),
@@ -2600,6 +2630,11 @@ impl Editor {
                         },
                     );
                     editor.mark_dirty();
+                    // A legitimate in-state mutation re-stamps the picture
+                    // selection's revision guard (inline-images §8 / R3) —
+                    // committing the alt must not decay the very state
+                    // whose strip the writer just typed into.
+                    editor.restamp_image_sel(block);
                 }
                 editor.alt_input = None;
                 window.focus(&editor.focus_handle, cx);
@@ -5921,8 +5956,24 @@ impl Editor {
         out
     }
 
-    fn render_alt_strip(&self) -> Option<impl IntoElement> {
-        let (_, input) = self.alt_input.clone()?;
+    fn render_alt_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        // Two ways in, one strip (inline-images §8): the open composer
+        // (double-click, or the click below) — or, while the picture is
+        // SELECTED, the alt shown as data. The strip IS the control (P12):
+        // clicking the data line enters the same edit state double-click
+        // opens. Never both at once — the composer wins.
+        let (editing, data): (Option<Entity<TextField>>, Option<(usize, String)>) =
+            match self.alt_input.clone() {
+                Some((_, input)) => (Some(input), None),
+                None => {
+                    let sel = self.image_sel_live()?;
+                    let BlockKind::Image { alt, .. } = self.doc.blocks().kind(sel.block)
+                    else {
+                        return None;
+                    };
+                    (None, Some((sel.block, alt.clone())))
+                }
+            };
         Some(
             div()
                 .absolute()
@@ -5945,7 +5996,30 @@ impl Editor {
                 .font_family("PT Serif")
                 .text_size(px(13.))
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Alt text:"))
-                .child(div().flex_1().child(input)),
+                .map(|d| match (editing, data) {
+                    (Some(input), _) => d.child(div().flex_1().child(input)),
+                    (None, Some((block, alt))) => d.child(
+                        div()
+                            .flex_1()
+                            .cursor(CursorStyle::IBeam)
+                            .text_color(if alt.is_empty() {
+                                rgb(MUTED_COLOR)
+                            } else {
+                                rgb(TEXT_COLOR)
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, _, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.edit_image_alt(block, window, cx);
+                                }),
+                            )
+                            // Data, not a prompt: the em-dash says "empty",
+                            // no ghost verbiage (P4).
+                            .child(if alt.is_empty() { "—".to_owned() } else { alt }),
+                    ),
+                    (None, None) => d, // unreachable by construction above
+                }),
         )
     }
 
@@ -6268,6 +6342,14 @@ impl Editor {
     /// Collapse the selection to `offset`. Keeps `goal_x`; non-vertical
     /// callers go through `move_to`, which clears it.
     fn set_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
+        // Any caret motion decays the picture selection without harm
+        // (inline-images §4: click elsewhere, travel, jumps — everything
+        // that isn't typing or the deletion key). The four plain arrows
+        // apply their direction law BEFORE reaching this funnel. One
+        // Option check: free for every ordinary caret move.
+        if self.image_sel.is_some() {
+            self.decay_image_sel();
+        }
         // The caret never rests on the seam line (seam-mechanics 3): a landing
         // there snaps past it in the direction of travel (approximated by
         // where the caret came from; the click path maps by y before this).
@@ -6378,6 +6460,11 @@ impl Editor {
 
     /// Extend the selection's moving end to `offset`. Keeps `goal_x`.
     fn extend_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
+        // A growing range selection replaces the picture selection (§4
+        // decay; §5's range door takes over from here).
+        if self.image_sel.is_some() {
+            self.decay_image_sel();
+        }
         // Never let a selection straddle the boundary (review B4): clamp the
         // moving end into the fixed anchor's region.
         let anchor = if self.selection_reversed {
@@ -6648,9 +6735,243 @@ impl Editor {
         }
     }
 
+    // -- The picture's standing (inline-images §4/§5) -------------------------
+
+    /// The live picture selection, revision-checked (R3's decay guard): the
+    /// positional block index is the identity, so `Some` only while no
+    /// document mutation happened since the state was minted and no takeover
+    /// (history, the reading room) owns the surface. A revision mismatch is
+    /// an unseen splice — decay, never a guess.
+    fn image_sel_live(&self) -> Option<ImageSel> {
+        let sel = self.image_sel?;
+        if self.history_view.is_some() || self.cold_read.is_some() || self.strip.is_parked() {
+            return None;
+        }
+        if sel.revision != self.doc.revision() || sel.block >= self.doc.blocks().len() {
+            return None;
+        }
+        debug_assert!(
+            matches!(self.doc.blocks().kind(sel.block), BlockKind::Image { .. }),
+            "ImageSel resolves to a non-image block under an unchanged revision"
+        );
+        Some(sel)
+    }
+
+    /// `image_sel_live`'s mutating twin — the one funnel every verb enters
+    /// through: a stale state is PURGED here, so nothing downstream ever
+    /// acts on a decayed selection.
+    fn resolve_image_sel(&mut self) -> Option<ImageSel> {
+        let live = self.image_sel_live();
+        if live.is_none() && self.image_sel.is_some() {
+            self.decay_image_sel();
+        }
+        live
+    }
+
+    /// Plain decay (§4/§5): click elsewhere, caret motion, focus change —
+    /// the state drops without harm and without moving the caret (the
+    /// parked `selected_range` — the door caret, or the caption start —
+    /// simply becomes visible again).
+    fn decay_image_sel(&mut self) {
+        self.image_sel = None;
+        self.image_stage_hold = None;
+    }
+
+    /// Re-stamp the revision guard after a legitimate in-state mutation —
+    /// the alt commit today, Phase 5's replace-in-place tomorrow. The ONE
+    /// funnel (R3): any mutation that doesn't pass here decays the state.
+    fn restamp_image_sel(&mut self, block: usize) {
+        if let Some(sel) = self.image_sel.as_mut().filter(|s| s.block == block) {
+            sel.revision = self.doc.revision();
+        }
+    }
+
+    /// Byte range of a block's own line (text start..text end, separator
+    /// excluded) — the unit every whole-block verb below acts on.
+    fn image_block_bounds(&self, block: usize) -> (usize, usize) {
+        let rope = self.doc.rope();
+        let start = rope.line_to_byte(block);
+        let end = if block + 1 < rope.len_lines() {
+            rope.line_to_byte(block + 1).saturating_sub(1)
+        } else {
+            rope.len_bytes()
+        };
+        (start, end)
+    }
+
+    /// Enter the picture-selected state (§4 click law / §5 stage).
+    /// `door_caret: Some` iff keyboard-born; `stage_key` is the staging
+    /// press's own key, whose autorepeat must not complete the exile (R5).
+    /// Entering collapses `selected_range` (R3) and parks the suppressed
+    /// caret where Esc will restore it: the door caret when keyboard-born,
+    /// else the caption start (§4's Esc law).
+    fn enter_image_sel(
+        &mut self,
+        block: usize,
+        door_caret: Option<usize>,
+        stage_key: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(
+            matches!(self.doc.blocks().kind(block), BlockKind::Image { .. }),
+            "picture selection can only enter on an image block"
+        );
+        let park = door_caret.unwrap_or_else(|| self.doc.rope().line_to_byte(block));
+        self.selected_range = park..park;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.goal_x = None;
+        self.image_sel = Some(ImageSel {
+            block,
+            door_caret,
+            revision: self.doc.revision(),
+        });
+        self.image_stage_hold = stage_key;
+        self.last_input = Instant::now();
+        // A state whose still cannot be seen does not count as shown (§4):
+        // scroll the WHOLE block into view — top wins when the picture is
+        // taller than the viewport — and cancel any pending caret scroll,
+        // which knows nothing of the pixels above the caption line.
+        if let Some(frame) = self.last_frame.as_ref() {
+            if let Some(par) = frame.paragraphs.get(block) {
+                let viewport = frame.bounds.size.height;
+                let mut scroll = self.scroll_top;
+                if par.top + par.height > scroll + viewport {
+                    scroll = par.top + par.height - viewport;
+                }
+                if par.top < scroll {
+                    scroll = par.top;
+                }
+                self.scroll_top = scroll;
+            }
+            self.autoscroll_request = false;
+        } else {
+            self.autoscroll_request = true;
+        }
+        self.on_selection_moved(cx); // LAW 1: the collapse lowers the flanks
+        cx.notify();
+    }
+
+    /// The §5 delete-key law, at the top of every Backspace/Delete variant
+    /// (the word-delete forms share it): completes a staged exile on a
+    /// FRESH press, stages at a boundary door, refuses at a wall — or
+    /// passes to the caller's ordinary path. Returns true when the press
+    /// was consumed. Cost far from images: one block lookup and one pair
+    /// of paragraph bounds (both O(log n) rope walks, no document scans).
+    fn image_delete_gate(&mut self, key: &'static str, forward: bool, cx: &mut Context<Self>) -> bool {
+        if !self.selected_range.is_empty() {
+            return false; // range deletes go by §5's range door (the model law)
+        }
+        // While the picture is selected: a fresh press exiles; the staging
+        // key's own autorepeat is refused until its key-up (R5) — a refused
+        // press mutates nothing, so its still is identical (P6).
+        if let Some(sel) = self.resolve_image_sel() {
+            if exile_press_is_fresh(self.image_stage_hold, key) {
+                self.exile_image_block(sel.block, cx);
+            }
+            return true;
+        }
+        if self.history_view.is_some() || self.strip.is_parked() || self.cold_read.is_some() {
+            return false; // read-only surfaces own their own refusals
+        }
+        let cursor = self.cursor_offset();
+        let (par_start, par_end) = self.paragraph_bounds(cursor);
+        let block = self.doc.block_of_byte(cursor);
+        let kinds = self.doc.blocks().kinds();
+        let door = if forward {
+            image_delete_door(kinds, block, cursor == par_end)
+        } else {
+            image_backspace_door(kinds, block, cursor == par_start, par_start == par_end)
+        };
+        match door {
+            ImageDoor::Stage(target) => {
+                self.enter_image_sel(target, Some(cursor), Some(key), cx);
+                true
+            }
+            // A wall (§5): pure no-op — no revision bump, no transaction,
+            // before and after stills identical (the refusal contract).
+            ImageDoor::Refuse => true,
+            ImageDoor::Pass => false,
+        }
+    }
+
+    /// Complete a staged exile (§5): the block — picture AND caption —
+    /// leaves whole through the whole-block door (`exile_to_graveyard` via
+    /// `file_cut`'s interpret-blocks arm; NEVER a byte-range cut, whose
+    /// clamp would leave a surviving separator and a wrong graveyard
+    /// entry). The asset GC keeps graveyard-referenced pixels alive, so
+    /// Put back restores picture and caption whole (P13). Post-exile caret
+    /// law rides `file_cut`'s collapse-to-range-start: the start of the
+    /// block that now follows, or — when the exiled block was last, where
+    /// the exile ate its LEADING separator — the end of the previous block.
+    fn exile_image_block(&mut self, block: usize, cx: &mut Context<Self>) {
+        self.decay_image_sel();
+        let (start, end) = self.image_block_bounds(block);
+        self.file_cut(start..end, false, true, cx);
+    }
+
+    /// Block index when `position` (window coords) lands ON a picture's
+    /// pixels (§4's click law): above the caption line (`par.text_top`)
+    /// and within the centered picture's painted width — the same
+    /// centering as paint (indent + (column − indent − w)/2). Clicks in
+    /// the margins beside the pixels stay text clicks (the caption door).
+    fn image_pixel_hit(&self, position: Point<Pixels>) -> Option<usize> {
+        let frame = self.last_frame.as_ref()?;
+        if self.history_preview.is_some() {
+            return None;
+        }
+        let p = frame.doc_point(position);
+        let par_ix = frame
+            .paragraphs
+            .partition_point(|par| par.top + par.height <= p.y);
+        let par = frame.paragraphs.get(par_ix)?;
+        // Stale-frame guard: never trust geometry past the live rope.
+        if par.range.end > self.doc.len_bytes() {
+            return None;
+        }
+        if p.y < par.top || p.y >= par.top + par.text_top.min(par.height) {
+            return None; // below the pixels: the caption's own ground
+        }
+        if !matches!(self.doc.blocks().kinds().get(par_ix), Some(BlockKind::Image { .. })) {
+            return None;
+        }
+        let (_, sz) = par.image.as_ref()?; // still decoding: no pixels to hit
+        let img_x = par.indent + ((frame.bounds.size.width - par.indent - sz.width) / 2.).max(px(0.));
+        (p.x >= img_x && p.x < img_x + sz.width).then_some(par_ix)
+    }
+
+    /// Phase-5 seam (§9 copy/cut): the selected picture's travelling
+    /// Markdown form `![alt](src "caption")`, produced by the ONE exporter
+    /// so quoting and span flattening can never fork. Nothing wires the
+    /// clipboard yet — cut is copy + leave-whole and lands next phase.
+    #[allow(dead_code)]
+    fn image_block_markdown(&self, block: usize) -> Option<String> {
+        if !matches!(self.doc.blocks().kind(block), BlockKind::Image { .. }) {
+            return None;
+        }
+        let (start, end) = self.image_block_bounds(block);
+        let rope = self.doc.rope();
+        let (cs, ce) = (rope.byte_to_char(start), rope.byte_to_char(end));
+        let line = self.doc.slice_bytes(start..end);
+        let spans = self.doc.spans().slice(cs..ce);
+        let blocks =
+            strop_core::document::BlockMap::from_kinds(vec![self.doc.blocks().kind(block).clone()]);
+        Some(
+            strop_core::markdown::to_markdown(&line, &spans, &blocks)
+                .trim_end()
+                .to_owned(),
+        )
+    }
+
     // -- Actions -------------------------------------------------------------
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        // The picture walls come first (inline-images §5): complete a staged
+        // exile, stage at a door, refuse at a wall — before the legacy
+        // strip-the-kind arm below can drain an Image kind (§0's bug).
+        if self.image_delete_gate("backspace", false, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             // The boundary line is removed only via the aside machinery:
             // backspace at manuscript start is a no-op, like backspace at 0.
@@ -6679,6 +7000,10 @@ impl Editor {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        // The picture walls (inline-images §5): see backspace.
+        if self.image_delete_gate("delete", true, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             // Forward-delete at the compost tail must not merge the boundary.
             if self.at_compost_tail(self.cursor_offset())
@@ -6694,6 +7019,12 @@ impl Editor {
     }
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+        // The picture walls (§5) — the word form shares the doors: the word
+        // boundary only crosses a block edge from the edge itself, exactly
+        // where the gate stands.
+        if self.image_delete_gate("backspace", false, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             if self.at_manuscript_start(self.cursor_offset()) {
                 return;
@@ -6711,6 +7042,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The picture walls (§5) — see delete_word_left.
+        if self.image_delete_gate("delete", true, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             if self.at_compost_tail(self.cursor_offset())
                 || self.at_separator_start(self.cursor_offset())
@@ -6733,6 +7068,15 @@ impl Editor {
             self.strip_step(-1, cx);
             return;
         }
+        // §4 arrows on a selected picture: deselect toward the direction —
+        // left/up land at the end of the block before, right/down at the
+        // caption's start. Never ON the pixels: there is no fourth state.
+        if let Some(sel) = self.resolve_image_sel() {
+            let (start, _) = self.image_block_bounds(sel.block);
+            self.decay_image_sel();
+            self.move_to(start.saturating_sub(1), cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
@@ -6743,6 +7087,12 @@ impl Editor {
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         if self.strip.is_parked() {
             self.strip_step(1, cx);
+            return;
+        }
+        if let Some(sel) = self.resolve_image_sel() {
+            let (start, _) = self.image_block_bounds(sel.block);
+            self.decay_image_sel();
+            self.move_to(start, cx); // §4: right/down → the caption's start
             return;
         }
         if self.selected_range.is_empty() {
@@ -6758,6 +7108,12 @@ impl Editor {
             self.history_select(ix, cx);
             return;
         }
+        if let Some(sel) = self.resolve_image_sel() {
+            let (start, _) = self.image_block_bounds(sel.block);
+            self.decay_image_sel();
+            self.move_to(start.saturating_sub(1), cx); // §4: left/up → end of block before
+            return;
+        }
         self.vertical_by(-1, false, cx);
     }
 
@@ -6765,6 +7121,12 @@ impl Editor {
         if let Some(hv) = &self.history_view {
             let ix = hv.selected + 1;
             self.history_select(ix, cx);
+            return;
+        }
+        if let Some(sel) = self.resolve_image_sel() {
+            let (start, _) = self.image_block_bounds(sel.block);
+            self.decay_image_sel();
+            self.move_to(start, cx); // §4: right/down → the caption's start
             return;
         }
         self.vertical_by(1, false, cx);
@@ -7809,6 +8171,18 @@ impl Editor {
             self.cancel_link(window, cx);
             return;
         }
+        // A selected picture is its own dismissable layer (inline-images
+        // §4/§5 decay): Esc deselects and returns the caret exactly whence
+        // the state was entered — the door caret when keyboard-born, the
+        // caption start when click-born. The parked `selected_range` IS
+        // that caret (enter_image_sel), so dropping the state reveals it;
+        // cancellation relocating the locus is itself harm.
+        if self.resolve_image_sel().is_some() {
+            self.decay_image_sel();
+            self.bump_activity(); // the caret returns: blink solid, scroll to it
+            cx.notify();
+            return;
+        }
         // The travel-home and history/strip layers run BEFORE the
         // collapse-selection fallback (finding 5): a find/@/chip jump often
         // leaves the matched text SELECTED under a latched excursion, and the
@@ -8540,6 +8914,91 @@ impl Editor {
             self.restore_selected(cx);
             return;
         }
+        // §4: Enter on a selected picture makes room on the side the
+        // insertion point faces — a selected object faces past itself, so
+        // a fresh paragraph opens BELOW and takes the caret; the picture
+        // stays (Enter makes room, a key that makes room must not destroy
+        // furniture — §12). The split runs at the caption's end, so the
+        // model's split law births the tail a Paragraph on its own (R6).
+        // (image_sel_live is None under every read-only takeover, so this
+        // arm cannot fire where edits are refused.)
+        if let Some(sel) = self.resolve_image_sel() {
+            self.decay_image_sel();
+            let (_, end) = self.image_block_bounds(sel.block);
+            self.doc.edit_bytes(end..end, "\n");
+            let caret = end + 1;
+            self.selected_range = caret..caret;
+            self.selection_reversed = false;
+            self.cursor_affinity_down = false;
+            self.goal_x = None;
+            self.marked_range = None;
+            self.caret_attrs.clear();
+            self.sync_mutations();
+            self.bump_activity();
+            cx.notify();
+            return;
+        }
+        // §6: Enter at the start of a NON-EMPTY caption opens room ABOVE —
+        // picture and caption stay together, the caret stays at the caption
+        // start (a caret at text start faces before it; without this the
+        // split law would strand the caption below a captionless picture).
+        // Mid/end/empty fall through to the ordinary split below, where the
+        // model's split law makes the tail a Paragraph (R6: no kind stamps;
+        // the empty-caption collision resolves to below — §6).
+        let cursor = self.cursor_offset();
+        // Plain read-only checks, not cr_guard: this branch edits the
+        // document directly, but a refused Enter must pulse exactly once —
+        // the fallthrough's apply_replace owns that refusal.
+        if self.cold_read.is_none()
+            && !self.strip.is_parked()
+            && self.selected_range.is_empty()
+        {
+            let block = self.doc.block_of_byte(cursor.min(self.doc.len_bytes()));
+            if let BlockKind::Image { src, alt } = self.doc.blocks().kind(block).clone() {
+                let (par_start, par_end) = self.paragraph_bounds(cursor);
+                if caption_enter_opens_above(cursor == par_start, par_start == par_end) {
+                    if par_start > 0 {
+                        // Split the block ABOVE at its end: the flowing
+                        // split law births the fresh line between prose and
+                        // picture; the image block is never the split
+                        // source, so nothing here can clone it (§2). The
+                        // fragment clones its source's kind (flowing law) —
+                        // demote non-paragraph residue in the same tx, the
+                        // Enter-at-heading-end convention.
+                        self.doc.edit_bytes(par_start - 1..par_start - 1, "\n");
+                        if *self.doc.blocks().kind(block) != BlockKind::Paragraph {
+                            self.doc
+                                .set_block_kind_in_current_tx(block, BlockKind::Paragraph);
+                        }
+                    } else {
+                        // Document-leading image: the split source IS the
+                        // image block, whose FIRST fragment keeps the
+                        // furniture kind (§2) — pointing the wrong way for
+                        // room-above. Correct both fragments inside the same
+                        // transaction (one undo restores everything): the
+                        // deliberate, narrow exception to R6's no-stamping,
+                        // where the model's law cannot express "room above
+                        // at the document's head".
+                        self.doc.edit_bytes(0..0, "\n");
+                        self.doc
+                            .set_block_kind_in_current_tx(0, BlockKind::Paragraph);
+                        self.doc
+                            .set_block_kind_in_current_tx(1, BlockKind::Image { src, alt });
+                    }
+                    let caret = par_start + 1; // the caption start, shifted past the fresh line
+                    self.selected_range = caret..caret;
+                    self.selection_reversed = false;
+                    self.cursor_affinity_down = false;
+                    self.goal_x = None;
+                    self.marked_range = None;
+                    self.caret_attrs.clear();
+                    self.sync_mutations();
+                    self.bump_activity();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         // Enter at the end of a heading/divider starts a paragraph, not
         // another heading (the split otherwise inherits the block kind).
         let cursor = self.cursor_offset();
@@ -9189,6 +9648,12 @@ impl Editor {
             if resolved_composer {
                 self.apply_composer_return(composer_return, cx);
             }
+            // Click elsewhere is plain decay (inline-images §4) even when
+            // the click never becomes a caret.
+            if self.image_sel.is_some() {
+                self.decay_image_sel();
+                cx.notify();
+            }
             return;
         }
         // A click in the graveyard tail section (Bug B). The section is painted
@@ -9208,6 +9673,11 @@ impl Editor {
                 .unwrap_or(false)
         {
             cx.stop_propagation();
+            // A record click is a click elsewhere: plain decay (§4).
+            if self.image_sel.is_some() {
+                self.decay_image_sel();
+                cx.notify();
+            }
             if let Some(action) = self.grave_action_at(ev.position) {
                 match action {
                     GraveAction::ShowOrigin(id) => self.show_grave_origin(id, cx),
@@ -9228,6 +9698,22 @@ impl Editor {
         {
             self.goal_x = None;
             self.set_cursor(target, false, cx); // collapses → LAW 1 lowers the flanks
+            return;
+        }
+        // Click on the pixels selects the picture whole (inline-images §4),
+        // claimed BEFORE the caret funnel — index_for_point resolves these
+        // very pixels to caption line 0 (the Phase-3 note), which would
+        // plant a caret instead. Click-born: no door caret. Shift-click
+        // stays a range gesture (§5's range door wants the sweep), and
+        // double/triple clicks fall through — the alt editor on
+        // click_count == 2 keeps working and now coexists with
+        // single-click selection. No drag begins: furniture doesn't sweep.
+        if ev.click_count == 1
+            && !ev.modifiers.shift
+            && self.history_view.is_none()
+            && let Some(block) = self.image_pixel_hit(ev.position)
+        {
+            self.enter_image_sel(block, None, None, cx);
             return;
         }
         self.goal_x = None;
@@ -9938,6 +10424,77 @@ impl Editor {
         cx.notify();
     }
 
+    /// Rig hook (`seed:imgrepro`): the FIELD REPRO of the round's origin
+    /// bug, exactly — an EMPTY paragraph, a captioned picture, a prose
+    /// paragraph below (inline-images §11's acceptance shape). From here
+    /// the script drives the doors: Delete at the empty block above must
+    /// STAGE (never fuse), a held Backspace from the prose below must stop
+    /// at the stage, Enter in the caption must never duplicate the picture.
+    pub fn debug_seed_image_repro(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else {
+            eprintln!("strop: seed:imgrepro needs a store-backed document");
+            return;
+        };
+        let src = store.put_asset(
+            debug_png(640, 360, |x, y| {
+                [200u8.saturating_sub((y / 4) as u8), (x / 4) as u8, 96]
+            }),
+            "png",
+        );
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "\nAfter the picture the prose paragraph carries on with enough words for a held backspace to walk through before it reaches the wall.",
+        );
+        // Insert after the empty block 0, then type the caption into the
+        // image block's own line — the real verbs, as ever.
+        let after = self.doc.insert_image_block(0, src);
+        let img_block = self.doc.rope().byte_to_line(after) - 1;
+        let cap_at = self.doc.rope().line_to_byte(img_block);
+        self.doc.edit_bytes(cap_at..cap_at, "Down to the pier at dusk");
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        // Caret parked in the prose below, the repro's starting stance.
+        let caret = self.doc.len_bytes();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    /// Rig hook (`img-geo`): every image block's pixel rect and caption
+    /// line, WINDOW coords, so the script can aim clicks at the pixels
+    /// (`click:X,Y`) and at the caption without guessing geometry.
+    pub fn debug_images(&self) -> String {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return "no-frame".into();
+        };
+        let origin = frame.bounds.origin;
+        let mut out = String::new();
+        for (ix, kind) in self.doc.blocks().kinds().iter().enumerate() {
+            let BlockKind::Image { .. } = kind else { continue };
+            let Some(par) = frame.paragraphs.get(ix) else { continue };
+            let (w, h) = par
+                .image
+                .as_ref()
+                .map(|(_, sz)| (f32::from(sz.width), f32::from(sz.height)))
+                .unwrap_or((0., 0.));
+            let img_x = f32::from(par.indent)
+                + ((f32::from(frame.bounds.size.width) - f32::from(par.indent) - w) / 2.)
+                    .max(0.);
+            let top = f32::from(par.top - frame.scroll_top);
+            out += &format!(
+                "img {ix} @{:.0},{:.0} w={w:.0} h={h:.0} cap@{:.0},{:.0}\n",
+                f32::from(origin.x) + img_x + w / 2.,
+                f32::from(origin.y) + top + h / 2.,
+                f32::from(origin.x) + f32::from(par.indent)
+                    + f32::from(frame.bounds.size.width - par.indent) / 2.,
+                f32::from(origin.y) + top + f32::from(par.text_top)
+                    + f32::from(par.line_height) / 2.,
+            );
+        }
+        out
+    }
+
     /// Rig hook (`seed:annotated`): a manuscript whose SECOND paragraph carries
     /// BOTH a writer note and a machine diagnosis, anchored inside it, and is
     /// selected — ready for `exile:selection`. After the cut the writer note
@@ -10617,6 +11174,17 @@ impl Editor {
             // once-per-session rule holds.
             session += &format!(" whisper=chord/{}", self.chord_whisper_generation);
         }
+        // Inline-images §4/§5 tags: the live picture selection (block, its
+        // door caret, the unreleased staging key) — the rig's window into
+        // stage / refuse / decay without pixel archaeology.
+        if let Some(sel) = self.image_sel_live() {
+            session += &format!(
+                " imgsel={} door={} hold={}",
+                sel.block,
+                sel.door_caret.map_or("-".into(), |c| c.to_string()),
+                self.image_stage_hold.unwrap_or("-"),
+            );
+        }
         let doc_state = format!(
             "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai}{pending}{panel}{session} mode={}",
             self.selected_range,
@@ -10672,6 +11240,23 @@ impl Editor {
         }
         if self.history_view.is_some() {
             return; // history preview is read-only
+        }
+        // §4: typing never destroys furniture. A printable key on a selected
+        // picture deselects INTO text first — keyboard-born restores the
+        // door caret; click-born puts the caret at the caption's END (the
+        // captioning gesture: click the picture, type the caption) — and
+        // the insert then proceeds as ordinary typing at that caret. The
+        // replace-on-type contract survives only for range selections (P7),
+        // which never coexist with ImageSel (entering collapsed them).
+        if !new_text.is_empty()
+            && let Some(sel) = self.resolve_image_sel()
+        {
+            let caret = sel
+                .door_caret
+                .unwrap_or_else(|| self.image_block_bounds(sel.block).1);
+            self.decay_image_sel();
+            self.selected_range = caret..caret;
+            self.selection_reversed = false;
         }
         // Typing replaces the selection with a caret; the empty selection alone
         // lowers the flanks (LAW 1's predicate), so no explicit dismissal here.
@@ -10887,6 +11472,18 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // §4's typing law holds for IME composition too: the preedit lands
+        // as text at the deselected caret, never over the furniture.
+        if !new_text.is_empty()
+            && let Some(sel) = self.resolve_image_sel()
+        {
+            let caret = sel
+                .door_caret
+                .unwrap_or_else(|| self.image_block_bounds(sel.block).1);
+            self.decay_image_sel();
+            self.selected_range = caret..caret;
+            self.selection_reversed = false;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -11876,7 +12473,12 @@ impl Element for EditorElement {
         };
         let cursor_offset = editor.cursor_offset();
         let cursor_affinity = editor.cursor_affinity_down;
-        let cursor_blink_visible = editor.cursor_visible && !in_history;
+        // No caret anywhere while the picture is selected (inline-images §4;
+        // R3): the parked caret is origin memory, not a text position on
+        // display. (The reuse fast-path above needs no twin gate — image
+        // documents never take it, see `can_reuse`.)
+        let cursor_blink_visible =
+            editor.cursor_visible && !in_history && editor.image_sel_live().is_none();
         let mut scroll_top = editor.scroll_top;
         let autoscroll = editor.autoscroll_request;
         // Formatting spans, converted to byte ranges for this frame. In
@@ -12468,12 +13070,13 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let _guard = DrawGuard::enter();
-        let (focus_handle, para_flash, grave_flashing) = {
+        let (focus_handle, para_flash, grave_flashing, image_sel_block) = {
             let ed = self.editor.read(cx);
             (
                 ed.focus_handle.clone(),
                 ed.para_flash.map(|(c, _)| ed.doc.char_to_byte(c.min(ed.doc.rope().len_chars()))),
                 ed.grave_flash.is_some(),
+                ed.image_sel_live().map(|s| s.block),
             )
         };
         window.handle_input(
@@ -12485,7 +13088,7 @@ impl Element for EditorElement {
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
         let viewport = bounds.size.height;
-        for par in &prepaint.paragraphs {
+        for (par_ix, par) in prepaint.paragraphs.iter().enumerate() {
             let y = par.top - scroll_top;
             // The wash tile bleeds one paragraph gap above its block (tiles
             // must join), so cull with that much grace on both edges: a block
@@ -12667,6 +13270,22 @@ impl Element for EditorElement {
                         cx,
                     )
                     .ok();
+            }
+            // The picture-selected wash (inline-images §4): warm amber over
+            // the WHOLE block — pixels and caption line together, because
+            // the block is the unit every verb acts on (what is washed is
+            // what goes, P6). Painted OVER the block's own paint: an
+            // under-wash would vanish behind the opaque picture, and a
+            // still that hides the blast radius lies. Same warm family as
+            // prose selection (SELECTION_COLOR — the writer owns it).
+            if image_sel_block == Some(par_ix) {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(-6.), y - px(3.)),
+                        size(bounds.size.width + px(12.), par.height + px(6.)),
+                    ),
+                    rgba(SELECTION_COLOR),
+                ));
             }
         }
 
@@ -18133,6 +18752,18 @@ impl Render for Editor {
         {
             self.exit_flank(window, cx);
         }
+        // The picture selection couples to focus the same way (inline-images
+        // §4: focus change is plain decay) — with ONE exception: its own alt
+        // strip may hold focus while the state stands (§8, the strip IS the
+        // control). Checked per frame, like the flank guard above, so every
+        // focus-stealing overlay (palette, fields, panels) decays it without
+        // each needing to know.
+        if self.image_sel.is_some()
+            && self.alt_input.is_none()
+            && !self.focus_handle.is_focused(window)
+        {
+            self.decay_image_sel();
+        }
         // History mode pushes the document aside (DESIGN §2-history: push,
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
@@ -18340,6 +18971,19 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::send_to_graveyard))
                     .on_action(cx.listener(Self::move_to_manuscript))
                     .on_action(cx.listener(Self::put_back_scrap))
+                    // R5's freshness bookkeeping, capture phase: the staging
+                    // key's RELEASE must be seen even when a child element
+                    // swallows the bubble, or the staged exile could never
+                    // re-arm. One Option compare per key-up — free for prose.
+                    // (`is_held` is never consulted; it lies on X11.)
+                    .capture_key_up(cx.listener(|editor, ev: &gpui::KeyUpEvent, _, _| {
+                        if editor
+                            .image_stage_hold
+                            .is_some_and(|k| k == ev.keystroke.key)
+                        {
+                            editor.image_stage_hold = None;
+                        }
+                    }))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -18433,7 +19077,7 @@ impl Render for Editor {
                     d
                 }
             })
-            .map(|d| match self.render_alt_strip() {
+            .map(|d| match self.render_alt_strip(cx) {
                 Some(strip) => d.child(strip),
                 None => d,
             })
@@ -18637,6 +19281,101 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
             .map_or(end, |(ix, seg)| offset + ix + seg.len())
             .min(len);
     }
+}
+
+// ---- The picture's doors (inline-images §5), as pure decisions ------------
+
+/// Where a collapsed-caret Backspace/Delete press stands relative to the
+/// picture walls (§5's doors table). Pure so the table is unit-testable
+/// row by row; the editor supplies the caret geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageDoor {
+    /// A boundary door: the first press stages the named block (ImageSel).
+    Stage(usize),
+    /// A wall: refused, pure no-op — the before/after stills are identical
+    /// (P6; refused edits bump nothing).
+    Refuse,
+    /// Not a picture boundary: the ordinary delete path proceeds.
+    Pass,
+}
+
+/// Backspace with a collapsed caret, against the §5 doors. `block` is the
+/// caret's block, `at_start` = caret at the block's first byte,
+/// `caption_empty` = the block's line holds no text.
+fn image_backspace_door(
+    kinds: &[BlockKind],
+    block: usize,
+    at_start: bool,
+    caption_empty: bool,
+) -> ImageDoor {
+    if !at_start {
+        return ImageDoor::Pass;
+    }
+    match kinds.get(block) {
+        // Inside the caption at its start: an empty room facing furniture
+        // stages (block-removal is the only plausible intent there); a
+        // caret inside the writer's own words refuses — whole-block
+        // destruction is never offered from inside the text being edited
+        // (§12, the Notion wall). Without this arm the legacy strip-the-
+        // kind convention below would drain the picture's kind — §0's bug.
+        Some(BlockKind::Image { .. }) => {
+            if caption_empty {
+                ImageDoor::Stage(block)
+            } else {
+                ImageDoor::Refuse
+            }
+        }
+        // Any other styled block keeps today's first-press-strips-the-kind
+        // convention (backspace()): a strip is not a merge, so the wall has
+        // nothing to guard — the door waits one press below.
+        Some(k) if !matches!(k, BlockKind::Paragraph) => ImageDoor::Pass,
+        // The outside door below the picture (§5): the merge this press
+        // would otherwise perform is exactly the wound.
+        _ if block > 0
+            && matches!(kinds.get(block - 1), Some(BlockKind::Image { .. })) =>
+        {
+            ImageDoor::Stage(block - 1)
+        }
+        _ => ImageDoor::Pass,
+    }
+}
+
+/// Delete with a collapsed caret, against the §5 doors. `at_end` = caret
+/// at the block's last byte.
+fn image_delete_door(kinds: &[BlockKind], block: usize, at_end: bool) -> ImageDoor {
+    if !at_end {
+        return ImageDoor::Pass;
+    }
+    if matches!(kinds.get(block), Some(BlockKind::Image { .. })) {
+        // Delete at caption end: a wall (§5, unanimous §13) — prose from
+        // below never climbs into a caption by keystroke, and a
+        // destructive key is never repurposed as navigation.
+        return ImageDoor::Refuse;
+    }
+    if matches!(kinds.get(block + 1), Some(BlockKind::Image { .. })) {
+        // The outside door above the picture — the field repro's step 7.
+        return ImageDoor::Stage(block + 1);
+    }
+    ImageDoor::Pass
+}
+
+/// §5's freshness ladder (R5), pure: may `key`'s press complete a staged
+/// exile? `stage_hold` is the staging key whose key-up has not been seen —
+/// its own presses are autorepeat and never cross the stage; any OTHER
+/// deletion key is a fresh key-down by construction (a second physical
+/// press of the held key is impossible without a release).
+fn exile_press_is_fresh(stage_hold: Option<&'static str>, key: &str) -> bool {
+    stage_hold != Some(key)
+}
+
+/// §6's Enter-direction rule for a caret inside a caption, pure: room
+/// opens ABOVE only at the start of a NON-EMPTY caption (a caret at text
+/// start faces before it — §12); everywhere else — mid, end, and the
+/// empty-caption collision, where "step out and keep writing" wins — the
+/// ordinary split proceeds and the model's split law births the tail a
+/// Paragraph (R6: no kind stamping here).
+fn caption_enter_opens_above(at_start: bool, caption_empty: bool) -> bool {
+    at_start && !caption_empty
 }
 
 // ---- The history strip: painting & the floor ------------------------------
@@ -22500,5 +23239,162 @@ mod tests {
         assert_eq!(&png[37..41], b"IDAT");
         assert_eq!(idat[2], 1, "final stored block");
         assert_eq!(u16::from_le_bytes([idat[3], idat[4]]), 20);
+    }
+
+    // ---- The picture's doors (inline-images §5), row by row ----------------
+
+    fn img() -> BlockKind {
+        BlockKind::Image { src: "asset:x.png".into(), alt: String::new() }
+    }
+
+    #[test]
+    fn backspace_doors_follow_the_section_5_table() {
+        use BlockKind::*;
+        let kinds = vec![Paragraph, img(), Paragraph];
+        // Backspace at the start of the block BELOW the image → stages it.
+        assert_eq!(
+            image_backspace_door(&kinds, 2, true, false),
+            ImageDoor::Stage(1)
+        );
+        // Mid-block: not a boundary, the ordinary path proceeds.
+        assert_eq!(image_backspace_door(&kinds, 2, false, false), ImageDoor::Pass);
+        // In an EMPTY caption → stages the image block itself.
+        assert_eq!(
+            image_backspace_door(&kinds, 1, true, true),
+            ImageDoor::Stage(1)
+        );
+        // At the start of a NON-EMPTY caption → a wall, pure no-op.
+        assert_eq!(image_backspace_door(&kinds, 1, true, false), ImageDoor::Refuse);
+        // Plain prose boundary far from any picture: pass.
+        assert_eq!(image_backspace_door(&kinds, 0, true, false), ImageDoor::Pass);
+        // A styled block below the image keeps the strip-the-kind press:
+        // the first backspace demotes, only the SECOND meets the door.
+        let styled = vec![Paragraph, img(), Heading(2)];
+        assert_eq!(image_backspace_door(&styled, 2, true, false), ImageDoor::Pass);
+        // Two pictures stacked: the caption start of the lower one still
+        // refuses (its own wall outranks the neighbour door above).
+        let stacked = vec![img(), img(), Paragraph];
+        assert_eq!(image_backspace_door(&stacked, 1, true, false), ImageDoor::Refuse);
+        assert_eq!(image_backspace_door(&stacked, 1, true, true), ImageDoor::Stage(1));
+    }
+
+    #[test]
+    fn delete_doors_follow_the_section_5_table() {
+        use BlockKind::*;
+        let kinds = vec![Paragraph, img(), Paragraph];
+        // Delete at the end of the block ABOVE the image → stages it (the
+        // field repro's step 7: never fuses).
+        assert_eq!(image_delete_door(&kinds, 0, true), ImageDoor::Stage(1));
+        assert_eq!(image_delete_door(&kinds, 0, false), ImageDoor::Pass);
+        // Delete at caption end → a wall: prose never climbs into a
+        // caption, and a destructive key is never navigation.
+        assert_eq!(image_delete_door(&kinds, 1, true), ImageDoor::Refuse);
+        // Last block, nothing follows: pass (the ordinary no-op at end).
+        assert_eq!(image_delete_door(&kinds, 2, true), ImageDoor::Pass);
+    }
+
+    #[test]
+    fn exile_freshness_ladder_never_lets_autorepeat_cross() {
+        // The staging key, unreleased: its own presses are autorepeat.
+        assert!(!exile_press_is_fresh(Some("backspace"), "backspace"));
+        assert!(!exile_press_is_fresh(Some("delete"), "delete"));
+        // The OTHER deletion key is a fresh key-down by construction.
+        assert!(exile_press_is_fresh(Some("backspace"), "delete"));
+        assert!(exile_press_is_fresh(Some("delete"), "backspace"));
+        // After the key-up (hold cleared) — and for a click-born selection
+        // that never had a staging key — every press is fresh.
+        assert!(exile_press_is_fresh(None, "backspace"));
+        assert!(exile_press_is_fresh(None, "delete"));
+    }
+
+    #[test]
+    fn caption_enter_direction_rule() {
+        // Start of a non-empty caption: room ABOVE (caption stays with the
+        // picture). Everywhere else the ordinary split proceeds — and the
+        // empty-caption collision resolves to below (§6).
+        assert!(caption_enter_opens_above(true, false));
+        assert!(!caption_enter_opens_above(true, true));
+        assert!(!caption_enter_opens_above(false, false));
+        assert!(!caption_enter_opens_above(false, true));
+    }
+
+    // ---- Whole-block exile and its inverse, at the model (§5) --------------
+
+    #[test]
+    fn image_exile_takes_the_block_whole_and_put_back_restores_it() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        let mut doc = Document::new(
+            "above\ncaption words\nbelow",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), BlockKind::Paragraph]),
+        );
+        // The whole-block door: block text bounds, no separator (the door
+        // takes the bounding one itself).
+        let id = doc.exile_to_graveyard(6..19, String::new(), 0, false);
+        assert_eq!(doc.text(), "above\nbelow");
+        assert_eq!(doc.blocks().kinds().len(), 2);
+        assert!(doc.blocks().kinds().iter().all(|k| !k.is_furniture()));
+        let entry = doc.graveyard().get(id).expect("filed");
+        assert!(entry.whole_blocks, "the picture leaves through the block door");
+        // Post-exile caret law: the start of the block that now follows.
+        assert_eq!(6usize.min(doc.len_bytes()), 6, "caret = start of 'below'");
+        // Put back restores picture AND caption (P13's honest inverse).
+        let caret = doc.put_back(id).expect("returns");
+        assert_eq!(doc.text(), "above\ncaption words\nbelow");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        assert_eq!(caret, 6, "caret at the returned block's start");
+    }
+
+    #[test]
+    fn empty_caption_image_exiles_whole_and_returns() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        // The birth state of every inserted image: an EMPTY caption line.
+        let mut doc = Document::new(
+            "above\n\nbelow",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), BlockKind::Paragraph]),
+        );
+        let id = doc.exile_to_graveyard(6..6, String::new(), 0, false);
+        assert_eq!(doc.text(), "above\nbelow", "block AND separator went");
+        let entry = doc.graveyard().get(id).expect("filed");
+        assert!(entry.whole_blocks, "an empty line that is a whole block still is one");
+        doc.put_back(id).expect("returns");
+        assert_eq!(doc.text(), "above\n\nbelow");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn image_exiled_last_lands_the_caret_at_the_previous_blocks_end() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        let mut doc = Document::new(
+            "above\ncaption",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img()]),
+        );
+        doc.exile_to_graveyard(6..13, String::new(), 0, false);
+        // The leading separator went with it; the caret collapse
+        // (`file_cut`: range.start.min(len)) lands at the end of "above".
+        assert_eq!(doc.text(), "above");
+        assert_eq!(6usize.min(doc.len_bytes()), 5, "caret = end of previous block");
+    }
+
+    #[test]
+    fn lone_furniture_block_never_survives_its_own_exile() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        // Degenerate by construction (insertion always leaves a neighbour),
+        // but the model must be safe on its own: the rope's one-line floor
+        // keeps the LINE — the kind must not keep the picture.
+        let mut doc = Document::new(
+            "caption",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img()]),
+        );
+        let id = doc.exile_to_graveyard(0..7, String::new(), 0, false);
+        assert_eq!(doc.text(), "");
+        assert!(
+            !doc.blocks().kind(0).is_furniture(),
+            "the remnant line is born-again prose, not a second picture"
+        );
+        assert!(doc.graveyard().get(id).is_some());
     }
 }

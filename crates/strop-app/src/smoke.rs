@@ -296,6 +296,48 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:image: captioned + tall pictures seeded");
                 continue;
             }
+            // `seed:imgrepro` builds the round's FIELD REPRO exactly (empty
+            // paragraph, captioned picture, prose below — inline-images
+            // §11's acceptance shape); `img-geo` prints every picture's
+            // pixel-rect + caption targets (window coords) for `click:`.
+            if key == "seed:imgrepro" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_image_repro(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                eprintln!("SMOKE seed:imgrepro: empty para + picture + prose seeded");
+                continue;
+            }
+            if key == "img-geo" {
+                let geo = window
+                    .update(cx, |editor, _, _| editor.debug_images())
+                    .unwrap_or_default();
+                eprintln!("SMOKE img-geo:\n{geo}");
+                continue;
+            }
+            // `keyup:<key>` dispatches a real KeyUp through GPUI (the same
+            // path a physical release takes). dispatch_keystroke sends only
+            // KeyDown, so without this token the staged-exile freshness law
+            // (inline-images §5, R5: completion waits for the staging key's
+            // release) would refuse every scripted second press — exactly
+            // as it must for a real held key.
+            if let Some(k) = key.strip_prefix("keyup:") {
+                let keystroke = Keystroke::parse(k).expect("bad keyup in STROP_SMOKE");
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
             if key == "seed:many" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_seed_many(cx))
