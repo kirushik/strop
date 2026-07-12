@@ -7,8 +7,9 @@
 //! own voice corpus, and (eventually) sync.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use loro::{
     ExpandType, ExportMode, Frontiers, LoroDoc, LoroValue, StyleConfig, StyleConfigMap, TextDelta,
@@ -460,6 +461,142 @@ fn blocks_fingerprint(blocks: &BlockMap) -> u64 {
     fingerprint(&format!("{kinds}\u{1}{boundary}\u{1}{scrap_line}"))
 }
 
+/// An immutable Loro snapshot which is safe to move to a filesystem thread.
+/// `LoroDoc` itself remains confined to the UI thread; after export, the
+/// worker owns only bytes and a path.
+pub struct PreparedSave {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl PreparedSave {
+    pub fn write(self) -> io::Result<()> {
+        atomic_write(&self.path, &self.bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SaveGeneration(u64);
+
+pub struct SaveCompletion {
+    pub generation: SaveGeneration,
+    pub result: io::Result<()>,
+}
+
+/// A single-consumer queue proves generation N reaches replacement before
+/// N+1, so an older snapshot can never overwrite a newer one.
+pub struct SaveWorker {
+    requests: mpsc::Sender<(SaveGeneration, PreparedSave)>,
+    completions: mpsc::Receiver<SaveCompletion>,
+    next_generation: u64,
+}
+
+impl SaveWorker {
+    pub fn new() -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<(SaveGeneration, PreparedSave)>();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("strop-save".into())
+            .spawn(move || {
+                while let Ok((generation, save)) = request_rx.recv() {
+                    let result = save.write();
+                    if completion_tx
+                        .send(SaveCompletion { generation, result })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn filesystem save worker");
+        Self {
+            requests: request_tx,
+            completions: completion_rx,
+            next_generation: 0,
+        }
+    }
+
+    pub fn request(&mut self, save: PreparedSave) -> SaveGeneration {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("save generation overflow");
+        let generation = SaveGeneration(self.next_generation);
+        self.requests
+            .send((generation, save))
+            .expect("save worker unexpectedly stopped");
+        generation
+    }
+
+    pub fn try_completion(&self) -> Option<SaveCompletion> {
+        self.completions.try_recv().ok()
+    }
+
+    pub fn wait_for(&self, generation: SaveGeneration) -> SaveCompletion {
+        loop {
+            let completion = self
+                .completions
+                .recv()
+                .expect("save worker unexpectedly stopped");
+            if completion.generation == generation {
+                return completion;
+            }
+        }
+    }
+}
+
+impl Default for SaveWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("strop.tmp");
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    atomic_replace(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both buffers are live, NUL-terminated UTF-16 paths; the temp is
+    // in the destination directory and therefore on the same volume.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl Store {
     /// Rename/move the on-disk file; subsequent saves follow. Refuses to
     /// overwrite — renaming is never allowed to destroy another document.
@@ -879,7 +1016,7 @@ impl Store {
     /// piece writes NOTHING, because in an append-only CRDT each rewrite is
     /// permanent oplog growth (the 4.8 MB-file bug class).
     #[allow(clippy::too_many_arguments)]
-    pub fn save_with_state(
+    pub fn prepare_save_with_state(
         &self,
         spans: &SpanSet,
         blocks: &BlockMap,
@@ -888,7 +1025,7 @@ impl Store {
         journal: &Journal,
         graveyard: &Graveyard,
         provenance: &Provenance,
-    ) -> io::Result<()> {
+    ) -> io::Result<PreparedSave> {
         // Journal: push only the tail past what the file already holds.
         // Callers settle the journal before saving, so every pushed item is
         // final — the containers stay strictly append-only (no rewrites, no
@@ -1032,7 +1169,30 @@ impl Store {
         drop(saved);
         self.collect_unreachable_assets(blocks, history, graveyard);
         self.doc.commit();
-        self.save()
+        self.prepare_save()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with_state(
+        &self,
+        spans: &SpanSet,
+        blocks: &BlockMap,
+        history: &History,
+        annotations: &Annotations,
+        journal: &Journal,
+        graveyard: &Graveyard,
+        provenance: &Provenance,
+    ) -> io::Result<()> {
+        self.prepare_save_with_state(
+            spans,
+            blocks,
+            history,
+            annotations,
+            journal,
+            graveyard,
+            provenance,
+        )?
+        .write()
     }
 
     /// Save-time asset GC: an asset survives if the current document, the
@@ -1120,17 +1280,19 @@ impl Store {
 
     /// Atomic snapshot save: full history + state, temp file + rename.
     pub fn save(&self) -> io::Result<()> {
+        self.prepare_save()?.write()
+    }
+
+    pub fn prepare_save(&self) -> io::Result<PreparedSave> {
         stamp_schema_version(&self.doc)?;
         let bytes = self
             .doc
             .export(ExportMode::Snapshot)
             .map_err(io::Error::other)?;
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let tmp = self.path.with_extension("strop.tmp");
-        fs::write(&tmp, &bytes)?;
-        fs::rename(&tmp, &self.path)
+        Ok(PreparedSave {
+            path: self.path.clone(),
+            bytes,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -1159,6 +1321,67 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("strop-test-{}-{tag}.strop", std::process::id()))
+    }
+
+    #[test]
+    fn atomic_save_replaces_an_existing_file() {
+        let path = temp_path("atomic-replace");
+        fs::write(&path, b"old").unwrap();
+        atomic_write(&path, b"new snapshot").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new snapshot");
+        assert!(!path.with_extension("strop.tmp").exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_worker_preserves_request_order() {
+        let path = temp_path("worker-order");
+        let mut worker = SaveWorker::new();
+        let first = worker.request(PreparedSave {
+            path: path.clone(),
+            bytes: b"older".to_vec(),
+        });
+        let latest = worker.request(PreparedSave {
+            path: path.clone(),
+            bytes: b"newer".to_vec(),
+        });
+        assert!(first < latest);
+        worker.wait_for(latest).result.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"newer");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_write_does_not_stop_later_generations() {
+        let blocker = temp_path("worker-fault-parent");
+        fs::write(&blocker, b"not a directory").unwrap();
+        let good = temp_path("worker-after-fault");
+        let mut worker = SaveWorker::new();
+        let bad_generation = worker.request(PreparedSave {
+            path: blocker.join("document.strop"),
+            bytes: b"cannot land".to_vec(),
+        });
+        let good_generation = worker.request(PreparedSave {
+            path: good.clone(),
+            bytes: b"survived".to_vec(),
+        });
+        let bad = worker.completions.recv().unwrap();
+        assert_eq!(bad.generation, bad_generation);
+        assert!(bad.result.is_err());
+        worker.wait_for(good_generation).result.unwrap();
+        assert_eq!(fs::read(&good).unwrap(), b"survived");
+        let _ = fs::remove_file(blocker);
+        let _ = fs::remove_file(good);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_replace_accepts_unicode_paths() {
+        let path = temp_path("atomic-作品");
+        fs::write(&path, b"before").unwrap();
+        atomic_write(&path, b"after").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
