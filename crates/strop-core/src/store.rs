@@ -27,6 +27,12 @@ const SESSION_CONTAINER: &str = "session";
 const ANNOTATIONS_CONTAINER: &str = "annotations";
 const CHECKPOINTS_CONTAINER: &str = "checkpoints";
 const ASSETS_CONTAINER: &str = "assets";
+const META_CONTAINER: &str = "meta";
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+/// Version of the durable container/schema contract, independent of the app
+/// release number. Files without a marker are legacy v0 and migrate through
+/// the same reader paths that have always used serde defaults/fallbacks.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 // The graveyard (docs/impl/02-asides.md §4/§5) rides its own map + fingerprint
 // channel, exactly like annotations (review B12): an unguarded blob of verbatim
 // cut text rewriting per idle save is the 4.8 MB class.
@@ -41,6 +47,58 @@ const PROVENANCE_CONTAINER: &str = "provenance";
 // state, exactly like checkpoints do.
 const JOURNAL_RUNS_CONTAINER: &str = "journal.runs";
 const JOURNAL_EVENTS_CONTAINER: &str = "journal.events";
+
+fn schema_version_of(doc: &LoroDoc) -> io::Result<u32> {
+    let Some(value) = doc.get_map(META_CONTAINER).get(SCHEMA_VERSION_KEY) else {
+        return Ok(0);
+    };
+    match value.into_value() {
+        Ok(LoroValue::I64(version)) => u32::try_from(version).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid .strop schema version")
+        }),
+        Ok(LoroValue::String(version)) => version.parse::<u32>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid .strop schema version")
+        }),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid .strop schema version",
+        )),
+    }
+}
+
+/// One explicit gate for every future durable migration. Version zero is the
+/// unmarked 0.1-era format; its compatibility readers already live in
+/// `read_state_of` and the serde defaults on the side structures.
+fn migrate_schema(doc: &LoroDoc) -> io::Result<()> {
+    let version = schema_version_of(doc)?;
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "this .strop file uses schema {version}, but this build supports up to {CURRENT_SCHEMA_VERSION}"
+            ),
+        ));
+    }
+    match version {
+        0 | CURRENT_SCHEMA_VERSION => Ok(()),
+        // Kept explicit: adding v2 means adding a v1 arm here rather than
+        // accidentally treating a new durable shape as the current one.
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no migration path from .strop schema {version}"),
+        )),
+    }
+}
+
+fn stamp_schema_version(doc: &LoroDoc) -> io::Result<()> {
+    let meta = doc.get_map(META_CONTAINER);
+    if schema_version_of(doc)? != CURRENT_SCHEMA_VERSION {
+        meta.insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION as i64)
+            .map_err(io::Error::other)?;
+        doc.commit();
+    }
+    Ok(())
+}
 
 /// Everything a reopened document restores.
 pub struct Loaded {
@@ -439,6 +497,7 @@ impl Store {
         match fs::read(&path) {
             Ok(bytes) => {
                 doc.import(&bytes).map_err(io::Error::other)?;
+                migrate_schema(&doc)?;
                 let doc = compact_on_open(doc, &bytes, &path);
                 let store = Self {
                     doc,
@@ -1061,6 +1120,7 @@ impl Store {
 
     /// Atomic snapshot save: full history + state, temp file + rename.
     pub fn save(&self) -> io::Result<()> {
+        stamp_schema_version(&self.doc)?;
         let bytes = self
             .doc
             .export(ExportMode::Snapshot)
@@ -1119,6 +1179,30 @@ mod tests {
         };
         let back: Checkpoint = serde_json::from_str(&serde_json::to_string(&exact).unwrap()).unwrap();
         assert_eq!(back.timestamp_ms(), 7_654);
+    }
+
+    #[test]
+    fn saves_stamp_the_schema_and_future_versions_fail_closed() {
+        let path = temp_path("schema-version");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("versioned");
+        store.save().unwrap();
+        let (reopened, loaded) = Store::open(&path).unwrap();
+        assert_eq!(loaded.unwrap().text, "versioned");
+        assert_eq!(schema_version_of(&reopened.doc).unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let future = LoroDoc::new();
+        future
+            .get_map(META_CONTAINER)
+            .insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION as i64 + 1)
+            .unwrap();
+        future.commit();
+        fs::write(&path, future.export(ExportMode::Snapshot).unwrap()).unwrap();
+        let err = Store::open(&path).err().expect("future schema is refused");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("uses schema"));
+        let _ = fs::remove_file(path);
     }
 
     /// Simulate a LEGACY file: strip the materialized state off every
