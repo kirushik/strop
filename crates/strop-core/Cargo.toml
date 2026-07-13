@@ -16,6 +16,9 @@ blake3 = { workspace = true }
 ureq = { workspace = true }
 similar = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 proptest = "1"
 proptest-state-machine = "0.8"

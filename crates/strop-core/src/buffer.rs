@@ -178,6 +178,12 @@ impl Buffer {
     }
 
     fn apply_edit(&mut self, char_range: Range<usize>, text: &str, coalesce: bool) -> bool {
+        // A collapsed deletion / empty IME commit is not an edit. Recording
+        // it used to create a ghost undo step and a full side-state snapshot
+        // in Document, despite changing neither text nor formatting.
+        if char_range.is_empty() && text.is_empty() {
+            return false;
+        }
         let edit = Edit {
             start: char_range.start,
             old: self.rope.slice(char_range.clone()).to_string(),
@@ -216,7 +222,7 @@ impl Buffer {
     pub fn undo(&mut self) -> Option<Option<usize>> {
         self.group_open = false;
         let tx = self.undo_stack.pop()?;
-        if !self.tx_in_bounds(&tx, false) {
+        if !self.tx_is_valid(&tx, false) {
             // Corrupted persisted history: drop it rather than panic.
             self.undo_stack.clear();
             return None;
@@ -242,7 +248,7 @@ impl Buffer {
     pub fn redo(&mut self) -> Option<Option<usize>> {
         self.group_open = false;
         let tx = self.redo_stack.pop()?;
-        if !self.tx_in_bounds(&tx, true) {
+        if !self.tx_is_valid(&tx, true) {
             self.redo_stack.clear();
             return None;
         }
@@ -283,25 +289,45 @@ impl Buffer {
         self.group_open = false;
     }
 
+    pub(crate) fn undo_len(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    pub(crate) fn redo_len(&self) -> usize {
+        self.redo_stack.len()
+    }
+
     /// A transaction's edits are valid only against the text state they
     /// were recorded for. Persisted history is saved atomically with that
     /// text, but guard against corrupted/foreign files anyway. Edits apply
     /// sequentially, so validity is checked against the *evolving* length.
-    fn tx_in_bounds(&self, tx: &Transaction, forward: bool) -> bool {
-        let mut len = self.rope.len_chars();
+    fn tx_is_valid(&self, tx: &Transaction, forward: bool) -> bool {
+        // Bounds alone are insufficient for persisted history: a foreign
+        // same-length transaction could otherwise delete valid current prose
+        // and inject its serialized `old` text. Validate each expected slice
+        // against an evolving scratch rope before touching the live buffer.
+        let mut rope = self.rope.clone();
         if forward {
             for e in &tx.edits {
-                if e.start + e.old_chars() > len {
+                let Some(end) = e.start.checked_add(e.old_chars()) else {
+                    return false;
+                };
+                if end > rope.len_chars() || rope.slice(e.start..end) != e.old.as_str() {
                     return false;
                 }
-                len = len - e.old_chars() + e.new_chars();
+                rope.remove(e.start..end);
+                rope.insert(e.start, &e.new);
             }
         } else {
             for e in tx.edits.iter().rev() {
-                if e.start + e.new_chars() > len {
+                let Some(end) = e.start.checked_add(e.new_chars()) else {
+                    return false;
+                };
+                if end > rope.len_chars() || rope.slice(e.start..end) != e.new.as_str() {
                     return false;
                 }
-                len = len - e.new_chars() + e.old_chars();
+                rope.remove(e.start..end);
+                rope.insert(e.start, &e.old);
             }
         }
         true
@@ -460,5 +486,31 @@ mod tests {
         buf.edit(1..1, "c");
         assert!(buf.redo().is_none());
         assert_eq!(buf.text(), "ac");
+    }
+
+    #[test]
+    fn empty_edit_is_not_an_undo_step() {
+        let mut buf = Buffer::new("abc");
+        let before = buf.snapshot().version;
+        assert!(!buf.edit_bytes(1..1, ""));
+        assert_eq!(buf.snapshot().version, before);
+        assert!(buf.take_ops().is_empty());
+        assert!(buf.undo().is_none());
+    }
+
+    #[test]
+    fn corrupt_same_length_history_cannot_replace_live_text() {
+        let mut buf = Buffer::new("safe");
+        // Bounds alone accept this transaction; content validation must not.
+        buf.undo_stack.push(Transaction {
+            edits: vec![Edit {
+                start: 0,
+                old: "past".into(),
+                new: "evil".into(),
+            }],
+        });
+        assert!(buf.undo().is_none());
+        assert_eq!(buf.text(), "safe");
+        assert!(buf.take_ops().is_empty());
     }
 }

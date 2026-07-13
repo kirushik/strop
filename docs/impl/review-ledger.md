@@ -15,10 +15,11 @@ spec. Full findings JSON: session scratchpad
   the `Restore` journal event. Reconstruction anchors are then always
   correct; the envelope folds `Restore.len_chars`. Applies to the
   strip's own Restore too (spec 01 §2 already re-bakes on it).
-- **Seconds vs milliseconds** (B11/B15) — ADOPTED as a stated law:
-  every journal comparison is in ms; `Checkpoint.created_unix` is
-  seconds and is multiplied by 1000 at every boundary. Field names
-  carry units in doc comments. Test scrubs to an early t.
+- **Seconds vs milliseconds** (B11/B15) — ADOPTED as a stated law, then
+  hardened after the first implementation exposed sub-second double replay:
+  every journal comparison is in ms; new checkpoints carry exact
+  `created_ms`, while `timestamp_ms()` falls back to `created_unix × 1000`
+  for legacy files. Test scrubs to an early t.
 - **Stability law vs fabric scroll** (B7) — ADOPTED. The law now
   separates the immutable BAKE from the mutable view offset; the rig
   asserts the `bakes` counter and playhead/readout state only.

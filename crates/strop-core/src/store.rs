@@ -7,8 +7,9 @@
 //! own voice corpus, and (eventually) sync.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use loro::{
     ExpandType, ExportMode, Frontiers, LoroDoc, LoroValue, StyleConfig, StyleConfigMap, TextDelta,
@@ -27,6 +28,12 @@ const SESSION_CONTAINER: &str = "session";
 const ANNOTATIONS_CONTAINER: &str = "annotations";
 const CHECKPOINTS_CONTAINER: &str = "checkpoints";
 const ASSETS_CONTAINER: &str = "assets";
+const META_CONTAINER: &str = "meta";
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+/// Version of the durable container/schema contract, independent of the app
+/// release number. Files without a marker are legacy v0 and migrate through
+/// the same reader paths that have always used serde defaults/fallbacks.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 // The graveyard (docs/impl/02-asides.md §4/§5) rides its own map + fingerprint
 // channel, exactly like annotations (review B12): an unguarded blob of verbatim
 // cut text rewriting per idle save is the 4.8 MB class.
@@ -41,6 +48,58 @@ const PROVENANCE_CONTAINER: &str = "provenance";
 // state, exactly like checkpoints do.
 const JOURNAL_RUNS_CONTAINER: &str = "journal.runs";
 const JOURNAL_EVENTS_CONTAINER: &str = "journal.events";
+
+fn schema_version_of(doc: &LoroDoc) -> io::Result<u32> {
+    let Some(value) = doc.get_map(META_CONTAINER).get(SCHEMA_VERSION_KEY) else {
+        return Ok(0);
+    };
+    match value.into_value() {
+        Ok(LoroValue::I64(version)) => u32::try_from(version).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid .strop schema version")
+        }),
+        Ok(LoroValue::String(version)) => version.parse::<u32>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid .strop schema version")
+        }),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid .strop schema version",
+        )),
+    }
+}
+
+/// One explicit gate for every future durable migration. Version zero is the
+/// unmarked 0.1-era format; its compatibility readers already live in
+/// `read_state_of` and the serde defaults on the side structures.
+fn migrate_schema(doc: &LoroDoc) -> io::Result<()> {
+    let version = schema_version_of(doc)?;
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "this .strop file uses schema {version}, but this build supports up to {CURRENT_SCHEMA_VERSION}"
+            ),
+        ));
+    }
+    match version {
+        0 | CURRENT_SCHEMA_VERSION => Ok(()),
+        // Kept explicit: adding v2 means adding a v1 arm here rather than
+        // accidentally treating a new durable shape as the current one.
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no migration path from .strop schema {version}"),
+        )),
+    }
+}
+
+fn stamp_schema_version(doc: &LoroDoc) -> io::Result<()> {
+    let meta = doc.get_map(META_CONTAINER);
+    if schema_version_of(doc)? != CURRENT_SCHEMA_VERSION {
+        meta.insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION as i64)
+            .map_err(io::Error::other)?;
+        doc.commit();
+    }
+    Ok(())
+}
 
 /// Everything a reopened document restores.
 pub struct Loaded {
@@ -60,6 +119,11 @@ pub struct Loaded {
 pub struct Checkpoint {
     pub name: String,
     pub created_unix: i64,
+    /// Exact journal-axis timestamp for checkpoints written by current
+    /// builds. Older files only have `created_unix`; `timestamp_ms` provides
+    /// the backward-compatible seconds fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_ms: Option<i64>,
     pub frontiers: Vec<u8>,
     /// Named-by-the-author (vs automatic session markers).
     #[serde(default)]
@@ -75,6 +139,13 @@ pub struct Checkpoint {
     /// rewind feature no longer needs any oplog history at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<CheckpointState>,
+}
+
+impl Checkpoint {
+    pub fn timestamp_ms(&self) -> i64 {
+        self.created_ms
+            .unwrap_or_else(|| self.created_unix.saturating_mul(1000))
+    }
 }
 
 /// A checkpoint's frozen document state (see `Checkpoint::state`).
@@ -131,6 +202,7 @@ const STYLE_KEYS: [&str; 8] = [
 /// `Store` so the backfill can read a private background-thread doc.
 fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
     let text = doc.get_text(TEXT_CONTAINER);
+    let text_string = text.to_string();
     // Formatting: the spans JSON when present (one map read), else derive it
     // from the legacy Peritext marks. The marks path is `to_delta()`, and on
     // a file that lived through months of unmark-everything/remark-everything
@@ -138,7 +210,7 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
     // measured 4.7 s for a 5.7 KB text, the dominant cost of open, of every
     // historical checkout, and of sealing a checkpoint. Spans persist as
     // JSON now (save_with_state); marks are read-only legacy.
-    let spans = match doc.get_map(BLOCKS_CONTAINER).get("spans") {
+    let mut spans = match doc.get_map(BLOCKS_CONTAINER).get("spans") {
         Some(v) => match v.into_value() {
             Ok(LoroValue::String(s)) => serde_json::from_str(&s).unwrap_or_default(),
             _ => SpanSet::default(),
@@ -196,7 +268,8 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
     {
         blocks.set_scrap_line(boundary);
     }
-    (text.to_string(), spans, blocks)
+    spans.normalize(text_string.chars().count());
+    (text_string, spans, blocks)
 }
 
 /// Compaction only makes sense once the oplog dwarfs the state; below this
@@ -385,6 +458,12 @@ fn checkpoints_of(doc: &LoroDoc) -> Vec<Checkpoint> {
             Ok(LoroValue::String(json)) => serde_json::from_str(&json).ok(),
             _ => None,
         })
+        .map(|mut cp: Checkpoint| {
+            if let Some(state) = &mut cp.state {
+                state.spans.normalize(state.text.chars().count());
+            }
+            cp
+        })
         .collect()
 }
 
@@ -502,6 +581,142 @@ fn blocks_fingerprint(blocks: &BlockMap) -> u64 {
     fingerprint(&format!("{kinds}\u{1}{boundary}\u{1}{scrap_line}"))
 }
 
+/// An immutable Loro snapshot which is safe to move to a filesystem thread.
+/// `LoroDoc` itself remains confined to the UI thread; after export, the
+/// worker owns only bytes and a path.
+pub struct PreparedSave {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl PreparedSave {
+    pub fn write(self) -> io::Result<()> {
+        atomic_write(&self.path, &self.bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SaveGeneration(u64);
+
+pub struct SaveCompletion {
+    pub generation: SaveGeneration,
+    pub result: io::Result<()>,
+}
+
+/// A single-consumer queue proves generation N reaches replacement before
+/// N+1, so an older snapshot can never overwrite a newer one.
+pub struct SaveWorker {
+    requests: mpsc::Sender<(SaveGeneration, PreparedSave)>,
+    completions: mpsc::Receiver<SaveCompletion>,
+    next_generation: u64,
+}
+
+impl SaveWorker {
+    pub fn new() -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<(SaveGeneration, PreparedSave)>();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("strop-save".into())
+            .spawn(move || {
+                while let Ok((generation, save)) = request_rx.recv() {
+                    let result = save.write();
+                    if completion_tx
+                        .send(SaveCompletion { generation, result })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn filesystem save worker");
+        Self {
+            requests: request_tx,
+            completions: completion_rx,
+            next_generation: 0,
+        }
+    }
+
+    pub fn request(&mut self, save: PreparedSave) -> SaveGeneration {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("save generation overflow");
+        let generation = SaveGeneration(self.next_generation);
+        self.requests
+            .send((generation, save))
+            .expect("save worker unexpectedly stopped");
+        generation
+    }
+
+    pub fn try_completion(&self) -> Option<SaveCompletion> {
+        self.completions.try_recv().ok()
+    }
+
+    pub fn wait_for(&self, generation: SaveGeneration) -> SaveCompletion {
+        loop {
+            let completion = self
+                .completions
+                .recv()
+                .expect("save worker unexpectedly stopped");
+            if completion.generation == generation {
+                return completion;
+            }
+        }
+    }
+}
+
+impl Default for SaveWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("strop.tmp");
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    atomic_replace(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both buffers are live, NUL-terminated UTF-16 paths; the temp is
+    // in the destination directory and therefore on the same volume.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl Store {
     /// Rename/move the on-disk file; subsequent saves follow. Refuses to
     /// overwrite — renaming is never allowed to destroy another document.
@@ -539,6 +754,7 @@ impl Store {
         match fs::read(&path) {
             Ok(bytes) => {
                 doc.import(&bytes).map_err(io::Error::other)?;
+                migrate_schema(&doc)?;
                 let doc = compact_on_open(doc, &bytes, &path);
                 let store = Self {
                     doc,
@@ -605,6 +821,13 @@ impl Store {
                     &mut provenance,
                 );
                 let history = if migrated { None } else { history };
+                // Repair untrusted side state against the text it describes —
+                // AFTER the migration, whose caption insert is the last thing
+                // to move the text and the offsets that index it.
+                let len_chars = text.chars().count();
+                annotations.normalize(len_chars);
+                graveyard.normalize(len_chars);
+                provenance.normalize(len_chars);
                 // Seed the save guards with what the file already holds, so
                 // the session's first unchanged save rewrites nothing.
                 *store.saved.borrow_mut() = SavedHashes {
@@ -724,12 +947,14 @@ impl Store {
         (text, spans, blocks): (String, SpanSet, BlockMap),
     ) {
         self.doc.commit();
+        let created_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
         let checkpoint = Checkpoint {
             name: name.to_owned(),
-            created_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
+            created_unix: created_ms / 1000,
+            created_ms: Some(created_ms),
             frontiers: self.doc.oplog_frontiers().encode(),
             manual,
             state: Some(CheckpointState { text, spans, blocks }),
@@ -762,6 +987,7 @@ impl Store {
         let checkpoint = Checkpoint {
             name: name.to_owned(),
             created_unix,
+            created_ms: None,
             frontiers: self.doc.oplog_frontiers().encode(),
             manual,
             state: Some(state),
@@ -947,7 +1173,7 @@ impl Store {
     /// piece writes NOTHING, because in an append-only CRDT each rewrite is
     /// permanent oplog growth (the 4.8 MB-file bug class).
     #[allow(clippy::too_many_arguments)]
-    pub fn save_with_state(
+    pub fn prepare_save_with_state(
         &self,
         spans: &SpanSet,
         blocks: &BlockMap,
@@ -956,7 +1182,7 @@ impl Store {
         journal: &Journal,
         graveyard: &Graveyard,
         provenance: &Provenance,
-    ) -> io::Result<()> {
+    ) -> io::Result<PreparedSave> {
         // Journal: push only the tail past what the file already holds.
         // Callers settle the journal before saving, so every pushed item is
         // final — the containers stay strictly append-only (no rewrites, no
@@ -1100,7 +1326,30 @@ impl Store {
         drop(saved);
         self.collect_unreachable_assets(blocks, history, graveyard);
         self.doc.commit();
-        self.save()
+        self.prepare_save()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with_state(
+        &self,
+        spans: &SpanSet,
+        blocks: &BlockMap,
+        history: &History,
+        annotations: &Annotations,
+        journal: &Journal,
+        graveyard: &Graveyard,
+        provenance: &Provenance,
+    ) -> io::Result<()> {
+        self.prepare_save_with_state(
+            spans,
+            blocks,
+            history,
+            annotations,
+            journal,
+            graveyard,
+            provenance,
+        )?
+        .write()
     }
 
     /// Save-time asset GC: an asset survives if the current document, the
@@ -1188,16 +1437,19 @@ impl Store {
 
     /// Atomic snapshot save: full history + state, temp file + rename.
     pub fn save(&self) -> io::Result<()> {
+        self.prepare_save()?.write()
+    }
+
+    pub fn prepare_save(&self) -> io::Result<PreparedSave> {
+        stamp_schema_version(&self.doc)?;
         let bytes = self
             .doc
             .export(ExportMode::Snapshot)
             .map_err(io::Error::other)?;
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let tmp = self.path.with_extension("strop.tmp");
-        fs::write(&tmp, &bytes)?;
-        fs::rename(&tmp, &self.path)
+        Ok(PreparedSave {
+            path: self.path.clone(),
+            bytes,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -1207,14 +1459,16 @@ impl Store {
     /// Write a snapshot copy (full history) to another path; the open
     /// document keeps saving to its own.
     pub fn save_copy_to(&self, path: &Path) -> io::Result<()> {
-        let bytes = self
-            .doc
-            .export(ExportMode::Snapshot)
-            .map_err(io::Error::other)?;
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        fs::write(path, bytes)
+        self.prepare_copy_to(path)?.write()
+    }
+
+    /// Prepare a full snapshot for another path without moving the open
+    /// document. Export stays with the Loro owner; the immutable result may
+    /// be written by a filesystem worker.
+    pub fn prepare_copy_to(&self, path: &Path) -> io::Result<PreparedSave> {
+        stamp_schema_version(&self.doc)?;
+        let bytes = self.doc.export(ExportMode::Snapshot).map_err(io::Error::other)?;
+        Ok(PreparedSave { path: path.to_owned(), bytes })
     }
 }
 
@@ -1226,6 +1480,111 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("strop-test-{}-{tag}.strop", std::process::id()))
+    }
+
+    #[test]
+    fn atomic_save_replaces_an_existing_file() {
+        let path = temp_path("atomic-replace");
+        fs::write(&path, b"old").unwrap();
+        atomic_write(&path, b"new snapshot").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new snapshot");
+        assert!(!path.with_extension("strop.tmp").exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_worker_preserves_request_order() {
+        let path = temp_path("worker-order");
+        let mut worker = SaveWorker::new();
+        let first = worker.request(PreparedSave {
+            path: path.clone(),
+            bytes: b"older".to_vec(),
+        });
+        let latest = worker.request(PreparedSave {
+            path: path.clone(),
+            bytes: b"newer".to_vec(),
+        });
+        assert!(first < latest);
+        worker.wait_for(latest).result.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"newer");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_write_does_not_stop_later_generations() {
+        let blocker = temp_path("worker-fault-parent");
+        fs::write(&blocker, b"not a directory").unwrap();
+        let good = temp_path("worker-after-fault");
+        let mut worker = SaveWorker::new();
+        let bad_generation = worker.request(PreparedSave {
+            path: blocker.join("document.strop"),
+            bytes: b"cannot land".to_vec(),
+        });
+        let good_generation = worker.request(PreparedSave {
+            path: good.clone(),
+            bytes: b"survived".to_vec(),
+        });
+        let bad = worker.completions.recv().unwrap();
+        assert_eq!(bad.generation, bad_generation);
+        assert!(bad.result.is_err());
+        worker.wait_for(good_generation).result.unwrap();
+        assert_eq!(fs::read(&good).unwrap(), b"survived");
+        let _ = fs::remove_file(blocker);
+        let _ = fs::remove_file(good);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_replace_accepts_unicode_paths() {
+        let path = temp_path("atomic-作品");
+        fs::write(&path, b"before").unwrap();
+        atomic_write(&path, b"after").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn checkpoint_millisecond_timestamp_round_trips_with_legacy_fallback() {
+        let legacy: Checkpoint = serde_json::from_str(
+            r#"{"name":"old","created_unix":7,"frontiers":[],"manual":false}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.timestamp_ms(), 7_000);
+
+        let exact = Checkpoint {
+            name: "new".into(),
+            created_unix: 7,
+            created_ms: Some(7_654),
+            frontiers: Vec::new(),
+            manual: false,
+            state: None,
+        };
+        let back: Checkpoint = serde_json::from_str(&serde_json::to_string(&exact).unwrap()).unwrap();
+        assert_eq!(back.timestamp_ms(), 7_654);
+    }
+
+    #[test]
+    fn saves_stamp_the_schema_and_future_versions_fail_closed() {
+        let path = temp_path("schema-version");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("versioned");
+        store.save().unwrap();
+        let (reopened, loaded) = Store::open(&path).unwrap();
+        assert_eq!(loaded.unwrap().text, "versioned");
+        assert_eq!(schema_version_of(&reopened.doc).unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let future = LoroDoc::new();
+        future
+            .get_map(META_CONTAINER)
+            .insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION as i64 + 1)
+            .unwrap();
+        future.commit();
+        fs::write(&path, future.export(ExportMode::Snapshot).unwrap()).unwrap();
+        let err = Store::open(&path).err().expect("future schema is refused");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("uses schema"));
+        let _ = fs::remove_file(path);
     }
 
     /// Simulate a LEGACY file: strip the materialized state off every

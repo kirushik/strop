@@ -197,18 +197,21 @@ become felt). That's the lens for prioritising what's left.
    per-block cache (so scroll-down is warm) — cleanest; (b) shape viewport + cheap
    height *estimates* for off-screen blocks, corrected lazily. This is the single
    most likely corridor-test complaint on slow hardware.
-2. **Autosave off-thread + dirty flags (`save_now`, 8 ms, grows).** Snapshot the
-   `ExportMode::Snapshot` bytes on the UI thread, then hand `fs::write` to
-   `background_executor`. Add per-subsystem dirty flags so `rebuild_marks` and the
-   annotations/blocks/history JSON aren't re-serialised when unchanged. The
-   history JSON is the bloat (`export_history(200)` = up to 400 full snapshots
-   re-emitted every save). **Risk: persistence atomicity / data loss — review the
-   ordering and the dirty-flag completeness before landing.**
-3. **Unbounded undo RAM.** `Document::{undo,redo}_states` and `Buffer::undo_stack`
-   are never trimmed in memory (only `export_history` caps the *persisted* tail).
-   Over a long session this is O(transactions × doc-structure) of mostly-identical
-   clones — matters on low-RAM laptops. Fix: a depth cap matching the persisted
-   200, and/or `Arc`/COW snapshots (most transactions don't touch blocks/spans).
+2. **Save preparation still grows.** Durable filesystem IO now runs on one
+   ordered worker (including Unix parent sync and Windows write-through replace),
+   and unchanged state channels have fingerprints. Loro export and changed-channel
+   serialization remain on the UI thread. History is the sharp edge: Arc/COW
+   shares live state, but Serde expands it into repeated JSON. On the reproducible
+   5,000-block fixture, cap 50 is 3.01 MB / 4.56 ms and cap 200 is 12.03 MB /
+   22.43 ms. The fix is cold reversible chunks, not a larger snapshot tail; see
+   [cold-history.md](cold-history.md).
+3. **Undo RAM, first stage landed.** `Document` side-state frames now use
+   transparent Arc/COW sharing, with no in-session depth cap. The 5,000-block ×
+   2,000-frame probe keeps one block-map allocation (10 million `BlockKind` clones
+   avoided), a 40-byte side-state handle per frame before unique changes/capacity,
+   and applies 2,000 undos in 1.39 ms. Text deltas and genuinely changed side
+   values still grow with work. The next stage moves sealed exact transactions to
+   checksummed disk chunks while retaining the complete timeline and undo surface.
 4. **Open-path cost before first paint** (mature docs): `read_state` rebuilds the
    `SpanSet` in O(runs²) (`SpanSet::add` retain-scans), and `add_checkpoint_if_changed`
    at startup does ~3 `read_state` + a Loro checkout. Single-pass span build +
@@ -224,8 +227,9 @@ become felt). That's the lens for prioritising what's left.
   optimised build. Nothing in it is speculative.
 - **Cold-open: acceptable at 151 ms, or invest in progressive first paint?** Decide
   once slow-laptop numbers land.
-- **Undo history persistence: keep in Loro (file grows per save) or move to a
-  sidecar overwrite?** Trade-off against the "single portable file" property.
+- **Cold-history byte/chunk budgets:** choose from the corpus matrix, not the
+  structural stress fixture. The storage direction is decided: a sidecar may be
+  a test backend, but the shipped authority remains one portable `.strop` envelope.
 - **Which deferred item first** (cold-open vs save off-thread vs RAM caps) — let
   corridor pain rank them.
 
