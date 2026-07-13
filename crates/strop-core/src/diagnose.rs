@@ -39,7 +39,7 @@ pub struct ParseReport {
     pub presentation: ParsePresentation,
 }
 
-pub const WHOLE_MANUSCRIPT_MAX_WORDS: usize = 10_000;
+pub const REQUEST_SOURCE_MAX_WORDS: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptScope {
@@ -61,7 +61,7 @@ impl std::fmt::Display for ScopeTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the manuscript is {} words; whole-piece reads stop at {}",
+            "this read contains {} words of manuscript source; one editor read stops at {}",
             self.words,
             self.limit
         )
@@ -232,9 +232,10 @@ Repair only these failures: {rejected}.\n\n\
     )
 }
 
-/// Automatic 0.2 scope policy. A selection is the exact target plus two
-/// neighboring paragraphs on either side. Without a selection the whole
-/// manuscript is sent only under the deliberate cost/quality ceiling.
+/// Automatic 0.2 scope policy. A selection is the exact target plus up to two
+/// complete neighboring paragraphs on either side, while all submitted source
+/// stays under the cost/quality ceiling. Without a selection the whole
+/// manuscript is sent only under that ceiling.
 pub fn prompt_scope(
     manuscript: &str,
     selection: Option<Range<usize>>,
@@ -245,27 +246,32 @@ pub fn prompt_scope(
         let end = selection.end.min(manuscript_chars).max(start);
         let target = char_slice(manuscript, start..end);
         let words = target.split_whitespace().count();
-        if words > WHOLE_MANUSCRIPT_MAX_WORDS {
+        if words > REQUEST_SOURCE_MAX_WORDS {
             return Err(ScopeTooLarge {
                 words,
-                limit: WHOLE_MANUSCRIPT_MAX_WORDS,
+                limit: REQUEST_SOURCE_MAX_WORDS,
             });
         }
-        let before_start = paragraph_context_start(manuscript, start, 2);
-        let after_end = paragraph_context_end(manuscript, end, 2);
+        let (context_before, context_after) = best_context(
+            manuscript,
+            start,
+            end,
+            words,
+            REQUEST_SOURCE_MAX_WORDS,
+        );
         return Ok(PromptScope {
             target_range: start..end,
             target,
-            context_before: char_slice(manuscript, before_start..start),
-            context_after: char_slice(manuscript, end..after_end),
+            context_before,
+            context_after,
             whole_manuscript: false,
         });
     }
     let words = manuscript.split_whitespace().count();
-    if words > WHOLE_MANUSCRIPT_MAX_WORDS {
+    if words > REQUEST_SOURCE_MAX_WORDS {
         return Err(ScopeTooLarge {
             words,
-            limit: WHOLE_MANUSCRIPT_MAX_WORDS,
+            limit: REQUEST_SOURCE_MAX_WORDS,
         });
     }
     Ok(PromptScope {
@@ -334,6 +340,49 @@ fn paragraph_context_end(text: &str, target: usize, paragraphs: usize) -> usize 
         Some(offset) => target + offset,
         None => len,
     }
+}
+
+fn best_context(
+    manuscript: &str,
+    start: usize,
+    end: usize,
+    target_words: usize,
+    limit: usize,
+) -> (String, String) {
+    let before = (0..=2)
+        .map(|paragraphs| {
+            if paragraphs == 0 {
+                return String::new();
+            }
+            let context_start = paragraph_context_start(manuscript, start, paragraphs);
+            char_slice(manuscript, context_start..start)
+        })
+        .collect::<Vec<_>>();
+    let after = (0..=2)
+        .map(|paragraphs| {
+            if paragraphs == 0 {
+                return String::new();
+            }
+            let context_end = paragraph_context_end(manuscript, end, paragraphs);
+            char_slice(manuscript, end..context_end)
+        })
+        .collect::<Vec<_>>();
+    let choices = [
+        (2, 2), (2, 1), (1, 2), (1, 1), (2, 0),
+        (0, 2), (1, 0), (0, 1), (0, 0),
+    ];
+    for (before_count, after_count) in choices {
+        let source_words = target_words
+            + before[before_count].split_whitespace().count()
+            + after[after_count].split_whitespace().count();
+        if source_words <= limit {
+            return (
+                before[before_count].clone(),
+                after[after_count].clone(),
+            );
+        }
+    }
+    (String::new(), String::new())
 }
 
 /// Backward-compatible convenience parser for tests and non-pass callers.
@@ -594,17 +643,55 @@ mod tests {
 
     #[test]
     fn whole_scope_has_a_word_ceiling_but_selection_does_not_prefix_truncate() {
-        let at_limit = std::iter::repeat_n("word", WHOLE_MANUSCRIPT_MAX_WORDS)
+        let at_limit = std::iter::repeat_n("word", REQUEST_SOURCE_MAX_WORDS)
             .collect::<Vec<_>>()
             .join(" ");
         assert!(prompt_scope(&at_limit, None).unwrap().whole_manuscript);
         let over = format!("{at_limit} extra");
         let error = prompt_scope(&over, None).unwrap_err();
-        assert_eq!(error.words, WHOLE_MANUSCRIPT_MAX_WORDS + 1);
+        assert_eq!(error.words, REQUEST_SOURCE_MAX_WORDS + 1);
         assert!(prompt_scope(&over, Some(0..over.chars().count())).is_err());
         let tail = over.chars().count() - 5;
         let selected = prompt_scope(&over, Some(tail..tail + 5)).unwrap();
         assert_eq!(selected.target, "extra");
+    }
+
+    #[test]
+    fn selected_scope_keeps_complete_context_inside_the_source_ceiling() {
+        let target = std::iter::repeat_n("word", REQUEST_SOURCE_MAX_WORDS - 2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!("before\n{target}\nafter");
+        let start = "before\n".chars().count();
+        let end = start + target.chars().count();
+        let scope = prompt_scope(&text, Some(start..end)).unwrap();
+        let submitted_words = scope.target.split_whitespace().count()
+            + scope.context_before.split_whitespace().count()
+            + scope.context_after.split_whitespace().count();
+
+        assert_eq!(scope.target, target);
+        assert_eq!(scope.context_before, "before\n");
+        assert_eq!(scope.context_after, "\nafter");
+        assert_eq!(submitted_words, REQUEST_SOURCE_MAX_WORDS);
+    }
+
+    #[test]
+    fn selected_scope_drops_a_whole_neighbor_instead_of_truncating_it() {
+        let target = std::iter::repeat_n("word", REQUEST_SOURCE_MAX_WORDS - 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!("two words\n{target}\ntwo more");
+        let start = "two words\n".chars().count();
+        let end = start + target.chars().count();
+        let scope = prompt_scope(&text, Some(start..end)).unwrap();
+        let submitted_words = scope.target.split_whitespace().count()
+            + scope.context_before.split_whitespace().count()
+            + scope.context_after.split_whitespace().count();
+
+        assert_eq!(scope.target, target);
+        assert!(scope.context_before.trim().is_empty());
+        assert!(scope.context_after.trim().is_empty());
+        assert_eq!(submitted_words, REQUEST_SOURCE_MAX_WORDS - 1);
     }
 
     #[test]

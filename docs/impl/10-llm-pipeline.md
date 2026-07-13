@@ -97,13 +97,14 @@ Policy:
 3. a short or ambiguous selection inherits the whole-manuscript result;
 4. low confidence uses a stable fallback, never a fresh model guess.
 
-`lingua-rs` is the candidate implementation because it is offline, supports
-Russian and Ukrainian separately, and exposes confidence. Adding it requires
-a separate dependency/licence/size review under repository dependency rules.
-The detector must be evaluated on Russian/Ukrainian confusion, English text
-with Cyrillic quotations, bilingual dialogue, and short selections. No
-detector is expected to classify a shared two-word phrase; inheritance is the
-designed answer.
+The local bakeoff in `docs/research/language-detection-2026-07.md` recommends
+unrestricted `whatlang` for the first implementation: it covers 70 languages
+at a small binary cost and handled ordinary Russian/Ukrainian paragraphs well.
+`lingua-rs` remains a fallback candidate if real corpora show unacceptable
+closely-related-language errors. Do not restrict detection to English,
+Russian, and Ukrainian, and do not make a vendor reliability flag the entire
+policy. No detector is expected to classify a shared two-word phrase;
+whole-manuscript inheritance is the designed answer.
 
 Acceptance:
 
@@ -119,24 +120,32 @@ Replace the silent 24,000-character prefix with an explicit internal scope
 object carrying the source snapshot, exact target document range, context
 range, pass kind, language, and whole/selection/local strategy.
 
-Ten thousand words is the initial per-request target ceiling, including an
-explicit select-all. It is a product cost/quality guard, not a claim about
-model context. Keep it as one named constant so evaluation can move it. Never
-submit a partial prefix and call it the manuscript.
+Ten thousand words is the initial per-request manuscript-source ceiling,
+including TARGET plus all CONTEXT and an explicit select-all. It is a product
+cost/quality guard, not a claim about model context. Keep it as one named
+constant so evaluation can move it. Never submit a partial prefix or paragraph
+and call it the manuscript.
 
-When the writer selects a passage, the selection is the target. Add one or two
-complete paragraphs before and after it as read-only context, plus the
-containing heading where practical. The model may read context but may return
-quotes only from the target. Validation and anchoring enforce that boundary.
+When the writer selects a passage, the selection is the target. Add up to two
+complete paragraphs before and after it as read-only context, as the remaining
+source budget allows, plus the containing heading where practical. Never trim
+the selection to make room for context. The model may read context but may
+return quotes only from the target. Validation and anchoring enforce that
+boundary.
 
 Without a selection:
 
 - at or below 10k words, whole-piece passes receive the whole manuscript;
-- above 10k, line and copy work may use an automatically chosen current
-  chapter/local window with neighboring context;
-- developmental, believing, and doubting passes must not pretend a local
-  window is global. Until hierarchical reading ships, fail calmly rather than
-  fabricate whole-piece authority.
+- above 10k, every 0.2 pass declines the whole-piece read and asks for a
+  shorter explicit selection. No pass silently chooses a caret or chapter
+  window because the existing unselected action means a whole-piece read.
+
+For a conservative sanity estimate, budget submitted source as two tokens per
+English word and four per non-English word, then leave prompt, output, and
+safety reserve. At 10k words this estimates at most 20k or 40k source tokens,
+well below the 100k-token planning baseline used for hosted models. This is a
+cost fuse and rough forecast, not a tokenizer or a provider guarantee. Small
+local Ollama contexts remain best effort and may fail truthfully.
 
 Scope stays automatic in 0.2. A quiet whole-piece/current-chapter indication
 inside existing “Ask an editor” action copy is backlog work requiring UX tests.
@@ -152,7 +161,12 @@ Acceptance:
 
 ## 5 · Long-document strategies
 
-Do not chunk every pass uniformly.
+Do not ship long-document chunking in 0.2. A local window would be honest for
+explicitly local line work, but the current no-selection action promises a
+whole read. Neighboring chapter summaries improve transitions yet cannot
+recover facts, arcs, contrasts, or global superlatives elsewhere in the work.
+
+The post-0.2 direction is not uniform chunking:
 
 - Line: chapter/caret window, paragraph boundaries, one-to-two-paragraph
   overlap, local claims only.
@@ -164,7 +178,10 @@ Do not chunk every pass uniformly.
 Intermediate dossiers preserve exact candidate quotes and uncertainty. Final
 cards are ranked once across the piece to the original five/seven-card limit;
 never emit a full allowance per chunk. This phase follows, rather than blocks,
-the 0.2 safety ceiling.
+the 0.2 safety ceiling. It also needs a summary/evidence cache, invalidation on
+edits, structural boundaries, source provenance, and retrieval of raw passages
+before final card generation. Adjacent-chapter summaries are one input to that
+system, not a substitute for it.
 
 ## 6 · Provider shims
 
@@ -187,9 +204,10 @@ truncated JSON, refusals, empty choices, one bad item among good siblings,
 wrong levels, repeated quotes, selection collisions, and Russian/Ukrainian/
 mixed-language cases.
 
-Then qualify a small rotating model set through Poe and selected direct/local
-endpoints. A short-lived, low-quota key lives outside the repository and never
-enters chat, fixtures, logs, or commits.
+Later in the product lifecycle, qualify a small rotating model set through Poe
+and selected direct/local endpoints. A short-lived, low-quota key lives outside
+the repository and never enters chat, fixtures, logs, or commits. This is not a
+0.2 provider-profile framework or release blocker.
 
 Measure grounded-card rate, usable-card precision, duplicate rate, target-
 language adherence, format/recovery rate, latency, cost, and global-pass
@@ -199,12 +217,14 @@ quality with decisive evidence at the opening, middle, and end.
 
 1. Truthful errors and response metadata.
 2. Robust parsing, partial salvage, and bounded retry/recovery.
-3. Deterministic local language detection and enforcement.
-4. Minimal provider shims and opportunistic structured output.
-5. Range-preserving scope, neighboring passage context, and the 10k-word
-   safety ceiling.
-6. Local long-document handling, then hierarchical global reads.
-7. Evaluation gates and controlled prompt/model tuning.
+3. Range-preserving scope, neighboring passage context, and the 10k-word
+   total-source safety ceiling.
+4. Deterministic local language detection and enforcement.
+5. Partial-result repair delivery after UX review in
+   `docs/impl/11-llm-repair-flow.md`.
+6. Minimal provider shims and opportunistic structured output.
+7. Post-0.2 hierarchical global reads.
+8. Evaluation gates and controlled prompt/model tuning.
 
 Dependency-light work comes first. The language detector and any provider-
 specific additions each require their own explicit dependency/compatibility

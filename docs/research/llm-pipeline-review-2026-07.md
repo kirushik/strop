@@ -18,7 +18,8 @@ The editorial prompts are unusually coherent. They define an editor's role,
 protect voice, require grounded quotes, prohibit rewrites, allow silence, and
 make the result usable as margin queries. Those are real strengths.
 
-The surrounding reliability layer is still prototype-grade. One generic
+At the start of this review, the surrounding reliability layer was prototype-
+grade. One generic
 OpenAI-compatible request shape is sent to every endpoint; JSON is requested
 only in prose; the response parser throws away completion metadata; one bad
 item invalidates the whole reply; the advertised retry does not exist; the
@@ -27,23 +28,27 @@ is silently reduced to the first 24,000 characters. Error messages therefore
 guess at a cause when the program has not collected enough evidence to know
 it.
 
-The right next move is not a wholesale prompt rewrite. It is to make the
+The right move is not a wholesale prompt rewrite. It is to make the
 contract around the prompts explicit and observable:
 
-1. capability-aware request construction;
-2. schema-constrained output where the endpoint supports it;
-3. a bounded validation and repair ladder;
-4. an explicit language policy;
-5. token-aware, pass-specific document scope;
+1. explicit, range-preserving document scope and a visible safety fuse;
+2. a bounded parsing, validation, salvage, and repair ladder;
+3. truthful provider evidence and privacy-safe diagnostics;
+4. an explicit local language policy;
+5. small provider shims and schema-constrained output where proven useful;
 6. fixtures and evaluation cases that measure these contracts.
 
-That is a safe post-0.2.0 sequence. The one pre-release change worth
-considering is correcting the misleading parse-error copy; it currently
-asserts “usually a too-small model” without evidence.
+Implementation began on branch `llm-pipeline-remediation`. Commit `4c9139e`
+already replaces the silent prefix, carries exact target/context scope,
+salvages valid siblings, bounds one repair turn, preserves response metadata,
+uses truthful failure copy, and writes a privacy-safe local log. The remaining
+0.2 work is local language resolution and, after design review, partial-result
+delivery during repair. Hierarchical long-document reads and model/provider
+qualification remain later work.
 
 ## What exists now
 
-The run path is compact:
+The audit-start run path was compact:
 
 ```text
 selection, otherwise manuscript
@@ -140,8 +145,9 @@ and Ollama documents
 [structured outputs](https://docs.ollama.com/capabilities/structured-outputs).
 The exact request field and schema subset differ, and compatibility gateways
 may ignore or reject them. Therefore the right abstraction is not “always
-send `response_format`”; it is a provider/capability profile with a prompt-only
-fallback.
+send `response_format`.” Keep the generic prompt-and-validate path and add only
+small, proven endpoint shims for schema support. A dynamic capability framework
+is not justified for 0.2.
 
 For capable endpoints, define a schema for an object such as:
 
@@ -242,7 +248,7 @@ Capture a small, provider-neutral result record:
 
 ```text
 provider and model
-request capability profile
+request shape or proven compatibility shim
 HTTP status and provider request ID
 latency and retry count
 input/output token usage when available
@@ -299,17 +305,20 @@ other languages, TARGET_LANGUAGE still governs generated fields.
 Determine the target before the request:
 
 1. honor an explicit document or user language preference, if one exists;
-2. otherwise detect the dominant language of the selected scope;
-3. for a very short or ambiguous selection, inherit the document's dominant
-   language;
+2. otherwise detect the dominant language of the whole manuscript locally;
+3. every selection inherits the whole-manuscript result, so a foreign quote or
+   short passage cannot flip it;
 4. if confidence is low, use a stable configured fallback instead of asking
    the model to guess anew on every run.
 
 Strop's existing typographic language logic distinguishes only Russian from
-English. It can supply an initial RU/EN signal but is not a universal language
-solution. A future detector should return a BCP 47-style language tag plus
-confidence, and should be evaluated on code-switching and quoted foreign text.
-No translated prompt catalogue is necessary.
+English. It is not a universal language solution. The local feasibility review
+in `docs/research/language-detection-2026-07.md` recommends unrestricted
+Whatlang for the first implementation: compact, offline coverage of 70
+languages, with whole-manuscript inheritance compensating for its weak short-
+fragment behavior. Lingua remains a later higher-cost candidate if real
+Russian/Ukrainian corpora expose unacceptable confusion. No translated prompt
+catalogue is necessary.
 
 Add semantic validation that generated fields predominantly match the target
 script/language when confidence is high. A mismatch is a candidate for one
@@ -412,6 +421,13 @@ described explicitly in Anthropic's
 [context-window documentation](https://platform.claude.com/docs/en/build-with-claude/context-windows).
 Exact token counting is model-dependent; OpenAI provides a current
 [token-counting guide](https://developers.openai.com/api/docs/guides/token-counting).
+Its general [token explainer](https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them)
+uses roughly four English characters or three-quarters of an English word per
+token while warning that non-English text often has a higher token-to-character
+ratio. Google's [Gemini token guide](https://ai.google.dev/gemini-api/docs/tokens)
+gives a similar four-character approximation and makes clear that input and
+output share the model limits. These are useful sanity checks, not universal
+tokenizers.
 
 Even when a document fits nominally, “send everything” is not automatically
 best. The primary study
@@ -429,23 +445,28 @@ usable source budget = model context limit
                      - safety margin
 ```
 
-Use the provider's counting endpoint or the model's tokenizer when available.
-For an unknown OpenAI-compatible model, require a configured context limit or
-use a conservative, visible fallback. Cut only at paragraph or structural
-boundaries.
+Exact tokenizers and provider counting endpoints may improve later telemetry,
+but they are not required for the 0.2 safety policy. Use a deliberately rough
+upper estimate of two tokens per English word and four per non-English word,
+then add prompt/output reserve. The useful accuracy here is the conservative
+factor, not a false provider-specific digit. Cut context only at paragraph or
+structural boundaries and never cut the selected target.
 
-Product decision after review: start with a 10,000-word request-target ceiling,
-including an explicit select-all. This is a deliberate cost/quality fuse
-against accidentally sending book-scale text, not a provider or model-context
-claim. Under it, send the whole piece whenever the pass implies global
-visibility. Local Ollama remains best effort even when its configured context
-is smaller. Over it, choose an honest pass-specific strategy or decline the
-global read—never take a prefix.
+Product decision after review: start with a 10,000-word total submitted-source
+ceiling, including TARGET, CONTEXT, and an explicit select-all. This is a
+deliberate cost/quality fuse against accidentally sending book-scale text, not
+a provider or model-context claim. At the heuristic above, 10k words consumes
+at most about 20k English or 40k non-English source tokens before reserves,
+comfortably inside a rough 100k hosted-model planning baseline. Local Ollama
+remains best effort even when its configured context is smaller. Under the cap,
+send the whole piece whenever the pass implies global visibility. Over it in
+0.2, visibly decline a no-selection read and ask for a shorter selection—never
+take a prefix or silently substitute a local window.
 
 ### Is the cap supported by surrounding code?
 
-Only mechanically. `chars().take(24_000)` is Unicode-boundary-safe and avoids
-a byte-slice panic. Beyond that, support is weak:
+At audit time, only mechanically. `chars().take(24_000)` was Unicode-boundary-
+safe and avoided a byte-slice panic. Beyond that, support was weak:
 
 - truncation is silent;
 - the first 24k is always favored, regardless of caret or pass;
@@ -455,6 +476,13 @@ a byte-slice panic. Beyond that, support is weak:
 - a later manual selection is anchored against the whole manuscript;
 - there are no boundary, N+1, deduplication, or global-ranking tests.
 
+Implementation note, 2026-07-13: the first remediation removed that prefix,
+added an exact target/context scope and range-aware anchoring, and visibly
+declines an oversized whole read. The follow-up caps TARGET plus CONTEXT at
+10,000 words and drops only whole neighboring passages when the context budget
+is tight. The fixed output reserve and post-0.2 hierarchical workflow remain
+open work.
+
 The cold-reading behavior does not fill this gap. For manuscripts over 10,000
 words, cold read opens at the caret's current chapter. Its chapter heuristic
 finds the shallowest heading level that occurs at least twice, then the nearest
@@ -462,9 +490,9 @@ such heading at or before the caret. This changes the opening page of a
 whole-manuscript reading snapshot. It does not change what an LLM pass sees,
 and the diagnosis path does not call it.
 
-The heuristic is nevertheless a useful structural primitive to reuse for AI
-scope. “Where cold read opens” and “what the model receives” should remain
-separate product decisions.
+The heuristic may become a useful structural primitive for later AI scope.
+“Where cold read opens” and “what the model receives” remain separate product
+decisions; in 0.2 the former must not silently narrow the latter.
 
 ### Can the second half be sent without context?
 
@@ -484,21 +512,23 @@ pass is:
 | Believing | Not reliable | Center of gravity, the “alive” sentence, and repeated latent material are comparative whole-piece judgments. |
 | Doubting | Not reliable | “Strongest case,” “most load-bearing,” and “weakest” are global superlatives. |
 
-Thus a raw N+1 chunk may safely produce local line observations if it is
-labelled `segment N+1 of M`, includes neighboring paragraphs and section
-context, and prohibits whole-piece claims. Running the existing developmental,
-believing, or doubting prompts unchanged over each chunk will produce
+Thus a raw N+1 chunk could later produce local line observations if it is
+explicitly requested and labelled `segment N+1 of M`, includes neighboring
+paragraphs and section context, and prohibits whole-piece claims. That is not
+the 0.2 behavior. Running the existing developmental, believing, or doubting
+prompts unchanged over each chunk will produce
 confident but incomparable local answers. Returning five or seven cards per
 chunk would also destroy the prompts' intended scarcity.
 
 ### Recommended long-document workflow
 
-Prefer full text whenever it fits the measured budget and evaluations say the
-chosen model handles it well. Strop targets essays, talks, and chapters, so
-many normal documents will fit hosted models without chunking. Capability,
-not an arbitrary product-wide character count, should decide.
+For 0.2, prefer full text whenever it fits the 10,000-word product cap. Strop
+targets essays, talks, and chapters, so many normal documents fit without
+chunking. Above it, visibly decline a no-selection read and retain the hard cap
+until a separately designed long-document system is ready.
 
-When it does not fit, use pass-specific strategies.
+After 0.2, measured model capability and pass quality can inform a movable cap.
+When a document does not fit, use pass-specific strategies.
 
 For line editing:
 
@@ -529,6 +559,10 @@ This is not ordinary map/reduce summarization. Intermediate summaries can
 erase voice and subtle evidence, so dossiers should retain exact quotes and
 explicit uncertainty. Opening/middle/ending sampling is acceptable only as an
 honestly labelled partial read, not as a substitute for global visibility.
+Previous/next-chapter summaries can help a local segment understand transitions
+and open threads, but they are only one dossier input. They cannot represent an
+arbitrary fact, image, or arc elsewhere, and summary generation introduces its
+own provenance, invalidation, and compounding-error problems.
 
 A scope object should make all of this concrete:
 
@@ -659,11 +693,12 @@ silently—with little provider-specific code.
 ### Phase 4 — correct scope
 
 - Introduce `PassScope` and range-preserving anchoring.
-- Replace the character cap with measured token budgeting.
-- Run whole-text passes when they fit.
-- Add local line/copy windows and hierarchical global passes when they do not.
-- Reuse the chapter-boundary primitive where appropriate.
-- Expose whole/local/partial scope quietly in the UI.
+- Replace the character cap with the 10,000-word total-source safety fuse.
+- Run whole-text passes under it; visibly decline unselected reads above it.
+- Keep selected context to complete paragraphs inside the same source budget.
+- Backlog local line/copy windows and hierarchical global passes rather than
+  silently changing the meaning of the current action.
+- Revisit quiet scope clarification only through the UX process.
 
 Success criterion: text after the old 24k boundary is never silently ignored;
 selected results cannot anchor outside the selection; global-pass quality does
@@ -675,7 +710,7 @@ not collapse when decisive evidence is in a later segment.
 - Run the deterministic suite on every change.
 - Run the editorial set for material prompt/model/scope changes.
 - Compare variants on grounded usefulness, not aesthetic preference.
-- Keep rollback possible per provider profile.
+- Keep rollback possible for each compatibility shim.
 
 Success criterion: a prompt or provider change ships only with measured
 non-regression on format, grounding, language, and editorial usefulness.
@@ -688,9 +723,10 @@ The 24,000-character cap is not a designed long-document workflow; it is an
 undocumented prototype guard whose first-prefix behavior is particularly
 unsafe for whole-piece passes.
 
-The smallest coherent improvement is not “increase 24,000.” It is to carry an
-explicit scope and language contract from request through validation and
+The smallest coherent improvement was not “increase 24,000.” It was to carry
+an explicit scope and language contract from request through validation and
 anchoring, while collecting enough response metadata to tell truncation,
-refusal, provider incompatibility, and schema failure apart. After that,
-token-aware whole-document reads and pass-specific overflow strategies can be
-introduced and judged with fixtures rather than intuition.
+refusal, provider incompatibility, and schema failure apart. The 10,000-word
+fuse now supplies the honest 0.2 boundary. Later whole-document and overflow
+strategies should be introduced only when their evidence, summary provenance,
+and UI meaning can be judged with fixtures rather than intuition.
