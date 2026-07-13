@@ -227,4 +227,3 @@ this belongs in a deliberately versioned post-0.2 release.
 - Every committed generation survives truncation after each individual write
   and sync point; no test yields a newer document paired with older history or
   vice versa.
-

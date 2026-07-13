@@ -130,7 +130,7 @@ but it is the same state with the same contract.)
 ## 4. Selecting the picture
 
 Click on the pixels selects the picture whole. The selection wash
-covers **the whole block — pixels and caption line together** — 
+covers **the whole block — pixels and caption line together** —
 because the block is the unit every verb below acts on: what is
 washed is what goes (P6; the still tells the truth about the blast
 radius). The wash is warm — the writer owns it; same amber family as
