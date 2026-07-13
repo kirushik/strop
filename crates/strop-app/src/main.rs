@@ -15,6 +15,7 @@
 // it past the default 128. A wider budget beats splitting the dump.
 #![recursion_limit = "256"]
 
+mod ai_log;
 mod bookpage;
 mod commands;
 mod config;

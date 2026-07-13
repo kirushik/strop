@@ -7,8 +7,8 @@
 //!   a dummy header).
 //! - `max_completion_tokens`, except base URLs that look like ollama
 //!   (the one holdout still documenting only `max_tokens`).
-//! - NO `response_format`: Poe and Anthropic-compat silently ignore it,
-//!   so structured output is prompt-and-parse with a lenient extractor.
+//! - NO universal `response_format`: structured output stays a prompt-and-
+//!   validate contract until an endpoint-specific shim proves otherwise.
 //! - OpenRouter can put errors inside an HTTP 200 body — always check.
 //! - Blocking ureq; callers run this on a background thread.
 
@@ -21,7 +21,7 @@ use serde_json::json;
 pub enum LlmError {
     /// 401/403 — fix the key/settings; never retried.
     Auth(String),
-    /// 429 — retryable upstream, surfaced after our single retry.
+    /// 429 — retryable upstream, surfaced after one bounded retry.
     RateLimited(String),
     /// 4xx/5xx/in-body errors; message passed through verbatim (the only
     /// cross-provider constant).
@@ -44,6 +44,28 @@ impl std::fmt::Display for LlmError {
 }
 
 impl std::error::Error for LlmError {}
+
+/// Provider-neutral completion evidence. Optional fields stay optional:
+/// OpenAI-compatible gateways disagree about which metadata they return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatResult {
+    pub content: String,
+    pub finish_reason: Option<String>,
+    pub refusal: Option<String>,
+    pub usage: TokenUsage,
+    pub request_id: Option<String>,
+    pub retries: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct TokenUsage {
+    #[serde(default, alias = "input_tokens")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, alias = "output_tokens")]
+    pub completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+}
 
 pub struct LlmClient {
     agent: ureq::Agent,
@@ -89,14 +111,29 @@ impl LlmClient {
         body
     }
 
-    /// Blocking chat-completion call. Run on a background thread.
-    pub fn chat(&self, system: &str, user: &str, max_tokens: u32) -> Result<String, LlmError> {
+    /// Blocking chat-completion call. Run on a background thread. A transient
+    /// network failure or 429 gets one retry; auth and response errors do not.
+    pub fn chat(&self, system: &str, user: &str, max_tokens: u32) -> Result<ChatResult, LlmError> {
         let body = self.request_body(system, user, max_tokens);
+        match self.chat_once(&body) {
+            Ok(result) => Ok(result),
+            Err(LlmError::Network(_)) | Err(LlmError::RateLimited(_)) => {
+                std::thread::sleep(Duration::from_millis(300));
+                self.chat_once(&body).map(|mut result| {
+                    result.retries = 1;
+                    result
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn chat_once(&self, body: &serde_json::Value) -> Result<ChatResult, LlmError> {
         let mut response = self
             .agent
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", &format!("Bearer {}", self.api_key))
-            .send_json(&body)
+            .send_json(body)
             .map_err(|e| LlmError::Network(e.to_string()))?;
         let status = response.status().as_u16();
         let text = response
@@ -133,6 +170,10 @@ struct ChatResponse {
     error: Option<ApiError>,
     #[serde(default)]
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: TokenUsage,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,15 +185,19 @@ struct ApiError {
 #[derive(Deserialize)]
 struct Choice {
     message: ChoiceMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChoiceMessage {
     #[serde(default)]
-    content: String,
+    content: serde_json::Value,
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
-fn parse_chat_response(status: u16, text: &str) -> Result<String, LlmError> {
+fn parse_chat_response(status: u16, text: &str) -> Result<ChatResult, LlmError> {
     let parsed: Result<ChatResponse, _> = serde_json::from_str(text);
     let error_message = parsed
         .as_ref()
@@ -187,13 +232,38 @@ fn parse_chat_response(status: u16, text: &str) -> Result<String, LlmError> {
     }
     let response =
         parsed.map_err(|e| LlmError::Shape(format!("{e}; body: {}", body_preview(text))))?;
-    response
+    let choice = response
         .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content)
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| LlmError::Shape("no choices in response".into()))
+        .ok_or_else(|| LlmError::Shape("no choices in response".into()))?;
+    let content = message_text(&choice.message.content);
+    if content.is_empty() && choice.message.refusal.is_none() {
+        return Err(LlmError::Shape("choice contained no text".into()));
+    }
+    Ok(ChatResult {
+        content,
+        finish_reason: choice.finish_reason,
+        refusal: choice.message.refusal,
+        usage: response.usage,
+        request_id: response.id,
+        retries: 0,
+    })
+}
+
+/// Compatibility endpoints return either a string or an array of typed text
+/// parts. Unknown/non-text parts are ignored; an entirely non-text choice is
+/// reported by the caller as a shape error.
+fn message_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
 }
 
 /// `GET /models` response parsing, split out so the status/error matrix is
@@ -253,14 +323,6 @@ fn body_preview(text: &str) -> &str {
     &text[..end]
 }
 
-/// Lenient JSON-array extraction for prompt-and-parse structured output:
-/// strips markdown fences, takes first '[' .. last ']'.
-pub fn extract_json_array(text: &str) -> Option<&str> {
-    let start = text.find('[')?;
-    let end = text.rfind(']')?;
-    (end > start).then(|| &text[start..=end])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +345,9 @@ mod tests {
     fn response_parsing_covers_the_error_matrix() {
         // Happy path.
         let ok = r#"{"choices":[{"message":{"role":"assistant","content":"привет"}}]}"#;
-        assert_eq!(parse_chat_response(200, ok).unwrap(), "привет");
+        let parsed = parse_chat_response(200, ok).unwrap();
+        assert_eq!(parsed.content, "привет");
+        assert_eq!(parsed.retries, 0);
         // Auth.
         let auth = r#"{"error":{"message":"bad key","type":"auth"}}"#;
         assert!(matches!(
@@ -320,6 +384,25 @@ mod tests {
     }
 
     #[test]
+    fn response_preserves_finish_usage_refusal_and_typed_content() {
+        let body = r#"{
+            "id":"req-7",
+            "choices":[{
+                "finish_reason":"length",
+                "message":{"content":[{"type":"text","text":"one"},{"type":"text","text":" two"}],"refusal":"policy"}
+            }],
+            "usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16}
+        }"#;
+        let parsed = parse_chat_response(200, body).unwrap();
+        assert_eq!(parsed.content, "one two");
+        assert_eq!(parsed.finish_reason.as_deref(), Some("length"));
+        assert_eq!(parsed.refusal.as_deref(), Some("policy"));
+        assert_eq!(parsed.request_id.as_deref(), Some("req-7"));
+        assert_eq!(parsed.usage.prompt_tokens, Some(11));
+        assert_eq!(parsed.usage.completion_tokens, Some(5));
+    }
+
+    #[test]
     fn models_response_surfaces_failures_but_keeps_empty_list_ok() {
         // 401 with a provider error body must become Auth, not Ok([]).
         let bad_key = r#"{"error":{"message":"bad key"}}"#;
@@ -352,13 +435,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn json_array_extraction_is_lenient() {
-        assert_eq!(
-            extract_json_array("```json\n[{\"a\":1}]\n```"),
-            Some("[{\"a\":1}]")
-        );
-        assert_eq!(extract_json_array("Вот:\n[1, 2]\nготово"), Some("[1, 2]"));
-        assert_eq!(extract_json_array("no array"), None);
-    }
 }

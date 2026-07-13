@@ -334,6 +334,8 @@ struct ParkGhost {
 /// deferral is dropped at flush by that check alone (one place, by construction).
 struct DeferredPass {
     diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+    rejected: usize,
+    scope: Option<strop_core::diagnose::PromptScope>,
     generation: u64,
 }
 /// At most this many AI (Layer-B) cards render FULL-SIZE at once; past the
@@ -4339,15 +4341,47 @@ impl Editor {
         // lands now rather than racing the run it just triggered.
         self.flush_deferred_pass(cx);
         self.drafting = false;
-        // Scope: the selection if there is one, else the MANUSCRIPT (never the
-        // compost — the rail is the writer's private scrap box, asides.md §1).
-        // Capped — a 24k-char window is plenty for an editorial pass.
-        let scope = if self.selected_range.is_empty() {
-            self.doc.manuscript_slice().0
+        // Scope is manuscript-relative even when the document has a compost
+        // rail. A selected passage is the target; neighboring paragraphs are
+        // context only. With no selection the whole piece is eligible up to
+        // the deliberate cost/quality ceiling — never a silent prefix.
+        let manuscript = self.doc.manuscript_slice().0;
+        let mrange = self.doc.manuscript_char_range();
+        let had_selection = !self.selected_range.is_empty();
+        let selection = if !had_selection {
+            None
         } else {
-            self.doc.slice_bytes(self.selected_range.clone())
+            let rope = self.doc.rope();
+            let start = rope.byte_to_char(self.selected_range.start.min(rope.len_bytes()));
+            let end = rope.byte_to_char(self.selected_range.end.min(rope.len_bytes()));
+            let start = start.max(mrange.start).min(mrange.end);
+            let end = end.max(start).min(mrange.end);
+            (start < end).then(|| (start - mrange.start)..(end - mrange.start))
         };
-        let scope: String = scope.chars().take(24_000).collect();
+        if had_selection && selection.is_none() {
+            self.ai_status = Some(AiStatus::Error {
+                title: "The editor reads manuscript passages".into(),
+                detail: "Select text in the manuscript and ask again.".into(),
+            });
+            cx.notify();
+            return;
+        }
+        let scope = match strop_core::diagnose::prompt_scope(&manuscript, selection) {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.ai_status = Some(AiStatus::Error {
+                    title: "This is too long for one editor read".into(),
+                    detail: format!("{error}. Select a shorter passage for now."),
+                });
+                cx.notify();
+                return;
+            }
+        };
+        let target_language = match self.config.language {
+            crate::config::Language::Ru => "ru",
+            crate::config::Language::En => "en",
+            crate::config::Language::Auto => "the dominant language of TARGET",
+        };
         self.ai_generation += 1;
         let generation = self.ai_generation;
         self.ai_status = Some(AiStatus::Running {
@@ -4370,13 +4404,106 @@ impl Editor {
                         PassKind::Doubting => strop_core::diagnose::doubting_system_prompt(),
                         PassKind::Diagnostic(mode) => strop_core::diagnose::system_prompt(mode),
                     };
-                    let user = strop_core::diagnose::user_prompt(&scope);
-                    client
+                    let user = strop_core::diagnose::user_prompt_scoped(
+                        &scope.target,
+                        &scope.context_before,
+                        &scope.context_after,
+                        target_language,
+                    );
+                    let response = client
                         .chat(&system, &user, 2048)
-                        .map_err(AiFailure::Llm)
-                        .and_then(|response| {
-                            strop_core::diagnose::parse(&response).map_err(AiFailure::Parse)
-                        })
+                        .map_err(AiFailure::Llm)?;
+                    if let Some(refusal) = &response.refusal {
+                        return Err(AiFailure::Parse(format!(
+                            "the model refused this request: {refusal}"
+                        )));
+                    }
+                    let first = strop_core::diagnose::parse_for(
+                        &response.content,
+                        kind.mode_str(),
+                    );
+                    let mut parse_error = None;
+                    let (mut diagnoses, repair_items, rejected) = match first {
+                        Ok(report) => {
+                            let rejected = report.rejected.len();
+                            (report.diagnoses, report.rejected, rejected)
+                        }
+                        Err(error) => {
+                            let stop = response
+                                .finish_reason
+                                .as_deref()
+                                .map(|reason| format!("; completion stopped: {reason}"))
+                                .unwrap_or_default();
+                            parse_error = Some(format!("{error}{stop}"));
+                            (Vec::new(), Vec::new(), 1)
+                        }
+                    };
+                    let initial_valid = diagnoses.len();
+                    if rejected > 0 {
+                        let repair_system =
+                            strop_core::diagnose::repair_system_prompt(kind.mode_str());
+                        let repair_user = strop_core::diagnose::repair_user_prompt(
+                            &response.content,
+                            &scope,
+                            target_language,
+                            &repair_items,
+                        );
+                        match client.chat(&repair_system, &repair_user, 2048) {
+                            Ok(repair) if repair.refusal.is_none() => {
+                                if let Ok(report) = strop_core::diagnose::parse_for(
+                                    &repair.content,
+                                    kind.mode_str(),
+                                ) {
+                                    for diagnosis in report.diagnoses {
+                                        let duplicate = diagnoses.iter().any(|existing| {
+                                            existing.quote == diagnosis.quote
+                                                && existing.problem == diagnosis.problem
+                                        });
+                                        if !duplicate {
+                                            diagnoses.push(diagnosis);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) if diagnoses.is_empty() => {
+                                return Err(AiFailure::Parse(format!(
+                                    "{}; repair request failed: {error}",
+                                    parse_error.as_deref().unwrap_or("invalid diagnosis reply")
+                                )));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if diagnoses.is_empty() && rejected > 0 {
+                        return Err(AiFailure::Parse(
+                            parse_error.unwrap_or_else(|| {
+                                "the reply contained no valid diagnosis items".into()
+                            }),
+                        ));
+                    }
+                    let recovered = diagnoses.len().saturating_sub(initial_valid);
+                    let unrecovered = rejected.saturating_sub(recovered);
+                    crate::ai_log::record(&crate::ai_log::PassLog {
+                        t_unix_ms: crate::ai_log::now_ms(),
+                        provider: crate::ai_log::provider_host(&base_url),
+                        model: &model,
+                        pass: kind.mode_str(),
+                        scope: if scope.whole_manuscript {
+                            "whole"
+                        } else {
+                            "selection"
+                        },
+                        target_chars: scope.target.chars().count(),
+                        finish_reason: response.finish_reason.as_deref(),
+                        prompt_tokens: response.usage.prompt_tokens,
+                        completion_tokens: response.usage.completion_tokens,
+                        retries: response.retries,
+                        repair_attempted: rejected > 0,
+                        accepted: diagnoses.len(),
+                        rejected: unrecovered,
+                    });
+                    Ok((diagnoses, unrecovered, scope))
                 })
                 .await;
             this.update(cx, |editor: &mut Editor, cx| {
@@ -4384,10 +4511,29 @@ impl Editor {
                     return; // cancelled or superseded — drop silently
                 }
                 match result {
-                    Ok(diagnoses) => editor.deliver_pass(diagnoses, generation, cx),
+                    Ok((diagnoses, rejected, scope)) => {
+                        editor.deliver_pass_report(
+                            diagnoses,
+                            rejected,
+                            Some(scope),
+                            generation,
+                            cx,
+                        )
+                    }
                     Err(failure) => {
-                        editor.ai_status =
-                            Some(failure.into_status(&editor.config.ai.base_url, &editor.config.ai.model));
+                        crate::ai_log::record_failure(&crate::ai_log::FailureLog {
+                            t_unix_ms: crate::ai_log::now_ms(),
+                            provider: crate::ai_log::provider_host(
+                                &editor.config.ai.base_url,
+                            ),
+                            model: &editor.config.ai.model,
+                            pass: editor.last_pass.mode_str(),
+                            failure: failure.kind(),
+                        });
+                        editor.ai_status = Some(failure.into_status(
+                            &editor.config.ai.base_url,
+                            &editor.config.ai.model,
+                        ));
                     }
                 }
                 cx.notify();
@@ -4447,6 +4593,8 @@ impl Editor {
     fn integrate_pass(
         &mut self,
         diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+        rejected: usize,
+        scope: Option<strop_core::diagnose::PromptScope>,
         generation: u64,
         cx: &mut Context<Self>,
     ) {
@@ -4459,31 +4607,43 @@ impl Editor {
         // that no longer match are dropped.
         self.diagnosis_pass += 1;
         let pass_id = self.diagnosis_pass;
-        // Anchor within the MANUSCRIPT slice, then rebase every range back by
-        // the manuscript base — so a card can never land in the compost, even
-        // when the writer set aside an earlier draft of the very sentence
-        // (review H40, TRAP 4). Existing notes are rebased into the slice too,
-        // so suppression still matches. When there is no rail the base is 0 and
-        // this is identical to anchoring against the whole document.
+        // Resolve the submitted target within the CURRENT manuscript, anchor
+        // only there, then rebase every range by the manuscript and target
+        // bases. A card therefore cannot land in context, compost, or an
+        // unrelated copy of a selected sentence. Existing notes are rebased
+        // into the same target so suppression still matches.
         let base = self.doc.manuscript_base_char();
-        let mrange = self.doc.manuscript_char_range();
         let mtext = self.doc.manuscript_slice().0;
+        let (target_start, target_text) = scope
+            .as_ref()
+            .and_then(|scope| strop_core::diagnose::resolve_target(&mtext, scope))
+            .unwrap_or_else(|| {
+                if scope.is_some() {
+                    (mtext.chars().count(), String::new())
+                } else {
+                    (0, mtext.clone())
+                }
+            });
+        let target_end = target_start + target_text.chars().count();
+        let target_doc_start = base + target_start;
+        let target_doc_end = base + target_end;
         let mut existing = Annotations::default();
         for n in self.doc.notes().notes() {
             // Only MANUSCRIPT-anchored notes join the suppression set: the
             // old `>= base` gate inverts under the tail era (scopes-search
             // 4), where the manuscript is the document's head.
-            if n.range.start >= mrange.start && n.range.start <= mrange.end {
+            if n.range.start >= target_doc_start && n.range.start <= target_doc_end {
                 let mut n = n.clone();
-                n.range = (n.range.start - base)..(n.range.end.min(mrange.end) - base);
+                n.range = (n.range.start - target_doc_start)
+                    ..(n.range.end.min(target_doc_end) - target_doc_start);
                 existing.push(n);
             }
         }
         let mut annotations =
-            strop_core::diagnose::to_annotations(&mtext, diagnoses, &existing, now, pass_id);
+            strop_core::diagnose::to_annotations(&target_text, diagnoses, &existing, now, pass_id);
         for a in &mut annotations {
-            a.range.start += base;
-            a.range.end += base;
+            a.range.start += base + target_start;
+            a.range.end += base + target_start;
         }
         let kept = annotations.len();
         self.doc.add_diagnoses(annotations);
@@ -4529,10 +4689,17 @@ impl Editor {
                 0 => "Pass complete — no quote matched the current text".to_owned(),
                 n => format!("{n} margin quer{} anchored", if n == 1 { "y" } else { "ies" }),
             },
-            detail: if count > kept && kept > 0 {
-                format!("{} dropped (stale quotes)", count - kept)
-            } else {
-                String::new()
+            detail: match (rejected, count.saturating_sub(kept)) {
+                (0, 0) => String::new(),
+                (bad, 0) => format!(
+                    "{bad} malformed item{} dropped",
+                    if bad == 1 { "" } else { "s" }
+                ),
+                (0, stale) => format!(
+                    "{stale} stale quote{} dropped",
+                    if stale == 1 { "" } else { "s" }
+                ),
+                (bad, stale) => format!("{bad} malformed, {stale} stale quotes dropped"),
             },
         });
         self.schedule_status_fade(generation, cx);
@@ -4552,14 +4719,30 @@ impl Editor {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
+        self.deliver_pass_report(diagnoses, 0, None, generation, cx);
+    }
+
+    fn deliver_pass_report(
+        &mut self,
+        diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+        rejected: usize,
+        scope: Option<strop_core::diagnose::PromptScope>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
         if self.typing_burst_live() || self.cold_read.is_some() {
             // F7: the reveal clock holds in the reading room — a pass
             // completing mid-read parks; exit flushes it after the
             // suppressed surfaces restore.
-            self.deferred_pass = Some(DeferredPass { diagnoses, generation });
+            self.deferred_pass = Some(DeferredPass {
+                diagnoses,
+                rejected,
+                scope,
+                generation,
+            });
             self.watch_for_lull(cx);
         } else {
-            self.integrate_pass(diagnoses, generation, cx);
+            self.integrate_pass(diagnoses, rejected, scope, generation, cx);
         }
     }
 
@@ -4573,7 +4756,7 @@ impl Editor {
         if d.generation != self.ai_generation {
             return; // cancelled or superseded while parked
         }
-        self.integrate_pass(d.diagnoses, d.generation, cx);
+        self.integrate_pass(d.diagnoses, d.rejected, d.scope, d.generation, cx);
     }
 
     /// Poll (4×/s) until the typing burst ends, then flush the parked pass.
@@ -17271,6 +17454,18 @@ fn resolved_key(field: &str) -> String {
 }
 
 impl AiFailure {
+    fn kind(&self) -> &'static str {
+        use strop_core::llm::LlmError as E;
+        match self {
+            Self::Llm(E::Auth(_)) => "authentication",
+            Self::Llm(E::RateLimited(_)) => "rate_limit",
+            Self::Llm(E::Provider(_)) => "provider",
+            Self::Llm(E::Network(_)) => "network",
+            Self::Llm(E::Shape(_)) => "response_shape",
+            Self::Parse(_) => "diagnosis_contract",
+        }
+    }
+
     fn into_status(self, base_url: &str, model: &str) -> AiStatus {
         use strop_core::llm::LlmError as E;
         let host = host_of(base_url);
@@ -17283,7 +17478,7 @@ impl AiFailure {
             Self::Llm(E::Network(m)) => (format!("Couldn't reach {host}"), m),
             Self::Llm(E::Shape(m)) => (format!("Unusable reply from {model}"), m),
             Self::Parse(m) => (
-                format!("{model} replied, but not in diagnosis format — usually a too-small model"),
+                format!("{model} replied, but the diagnosis could not be read"),
                 m,
             ),
         };
