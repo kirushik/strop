@@ -28,7 +28,7 @@ use gpui::{
 };
 use strop_core::document::{
     Annotation, Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus,
-    SpanSet,
+    SpanSet, line_text_end_bytes,
 };
 use strop_core::{SaveCompletion, SaveGeneration, SaveWorker, Store, typograph};
 
@@ -1180,6 +1180,12 @@ struct FlankLayout {
 struct ImageSel {
     block: usize,
     door_caret: Option<usize>,
+    revision: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DropAnchor {
+    byte: usize,
     revision: u64,
 }
 
@@ -3737,12 +3743,7 @@ impl Editor {
             else {
                 continue;
             };
-            let start = rope.line_to_byte(block);
-            let end = if block + 1 < rope.len_lines() {
-                rope.line_to_byte(block + 1).saturating_sub(1)
-            } else {
-                rope.len_bytes()
-            };
+            let (start, end) = block_bounds_in(&self.doc, block);
             // One visual home (H4): if the definition block is itself on
             // screen — the reader has scrolled down to the Footnotes
             // section — don't also mirror it in the page-bottom zone. The
@@ -6977,15 +6978,7 @@ impl Editor {
 
     /// Start/end of the *paragraph* (rope line) containing `offset`.
     fn paragraph_bounds(&self, offset: usize) -> (usize, usize) {
-        let rope = self.doc.rope();
-        let line_ix = rope.byte_to_line(offset);
-        let start = rope.line_to_byte(line_ix);
-        let end = if line_ix + 1 < rope.len_lines() {
-            rope.line_to_byte(line_ix + 1).saturating_sub(1)
-        } else {
-            rope.len_bytes()
-        };
-        (start, end)
+        paragraph_bounds_in(&self.doc, offset)
     }
 
     /// Start/end of the *visual* line under the cursor, with the affinity
@@ -7045,27 +7038,12 @@ impl Editor {
     /// GTK/Windows paragraph motion: to start of current paragraph, or of
     /// the previous one when already at a start.
     fn previous_paragraph_boundary(&self, offset: usize) -> usize {
-        let (start, _) = self.paragraph_bounds(offset);
-        if offset > start {
-            start
-        } else if start > 0 {
-            self.paragraph_bounds(start - 1).0
-        } else {
-            0
-        }
+        previous_paragraph_boundary_in(&self.doc, offset)
     }
 
     /// To end of current paragraph, or of the next one when already at an end.
     fn next_paragraph_boundary(&self, offset: usize) -> usize {
-        let (_, end) = self.paragraph_bounds(offset);
-        let len = self.doc.len_bytes();
-        if offset < end {
-            end
-        } else if end < len {
-            self.paragraph_bounds(end + 1).1
-        } else {
-            len
-        }
+        next_paragraph_boundary_in(&self.doc, offset)
     }
 
     /// Word-bound segment containing `offset` (for double-click selection).
@@ -7214,14 +7192,7 @@ impl Editor {
     /// Byte range of a block's own line (text start..text end, separator
     /// excluded) — the unit every whole-block verb below acts on.
     fn image_block_bounds(&self, block: usize) -> (usize, usize) {
-        let rope = self.doc.rope();
-        let start = rope.line_to_byte(block);
-        let end = if block + 1 < rope.len_lines() {
-            rope.line_to_byte(block + 1).saturating_sub(1)
-        } else {
-            rope.len_bytes()
-        };
-        (start, end)
+        image_block_bounds_in(&self.doc, block)
     }
 
     /// Enter the picture-selected state (§4 click law / §5 stage).
@@ -7369,21 +7340,7 @@ impl Editor {
     /// `![alt](src "caption")`, produced by the ONE exporter so quoting
     /// and span flattening can never fork.
     fn image_block_markdown(&self, block: usize) -> Option<String> {
-        if !matches!(self.doc.blocks().kind(block), BlockKind::Image { .. }) {
-            return None;
-        }
-        let (start, end) = self.image_block_bounds(block);
-        let rope = self.doc.rope();
-        let (cs, ce) = (rope.byte_to_char(start), rope.byte_to_char(end));
-        let line = self.doc.slice_bytes(start..end);
-        let spans = self.doc.spans().slice(cs..ce);
-        let blocks =
-            strop_core::document::BlockMap::from_kinds(vec![self.doc.blocks().kind(block).clone()]);
-        Some(
-            strop_core::markdown::to_markdown(&line, &spans, &blocks)
-                .trim_end()
-                .to_owned(),
-        )
+        image_block_markdown_in(&self.doc, block)
     }
 
     /// §9's two-entry travelling form for a selected picture: the Markdown
@@ -7523,9 +7480,12 @@ impl Editor {
         // left/up land at the end of the block before, right/down at the
         // caption's start. Never ON the pixels: there is no fourth state.
         if let Some(sel) = self.resolve_image_sel() {
-            let (start, _) = self.image_block_bounds(sel.block);
             self.decay_image_sel();
-            self.move_to(start.saturating_sub(1), cx);
+            let end = sel
+                .block
+                .checked_sub(1)
+                .map_or(0, |block| line_text_end_bytes(self.doc.rope(), block));
+            self.move_to(end, cx);
             return;
         }
         if self.selected_range.is_empty() {
@@ -7560,9 +7520,12 @@ impl Editor {
             return;
         }
         if let Some(sel) = self.resolve_image_sel() {
-            let (start, _) = self.image_block_bounds(sel.block);
             self.decay_image_sel();
-            self.move_to(start.saturating_sub(1), cx); // §4: left/up → end of block before
+            let end = sel
+                .block
+                .checked_sub(1)
+                .map_or(0, |block| line_text_end_bytes(self.doc.rope(), block));
+            self.move_to(end, cx); // §4: left/up → end of block before
             return;
         }
         self.vertical_by(-1, false, cx);
@@ -10083,11 +10046,14 @@ impl Editor {
         if files.is_empty() {
             return;
         }
-        // Anchor the gap as a byte so the async import survives a stray
-        // edit: gap g > 0 means "after block g-1" (any byte of its line;
-        // its end names the gap). Gap 0 — before the first block — is the
-        // one splice `insert_image_block` can't express (None).
-        let anchor = (gap > 0).then(|| self.image_block_bounds(gap - 1).1);
+        // Anchor the gap as a byte and revision: gap g > 0 means "after
+        // block g-1" (its end names the gap). Gap 0 — before the first
+        // block — is the one splice `insert_image_block` can't express
+        // (None).
+        let anchor = (gap > 0).then(|| DropAnchor {
+            byte: self.image_block_bounds(gap - 1).1,
+            revision: self.doc.revision(),
+        });
         cx.spawn(async move |this, cx| {
             let imported = cx
                 .background_executor()
@@ -10118,7 +10084,7 @@ impl Editor {
     fn land_dropped_images(
         &mut self,
         imported: Vec<strop_core::images::Imported>,
-        anchor: Option<usize>,
+        anchor: Option<DropAnchor>,
         cx: &mut Context<Self>,
     ) {
         if imported.is_empty() {
@@ -10135,16 +10101,20 @@ impl Editor {
         self.mark_dirty();
         let caret = self.selected_range.clone();
         let before_len = self.doc.len_bytes();
-        // Clamped in case an edit slipped in during the import (the gap
-        // was aimed at pixels; a moved wall still lands at a block end).
-        let mut at = anchor.map(|a| a.min(self.doc.len_bytes()));
+        // The drop aimed at a spatial gap. After an intervening edit, the
+        // nearest surviving block end is the honest landing: clamp the old
+        // byte, then snap to the containing line's text end. With no edit,
+        // retain the exact captured byte as before.
+        let anchor = resolve_drop_anchor(&self.doc, anchor);
+        let mut at = anchor;
         for src in srcs {
             let after = match at {
                 Some(a) => self.doc.insert_image_block(a, src),
                 None => self.doc.insert_image_block_before_first(src),
             };
             // The next file lands below this one: the new block's own
-            // line end names the gap under it.
+            // line end names the gap under it. `insert_image_block` opens
+            // that following line with its recorded synthesized `\n`.
             at = Some(after.saturating_sub(1));
         }
         let delta = self.doc.len_bytes() - before_len;
@@ -10152,13 +10122,7 @@ impl Editor {
         // A caret byte at the anchor itself is the end of the block ABOVE
         // the gap — it stays; gap 0 has no block above, so everything
         // shifts.
-        let shift = |o: usize| {
-            if anchor.is_none_or(|a| o > a) {
-                (o + delta).min(len)
-            } else {
-                o
-            }
-        };
+        let shift = |o: usize| shift_drop_caret(o, anchor, delta, len);
         self.selected_range = shift(caret.start)..shift(caret.end);
         self.sync_mutations();
         self.bump_activity();
@@ -20418,20 +20382,109 @@ impl Focusable for Editor {
 // of tens of thousands of empty lines could overflow the stack (an uncatchable
 // abort). The loop is byte-for-byte equivalent for every input.
 
+fn paragraph_bounds_in(doc: &Document, offset: usize) -> (usize, usize) {
+    let rope = doc.rope();
+    let line = rope.byte_to_line(offset);
+    block_bounds_in(doc, line)
+}
+
+fn block_bounds_in(doc: &Document, block: usize) -> (usize, usize) {
+    let rope = doc.rope();
+    (rope.line_to_byte(block), line_text_end_bytes(rope, block))
+}
+
+fn image_block_bounds_in(doc: &Document, block: usize) -> (usize, usize) {
+    block_bounds_in(doc, block)
+}
+
+fn image_block_markdown_in(doc: &Document, block: usize) -> Option<String> {
+    if !matches!(doc.blocks().kind(block), BlockKind::Image { .. }) {
+        return None;
+    }
+    let (start, end) = image_block_bounds_in(doc, block);
+    let rope = doc.rope();
+    let (cs, ce) = (rope.byte_to_char(start), rope.byte_to_char(end));
+    let line = doc.slice_bytes(start..end);
+    let spans = doc.spans().slice(cs..ce);
+    let blocks = BlockMap::from_kinds(vec![doc.blocks().kind(block).clone()]);
+    Some(
+        strop_core::markdown::to_markdown(&line, &spans, &blocks)
+            .trim_end()
+            .to_owned(),
+    )
+}
+
+fn resolve_drop_anchor(doc: &Document, anchor: Option<DropAnchor>) -> Option<usize> {
+    anchor.map(|anchor| {
+        let clamped = anchor.byte.min(doc.len_bytes());
+        if anchor.revision == doc.revision() {
+            clamped
+        } else {
+            let line = doc.rope().byte_to_line(clamped);
+            line_text_end_bytes(doc.rope(), line)
+        }
+    })
+}
+
+fn shift_drop_caret(offset: usize, anchor: Option<usize>, delta: usize, len: usize) -> usize {
+    if anchor.is_none_or(|anchor| offset > anchor) {
+        (offset + delta).min(len)
+    } else {
+        offset
+    }
+}
+
+fn previous_paragraph_boundary_in(doc: &Document, offset: usize) -> usize {
+    let (start, _) = paragraph_bounds_in(doc, offset);
+    if offset > start {
+        start
+    } else if start > 0 {
+        // `start - 1` sits inside the preceding break for a multibyte
+        // separator, but only byte_to_line consumes it (boundary-agnostic),
+        // so the bounds still name the previous line.
+        paragraph_bounds_in(doc, start - 1).0
+    } else {
+        0
+    }
+}
+
+fn next_paragraph_boundary_in(doc: &Document, offset: usize) -> usize {
+    let (_, end) = paragraph_bounds_in(doc, offset);
+    let len = doc.len_bytes();
+    if offset < end {
+        end
+    } else if end < len {
+        // Step over the WHOLE break: `end + 1` inside a CRLF/NEL/U+2028
+        // separator resolves to the same line and pins the caret here.
+        let rope = doc.rope();
+        paragraph_bounds_in(doc, rope.line_to_byte(rope.byte_to_line(end) + 1)).1
+    } else {
+        len
+    }
+}
+
 fn previous_word_boundary(doc: &Document, mut offset: usize) -> usize {
     let rope = doc.rope();
     loop {
         if offset == 0 {
             return 0;
         }
-        let start = rope.line_to_byte(rope.byte_to_line(offset));
-        if offset == start {
+        let line_ix = rope.byte_to_line(offset);
+        let start = rope.line_to_byte(line_ix);
+        // Cap a mid-break offset to the line's own text: stepping byte-wise
+        // into a CRLF/NEL/U+2028 separator would hand slice_bytes a
+        // non-boundary end.
+        let cap = offset.min(line_text_end_bytes(rope, line_ix));
+        if cap == start {
+            if line_ix == 0 {
+                return 0;
+            }
             // Continue from the end of the previous paragraph (iterate, never
             // recurse: a long blank run must not grow the stack).
-            offset -= 1;
+            offset = line_text_end_bytes(rope, line_ix - 1);
             continue;
         }
-        let line = doc.slice_bytes(start..offset);
+        let line = doc.slice_bytes(start..cap);
         return line
             .split_word_bound_indices()
             .rev()
@@ -20448,13 +20501,15 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
             return len;
         }
         let line_ix = rope.byte_to_line(offset);
-        let end = if line_ix + 1 < rope.len_lines() {
-            rope.line_to_byte(line_ix + 1).saturating_sub(1)
-        } else {
-            len
-        };
-        if offset == end {
-            offset += 1;
+        let end = line_text_end_bytes(rope, line_ix);
+        if offset >= end {
+            // At (or inside) the line's break: continue from the next line's
+            // start — a byte-wise `+= 1` would strand the offset inside a
+            // CRLF/NEL/U+2028 separator and feed slice_bytes a reversed range.
+            if line_ix + 1 >= rope.len_lines() {
+                return len;
+            }
+            offset = rope.line_to_byte(line_ix + 1);
             continue;
         }
         let line = doc.slice_bytes(offset..end);
@@ -24692,6 +24747,122 @@ mod tests {
 
     fn img() -> BlockKind {
         BlockKind::Image { src: "asset:x.png".into(), alt: String::new() }
+    }
+
+    #[test]
+    fn image_bounds_and_markdown_exclude_every_multibyte_separator() {
+        for separator in ["\r\n", "\u{0085}", "\u{2028}"] {
+            let text = format!("above{separator}caption{separator}below");
+            let doc = Document::new(
+                &text,
+                SpanSet::default(),
+                BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), BlockKind::Paragraph]),
+            );
+            let range = image_block_bounds_in(&doc, 1);
+            assert_eq!(doc.slice_bytes(range.0..range.1), "caption", "{separator:?}");
+            assert_eq!(doc.rope().char_to_byte(doc.rope().byte_to_char(range.0)), range.0);
+            assert_eq!(doc.rope().char_to_byte(doc.rope().byte_to_char(range.1)), range.1);
+
+            let markdown = image_block_markdown_in(&doc, 1).expect("image markdown");
+            assert!(markdown.contains("caption"), "{separator:?}");
+            assert!(!markdown.contains(['\r', '\u{0085}', '\u{2028}']), "{separator:?}");
+        }
+    }
+
+    #[test]
+    fn paragraph_and_footnote_bounds_exclude_crlf_whole() {
+        let doc = Document::new(
+            "paragraph\r\ndefinition\r\nafter",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                BlockKind::FootnoteDef { id: "note".into() },
+                BlockKind::Paragraph,
+            ]),
+        );
+        let paragraph = paragraph_bounds_in(&doc, 3);
+        assert_eq!(doc.slice_bytes(paragraph.0..paragraph.1), "paragraph");
+        assert_eq!(paragraph, (0, 9));
+
+        let footnote = block_bounds_in(&doc, 1);
+        assert_eq!(doc.slice_bytes(footnote.0..footnote.1), "definition");
+        assert_eq!(footnote, (11, 21));
+    }
+
+    #[test]
+    fn drop_anchor_keeps_its_byte_when_revision_is_unchanged() {
+        let doc = Document::new(
+            "above\nbelow",
+            SpanSet::default(),
+            BlockMap::new(2),
+        );
+        let anchor = DropAnchor { byte: 5, revision: doc.revision() };
+        assert_eq!(resolve_drop_anchor(&doc, Some(anchor)), Some(5));
+        assert_eq!(shift_drop_caret(5, Some(5), 2, 13), 5);
+        assert_eq!(shift_drop_caret(6, Some(5), 2, 13), 8);
+    }
+
+    #[test]
+    fn edited_drop_anchor_snaps_to_a_block_end_and_shifts_caret_from_it() {
+        let mut doc = Document::new(
+            "one\nsecond\nthird",
+            SpanSet::default(),
+            BlockMap::new(3),
+        );
+        let anchor = DropAnchor { byte: 10, revision: doc.revision() };
+        doc.edit_bytes(0..0, "long ");
+
+        let snapped = resolve_drop_anchor(&doc, Some(anchor)).expect("anchor");
+        assert_eq!(snapped, 15, "the stale byte was mid-block after the edit");
+        assert_eq!(snapped, line_text_end_bytes(doc.rope(), doc.block_of_byte(snapped)));
+
+        let before_len = doc.len_bytes();
+        doc.insert_image_block(snapped, "asset:dropped.png".into());
+        let delta = doc.len_bytes() - before_len;
+        assert_eq!(shift_drop_caret(14, Some(snapped), delta, doc.len_bytes()), 14);
+        let shifted = shift_drop_caret(16, Some(snapped), delta, doc.len_bytes());
+        assert_eq!(doc.slice_bytes(shifted..doc.len_bytes()), "third");
+        assert!(matches!(doc.blocks().kind(2), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn word_and_paragraph_walkers_cross_every_separator_without_slicing_it() {
+        for separator in ["\n", "\r\n", "\u{0085}", "\u{2028}"] {
+            let text = format!("alpha beta{separator}gamma delta");
+            let doc = Document::new(&text, SpanSet::default(), BlockMap::new(2));
+            let end0 = 10; // "alpha beta"
+            let start1 = end0 + separator.len();
+
+            // Forward from the first line's text end: over the break, then
+            // to the end of "gamma" — never a reversed or mid-break slice.
+            assert_eq!(next_word_boundary(&doc, end0), start1 + 5, "{separator:?}");
+            // Backward from the second line's start: the previous line's
+            // last word start.
+            assert_eq!(previous_word_boundary(&doc, start1), 6, "{separator:?}");
+
+            // Paragraph motion never pins at a multibyte break.
+            assert_eq!(next_paragraph_boundary_in(&doc, end0), doc.len_bytes(), "{separator:?}");
+            assert_eq!(previous_paragraph_boundary_in(&doc, start1), 0, "{separator:?}");
+        }
+    }
+
+    #[test]
+    fn shrunk_drop_anchor_at_a_multibyte_edge_is_safe_and_lands_at_a_block_end() {
+        let mut doc = Document::new(
+            "above\nmiddle\ntail",
+            SpanSet::default(),
+            BlockMap::new(3),
+        );
+        let anchor = DropAnchor { byte: 12, revision: doc.revision() };
+        let len = doc.len_bytes();
+        doc.edit_bytes(5..len, "\u{2028}");
+
+        let snapped = resolve_drop_anchor(&doc, Some(anchor)).expect("anchor");
+        assert_eq!(snapped, doc.len_bytes());
+        assert_eq!(doc.rope().char_to_byte(doc.rope().byte_to_char(snapped)), snapped);
+        assert_eq!(snapped, line_text_end_bytes(doc.rope(), doc.block_of_byte(snapped)));
+        doc.insert_image_block(snapped, "asset:dropped.png".into());
+        assert!(doc.blocks().kinds().iter().any(|kind| matches!(kind, BlockKind::Image { .. })));
     }
 
     #[test]

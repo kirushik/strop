@@ -93,6 +93,26 @@ fn break_len_before(rope: &ropey::Rope, pos: usize) -> usize {
     }
 }
 
+/// Length in bytes of the line break ENDING exactly at `byte_pos`: two for
+/// CRLF and NEL, three for U+2028 / U+2029, one for the ASCII single-char
+/// breaks, and zero when none ends here. `byte_pos` is a char boundary.
+pub fn break_len_before_bytes(rope: &ropey::Rope, byte_pos: usize) -> usize {
+    let pos = rope.byte_to_char(byte_pos);
+    let break_chars = break_len_before(rope, pos);
+    byte_pos - rope.char_to_byte(pos - break_chars)
+}
+
+/// Byte position where `line`'s own text ends, excluding the line break
+/// ropey assigns to it. The final line ends at the rope's byte length.
+pub fn line_text_end_bytes(rope: &ropey::Rope, line: usize) -> usize {
+    if line + 1 < rope.len_lines() {
+        let next = rope.line_to_byte(line + 1);
+        next - break_len_before_bytes(rope, next)
+    } else {
+        rope.len_bytes()
+    }
+}
+
 /// Length in chars of the line break STARTING exactly at `pos`: two for CRLF,
 /// one for every other break ropey recognises, and zero when none starts here.
 fn break_len_at(rope: &ropey::Rope, pos: usize) -> usize {
@@ -3885,6 +3905,29 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_break_lengths_and_line_text_ends_cover_ropeys_full_set() {
+        for (separator, bytes) in [
+            ("\n", 1),
+            ("\u{000B}", 1),
+            ("\u{000C}", 1),
+            ("\r", 1),
+            ("\r\n", 2),
+            ("\u{0085}", 2),
+            ("\u{2028}", 3),
+            ("\u{2029}", 3),
+        ] {
+            let rope = ropey::Rope::from_str(&format!("alpha{separator}beta"));
+            let next = rope.line_to_byte(1);
+            assert_eq!(break_len_before_bytes(&rope, next), bytes, "{separator:?}");
+            assert_eq!(line_text_end_bytes(&rope, 0), 5, "{separator:?}");
+            assert_eq!(line_text_end_bytes(&rope, 1), rope.len_bytes(), "{separator:?}");
+        }
+
+        let rope = ropey::Rope::from_str("alpha beta");
+        assert_eq!(break_len_before_bytes(&rope, 5), 0);
+    }
 
     #[test]
     fn side_snapshots_share_unchanged_components_and_cow_only_the_mutated_one() {
