@@ -47,21 +47,40 @@ fn char_slice(text: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
-/// The char position where the line break PRECEDING `line_start` begins —
-/// i.e. `line_start` minus its own leading break (one char, or two for CRLF,
-/// which ropey counts as one break but two chars). 0 stays 0.
-fn line_break_before(rope: &ropey::Rope, line_start: usize) -> usize {
-    if line_start == 0 {
+/// Length in chars of the line break ENDING exactly at `pos`: two for CRLF,
+/// one for every other break ropey recognises, and zero when none ends here.
+fn break_len_before(rope: &ropey::Rope, pos: usize) -> usize {
+    if pos == 0 {
         return 0;
     }
-    if rope.char(line_start - 1) == '\n'
-        && line_start >= 2
-        && rope.char(line_start - 2) == '\r'
-    {
-        line_start - 2
-    } else {
-        line_start - 1
+    match rope.char(pos - 1) {
+        '\n' if pos >= 2 && rope.char(pos - 2) == '\r' => 2,
+        '\n' | '\u{000B}' | '\u{000C}' | '\r' | '\u{0085}' | '\u{2028}'
+        | '\u{2029}' => 1,
+        _ => 0,
     }
+}
+
+/// Length in chars of the line break STARTING exactly at `pos`: two for CRLF,
+/// one for every other break ropey recognises, and zero when none starts here.
+fn break_len_at(rope: &ropey::Rope, pos: usize) -> usize {
+    if pos >= rope.len_chars() {
+        return 0;
+    }
+    match rope.char(pos) {
+        '\r' if pos + 1 < rope.len_chars() && rope.char(pos + 1) == '\n' => 2,
+        '\n' | '\u{000B}' | '\u{000C}' | '\r' | '\u{0085}' | '\u{2028}'
+        | '\u{2029}' => 1,
+        _ => 0,
+    }
+}
+
+/// The char position where the line break PRECEDING `line_start` begins —
+/// i.e. `line_start` minus its own leading break (one char, or two for CRLF,
+/// which ropey counts as one break but two chars). A position without a
+/// preceding break stays where it is.
+fn line_break_before(rope: &ropey::Rope, line_start: usize) -> usize {
+    line_start - break_len_before(rope, line_start)
 }
 
 /// Char range of the manuscript region of `rope` under `blocks`' boundary,
@@ -2049,13 +2068,14 @@ impl Document {
     ) -> (String, SpanSet, Vec<BlockKind>, GraveRegion, bool) {
         let rope = self.buffer.rope();
         let mut norm_end = end_char;
-        if norm_end > start_char && rope.char(norm_end - 1) == '\n' {
-            norm_end -= 1;
+        let trailing_break = break_len_before(rope, norm_end);
+        if trailing_break > 0 && norm_end - start_char >= trailing_break {
+            norm_end -= trailing_break;
         }
         let first_line = rope.char_to_line(start_char);
         let last_line = rope.char_to_line(norm_end);
         let text_end_of_last = if last_line + 1 < rope.len_lines() {
-            rope.line_to_char(last_line + 1) - 1
+            line_break_before(rope, rope.line_to_char(last_line + 1))
         } else {
             rope.len_chars()
         };
@@ -2114,8 +2134,9 @@ impl Document {
         // shift+down already include the trailing newline) is reclassified as
         // ending at the previous block's text end — otherwise "consume one
         // more" would eat two separators and fuse the neighbours.
-        if e > s && e > 0 && rope.char(e - 1) == '\n' {
-            e -= 1;
+        let trailing_break = break_len_before(rope, e);
+        if trailing_break > 0 && e - s >= trailing_break {
+            e -= trailing_break;
         }
         // Whole-block detection on the normalized range: both ends sit on a
         // block edge, and the two ends live in the same region (the exile verb
@@ -2127,7 +2148,7 @@ impl Document {
         let text_start_of = |line: usize| rope.line_to_char(line);
         let text_end_of = |line: usize| {
             if line + 1 < rope.len_lines() {
-                rope.line_to_char(line + 1) - 1
+                line_break_before(rope, rope.line_to_char(line + 1))
             } else {
                 len_chars
             }
@@ -2169,14 +2190,16 @@ impl Document {
         let spans = self.spans.slice(s..e);
         // A same-region block follows iff the char at `e` is a separator whose
         // next line stays in this region.
-        let trailing_sep = e < len_chars
-            && rope.char(e) == '\n'
-            && region_of_char(rope, &self.blocks, e + 1) == region_of_char(rope, &self.blocks, s);
+        let trailing_break = break_len_at(rope, e);
+        let trailing_sep = trailing_break > 0
+            && region_of_char(rope, &self.blocks, e + trailing_break)
+                == region_of_char(rope, &self.blocks, s);
         let (del_start, del_end, origin) = if trailing_sep {
-            (s, e + 1, s)
-        } else if s > 0 && rope.char(s - 1) == '\n' {
+            (s, e + trailing_break, s)
+        } else if break_len_before(rope, s) > 0 {
             // Leading separator: eat the newline joining us to the block above.
-            (s - 1, e, s - 1)
+            let leading_break = break_len_before(rope, s);
+            (s - leading_break, e, s - leading_break)
         } else {
             // A lone block that is the entire region: no separator to take.
             (s, e, s)
@@ -2359,15 +2382,25 @@ impl Document {
             }
             .clamp(region.start, region.end);
             let at_end = boundary >= rope.len_chars();
+            let boundary_line = rope.char_to_line(boundary);
+            let boundary_start = rope.line_to_char(boundary_line);
+            let boundary_end = if boundary_line + 1 < rope.len_lines() {
+                line_break_before(rope, rope.line_to_char(boundary_line + 1))
+            } else {
+                rope.len_chars()
+            };
+            let empty_line = boundary == boundary_start
+                && boundary_start == boundary_end;
             // A trailing separator when a block follows the landing; a leading
             // one when the returned block is the last of the document; none at
             // all into an empty document (no phantom blank block) — or into a
             // trailing EMPTY block (the grave a plain delete leaves standing):
             // the return fills that block rather than opening a second blank.
-            let (payload, text_offset) = if rope.len_chars() == 0 {
+            // Synthesized LF can mix with CRLF; Ropey and BlockMap stay aligned.
+            let (payload, text_offset) = if rope.len_chars() == 0 || empty_line {
                 (entry.text.clone(), 0)
             } else if at_end {
-                if rope.char(rope.len_chars() - 1) == '\n' {
+                if break_len_before(rope, rope.len_chars()) > 0 {
                     (entry.text.clone(), 0)
                 } else {
                     (format!("\n{}", entry.text), 1)
@@ -2967,6 +3000,29 @@ impl Document {
     pub fn remove_note(&mut self, id: u64) -> Option<Annotation> {
         self.revision += 1;
         self.notes.remove(id)
+    }
+
+    /// Cancel a never-written note (LAW 2 / C4 empty-discard), removing its
+    /// paired empty undo step when still topmost and otherwise scrubbing every
+    /// history snapshot so no later undo or redo can resurrect the blank card.
+    pub fn cancel_provisional_note(&mut self, id: u64) -> Option<Annotation> {
+        self.revision += 1;
+        let removed = self.notes.remove(id)?;
+        let paired_add_is_top = self
+            .undo_states
+            .last()
+            .is_some_and(|(_, _, notes, _, _)| notes.get(id).is_none());
+        if paired_add_is_top && self.buffer.pop_empty_transaction() {
+            self.undo_states.pop();
+        } else {
+            for (_, _, notes, _, _) in &mut self.undo_states {
+                notes.remove(id);
+            }
+            for (_, _, notes, _, _) in &mut self.redo_states {
+                notes.remove(id);
+            }
+        }
+        Some(removed)
     }
 
     /// Add a batch of diagnoses as ONE undoable transaction (one ctrl-z
@@ -3926,6 +3982,56 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_topmost_provisional_note_removes_its_empty_undo_step() {
+        let mut doc = Document::new("base", SpanSet::default(), BlockMap::default());
+        doc.edit_bytes(4..4, " edit");
+        let depth = doc.undo_states.len();
+        let id = doc.add_note(0..4, String::new(), 0);
+        assert_eq!(doc.undo_states.len(), depth + 1);
+        assert!(doc.cancel_provisional_note(id).is_some());
+        assert_eq!(doc.undo_states.len(), depth);
+        doc.undo();
+        assert_eq!(doc.text(), "base", "next undo reaches the real edit");
+    }
+
+    #[test]
+    fn cancelling_intervened_provisional_note_scrubs_undo_and_redo() {
+        let mut doc = Document::new("base", SpanSet::default(), BlockMap::default());
+        let id = doc.add_note(0..4, String::new(), 0);
+        doc.add_diagnoses(vec![Annotation {
+            id: 0,
+            range: 0..4,
+            body: "query".into(),
+            status: NoteStatus::Open,
+            created_unix: 0,
+            kind: NoteKind::Diagnosis,
+            title: "diagnosis".into(),
+            level: "line".into(),
+            orphaned: false,
+            pass_id: 1,
+            unverified: false,
+        }]);
+        assert!(doc.cancel_provisional_note(id).is_some());
+        doc.undo();
+        assert!(doc.notes().get(id).is_none(), "undo must not resurrect it");
+        doc.redo();
+        assert!(doc.notes().get(id).is_none(), "redo must not resurrect it");
+    }
+
+    #[test]
+    fn committed_note_keeps_its_existing_undo_and_redo_history() {
+        let mut doc = Document::new("base", SpanSet::default(), BlockMap::default());
+        let id = doc.add_note(0..4, String::new(), 0);
+        doc.set_note_body(id, "kept".into());
+        doc.undo();
+        assert_eq!(doc.notes().get(id).unwrap().body, "");
+        doc.undo();
+        assert!(doc.notes().get(id).is_none());
+        doc.redo();
+        assert!(doc.notes().get(id).is_some());
+    }
+
+    #[test]
     fn restore_reanchors_notes_to_their_content() {
         // A note follows the passage it covers to wherever that text lives in
         // the restored version — not collapsed to the document end.
@@ -4653,6 +4759,48 @@ mod tests {
     }
 
     #[test]
+    fn immediate_middle_paragraph_put_back_fills_the_leftover_grave() {
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.cut_to_graveyard(4..7, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\n\nCCC");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert_eq!(caret, 4);
+        assert_eq!(doc.blocks().len(), 3);
+    }
+
+    #[test]
+    fn unicode_break_whole_block_doors_put_back_without_stray_break_chars() {
+        for sep in ["\n", "\r\n", "\r", "\u{0085}", "\u{2028}"] {
+            let original = format!("AAA{sep}BBB{sep}CCC");
+            let start = 3 + sep.len();
+            let end = start + 3;
+
+            let mut exiled =
+                Document::new(&original, SpanSet::default(), BlockMap::default());
+            let id = exiled.exile_to_graveyard(
+                start..end,
+                String::new(),
+                0,
+                false,
+            );
+            assert!(exiled.graveyard().get(id).unwrap().whole_blocks, "{sep:?}");
+            exiled.put_back(id).unwrap();
+            let authored = format!("AAA{sep}BBB\nCCC");
+            assert_eq!(exiled.text(), authored, "{sep:?}");
+            assert_eq!(exiled.blocks().len(), 3, "{sep:?}");
+
+            let mut deleted =
+                Document::new(&original, SpanSet::default(), BlockMap::default());
+            let id = deleted.cut_to_graveyard(start..end, String::new(), 0, false);
+            assert!(deleted.graveyard().get(id).unwrap().whole_blocks, "{sep:?}");
+            deleted.put_back(id).unwrap();
+            assert_eq!(deleted.text(), original, "{sep:?}");
+            assert_eq!(deleted.blocks().len(), 3, "{sep:?}");
+        }
+    }
+
+    #[test]
     fn partial_selection_plain_delete_still_splices() {
         // Anything short of complete blocks keeps today's fragment contract.
         let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
@@ -4761,7 +4909,6 @@ mod tests {
         BlockKind::Image {
             src: src.into(),
             alt: String::new(),
-            caption: String::new(),
         }
     }
 
