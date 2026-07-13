@@ -5,11 +5,43 @@
 //! consistent across every edit (including undo/redo, which arrive as
 //! ordinary ops). The same adjustment math will anchor annotations.
 
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::{Buffer, TextOp, Transaction};
+
+/// An immutable side-state version shared by the live document and its undo
+/// frames. Mutation is copy-on-write, while serde deliberately delegates to
+/// `T` so persisted History keeps its existing tuple/object wire shape.
+#[derive(Debug, Clone, Default)]
+struct Shared<T>(Arc<T>);
+
+impl<T> From<T> for Shared<T> {
+    fn from(value: T) -> Self { Self(Arc::new(value)) }
+}
+
+impl<T> Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.0 }
+}
+
+impl<T: Clone> DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T { Arc::make_mut(&mut self.0) }
+}
+
+impl<T: Serialize> Serialize for Shared<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (**self).serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Shared<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::from)
+    }
+}
 
 /// Count line breaks in `text` using ropey's Unicode line-break set, so a
 /// block-map split count always agrees with `Rope::len_lines()`: CRLF counts
@@ -260,7 +292,7 @@ pub fn flip_char_map(rope: &ropey::Rope, b: usize) -> FlipCharMap {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum InlineAttr {
     Emphasis,
     Strong,
@@ -566,6 +598,62 @@ impl SpanSet {
         &self.spans
     }
 
+    fn needs_normalization(&self, len_chars: usize) -> bool {
+        !self.spans.iter().all(|s| {
+            s.range.start < s.range.end && s.range.end <= len_chars
+        }) || !self.spans.windows(2).all(|p| p[0].range.start <= p[1].range.start)
+    }
+
+    fn affected_by(&self, op: &TextOp) -> bool {
+        let ins = !op.insert.is_empty();
+        self.spans.iter().any(|s| {
+            (op.delete > 0 && s.range.end > op.pos)
+                || (ins && (s.range.start >= op.pos || s.range.end > op.pos
+                    || (s.range.end == op.pos && s.attr.expands())))
+        })
+    }
+
+    /// Repair spans loaded from an untrusted/older file against the text
+    /// they describe. Serde itself accepts inverted, unsorted, overlapping,
+    /// and out-of-range intervals; the editor's char→byte conversion does
+    /// not. The repair sorts once and merges same-attribute intervals in a
+    /// linear sweep after grouping, avoiding quadratic open time.
+    pub fn normalize(&mut self, len_chars: usize) {
+        if !self.needs_normalization(len_chars) {
+            // Preserve equal-start attribute ordering: it is observable in
+            // undo snapshots and controls deterministic Markdown nesting.
+            return;
+        }
+        for span in &mut self.spans {
+            span.range.start = span.range.start.min(len_chars);
+            span.range.end = span.range.end.min(len_chars);
+        }
+        self.spans.retain(|s| s.range.start < s.range.end);
+        // Group equal attributes, merge their intervals in one sweep, then
+        // restore the public start-sorted invariant. This avoids feeding a
+        // loaded set through `add` one span at a time (quadratic on a richly
+        // formatted long document).
+        self.spans
+            .sort_by(|a, b| a.attr.cmp(&b.attr).then(a.range.start.cmp(&b.range.start)));
+        let mut merged: Vec<Span> = Vec::with_capacity(self.spans.len());
+        for span in self.spans.drain(..) {
+            if let Some(last) = merged.last_mut()
+                && last.attr == span.attr
+                && span.range.start <= last.range.end
+            {
+                last.range.end = last.range.end.max(span.range.end);
+            } else {
+                merged.push(span);
+            }
+        }
+        // `sort_by_key` is stable: equal-start spans retain the deterministic
+        // attribute order established by the grouping sort above. Do not use
+        // `sort_unstable_by_key` here; equal-start order controls Markdown
+        // marker nesting and is observable in undo snapshots.
+        merged.sort_by_key(|s| s.range.start);
+        self.spans = merged;
+    }
+
     pub fn attrs_at(&self, pos: usize) -> impl Iterator<Item = &InlineAttr> {
         self.spans
             .iter()
@@ -780,6 +868,31 @@ pub struct Annotations {
 }
 
 impl Annotations {
+    fn needs_normalization(&self, len_chars: usize) -> bool {
+        self.notes.iter().any(|n| n.range.start > n.range.end || n.range.end > len_chars)
+            || self.notes.windows(2).any(|p| p[0].range.start > p[1].range.start)
+            || self.next_id < self.notes.iter().map(|n| n.id).max().unwrap_or(0)
+    }
+
+    fn affected_by(&self, op: &TextOp) -> bool {
+        let ins = !op.insert.is_empty();
+        self.notes.iter().any(|n| {
+            (op.delete > 0 && n.range.end > op.pos)
+                || (ins && (n.range.start >= op.pos || n.range.end > op.pos))
+        })
+    }
+
+    pub fn normalize(&mut self, len_chars: usize) {
+        for note in &mut self.notes {
+            note.range.start = note.range.start.min(len_chars);
+            note.range.end = note.range.end.min(len_chars).max(note.range.start);
+        }
+        self.notes.sort_by_key(|n| n.range.start);
+        self.next_id = self
+            .next_id
+            .max(self.notes.iter().map(|n| n.id).max().unwrap_or(0));
+    }
+
     pub fn add(&mut self, range: Range<usize>, body: String, created_unix: i64) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
@@ -988,6 +1101,32 @@ pub struct Provenance {
 }
 
 impl Provenance {
+    fn needs_normalization(&self, len_chars: usize) -> bool {
+        self.records.iter().any(|r| r.range.start >= r.range.end || r.range.end > len_chars)
+            || self.records.windows(2).any(|p| p[0].range.start > p[1].range.start)
+            || self.next_id < self.records.iter().map(|r| r.id).max().unwrap_or(0)
+    }
+
+    fn affected_by(&self, op: &TextOp) -> bool {
+        let ins = !op.insert.is_empty();
+        self.records.iter().any(|r| {
+            (op.delete > 0 && r.range.end > op.pos)
+                || (ins && (r.range.start >= op.pos || r.range.end > op.pos))
+        })
+    }
+
+    pub fn normalize(&mut self, len_chars: usize) {
+        for record in &mut self.records {
+            record.range.start = record.range.start.min(len_chars);
+            record.range.end = record.range.end.min(len_chars).max(record.range.start);
+        }
+        self.records.retain(|r| r.range.start < r.range.end);
+        self.records.sort_by_key(|r| r.range.start);
+        self.next_id = self
+            .next_id
+            .max(self.records.iter().map(|r| r.id).max().unwrap_or(0));
+    }
+
     pub fn records(&self) -> &[ProvenanceRecord] {
         &self.records
     }
@@ -1139,6 +1278,31 @@ pub struct Graveyard {
 }
 
 impl Graveyard {
+    fn needs_normalization(&self, document_len: usize) -> bool {
+        self.entries.iter().any(|e| {
+            e.origin_pos > document_len
+                || e.spans.needs_normalization(e.text.chars().count())
+        }) || self.next_id < self.entries.iter().map(|e| e.id).max().unwrap_or(0)
+    }
+
+    fn affected_by(&self, op: &TextOp) -> bool {
+        let ins = !op.insert.is_empty();
+        self.entries.iter().any(|e| {
+            (op.delete > 0 && e.origin_pos > op.pos)
+                || (ins && e.origin_pos >= op.pos)
+        })
+    }
+
+    pub fn normalize(&mut self, document_len: usize) {
+        for entry in &mut self.entries {
+            entry.origin_pos = entry.origin_pos.min(document_len);
+            entry.spans.normalize(entry.text.chars().count());
+        }
+        self.next_id = self
+            .next_id
+            .max(self.entries.iter().map(|e| e.id).max().unwrap_or(0));
+    }
+
     /// Entries in filing order (oldest first). The footer renders newest-first;
     /// that is a view concern, so storage keeps the honest insertion order.
     pub fn entries(&self) -> &[GraveEntry] {
@@ -1246,7 +1410,10 @@ impl Graveyard {
 /// it is the persisted `History` element, and its serde shape is the
 /// documented compatibility contract (a pre-Scraps 4-tuple history fails the
 /// arity check and is dropped once, non-destructively; see `History`).
-type SideState = (SpanSet, BlockMap, Annotations, Graveyard, Provenance);
+type SideState = (
+    Shared<SpanSet>, Shared<BlockMap>, Shared<Annotations>,
+    Shared<Graveyard>, Shared<Provenance>,
+);
 
 /// What a park did — enough for the editor to journal card closures and
 /// aim the receipt, without re-deriving any of it.
@@ -1268,17 +1435,17 @@ pub struct ParkOutcome {
 #[derive(Debug, Default)]
 pub struct Document {
     buffer: Buffer,
-    spans: SpanSet,
-    blocks: BlockMap,
-    notes: Annotations,
+    spans: Shared<SpanSet>,
+    blocks: Shared<BlockMap>,
+    notes: Shared<Annotations>,
     /// The graveyard record (docs/impl/02-asides.md §4). Lives here beside the
     /// notes so it rides the SAME undo snapshot (undo of a cut removes its
     /// entry) and the SAME op-absorption path (`origin_pos` shifts like a note
     /// anchor). See `GraveEntry`.
-    graveyard: Graveyard,
+    graveyard: Shared<Graveyard>,
     /// Parked blocks' origin records (see `Provenance`): same lifecycle as
     /// the graveyard — snapshot-riding, op-absorbed, own store channel.
-    provenance: Provenance,
+    provenance: Shared<Provenance>,
     undo_states: Vec<SideState>,
     redo_states: Vec<SideState>,
     pending_ops: Vec<TextOp>,
@@ -1297,18 +1464,25 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn new(text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
+    pub fn new(text: &str, mut spans: SpanSet, blocks: BlockMap) -> Self {
         let buffer = Buffer::new(text);
         let mut blocks = blocks;
+        spans.normalize(buffer.rope().len_chars());
         // Repair a stale/foreign block map against the actual text.
         let lines = buffer.rope().len_lines();
         if blocks.len() != lines {
-            blocks = BlockMap::new(lines);
+            let mut repaired = BlockMap::new(lines);
+            // Keep a still-valid serialized region boundary. Dropping it
+            // silently reclassifies private Scraps as manuscript; the
+            // restore/replay repair paths already preserve it the same way.
+            repaired.set_aside_boundary(blocks.aside_boundary());
+            repaired.set_scrap_line(blocks.scrap_line());
+            blocks = repaired;
         }
         Self {
             buffer,
-            spans,
-            blocks,
+            spans: spans.into(),
+            blocks: blocks.into(),
             ..Default::default()
         }
     }
@@ -1374,10 +1548,10 @@ impl Document {
         let ops = self.buffer.take_ops();
         let now = crate::journal::now_ms();
         for op in &ops {
-            self.spans.apply_op(op);
-            self.notes.apply_op(op);
-            self.graveyard.apply_op(op);
-            self.provenance.apply_op(op);
+            if self.spans.affected_by(op) { self.spans.apply_op(op); }
+            if self.notes.affected_by(op) { self.notes.apply_op(op); }
+            if self.graveyard.affected_by(op) { self.graveyard.apply_op(op); }
+            if self.provenance.affected_by(op) { self.provenance.apply_op(op); }
             self.journal.record(op, now);
         }
         self.pending_ops.extend(ops);
@@ -1439,13 +1613,29 @@ impl Document {
         )
     }
 
+    fn normalize_side_structures(&mut self) {
+        let len = self.buffer.rope().len_chars();
+        if self.spans.needs_normalization(len) { self.spans.normalize(len); }
+        if self.notes.needs_normalization(len) { self.notes.normalize(len); }
+        if self.graveyard.needs_normalization(len) { self.graveyard.normalize(len); }
+        if self.provenance.needs_normalization(len) { self.provenance.normalize(len); }
+        let lines = self.buffer.rope().len_lines();
+        if self.blocks.len() != lines {
+            let mut repaired = BlockMap::new(lines);
+            repaired.set_aside_boundary(self.blocks.aside_boundary());
+            repaired.set_scrap_line(self.blocks.scrap_line());
+            self.blocks = repaired.into();
+        }
+    }
+
     pub fn notes(&self) -> &Annotations {
         &self.notes
     }
 
-    pub fn set_notes(&mut self, notes: Annotations) {
+    pub fn set_notes(&mut self, mut notes: Annotations) {
         self.revision += 1;
-        self.notes = notes;
+        notes.normalize(self.buffer.rope().len_chars());
+        self.notes = notes.into();
     }
 
     pub fn graveyard(&self) -> &Graveyard {
@@ -1453,9 +1643,10 @@ impl Document {
     }
 
     /// Install the persisted graveyard at load (like `set_notes`).
-    pub fn set_graveyard(&mut self, graveyard: Graveyard) {
+    pub fn set_graveyard(&mut self, mut graveyard: Graveyard) {
         self.revision += 1;
-        self.graveyard = graveyard;
+        graveyard.normalize(self.buffer.rope().len_chars());
+        self.graveyard = graveyard.into();
     }
 
     pub fn provenance(&self) -> &Provenance {
@@ -1463,9 +1654,10 @@ impl Document {
     }
 
     /// Install the persisted provenance at load (like `set_notes`).
-    pub fn set_provenance(&mut self, provenance: Provenance) {
+    pub fn set_provenance(&mut self, mut provenance: Provenance) {
         self.revision += 1;
-        self.provenance = provenance;
+        provenance.normalize(self.buffer.rope().len_chars());
+        self.provenance = provenance.into();
     }
 
     /// The out-of-band asides boundary — LEGACY Top-era reader (see
@@ -2379,6 +2571,9 @@ impl Document {
     }
 
     pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
+        if byte_range.is_empty() && text.is_empty() {
+            return;
+        }
         self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes(byte_range, text) {
@@ -2389,12 +2584,15 @@ impl Document {
             self.undo_states.push(self.snapshot());
             self.redo_states.clear();
         }
-        self.blocks
-            .on_edit(block, merged, count_line_breaks(text));
+        let splits = count_line_breaks(text);
+        if merged != 0 || splits != 0 { self.blocks.on_edit(block, merged, splits); }
         self.absorb_buffer_ops();
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
+        if byte_range.is_empty() && text.is_empty() {
+            return;
+        }
         self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.buffer.edit_bytes_coalescing(byte_range, text) {
@@ -2406,8 +2604,8 @@ impl Document {
             self.undo_states.push(self.snapshot());
             self.redo_states.clear();
         }
-        self.blocks
-            .on_edit(block, merged, count_line_breaks(text));
+        let splits = count_line_breaks(text);
+        if merged != 0 || splits != 0 { self.blocks.on_edit(block, merged, splits); }
         self.absorb_buffer_ops();
     }
 
@@ -2504,7 +2702,11 @@ impl Document {
     /// Undo one transaction (text, formatting, and block kinds together).
     /// Outer None = nothing to undo; inner None = format-only (keep cursor).
     pub fn undo(&mut self) -> Option<Option<usize>> {
-        let cursor = self.buffer.undo()?;
+        let had_transaction = self.buffer.undo_len() != 0;
+        let Some(cursor) = self.buffer.undo() else {
+            if had_transaction { self.undo_states.clear(); }
+            return None;
+        };
         self.revision += 1;
         let before_seam = self.blocks.scrap_line();
         if let Some((spans, blocks, notes, graveyard, provenance)) = self.undo_states.pop() {
@@ -2515,6 +2717,7 @@ impl Document {
                 std::mem::replace(&mut self.graveyard, graveyard),
                 std::mem::replace(&mut self.provenance, provenance),
             ));
+            self.normalize_side_structures();
         }
         // Buffer inverse ops still mirror to the store, but must NOT be
         // re-applied to spans/blocks (the snapshot is the correct state).
@@ -2532,7 +2735,11 @@ impl Document {
     }
 
     pub fn redo(&mut self) -> Option<Option<usize>> {
-        let cursor = self.buffer.redo()?;
+        let had_transaction = self.buffer.redo_len() != 0;
+        let Some(cursor) = self.buffer.redo() else {
+            if had_transaction { self.redo_states.clear(); }
+            return None;
+        };
         self.revision += 1;
         let before_seam = self.blocks.scrap_line();
         if let Some((spans, blocks, notes, graveyard, provenance)) = self.redo_states.pop() {
@@ -2543,6 +2750,7 @@ impl Document {
                 std::mem::replace(&mut self.graveyard, graveyard),
                 std::mem::replace(&mut self.provenance, provenance),
             ));
+            self.normalize_side_structures();
         }
         let ops = self.buffer.take_ops();
         let now = crate::journal::now_ms();
@@ -2606,7 +2814,7 @@ impl Document {
         self.journal.resume();
         // The wholesale text op mangled span/block/note adjustment; the
         // restored state and the content-based re-anchoring are authoritative.
-        self.spans = spans;
+        self.spans = spans.into();
         let lines = self.buffer.rope().len_lines();
         self.blocks = if blocks.len() == lines {
             blocks
@@ -2620,7 +2828,7 @@ impl Document {
             fresh.set_aside_boundary(blocks.aside_boundary());
             fresh.set_scrap_line(blocks.scrap_line());
             fresh
-        };
+        }.into();
         self.notes = reanchored;
         self.provenance = prov;
         // Overwrite the origin_pos-mangled entries with the preserved ones,
@@ -2710,8 +2918,8 @@ impl Document {
         self.absorb_buffer_ops();
         self.journal.resume();
 
-        self.spans = new_spans;
-        self.blocks = new_blocks;
+        self.spans = new_spans.into();
+        self.blocks = new_blocks.into();
         self.notes = saved_notes;
         for n in &mut self.notes.notes {
             n.range = map.pos(n.range.start)..map.pos(n.range.end);
@@ -2780,6 +2988,118 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_snapshots_share_unchanged_components_and_cow_only_the_mutated_one() {
+        let mut doc = Document::new("abc", SpanSet::default(), BlockMap::new(1));
+        doc.edit_bytes_coalescing(3..3, "x");
+        let first = doc.undo_states.last().unwrap();
+        assert!(Arc::ptr_eq(&doc.spans.0, &first.0.0));
+        assert!(Arc::ptr_eq(&doc.blocks.0, &first.1.0));
+        assert!(Arc::ptr_eq(&doc.notes.0, &first.2.0));
+        assert!(Arc::ptr_eq(&doc.graveyard.0, &first.3.0));
+        assert!(Arc::ptr_eq(&doc.provenance.0, &first.4.0));
+
+        doc.toggle_format(0..1, InlineAttr::Strong);
+        let before = doc.undo_states.last().unwrap();
+        assert!(!Arc::ptr_eq(&doc.spans.0, &before.0.0));
+        assert!(Arc::ptr_eq(&doc.blocks.0, &before.1.0));
+        assert!(Arc::ptr_eq(&doc.notes.0, &before.2.0));
+        assert!(Arc::ptr_eq(&doc.graveyard.0, &before.3.0));
+        assert!(Arc::ptr_eq(&doc.provenance.0, &before.4.0));
+
+        doc.undo(); doc.undo();
+        assert_eq!(doc.text(), "abc");
+        doc.redo(); doc.redo();
+        assert_eq!(doc.text(), "abcx");
+        assert!(doc.spans().covers(0..1, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn edits_after_nonempty_overlays_keep_unaffected_versions_shared() {
+        let mut doc = Document::new("abc", SpanSet::default(), BlockMap::new(1));
+        doc.add_note(0..1, "note".into(), 1);
+        doc.edit_bytes(3..3, "x");
+        let before_edit = doc.undo_states.last().unwrap();
+        assert!(!doc.notes().notes().is_empty());
+        assert!(Arc::ptr_eq(&doc.notes.0, &before_edit.2.0));
+    }
+
+    /// Deterministic allocation proxy plus an undo timing probe. Run with
+    /// `cargo test -p strop-core --release cow_history_sharing_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cow_history_sharing_probe() {
+        let lines = 5_000;
+        let steps = 2_000;
+        let text = "\n".repeat(lines - 1);
+        let mut doc = Document::new(&text, SpanSet::default(), BlockMap::new(lines));
+        for _ in 0..steps { doc.edit_bytes(0..0, "x"); }
+        let block_ptr = Arc::as_ptr(&doc.blocks.0);
+        assert!(doc.undo_states.iter().all(|s| Arc::as_ptr(&s.1.0) == block_ptr));
+        eprintln!(
+            "cow history: {steps} frames × {lines} blocks; 1 shared BlockMap allocation ({} BlockKind clones avoided)",
+            steps * lines
+        );
+        eprintln!(
+            "cow history: SideState handle = {} bytes/frame before Vec capacity and uniquely changed values",
+            std::mem::size_of::<SideState>()
+        );
+        for cap in [50, 200] {
+            let started = std::time::Instant::now();
+            let bytes = serde_json::to_vec(&doc.export_history(cap)).unwrap();
+            eprintln!(
+                "cow history: serialized cap {cap} = {} bytes in {:?}",
+                bytes.len(),
+                started.elapsed()
+            );
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..steps { assert!(doc.undo().is_some()); }
+        eprintln!("cow history: {steps} undos in {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn shared_history_keeps_the_legacy_json_wire_shape() {
+        let mut doc = Document::new("abc", SpanSet::default(), BlockMap::new(1));
+        doc.edit_bytes(3..3, "x");
+        let value = serde_json::to_value(doc.export_history(10)).unwrap();
+        assert_eq!(value, serde_json::json!({
+            "undo": [{"edits": [{"start": 3, "old": "", "new": "x"}]}],
+            "redo": [],
+            "undo_states": [[
+                {"spans": []}, {"kinds": ["Paragraph"]},
+                {"notes": [], "next_id": 0}, {"entries": [], "next_id": 0},
+                {"records": [], "next_id": 0}
+            ]],
+            "redo_states": []
+        }));
+        let history: History = serde_json::from_value(value).unwrap();
+        let mut reopened = Document::new("abcx", SpanSet::default(), BlockMap::new(1));
+        reopened.import_history(history);
+        assert_eq!(reopened.undo(), Some(Some(3)));
+        assert_eq!(reopened.text(), "abc");
+    }
+
+    #[test]
+    fn rejected_persisted_transaction_clears_its_aligned_side_stack() {
+        let value = serde_json::json!({
+            "undo": [{"edits": [{"start": 0, "old": "", "new": "foreign"}]}],
+            "redo": [],
+            "undo_states": [[
+                {"spans": []}, {"kinds": ["Paragraph"]},
+                {"notes": [], "next_id": 0}, {"entries": [], "next_id": 0},
+                {"records": [], "next_id": 0}
+            ]],
+            "redo_states": []
+        });
+        let mut doc = Document::new("local", SpanSet::default(), BlockMap::new(1));
+        doc.import_history(serde_json::from_value(value).unwrap());
+        assert_eq!(doc.undo(), None);
+        let history = doc.export_history(10);
+        assert!(history.undo.is_empty() && history.undo_states.is_empty());
+        assert_eq!(doc.text(), "local");
+    }
 
     fn op(pos: usize, delete: usize, insert: &str) -> TextOp {
         TextOp {
@@ -3156,6 +3476,48 @@ mod tests {
         assert_eq!(at3.len(), 2);
         assert_eq!(set.attrs_at(5).count(), 1);
         assert_eq!(set.attrs_at(6).count(), 0); // end-exclusive
+    }
+
+    #[test]
+    fn span_normalization_has_deterministic_ties() {
+        // Repair first groups by attribute so same-attribute overlaps can be
+        // merged in one sweep. Its final stable start-sort must retain that
+        // canonical attribute order for equal starts; Markdown nesting and
+        // persisted undo snapshots both observe it.
+        let mut set = SpanSet {
+            spans: vec![
+                Span { range: 2..5, attr: InlineAttr::Strong },
+                Span { range: 0..3, attr: InlineAttr::Underline },
+                Span { range: 0..2, attr: InlineAttr::Emphasis },
+                Span { range: 0..2, attr: InlineAttr::Strong },
+            ],
+        };
+
+        set.normalize(5);
+
+        assert_eq!(
+            set.spans(),
+            &[
+                Span { range: 0..2, attr: InlineAttr::Emphasis },
+                Span { range: 0..5, attr: InlineAttr::Strong },
+                Span { range: 0..3, attr: InlineAttr::Underline },
+            ]
+        );
+    }
+
+    #[test]
+    fn span_normalization_does_not_reorder_an_already_valid_set() {
+        // Equal-start ordering can encode the user's marker nesting. A load
+        // that needs no repair must not rewrite that otherwise-valid state.
+        let original = vec![
+            Span { range: 0..3, attr: InlineAttr::Underline },
+            Span { range: 0..3, attr: InlineAttr::Emphasis },
+        ];
+        let mut set = SpanSet { spans: original.clone() };
+
+        set.normalize(3);
+
+        assert_eq!(set.spans(), original);
     }
 
     #[test]
@@ -3696,6 +4058,42 @@ mod tests {
         let mut b = BlockMap::new(3);
         b.set_scrap_line(Some(1));
         assert_eq!(via_doc, manuscript_slice_of(&rope, &SpanSet::default(), &b));
+    }
+
+    #[test]
+    fn new_repairs_untrusted_spans_before_char_to_byte_use() {
+        let spans: SpanSet = serde_json::from_str(
+            r#"{"spans":[
+                {"range":{"start":9,"end":2},"attr":"Strong"},
+                {"range":{"start":0,"end":999},"attr":"Emphasis"},
+                {"range":{"start":1,"end":3},"attr":"Emphasis"}
+            ]}"#,
+        )
+        .unwrap();
+        let doc = Document::new("x", spans, BlockMap::default());
+        assert_eq!(doc.spans().spans().len(), 1);
+        assert_eq!(doc.spans().spans()[0].range, 0..1);
+        // This is the renderer's formerly-panicking conversion.
+        assert_eq!(doc.rope().char_to_byte(doc.spans().spans()[0].range.end), 1);
+    }
+
+    #[test]
+    fn block_count_repair_preserves_a_still_valid_scrap_line() {
+        let mut stale = BlockMap::new(5);
+        stale.set_scrap_line(Some(2));
+        let doc = Document::new("one\ntwo\n\nscrap", SpanSet::default(), stale);
+        assert_eq!(doc.blocks().len(), 4);
+        assert_eq!(doc.scrap_line(), Some(2));
+    }
+
+    #[test]
+    fn empty_document_edit_changes_neither_revision_nor_undo() {
+        let mut doc = Document::new("abc", SpanSet::default(), BlockMap::default());
+        let revision = doc.revision();
+        doc.edit_bytes(1..1, "");
+        assert_eq!(doc.revision(), revision);
+        assert!(doc.take_ops().is_empty());
+        assert!(doc.undo().is_none());
     }
 
     #[test]

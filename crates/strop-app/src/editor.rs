@@ -28,7 +28,7 @@ use strop_core::document::{
     Annotation, Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus,
     SpanSet,
 };
-use strop_core::{Store, typograph};
+use strop_core::{SaveCompletion, SaveGeneration, SaveWorker, Store, typograph};
 
 use crate::config::{Config, Language};
 use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
@@ -39,6 +39,65 @@ use crate::text_field::{
     TextFieldEvent,
 };
 use unicode_segmentation::UnicodeSegmentation;
+
+/// A manuscript-only Markdown export detached from the live editor so Save a
+/// Copy can finish after the asynchronous path prompt. Embedded assets travel
+/// with it; destination-specific relative links are written in `write_to`.
+struct MarkdownExport {
+    markdown: String,
+    assets: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SaveRevision(u64);
+
+struct PendingSave {
+    generation: SaveGeneration,
+    revision: SaveRevision,
+}
+
+#[derive(Default)]
+enum QuitGuard {
+    #[default]
+    Idle,
+    Saving,
+    Failed(String),
+    SavingCopy,
+    Bypass,
+}
+
+impl MarkdownExport {
+    fn prepare(doc: &Document, store: &Store) -> Self {
+        let (text, spans, blocks) = doc.manuscript_slice();
+        let markdown = strop_core::markdown::to_markdown(&text, &spans, &blocks);
+        let assets = blocks
+            .asset_refs()
+            .filter_map(|id| store.get_asset(id).map(|bytes| (id.to_owned(), bytes)))
+            .collect();
+        Self { markdown, assets }
+    }
+
+    fn write_to(mut self, path: &std::path::Path) -> std::io::Result<()> {
+        if !self.assets.is_empty() {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("doc")
+                .to_owned();
+            let dir = path.with_file_name(format!("{stem}.assets"));
+            std::fs::create_dir_all(&dir)?;
+            for (id, bytes) in self.assets {
+                let file = id.trim_start_matches("asset:");
+                std::fs::write(dir.join(file), bytes)?;
+                let rel = format!("{stem}.assets/{file}");
+                self.markdown = self
+                    .markdown
+                    .replace(&format!("]({id})"), &format!("]({rel})"));
+            }
+        }
+        std::fs::write(path, self.markdown)
+    }
+}
 
 // The semantic color language lives in `theme`; everything below is layout.
 pub use crate::theme::{BG_COLOR, TEXT_COLOR};
@@ -596,6 +655,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-2", Heading2, ctx),
         KeyBinding::new("ctrl-alt-3", Heading3, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
+        KeyBinding::new("escape", EscapeMode, Some("QuitGuard")),
         // GNOME's menu key opens the palette — it IS the menu.
         KeyBinding::new("f10", TogglePalette, ctx),
         KeyBinding::new("enter", FieldCommit, Some("NoteInput")),
@@ -1008,6 +1068,7 @@ struct FlankLayout {
 
 pub struct Editor {
     focus_handle: FocusHandle,
+    quit_focus: FocusHandle,
     /// Text + formatting with unified transaction history. Marks persist
     /// via Store::save_with_marks at save time.
     doc: Document,
@@ -1044,6 +1105,21 @@ pub struct Editor {
     /// Durable layer; edits mirror into it, a background task saves when idle.
     store: Option<Store>,
     store_dirty: bool,
+    /// Loro export stays on this thread; only immutable bytes cross into the
+    /// ordered filesystem worker.
+    save_worker: Option<SaveWorker>,
+    save_revision: SaveRevision,
+    latest_save: Option<PendingSave>,
+    /// A failed autosave stays dirty but backs off instead of synchronously
+    /// reserializing the document every one-second heartbeat.
+    save_retry_at: Option<Instant>,
+    save_retry_delay: Duration,
+    /// Visible durability warning; stderr is often invisible for a desktop
+    /// launch and must never be the only sign that edits are not landing.
+    save_error: Option<String>,
+    /// A close request is a small state machine, not an irrevocable event:
+    /// the window remains alive until the newest generation reaches disk.
+    quit_guard: QuitGuard,
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
@@ -1637,6 +1713,7 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            quit_focus: cx.focus_handle(),
             word_count: count_words([text].into_iter()),
             doc: Document::new(text, spans, blocks),
             caret_attrs: Vec::new(),
@@ -1656,6 +1733,13 @@ impl Editor {
             last_input: Instant::now(),
             store: None,
             store_dirty: false,
+            save_worker: None,
+            save_revision: SaveRevision(0),
+            latest_save: None,
+            save_retry_at: None,
+            save_retry_delay: Duration::from_secs(1),
+            save_error: None,
+            quit_guard: QuitGuard::Idle,
             history_view: None,
             history_preview: None,
             history_backfill_running: false,
@@ -1739,6 +1823,7 @@ impl Editor {
     pub fn attach_store(&mut self, store: Store, cx: &mut Context<Self>) {
         let legacy = !store.checkpoints_materialized();
         self.store = Some(store);
+        self.save_worker = Some(SaveWorker::new());
         // Heal a legacy file without waiting for the writer to open history:
         // materialize its checkpoint states in the background now, so the
         // sidebar is instant whenever it IS opened — and the next open of
@@ -1752,13 +1837,18 @@ impl Editor {
                     .timer(Duration::from_millis(1000))
                     .await;
                 let alive = this.update(cx, |editor: &mut Editor, cx| {
+                    editor.drain_save_completions();
+                    editor.finish_quit_if_ready(cx);
                     // Keystroke-durability for the open note composer: mirror
                     // its live draft onto the note every tick so a crash never
                     // loses what's been typed. Every other field in the app is
                     // already keystroke-durable; the composer was the lone
                     // RAM-only one (it wrote to the doc only on Enter-commit).
                     editor.sync_active_note_draft(cx);
-                    if editor.store_dirty && editor.last_input.elapsed() >= Duration::from_secs(1)
+                    if editor.store_dirty
+                        && editor.latest_save.is_none()
+                        && editor.last_input.elapsed() >= Duration::from_secs(1)
+                        && editor.save_retry_at.is_none_or(|at| Instant::now() >= at)
                     {
                         editor.save_now();
                     }
@@ -1786,6 +1876,14 @@ impl Editor {
     /// composer once did. Keep this the ONLY place that sets the flag true.
     fn mark_dirty(&mut self) {
         self.store_dirty = true;
+        self.save_revision.0 = self
+            .save_revision
+            .0
+            .checked_add(1)
+            .expect("document save revision overflow");
+        // A fresh edit is useful new information: try it promptly after the
+        // ordinary one-second idle lull, even if an older attempt backed off.
+        self.save_retry_at = None;
     }
 
     /// Fan buffer changes out to every offset-tracking consumer (formatting
@@ -2614,8 +2712,9 @@ impl Editor {
         self.strip.scratch = None; // re-anchor against the new bake
     }
 
-    /// Checkpoints reduced to draw/anchor metadata (created_unix SECONDS ×1000
-    /// at the boundary — the unit law). Word/char counts come from the ALREADY
+    /// Checkpoints reduced to draw/anchor metadata (`timestamp_ms`; legacy
+    /// second-resolution entries fall back inside that accessor). Word/char
+    /// counts come from the ALREADY
     /// materialized state (a cheap in-memory read — no time-travel; a stateless
     /// legacy checkpoint reports 0/0 and sizes no span, per Bug A).
     fn strip_stations(&self) -> Vec<strip::StationSnap> {
@@ -2639,7 +2738,7 @@ impl Editor {
                     })
                     .unwrap_or((0, 0));
                 strip::StationSnap {
-                    created_ms: cp.created_unix * 1000,
+                    created_ms: cp.timestamp_ms(),
                     name: cp.name,
                     manual: cp.manual,
                     has_state: cp.state.is_some(),
@@ -2693,7 +2792,7 @@ impl Editor {
         store
             .checkpoints()
             .iter()
-            .rfind(|cp| cp.created_unix * 1000 <= first && cp.state.is_some())
+            .rfind(|cp| cp.timestamp_ms() <= first && cp.state.is_some())
             .and_then(|cp| cp.state.as_ref())
             .map(|s| s.text.chars().count())
             .unwrap_or(0)
@@ -2711,7 +2810,7 @@ impl Editor {
         let cp = cps
             .iter()
             .rev()
-            .find(|cp| cp.created_unix * 1000 == ms && cp.state.is_some())?;
+            .find(|cp| cp.timestamp_ms() == ms && cp.state.is_some())?;
         store.checkpoint_state(cp)
     }
 
@@ -3131,40 +3230,8 @@ impl Editor {
             eprintln!("strop: no document file to export next to");
             return;
         };
-        // Export the MANUSCRIPT only — the compost rail is the writer's private
-        // scrap box, never part of the exported document (asides.md §1). The
-        // slice rebases span/block offsets to 0 (review H40, TRAP 14).
-        let (mtext, mspans, mblocks) = self.doc.manuscript_slice();
-        let mut md = strop_core::markdown::to_markdown(&mtext, &mspans, &mblocks);
         let path = store.path().with_extension("md");
-        // Materialize in-file assets as a sidecar dir with relative links
-        // (document-model §6). The MANUSCRIPT slice's blocks, not the full
-        // document's (scopes-search 4): an image living in the pile must not
-        // leak its file into the exported .assets/ dir the markdown never
-        // references — a live bug before the flip, load-bearing after it.
-        let asset_ids: Vec<String> = mblocks.asset_refs().map(str::to_owned).collect();
-        if !asset_ids.is_empty() {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("doc")
-                .to_owned();
-            let dir = path.with_file_name(format!("{stem}.assets"));
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                eprintln!("strop: export assets dir: {e}");
-            } else {
-                for id in asset_ids {
-                    let Some(bytes) = store.get_asset(&id) else { continue };
-                    let file = id.trim_start_matches("asset:").to_owned();
-                    let rel = format!("{stem}.assets/{file}");
-                    if let Err(e) = std::fs::write(dir.join(&file), bytes) {
-                        eprintln!("strop: export asset {file}: {e}");
-                    }
-                    md = md.replace(&format!("]({id})"), &format!("]({rel})"));
-                }
-            }
-        }
-        match std::fs::write(&path, md) {
+        match MarkdownExport::prepare(&self.doc, store).write_to(&path) {
             Ok(()) => {
                 eprintln!("strop: exported {}", path.display());
                 // A ship-shaped moment — the strip marks it.
@@ -3410,15 +3477,11 @@ impl Editor {
             store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
         );
         let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
-        let md = strop_core::markdown::to_markdown(
-            &self.doc.text(),
-            self.doc.spans(),
-            self.doc.blocks(),
-        );
+        let markdown = MarkdownExport::prepare(&self.doc, store);
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 if path.extension().is_some_and(|e| e == "md") {
-                    if let Err(e) = std::fs::write(&path, md) {
+                    if let Err(e) = markdown.write_to(&path) {
                         eprintln!("strop: save copy: {e}");
                     }
                 } else {
@@ -4899,6 +4962,13 @@ impl Editor {
             cx.notify();
             return;
         };
+        // Pending snapshots capture their destination; drain before moving so
+        // a delayed write cannot recreate the old path after the rename.
+        if let Err(e) = self.flush_saves() {
+            eprintln!("strop: save before rename: {e}");
+            cx.notify();
+            return;
+        }
         if let Some(store) = &mut self.store {
             let old = store.path().to_owned();
             let new_path = old
@@ -5609,7 +5679,8 @@ impl Editor {
         // at ≥1s idle, a natural run boundary anyway.
         self.doc.journal_mut().settle();
         if let Some(store) = &self.store {
-            match store.save_with_state(
+            let path = store.path().to_owned();
+            match store.prepare_save_with_state(
                 self.doc.spans(),
                 self.doc.blocks(),
                 // 50, not 200: each persisted undo entry snapshots the FULL
@@ -5624,13 +5695,194 @@ impl Editor {
                 self.doc.graveyard(),
                 self.doc.provenance(),
             ) {
-                Ok(()) => self.store_dirty = false,
-                Err(e) => eprintln!("strop: failed to save {}: {e}", store.path().display()),
+                Ok(save) => {
+                    let generation = self
+                        .save_worker
+                        .as_mut()
+                        .expect("attached Store has a save worker")
+                        .request(save);
+                    self.latest_save = Some(PendingSave {
+                        generation,
+                        revision: self.save_revision,
+                    });
+                }
+                Err(e) => {
+                    let message = format!("Not saved: {e}");
+                    eprintln!("strop: failed to prepare save {}: {e}", path.display());
+                    self.save_error = Some(message);
+                    self.save_retry_at = Some(Instant::now() + self.save_retry_delay);
+                    self.save_retry_delay = (self.save_retry_delay * 2).min(Duration::from_secs(60));
+                }
             }
         }
         if let Some(t) = perf {
             eprintln!("strop-perf: save_now {:?}", t.elapsed());
         }
+    }
+
+    fn apply_save_completion(&mut self, completion: SaveCompletion) {
+        let Some(pending) = self.latest_save.as_ref() else {
+            return;
+        };
+        // Older completions cannot alter dirty/error state. The ordered worker
+        // will report the latest request after them.
+        if completion.generation != pending.generation {
+            return;
+        }
+        let saved_revision = pending.revision;
+        self.latest_save = None;
+        match completion.result {
+            Ok(()) => {
+                if self.save_revision == saved_revision {
+                    self.store_dirty = false;
+                }
+                self.save_retry_at = None;
+                self.save_retry_delay = Duration::from_secs(1);
+                self.save_error = None;
+            }
+            Err(e) => {
+                let path = self
+                    .store
+                    .as_ref()
+                    .map(|s| s.path().display().to_string())
+                    .unwrap_or_else(|| "document".into());
+                eprintln!("strop: failed to save {path}: {e}");
+                self.save_error = Some(format!("Not saved: {e}"));
+                self.save_retry_at = (self.save_revision == saved_revision)
+                    .then(|| Instant::now() + self.save_retry_delay);
+                self.save_retry_delay = (self.save_retry_delay * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+
+    fn drain_save_completions(&mut self) {
+        while let Some(completion) = self.save_worker.as_ref().and_then(SaveWorker::try_completion) {
+            self.apply_save_completion(completion);
+        }
+    }
+
+    /// Queue the newest snapshot and wait only at a shutdown/rename boundary.
+    pub fn flush_saves(&mut self) -> std::io::Result<()> {
+        self.save_now();
+        let Some(generation) = self.latest_save.as_ref().map(|pending| pending.generation) else {
+            return self
+                .save_error
+                .as_ref()
+                .map_or(Ok(()), |m| Err(std::io::Error::other(m.clone())));
+        };
+        let completion = self
+            .save_worker
+            .as_ref()
+            .expect("pending save has a worker")
+            .wait_for(generation);
+        let result = completion
+            .result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| std::io::Error::new(e.kind(), e.to_string()));
+        self.apply_save_completion(completion);
+        result
+    }
+
+    /// Keep the window alive until the newest save generation reaches disk.
+    pub fn request_quit(
+        &mut self,
+        _: &crate::Quit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.quit_guard, QuitGuard::Bypass | QuitGuard::Saving | QuitGuard::SavingCopy) {
+            return;
+        }
+        self.sync_active_note_draft(cx);
+        self.quit_guard = QuitGuard::Saving;
+        window.focus(&self.quit_focus, cx);
+        self.save_now();
+        self.finish_quit_if_ready(cx);
+        cx.notify();
+    }
+
+    fn finish_quit_if_ready(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.quit_guard, QuitGuard::Saving) || self.latest_save.is_some() {
+            return;
+        }
+        // A background result can legitimately mutate the document while the
+        // save is in flight. Chase that newer revision instead of either
+        // closing over stale bytes or making the writer press Retry.
+        if self.store_dirty && self.save_error.is_none() {
+            self.save_now();
+            return;
+        }
+        if self.store_dirty || self.save_error.is_some() {
+            self.quit_guard = QuitGuard::Failed(
+                self.save_error.clone().unwrap_or_else(|| "The newest changes have not reached disk.".into()),
+            );
+            cx.notify();
+            return;
+        }
+        self.record_exit_state();
+        self.quit_guard = QuitGuard::Bypass;
+        cx.quit();
+    }
+
+    fn cancel_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.quit_guard, QuitGuard::Failed(_)) {
+            self.quit_guard = QuitGuard::Idle;
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    fn quit_anyway(&mut self, cx: &mut Context<Self>) {
+        self.quit_guard = QuitGuard::Bypass;
+        cx.quit();
+    }
+
+    fn save_quit_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let QuitGuard::Failed(previous_error) = &self.quit_guard else { return };
+        let previous_error = previous_error.clone();
+        let Some(store) = &self.store else { return };
+        let dir = store.path().parent().map(ToOwned::to_owned)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let suggested = format!(
+            "{} recovery.strop",
+            store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
+        );
+        self.quit_guard = QuitGuard::SavingCopy;
+        let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let path = match rx.await {
+                Ok(Ok(Some(path))) => path,
+                _ => {
+                    this.update(cx, |editor: &mut Editor, cx| {
+                        editor.quit_guard = QuitGuard::Failed(previous_error);
+                        cx.notify();
+                    }).ok();
+                    return;
+                }
+            };
+            let prepared = this.update(cx, |editor: &mut Editor, _| {
+                editor.store.as_ref()
+                    .ok_or_else(|| std::io::Error::other("document store is no longer open"))?
+                    .prepare_copy_to(&path)
+            }).unwrap_or_else(|_| Err(std::io::Error::other("document window closed")));
+            let result = match prepared {
+                Ok(save) => cx.background_executor().spawn(async move { save.write() }).await,
+                Err(e) => Err(e),
+            };
+            this.update(cx, |editor: &mut Editor, cx| match result {
+                Ok(()) => {
+                    editor.quit_guard = QuitGuard::Bypass;
+                    cx.quit();
+                }
+                Err(e) => {
+                    editor.quit_guard = QuitGuard::Failed(format!("Could not save the copy: {e}"));
+                    cx.notify();
+                }
+            }).ok();
+        }).detach();
+        window.focus(&self.quit_focus, cx);
+        cx.notify();
     }
 
     /// Would text typed at the caret inherit `attr` from the existing spans?
@@ -7293,6 +7545,10 @@ impl Editor {
     /// which closes the same layer. Order: AI settings → palette →
     /// shortcuts → selection popover → find/replace → history takeover.
     fn escape_mode(&mut self, _: &EscapeMode, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.quit_guard, QuitGuard::Failed(_)) {
+            self.cancel_quit(window, cx);
+            return;
+        }
         // The cold read's belt for focus loss (F4): its own key context owns
         // Esc while focused; this branch catches an Esc that reached the
         // editor context while the takeover is somehow up.
@@ -10248,6 +10504,10 @@ struct LayoutKey {
     /// and the counter live outside `revision` too (a bar flash, an entry
     /// expand). Keying on a coarse fingerprint rebuilds when they change.
     grave_fingerprint: u64,
+    /// Resolved image geometry. Async decode changes `None` to a device-pixel
+    /// size and invalidates layout exactly once; thereafter an image document
+    /// can use the same scroll/blink/caret fast path as plain prose.
+    image_sizes: Vec<(String, Option<(i32, i32)>)>,
 }
 
 struct PrepaintState {
@@ -10856,22 +11116,19 @@ impl Element for EditorElement {
         let perf_start = std::env::var_os("STROP_PERF").map(|_| Instant::now());
         // Ensure encoded-image handles exist for every Image block (the
         // actual decode is async inside GPUI's asset cache).
-        let needed: Vec<String> = {
+        let (image_ids, needed): (Vec<String>, Vec<String>) = {
             let editor = self.editor.read(cx);
-            editor
-                .doc
-                .blocks()
-                .kinds()
-                .iter()
-                .filter_map(|k| match k {
-                    BlockKind::Image { src, .. }
-                        if !editor.image_assets.contains_key(src) =>
-                    {
-                        Some(src.clone())
+            let mut ids = Vec::new();
+            let mut missing = Vec::new();
+            for kind in editor.doc.blocks().kinds() {
+                if let BlockKind::Image { src, .. } = kind {
+                    ids.push(src.clone());
+                    if !editor.image_assets.contains_key(src) {
+                        missing.push(src.clone());
                     }
-                    _ => None,
-                })
-                .collect()
+                }
+            }
+            (ids, missing)
         };
         if !needed.is_empty() {
             self.editor.update_in_draw(cx, |editor| {
@@ -10891,6 +11148,31 @@ impl Element for EditorElement {
                 }
             });
         }
+
+        // Clone handles out of the entity borrow before asking GPUI for their
+        // async render state (`use_render_image` itself needs mutable `cx`).
+        let keyed_images: Vec<(String, Option<Arc<gpui::Image>>)> = {
+            let editor = self.editor.read(cx);
+            image_ids
+                .into_iter()
+                .map(|src| {
+                    let handle = editor.image_assets.get(&src).cloned();
+                    (src, handle)
+                })
+                .collect()
+        };
+        let image_sizes = keyed_images
+            .into_iter()
+            .map(|(src, handle)| {
+                let size = handle
+                    .and_then(|image| image.use_render_image(window, cx))
+                    .map(|render| {
+                        let size = render.size(0);
+                        (size.width.0, size.height.0)
+                    });
+                (src, size)
+            })
+            .collect();
 
         let editor = self.editor.read(cx);
         let style = window.text_style();
@@ -10947,14 +11229,9 @@ impl Element for EditorElement {
             scrap_flash: editor.arrival_flash.is_some(),
             scrap_words: editor.scraps_word_count(),
             grave_fingerprint: editor.grave_layout_fingerprint(),
+            image_sizes,
         };
         let can_reuse = !in_history
-            && !editor
-                .doc
-                .blocks()
-                .kinds()
-                .iter()
-                .any(|k| matches!(k, BlockKind::Image { .. }))
             && editor.last_frame.as_ref().is_some_and(|f| {
                 f.bounds.size.width == wrap_width && f.layout_key == layout_key
             });
@@ -12752,6 +13029,18 @@ impl Editor {
                 .when_some(cr_mode_label, |bar, label| {
                     bar.child(div().ml(px(6.)).text_color(rgb(MUTED_COLOR)).child(label))
                 })
+                .when_some(self.save_error.clone(), |bar, message| {
+                    bar.child(
+                        div()
+                            .id("save-error")
+                            .ml(px(8.))
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(ERROR))
+                            .tooltip(tip(message, None))
+                            .child("Not saved · retrying"),
+                    )
+                })
                 // Word count + the session goal's live delta (DESIGN §4.2).
                 // Clickable: sets or changes the goal for this sitting.
                 // Hidden in the reading room — the count lives in the banner
@@ -13184,7 +13473,12 @@ impl Editor {
                     .child(self.window_button(icons::WIN_MAXIMIZE, "Maximize", None, |window, _| {
                         window.zoom_window()
                     }))
-                    .child(self.window_button(icons::WIN_CLOSE, "Close", Some("ctrl-q"), |_, cx| cx.quit()))
+                    .child(self.window_button(
+                        icons::WIN_CLOSE,
+                        "Close",
+                        Some("ctrl-q"),
+                        |window, cx| window.dispatch_action(Box::new(crate::Quit), cx),
+                    ))
                 })
             )
     }
@@ -17000,6 +17294,48 @@ impl Editor {
     }
 }
 
+impl Editor {
+    fn render_quit_guard(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (title, detail, working) = match &self.quit_guard {
+            QuitGuard::Idle | QuitGuard::Bypass => return None,
+            QuitGuard::Saving => ("Saving before closing", "The window will close as soon as the newest changes are safely on disk.".into(), true),
+            QuitGuard::SavingCopy => ("Saving a recovery copy", "The original file is unchanged. The window will close when the copy is safe.".into(), true),
+            QuitGuard::Failed(message) => ("Your changes could not be saved", message.clone(), false),
+        };
+        let button = |id: &'static str, label: &'static str| div()
+            .id(id).occlude().px(px(13.)).py(px(7.)).rounded(px(5.))
+            .border_1().border_color(rgb(RULE_COLOR)).bg(rgb(CARD_BG))
+            .font_family("PT Sans").text_size(px(12.)).cursor(CursorStyle::PointingHand)
+            .hover(|d| d.border_color(rgb(ACTIVE_BORDER))).child(label);
+        Some(div().absolute().inset_0().occlude().track_focus(&self.quit_focus)
+            .key_context("QuitGuard").bg(rgba(0x1A1A1842)).flex().items_center().justify_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(div().w(px(430.)).bg(rgb(BG_COLOR)).border_1().border_color(rgb(RULE_COLOR))
+                .rounded(px(9.)).px(px(24.)).py(px(22.)).font_family("PT Serif")
+                .text_color(rgb(TEXT_COLOR)).child(div().text_size(px(18.)).child(title))
+                .child(div().mt(px(9.)).text_size(px(13.)).line_height(px(19.))
+                    .text_color(rgb(MUTED_COLOR)).child(detail))
+                .when(working, |d| d.child(div().mt(px(18.)).font_family("PT Sans")
+                    .text_size(px(12.)).text_color(rgb(MUTED_COLOR)).child("Please keep this window open…")))
+                .when(!working, |d| d.child(div().mt(px(20.)).flex().items_center().gap(px(8.))
+                    .child(button("quit-retry", "Try again").on_mouse_down(MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation(); editor.request_quit(&crate::Quit, window, cx);
+                        })))
+                    .child(button("quit-copy", "Save a copy…").on_mouse_down(MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation(); editor.save_quit_copy(window, cx);
+                        })))
+                    .child(div().flex_1())
+                    .child(button("quit-anyway", "Quit anyway").text_color(rgb(ERROR))
+                        .on_mouse_down(MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation(); editor.quit_anyway(cx);
+                            })))))).into_any_element())
+    }
+}
+
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Measure-and-cache margin-card heights up front (the window's text
@@ -17083,6 +17419,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::show_shortcuts))
             .on_action(cx.listener(Self::open_welcome))
             .on_action(cx.listener(Self::read_it_cold))
+            .on_action(cx.listener(Self::request_quit))
             // §0.6 law 3 (click-outside) lives on the root so the whole
             // window counts as "outside", gutters and titlebar included.
             .on_mouse_down(
@@ -17386,7 +17723,8 @@ impl Render for Editor {
             .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
             .when(self.ai_settings.is_some(), |d| {
                 d.child(self.render_ai_settings(cx))
-            });
+            })
+            .when_some(self.render_quit_guard(cx), |d, guard| d.child(guard));
 
         // CSD chrome (window-decorations-csd.md): the content sits in an inner
         // surface inset by the shadow gutter on each untiled edge, with a soft
@@ -18192,7 +18530,7 @@ impl Editor {
         let store = self.store.as_ref()?;
         store.checkpoints().iter().enumerate().find_map(|(i, cp)| {
             (cp.state.is_some()
-                && (b.timeline.work_at(cp.created_unix * 1000) - play).abs() < 5.)
+                && (b.timeline.work_at(cp.timestamp_ms()) - play).abs() < 5.)
                 .then_some(i)
         })
     }
@@ -20483,6 +20821,44 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn markdown_copy_excludes_scraps_and_materializes_assets() {
+        let root = std::env::temp_dir().join(format!(
+            "strop-markdown-copy-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (store, _) = Store::open(root.join("doc.strop")).unwrap();
+        let bytes = b"image bytes".to_vec();
+        let id = store.put_asset(bytes.clone(), "png");
+        let mut blocks = BlockMap::new(3);
+        blocks.set_kind(
+            0,
+            BlockKind::Image {
+                src: id,
+                alt: "cover".into(),
+                caption: String::new(),
+            },
+        );
+        blocks.set_scrap_line(Some(1));
+        let doc = Document::new("\n\nprivate scrap", SpanSet::default(), blocks);
+        let path = root.join("copy.md");
+        MarkdownExport::prepare(&doc, &store).write_to(&path).unwrap();
+
+        let markdown = std::fs::read_to_string(&path).unwrap();
+        assert!(!markdown.contains("private scrap"));
+        assert!(markdown.contains("copy.assets/"));
+        let asset = std::fs::read_dir(root.join("copy.assets"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(asset).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     // Margin packer invariants, against random card stacks. Floor and viewport
     // are fixed; cards are sorted by anchor (the order margin_cards feeds).

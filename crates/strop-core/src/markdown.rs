@@ -48,9 +48,44 @@ fn escape_into(c: char, out: &mut String) {
 /// spans are re-opened as needed — Markdown cannot express true overlap).
 fn inline_md(line: &str, base: usize, spans: &SpanSet) -> String {
     let chars: Vec<char> = line.chars().collect();
+    // Build the line's span boundary events once. The old `attrs_at` call
+    // scanned every document span for every character, making export
+    // O(chars × spans) on formatting-rich long documents.
+    let mut starts: Vec<Vec<InlineAttr>> = vec![Vec::new(); chars.len() + 1];
+    let mut ends: Vec<Vec<InlineAttr>> = vec![Vec::new(); chars.len() + 1];
+    let line_end = base + chars.len();
+    for span in spans.spans() {
+        if span.range.end <= base || span.range.start >= line_end {
+            continue;
+        }
+        let start = span.range.start.max(base) - base;
+        let end = span.range.end.min(line_end) - base;
+        starts[start].push(span.attr.clone());
+        ends[end].push(span.attr.clone());
+    }
     let mut out = String::new();
     let mut stack: Vec<InlineAttr> = Vec::new();
+    let mut active: Vec<(InlineAttr, usize)> = Vec::new();
+    let trailing_break_start = chars
+        .iter()
+        .rposition(|c| *c != '\u{2028}')
+        .map_or(0, |i| i + 1);
     for i in 0..=chars.len() {
+        for attr in &ends[i] {
+            if let Some(ix) = active.iter().position(|(a, _)| a == attr) {
+                active[ix].1 -= 1;
+                if active[ix].1 == 0 {
+                    active.remove(ix);
+                }
+            }
+        }
+        for attr in &starts[i] {
+            if let Some((_, count)) = active.iter_mut().find(|(a, _)| a == attr) {
+                *count += 1;
+            } else {
+                active.push((attr.clone(), 1));
+            }
+        }
         // At end-of-block every marker MUST close even when the span
         // itself continues across the newline (markdown inline formatting
         // cannot cross blocks; the next block reopens it). Leaving it
@@ -59,7 +94,7 @@ fn inline_md(line: &str, base: usize, spans: &SpanSet) -> String {
         let here: Vec<InlineAttr> = if i == chars.len() {
             Vec::new()
         } else {
-            spans.attrs_at(base + i).cloned().collect()
+            active.iter().map(|(attr, _)| attr.clone()).collect()
         };
         // Close everything above (and including) any attr that ended here,
         // remembering still-active ones to reopen.
@@ -86,8 +121,7 @@ fn inline_md(line: &str, base: usize, spans: &SpanSet) -> String {
             // unrepresentable in CommonMark: escape_into would emit a stray
             // "\\\n" that re-imports as a literal backslash. Drop the trailing
             // run instead (a mid-block break still exports normally).
-            let trailing_break =
-                *c == '\u{2028}' && chars[i + 1..].iter().all(|h| *h == '\u{2028}');
+            let trailing_break = *c == '\u{2028}' && i >= trailing_break_start;
             // A footnote ref's marker replaces its carrier text entirely.
             if !trailing_break
                 && !here

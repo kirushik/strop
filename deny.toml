@@ -74,6 +74,10 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = [
+    # gpui's `test-support` feature uses Zed's revision-pinned proptest fork.
+    "https://github.com/proptest-rs/proptest",
+]
 
 [sources.allow-org]
 # gpui is pulled from a Strop fork of Zed's repo (github.com/kirushik/zed,

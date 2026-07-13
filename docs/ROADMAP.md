@@ -133,13 +133,35 @@ unless they'd be expensive to reverse.
       dedupes shaping. No paragraph cache needed at MVP scale. Typometer
       verification remains a nice-to-have (external hardware-ish setup).
 - [x] D3. Window niceties: size/position remembered, title shows the
-      document name (B4). Confirm-quit-on-failed-save judged not worth a
-      blocking quit-time prompt: idle-save failures already warn on every
-      heartbeat long before quit; revisit if a real data loss ever occurs.
+      document name (B4). **The original no-quit-guard decision is superseded
+      for 0.2:** a failed final save must keep the editor alive and offer
+      Retry / full Strop copy / Quit Anyway. Idle warnings alone cannot prove
+      the last generation reached disk.
 - [x] D4. Docs sweep: README rewritten to match the shipped feature set;
       ROADMAP is the live record. **MVP gate passed 2026-06-11.**
 
 ## Backlog (researched properly, not squeezed in)
+
+- **Bounded-memory, unbounded exact history.** The 0.2 Arc/COW change removes
+  duplicate live side-state structures without capping in-session undo, but
+  the current persisted 50-entry tail still expands shared values into full
+  JSON snapshots. The post-0.2 design is an exact reversible transaction store:
+  a byte-budgeted hot window, immutable checksummed cold chunks, whole-timeline
+  summaries, boundary prefetch, and ultimately one versioned portable `.strop`
+  envelope. No depth cap and no “end of undo” at the RAM boundary. Measurements,
+  failure rules, migration, delivery order, and acceptance gates live in
+  [cold-history.md](cold-history.md).
+
+- **Startup/open/recovery failure UX — design for good.** The 0.2 standalone
+  paper-styled error window is intentionally a contained stopgap: it never
+  impersonates an editor and offers Try Again / Open Another / Close. The
+  durable design must unify corrupt, missing, permission-denied, import,
+  unsupported-version, already-open, backup, and failed-save states in one
+  document-level grammar; retry/open in the same process; expose reveal/copy
+  and recovery choices without making opening a healthy document ask a
+  question; announce failures accessibly; and behave coherently for desktop,
+  file-manager, and OS-session launches on all three platforms. Treat this as
+  a recovery-system design task, not another dialog-polish pass.
 
 - [x] **Asset GC** (2026-06-11): save-time reachability sweep — an asset
   survives if the current blocks, any persisted undo/redo state, or any
