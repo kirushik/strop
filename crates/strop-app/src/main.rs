@@ -473,7 +473,26 @@ fn main() {
             .expect("window just opened");
         let window_for_quit = window;
         cx.on_app_quit(move |cx| {
+            // Finding 7 / LAW 2: an open transient field must not lose its
+            // content to the quit. Flush the composer (synchronous doc mutation)
+            // and every single-line field (including link and cold-read
+            // reaction) in a SEPARATE update, so their resolution effects
+            // deliver — writing edits into the doc — BEFORE the save update
+            // below serializes it.
+            editor.update_checked(cx, |editor, cx| {
+                editor.commit_composer_no_focus(cx);
+                editor.commit_transient_fields_on_quit(cx);
+            });
             editor.update_checked(cx, |editor, _| {
+                // The last-ditch write, for the quit paths that never reach
+                // `request_quit` (the smoke script, an unhandled Quit): those
+                // reach the process's end with no window left to hold open, so
+                // the guarantee has to be met HERE. It must WAIT, not enqueue —
+                // the worker owns the write now, and `save_now` alone would let
+                // the process exit with the bytes still in flight. A graceful
+                // quit has already saved by this point, and the fingerprint
+                // guards make this second call a no-op that writes nothing.
+                let _ = editor.flush_saves();
                 // Caret remembered for next open (resume mid-sentence);
                 // never a question, never a dialog (DESIGN §4b tension 6).
                 editor.record_exit_state();

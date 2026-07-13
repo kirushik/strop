@@ -48,7 +48,7 @@ Markdown's trailing-backslash break.
 | Blockquote | `>` | essential for op-ed/criticism; one nesting level |
 | List item {bullet/ordered, depth 0–1} | `-` / `1.` | prose lists are flat; two levels max, deliberately |
 | Divider / scene break | `***` | first-class for fiction (⁂-class rendering later), not just a rule |
-| Image {src, alt, caption} | `![alt](src)` | standalone block only; assets stored in-file (§5b) |
+| Image {src, alt} | `![alt](src "caption")` | standalone block only; assets stored in-file (§5b); the block's own text line IS the caption (edit semantics in `inline-images.md`) |
 | Code block {info} | ``` fenced ``` | monospace, **no syntax highlighting** — by design; doubles as the ASCII-pseudotable escape hatch. The fence info string (` ```rust `) is stored for round-trip fidelity, never acted on |
 | Footnote definition {id} | `[^id]: …` | lives in the text stream as a block; rendered in the viewport footnote zone (§4c) |
 
@@ -178,7 +178,11 @@ of capping it): every block/span row above lists its mapping. Underline
 exports as `<u>` (documented HTML passthrough); soft breaks as
 trailing-backslash; footnotes as `[^id]`/`[^id]: …` pairs; images export
 alongside an assets directory (`doc.assets/<hash>.png`) with relative
-links. Anything Markdown can express that this schema can't (tables, raw
+links, and the caption travels in the Markdown title slot
+(`![alt](src "caption")` — caption spans flatten to CommonMark inline
+syntax inside the title and re-parse on import, so Strop↔Strop
+round-trips whole; a foreign renderer shows the syntax literally in
+its tooltip, a visible cost of the same class as `<u>`). Anything Markdown can express that this schema can't (tables, raw
 HTML beyond `<u>`) imports as literal text — visibly, not silently.
 
 ## 7. Migration

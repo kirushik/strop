@@ -17,16 +17,18 @@ use std::sync::Arc;
 use gpui::{
     Animation, AnimationExt,
     AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
-    Decorations, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla, RenderImage,
+    Decorations, DragMoveEvent, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla,
+    RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad,
     Pixels, Point, ResizeEdge, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
     Style, TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
     WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
     Annotation, Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus,
-    SpanSet,
+    SpanSet, line_text_end_bytes,
 };
 use strop_core::{SaveCompletion, SaveGeneration, SaveWorker, Store, typograph};
 
@@ -418,6 +420,17 @@ const PROV_CARD_H: f32 = 22.;
 /// blink): traversing a 60-scrap pile must not strobe the margin
 /// (surfaces-attention 5). Hide on leave is instant.
 const PROV_REST_DELAY: Duration = Duration::from_millis(1000);
+/// LAW 1 (papercuts-2026-07 §1): the flanks rise one settle beat — 250 ms since
+/// the last selection extension — after a non-empty selection settles. One
+/// constant for mouse and keyboard alike (no dialect the hand must learn); it
+/// gates only the FIRST rise, and once risen the flanks track growth without
+/// lowering (no strobing).
+const FLANK_SETTLE_MS: u64 = 250;
+/// LAW 2 (papercuts-2026-07 §3): a bare focus-out (a keyboard-layout switch,
+/// app deactivation, window churn) is not a departure. A blurred field commits
+/// only if focus has NOT returned within this grace; a real gesture (a click, a
+/// chord, an invoked command) resolves the field at once, never through here.
+const FIELD_BLUR_GRACE_MS: u64 = 100;
 
 /// A small hover tooltip: a control's name and, optionally, its chord in a
 /// mono chip (DESIGN §0 — every titlebar control should teach its shortcut).
@@ -859,8 +872,8 @@ pub fn bind_keys(cx: &mut App) {
 ///
 /// Every one of those was two booleans that drifted apart. Here they cannot:
 /// the composer's identity and its `NoteInput` live in the same variant, and
-/// the SINGLE exit from `Composing` (`resolve_composer`) persists the draft to
-/// the note it actually belongs to. New interaction states force every
+/// the SINGLE exit from `Composing` (`resolve_composer_draft`) resolves the
+/// draft on the note it actually belongs to. New interaction states force every
 /// `match` below to be updated (exhaustiveness), so this class can't silently
 /// regrow. See `card_body` for the render-side counterpart.
 enum CardFocus {
@@ -1076,6 +1089,20 @@ enum FlankLeft {
     Horizontal,
 }
 
+/// LAW 1 (papercuts-2026-07 §1) as a pure predicate: the flanks are visible iff
+/// a settled non-empty selection exists, the prose owns keyboard focus (no
+/// transient field is open), and the offer is not latched — never mid-drag.
+/// Pure over booleans so the state transitions test without a live frame.
+fn flanks_visible_pred(
+    sel_empty: bool,
+    is_selecting: bool,
+    risen: bool,
+    latched: bool,
+    field_open: bool,
+) -> bool {
+    !sel_empty && !is_selecting && risen && !latched && !field_open
+}
+
 /// Which flanks rise, as one decision (docs/impl/03-flanks.md §1-2). Both are a
 /// consequence of chirality: tools left, the conversation right (asides.md §4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1140,8 +1167,40 @@ struct FlankLayout {
     pile_selection: bool,
 }
 
+/// The single picture-selected state (inline-images §4; plan R3): one
+/// contract whether click-born or reached through a §5 door — "typing types
+/// text, deletion completes, everything else decays". `door_caret` is the
+/// keyboard door's origin memory (§12: origin, not mode): `Some` iff the
+/// state was staged from a caret, which Esc and typing restore. `revision`
+/// is the decay guard: the positional `block` index is the identity, so any
+/// document mutation this state didn't make (an unseen splice) invalidates
+/// it — legitimate in-state mutations (the alt commit; Phase 5's
+/// replace-in-place) re-stamp through `restamp_image_sel`, the one funnel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ImageSel {
+    block: usize,
+    door_caret: Option<usize>,
+    revision: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DropAnchor {
+    byte: usize,
+    revision: u64,
+}
+
 pub struct Editor {
     focus_handle: FocusHandle,
+    /// The raised flank's own keyboard focus (A1, the ctrl-. deliberate path):
+    /// focus lands here so arrows navigate cells and Enter fires. Passive raise
+    /// never touches it — it claims no focus and reroutes no keystroke.
+    flank_focus_handle: FocusHandle,
+    /// Is focus currently INSIDE the flank (ctrl-. entered)? Drives the cell
+    /// focus ring and the on-key navigation; Escape (`exit_flank`) clears it.
+    flank_focused: bool,
+    /// The focused cell index within the flank grid's flat cell order
+    /// (`flank_cells`) while `flank_focused`.
+    flank_focus_cell: usize,
     quit_focus: FocusHandle,
     /// Text + formatting with unified transaction history. Marks persist
     /// via Store::save_with_marks at save time.
@@ -1340,6 +1399,30 @@ pub struct Editor {
     rename_input: Option<(usize, Entity<TextField>)>,
     /// Alt-text composer for an image block: (block index, composer).
     alt_input: Option<(usize, Entity<TextField>)>,
+    /// The picture-selected state (inline-images §4/§5, plan R3) — staged
+    /// exile IS this state reached through a door, not a second state.
+    /// Always read through `image_sel_live` / `resolve_image_sel` (the
+    /// revision guard lives there, nowhere else).
+    image_sel: Option<ImageSel>,
+    /// §5's freshness law (R5): the staging key ("backspace"/"delete")
+    /// whose key-up has NOT yet been observed since the stage. While set,
+    /// presses of that key are the staging press's own autorepeat and are
+    /// refused — key autorepeat never crosses the stage. Cleared by the
+    /// capture-phase key-up listener on the editor column; the platform's
+    /// own repeat flag (`is_held`) is never trusted — it lies on X11.
+    image_stage_hold: Option<&'static str>,
+    /// §7's drag-over layer: while an external file drag is over the
+    /// window, the gap between blocks nearest the pointer — (gap index,
+    /// the insertion rule's doc-space y). Painted as the quiet rule ("it
+    /// will land here", P6), gated on `cx.has_active_drag()` so a drag
+    /// that Exited never leaves a stale rule; the LANDING law never reads
+    /// this — the drop's own position aims it (§7: unconditional).
+    drop_gap: Option<(usize, Pixels)>,
+    /// The writer's caret/selection saved at composer-open (LAW 2 / C4 split
+    /// exit): `(range, reversed)`. A keyboard commit or a dead-zone click-away
+    /// restores it so the exit lands where thought left off; a click INTO the
+    /// prose overrides it with the caret at the click point.
+    composer_return: Option<(Range<usize>, bool)>,
     /// Self-baseline from the [voice] corpus (None until >=3 docs load).
     pub voice_baseline: Option<strop_core::voice::Baseline>,
     /// Narrow-window notes drawer (DESIGN §narrow-margin): below ~932px even
@@ -1351,10 +1434,26 @@ pub struct Editor {
     /// glued flush under the titlebar control. A bool-toggled overlay, light-
     /// dismissed like the narrow-notes panel it borrows its anchoring from.
     editor_menu_open: bool,
-    /// Selection popover (DESIGN §2-toolbar): formatting rides the
-    /// selection. Shown on mouse-up over a selection or via ctrl-.;
-    /// dismissed by mousedown, typing, scrolling, or escape.
-    selection_popover: bool,
+    /// LAW 1 (papercuts-2026-07 §1): flank visibility is a DERIVED predicate
+    /// (`flanks_visible`), never a mouse-up-only flag. These three facts feed it:
+    ///
+    /// `flank_risen` — the settle latch: true once a non-empty selection has sat
+    /// still for one `FLANK_SETTLE_MS` beat (`arm_flank_settle`). Sticky: it
+    /// gates only the FIRST rise, so once up the flanks track growth without
+    /// re-gating; it drops only when the selection collapses to empty.
+    flank_risen: bool,
+    /// The LATCH: set by focus-/text-moving verbs (annotate, aside, exile) and by
+    /// Escape/collapse; cleared ONLY when the selection genuinely CHANGES (an
+    /// unchanged restored selection keeps it — no post-commit re-offer). Style
+    /// toggles never set it, so the flanks stay up over a styled selection.
+    flank_latched: bool,
+    /// The pending settle beat: `Some(t)` while a fresh non-empty selection is
+    /// waiting out its 250 ms. Only the timer whose captured `t` still matches
+    /// flips `flank_risen`, so a later extension's beat supersedes a stale one.
+    flank_settle: Option<Instant>,
+    /// The selection range last seen by the flank logic — the change detector for
+    /// the latch (a restore to the identical range is not a change).
+    flank_sel: Range<usize>,
     /// The left flank's link argument-field (docs/impl/03-flanks.md §0.1,
     /// review B2 + findings 59/88): the URL editor opened from the grid's link
     /// cell. It CAPTURES the target CHAR range at open — never a re-read of
@@ -1588,6 +1687,19 @@ struct ParagraphLayout {
     font_size: Pixels,
     /// Decoded image for Image blocks, with its display size.
     image: Option<(Arc<RenderImage>, gpui::Size<Pixels>)>,
+    /// Y offset from `top` to the block's first text line. Zero for prose;
+    /// an Image block reserves the picture + a small gap above its caption
+    /// line (inline-images §11: the picture paints first, the caption lays
+    /// out BELOW it — the typover died here). Every line-y computation
+    /// (`position_of`, `index_for_point`, the caret quad, `fn_marks`) adds
+    /// this, so caret and hit-test can never land ON the pixels.
+    text_top: Pixels,
+    /// Center each visual line within the measure (image captions match the
+    /// cold-read caption's optics — inline-images §11). Paint passes
+    /// `TextAlign::Center`; the two x translators (`x_for`/`index_at`)
+    /// apply `center_shift`, the same per-line math gpui's aligner uses,
+    /// so painted glyphs and caret geometry cannot drift apart.
+    centered: bool,
     /// The input runs this line was shaped with. Compared on the next rebuild
     /// to decide whether the shaped line can be reused verbatim (per-block
     /// layout reuse) instead of re-shaping — a few `TextRun`s per block.
@@ -1619,11 +1731,41 @@ impl ParagraphLayout {
             .partition_point(|&b| if affinity_down { b <= local } else { b < local })
     }
 
+    /// Painted width of visual line `line`: boundary glyph to boundary
+    /// glyph, `layout.width` for the last — exactly what gpui's
+    /// `aligned_origin_x` measures (`boundaries` store those glyphs' byte
+    /// indices, and `x_for_index` of a glyph's index IS its position).
+    fn line_width(&self, line: usize) -> Pixels {
+        let layout = &self.line.unwrapped_layout;
+        let end = match self.boundaries.get(line) {
+            Some(&b) => layout.x_for_index(b),
+            None => layout.width,
+        };
+        end - layout.x_for_index(self.line_start(line))
+    }
+
+    /// Horizontal shift of visual line `line` under centering: gpui's
+    /// `TextAlign::Center` origin math verbatim (align width = the wrap
+    /// width the line was shaped to, no clamp — an overfull word overhangs
+    /// both in paint and here). Zero for left-set blocks, so prose pays
+    /// one branch.
+    fn center_shift(&self, line: usize) -> Pixels {
+        if !self.centered {
+            return px(0.);
+        }
+        let align_width = self
+            .line
+            .wrap_width
+            .unwrap_or(self.line.unwrapped_layout.width);
+        (align_width - self.line_width(line)) / 2.
+    }
+
     /// X position of a local index within its visual line, in frame
-    /// coordinates (block indent included).
+    /// coordinates (block indent and caption centering included).
     fn x_for(&self, local: usize, line: usize) -> Pixels {
         let layout = &self.line.unwrapped_layout;
-        self.indent + layout.x_for_index(local) - layout.x_for_index(self.line_start(line))
+        self.indent + self.center_shift(line) + layout.x_for_index(local)
+            - layout.x_for_index(self.line_start(line))
     }
 
     fn position(&self, local: usize, affinity_down: bool) -> (usize, Pixels) {
@@ -1636,12 +1778,22 @@ impl ParagraphLayout {
     fn index_at(&self, line: usize, x: Pixels) -> (usize, bool) {
         let line = line.min(self.line_count() - 1);
         let y = self.line_height * (line as f32) + self.line_height / 2.;
-        let local_x = (x - self.indent).max(px(0.));
+        let local_x = (x - self.indent - self.center_shift(line)).max(px(0.));
         let ix = self
             .line
             .closest_index_for_position(point(local_x, y), self.line_height)
             .unwrap_or_else(|ix| ix);
         (ix, line > 0 && ix == self.line_start(line))
+    }
+
+    /// Hit-test-only band below `height`: an image block's EMPTY caption
+    /// paints no chrome and adds no height (inline-images §3 —
+    /// manifestation costs no geometry), but the band one caret-height
+    /// beneath the pixels still routes to the caption caret — a click
+    /// door with zero painted chrome. Zero for every other block (their
+    /// text height always reaches `text_top + line_height`).
+    fn caption_band(&self) -> Pixels {
+        (self.text_top + self.line_height - self.height).max(px(0.))
     }
 }
 
@@ -1662,8 +1814,13 @@ impl TextFrame {
 
     /// (paragraph index, visual line, x) of a byte offset.
     fn cursor_position(&self, offset: usize, affinity_down: bool) -> Option<(usize, usize, Pixels)> {
-        let par_ix = self.paragraphs.iter().position(|p| offset <= p.range.end)?;
-        let par = &self.paragraphs[par_ix];
+        // Paragraphs are sorted and contiguous by byte range, so binary-search
+        // the owning paragraph instead of a linear scan (finding 9a — this rides
+        // the scroll and flank-geometry hot paths). `partition_point` returns the
+        // first paragraph whose end is at/after `offset`, matching the old
+        // `position(|p| offset <= p.range.end)`.
+        let par_ix = self.paragraphs.partition_point(|p| p.range.end < offset);
+        let par = self.paragraphs.get(par_ix)?;
         let (line, x) = par.position(offset - par.range.start, affinity_down);
         Some((par_ix, line, x))
     }
@@ -1672,7 +1829,7 @@ impl TextFrame {
     fn position_of(&self, offset: usize, affinity_down: bool) -> Option<Point<Pixels>> {
         let (par_ix, line, x) = self.cursor_position(offset, affinity_down)?;
         let par = &self.paragraphs[par_ix];
-        Some(point(x, par.top + par.line_height * (line as f32)))
+        Some(point(x, par.top + par.text_top + par.line_height * (line as f32)))
     }
 
     /// Byte offset (and cursor affinity) closest to a point relative to
@@ -1687,7 +1844,14 @@ impl TextFrame {
             if p.y < par.top && i > 0 {
                 let prev = &self.paragraphs[i - 1];
                 let prev_bottom = prev.top + prev.height;
-                let (target, line) = if p.y - prev_bottom <= par.top - p.y {
+                // The empty-caption click band (inline-images §3): the band
+                // one caret-height beneath an image's pixels belongs to its
+                // caption even though the empty slot adds no height — it
+                // borrows the block's bottom margin. Then the ordinary
+                // nearest-edge rule for the rest of the gap.
+                let (target, line) = if p.y < prev_bottom + prev.caption_band()
+                    || p.y - prev_bottom <= par.top - p.y
+                {
                     (prev, prev.line_count() - 1)
                 } else {
                     (par, 0)
@@ -1696,7 +1860,12 @@ impl TextFrame {
                 return (target.range.start + ix, aff);
             }
             if p.y < par.top + par.height {
-                let line = ((p.y - par.top) / par.line_height) as usize;
+                // `text_top` keeps clicks on an image's pixels off any text
+                // line math: they resolve to the caption's first line (the
+                // only caret an image block owns — inline-images §3; Phase 4
+                // reroutes pixel clicks to picture selection upstream).
+                let line =
+                    ((p.y - par.top - par.text_top).max(px(0.)) / par.line_height) as usize;
                 let (ix, aff) = par.index_at(line, x);
                 return (par.range.start + ix, aff);
             }
@@ -1727,6 +1896,67 @@ fn format_thousands(n: usize) -> String {
 /// and the move-vs-cut distinction are unit-tested.
 fn auto_cut_qualifies(new_text: &str, range_chars: usize) -> bool {
     new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS
+}
+
+/// A tiny deterministic PNG for the rig (`seed:image`): 8-bit RGB, zlib
+/// STORED blocks — a few honest lines instead of an encoder dependency.
+/// `f` maps (x, y) to a pixel, so seeds draw gradients that make scaling
+/// and cropping errors visible on a screenshot.
+fn debug_png(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+    // Raw scanlines: filter byte 0, then RGB per pixel.
+    let mut raw = Vec::with_capacity((h * (1 + w * 3)) as usize);
+    for y in 0..h {
+        raw.push(0u8);
+        for x in 0..w {
+            raw.extend_from_slice(&f(x, y));
+        }
+    }
+    // zlib stream: header, STORED deflate blocks, adler32 of the raw data.
+    let mut z = vec![0x78, 0x01];
+    for (i, chunk) in raw.chunks(65535).enumerate() {
+        z.push(((i + 1) * 65535 >= raw.len()) as u8); // BFINAL on the last
+        z.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(chunk.len() as u16)).to_le_bytes());
+        z.extend_from_slice(chunk);
+    }
+    let adler = {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in &raw {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    };
+    z.extend_from_slice(&adler.to_be_bytes());
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut c: u32 = !0;
+        for &b in data {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(data);
+        let mut crc_input = tag.to_vec();
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    }
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit depth, RGB, no interlace
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &z);
+    chunk(&mut png, b"IEND", &[]);
+    png
 }
 
 /// The headstone for the graveyard bar — the metaphor sits beside its
@@ -1762,6 +1992,16 @@ fn count_words<'a>(chunks: impl Iterator<Item = &'a str>) -> usize {
     words
 }
 
+/// STROP_TEST_STILL (the visual rig, scripts/wflip.sh): freeze every clock so
+/// captures byte-compare across runs. Read ONCE into a static (V13b) — the env
+/// var can't change mid-process, so the per-card, per-frame `env::var` lookups
+/// this replaces were pure overhead.
+fn test_still() -> bool {
+    static STILL: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("STROP_TEST_STILL").is_some());
+    *STILL
+}
+
 /// `seed:legacy` prose: exactly `words` words of placeholder text, broken into
 /// ~40-word paragraphs so a checkpoint state reads like a real draft. Its word
 /// count is `words` and its char count is deterministic — the strip's legacy
@@ -1787,6 +2027,9 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            flank_focus_handle: cx.focus_handle(),
+            flank_focused: false,
+            flank_focus_cell: 0,
             quit_focus: cx.focus_handle(),
             word_count: count_words([text].into_iter()),
             doc: Document::new(text, spans, blocks),
@@ -1859,12 +2102,19 @@ impl Editor {
             replace_input: None,
             rename_input: None,
             alt_input: None,
+            image_sel: None,
+            image_stage_hold: None,
+            drop_gap: None,
+            composer_return: None,
             voice_baseline: None,
             card_heights: HashMap::new(),
             active_card_height: None,
             narrow_notes_open: false,
             editor_menu_open: false,
-            selection_popover: false,
+            flank_risen: false,
+            flank_latched: false,
+            flank_settle: None,
+            flank_sel: 0..0,
             link_input: None,
             excursion: None,
             pile_end: None,
@@ -2500,21 +2750,61 @@ impl Editor {
     ) {
         let handle = input.read(cx).focus_handle.clone();
         let weak = cx.entity().downgrade();
+        // LAW 2 / D2: a bare focus-out is not a departure. A GENERATION counter
+        // (V7b) — bumped by every focus-out AND every focus-in — supersedes the
+        // old shared AtomicBool: each blur captures its own generation and its
+        // timer commits only if the count is still current. A keyboard-layout
+        // switch or alt-tab that returns focus bumps the count (focus-in), so
+        // the pending commit is stale; and a blur/focus/blur BOUNCE can no
+        // longer let the first blur's timer commit on the second blur's behalf
+        // before that blur's own grace has elapsed (the AtomicBool did).
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let generation = generation.clone();
+            window
+                .on_focus_in(&handle, cx, move |_window, _cx| {
+                    generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                })
+                .detach();
+        }
+        let still = std::rc::Rc::new(still);
         window
-            .on_focus_out(&handle, cx, move |_, _window, cx| {
+            .on_focus_out(&handle, cx, move |_, window, cx| {
                 let Some(editor) = weak.upgrade() else { return };
-                editor.update_checked(cx, |editor, cx| {
-                    if let Some(field) = still(editor) {
-                        let text = field.read(cx).content.clone();
-                        field.update_checked(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
-                    }
-                });
+                let my_gen = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let generation = generation.clone();
+                let still = still.clone();
+                let weak = editor.downgrade();
+                window
+                    .spawn(cx, async move |cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(FIELD_BLUR_GRACE_MS))
+                            .await;
+                        cx.update(|window, app| {
+                            if generation.load(std::sync::atomic::Ordering::Relaxed) != my_gen
+                                || !window.is_window_active()
+                            {
+                                return; // superseded, or app deactivation — not a departure
+                            }
+                            let Some(editor) = weak.upgrade() else { return };
+                            editor.update_checked(app, |editor, cx| {
+                                if let Some(field) = still(editor) {
+                                    let text = field.read(cx).content.clone();
+                                    field.update_checked(cx, |_, fcx| {
+                                        fcx.emit(TextFieldEvent::Commit(text))
+                                    });
+                                }
+                            });
+                        })
+                        .ok();
+                    })
+                    .detach();
             })
             .detach();
     }
 
     fn edit_image_alt(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let BlockKind::Image { src, alt, caption } = self.doc.blocks().kind(block).clone()
+        let BlockKind::Image { src, alt } = self.doc.blocks().kind(block).clone()
         else {
             return;
         };
@@ -2529,10 +2819,14 @@ impl Editor {
                         BlockKind::Image {
                             src: src.clone(),
                             alt: new_alt.clone(),
-                            caption: caption.clone(),
                         },
                     );
                     editor.mark_dirty();
+                    // A legitimate in-state mutation re-stamps the picture
+                    // selection's revision guard (inline-images §8 / R3) —
+                    // committing the alt must not decay the very state
+                    // whose strip the writer just typed into.
+                    editor.restamp_image_sel(block);
                 }
                 editor.alt_input = None;
                 window.focus(&editor.focus_handle, cx);
@@ -3449,12 +3743,7 @@ impl Editor {
             else {
                 continue;
             };
-            let start = rope.line_to_byte(block);
-            let end = if block + 1 < rope.len_lines() {
-                rope.line_to_byte(block + 1).saturating_sub(1)
-            } else {
-                rope.len_bytes()
-            };
+            let (start, end) = block_bounds_in(&self.doc, block);
             // One visual home (H4): if the definition block is itself on
             // screen — the reader has scrolled down to the Footnotes
             // section — don't also mirror it in the page-bottom zone. The
@@ -3595,39 +3884,119 @@ impl Editor {
             .unwrap_or(0);
         let id = self.doc.add_note(char_range, String::new(), now);
         self.mark_dirty();
+        let saved = (self.selected_range.clone(), self.selection_reversed);
         self.open_composer(id, String::new(), window, cx);
+        // Save the writer's selection so the composer's exit lands where thought
+        // left off (LAW 2 split-exit; the keyboard/dead-zone exits restore it).
+        // AFTER open_composer, whose internal resolve of any prior composer would
+        // otherwise clear it.
+        self.composer_return = Some(saved);
+        // A focus-moving verb LATCHES the flanks down (LAW 1 / C2): the selection
+        // persists but the offer withdraws, so the composer is never overpainted
+        // and no re-offer fires when the composer commits and the selection
+        // returns unchanged.
+        self.flank_latched = true;
         self.bump_activity();
         cx.notify();
     }
 
-    /// The SINGLE exit from `Composing`: persist the open composer's current
-    /// text onto the note it edits, then demote that card to `Selected`. Every
-    /// focus-changing action calls this first, so a composer is never stranded
-    /// on a deselected card and its draft is never committed to a card the
-    /// writer merely clicked. No-op unless a composer is actually open.
-    fn resolve_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The shared resolve (V15a): apply an open composer's draft to the doc —
+    /// empty trimmed body → C4 empty-DISCARD (no blank card manufactured), else
+    /// commit — and settle CardFocus accordingly. Focus and notify are the
+    /// callers' to own; returns whether a composer was actually open.
+    fn resolve_composer_draft(&mut self, cx: &mut Context<Self>) -> bool {
         let (id, body) = match &self.focus {
             CardFocus::Composing { id, input } => (*id, input.read(cx).content.clone()),
-            _ => return,
+            _ => return false,
         };
-        self.doc.set_note_body(id, body);
-        self.focus = CardFocus::Selected(id);
+        self.composer_return = None;
+        if body.trim().is_empty() {
+            // Undo-aligned cancel: drops the add's paired empty undo step when
+            // still topmost, else scrubs history so no undo/redo resurrects a
+            // blank card (review finding 4).
+            self.doc.cancel_provisional_note(id);
+            self.focus = CardFocus::Idle;
+        } else {
+            self.doc.set_note_body(id, body);
+            self.focus = CardFocus::Selected(id);
+        }
         self.mark_dirty();
-        // The composer field just left the tree; hand keyboard control back to
-        // the document so the next keystroke edits prose, not nothing. This is
-        // the SINGLE place a composer exit restores focus — because EVERY exit
-        // funnels through here, a lane click (selecting another card, done/×)
-        // can no longer strand the keyboard the way it did when only
-        // finish_composing refocused. Callers that want a *different* target
-        // (open_composer focuses the new field) just re-focus after us.
-        window.focus(&self.focus_handle, cx);
+        true
     }
 
-    /// Leave the composer (Enter, Escape, or any focus loss). The draft is
-    /// already the note's text and focus is restored by `resolve_composer`, so
-    /// the card just stays selected, now showing what was written.
+    /// Commit (or C4 empty-DISCARD) the open composer WITHOUT moving focus — the
+    /// LAW 2 blur path, where focus has already genuinely left the field, so
+    /// stealing it back to the document would be wrong. A no-op unless a
+    /// composer is open.
+    pub(crate) fn commit_composer_no_focus(&mut self, cx: &mut Context<Self>) {
+        if self.resolve_composer_draft(cx) {
+            cx.notify();
+        }
+    }
+
+    /// Commit (or C4 empty-discard) the open composer and hand focus back to the
+    /// prose — the LAW 2 GESTURE path (a click resolves the field at once). Does
+    /// NOT restore the saved caret; the caller decides (a prose click places the
+    /// caret at the click point; a dead-zone click restores). `true` if a
+    /// composer was open.
+    fn commit_or_discard_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Restore the caret/selection saved at composer-open (LAW 2 / C4 split
+    /// exit): the keyboard-commit and dead-zone-click exits land where thought
+    /// left off. The restored selection is unchanged, so it keeps the flank latch.
+    fn apply_composer_return(&mut self, ret: Option<(Range<usize>, bool)>, cx: &mut Context<Self>) {
+        let Some((range, reversed)) = ret else { return };
+        let len = self.doc.len_bytes();
+        self.selected_range = range.start.min(len)..range.end.min(len);
+        self.selection_reversed = reversed;
+        self.flank_sel = self.selected_range.clone();
+        self.flank_latched = true;
+        cx.notify();
+    }
+
+    /// Commit every open single-line transient field on a writer GESTURE (LAW 2:
+    /// a click resolves the field family at once, not on the delayed blur). Each
+    /// field's own Commit subscription closes it — the durable write rides that
+    /// path. A no-op when nothing is open.
+    pub(crate) fn commit_transient_fields_on_gesture(&mut self, cx: &mut Context<Self>) {
+        let fields = [
+            self.doc_rename_input.clone(),
+            self.goal_input.clone(),
+            self.rename_input.as_ref().map(|(_, f)| f.clone()),
+            self.alt_input.as_ref().map(|(_, f)| f.clone()),
+        ];
+        for field in fields.into_iter().flatten() {
+            let text = field.read(cx).content.clone();
+            field.update_checked(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
+        }
+    }
+
+    /// Quit is the one resolution boundary broader than writer gestures: every
+    /// durable transient field must reach the document before `save_now`.
+    pub(crate) fn commit_transient_fields_on_quit(&mut self, cx: &mut Context<Self>) {
+        self.commit_transient_fields_on_gesture(cx);
+        if let Some(field) = self.link_input.as_ref().map(|(_, field)| field.clone()) {
+            let text = field.read(cx).content.clone();
+            field.update_checked(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
+        }
+        self.cr_commit_input_inner(cx);
+    }
+
+    /// Leave the composer by KEYBOARD (Enter/Escape). The draft is already the
+    /// note's text; the exit restores the writer's saved caret (LAW 2).
     fn finish_composing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.resolve_composer(window, cx);
+        let ret = self.composer_return.take();
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+        self.apply_composer_return(ret, cx);
         cx.notify();
     }
 
@@ -3635,14 +4004,18 @@ impl Editor {
     /// its anchor). Resolves any open composer first so the previous note's
     /// draft is saved and its composer never lingers.
     fn select_card(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         self.focus = CardFocus::Selected(id);
     }
 
     /// Drop all card selection (a click that hits no anchor). Resolves any
     /// open composer first.
     fn deselect_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         self.focus = CardFocus::Idle;
     }
 
@@ -3654,7 +4027,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         // Switching composers: commit the one we're leaving before opening this.
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         let input = cx.new(|cx| TextField::multiline(cx, body));
         cx.subscribe_in(
             &input,
@@ -3666,21 +4041,49 @@ impl Editor {
             },
         )
         .detach();
-        // Click-away commits immediately (low-latency: the input becomes a label
-        // the instant focus leaves, not when some later click happens to resolve
-        // it). Guarded on THIS composer still being open — switching to another
-        // card or clicking the document already resolved it through its own path,
-        // so the stale handle must not double-commit.
+        // Click-away commits — but only on a real DEPARTURE (LAW 2 / D2): a
+        // transient focus-out (keyboard-layout switch, app deactivation) is
+        // never a commit. Each blur owns a generation, so a blur/focus/blur
+        // bounce cannot let the first timer commit on the second blur's behalf.
+        // Empty ⇒ discard (C4). Guarded on THIS composer still being open so a
+        // switch/click that already resolved it can't double-commit.
         let handle = input.read(cx).focus_handle.clone();
         let weak = cx.entity().downgrade();
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let generation = generation.clone();
+            window
+                .on_focus_in(&handle, cx, move |_window, _cx| {
+                    generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                })
+                .detach();
+        }
         window
             .on_focus_out(&handle, cx, move |_, window, cx| {
-                let Some(editor) = weak.upgrade() else { return };
-                editor.update_checked(cx, |editor, cx| {
-                    if editor.focus.composing_id() == Some(id) {
-                        editor.finish_composing(window, cx);
-                    }
-                });
+                let my_gen = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let generation = generation.clone();
+                let weak = weak.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(FIELD_BLUR_GRACE_MS))
+                            .await;
+                        cx.update(|window, app| {
+                            if generation.load(std::sync::atomic::Ordering::Relaxed) != my_gen
+                                || !window.is_window_active()
+                            {
+                                return;
+                            }
+                            let Some(editor) = weak.upgrade() else { return };
+                            editor.update_checked(app, |editor, cx| {
+                                if editor.focus.composing_id() == Some(id) {
+                                    editor.commit_composer_no_focus(cx);
+                                }
+                            });
+                        })
+                        .ok();
+                    })
+                    .detach();
             })
             .detach();
         let input_focus = input.read(cx).focus_handle.clone();
@@ -3697,7 +4100,9 @@ impl Editor {
     ) {
         // Commit any open draft first (the click may be on this card's own
         // done/×, or on another card while this one composes).
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         // A resolved card leaves with a brief exit fade rather than blinking
         // out: snapshot its rendered slot BEFORE the model change (afterwards
         // it has no card to snapshot). The model itself commits immediately —
@@ -5007,22 +5412,13 @@ impl Editor {
         )
         .detach();
         // Click-away commits the rename (the title is a real edit, like the
-        // note composer's body — losing focus should save it, not drop it).
-        // Guarded on the field still being open so an Enter-then-blur, which
-        // already finished, doesn't rename a second time.
-        let handle = input.read(cx).focus_handle.clone();
-        let weak = cx.entity().downgrade();
-        window
-            .on_focus_out(&handle, cx, move |_, window, cx| {
-                let Some(editor) = weak.upgrade() else { return };
-                editor.update_checked(cx, |editor, cx| {
-                    if let Some(field) = editor.doc_rename_input.clone() {
-                        let title = field.read(cx).content.clone();
-                        editor.finish_rename(title, window, cx);
-                    }
-                });
-            })
-            .detach();
+        // note composer's body — losing focus should save it, not drop it). Via
+        // the SHARED blur grace (finding 6 / LAW 2): a bare focus-out — the
+        // transient blur a keyboard-layout switch fires — must not commit
+        // mid-rename; only a real departure does. The Commit it emits routes
+        // through the subscription above (finish_rename), which no-ops if the
+        // field already closed.
+        self.commit_field_on_blur(&input, window, cx, |e| e.doc_rename_input.clone());
         let input_focus = input.read(cx).focus_handle.clone();
         window.focus(&input_focus, cx);
         self.doc_rename_input = Some(input);
@@ -5722,8 +6118,24 @@ impl Editor {
         out
     }
 
-    fn render_alt_strip(&self) -> Option<impl IntoElement> {
-        let (_, input) = self.alt_input.clone()?;
+    fn render_alt_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        // Two ways in, one strip (inline-images §8): the open composer
+        // (double-click, or the click below) — or, while the picture is
+        // SELECTED, the alt shown as data. The strip IS the control (P12):
+        // clicking the data line enters the same edit state double-click
+        // opens. Never both at once — the composer wins.
+        let (editing, data): (Option<Entity<TextField>>, Option<(usize, String)>) =
+            match self.alt_input.clone() {
+                Some((_, input)) => (Some(input), None),
+                None => {
+                    let sel = self.image_sel_live()?;
+                    let BlockKind::Image { alt, .. } = self.doc.blocks().kind(sel.block)
+                    else {
+                        return None;
+                    };
+                    (None, Some((sel.block, alt.clone())))
+                }
+            };
         Some(
             div()
                 .absolute()
@@ -5733,6 +6145,11 @@ impl Editor {
                 .bg(rgb(0xF4F1EA))
                 .border_t_1()
                 .border_color(rgb(RULE_COLOR))
+                // The strip IS the alt field's surface: its clicks must never
+                // bubble to the root's no-dead-zones resolver (C4) and commit
+                // the very field the writer is clicking into (twin of
+                // render_composer_strip).
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .px(px(28.))
                 .py(px(8.))
                 .flex()
@@ -5741,7 +6158,30 @@ impl Editor {
                 .font_family("PT Serif")
                 .text_size(px(13.))
                 .child(div().text_color(rgb(MUTED_COLOR)).child("Alt text:"))
-                .child(div().flex_1().child(input)),
+                .map(|d| match (editing, data) {
+                    (Some(input), _) => d.child(div().flex_1().child(input)),
+                    (None, Some((block, alt))) => d.child(
+                        div()
+                            .flex_1()
+                            .cursor(CursorStyle::IBeam)
+                            .text_color(if alt.is_empty() {
+                                rgb(MUTED_COLOR)
+                            } else {
+                                rgb(TEXT_COLOR)
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, _, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.edit_image_alt(block, window, cx);
+                                }),
+                            )
+                            // Data, not a prompt: the em-dash says "empty",
+                            // no ghost verbiage (P4).
+                            .child(if alt.is_empty() { "—".to_owned() } else { alt }),
+                    ),
+                    (None, None) => d, // unreachable by construction above
+                }),
         )
     }
 
@@ -5873,8 +6313,21 @@ impl Editor {
         self.sync_active_note_draft(cx);
         self.quit_guard = QuitGuard::Saving;
         window.focus(&self.quit_focus, cx);
-        let _ = self.save_now();
-        self.finish_quit_if_ready(cx);
+        // LAW 2: quit's resolution boundary is broader than any gesture's — the
+        // composer AND every single-line field (link, cold-read reaction) must
+        // reach the document before it is serialized. The composer mutates it
+        // synchronously, but a single-line field resolves by EMITTING Commit,
+        // and its subscriber only receives that when the effect cycle flushes.
+        // So the save cannot run inline here: `defer_in` schedules it at the end
+        // of the cycle, and the effect queue is FIFO — the emits above are
+        // delivered, writing their text into the document, before it runs.
+        self.commit_composer_no_focus(cx);
+        self.commit_transient_fields_on_quit(cx);
+        cx.defer_in(window, |editor, _, cx| {
+            let _ = editor.save_now();
+            editor.finish_quit_if_ready(cx);
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -6061,6 +6514,9 @@ impl Editor {
         self.commit_field_on_blur(&input, window, cx, |e| {
             e.link_input.as_ref().map(|(_, f)| f.clone())
         });
+        if self.flank_focused {
+            self.exit_flank(window, cx);
+        }
         let handle = input.read(cx).focus_handle.clone();
         window.focus(&handle, cx);
         self.link_input = Some((range, input));
@@ -6090,14 +6546,106 @@ impl Editor {
         cx.notify();
     }
 
-    /// Tear down BOTH flanks (review H20): acting on any right-menu row clears
-    /// them before its result (a composer card, a pass, an aside) takes the lane,
-    /// so only one pinned object ever sits at the selection's y. Also drops a
-    /// half-typed link argument.
+    /// Take BOTH flanks down by LATCHING (LAW 1; review H20): a focus-/text-
+    /// moving verb (annotate, aside, exile) leaves the selection standing but the
+    /// offer withdrawn, so only one pinned object sits at the selection's y and
+    /// the predicate can never re-raise the flanks over the composer a settle
+    /// beat later. The latch clears itself the moment the selection changes; an
+    /// unchanged restored selection keeps it (no post-commit re-offer, P2). Also
+    /// drops a half-typed link argument.
     fn dismiss_flanks(&mut self, cx: &mut Context<Self>) {
-        self.selection_popover = false;
+        self.flank_latched = true;
         self.link_input = None;
         cx.notify();
+    }
+
+    /// LAW 1 (papercuts-2026-07 §1) — flank visibility as a per-frame derived
+    /// predicate: visible iff a settled non-empty selection exists, the prose
+    /// owns keyboard focus (no transient field open), and the offer is not
+    /// latched. The mouse-drag and off-screen/history/cold-read conjuncts live
+    /// in `flank_layout` (they also need the frame geometry); this is the core
+    /// LAW that the render path, the debug dump, and the rig all read.
+    fn flanks_visible(&self) -> bool {
+        flanks_visible_pred(
+            self.selected_range.is_empty(),
+            self.is_selecting,
+            self.flank_risen,
+            self.flank_latched,
+            self.transient_field_open(),
+        )
+    }
+
+    /// Is a transient single-line/composer field open? Its presence means the
+    /// prose no longer owns keyboard focus, so the flanks yield to it (LAW 1's
+    /// no-transient-field conjunct — the C2 composer-occlusion fix). The link
+    /// argument-field is EXCLUDED: it is the flank's own inner surface, and while
+    /// it is up `render_selection_popover` paints it in the flank's place.
+    fn transient_field_open(&self) -> bool {
+        self.focus.composing_id().is_some()
+            || self.doc_rename_input.is_some()
+            || self.goal_input.is_some()
+            || self.rename_input.is_some()
+            || self.alt_input.is_some()
+            || self.replace_input.is_some()
+            || self.palette_input.is_some()
+    }
+
+    /// The single selection-change hook feeding LAW 1 (called from the caret
+    /// funnels `set_cursor`/`extend_cursor` and the other genuine selection
+    /// verbs). Clears the latch on a real change, drops the flanks when the
+    /// selection collapses, and arms the settle beat for a fresh non-empty
+    /// selection — while a risen flank tracks growth untouched.
+    fn on_selection_moved(&mut self, cx: &mut Context<Self>) {
+        if self.selected_range == self.flank_sel {
+            return; // a restored/identical selection keeps the latch (LAW 1)
+        }
+        // A selection move leaves the ctrl-. flank navigation (the cells no
+        // longer describe the same extent); focus returns to the prose naturally.
+        self.flank_focused = false;
+        self.flank_sel = self.selected_range.clone();
+        self.flank_latched = false; // a genuine selection change clears the latch
+        if self.selected_range.is_empty() {
+            // Collapse lowers the flanks as a consequence (they are never their
+            // own layer) — the empty selection alone suffices for the predicate.
+            self.flank_risen = false;
+            self.flank_settle = None;
+            return;
+        }
+        if self.flank_risen {
+            return; // growth: stay up, never re-gate mid-extension (no strobe)
+        }
+        // A mouse DRAG extends the selection on every mousemove — arming here
+        // would spawn a settle timer per move (V8b). Mouse-up re-arms once the
+        // drag settles; only keyboard selections (is_selecting == false) arm here.
+        if !self.is_selecting {
+            self.arm_flank_settle(cx);
+        }
+    }
+
+    /// Arm the settle beat (LAW 1): after `FLANK_SETTLE_MS` of no further
+    /// extension, a still-live, no-longer-dragging selection raises the flanks.
+    /// The captured instant guards against a stale timer firing after a newer
+    /// extension re-armed the beat.
+    fn arm_flank_settle(&mut self, cx: &mut Context<Self>) {
+        let at = Instant::now();
+        self.flank_settle = Some(at);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(FLANK_SETTLE_MS))
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.flank_settle == Some(at)
+                    && !editor.selected_range.is_empty()
+                    && !editor.is_selecting
+                {
+                    editor.flank_risen = true;
+                    editor.flank_settle = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Start the cursor-blink heartbeat. GNOME-style: solid while typing,
@@ -6108,7 +6656,7 @@ impl Editor {
     /// cursor is nondeterminism. `cursor_visible` starts true and nothing
     /// ever toggles it, so the caret stays solid in every frame.
     pub fn start_blink(&self, cx: &mut Context<Self>) {
-        if std::env::var("STROP_TEST_STILL").is_ok() {
+        if test_still() {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -6156,6 +6704,14 @@ impl Editor {
     /// Collapse the selection to `offset`. Keeps `goal_x`; non-vertical
     /// callers go through `move_to`, which clears it.
     fn set_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
+        // Any caret motion decays the picture selection without harm
+        // (inline-images §4: click elsewhere, travel, jumps — everything
+        // that isn't typing or the deletion key). The four plain arrows
+        // apply their direction law BEFORE reaching this funnel. One
+        // Option check: free for every ordinary caret move.
+        if self.image_sel.is_some() {
+            self.decay_image_sel();
+        }
         // The caret never rests on the seam line (seam-mechanics 3): a landing
         // there snaps past it in the direction of travel (approximated by
         // where the caret came from; the click path maps by y before this).
@@ -6247,6 +6803,7 @@ impl Editor {
             }
         }
         self.bump_activity();
+        self.on_selection_moved(cx); // LAW 1: a collapse/caret-move lowers the flanks
         cx.notify();
     }
 
@@ -6265,6 +6822,11 @@ impl Editor {
 
     /// Extend the selection's moving end to `offset`. Keeps `goal_x`.
     fn extend_cursor(&mut self, offset: usize, affinity_down: bool, cx: &mut Context<Self>) {
+        // A growing range selection replaces the picture selection (§4
+        // decay; §5's range door takes over from here).
+        if self.image_sel.is_some() {
+            self.decay_image_sel();
+        }
         // Never let a selection straddle the boundary (review B4): clamp the
         // moving end into the fixed anchor's region.
         let anchor = if self.selection_reversed {
@@ -6286,6 +6848,7 @@ impl Editor {
         self.caret_attrs.clear();
         self.bump_activity();
         self.publish_primary(cx);
+        self.on_selection_moved(cx); // LAW 1: keyboard/drag extension feeds the flank predicate
         cx.notify();
     }
 
@@ -6318,12 +6881,76 @@ impl Editor {
         format!("{above}\n{below}")
     }
 
+    /// One fragment of `clipboard_text` (§9): the plain doc slice, with
+    /// every image block the range covers WHOLE swapped for its Markdown
+    /// line — the travelling form, so a range copy carries pictures. A
+    /// partially covered caption stays the plain fragment the writer
+    /// selected (only the whole block owns the Markdown form; a partial
+    /// range is just text). Prose pays one kind scan over the spanned
+    /// blocks and nothing more.
+    fn clipboard_slice(&self, range: Range<usize>) -> String {
+        let covered = self.covered_image_lines(&range);
+        if covered.is_empty() {
+            return self.doc.slice_bytes(range);
+        }
+        splice_image_markdown(&self.doc.slice_bytes(range.clone()), range.start, &covered)
+    }
+
+    /// Image blocks whose LINE TEXT `range` covers whole, with their §9
+    /// Markdown forms — ascending, ranges within `range` by construction.
+    fn covered_image_lines(&self, range: &Range<usize>) -> Vec<(Range<usize>, String)> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+        let rope = self.doc.rope();
+        let first = rope.byte_to_line(range.start);
+        let last = rope.byte_to_line(range.end.min(self.doc.len_bytes()));
+        let kinds = self.doc.blocks().kinds();
+        let mut out = Vec::new();
+        for block in first..=last.min(kinds.len().saturating_sub(1)) {
+            if !matches!(kinds.get(block), Some(BlockKind::Image { .. })) {
+                continue;
+            }
+            let (start, end) = self.image_block_bounds(block);
+            if range.start <= start
+                && end <= range.end
+                && let Some(md) = self.image_block_markdown(block)
+            {
+                out.push((start..end, md));
+            }
+        }
+        out
+    }
+
+    /// `selection_text`, dressed for the pasteboard (§9): the same seam
+    /// law, with every fragment passing the image splice. The find seed
+    /// and every other in-app reader keep `selection_text` — the Markdown
+    /// form exists for travel only.
+    fn clipboard_text(&self, range: &Range<usize>) -> String {
+        if !self.selection_spans_seam(range) {
+            return self.clipboard_slice(range.clone());
+        }
+        let m = self.doc.manuscript_char_range();
+        let s = self
+            .doc
+            .scraps_char_range()
+            .unwrap_or_else(|| m.clone());
+        let (above_end, below_start) = if s.start > m.end {
+            (self.doc.char_to_byte(m.end), self.doc.char_to_byte(s.start))
+        } else {
+            (self.doc.char_to_byte(s.end), self.doc.char_to_byte(m.start))
+        };
+        let above = self.clipboard_slice(range.start.min(above_end)..above_end.min(range.end));
+        let below = self.clipboard_slice(below_start.max(range.start)..range.end.max(below_start));
+        format!("{above}\n{below}")
+    }
+
     /// Linux PRIMARY-selection contract: any selection (mouse or keyboard)
     /// is published; middle-click pastes it. With auto_copy_selection
     /// (config), the regular clipboard gets it too — Kirill's habit.
     fn publish_primary(&self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            let text = self.selection_text(&self.selected_range.clone());
+            let text = self.clipboard_text(&self.selected_range.clone());
             if self.config.auto_copy_selection {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             }
@@ -6351,15 +6978,7 @@ impl Editor {
 
     /// Start/end of the *paragraph* (rope line) containing `offset`.
     fn paragraph_bounds(&self, offset: usize) -> (usize, usize) {
-        let rope = self.doc.rope();
-        let line_ix = rope.byte_to_line(offset);
-        let start = rope.line_to_byte(line_ix);
-        let end = if line_ix + 1 < rope.len_lines() {
-            rope.line_to_byte(line_ix + 1).saturating_sub(1)
-        } else {
-            rope.len_bytes()
-        };
-        (start, end)
+        paragraph_bounds_in(&self.doc, offset)
     }
 
     /// Start/end of the *visual* line under the cursor, with the affinity
@@ -6419,27 +7038,12 @@ impl Editor {
     /// GTK/Windows paragraph motion: to start of current paragraph, or of
     /// the previous one when already at a start.
     fn previous_paragraph_boundary(&self, offset: usize) -> usize {
-        let (start, _) = self.paragraph_bounds(offset);
-        if offset > start {
-            start
-        } else if start > 0 {
-            self.paragraph_bounds(start - 1).0
-        } else {
-            0
-        }
+        previous_paragraph_boundary_in(&self.doc, offset)
     }
 
     /// To end of current paragraph, or of the next one when already at an end.
     fn next_paragraph_boundary(&self, offset: usize) -> usize {
-        let (_, end) = self.paragraph_bounds(offset);
-        let len = self.doc.len_bytes();
-        if offset < end {
-            end
-        } else if end < len {
-            self.paragraph_bounds(end + 1).1
-        } else {
-            len
-        }
+        next_paragraph_boundary_in(&self.doc, offset)
     }
 
     /// Word-bound segment containing `offset` (for double-click selection).
@@ -6522,7 +7126,7 @@ impl Editor {
         let x = self.goal_x.unwrap_or(x);
         let page = (frame.bounds.size.height - frame.line_height).max(frame.line_height);
         let par = &frame.paragraphs[par_ix];
-        let y = par.top + par.line_height * (line_ix as f32) + par.line_height / 2.;
+        let y = par.top + par.text_top + par.line_height * (line_ix as f32) + par.line_height / 2.;
         let target = point(x, y + page * (direction as f32));
         let (offset, affinity) = frame.index_for_point(target);
 
@@ -6534,9 +7138,240 @@ impl Editor {
         }
     }
 
+    // -- The picture's standing (inline-images §4/§5) -------------------------
+
+    /// The live picture selection, revision-checked (R3's decay guard): the
+    /// positional block index is the identity, so `Some` only while no
+    /// document mutation happened since the state was minted and no takeover
+    /// (history, the reading room) owns the surface. A revision mismatch is
+    /// an unseen splice — decay, never a guess.
+    fn image_sel_live(&self) -> Option<ImageSel> {
+        let sel = self.image_sel?;
+        if self.history_view.is_some() || self.cold_read.is_some() || self.strip.is_parked() {
+            return None;
+        }
+        if sel.revision != self.doc.revision() || sel.block >= self.doc.blocks().len() {
+            return None;
+        }
+        debug_assert!(
+            matches!(self.doc.blocks().kind(sel.block), BlockKind::Image { .. }),
+            "ImageSel resolves to a non-image block under an unchanged revision"
+        );
+        Some(sel)
+    }
+
+    /// `image_sel_live`'s mutating twin — the one funnel every verb enters
+    /// through: a stale state is PURGED here, so nothing downstream ever
+    /// acts on a decayed selection.
+    fn resolve_image_sel(&mut self) -> Option<ImageSel> {
+        let live = self.image_sel_live();
+        if live.is_none() && self.image_sel.is_some() {
+            self.decay_image_sel();
+        }
+        live
+    }
+
+    /// Plain decay (§4/§5): click elsewhere, caret motion, focus change —
+    /// the state drops without harm and without moving the caret (the
+    /// parked `selected_range` — the door caret, or the caption start —
+    /// simply becomes visible again).
+    fn decay_image_sel(&mut self) {
+        self.image_sel = None;
+        self.image_stage_hold = None;
+    }
+
+    /// Re-stamp the revision guard after a legitimate in-state mutation —
+    /// the alt commit today, Phase 5's replace-in-place tomorrow. The ONE
+    /// funnel (R3): any mutation that doesn't pass here decays the state.
+    fn restamp_image_sel(&mut self, block: usize) {
+        if let Some(sel) = self.image_sel.as_mut().filter(|s| s.block == block) {
+            sel.revision = self.doc.revision();
+        }
+    }
+
+    /// Byte range of a block's own line (text start..text end, separator
+    /// excluded) — the unit every whole-block verb below acts on.
+    fn image_block_bounds(&self, block: usize) -> (usize, usize) {
+        image_block_bounds_in(&self.doc, block)
+    }
+
+    /// Enter the picture-selected state (§4 click law / §5 stage).
+    /// `door_caret: Some` iff keyboard-born; `stage_key` is the staging
+    /// press's own key, whose autorepeat must not complete the exile (R5).
+    /// Entering collapses `selected_range` (R3) and parks the suppressed
+    /// caret where Esc will restore it: the door caret when keyboard-born,
+    /// else the caption start (§4's Esc law).
+    fn enter_image_sel(
+        &mut self,
+        block: usize,
+        door_caret: Option<usize>,
+        stage_key: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(
+            matches!(self.doc.blocks().kind(block), BlockKind::Image { .. }),
+            "picture selection can only enter on an image block"
+        );
+        let park = door_caret.unwrap_or_else(|| self.doc.rope().line_to_byte(block));
+        self.selected_range = park..park;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.goal_x = None;
+        self.image_sel = Some(ImageSel {
+            block,
+            door_caret,
+            revision: self.doc.revision(),
+        });
+        self.image_stage_hold = stage_key;
+        self.last_input = Instant::now();
+        // A state whose still cannot be seen does not count as shown (§4):
+        // scroll the WHOLE block into view — top wins when the picture is
+        // taller than the viewport — and cancel any pending caret scroll,
+        // which knows nothing of the pixels above the caption line.
+        if let Some(frame) = self.last_frame.as_ref() {
+            if let Some(par) = frame.paragraphs.get(block) {
+                let viewport = frame.bounds.size.height;
+                let mut scroll = self.scroll_top;
+                if par.top + par.height > scroll + viewport {
+                    scroll = par.top + par.height - viewport;
+                }
+                if par.top < scroll {
+                    scroll = par.top;
+                }
+                self.scroll_top = scroll;
+            }
+            self.autoscroll_request = false;
+        } else {
+            self.autoscroll_request = true;
+        }
+        self.on_selection_moved(cx); // LAW 1: the collapse lowers the flanks
+        cx.notify();
+    }
+
+    /// The §5 delete-key law, at the top of every Backspace/Delete variant
+    /// (the word-delete forms share it): completes a staged exile on a
+    /// FRESH press, stages at a boundary door, refuses at a wall — or
+    /// passes to the caller's ordinary path. Returns true when the press
+    /// was consumed. Cost far from images: one block lookup and one pair
+    /// of paragraph bounds (both O(log n) rope walks, no document scans).
+    fn image_delete_gate(&mut self, key: &'static str, forward: bool, cx: &mut Context<Self>) -> bool {
+        if !self.selected_range.is_empty() {
+            return false; // range deletes go by §5's range door (the model law)
+        }
+        // While the picture is selected: a fresh press exiles; the staging
+        // key's own autorepeat is refused until its key-up (R5) — a refused
+        // press mutates nothing, so its still is identical (P6).
+        if let Some(sel) = self.resolve_image_sel() {
+            if exile_press_is_fresh(self.image_stage_hold, key) {
+                self.exile_image_block(sel.block, cx);
+            }
+            return true;
+        }
+        if self.history_view.is_some() || self.strip.is_parked() || self.cold_read.is_some() {
+            return false; // read-only surfaces own their own refusals
+        }
+        let cursor = self.cursor_offset();
+        let (par_start, par_end) = self.paragraph_bounds(cursor);
+        let block = self.doc.block_of_byte(cursor);
+        let kinds = self.doc.blocks().kinds();
+        let door = if forward {
+            image_delete_door(kinds, block, cursor == par_end)
+        } else {
+            image_backspace_door(kinds, block, cursor == par_start, par_start == par_end)
+        };
+        match door {
+            ImageDoor::Stage(target) => {
+                self.enter_image_sel(target, Some(cursor), Some(key), cx);
+                true
+            }
+            // A wall (§5): pure no-op — no revision bump, no transaction,
+            // before and after stills identical (the refusal contract).
+            ImageDoor::Refuse => true,
+            ImageDoor::Pass => false,
+        }
+    }
+
+    /// Complete a staged exile (§5): the block — picture AND caption —
+    /// leaves whole through the whole-block door (`exile_to_graveyard` via
+    /// `file_cut`'s interpret-blocks arm; NEVER a byte-range cut, whose
+    /// clamp would leave a surviving separator and a wrong graveyard
+    /// entry). The asset GC keeps graveyard-referenced pixels alive, so
+    /// Put back restores picture and caption whole (P13). Post-exile caret
+    /// law rides `file_cut`'s collapse-to-range-start: the start of the
+    /// block that now follows, or — when the exiled block was last, where
+    /// the exile ate its LEADING separator — the end of the previous block.
+    fn exile_image_block(&mut self, block: usize, cx: &mut Context<Self>) {
+        self.decay_image_sel();
+        let (start, end) = self.image_block_bounds(block);
+        self.file_cut(start..end, false, true, cx);
+    }
+
+    /// Block index when `position` (window coords) lands ON a picture's
+    /// pixels (§4's click law): above the caption line (`par.text_top`)
+    /// and within the centered picture's painted width — the same
+    /// centering as paint (indent + (column − indent − w)/2). Clicks in
+    /// the margins beside the pixels stay text clicks (the caption door).
+    fn image_pixel_hit(&self, position: Point<Pixels>) -> Option<usize> {
+        let frame = self.last_frame.as_ref()?;
+        if self.history_preview.is_some() {
+            return None;
+        }
+        let p = frame.doc_point(position);
+        let par_ix = frame
+            .paragraphs
+            .partition_point(|par| par.top + par.height <= p.y);
+        let par = frame.paragraphs.get(par_ix)?;
+        // Stale-frame guard: never trust geometry past the live rope.
+        if par.range.end > self.doc.len_bytes() {
+            return None;
+        }
+        if p.y < par.top || p.y >= par.top + par.text_top.min(par.height) {
+            return None; // below the pixels: the caption's own ground
+        }
+        if !matches!(self.doc.blocks().kinds().get(par_ix), Some(BlockKind::Image { .. })) {
+            return None;
+        }
+        let (_, sz) = par.image.as_ref()?; // still decoding: no pixels to hit
+        let img_x = par.indent + ((frame.bounds.size.width - par.indent - sz.width) / 2.).max(px(0.));
+        (p.x >= img_x && p.x < img_x + sz.width).then_some(par_ix)
+    }
+
+    /// §9 copy/cut: the selected picture's travelling Markdown form
+    /// `![alt](src "caption")`, produced by the ONE exporter so quoting
+    /// and span flattening can never fork.
+    fn image_block_markdown(&self, block: usize) -> Option<String> {
+        image_block_markdown_in(&self.doc, block)
+    }
+
+    /// §9's two-entry travelling form for a selected picture: the Markdown
+    /// line as text (caption and alt survive everywhere) and the stored
+    /// bytes as a bitmap (real pixels where the pasteboard carries them —
+    /// on Linux cross-app only the text half survives, the recorded
+    /// platform cost). Bytes leave the asset store exactly as imported,
+    /// so the bitmap entry's format is the asset's own extension.
+    fn image_clipboard_item(&self, block: usize) -> Option<ClipboardItem> {
+        let md = self.image_block_markdown(block)?;
+        let mut entries = vec![ClipboardEntry::String(gpui::ClipboardString::new(md))];
+        if let BlockKind::Image { src, .. } = self.doc.blocks().kind(block)
+            && let Some(bytes) = self.store.as_ref().and_then(|s| s.get_asset(src))
+        {
+            entries.push(ClipboardEntry::Image(gpui::Image::from_bytes(
+                image_format_for_src(src),
+                bytes,
+            )));
+        }
+        Some(ClipboardItem { entries })
+    }
+
     // -- Actions -------------------------------------------------------------
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        // The picture walls come first (inline-images §5): complete a staged
+        // exile, stage at a door, refuse at a wall — before the legacy
+        // strip-the-kind arm below can drain an Image kind (§0's bug).
+        if self.image_delete_gate("backspace", false, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             // The boundary line is removed only via the aside machinery:
             // backspace at manuscript start is a no-op, like backspace at 0.
@@ -6565,6 +7400,10 @@ impl Editor {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        // The picture walls (inline-images §5): see backspace.
+        if self.image_delete_gate("delete", true, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             // Forward-delete at the compost tail must not merge the boundary.
             if self.at_compost_tail(self.cursor_offset())
@@ -6580,11 +7419,25 @@ impl Editor {
     }
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+        // The picture walls (§5) — the word form shares the doors: the word
+        // boundary only crosses a block edge from the edge itself, exactly
+        // where the gate stands.
+        if self.image_delete_gate("backspace", false, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             if self.at_manuscript_start(self.cursor_offset()) {
                 return;
             }
-            let prev = self.previous_word_boundary(self.cursor_offset());
+            let cursor = self.cursor_offset();
+            let block = self.doc.block_of_byte(cursor);
+            let (par_start, _) = self.paragraph_bounds(cursor);
+            let prev = image_word_left_boundary(
+                self.doc.blocks().kinds(),
+                block,
+                par_start,
+                self.previous_word_boundary(cursor),
+            );
             self.select_to(prev, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
@@ -6597,6 +7450,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The picture walls (§5) — see delete_word_left.
+        if self.image_delete_gate("delete", true, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             if self.at_compost_tail(self.cursor_offset())
                 || self.at_separator_start(self.cursor_offset())
@@ -6619,6 +7476,18 @@ impl Editor {
             self.strip_step(-1, cx);
             return;
         }
+        // §4 arrows on a selected picture: deselect toward the direction —
+        // left/up land at the end of the block before, right/down at the
+        // caption's start. Never ON the pixels: there is no fourth state.
+        if let Some(sel) = self.resolve_image_sel() {
+            self.decay_image_sel();
+            let end = sel
+                .block
+                .checked_sub(1)
+                .map_or(0, |block| line_text_end_bytes(self.doc.rope(), block));
+            self.move_to(end, cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
@@ -6629,6 +7498,12 @@ impl Editor {
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         if self.strip.is_parked() {
             self.strip_step(1, cx);
+            return;
+        }
+        if let Some(sel) = self.resolve_image_sel() {
+            let (start, _) = self.image_block_bounds(sel.block);
+            self.decay_image_sel();
+            self.move_to(start, cx); // §4: right/down → the caption's start
             return;
         }
         if self.selected_range.is_empty() {
@@ -6644,6 +7519,15 @@ impl Editor {
             self.history_select(ix, cx);
             return;
         }
+        if let Some(sel) = self.resolve_image_sel() {
+            self.decay_image_sel();
+            let end = sel
+                .block
+                .checked_sub(1)
+                .map_or(0, |block| line_text_end_bytes(self.doc.rope(), block));
+            self.move_to(end, cx); // §4: left/up → end of block before
+            return;
+        }
         self.vertical_by(-1, false, cx);
     }
 
@@ -6651,6 +7535,12 @@ impl Editor {
         if let Some(hv) = &self.history_view {
             let ix = hv.selected + 1;
             self.history_select(ix, cx);
+            return;
+        }
+        if let Some(sel) = self.resolve_image_sel() {
+            let (start, _) = self.image_block_bounds(sel.block);
+            self.decay_image_sel();
+            self.move_to(start, cx); // §4: right/down → the caption's start
             return;
         }
         self.vertical_by(1, false, cx);
@@ -6875,6 +7765,7 @@ impl Editor {
             .doc
             .char_to_byte(outcome.caret.min(self.doc.rope().len_chars()));
         self.set_cursor(caret, false, cx);
+        self.flank_latched = true; // a text-moving verb latches the flanks (LAW 1)
         self.schedule_flash_clear(cx);
         self.mark_dirty();
         self.bump_activity();
@@ -6910,8 +7801,9 @@ impl Editor {
         }
         let range = self.selected_range.clone();
         // The deliberate verb collapses an emptied pile in the same atom
-        // (graveyard-interplay 4).
-        self.file_cut(range, true, cx);
+        // (graveyard-interplay 4) AND interprets whole-block intent (§B1).
+        self.file_cut(range, true, true, cx);
+        self.flank_latched = true; // a text-moving verb latches the flanks (LAW 1)
     }
 
     /// `Move to the manuscript` — the retrieval verb's SURFACE half (08 §2):
@@ -7027,7 +7919,13 @@ impl Editor {
         self.selected_range = s..e;
         self.selection_reversed = false;
         self.marked_range = None;
-        self.selection_popover = false;
+        // The text arrives SELECTED as its own move handle — but the offer is a
+        // text-moving verb's aftermath, so latch the flanks down (LAW 1); the
+        // next genuine selection change lifts the latch.
+        self.flank_latched = true;
+        self.flank_risen = false;
+        self.flank_settle = None;
+        self.flank_sel = self.selected_range.clone();
         self.excursion = None;
         self.pile_end = self
             .doc
@@ -7109,10 +8007,25 @@ impl Editor {
     /// site that ever files a corpse. `collapse_emptied` folds a last-scrap
     /// exile's seam evaporation into the same transaction (the auto-capture
     /// path passes false: the retype-race guard governs it instead).
-    fn file_cut(&mut self, byte_range: Range<usize>, collapse_emptied: bool, cx: &mut Context<Self>) {
+    fn file_cut(
+        &mut self,
+        byte_range: Range<usize>,
+        collapse_emptied: bool,
+        interpret_blocks: bool,
+        cx: &mut Context<Self>,
+    ) {
         let quote = self.origin_quote_before(byte_range.start);
-        self.doc
-            .cut_to_graveyard(byte_range.clone(), quote, now_unix(), collapse_emptied);
+        // The explicit exile verb interprets intent (papercuts §B1): a
+        // whole-block selection takes its bounding separator, leaving no empty
+        // grave. The auto-cut path (a plain type-over/backspace deletion) stays
+        // exact-bytes — two verbs, two contracts.
+        if interpret_blocks {
+            self.doc
+                .exile_to_graveyard(byte_range.clone(), quote, now_unix(), collapse_emptied);
+        } else {
+            self.doc
+                .cut_to_graveyard(byte_range.clone(), quote, now_unix(), collapse_emptied);
+        }
         let caret = byte_range.start.min(self.doc.len_bytes());
         self.selected_range = caret..caret;
         self.selection_reversed = false;
@@ -7232,14 +8145,30 @@ impl Editor {
     /// the manuscript by the core; here we place the caret, flash the returned
     /// paragraph, and drop the now-stale expanded flag.
     fn put_back_entry(&mut self, id: u64, cx: &mut Context<Self>) {
+        // A whole-block entry returns the caret at the START of its rebuilt
+        // block (§B2 reveal-the-landing); a fragment splice returns it after
+        // the re-inserted text (unchanged).
+        let whole = self
+            .doc
+            .graveyard()
+            .get(id)
+            .map(|e| e.whole_blocks)
+            .unwrap_or(false);
         let Some(caret_char) = self.doc.put_back(id) else {
             return;
         };
         self.sync_mutations();
         let caret = self.doc.char_to_byte(caret_char.min(self.doc.rope().len_chars()));
         self.grave_expanded.retain(|e| *e != id);
-        // Flash the paragraph the passage returned to (P13's visible inverse).
-        self.para_flash = Some((caret_char.saturating_sub(1), Instant::now()));
+        // Flash the paragraph the passage returned to (P13's visible inverse):
+        // the block itself for a whole-block return, the merged-into line for a
+        // fragment splice.
+        let flash_at = if whole {
+            caret_char
+        } else {
+            caret_char.saturating_sub(1)
+        };
+        self.para_flash = Some((flash_at, Instant::now()));
         self.autoscroll_request = true;
         self.set_cursor(caret, false, cx);
         self.schedule_flash_clear(cx);
@@ -7660,11 +8589,25 @@ impl Editor {
             self.cancel_link(window, cx);
             return;
         }
-        if self.selection_popover {
-            self.selection_popover = false;
+        // A selected picture is its own dismissable layer (inline-images
+        // §4/§5 decay): Esc deselects and returns the caret exactly whence
+        // the state was entered — the door caret when keyboard-born, the
+        // caption start when click-born. The parked `selected_range` IS
+        // that caret (enter_image_sel), so dropping the state reveals it;
+        // cancellation relocating the locus is itself harm.
+        if self.resolve_image_sel().is_some() {
+            self.decay_image_sel();
+            self.bump_activity(); // the caret returns: blink solid, scroll to it
             cx.notify();
             return;
         }
+        // The travel-home and history/strip layers run BEFORE the
+        // collapse-selection fallback (finding 5): a find/@/chip jump often
+        // leaves the matched text SELECTED under a latched excursion, and the
+        // documented contract ("Esc closes find, Esc travels home", ~4947) must
+        // cost two presses, not three. Field-cancel still comes first (spec §1
+        // A1 — the field layers above already returned).
+        //
         // Esc-home ends a LATCHED excursion (08 §2; scopes-search 1): only a
         // tail entered by travel — chip, ctrl-shift-o, a find/@ jump — travels
         // back; a caret the writer walked in herself (scroll-and-click) makes
@@ -7698,13 +8641,65 @@ impl Editor {
         }
         if self.history_view.is_some() {
             self.exit_history(cx);
+            return;
+        }
+        // The flanks are NEVER their own Escape layer (LAW 1): with nothing
+        // bigger to dismiss, Escape collapses a live selection to a caret, which
+        // lowers the flanks as a consequence. Latch so a restore can't re-raise
+        // them. Last, so a match-selection never shadows travel-home above.
+        if !self.selected_range.is_empty() {
+            let caret = self.cursor_offset();
+            self.set_cursor(caret, self.cursor_affinity_down, cx);
+            self.flank_latched = true;
         }
     }
 
-    /// ctrl-.: summon the selection popover by keyboard (the ARIA-toolbar
-    /// requirement — no capability reachable by only one modality).
-    fn toggle_popover(&mut self, _: &TogglePopover, _: &mut Window, cx: &mut Context<Self>) {
-        self.selection_popover = !self.selection_popover && !self.selected_range.is_empty();
+    /// ctrl-.: the deliberate keyboard summon (LAW 1 / A1 — the ARIA-toolbar
+    /// requirement, no capability reachable by only one modality). Unlike the
+    /// passive settle-gated raise, this forces the flanks up NOW (past the beat
+    /// and any latch) and moves focus INTO the flank, where arrows navigate cells
+    /// and Enter fires; Escape (`exit_flank`) returns to the prose caret.
+    fn toggle_popover(&mut self, _: &TogglePopover, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            return;
+        }
+        self.flank_latched = false;
+        self.flank_risen = true;
+        self.flank_settle = None;
+        self.flank_sel = self.selected_range.clone();
+        // Only ENTER the flank when the grid form actually paints in a real
+        // gutter (finding 2). The horizontal fallback is formatting-only display
+        // with no cell navigation, and the link field owns the flank when open —
+        // focusing `flank_focus_handle` in either case would strand the keyboard
+        // on an unpainted target. Where there's no grid, raise the flank as pure
+        // display and keep prose focus.
+        let grid = self.link_input.is_none()
+            && self
+                .flank_layout(window)
+                .is_some_and(|l| l.gate.left == FlankLeft::Grid);
+        if grid {
+            self.enter_flank(window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Move keyboard focus into the raised flank (the ctrl-. deliberate path).
+    /// The saved caret is the selection's own live range, restored by
+    /// `exit_flank`. Passive raise never calls this — it claims no focus.
+    fn enter_flank(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flank_focus_cell = 0;
+        self.flank_focused = true;
+        window.focus(&self.flank_focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Return focus to the prose at the live selection (Escape from a focused
+    /// flank). The selection was never disturbed, so the caret lands where it
+    /// left off.
+    fn exit_flank(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flank_focused = false;
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -8337,6 +9332,91 @@ impl Editor {
             self.restore_selected(cx);
             return;
         }
+        // §4: Enter on a selected picture makes room on the side the
+        // insertion point faces — a selected object faces past itself, so
+        // a fresh paragraph opens BELOW and takes the caret; the picture
+        // stays (Enter makes room, a key that makes room must not destroy
+        // furniture — §12). The split runs at the caption's end, so the
+        // model's split law births the tail a Paragraph on its own (R6).
+        // (image_sel_live is None under every read-only takeover, so this
+        // arm cannot fire where edits are refused.)
+        if let Some(sel) = self.resolve_image_sel() {
+            self.decay_image_sel();
+            let (_, end) = self.image_block_bounds(sel.block);
+            self.doc.edit_bytes(end..end, "\n");
+            let caret = end + 1;
+            self.selected_range = caret..caret;
+            self.selection_reversed = false;
+            self.cursor_affinity_down = false;
+            self.goal_x = None;
+            self.marked_range = None;
+            self.caret_attrs.clear();
+            self.sync_mutations();
+            self.bump_activity();
+            cx.notify();
+            return;
+        }
+        // §6: Enter at the start of a NON-EMPTY caption opens room ABOVE —
+        // picture and caption stay together, the caret stays at the caption
+        // start (a caret at text start faces before it; without this the
+        // split law would strand the caption below a captionless picture).
+        // Mid/end/empty fall through to the ordinary split below, where the
+        // model's split law makes the tail a Paragraph (R6: no kind stamps;
+        // the empty-caption collision resolves to below — §6).
+        let cursor = self.cursor_offset();
+        // Plain read-only checks, not cr_guard: this branch edits the
+        // document directly, but a refused Enter must pulse exactly once —
+        // the fallthrough's apply_replace owns that refusal.
+        if self.cold_read.is_none()
+            && !self.strip.is_parked()
+            && self.selected_range.is_empty()
+        {
+            let block = self.doc.block_of_byte(cursor.min(self.doc.len_bytes()));
+            if let BlockKind::Image { src, alt } = self.doc.blocks().kind(block).clone() {
+                let (par_start, par_end) = self.paragraph_bounds(cursor);
+                if caption_enter_opens_above(cursor == par_start, par_start == par_end) {
+                    if par_start > 0 {
+                        // Split the block ABOVE at its end: the flowing
+                        // split law births the fresh line between prose and
+                        // picture; the image block is never the split
+                        // source, so nothing here can clone it (§2). The
+                        // fragment clones its source's kind (flowing law) —
+                        // demote non-paragraph residue in the same tx, the
+                        // Enter-at-heading-end convention.
+                        self.doc.edit_bytes(par_start - 1..par_start - 1, "\n");
+                        if *self.doc.blocks().kind(block) != BlockKind::Paragraph {
+                            self.doc
+                                .set_block_kind_in_current_tx(block, BlockKind::Paragraph);
+                        }
+                    } else {
+                        // Document-leading image: the split source IS the
+                        // image block, whose FIRST fragment keeps the
+                        // furniture kind (§2) — pointing the wrong way for
+                        // room-above. Correct both fragments inside the same
+                        // transaction (one undo restores everything): the
+                        // deliberate, narrow exception to R6's no-stamping,
+                        // where the model's law cannot express "room above
+                        // at the document's head".
+                        self.doc.edit_bytes(0..0, "\n");
+                        self.doc
+                            .set_block_kind_in_current_tx(0, BlockKind::Paragraph);
+                        self.doc
+                            .set_block_kind_in_current_tx(1, BlockKind::Image { src, alt });
+                    }
+                    let caret = par_start + 1; // the caption start, shifted past the fresh line
+                    self.selected_range = caret..caret;
+                    self.selection_reversed = false;
+                    self.cursor_affinity_down = false;
+                    self.goal_x = None;
+                    self.marked_range = None;
+                    self.caret_attrs.clear();
+                    self.sync_mutations();
+                    self.bump_activity();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         // Enter at the end of a heading/divider starts a paragraph, not
         // another heading (the split otherwise inherits the block kind).
         let cursor = self.cursor_offset();
@@ -8348,7 +9428,21 @@ impl Editor {
                 self.doc.blocks().kind(block),
                 BlockKind::Heading(_) | BlockKind::Divider
             );
+        // Inline momentum dies at the paragraph seam (papercuts §A2): a new
+        // paragraph starts with clean inline state, exactly as it starts with a
+        // clean block kind. The span-side seam (SpanSet stops right-edge
+        // expansion across a newline) covers marks the caret sits at the edge
+        // of; clearing the sticky caret arm here means the freshly opened
+        // paragraph is not still-armed. But `replace_text_in_range` may REFUSE
+        // the edit (cold read, parked past): clear only AFTER the seam actually
+        // opened (V5a), gauged by the revision bump — a refused Enter keeps the
+        // writer's unspent arm intact.
+        let rev = self.doc.revision();
         self.replace_text_in_range(None, "\n", window, cx);
+        if self.doc.revision() == rev {
+            return; // the edit was refused — arm and block kind untouched
+        }
+        self.caret_attrs.clear();
         if demote {
             let new_block = self.doc.block_of_byte(self.cursor_offset());
             self.doc
@@ -8375,6 +9469,19 @@ impl Editor {
         let seam = self.doc.boundary().map(|(_, b)| b);
         let start_block = self.doc.block_of_byte(self.selected_range.start);
         let end_block = self.doc.block_of_byte(self.selected_range.end);
+        // §2: the picture changes only by whole-block verbs, and a format
+        // verb is not one of them — stamping over BlockKind::Image drops
+        // src/alt and the pixels with them. Anchored ON the furniture
+        // (caret in the caption, or the picture selected — ImageSel parks
+        // the caret at the caption start), the verb refuses whole; the
+        // selection decays without harm (§4's plain decay, nothing moves).
+        if self.doc.blocks().kind(start_block).is_furniture() {
+            if self.image_sel.is_some() {
+                self.decay_image_sel();
+                cx.notify();
+            }
+            return;
+        }
         let target = if *self.doc.blocks().kind(start_block) == kind {
             BlockKind::Paragraph
         } else {
@@ -8388,7 +9495,10 @@ impl Editor {
             self.doc.set_block_kind(start_block, BlockKind::Paragraph);
         }
         for block in start_block + 1..=end_block {
-            if Some(block) == seam {
+            // A range that merely CROSSES furniture skips it — the same
+            // lane the seam line rides (§2: the wall law holds inside a
+            // sweep too).
+            if Some(block) == seam || self.doc.blocks().kind(block).is_furniture() {
                 continue;
             }
             self.doc.set_block_kind_in_current_tx(block, target.clone());
@@ -8462,6 +9572,15 @@ impl Editor {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
+            // §9: the selected picture travels as TWO entries — the
+            // Markdown line (caption + alt, the honest text form) and the
+            // pixels — so elsewhere never gets a dead asset: link alone.
+            if let Some(sel) = self.image_sel_live()
+                && let Some(item) = self.image_clipboard_item(sel.block)
+            {
+                crate::smoke::mirror_clipboard_item(&item);
+                cx.write_to_clipboard(item);
+            }
             return;
         }
         // Copy MUST work while parked (Bug B): the writer wants to lift text out
@@ -8477,9 +9596,11 @@ impl Editor {
                 p.text.get(r).unwrap_or("").to_owned()
             }
             // Live copy strips the seam from a spanning selection
-            // (seam-mechanics 2 — the fragments join with one newline).
-            None => self.selection_text(&self.selected_range.clone()),
+            // (seam-mechanics 2 — the fragments join with one newline) and
+            // carries whole-covered pictures in their Markdown form (§9).
+            None => self.clipboard_text(&self.selected_range.clone()),
         };
+        crate::smoke::mirror_clipboard(&text);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
@@ -8493,39 +9614,177 @@ impl Editor {
             self.pulse_strip(cx);
             return;
         }
-        if !self.selected_range.is_empty() {
-            // Cut = copy + delete (seam-mechanics 2): the clipboard joins a
-            // spanning selection's fragments; the delete path below splits
-            // at the seam and leaves it between the remnants.
-            let text = self.selection_text(&self.selected_range.clone());
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.replace_text_in_range(None, "", window, cx);
+        if self.selected_range.is_empty() {
+            // §9 cut = copy + leave-whole: the same two entries, then the
+            // block exits by the §5 whole-block door — both halves of the
+            // verb in one gesture, inverse intact (P13: Put back, or paste
+            // it back — either door).
+            if let Some(sel) = self.resolve_image_sel()
+                && let Some(item) = self.image_clipboard_item(sel.block)
+            {
+                crate::smoke::mirror_clipboard_item(&item);
+                cx.write_to_clipboard(item);
+                self.exile_image_block(sel.block, cx);
+            }
+            return;
         }
+        // Cut = copy + delete (seam-mechanics 2): the clipboard joins a
+        // spanning selection's fragments (pictures in Markdown form, §9);
+        // the delete path below splits at the seam and leaves it between
+        // the remnants.
+        let text = self.clipboard_text(&self.selected_range.clone());
+        crate::smoke::mirror_clipboard(&text);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.replace_text_in_range(None, "", window, cx);
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
-        let Some(item) = cx.read_from_clipboard() else {
-            // Headless-rig transport shim (see smoke::clipboard_override):
-            // present so a leak test CAN catch a field paste falling
-            // through to the document — never set outside smoke runs.
-            if let Some(text) = crate::smoke::clipboard_override() {
-                self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
-            }
+        // The or_else is the headless-rig transport shim (see
+        // smoke::clipboard_item_override) — never set outside smoke runs;
+        // it now carries whole items so the rig can round-trip §9's
+        // two-entry image form, not just text.
+        let Some(item) = cx
+            .read_from_clipboard()
+            .or_else(crate::smoke::clipboard_item_override)
+        else {
             return;
         };
-        for entry in item.into_entries() {
+        // §9's gates, priced for prose: one reference pass over the
+        // entries, and the image-line parse runs only when the text even
+        // contains "![" — an ordinary paste pays two finds and a substring
+        // scan, no allocation beyond what it always paid.
+        let mut entries = item.entries;
+        let text_entry: Option<String> = entries.iter().find_map(|e| match e {
+            ClipboardEntry::String(s) => Some(s.text().replace("\r\n", "\n")),
+            _ => None,
+        });
+        let bitmap_ix = entries
+            .iter()
+            .position(|e| matches!(e, ClipboardEntry::Image(_)));
+        let take_bitmap = |entries: &mut Vec<ClipboardEntry>, ix: usize| -> Vec<u8> {
+            match entries.swap_remove(ix) {
+                ClipboardEntry::Image(img) => img.bytes,
+                _ => unreachable!("bitmap_ix indexes an Image entry"),
+            }
+        };
+        let strop_line = text_entry
+            .as_deref()
+            .filter(|t| t.contains("!["))
+            .and_then(strop_core::markdown::parse_image_line);
+
+        if let Some(sel) = self.image_sel_live() {
+            // §4: a paste that MEANS a picture, aimed at the selected
+            // picture, replaces in place — same block, caption and alt
+            // untouched, one undo step. The §9 precedence still orders the
+            // pixel sources: the text form's asset: hash when it resolves
+            // here (no bytes touched at all), else the sibling bitmap
+            // through the §5b import. Text that isn't a picture falls
+            // through — apply_replace's §4 gate types it into the caption.
+            if let Some(line) = &strop_line {
+                if self.store.as_ref().is_some_and(|s| s.has_asset(&line.src)) {
+                    self.doc.replace_image_src(sel.block, line.src.clone());
+                    self.restamp_image_sel(sel.block);
+                    self.mark_dirty();
+                    self.sync_mutations();
+                    self.bump_activity();
+                    cx.notify();
+                } else if let Some(ix) = bitmap_ix {
+                    let bytes = take_bitmap(&mut entries, ix);
+                    self.replace_selected_image_pixels(sel, bytes, cx);
+                } else {
+                    // A picture-shaped paste whose pixels resolve nowhere:
+                    // refused, logged — a replace that cannot deliver
+                    // pixels must not degrade into caption text.
+                    eprintln!(
+                        "strop: paste aimed at the selected picture, \
+                         but its pixels resolve nowhere; nothing changed"
+                    );
+                }
+                return;
+            }
+            if let Some(ix) = bitmap_ix {
+                let bytes = take_bitmap(&mut entries, ix);
+                self.replace_selected_image_pixels(sel, bytes, cx);
+                return;
+            }
+        } else if let Some(line) = &strop_line {
+            // §9's precedence ladder, single image line: the text form
+            // wins — caption and alt come from it ALWAYS; pixels from the
+            // asset store when the hash resolves in this document, else
+            // from the sibling bitmap (blake3 dedupe keeps the re-import
+            // byte-honest), else the paste degrades to the literal
+            // Markdown line as visible text — the fall-through below.
+            if self.strip.is_parked() {
+                self.pulse_strip(cx);
+                return;
+            }
+            if self.history_view.is_some() {
+                return;
+            }
+            if self.store.as_ref().is_some_and(|s| s.has_asset(&line.src)) {
+                if self.selected_range.is_empty() && self.marked_range.is_none() {
+                    // The picture verb's shape (§7): its own block after
+                    // the caret's, caret parked past it.
+                    let (caption, spans) =
+                        strop_core::markdown::caption_from_title(&line.caption);
+                    let cursor = self.cursor_offset().min(self.doc.len_bytes());
+                    let cursor = self.doc.insert_image_block_full(
+                        cursor,
+                        line.src.clone(),
+                        line.alt.clone(),
+                        &caption,
+                        &spans,
+                    );
+                    self.selected_range = cursor..cursor;
+                    self.selection_reversed = false;
+                    self.mark_dirty();
+                    self.sync_mutations();
+                    self.bump_activity();
+                    cx.notify();
+                    return;
+                }
+                // Over a range selection the paste is the text verb: the
+                // rebuild splice replaces the selection in one step. A
+                // landing the splice can't honor (seam, wall) degrades to
+                // the literal line below — visible, never silent.
+                if self.paste_rebuild_lines(
+                    text_entry.as_deref().unwrap_or_default(),
+                    vec![(0, line.clone())],
+                    cx,
+                ) {
+                    return;
+                }
+            } else if let Some(ix) = bitmap_ix {
+                let bytes = take_bitmap(&mut entries, ix);
+                self.import_image_with_meta(bytes, line.alt.clone(), line.caption.clone(), cx);
+                return;
+            }
+        } else if let Some(text) = text_entry.as_deref().filter(|t| t.contains("![") && t.contains('\n')) {
+            // §9's range-paste: each LINE that parses as a Strop image
+            // line with a resolving asset rebuilds an image block; every
+            // other line stays literal visible text (the boundary rule).
+            let images = image_lines_in(text, &|src| {
+                self.store.as_ref().is_some_and(|s| s.has_asset(src))
+            });
+            if !images.is_empty() && self.paste_rebuild_lines(text, images, cx) {
+                return;
+            }
+        }
+        // The ordinary path, order-preserved from before §9: a foreign
+        // bitmap takes the bare §5b import; text pastes as text (never
+        // typographed — already authored).
+        for entry in entries {
             match entry {
                 ClipboardEntry::Image(image) => {
                     self.import_image_bytes(image.bytes, cx);
                     return;
                 }
                 ClipboardEntry::String(text) => {
-                    // Pasted text is never typographed — already authored.
                     let text = text.text().replace("\r\n", "\n");
-                    self.apply_replace(None, &text, false, cx);
+                    self.apply_replace(None, &text, false, true, cx);
                     return;
                 }
                 // New variant post-0.2.2; pasting file paths did nothing
@@ -8535,15 +9794,115 @@ impl Editor {
         }
     }
 
+    /// §9's multi-line rebuild: ONE verbatim splice carries the whole
+    /// paste — image lines travel as their caption text — and the image
+    /// kinds, alt and caption spans stamp inside the same transaction, so
+    /// undo takes the paste back in one step. Boundary separators are
+    /// added by the plan so a rebuilt picture always owns its whole line
+    /// (the §2 wall's insert-shape corollary: prose never fuses onto a
+    /// picture). Returns false — nothing mutated — when the landing
+    /// crosses a law this splice can't honor (a seam-spanning or
+    /// furniture-touching selection): the caller degrades to the literal
+    /// text paste, visible, never silent (recorded ruling).
+    fn paste_rebuild_lines(
+        &mut self,
+        text: &str,
+        images: Vec<(usize, strop_core::markdown::ImageLine)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return true; // consumed: the past is read-only
+        }
+        if self.history_view.is_some() {
+            return true;
+        }
+        let range = self
+            .marked_range
+            .clone()
+            .unwrap_or(self.selected_range.clone());
+        if self.selection_spans_seam(&range) {
+            return false;
+        }
+        if !range.is_empty() {
+            // The wall-clamped replace decomposes at furniture and lands
+            // the insert elsewhere than range.start — the stamp math below
+            // would misdress blocks. Degrade instead of guessing.
+            let rope = self.doc.rope();
+            let first = rope.byte_to_line(range.start);
+            let last = rope.byte_to_line(range.end.min(self.doc.len_bytes()));
+            let kinds = self.doc.blocks().kinds();
+            if kinds[first..=last.min(kinds.len().saturating_sub(1))]
+                .iter()
+                .any(BlockKind::is_furniture)
+            {
+                return false;
+            }
+        }
+        let rope = self.doc.rope();
+        let at_line_start = range.start == 0
+            || rope.char(rope.byte_to_char(range.start) - 1) == '\n';
+        let at_line_end = range.end < self.doc.len_bytes()
+            && rope.char(rope.byte_to_char(range.end)) == '\n';
+        let (final_text, stamps) =
+            plan_image_line_rebuild(text, images, at_line_start, at_line_end);
+        self.doc.edit_bytes_verbatim(range.clone(), &final_text);
+        let base_line = self.doc.rope().byte_to_line(range.start);
+        for (line_ix, line, spans) in &stamps {
+            let block = base_line + line_ix;
+            self.doc.set_block_kind_in_current_tx(
+                block,
+                BlockKind::Image {
+                    src: line.src.clone(),
+                    alt: line.alt.clone(),
+                },
+            );
+            let cap_start = self.doc.rope().line_to_char(block);
+            for s in spans.spans() {
+                self.doc.format_in_current_tx(
+                    cap_start + s.range.start..cap_start + s.range.end,
+                    s.attr.clone(),
+                    true,
+                );
+            }
+        }
+        let caret = (range.start + final_text.len()).min(self.doc.len_bytes());
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.goal_x = None;
+        self.mark_dirty();
+        self.sync_mutations();
+        self.bump_activity();
+        cx.notify();
+        // A replaced range may have carried margin anchors, exactly like
+        // any other structural removal.
+        self.reconcile_dead_anchors(cx);
+        true
+    }
+
     /// Run the §5b import pipeline off the UI thread, then insert a block.
     fn import_image_bytes(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.import_image_with_meta(bytes, String::new(), String::new(), cx);
+    }
+
+    /// §9's middle rung shares the §5b pipeline: the pixels re-import
+    /// (blake3 dedupe keeps it byte-honest) and the block lands wearing
+    /// the text form's caption and alt — empty for a bare bitmap.
+    fn import_image_with_meta(
+        &mut self,
+        bytes: Vec<u8>,
+        alt: String,
+        caption_md: String,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { strop_core::images::import_image(bytes) })
                 .await;
             this.update(cx, |editor: &mut Editor, cx| match result {
-                Ok(imported) => editor.insert_image_block(imported, cx),
+                Ok(imported) => editor.insert_imported_image(imported, &alt, &caption_md, cx),
                 Err(e) => eprintln!("strop: {e}"),
             })
             .ok();
@@ -8551,9 +9910,11 @@ impl Editor {
         .detach();
     }
 
-    fn insert_image_block(
+    fn insert_imported_image(
         &mut self,
         imported: strop_core::images::Imported,
+        alt: &str,
+        caption_md: &str,
         cx: &mut Context<Self>,
     ) {
         let Some(store) = &self.store else {
@@ -8563,18 +9924,14 @@ impl Editor {
         let src = store.put_asset(imported.bytes, imported.ext);
         self.mark_dirty();
         let cursor = self.cursor_offset().min(self.doc.len_bytes());
-        let (_, par_end) = self.paragraph_bounds(cursor);
-        self.doc.edit_bytes(par_end..par_end, "\n");
-        let block = self.doc.block_of_byte((par_end + 1).min(self.doc.len_bytes()));
-        self.doc.set_block_kind_in_current_tx(
-            block,
-            BlockKind::Image {
-                src,
-                alt: String::new(),
-                caption: String::new(),
-            },
-        );
-        let cursor = par_end + 1;
+        // The image stands as its OWN block and the caret lands at the START
+        // of the block after it (report 4) — never ON the image, where typing
+        // would write invisible text into the image block. The document owns
+        // the shape (separators, trailing paragraph, kind stamp, one tx).
+        let (caption, spans) = strop_core::markdown::caption_from_title(caption_md);
+        let cursor =
+            self.doc
+                .insert_image_block_full(cursor, src, alt.to_owned(), &caption, &spans);
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.sync_mutations();
@@ -8582,13 +9939,275 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_file_drop(&mut self, paths: &ExternalPaths, _: &mut Window, cx: &mut Context<Self>) {
+    /// §4 replace-in-place, the async half: the §5b import runs
+    /// off-thread, and the SELECTION is re-checked on the UI thread after
+    /// it lands — block AND revision — because the writer may have
+    /// deselected or edited meanwhile. A decayed aim DROPS the operation
+    /// (recorded ruling): a replace is aimed at a selection; when the aim
+    /// is gone, materializing the picture at some caret the writer never
+    /// aimed would be a silent insertion elsewhere — §4's exact forbidden
+    /// outcome. Nothing destructive happened; one stderr line records the
+    /// drop.
+    fn replace_selected_image_pixels(
+        &mut self,
+        sel: ImageSel,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { strop_core::images::import_image(bytes) })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                let imported = match result {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("strop: {e}");
+                        return;
+                    }
+                };
+                if editor
+                    .image_sel_live()
+                    .is_none_or(|l| (l.block, l.revision) != (sel.block, sel.revision))
+                {
+                    eprintln!(
+                        "strop: replace-in-place aimed at a picture that is \
+                         no longer selected; dropped (nothing changed)"
+                    );
+                    return;
+                }
+                let Some(store) = &editor.store else { return };
+                let src = store.put_asset(imported.bytes, imported.ext);
+                // Same block, caption + alt untouched, ONE undo step (§4;
+                // the snapshot path inside replace_image_src) — then the
+                // legitimate in-state mutation re-stamps the revision
+                // guard through the one funnel (R3).
+                editor.doc.replace_image_src(sel.block, src);
+                editor.restamp_image_sel(sel.block);
+                editor.mark_dirty();
+                editor.sync_mutations();
+                editor.bump_activity();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// §7: the drop lands at the GAP between blocks nearest the pointer,
+    /// and the caret never moves — the hand aimed the drop; the caret
+    /// wasn't involved (the old caret-relative landing is the recorded
+    /// Norman gulf-of-evaluation failure). The pointer-targeted landing
+    /// is unconditional: it reads the drop's own position (Submit carries
+    /// it; `window.mouse_position()` holds it here), never the drag-over
+    /// rule, so a platform that withheld Pending still lands right.
+    /// Multi-file: each file in order at the same gap. ONE file dropped
+    /// onto the selected picture's pixels replaces in place (§4); a
+    /// multi-file drop always lands at the gap — spraying N pictures into
+    /// one replace slot has no honest meaning (recorded ruling).
+    fn on_file_drop(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_gap = None;
+        if self.cr_guard(cx) {
+            return; // the reading room refuses with the pulse
+        }
+        if self.strip.is_parked() {
+            self.pulse_strip(cx);
+            return; // the past is read-only
+        }
+        if self.history_view.is_some() {
+            return;
+        }
+        let position = window.mouse_position();
+        if let [path] = paths.paths()
+            && let Some(sel) = self.image_sel_live()
+            && self.image_pixel_hit(position) == Some(sel.block)
+        {
+            match std::fs::read(path) {
+                Ok(bytes) => self.replace_selected_image_pixels(sel, bytes, cx),
+                Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
+            }
+            return;
+        }
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let p = frame.doc_point(position);
+        let Some((gap, _)) = self.drop_gap_at(p) else {
+            return;
+        };
+        let mut files = Vec::new();
         for path in paths.paths() {
             match std::fs::read(path) {
-                Ok(bytes) => self.import_image_bytes(bytes, cx),
+                Ok(bytes) => files.push(bytes),
                 Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
             }
         }
+        if files.is_empty() {
+            return;
+        }
+        // Anchor the gap as a byte and revision: gap g > 0 means "after
+        // block g-1" (its end names the gap). Gap 0 — before the first
+        // block — is the one splice `insert_image_block` can't express
+        // (None).
+        let anchor = (gap > 0).then(|| DropAnchor {
+            byte: self.image_block_bounds(gap - 1).1,
+            revision: self.doc.revision(),
+        });
+        cx.spawn(async move |this, cx| {
+            let imported = cx
+                .background_executor()
+                .spawn(async move {
+                    files
+                        .into_iter()
+                        .filter_map(|b| {
+                            strop_core::images::import_image(b)
+                                .map_err(|e| eprintln!("strop: {e}"))
+                                .ok()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                editor.land_dropped_images(imported, anchor, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The UI-thread half of a §7 drop: stand each picture at the gap, in
+    /// order, and leave the caret exactly where it stood — its offsets
+    /// shift with the insertion when it sits below the gap (same text
+    /// position, never a new one), and NO autoscroll fires: the writer is
+    /// looking at the drop, not the caret.
+    fn land_dropped_images(
+        &mut self,
+        imported: Vec<strop_core::images::Imported>,
+        anchor: Option<DropAnchor>,
+        cx: &mut Context<Self>,
+    ) {
+        if imported.is_empty() {
+            return;
+        }
+        let Some(store) = &self.store else {
+            eprintln!("strop: image dropped, but no document store to keep it in");
+            return;
+        };
+        let srcs: Vec<String> = imported
+            .into_iter()
+            .map(|i| store.put_asset(i.bytes, i.ext))
+            .collect();
+        self.mark_dirty();
+        let caret = self.selected_range.clone();
+        let before_len = self.doc.len_bytes();
+        // The drop aimed at a spatial gap. After an intervening edit, the
+        // nearest surviving block end is the honest landing: clamp the old
+        // byte, then snap to the containing line's text end. With no edit,
+        // retain the exact captured byte as before.
+        let anchor = resolve_drop_anchor(&self.doc, anchor);
+        let mut at = anchor;
+        for src in srcs {
+            let after = match at {
+                Some(a) => self.doc.insert_image_block(a, src),
+                None => self.doc.insert_image_block_before_first(src),
+            };
+            // The next file lands below this one: the new block's own
+            // line end names the gap under it. `insert_image_block` opens
+            // that following line with its recorded synthesized `\n`.
+            at = Some(after.saturating_sub(1));
+        }
+        let delta = self.doc.len_bytes() - before_len;
+        let len = self.doc.len_bytes();
+        // A caret byte at the anchor itself is the end of the block ABOVE
+        // the gap — it stays; gap 0 has no block above, so everything
+        // shifts.
+        let shift = |o: usize| shift_drop_caret(o, anchor, delta, len);
+        self.selected_range = shift(caret.start)..shift(caret.end);
+        self.sync_mutations();
+        self.bump_activity();
+        cx.notify();
+    }
+
+    /// §7's drag-over layer: while an external file drag crosses the
+    /// window, park the insertion rule at the gap nearest the pointer.
+    /// gpui synthesizes FileDropEvent::Pending into MouseMove with the
+    /// paths riding `cx.active_drag` (fork window.rs:4602), which is
+    /// exactly what `on_drag_move::<ExternalPaths>` keys on; a platform
+    /// that withholds Pending simply never paints the rule — the landing
+    /// law in `on_file_drop` does not depend on it.
+    fn on_external_drag_move(
+        &mut self,
+        ev: &DragMoveEvent<ExternalPaths>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // gpui's drop dispatch gates on `hitbox.is_hovered`, which reads
+        // the input-modality flag — and FileDropEvent never updates it
+        // (fork window.rs:4529 maps only KeyDown/MouseDown/MouseMove), so
+        // a drop right after TYPING would be silently refused: during a
+        // drag the pointer is grabbed and no real MouseMove ever arrives
+        // to flip the flag. Nudge it with exactly the event the platform
+        // would have sent — deferred, never re-entering dispatch mid-event.
+        // Rig-proven (dragenter after ctrl-end); the fork-side modality
+        // fix is a named follow-up on the pending fork-push ceremony.
+        if window.last_input_was_keyboard() {
+            let position = ev.event.position;
+            window.defer(cx, move |window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                        position,
+                        pressed_button: None,
+                        modifiers: gpui::Modifiers::default(),
+                    }),
+                    cx,
+                );
+            });
+        }
+        if self.history_view.is_some() || self.strip.is_parked() || self.cold_read.is_some() {
+            if self.drop_gap.take().is_some() {
+                cx.notify();
+            }
+            return; // surfaces where the drop would be refused show no rule
+        }
+        // A one-file drop ON the selected pixels replaces in place (§4),
+        // so §7's insertion rule would lie about the landing. The paths
+        // ride active_drag during Pending; keep the still honest.
+        if matches!(ev.drag(cx).paths(), [_])
+            && let Some(sel) = self.image_sel_live()
+            && self.image_pixel_hit(ev.event.position) == Some(sel.block)
+        {
+            if self.drop_gap.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let gap = self.drop_gap_at(frame.doc_point(ev.event.position));
+        if gap != self.drop_gap {
+            self.drop_gap = gap;
+            cx.notify();
+        }
+    }
+
+    /// The gap between blocks nearest a doc-space point, with the
+    /// insertion rule's doc-space y (`drop_gap_for_y` owns the math).
+    /// None on a stale frame — never trust geometry past the live rope.
+    fn drop_gap_at(&self, p: Point<Pixels>) -> Option<(usize, Pixels)> {
+        let frame = self.last_frame.as_ref()?;
+        let last = frame.paragraphs.last()?;
+        if last.range.end > self.doc.len_bytes() {
+            return None;
+        }
+        let rows: Vec<(f32, f32)> = frame
+            .paragraphs
+            .iter()
+            .map(|par| (f32::from(par.top), f32::from(par.height)))
+            .collect();
+        let (gap, y) = drop_gap_for_y(&rows, f32::from(p.y));
+        Some((gap, px(y)))
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
@@ -8674,8 +10293,13 @@ impl Editor {
         let target = (self.scroll_top - delta.y).clamp(px(0.), frame.max_scroll());
         if target != self.scroll_top {
             self.scroll_top = target;
-            // Anchored to stale geometry once the text moves — dismiss.
-            self.selection_popover = false;
+            // §5's decay table: looking elsewhere abandons both a clicked
+            // picture selection and a staged exile before it can complete
+            // destructively against furniture now off-screen.
+            self.decay_image_sel();
+            // The flanks FOLLOW the selection (LAW 1): `flank_layout` recomputes
+            // geometry each frame and its off-screen gate hides them when the
+            // selection scrolls out of view — so scrolling no longer dismisses.
             cx.notify();
         }
     }
@@ -8710,7 +10334,6 @@ impl Editor {
             let t = px(reveal_scroll(target.anchor_y, vp_h, max_scroll, below));
             if t != self.scroll_top {
                 self.scroll_top = t;
-                self.selection_popover = false;
                 cx.notify();
             }
         } else {
@@ -8799,6 +10422,12 @@ impl Editor {
         if par.range.end > self.doc.len_bytes() {
             return None;
         }
+        // An image's pixels are not its caption text (§4). This router runs
+        // before image_pixel_hit, so refusing the picture band here lets the
+        // click reach the picture-selection door below.
+        if !footnote_text_band_contains(par.top, par.text_top, p.y) {
+            return None;
+        }
         let rope = self.doc.rope();
         if p.x < par.indent {
             // The def's marker gutter: jump back to the in-text ref.
@@ -8816,7 +10445,8 @@ impl Editor {
         }
         // A ref's carrier: jump forward to the def. Hit-test the span's
         // glyph band — a caret landing *next to* the ref must not teleport.
-        let line_ix = (((p.y - par.top) / par.line_height) as usize).min(par.line_count() - 1);
+        let line_ix = (((p.y - par.top - par.text_top).max(px(0.)) / par.line_height) as usize)
+            .min(par.line_count() - 1);
         for s in self.doc.spans().spans() {
             let InlineAttr::FootnoteRef(id) = &s.attr else {
                 continue;
@@ -8905,6 +10535,22 @@ impl Editor {
     /// the window root — the layers themselves stop propagation, so only
     /// genuinely-outside clicks arrive here.
     fn light_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // LAW 2 / C4 — no dead zones ANYWHERE: the margin lane, the titlebar
+        // blank and the gutters all live OUTSIDE the editor column's hitbox,
+        // so the column's own `on_mouse_down` (which resolves fields for
+        // prose clicks) never fires out there — the report-1 bug: a click
+        // right beside a composing card closed nothing. The root handler is
+        // the one listener every unclaimed click reaches, so the field family
+        // resolves HERE with the dead-zone exit: commit (an empty composer
+        // discards) and restore the caret saved at open. A prose click
+        // already resolved everything in the column handler, and every
+        // field's own chrome stops propagation — both paths make this a
+        // no-op, never a double-commit.
+        let composer_return = self.composer_return.clone();
+        if self.commit_or_discard_composer(window, cx) {
+            self.apply_composer_return(composer_return, cx);
+        }
+        self.commit_transient_fields_on_gesture(cx);
         if self.palette_input.is_some() {
             self.close_palette(window, cx);
         }
@@ -8918,8 +10564,10 @@ impl Editor {
         if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
             self.commit_link(url, window, cx);
         }
-        if self.selection_popover {
-            self.selection_popover = false;
+        // A light-dismiss click is a gesture on chrome outside the flank; latch
+        // the offer down (LAW 1) — a later selection change lifts the latch.
+        if self.flank_risen && !self.flank_latched {
+            self.flank_latched = true;
             cx.notify();
         }
         if self.narrow_notes_open {
@@ -8941,12 +10589,31 @@ impl Editor {
         if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
             self.commit_link(url, window, cx);
         }
+        // LAW 2 / C4 — no dead zones: a mouse-down is a GESTURE, so it resolves
+        // any open transient field at once (never waiting on a blur the dead-zone
+        // click would never deliver). Capture the saved caret first: a dead-zone
+        // landing restores it (land where thought left off); a prose landing
+        // overrides it with the caret at the click point. Empty ⇒ discard.
+        let composer_return = self.composer_return.clone();
+        let resolved_composer = self.commit_or_discard_composer(window, cx);
+        self.commit_transient_fields_on_gesture(cx);
         // A click in the right note lane is NOT a document click — the lane's
         // own cards and pills handle it. The lane is a sibling element painted
         // over this (full-width) column, so a card/pill's stop_propagation
         // doesn't reach this handler; without this guard, clicking any margin
         // card or off-screen pill also jumped the text caret.
         if f32::from(ev.position.x) > self.column_right(window) + MARGIN_GAP {
+            // A true dead zone (the margin blank): the click resolved the field;
+            // restore the saved caret so the exit lands where thought left off.
+            if resolved_composer {
+                self.apply_composer_return(composer_return, cx);
+            }
+            // Click elsewhere is plain decay (inline-images §4) even when
+            // the click never becomes a caret.
+            if self.image_sel.is_some() {
+                self.decay_image_sel();
+                cx.notify();
+            }
             return;
         }
         // A click in the graveyard tail section (Bug B). The section is painted
@@ -8966,6 +10633,11 @@ impl Editor {
                 .unwrap_or(false)
         {
             cx.stop_propagation();
+            // A record click is a click elsewhere: plain decay (§4).
+            if self.image_sel.is_some() {
+                self.decay_image_sel();
+                cx.notify();
+            }
             if let Some(action) = self.grave_action_at(ev.position) {
                 match action {
                     GraveAction::ShowOrigin(id) => self.show_grave_origin(id, cx),
@@ -8985,13 +10657,29 @@ impl Editor {
             && let Some(target) = self.footnote_jump_target(ev.position)
         {
             self.goal_x = None;
-            self.selection_popover = false;
-            self.set_cursor(target, false, cx);
+            self.set_cursor(target, false, cx); // collapses → LAW 1 lowers the flanks
+            return;
+        }
+        // Click on the pixels selects the picture whole (inline-images §4),
+        // claimed BEFORE the caret funnel — index_for_point resolves these
+        // very pixels to caption line 0 (the Phase-3 note), which would
+        // plant a caret instead. Click-born: no door caret. Shift-click
+        // stays a range gesture (§5's range door wants the sweep), and
+        // double/triple clicks fall through — the alt editor on
+        // click_count == 2 keeps working and now coexists with
+        // single-click selection. No drag begins: furniture doesn't sweep.
+        if ev.click_count == 1
+            && !ev.modifiers.shift
+            && self.history_view.is_none()
+            && let Some(block) = self.image_pixel_hit(ev.position)
+        {
+            self.enter_image_sel(block, None, None, cx);
             return;
         }
         self.goal_x = None;
         self.is_selecting = true;
-        self.selection_popover = false;
+        // The click's own set_cursor/extend below feeds LAW 1 (`on_selection_moved`);
+        // and `is_selecting` keeps the flanks down for the whole drag regardless.
         self.drag_point = Some(ev.position);
         if !self.autoscroll_active {
             self.autoscroll_active = true;
@@ -9052,9 +10740,13 @@ impl Editor {
                 }
             }
             2 => {
-                // Double-click on an image block edits its alt text.
+                // Double-click on an image block edits its alt text. The
+                // gesture is CLAIMED: without the stop it would bubble on to
+                // the root's no-dead-zones resolver (C4) and commit the very
+                // field it just opened.
                 let block = self.doc.block_of_byte(ix.min(self.doc.len_bytes()));
                 if matches!(self.doc.blocks().kind(block), BlockKind::Image { .. }) {
+                    cx.stop_propagation();
                     self.edit_image_alt(block, window, cx);
                     return;
                 }
@@ -9082,26 +10774,56 @@ impl Editor {
                 return;
             };
             let (ix, _) = self.index_for_mouse(ev.position);
+            // A middle-click is a click elsewhere: plain decay (§4), BEFORE
+            // the caret lands — with the state left live, apply_replace's
+            // §4 typing gate re-aimed the paste at the caption's end / the
+            // door caret instead of the click point ("dropped, never
+            // re-aimed", §5).
+            if self.image_sel.is_some() {
+                self.decay_image_sel();
+            }
             self.selected_range = ix..ix;
             self.selection_reversed = false;
-            self.apply_replace(None, &text.replace("\r\n", "\n"), false, cx);
+            let text = text.replace("\r\n", "\n");
+            // PRIMARY is text-only, but a Strop image-spanning selection
+            // published its Markdown form (§9) — the same rebuild law as
+            // ctrl-v applies, so the two paste doors agree; anything that
+            // doesn't resolve stays literal visible text as ever.
+            if text.contains("![") {
+                let images = image_lines_in(&text, &|src| {
+                    self.store.as_ref().is_some_and(|s| s.has_asset(src))
+                });
+                if !images.is_empty() && self.paste_rebuild_lines(&text, images, cx) {
+                    return;
+                }
+            }
+            self.apply_replace(None, &text, false, true, cx);
         }
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         let _ = (ev, cx);
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // Medium lineage: the popover appears when the button releases over
-        // a live selection — never mid-drag.
-        if self.is_selecting && !self.selected_range.is_empty() {
-            self.selection_popover = true;
-            cx.notify();
-        }
+        // The release ends the drag; LAW 1's settle beat now runs from HERE (the
+        // last extension), the same 250 ms a keyboard selection waits — no
+        // mouse-up-only flag any more. `arm_flank_settle` gates the first rise;
+        // once risen, further extension never lowers.
+        let settled_selection = self.is_selecting && !self.selected_range.is_empty();
         self.is_selecting = false;
         self.drag_point = None;
+        if settled_selection && !self.flank_risen && !self.flank_latched {
+            self.arm_flank_settle(cx);
+        }
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A drag that left the window (FileDropEvent::Exited) never tells
+        // the view — the first ordinary move sweeps the stale §7 rule.
+        // One is_some + one App read; prose motion pays nothing more.
+        if self.drop_gap.is_some() && !cx.has_active_drag() {
+            self.drop_gap = None;
+            cx.notify();
+        }
         if !self.is_selecting {
             return;
         }
@@ -9137,7 +10859,8 @@ impl Editor {
             let line = par.line_of(bs - par.range.start, true);
             let x0 = par.x_for(bs - par.range.start, line);
             let x1 = par.x_for(be - par.range.start, line);
-            let y = par.top + par.line_height * (line as f32) + par.line_height / 2.
+            let y = par.top + par.text_top + par.line_height * (line as f32)
+                + par.line_height / 2.
                 - frame.scroll_top;
             out += &format!(
                 "ref {id} @{:.0},{:.0}\n",
@@ -9186,7 +10909,11 @@ impl Editor {
         if self.shortcuts_open {
             overlays.push("shortcuts");
         }
-        if self.selection_popover {
+        // Key on the RENDER gate, not the bare predicate (V9b): a settled
+        // selection scrolled off-screen passes `flanks_visible` but paints
+        // nothing, so `flank_layout` (which folds in the geometry) is the honest
+        // signal — matching what `render_selection_popover` actually draws.
+        if self.flank_layout(window).is_some() {
             overlays.push("popover");
         }
         if self.replace_input.is_some() {
@@ -9626,8 +11353,136 @@ impl Editor {
     fn debug_cut_substring(&mut self, needle: &str, cx: &mut Context<Self>) {
         let text = self.doc.text();
         if let Some(byte) = text.find(needle) {
-            self.file_cut(byte..byte + needle.len(), true, cx);
+            self.file_cut(byte..byte + needle.len(), true, false, cx);
         }
+    }
+
+    /// Rig hook (`seed:image`, inline-images §11): the rig's first way to
+    /// SEE pictures. Built through the real verbs — `put_asset`,
+    /// `insert_image_block`, then TYPING into the block's own line (§10:
+    /// the line IS the caption) — never by hand-assembling block state.
+    /// Three stills in one document: a captioned picture (the caption
+    /// wraps, so the centered multi-line face shows), a tall portrait
+    /// (the two-thirds-viewport cap), and its EMPTY caption slot (no
+    /// chrome, but the click band under the pixels answers).
+    pub fn debug_seed_image(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else {
+            eprintln!("strop: seed:image needs a store-backed document");
+            return;
+        };
+        // Deterministic gradients — no assets on disk, no decoder deps.
+        let wide = store.put_asset(
+            debug_png(640, 360, |x, y| {
+                [(x / 3) as u8, 96u8.saturating_add((y / 3) as u8), 140]
+            }),
+            "png",
+        );
+        let tall = store.put_asset(
+            debug_png(300, 1800, |x, y| {
+                [180, (y / 8) as u8, 80u8.saturating_add((x / 2) as u8)]
+            }),
+            "png",
+        );
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "A paragraph of ordinary prose stands above the picture, so the wall between text and furniture is visible in one frame.",
+        );
+        // The captioned picture: insert, then type the caption into the
+        // image block's line — long enough to wrap at the measure.
+        let caret = self.doc.len_bytes();
+        let after_wide = self.doc.insert_image_block(caret, wide);
+        let img_block = self.doc.rope().byte_to_line(after_wide) - 1;
+        let cap_at = self.doc.rope().line_to_byte(img_block);
+        self.doc.edit_bytes(
+            cap_at..cap_at,
+            "The night crossing, seen from the pier \u{2014} the caption is the block's own line, quieter than body, and it wraps like any prose when it runs long.",
+        );
+        // Prose between the pictures, then the tall one — caption left
+        // EMPTY on purpose (the birth state of every inserted image).
+        let end = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            end..end,
+            "Between the pictures the manuscript keeps its voice; the tall portrait below must cap at two-thirds of the viewport instead of swallowing the page.",
+        );
+        let caret2 = self.doc.len_bytes();
+        let _ = self.doc.insert_image_block(caret2, tall);
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        cx.notify();
+    }
+
+    /// Rig hook (`seed:imgrepro`): the FIELD REPRO of the round's origin
+    /// bug, exactly — an EMPTY paragraph, a captioned picture, a prose
+    /// paragraph below (inline-images §11's acceptance shape). From here
+    /// the script drives the doors: Delete at the empty block above must
+    /// STAGE (never fuse), a held Backspace from the prose below must stop
+    /// at the stage, Enter in the caption must never duplicate the picture.
+    pub fn debug_seed_image_repro(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.store else {
+            eprintln!("strop: seed:imgrepro needs a store-backed document");
+            return;
+        };
+        let src = store.put_asset(
+            debug_png(640, 360, |x, y| {
+                [200u8.saturating_sub((y / 4) as u8), (x / 4) as u8, 96]
+            }),
+            "png",
+        );
+        let len = self.doc.len_bytes();
+        self.doc.edit_bytes(
+            0..len,
+            "\nAfter the picture the prose paragraph carries on with enough words for a held backspace to walk through before it reaches the wall.",
+        );
+        // Insert after the empty block 0, then type the caption into the
+        // image block's own line — the real verbs, as ever.
+        let after = self.doc.insert_image_block(0, src);
+        let img_block = self.doc.rope().byte_to_line(after) - 1;
+        let cap_at = self.doc.rope().line_to_byte(img_block);
+        self.doc.edit_bytes(cap_at..cap_at, "Down to the pier at dusk");
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        // Caret parked in the prose below, the repro's starting stance.
+        let caret = self.doc.len_bytes();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    /// Rig hook (`img-geo`): every image block's pixel rect and caption
+    /// line, WINDOW coords, so the script can aim clicks at the pixels
+    /// (`click:X,Y`) and at the caption without guessing geometry.
+    pub fn debug_images(&self) -> String {
+        let Some(frame) = self.last_frame.as_ref() else {
+            return "no-frame".into();
+        };
+        let origin = frame.bounds.origin;
+        let mut out = String::new();
+        for (ix, kind) in self.doc.blocks().kinds().iter().enumerate() {
+            let BlockKind::Image { src, .. } = kind else { continue };
+            let Some(par) = frame.paragraphs.get(ix) else { continue };
+            let (w, h) = par
+                .image
+                .as_ref()
+                .map(|(_, sz)| (f32::from(sz.width), f32::from(sz.height)))
+                .unwrap_or((0., 0.));
+            let img_x = f32::from(par.indent)
+                + ((f32::from(frame.bounds.size.width) - f32::from(par.indent) - w) / 2.)
+                    .max(0.);
+            let top = f32::from(par.top - frame.scroll_top);
+            // `src` rides along so the rig can assert content addressing:
+            // a pasted copy resolves to the SAME asset id, never a twin.
+            out += &format!(
+                "img {ix} @{:.0},{:.0} w={w:.0} h={h:.0} cap@{:.0},{:.0} src={src}\n",
+                f32::from(origin.x) + img_x + w / 2.,
+                f32::from(origin.y) + top + h / 2.,
+                f32::from(origin.x) + f32::from(par.indent)
+                    + f32::from(frame.bounds.size.width - par.indent) / 2.,
+                f32::from(origin.y) + top + f32::from(par.text_top)
+                    + f32::from(par.line_height) / 2.,
+            );
+        }
+        out
     }
 
     /// Rig hook (`seed:annotated`): a manuscript whose SECOND paragraph carries
@@ -9726,7 +11581,7 @@ impl Editor {
         let milk = text.find("There was a longer version").expect("fixture text");
         let (ms, me) = self.paragraph_bounds(milk);
         // Take the leading newline so no empty block strands above the seam.
-        self.file_cut(ms.saturating_sub(1)..me, true, cx);
+        self.file_cut(ms.saturating_sub(1)..me, true, false, cx);
         self.word_count = self.manuscript_word_count();
         // Scene carets.
         let text = self.doc.text();
@@ -9767,9 +11622,11 @@ impl Editor {
     }
 
     /// Rig hook (`select:para`, docs/impl/03-flanks.md §3): select the caret's
-    /// paragraph deterministically AND raise the popover — programmatic selection
-    /// alone never sets `selection_popover` (only mouse-up does), so without this
-    /// the flanks would never render for the dump to observe (finding 117).
+    /// paragraph deterministically AND force it PAST the settle beat, so the dump
+    /// observes a settled selection without waiting out the 250 ms timer. Under
+    /// LAW 1 the flanks are DERIVED (`flanks_visible`): a settled non-empty
+    /// selection with prose focus, no field open, and no latch — which is exactly
+    /// the state this leaves. (Was: a mouse-up-only `selection_popover` flag.)
     pub fn debug_select_para(&mut self, cx: &mut Context<Self>) {
         let (start, end) = self.paragraph_bounds(self.cursor_offset());
         if start >= end {
@@ -9778,7 +11635,36 @@ impl Editor {
         self.selected_range = start..end;
         self.selection_reversed = false;
         self.is_selecting = false;
-        self.selection_popover = true;
+        self.flank_latched = false;
+        self.flank_settle = None;
+        self.flank_sel = self.selected_range.clone();
+        self.flank_risen = true;
+        cx.notify();
+    }
+
+    /// Rig hook (`select:kbd`): a KEYBOARD selection (shift+right ×n over the
+    /// caret's paragraph) driven through the real `extend_cursor` path, then
+    /// forced past the settle beat — the proof that keyboard selections raise the
+    /// flanks exactly like mouse ones (LAW 1 / A1).
+    pub fn debug_select_kbd(&mut self, cx: &mut Context<Self>) {
+        let (start, end) = self.paragraph_bounds(self.cursor_offset());
+        if start >= end {
+            return;
+        }
+        self.set_cursor(start, false, cx); // collapse to the paragraph start
+        while self.cursor_offset() < end {
+            let next = self.next_boundary(self.cursor_offset());
+            if next <= self.cursor_offset() {
+                break;
+            }
+            self.select_to(next, cx); // extend_cursor → on_selection_moved (the keyboard path)
+        }
+        // The settle beat is async; force it here so the headless dump can see
+        // the post-settle state the timer would have produced.
+        if !self.selected_range.is_empty() {
+            self.flank_risen = true;
+            self.flank_settle = None;
+        }
         cx.notify();
     }
 
@@ -10010,6 +11896,46 @@ impl Editor {
         self.cr_react_chip(body, cx);
     }
 
+    /// Rig hook (`coldread:raise`): raise the reaction input on the current
+    /// selection — the mouseup path minus the drag. Follow it with real
+    /// keystroke tokens (`h i space t h e r e enter`) to drive the D1
+    /// regression: a multi-word note typed through REAL key dispatch, where a
+    /// space must land IN the note, never flip the page.
+    pub fn debug_coldread_raise(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cr_raise_input(window, cx);
+    }
+
+    /// Rig hook (`coldread:pageclick:Z`): synthesize a real page click in flip
+    /// zone Z (`-1` left, `0` mid, `1` right) through the actual mouse
+    /// handlers. Drives D1's mouse carve-out: a click that resolves an open
+    /// note commits it but must NOT also flip the page.
+    pub fn debug_coldread_pageclick(&mut self, zone: i8, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.cr_page_bounds.borrow() else { return };
+        let Some(cr) = self.cold_read.as_ref() else { return };
+        let (page_w, page_h) = (cr.geom.page_w, cr.geom.page_h);
+        let x = match zone {
+            -1 => page_w * 0.05,
+            1 => page_w * 0.95,
+            _ => page_w * 0.5,
+        };
+        let pos = point(bounds.origin.x + px(x), bounds.origin.y + px(page_h * 0.5));
+        let down = MouseDownEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        self.cr_page_mouse_down(&down, window, cx);
+        let up = MouseUpEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+        };
+        self.cr_page_mouse_up(&up, window, cx);
+    }
+
     /// Rig hook (`coldread:past[:N]`): park the strip exactly ON a
     /// materialized tick (checkpoint N, or the newest with a state), then
     /// enter the Past read through the banner verb's own gate.
@@ -10238,6 +12164,17 @@ impl Editor {
             // once-per-session rule holds.
             session += &format!(" whisper=chord/{}", self.chord_whisper_generation);
         }
+        // Inline-images §4/§5 tags: the live picture selection (block, its
+        // door caret, the unreleased staging key) — the rig's window into
+        // stage / refuse / decay without pixel archaeology.
+        if let Some(sel) = self.image_sel_live() {
+            session += &format!(
+                " imgsel={} door={} hold={}",
+                sel.block,
+                sel.door_caret.map_or("-".into(), |c| c.to_string()),
+                self.image_stage_hold.unwrap_or("-"),
+            );
+        }
         let doc_state = format!(
             "off={cursor} sel={:?} tail={tail:?} kind={:?} spans={:?}{hist}{ai}{pending}{panel}{session} mode={}",
             self.selected_range,
@@ -10275,6 +12212,7 @@ impl Editor {
         range_utf16: Option<Range<usize>>,
         new_text: &str,
         typograph: bool,
+        machine: bool,
         cx: &mut Context<Self>,
     ) {
         if self.cr_guard(cx) {
@@ -10293,7 +12231,25 @@ impl Editor {
         if self.history_view.is_some() {
             return; // history preview is read-only
         }
-        self.selection_popover = false;
+        // §4: typing never destroys furniture. A printable key on a selected
+        // picture deselects INTO text first — keyboard-born restores the
+        // door caret; click-born puts the caret at the caption's END (the
+        // captioning gesture: click the picture, type the caption) — and
+        // the insert then proceeds as ordinary typing at that caret. The
+        // replace-on-type contract survives only for range selections (P7),
+        // which never coexist with ImageSel (entering collapsed them).
+        if !new_text.is_empty()
+            && let Some(sel) = self.resolve_image_sel()
+        {
+            let caret = sel
+                .door_caret
+                .unwrap_or_else(|| self.image_block_bounds(sel.block).1);
+            self.decay_image_sel();
+            self.selected_range = caret..caret;
+            self.selection_reversed = false;
+        }
+        // Typing replaces the selection with a caret; the empty selection alone
+        // lowers the flanks (LAW 1's predicate), so no explicit dismissal here.
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -10338,6 +12294,10 @@ impl Editor {
             self.selected_range = caret..caret;
             self.selection_reversed = false;
             self.marked_range = None;
+            // Re-arm the settle gate (finding 8 / LAW 1): this collapse bypasses
+            // the caret funnel, so the next selection must wait its full beat.
+            self.flank_risen = false;
+            self.flank_settle = None;
             self.sync_mutations();
             self.bump_activity();
             cx.notify();
@@ -10360,13 +12320,22 @@ impl Editor {
             if auto_cut_qualifies(new_text, end_char - start_char) {
                 // The auto path never collapses the seam itself: the caret
                 // ends inside the emptied pile, and the retype-race guard
-                // (seam-mechanics 6) owns the evaporation moment.
-                self.file_cut(range, false, cx);
+                // (seam-mechanics 6) owns the evaporation moment. Plain delete
+                // stays exact-bytes — only the exile verb interprets blocks.
+                self.file_cut(range, false, false, cx);
                 return;
             }
         }
 
-        self.doc.edit_bytes_coalescing(range.clone(), new_text);
+        // A machine-performed insertion (paste) re-anchors spans verbatim: no
+        // right-edge expansion dresses it in a neighbour's mark (papercuts §A3
+        // machine-insertion law). The typing hand still extends via the
+        // coalescing path.
+        if machine {
+            self.doc.edit_bytes_verbatim(range.clone(), new_text);
+        } else {
+            self.doc.edit_bytes_coalescing(range.clone(), new_text);
+        }
         let mut cursor = range.start + new_text.len();
         let mut block_shortcut_fired = false;
 
@@ -10412,6 +12381,12 @@ impl Editor {
         self.cursor_affinity_down = false;
         self.goal_x = None;
         self.marked_range = None;
+        // A type-over collapses the selection outside the caret funnel, so
+        // `on_selection_moved` never runs — re-arm the settle gate by hand
+        // (finding 8 / LAW 1) so the writer's NEXT selection waits the full
+        // 250ms beat instead of inheriting this stale risen state.
+        self.flank_risen = false;
+        self.flank_settle = None;
         self.sync_mutations();
 
         // Sticky caret formatting applies to what was just inserted (after
@@ -10476,7 +12451,7 @@ impl EntityInputHandler for Editor {
         // Typograph only single typed characters — multi-char inserts are
         // IME commits or programmatic and arrive already authored.
         let typograph = new_text.chars().count() == 1;
-        self.apply_replace(range_utf16, new_text, typograph, cx);
+        self.apply_replace(range_utf16, new_text, typograph, false, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -10487,6 +12462,18 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // §4's typing law holds for IME composition too: the preedit lands
+        // as text at the deselected caret, never over the furniture.
+        if !new_text.is_empty()
+            && let Some(sel) = self.resolve_image_sel()
+        {
+            let caret = sel
+                .door_caret
+                .unwrap_or_else(|| self.image_block_bounds(sel.block).1);
+            self.decay_image_sel();
+            self.selected_range = caret..caret;
+            self.selection_reversed = false;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -10560,6 +12547,15 @@ struct LayoutKey {
     /// `Document::revision`.
     revision: u64,
     width_bits: u32,
+    /// Image display geometry is viewport-keyed (the §11 two-thirds height
+    /// cap), so a document holding pictures keys on the viewport height too
+    /// — or a vertical-only resize would carry stale image sizes. Kept at a
+    /// flat 0 for prose documents, whose layout is height-independent, so
+    /// their reuse still survives vertical resizes untouched. (Image
+    /// documents currently opt out of the fast-path wholesale — decode is
+    /// async and outside `revision`; see `can_reuse` — but the key stays
+    /// honest for when that loosens.)
+    viewport_bits: u32,
     font_scale_bits: u32,
     /// Non-empty selection only: an empty selection paints no highlight, so a
     /// collapsed-caret move leaves the layout identical.
@@ -10618,6 +12614,13 @@ struct BlockStyle {
     family: Option<&'static str>,
     weight: Option<FontWeight>,
     muted: bool,
+    /// The caption face slants (inline-images §11); inline Emphasis spans
+    /// already toggle the same font style, so italic-in-italic holds.
+    italic: bool,
+    /// Visual lines center in the measure (image captions). Carried into
+    /// `ParagraphLayout.centered` — paint alignment and the x translators
+    /// read the one flag.
+    centered: bool,
     bg: Option<gpui::Rgba>,
     quote_rule: bool,
 }
@@ -10632,6 +12635,8 @@ impl Default for BlockStyle {
             family: None,
             weight: None,
             muted: false,
+            italic: false,
+            centered: false,
             bg: None,
             quote_rule: false,
         }
@@ -10702,8 +12707,57 @@ fn block_style(kind: &BlockKind) -> BlockStyle {
             bg: Some(rgba(CODE_BG_COLOR)),
             ..Default::default()
         },
+        // The caption face (inline-images §11): quieter and smaller than
+        // body — the cold-read caption's ~0.8× muted italic, centered —
+        // so the two doors agree on what a caption looks like. The
+        // line height here is also the caption caret's height (the
+        // empty-slot click band is one of these).
+        BlockKind::Image { .. } => BlockStyle {
+            size: px(16.),
+            line_height: px(22.),
+            muted: true,
+            italic: true,
+            centered: true,
+            ..Default::default()
+        },
         _ => BlockStyle::default(),
     }
+}
+
+/// Gap between an image's pixels and its caption line (inline-images §11:
+/// under, never on). Small on purpose — the caption's own line box carries
+/// its leading, and the cold-read page sets its caption flush under the box.
+const IMAGE_CAPTION_GAP: f32 = 6.;
+
+/// Display-size law (inline-images §11): the picture fits the column width
+/// AND its display height caps at ~two-thirds of the viewport, proportional
+/// — a tall portrait never swallows the page. Natural size within those
+/// bounds (§5b already caps stored pixels). Pure, so the law is unit-tested.
+fn image_display_size(natural: (f32, f32), column_w: f32, viewport_h: f32) -> (f32, f32) {
+    let (nw, nh) = natural;
+    if nw <= 0. || nh <= 0. {
+        return (0., 0.);
+    }
+    let mut w = nw.min(column_w);
+    let mut h = nh * (w / nw);
+    let max_h = viewport_h * (2. / 3.);
+    if max_h > 0. && h > max_h {
+        w *= max_h / h;
+        h = max_h;
+    }
+    (w, h)
+}
+
+/// The image block's bottom gap (inline-images §3): the EMPTY caption slot
+/// borrows the block's bottom margin — the caret paints inside space
+/// already reserved, so caret travel never reflows the document. The margin
+/// must therefore hold the caption gap plus one caption caret-height; at
+/// the default scale that is exactly the ordinary paragraph gap (6 + 22 =
+/// 28), and small font scales, where the body gap shrinks faster than the
+/// caption line, bump it once here — a per-block-style constant, never a
+/// per-caret reflow.
+fn image_gap_below(paragraph_gap: f32, caption_line_height: f32) -> f32 {
+    paragraph_gap.max(IMAGE_CAPTION_GAP + caption_line_height)
 }
 
 /// Painted footnote numbers (DESIGN §2-footnotes): the Nth distinct ref in
@@ -10942,6 +12996,11 @@ struct GraveEntryView {
     /// Which side of the seam the text was cut from — the whisper's honest
     /// "from scraps" (graveyard-interplay 2).
     region: strop_core::document::GraveRegion,
+    /// Whether the cut was a whole paragraph block (papercuts §B2 — form shows
+    /// the contract): whole-block entries stand as paragraph blocks; fragments
+    /// wear the anchor-fragment quoted dress, so the entry's shape predicts its
+    /// return behaviour.
+    whole_blocks: bool,
 }
 
 const GRAVE_SECTION_GAP: f32 = 44.; // breathing room after the last prose block
@@ -11024,7 +13083,7 @@ fn shape_grave_section(
         // The whisper speaks the strip's own date grammar ("Today",
         // "Fri 19 Jun") — one calendar voice per app (P8), never the machine's
         // ISO stamp. STROP_TEST_STILL keeps the frozen form for byte-compares.
-        let date = if std::env::var("STROP_TEST_STILL").is_ok() {
+        let date = if test_still() {
             format_unix(e.cut_unix)
         } else {
             strip::date_label(e.cut_unix, strop_core::journal::now_ms() / 1000)
@@ -11085,16 +13144,32 @@ fn shape_grave_section(
             top += px(GRAVE_WHISPER_H);
 
             // The full cut text, dimmed, ruled — one wrapped row per source
-            // paragraph, no character cap (P1: the record is verbatim).
+            // paragraph, no character cap (P1: the record is verbatim). Form
+            // shows the contract (§B2): a whole-block entry stands as paragraph
+            // block(s); a FRAGMENT wears the anchor-fragment quoted dress —
+            // italic, curly-quoted — the one grammar for "a piece of your text,
+            // quoted" (P8), so the shape predicts the return behaviour.
+            let fragment = !e.whole_blocks;
+            let mut body_font = gpui::font("PT Serif");
+            if fragment {
+                body_font.style = FontStyle::Italic;
+            }
             let body_run = TextRun {
                 len: 0,
-                font: gpui::font("PT Serif"),
+                font: body_font,
                 color: rgb(MUTED_COLOR).into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            for para in e.text.split('\n') {
+            // A whole-block entry borrows its text straight through; only the
+            // fragment dress (the quoted-ellipsis wrapper) allocates (V16c).
+            let body_text: std::borrow::Cow<str> = if fragment {
+                format!("\u{201C}\u{2026}{}\u{201D}", e.text).into()
+            } else {
+                std::borrow::Cow::Borrowed(e.text.as_str())
+            };
+            for para in body_text.split('\n') {
                 let run = TextRun { len: para.len(), ..body_run.clone() };
                 let wrapped = window
                     .text_system()
@@ -11267,12 +13342,25 @@ impl Element for EditorElement {
         // re-shape every block (the whole-document O(N) prepaint). Scroll,
         // cursor blink and collapsed-caret moves all land here — they touch
         // only the scroll offset and the caret quad, both recomputed below from
-        // the carried-forward paragraphs. History preview and image blocks opt
-        // out: the preview text and async image decode aren't captured by the
-        // document revision.
+        // the carried-forward paragraphs. History preview opts out: its preview
+        // text is not captured by the document revision. An image document does
+        // NOT opt out — the two things `revision` misses about a picture are
+        // both keyed instead: the async decode (`image_sizes`) and the §11
+        // two-thirds-viewport height cap (`viewport_bits`).
+        let has_images = editor
+            .doc
+            .blocks()
+            .kinds()
+            .iter()
+            .any(|k| matches!(k, BlockKind::Image { .. }));
         let layout_key = LayoutKey {
             revision: editor.doc.revision(),
             width_bits: f32::from(wrap_width).to_bits(),
+            viewport_bits: if has_images {
+                f32::from(viewport).to_bits()
+            } else {
+                0
+            },
             font_scale_bits: editor
                 .config
                 .font_size
@@ -11342,7 +13430,7 @@ impl Element for EditorElement {
                     let (line, x) =
                         par.position(cursor_offset - par.range.start, cursor_affinity);
                     (
-                        point(x, par.top + par.line_height * (line as f32)),
+                        point(x, par.top + par.text_top + par.line_height * (line as f32)),
                         par.line_height,
                     )
                 });
@@ -11403,7 +13491,12 @@ impl Element for EditorElement {
         };
         let cursor_offset = editor.cursor_offset();
         let cursor_affinity = editor.cursor_affinity_down;
-        let cursor_blink_visible = editor.cursor_visible && !in_history;
+        // No caret anywhere while the picture is selected (inline-images §4;
+        // R3): the parked caret is origin memory, not a text position on
+        // display. (The reuse fast-path above needs no twin gate — image
+        // documents never take it, see `can_reuse`.)
+        let cursor_blink_visible =
+            editor.cursor_visible && !in_history && editor.image_sel_live().is_none();
         let mut scroll_top = editor.scroll_top;
         let autoscroll = editor.autoscroll_request;
         // Formatting spans, converted to byte ranges for this frame. In
@@ -11525,6 +13618,7 @@ impl Element for EditorElement {
                     words: e.words,
                     full: Some(e.id) == newest_id || editor.grave_expanded.contains(&e.id),
                     region: e.region,
+                    whole_blocks: e.whole_blocks,
                 })
                 .collect()
         };
@@ -11657,6 +13751,9 @@ impl Element for EditorElement {
             }
             if let Some(weight) = bstyle.weight {
                 block_font.weight = weight;
+            }
+            if bstyle.italic {
+                block_font.style = FontStyle::Italic;
             }
             let block_base = TextRun {
                 font: block_font,
@@ -11817,23 +13914,42 @@ impl Element for EditorElement {
             if section_rule {
                 top += px(24.);
             }
-            let mut height = line.size(bstyle.line_height).height;
+            let text_height = line.size(bstyle.line_height).height;
             let image = image_handles[block_ix].clone().and_then(|handle| {
                 let render = handle.use_render_image(window, cx)?;
                 let dev = render.size(0);
-                // Crisp at this DPI, capped to the column width.
-                let natural_w = dev.width.0 as f32 / scale;
-                let natural_h = dev.height.0 as f32 / scale;
-                let w = natural_w.min(f32::from(wrap_width));
-                let h = natural_h * (w / natural_w);
+                // Crisp at this DPI; the §11 law caps to the column width
+                // AND to two-thirds of the viewport, proportional — which
+                // is why image documents key their layout on the viewport
+                // height (`LayoutKey::viewport_bits`).
+                let (w, h) = image_display_size(
+                    (dev.width.0 as f32 / scale, dev.height.0 as f32 / scale),
+                    f32::from(wrap_width),
+                    f32::from(viewport),
+                );
                 Some((render, gpui::size(px(w), px(h))))
             });
-            if matches!(kind, BlockKind::Image { .. }) {
-                height = image
+            let is_image = matches!(kind, BlockKind::Image { .. });
+            // The image block's vertical anatomy (inline-images §11): the
+            // picture on top, a small gap, then the caption line — under,
+            // never on (the old paint at the shared origin was the typover,
+            // and it died this round). An EMPTY caption adds no height at
+            // all (§3: no chrome, no placeholder, no geometry — its caret
+            // borrows the block's bottom margin, sized below).
+            let (text_top, height) = if is_image {
+                let picture_h = image
                     .as_ref()
                     .map(|(_, sz)| sz.height)
                     .unwrap_or(px(56.)); // decoding placeholder
-            }
+                let text_top = picture_h + px(IMAGE_CAPTION_GAP);
+                if par_text.is_empty() {
+                    (text_top, picture_h)
+                } else {
+                    (text_top, text_top + text_height)
+                }
+            } else {
+                (px(0.), text_height)
+            };
             paragraphs.push(ParagraphLayout {
                 line,
                 range: range.clone(),
@@ -11855,6 +13971,8 @@ impl Element for EditorElement {
                 fn_marks,
                 font_size: bstyle.size,
                 image,
+                text_top,
+                centered: bstyle.centered,
                 runs,
             });
             // The pile keeps a tighter vertical rhythm (the mockup's
@@ -11863,6 +13981,14 @@ impl Element for EditorElement {
             top += height
                 + if in_pile {
                     px((f32::from(paragraph_gap) * 0.5 / 2.).round() * 2.)
+                } else if is_image && par_text.is_empty() {
+                    // The empty caption slot's borrowed margin (§3): must
+                    // hold one caption caret — a no-op at the default
+                    // scale, where 6 + 22 is exactly the paragraph gap.
+                    px(image_gap_below(
+                        f32::from(paragraph_gap),
+                        f32::from(bstyle.line_height),
+                    ))
                 } else {
                     paragraph_gap
                 };
@@ -11889,13 +14015,17 @@ impl Element for EditorElement {
         scroll_top = scroll_top.clamp(px(0.), max_scroll);
 
         // Cursor position in document space (needed for autoscroll + quad).
+        // `text_top` rides in: a caret entering a caption under a tall
+        // picture must scroll to where the caption actually IS, not to the
+        // picture's origin (inline-images §3 — never revealed below the
+        // fold).
         let cursor_pos = paragraphs
             .iter()
             .find(|p| cursor_offset <= p.range.end)
             .map(|par| {
                 let (line, x) = par.position(cursor_offset - par.range.start, cursor_affinity);
                 (
-                    point(x, par.top + par.line_height * (line as f32)),
+                    point(x, par.top + par.text_top + par.line_height * (line as f32)),
                     par.line_height,
                 )
             });
@@ -11958,12 +14088,19 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let _guard = DrawGuard::enter();
-        let (focus_handle, para_flash, grave_flashing) = {
+        let (focus_handle, para_flash, grave_flashing, image_sel_block, drop_rule_y) = {
             let ed = self.editor.read(cx);
             (
                 ed.focus_handle.clone(),
                 ed.para_flash.map(|(c, _)| ed.doc.char_to_byte(c.min(ed.doc.rope().len_chars()))),
                 ed.grave_flash.is_some(),
+                ed.image_sel_live().map(|s| s.block),
+                // §7: the rule paints only while a drag is actually over
+                // the window — Exited drops active_drag, and with it the
+                // rule, even before the sweep in on_mouse_move runs.
+                ed.drop_gap
+                    .filter(|_| cx.has_active_drag())
+                    .map(|(_, y)| y),
             )
         };
         window.handle_input(
@@ -11972,10 +14109,11 @@ impl Element for EditorElement {
             cx,
         );
 
+
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
         let viewport = bounds.size.height;
-        for par in &prepaint.paragraphs {
+        for (par_ix, par) in prepaint.paragraphs.iter().enumerate() {
             let y = par.top - scroll_top;
             // The wash tile bleeds one paragraph gap above its block (tiles
             // must join), so cull with that much grace on both edges: a block
@@ -12087,17 +14225,24 @@ impl Element for EditorElement {
                     rgba(SELECTION_COLOR),
                 ));
             }
-            let origin = bounds.origin + point(par.indent, y);
-            if let Some((render, sz)) = &par.image
-                && let Err(e) = window.paint_image(
-                    Bounds::new(origin, *sz),
+            // The picture paints first, centered in the measure (matching
+            // the cold-read page's box), and the block's text line — the
+            // caption — lays out BELOW it at `text_top` (inline-images
+            // §11: under, never on; the old shared-origin paint was the
+            // typover). An empty caption paints nothing: no chrome, no
+            // placeholder (§3).
+            if let Some((render, sz)) = &par.image {
+                let img_x =
+                    par.indent + ((bounds.size.width - par.indent - sz.width) / 2.).max(px(0.));
+                if let Err(e) = window.paint_image(
+                    Bounds::new(bounds.origin + point(img_x, y), *sz),
                     Corners::default(),
                     render.clone(),
                     0,
                     false,
-                )
-            {
-                eprintln!("strop: paint image: {e}");
+                ) {
+                    eprintln!("strop: paint image: {e}");
+                }
             }
             if let Some(shaped) = &par.marker {
                 shaped
@@ -12111,11 +14256,16 @@ impl Element for EditorElement {
                     )
                     .ok();
             }
+            let origin = bounds.origin + point(par.indent, y + par.text_top);
+            // Centered captions align in paint with the SAME math the x
+            // translators mirror (`center_shift`), so glyphs, wash and
+            // caret agree to the pixel.
+            let align = if par.centered { TextAlign::Center } else { TextAlign::Left };
             par.line
-                .paint_background(origin, par.line_height, TextAlign::Left, None, window, cx)
+                .paint_background(origin, par.line_height, align, None, window, cx)
                 .expect("paint_background failed");
             par.line
-                .paint(origin, par.line_height, TextAlign::Left, None, window, cx)
+                .paint(origin, par.line_height, align, None, window, cx)
                 .expect("paint failed");
             // Footnote refs as painted superior figures (DESIGN
             // §2-footnotes): ~65% of the block size, baseline raised ~35%
@@ -12134,7 +14284,7 @@ impl Element for EditorElement {
                 let small_baseline =
                     (par.line_height - shaped.ascent - shaped.descent) / 2. + shaped.ascent;
                 let dy = body_baseline - small_baseline - par.font_size * 0.35;
-                let line_y = y + par.line_height * (line_ix as f32);
+                let line_y = y + par.text_top + par.line_height * (line_ix as f32);
                 shaped
                     .paint(
                         bounds.origin + point(x, line_y + dy),
@@ -12145,6 +14295,22 @@ impl Element for EditorElement {
                         cx,
                     )
                     .ok();
+            }
+            // The picture-selected wash (inline-images §4): warm amber over
+            // the WHOLE block — pixels and caption line together, because
+            // the block is the unit every verb acts on (what is washed is
+            // what goes, P6). Painted OVER the block's own paint: an
+            // under-wash would vanish behind the opaque picture, and a
+            // still that hides the blast radius lies. Same warm family as
+            // prose selection (SELECTION_COLOR — the writer owns it).
+            if image_sel_block == Some(par_ix) {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(-6.), y - px(3.)),
+                        size(bounds.size.width + px(12.), par.height + px(6.)),
+                    ),
+                    rgba(SELECTION_COLOR),
+                ));
             }
         }
 
@@ -12216,6 +14382,22 @@ impl Element for EditorElement {
                     ));
                     dx += px(4.);
                 }
+            }
+        }
+
+        // The §7 insertion rule: a quiet 2px warm hairline across the
+        // measure at the drag-over gap — the still reads as "it will land
+        // here" (P6). Warm: the drop is the writer's own hand.
+        if let Some(gap_y) = drop_rule_y {
+            let y = gap_y - scroll_top;
+            if y > px(-4.) && y < viewport + px(4.) {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        bounds.origin + point(px(0.), y - px(1.)),
+                        size(bounds.size.width, px(2.)),
+                    ),
+                    rgb(ACTIVE_BORDER),
+                ));
             }
         }
 
@@ -12478,22 +14660,30 @@ impl Editor {
     /// Two columns halve pointer travel versus the old 1×N stack (Fitts).
     fn format_grid(&self, cx: &mut Context<Self>) -> gpui::Div {
         let seam = || div().h(px(1.)).w_full().my(px(3.)).bg(rgb(RULE_COLOR));
-        // Fixed cells so the two columns align regardless of glyph width.
-        let cell = |el: gpui::AnyElement| {
+        // The keyboard-focused cell (ctrl-. deliberate path): a ring marks it so
+        // a surface summoned for the keyboard is operable BY it (A1 / WAI-ARIA).
+        let focused = self.flank_focused.then_some(self.flank_focus_cell);
+        // Fixed cells so the two columns align regardless of glyph width; `ix`
+        // gives the cell its place in the flat navigation order (`flank_cells`).
+        let cell = move |ix: usize, el: gpui::AnyElement| {
             div()
                 .w(px(30.))
                 .flex()
                 .items_center()
                 .justify_center()
+                .rounded(px(5.))
+                .when(focused == Some(ix), |d| {
+                    d.border_1().border_color(rgb(ACTIVE_BORDER))
+                })
                 .child(el)
         };
-        let row = |a: gpui::AnyElement, b: gpui::AnyElement| {
+        let row = move |ia: usize, a: gpui::AnyElement, ib: usize, b: gpui::AnyElement| {
             div()
                 .flex()
                 .items_center()
                 .gap(px(2.))
-                .child(cell(a))
-                .child(cell(b))
+                .child(cell(ia, a))
+                .child(cell(ib, b))
         };
         div()
             .flex()
@@ -12501,14 +14691,18 @@ impl Editor {
             .items_center()
             .gap(px(2.))
             .child(row(
+                0,
                 self.format_button("B", InlineAttr::Strong, "Bold", Some("ctrl-b"), cx)
                     .into_any_element(),
+                1,
                 self.format_button("I", InlineAttr::Emphasis, "Italic", Some("ctrl-i"), cx)
                     .into_any_element(),
             ))
             .child(row(
+                2,
                 self.format_button("U", InlineAttr::Underline, "Underline", Some("ctrl-u"), cx)
                     .into_any_element(),
+                3,
                 self.format_button(
                     "S",
                     InlineAttr::Strikethrough,
@@ -12519,15 +14713,19 @@ impl Editor {
                 .into_any_element(),
             ))
             .child(row(
+                4,
                 self.format_button("==", InlineAttr::Highlight, "Highlight", Some("ctrl-shift-h"), cx)
                     .into_any_element(),
+                5,
                 self.format_button("{}", InlineAttr::Code, "Code", Some("ctrl-e"), cx)
                     .into_any_element(),
             ))
             .child(seam())
             // The argument-takers, below the first seam.
             .child(row(
+                6,
                 self.link_button(cx).into_any_element(),
+                7,
                 self.footnote_button(cx).into_any_element(),
             ))
             .child(seam())
@@ -12538,25 +14736,80 @@ impl Editor {
                     .items_center()
                     .gap(px(2.))
                     .child(cell(
+                        8,
                         self.heading_button("H1", 1, "Heading 1", Some("ctrl-1"), cx)
                             .into_any_element(),
                     ))
                     .child(cell(
+                        9,
                         self.heading_button("H2", 2, "Heading 2", Some("ctrl-2"), cx)
                             .into_any_element(),
                     ))
                     .child(cell(
+                        10,
                         self.heading_button("H3", 3, "Heading 3", Some("ctrl-3"), cx)
                             .into_any_element(),
                     )),
             )
     }
 
+    /// The flat cell order of the format grid (A1 keyboard navigation): the ctrl-.
+    /// entry moves `flank_focus_cell` through these and Enter fires one. Kept in
+    /// lockstep with `format_grid`'s indices.
+    const FLANK_CELL_COUNT: usize = 11;
+
+    /// Fire the flank cell at `ix` (Enter on the focused cell, or a direct call).
+    fn fire_flank_cell(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match ix {
+            0 => self.toggle_span(InlineAttr::Strong, cx),
+            1 => self.toggle_span(InlineAttr::Emphasis, cx),
+            2 => self.toggle_span(InlineAttr::Underline, cx),
+            3 => self.toggle_span(InlineAttr::Strikethrough, cx),
+            4 => self.toggle_span(InlineAttr::Highlight, cx),
+            5 => self.toggle_span(InlineAttr::Code, cx),
+            6 => self.open_link_input(window, cx),
+            7 => self.insert_footnote(&InsertFootnote, window, cx),
+            8 => self.toggle_block(BlockKind::Heading(1), cx),
+            9 => self.toggle_block(BlockKind::Heading(2), cx),
+            10 => self.toggle_block(BlockKind::Heading(3), cx),
+            _ => {}
+        }
+    }
+
+    /// Handle a keystroke while focus is INSIDE the flank (A1 raise-and-enter).
+    /// Returns true if consumed. Arrows/Tab roam the cells, Enter fires the
+    /// focused one, Escape returns focus to the prose caret.
+    fn flank_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let n = Self::FLANK_CELL_COUNT;
+        match key {
+            "escape" => {
+                self.exit_flank(window, cx);
+                true
+            }
+            "enter" => {
+                self.fire_flank_cell(self.flank_focus_cell, window, cx);
+                true
+            }
+            "right" | "down" | "tab" => {
+                self.flank_focus_cell = (self.flank_focus_cell + 1) % n;
+                cx.notify();
+                true
+            }
+            "left" | "up" => {
+                self.flank_focus_cell = (self.flank_focus_cell + n - 1) % n;
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The per-frame flank geometry + gating (docs/impl/03-flanks.md §1-2).
     /// `None` when there's no live selection to flank. Computed ONCE so the left
     /// popover, the right menu, and the rig dump all agree on presence and y.
     fn flank_layout(&self, window: &Window) -> Option<FlankLayout> {
-        if !self.selection_popover || self.selected_range.is_empty() || self.is_selecting {
+        // LAW 1 (papercuts-2026-07 §1): visibility is the derived predicate.
+        if !self.flanks_visible() {
             return None;
         }
         // The reading room suppresses both flanks (spec §4.4): the page's
@@ -12566,8 +14819,37 @@ impl Editor {
             return None;
         }
         let frame = self.last_frame.as_ref()?;
-        let (par_ix, line, x) =
-            frame.cursor_position(self.selected_range.start.min(frame.doc_len()), false)?;
+        let viewport_h = f32::from(window.viewport_size().height);
+        // The RAW (lane) y of a byte's visual line — co-registers with the margin
+        // CARDS (`margin_cards` uses the bare origin.y + pos.y - scroll_top).
+        let anchor_line = |byte: usize, down: bool| -> Option<(usize, f32, f32)> {
+            let (pix, ln, x) = frame.cursor_position(byte.min(frame.doc_len()), down)?;
+            let p = &frame.paragraphs[pix];
+            let top = f32::from(frame.bounds.origin.y) + f32::from(p.top)
+                + f32::from(p.line_height) * ln as f32
+                - f32::from(frame.scroll_top);
+            Some((pix, f32::from(x), top))
+        };
+        let on_screen =
+            |top: f32, lh: f32| top + lh > BAR_HEIGHT && top < viewport_h;
+        // Off-screen selections raise NOTHING (LAW 1 geometry): rise beside the
+        // VISIBLE end. Prefer the selection's start line; if it scrolled out of
+        // view, fall back to the end line; if neither is on screen, don't rise.
+        let start_a = anchor_line(self.selected_range.start, false);
+        let (par_ix, x, raw_top) = match start_a {
+            Some((pix, xx, top))
+                if on_screen(top, f32::from(frame.paragraphs[pix].line_height)) =>
+            {
+                (pix, xx, top)
+            }
+            _ => {
+                let (pix, xx, top) = anchor_line(self.selected_range.end, true)?;
+                if !on_screen(top, f32::from(frame.paragraphs[pix].line_height)) {
+                    return None;
+                }
+                (pix, xx, top)
+            }
+        };
         let par = &frame.paragraphs[par_ix];
         // CSD insets (the old popover math): the `content` surface the flanks are
         // children of is inset by the shadow gutter on each untiled edge
@@ -12581,15 +14863,9 @@ impl Editor {
             ),
             Decorations::Server => (0., 0., 0.),
         };
-        // RAW (lane) y of the selection's first visual line — co-registers with
-        // the margin CARDS (which also skip the inset: `margin_cards` uses the
-        // bare `frame.bounds.origin.y + pos.y - scroll_top`). The LEFT flank
-        // subtracts the top inset to co-register with the prose column instead;
-        // sharing one basis would drift the menu a gutter off the cards it
-        // occludes on floating windows (review finding 89).
-        let raw_top = f32::from(frame.bounds.origin.y) + f32::from(par.top)
-            + f32::from(par.line_height) * line as f32
-            - f32::from(frame.scroll_top);
+        // The LEFT flank subtracts the top inset to co-register with the prose
+        // column; the RIGHT menu keeps the raw basis so it lines up with the
+        // cards it occludes on floating windows (review finding 89).
         let col_left = f32::from(frame.bounds.origin.x) - l_inset;
         let left_gutter = col_left;
         // A history surface (strip open, the panel, or a parked preview) claims
@@ -12617,7 +14893,7 @@ impl Editor {
             left_top: raw_top - t_inset,
             right_top: raw_top,
             line_h: f32::from(par.line_height),
-            x: f32::from(x),
+            x,
             col_left,
             vw: self.content_width(window),
             vh: f32::from(window.viewport_size().height) - t_inset - b_inset,
@@ -12634,21 +14910,20 @@ impl Editor {
     /// horizontal popover above the line.
     fn render_selection_popover(
         &self,
-        window: &Window,
+        layout: &FlankLayout,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
-        let layout = self.flank_layout(window)?;
         // The link argument-field OWNS the flank while open (spec §0.1): a wide
         // URL field at the selection line — the grid is far too narrow to type a
         // URL into. The field holds keyboard focus, so "typing dismisses" (an
         // EDITOR-focus rule) never fires over the URL; Enter commits, Esc cancels.
         if let Some((_, input)) = &self.link_input {
-            return Some(self.render_link_field(&layout, input.clone()));
+            return Some(self.render_link_field(layout, input.clone()));
         }
         match layout.gate.left {
             FlankLeft::None => None,
-            FlankLeft::Grid => Some(self.render_flank_grid(&layout, cx)),
-            FlankLeft::Horizontal => Some(self.render_flank_horizontal(&layout, cx)),
+            FlankLeft::Grid => Some(self.render_flank_grid(layout, cx)),
+            FlankLeft::Horizontal => Some(self.render_flank_horizontal(layout, cx)),
         }
     }
 
@@ -12679,6 +14954,15 @@ impl Editor {
             .items_center()
             .font_family("PT Serif")
             .text_size(px(13.))
+            // The ctrl-. deliberate path focuses this handle; on_key_down then
+            // roams the cells and fires (A1). Passive raise never focuses it, so
+            // arrow keys keep meaning caret motion in the prose.
+            .track_focus(&self.flank_focus_handle)
+            .on_key_down(cx.listener(|editor, ev: &KeyDownEvent, window, cx| {
+                if editor.flank_focused && editor.flank_key(&ev.keystroke.key, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(self.format_grid(cx))
     }
@@ -12775,10 +15059,9 @@ impl Editor {
     /// `flank_layout` (compost-rail and history both stand it down).
     fn render_selection_menu(
         &self,
-        window: &Window,
+        layout: &FlankLayout,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let layout = self.flank_layout(window)?;
         if !layout.gate.right {
             return None;
         }
@@ -13429,6 +15712,40 @@ impl Editor {
                             ),
                         ),
                 )
+                // The reading room's doorknob (spec D4): a resting place, not an
+                // advertisement (P2/P5). `ReadItCold` already toggles, so the
+                // control IS the indicator (P12) — muted at rest, lit inside the
+                // room, and a click leaves. It is the ONE right-cluster control
+                // that stays LIVE in the cold read (the word pill and editor
+                // button hide there), so every still of the room shows the lit
+                // mark that exits it (P6). An open book, the reader's mark —
+                // the pictorial family's newest member (docs/iconography.md).
+                .child(
+                    div()
+                        .id("cold-read-toggle")
+                        .occlude()
+                        .flex_shrink_0()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .mr(px(2.))
+                        .rounded(px(5.))
+                        .cursor(CursorStyle::PointingHand)
+                        .when(in_cold, |d| d.bg(rgba(0x1A1A1812u32)))
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Read it cold", Some("ctrl-shift-l")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.read_it_cold(&ReadItCold, window, cx);
+                            }),
+                        )
+                        .child(icon(
+                            icons::BOOK,
+                            13.,
+                            if in_cold { TEXT_COLOR } else { MUTED_COLOR },
+                        )),
+                )
                 // The editor button (impl 04 §0): the AI subsystem's single home,
                 // where its results live — just left of the margin side. The old
                 // drawn mini-card is gone; the control now WEARS its state (a
@@ -13566,7 +15883,7 @@ impl Editor {
 fn format_unix(secs: i64) -> String {
     // STROP_TEST_STILL (scripts/wflip.sh): captures are byte-compared, so
     // every rendered timestamp freezes to a fixed string.
-    if std::env::var("STROP_TEST_STILL").is_ok() {
+    if test_still() {
         return "0000-00-00 00:00".into();
     }
     let days = secs.div_euclid(86400);
@@ -15052,20 +17369,73 @@ struct MarginCard {
     /// (08 §2): muted machine bookkeeping, no card fill, carrying the quiet
     /// Put back verb. `body` holds the one-liner text.
     provenance: Option<u64>,
+    /// When the note was created, UNIX seconds (`Annotation::created_unix`) — the
+    /// writer-note caption's data (C3, messenger grammar). 0 for provenance rows.
+    created_unix: i64,
 }
 
-/// A note card's header label: "Note" / a diagnosis level (or "Diagnosis"),
-/// with a quiet "· detached" when the anchor was lost in a restore.
-fn note_card_label(is_diagnosis: bool, level: &str, orphaned: bool) -> String {
-    let base = if is_diagnosis {
-        if level.is_empty() { "Diagnosis" } else { level }
+/// A writer note's creation MOMENT, messenger-style (C3, papercuts §3): a
+/// timezone-free elapsed label while fresh, then the strip's quiet relative
+/// date for older ones ("Yesterday", "Tue 1 Jul"). Pure over its inputs so the
+/// caption formatter is unit-testable headlessly. Review finding 8: local civil
+/// time is deferred until the project accepts a time dependency.
+fn note_moment_label(created_unix: i64, now_secs: i64) -> String {
+    let elapsed = now_secs.saturating_sub(created_unix).max(0);
+    if elapsed < 60 {
+        "now".into()
+    } else if elapsed < 3600 {
+        format!("{} min", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{} h", elapsed / 3600)
     } else {
-        "Note"
+        strip::date_label(created_unix, now_secs)
+    }
+}
+
+/// A note card's header caption. A DIAGNOSIS keeps its level word (that *is*
+/// data); a WRITER NOTE shows its creation moment (C3 — the category noun
+/// "Note" told the writer nothing her warm card and own words didn't). A lost
+/// anchor adds the quiet "· detached" either way.
+fn note_card_label(
+    is_diagnosis: bool,
+    level: &str,
+    orphaned: bool,
+    created_unix: i64,
+    now_secs: i64,
+) -> String {
+    let base = if is_diagnosis {
+        if level.is_empty() {
+            "Diagnosis".to_owned()
+        } else {
+            level.to_owned()
+        }
+    } else {
+        note_moment_label(created_unix, now_secs)
     };
     if orphaned {
         format!("{base} · detached")
     } else {
-        base.to_owned()
+        base
+    }
+}
+
+/// UI boundary for the visual rig's frozen clock; the label grammar above
+/// remains pure, while still screenshots keep their constant caption.
+fn note_card_label_for_ui(
+    is_diagnosis: bool,
+    level: &str,
+    orphaned: bool,
+    created_unix: i64,
+    now_secs: i64,
+) -> String {
+    if !is_diagnosis && test_still() {
+        if orphaned {
+            "00:00 · detached".into()
+        } else {
+            "00:00".into()
+        }
+    } else {
+        note_card_label(is_diagnosis, level, orphaned, created_unix, now_secs)
     }
 }
 
@@ -15632,6 +18002,7 @@ impl Editor {
                 pass_id: n.pass_id,
                 collapsed: false,
                 provenance: None,
+                created_unix: n.created_unix,
             });
         }
         // The caret-block's provenance one-liner (08 §2; surfaces-attention
@@ -15677,6 +18048,7 @@ impl Editor {
                     pass_id: 0,
                     collapsed: false,
                     provenance: Some(rec_id),
+                    created_unix: 0,
                 });
                 cards.sort_by(|a, b| a.top.total_cmp(&b.top));
             }
@@ -16026,6 +18398,10 @@ impl Editor {
                 .bg(rgb(0xF4F1EA))
                 .border_t_1()
                 .border_color(rgb(RULE_COLOR))
+                // The strip IS the composer's surface: its clicks must never
+                // bubble to the root's no-dead-zones resolver (C4) and commit
+                // the very field the writer is clicking into.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .px(px(28.))
                 .py(px(8.))
                 .flex()
@@ -16415,6 +18791,10 @@ impl Editor {
         });
         let reduce_motion = self.config.reduce_motion;
         let lane_left = col_right + MARGIN_GAP;
+        // The wall-clock second, read ONCE for the whole lane (V13c) — every
+        // card's caption dates against the same "now", instead of each card
+        // re-reading the clock per frame.
+        let now_secs = strop_core::journal::now_ms() / 1000;
         Some(
             div()
                 .absolute()
@@ -16441,6 +18821,7 @@ impl Editor {
                         unverified,
                         collapsed,
                         provenance,
+                        created_unix,
                         ..
                     } = card;
                     // Inside its entrance fade? (One fade per landed pass;
@@ -16555,7 +18936,18 @@ impl Editor {
                         .then(|| self.focus.input().cloned())
                         .flatten();
                     let is_diagnosis = kind == NoteKind::Diagnosis;
-                    let label = note_card_label(is_diagnosis, &level, orphaned);
+                    let label = note_card_label_for_ui(
+                        is_diagnosis,
+                        &level,
+                        orphaned,
+                        created_unix,
+                        now_secs,
+                    );
+                    // The caption's hover expands the moment to the full timestamp
+                    // (P9 — hover only completes what is shown); writer notes only.
+                    // The stamp itself builds lazily, in the tooltip closure — a
+                    // card only pays for `format_unix` when actually hovered (V13c).
+                    let moment_full = !is_diagnosis;
                     let card = div()
                         .id(("note-card", id as usize))
                         .absolute()
@@ -16625,15 +19017,39 @@ impl Editor {
                                 .justify_between()
                                 .text_size(px(11.))
                                 .text_color(rgb(MUTED_COLOR))
-                                .child(label)
+                                .child(
+                                    div()
+                                        .id(("note-moment", id as usize))
+                                        .when(moment_full, |d| {
+                                            // Build the full timestamp only when
+                                            // the caption is actually hovered
+                                            // (V13c) — resting cards pay nothing.
+                                            d.tooltip(move |_window, cx| {
+                                                cx.new(|_| Tip {
+                                                    label: format_unix(created_unix).into(),
+                                                    chord: None,
+                                                })
+                                                .into()
+                                            })
+                                        })
+                                        .child(label),
+                                )
                                 .child(
                                     div()
                                         .flex()
                                         .gap(px(6.))
+                                        .items_center()
                                         .child(
+                                            // A clickable WORD wears the house dress
+                                            // (C1, P8): the dashed underline that
+                                            // says "this text is clickable", like
+                                            // Put back and the door's inactive pole.
                                             div()
                                                 .id(("note-done", id as usize))
                                                 .cursor(CursorStyle::PointingHand)
+                                                .border_b_1()
+                                                .border_dashed()
+                                                .border_color(rgb(MUTED_COLOR))
                                                 .hover(|d| d.text_color(rgb(TEXT_COLOR)))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
@@ -16655,10 +19071,29 @@ impl Editor {
                                                 .child("done"),
                                         )
                                         .child(
+                                            // A clickable GLYPH is an icon button
+                                            // with the titlebar's hover plate (C1):
+                                            // the plate IS the hit region, ≥ the
+                                            // titlebar icons' target (no sub-Fitts
+                                            // card control), and the mark says
+                                            // "control", never "letter".
                                             div()
                                                 .id(("note-dismiss", id as usize))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .px(px(4.))
+                                                .py(px(2.))
+                                                .rounded(px(5.))
                                                 .cursor(CursorStyle::PointingHand)
-                                                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                                                // The svg's ink is its own (no
+                                                // text-color cascade), so the
+                                                // hover ink-brighten rides a group
+                                                // — matching the titlebar dress
+                                                // fully (V16a).
+                                                .group("note-dismiss")
+                                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                                .tooltip(tip("Dismiss", None))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(
@@ -16676,7 +19111,12 @@ impl Editor {
                                                         },
                                                     ),
                                                 )
-                                                .child("×"),
+                                                .child(
+                                                    icon(icons::DISMISS, 11., MUTED_COLOR)
+                                                        .group_hover("note-dismiss", |s| {
+                                                            s.text_color(rgb(TEXT_COLOR))
+                                                        }),
+                                                ),
                                         ),
                                 ),
                         )
@@ -17188,6 +19628,9 @@ impl Editor {
         let vw = f32::from(window.viewport_size().width);
         let vh = f32::from(window.viewport_size().height);
         let panel_w = (vw - 24.).min(340.);
+        // Match the wide lane's V13c discipline: every card in this drawer
+        // renders against one clock sample.
+        let now_secs = strop_core::journal::now_ms() / 1000;
         let mut list = div()
             .id("narrow-notes-list")
             .flex()
@@ -17228,7 +19671,7 @@ impl Editor {
             );
         } else {
             for card in &cards {
-                list = list.child(self.narrow_note_card(card, cx));
+                list = list.child(self.narrow_note_card(card, now_secs, cx));
             }
         }
         Some(
@@ -17254,7 +19697,12 @@ impl Editor {
     /// One card in the narrow drawer: the same content the margin shows, in a
     /// stacked (non-absolute) box. No inline composer — a writer's note opens
     /// the bottom strip on click; diagnoses are read-only here as everywhere.
-    fn narrow_note_card(&self, card: &MarginCard, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn narrow_note_card(
+        &self,
+        card: &MarginCard,
+        now_secs: i64,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         // The caret-block's provenance rides the narrow drawer exactly as
         // cards do (surfaces-attention 6) — same quiet row, same Put back.
         if let Some(rec_id) = card.provenance {
@@ -17289,10 +19737,16 @@ impl Editor {
                 )
                 .into_any_element();
         }
-        let MarginCard { id, body, kind, title, level, orphaned, .. } = card;
+        let MarginCard { id, body, kind, title, level, orphaned, created_unix, .. } = card;
         let (id, kind) = (*id, *kind);
         let is_diagnosis = kind == NoteKind::Diagnosis;
-        let label = note_card_label(is_diagnosis, level, *orphaned);
+        let label = note_card_label_for_ui(
+            is_diagnosis,
+            level,
+            *orphaned,
+            *created_unix,
+            now_secs,
+        );
         let body = body.clone();
         let title = title.clone();
         div()
@@ -17420,6 +19874,34 @@ impl Render for Editor {
         // Then diff the packed lane against last frame: a discrete re-pack
         // starts the card slides; scroll/composer/burst frames snap instead.
         self.update_lane_motion(cx);
+        // The flank geometry, computed ONCE per frame (finding 9b) and shared by
+        // both selection-flank renders below. It also drives the focus-couples-
+        // to-paint guard (finding 3): keyboard focus must not outlive the painted
+        // grid. If focus is inside the flank but the grid stopped painting — the
+        // offer latched (light_dismiss / dismiss_flanks), the selection scrolled
+        // off-screen (layout None), or the window narrowed to the horizontal
+        // fallback (gate.left != Grid) — hand focus back to the prose. This one
+        // per-frame check covers all three hide-while-focused paths at once.
+        let flank_layout = self.flank_layout(window);
+        if self.flank_focused
+            && flank_layout
+                .as_ref()
+                .is_none_or(|l| l.gate.left != FlankLeft::Grid)
+        {
+            self.exit_flank(window, cx);
+        }
+        // The picture selection couples to focus the same way (inline-images
+        // §4: focus change is plain decay) — with ONE exception: its own alt
+        // strip may hold focus while the state stands (§8, the strip IS the
+        // control). Checked per frame, like the flank guard above, so every
+        // focus-stealing overlay (palette, fields, panels) decays it without
+        // each needing to know.
+        if self.image_sel.is_some()
+            && self.alt_input.is_none()
+            && !self.focus_handle.is_focused(window)
+        {
+            self.decay_image_sel();
+        }
         // History mode pushes the document aside (DESIGN §2-history: push,
         // not overlay — single-document app, reflow is cheap). The column
         // re-centers and re-wraps in the remaining width.
@@ -17628,6 +20110,19 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::send_to_graveyard))
                     .on_action(cx.listener(Self::move_to_manuscript))
                     .on_action(cx.listener(Self::put_back_scrap))
+                    // R5's freshness bookkeeping, capture phase: the staging
+                    // key's RELEASE must be seen even when a child element
+                    // swallows the bubble, or the staged exile could never
+                    // re-arm. One Option compare per key-up — free for prose.
+                    // (`is_held` is never consulted; it lies on X11.)
+                    .capture_key_up(cx.listener(|editor, ev: &gpui::KeyUpEvent, _, _| {
+                        if editor
+                            .image_stage_hold
+                            .is_some_and(|k| k == ev.keystroke.key)
+                        {
+                            editor.image_stage_hold = None;
+                        }
+                    }))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -17637,6 +20132,13 @@ impl Render for Editor {
                     // whole document surface — see below); not here, or it would
                     // double-fire as the event bubbles up.
                     .on_drop(cx.listener(Self::on_file_drop))
+                    // §7's drag-over layer: Pending positions (synthesized
+                    // MouseMove while ExternalPaths ride active_drag) park
+                    // the insertion rule at the nearest gap. Capture-phase,
+                    // no hover gate — it also carries the input-modality
+                    // nudge that keeps the on_drop above alive after
+                    // typing (see on_external_drag_move).
+                    .on_drag_move(cx.listener(Self::on_external_drag_move))
                             // History recentres/rewraps in the remaining width;
                             // otherwise the column takes its width-only measure.
                             .map(|d| {
@@ -17721,7 +20223,7 @@ impl Render for Editor {
                     d
                 }
             })
-            .map(|d| match self.render_alt_strip() {
+            .map(|d| match self.render_alt_strip(cx) {
                 Some(strip) => d.child(strip),
                 None => d,
             })
@@ -17773,13 +20275,20 @@ impl Render for Editor {
             // The two selection flanks rise together (docs/impl/03-flanks.md).
             // The RIGHT verb menu paints AFTER render_margin (above), so it
             // OCCLUDES the cards at its y (review B8); the LEFT formatting flank
-            // lives in the opposite gutter.
-            .map(|d| match self.render_selection_menu(window, cx) {
-                Some(menu) => d.child(menu),
+            // lives in the opposite gutter. The geometry is computed ONCE here
+            // (finding 9b) and shared by both, instead of each recomputing it.
+            .map(|d| match flank_layout.as_ref() {
+                Some(layout) => match self.render_selection_menu(layout, cx) {
+                    Some(menu) => d.child(menu),
+                    None => d,
+                },
                 None => d,
             })
-            .map(|d| match self.render_selection_popover(window, cx) {
-                Some(popover) => d.child(popover),
+            .map(|d| match flank_layout.as_ref() {
+                Some(layout) => match self.render_selection_popover(layout, cx) {
+                    Some(popover) => d.child(popover),
+                    None => d,
+                },
                 None => d,
             })
             .map(|d| match self.render_narrow_notes_panel(window, cx) {
@@ -17873,20 +20382,109 @@ impl Focusable for Editor {
 // of tens of thousands of empty lines could overflow the stack (an uncatchable
 // abort). The loop is byte-for-byte equivalent for every input.
 
+fn paragraph_bounds_in(doc: &Document, offset: usize) -> (usize, usize) {
+    let rope = doc.rope();
+    let line = rope.byte_to_line(offset);
+    block_bounds_in(doc, line)
+}
+
+fn block_bounds_in(doc: &Document, block: usize) -> (usize, usize) {
+    let rope = doc.rope();
+    (rope.line_to_byte(block), line_text_end_bytes(rope, block))
+}
+
+fn image_block_bounds_in(doc: &Document, block: usize) -> (usize, usize) {
+    block_bounds_in(doc, block)
+}
+
+fn image_block_markdown_in(doc: &Document, block: usize) -> Option<String> {
+    if !matches!(doc.blocks().kind(block), BlockKind::Image { .. }) {
+        return None;
+    }
+    let (start, end) = image_block_bounds_in(doc, block);
+    let rope = doc.rope();
+    let (cs, ce) = (rope.byte_to_char(start), rope.byte_to_char(end));
+    let line = doc.slice_bytes(start..end);
+    let spans = doc.spans().slice(cs..ce);
+    let blocks = BlockMap::from_kinds(vec![doc.blocks().kind(block).clone()]);
+    Some(
+        strop_core::markdown::to_markdown(&line, &spans, &blocks)
+            .trim_end()
+            .to_owned(),
+    )
+}
+
+fn resolve_drop_anchor(doc: &Document, anchor: Option<DropAnchor>) -> Option<usize> {
+    anchor.map(|anchor| {
+        let clamped = anchor.byte.min(doc.len_bytes());
+        if anchor.revision == doc.revision() {
+            clamped
+        } else {
+            let line = doc.rope().byte_to_line(clamped);
+            line_text_end_bytes(doc.rope(), line)
+        }
+    })
+}
+
+fn shift_drop_caret(offset: usize, anchor: Option<usize>, delta: usize, len: usize) -> usize {
+    if anchor.is_none_or(|anchor| offset > anchor) {
+        (offset + delta).min(len)
+    } else {
+        offset
+    }
+}
+
+fn previous_paragraph_boundary_in(doc: &Document, offset: usize) -> usize {
+    let (start, _) = paragraph_bounds_in(doc, offset);
+    if offset > start {
+        start
+    } else if start > 0 {
+        // `start - 1` sits inside the preceding break for a multibyte
+        // separator, but only byte_to_line consumes it (boundary-agnostic),
+        // so the bounds still name the previous line.
+        paragraph_bounds_in(doc, start - 1).0
+    } else {
+        0
+    }
+}
+
+fn next_paragraph_boundary_in(doc: &Document, offset: usize) -> usize {
+    let (_, end) = paragraph_bounds_in(doc, offset);
+    let len = doc.len_bytes();
+    if offset < end {
+        end
+    } else if end < len {
+        // Step over the WHOLE break: `end + 1` inside a CRLF/NEL/U+2028
+        // separator resolves to the same line and pins the caret here.
+        let rope = doc.rope();
+        paragraph_bounds_in(doc, rope.line_to_byte(rope.byte_to_line(end) + 1)).1
+    } else {
+        len
+    }
+}
+
 fn previous_word_boundary(doc: &Document, mut offset: usize) -> usize {
     let rope = doc.rope();
     loop {
         if offset == 0 {
             return 0;
         }
-        let start = rope.line_to_byte(rope.byte_to_line(offset));
-        if offset == start {
+        let line_ix = rope.byte_to_line(offset);
+        let start = rope.line_to_byte(line_ix);
+        // Cap a mid-break offset to the line's own text: stepping byte-wise
+        // into a CRLF/NEL/U+2028 separator would hand slice_bytes a
+        // non-boundary end.
+        let cap = offset.min(line_text_end_bytes(rope, line_ix));
+        if cap == start {
+            if line_ix == 0 {
+                return 0;
+            }
             // Continue from the end of the previous paragraph (iterate, never
             // recurse: a long blank run must not grow the stack).
-            offset -= 1;
+            offset = line_text_end_bytes(rope, line_ix - 1);
             continue;
         }
-        let line = doc.slice_bytes(start..offset);
+        let line = doc.slice_bytes(start..cap);
         return line
             .split_word_bound_indices()
             .rev()
@@ -17903,13 +20501,15 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
             return len;
         }
         let line_ix = rope.byte_to_line(offset);
-        let end = if line_ix + 1 < rope.len_lines() {
-            rope.line_to_byte(line_ix + 1).saturating_sub(1)
-        } else {
-            len
-        };
-        if offset == end {
-            offset += 1;
+        let end = line_text_end_bytes(rope, line_ix);
+        if offset >= end {
+            // At (or inside) the line's break: continue from the next line's
+            // start — a byte-wise `+= 1` would strand the offset inside a
+            // CRLF/NEL/U+2028 separator and feed slice_bytes a reversed range.
+            if line_ix + 1 >= rope.len_lines() {
+                return len;
+            }
+            offset = rope.line_to_byte(line_ix + 1);
             continue;
         }
         let line = doc.slice_bytes(offset..end);
@@ -17919,6 +20519,247 @@ fn next_word_boundary(doc: &Document, mut offset: usize) -> usize {
             .map_or(end, |(ix, seg)| offset + ix + seg.len())
             .min(len);
     }
+}
+
+/// Ctrl+Backspace's §5 verb clamp. A styled block deliberately passes the
+/// ordinary Backspace door so it can shed its kind, but its WORD form must
+/// not use that pass to reach through the picture wall into the caption.
+/// Caret word-motion keeps the free boundary unchanged and may cross.
+fn image_word_left_boundary(
+    kinds: &[BlockKind],
+    block: usize,
+    paragraph_start: usize,
+    boundary: usize,
+) -> usize {
+    if boundary < paragraph_start
+        && kinds.get(block).is_some_and(|k| !matches!(k, BlockKind::Paragraph))
+        && block > 0
+        && matches!(kinds.get(block - 1), Some(BlockKind::Image { .. }))
+    {
+        paragraph_start
+    } else {
+        boundary
+    }
+}
+
+/// Footnote routing begins only at a paragraph's text band. For ordinary
+/// blocks `text_top` is zero; for a picture it excludes the pixels above
+/// the caption so §4's picture click can win.
+fn footnote_text_band_contains(top: Pixels, text_top: Pixels, y: Pixels) -> bool {
+    y >= top + text_top
+}
+
+// ---- The picture's doors (inline-images §5), as pure decisions ------------
+
+/// Where a collapsed-caret Backspace/Delete press stands relative to the
+/// picture walls (§5's doors table). Pure so the table is unit-testable
+/// row by row; the editor supplies the caret geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageDoor {
+    /// A boundary door: the first press stages the named block (ImageSel).
+    Stage(usize),
+    /// A wall: refused, pure no-op — the before/after stills are identical
+    /// (P6; refused edits bump nothing).
+    Refuse,
+    /// Not a picture boundary: the ordinary delete path proceeds.
+    Pass,
+}
+
+/// Backspace with a collapsed caret, against the §5 doors. `block` is the
+/// caret's block, `at_start` = caret at the block's first byte,
+/// `caption_empty` = the block's line holds no text.
+fn image_backspace_door(
+    kinds: &[BlockKind],
+    block: usize,
+    at_start: bool,
+    caption_empty: bool,
+) -> ImageDoor {
+    if !at_start {
+        return ImageDoor::Pass;
+    }
+    match kinds.get(block) {
+        // Inside the caption at its start: an empty room facing furniture
+        // stages (block-removal is the only plausible intent there); a
+        // caret inside the writer's own words refuses — whole-block
+        // destruction is never offered from inside the text being edited
+        // (§12, the Notion wall). Without this arm the legacy strip-the-
+        // kind convention below would drain the picture's kind — §0's bug.
+        Some(BlockKind::Image { .. }) => {
+            if caption_empty {
+                ImageDoor::Stage(block)
+            } else {
+                ImageDoor::Refuse
+            }
+        }
+        // Any other styled block keeps today's first-press-strips-the-kind
+        // convention (backspace()): a strip is not a merge, so the wall has
+        // nothing to guard — the door waits one press below.
+        Some(k) if !matches!(k, BlockKind::Paragraph) => ImageDoor::Pass,
+        // The outside door below the picture (§5): the merge this press
+        // would otherwise perform is exactly the wound.
+        _ if block > 0
+            && matches!(kinds.get(block - 1), Some(BlockKind::Image { .. })) =>
+        {
+            ImageDoor::Stage(block - 1)
+        }
+        _ => ImageDoor::Pass,
+    }
+}
+
+/// Delete with a collapsed caret, against the §5 doors. `at_end` = caret
+/// at the block's last byte.
+fn image_delete_door(kinds: &[BlockKind], block: usize, at_end: bool) -> ImageDoor {
+    if !at_end {
+        return ImageDoor::Pass;
+    }
+    if matches!(kinds.get(block), Some(BlockKind::Image { .. })) {
+        // Delete at caption end: a wall (§5, unanimous §13) — prose from
+        // below never climbs into a caption by keystroke, and a
+        // destructive key is never repurposed as navigation.
+        return ImageDoor::Refuse;
+    }
+    if matches!(kinds.get(block + 1), Some(BlockKind::Image { .. })) {
+        // The outside door above the picture — the field repro's step 7.
+        return ImageDoor::Stage(block + 1);
+    }
+    ImageDoor::Pass
+}
+
+/// §5's freshness ladder (R5), pure: may `key`'s press complete a staged
+/// exile? `stage_hold` is the staging key whose key-up has not been seen —
+/// its own presses are autorepeat and never cross the stage; any OTHER
+/// deletion key is a fresh key-down by construction (a second physical
+/// press of the held key is impossible without a release).
+fn exile_press_is_fresh(stage_hold: Option<&'static str>, key: &str) -> bool {
+    stage_hold != Some(key)
+}
+
+/// §6's Enter-direction rule for a caret inside a caption, pure: room
+/// opens ABOVE only at the start of a NON-EMPTY caption (a caret at text
+/// start faces before it — §12); everywhere else — mid, end, and the
+/// empty-caption collision, where "step out and keep writing" wins — the
+/// ordinary split proceeds and the model's split law births the tail a
+/// Paragraph (R6: no kind stamping here).
+fn caption_enter_opens_above(at_start: bool, caption_empty: bool) -> bool {
+    at_start && !caption_empty
+}
+
+/// The asset's own extension names the clipboard bitmap's format (§9 copy):
+/// `put_asset` ids end ".png" / ".jpg" / ".webp" — the §5b import's whole
+/// output alphabet. Anything else (a legacy id) claims PNG and lets the
+/// paster's own sniffer disagree.
+fn image_format_for_src(src: &str) -> gpui::ImageFormat {
+    match src.rsplit('.').next() {
+        Some("jpg") | Some("jpeg") => gpui::ImageFormat::Jpeg,
+        Some("webp") => gpui::ImageFormat::Webp,
+        _ => gpui::ImageFormat::Png,
+    }
+}
+
+/// §9's range-copy serialization, pure: swap each whole-covered image
+/// line inside a copied slice for its Markdown form. `images` are
+/// (doc byte range of the line's text, Markdown form), ascending and
+/// inside `range_start..range_start + slice.len()` by construction.
+fn splice_image_markdown(
+    slice: &str,
+    range_start: usize,
+    images: &[(Range<usize>, String)],
+) -> String {
+    let mut out = String::with_capacity(slice.len());
+    let mut at = 0usize;
+    for (r, md) in images {
+        out.push_str(&slice[at..r.start - range_start]);
+        out.push_str(md);
+        at = r.end - range_start;
+    }
+    out.push_str(&slice[at..]);
+    out
+}
+
+/// §9's range-paste classification, pure: the lines of a normalized paste
+/// that parse as Strop image lines AND whose src resolves through the
+/// caller's oracle — only those rebuild; a non-resolving image line stays
+/// literal visible text (the boundary rule). Indices are `split('\n')`
+/// positions, matching `plan_image_line_rebuild`'s.
+fn image_lines_in(
+    text: &str,
+    resolves: &dyn Fn(&str) -> bool,
+) -> Vec<(usize, strop_core::markdown::ImageLine)> {
+    text.split('\n')
+        .enumerate()
+        .filter(|(_, l)| l.contains("!["))
+        .filter_map(|(ix, l)| strop_core::markdown::parse_image_line(l).map(|il| (ix, il)))
+        .filter(|(_, il)| resolves(&il.src))
+        .collect()
+}
+
+/// §9's multi-line rebuild plan, pure: each rebuilding image line is
+/// swapped for its caption TEXT (title → text + spans through the one
+/// importer), and the wall's boundary separators are added so a rebuilt
+/// picture owns its whole line — a leading image line gets its own line
+/// start when the landing sits mid-line (`at_line_start` false), a
+/// trailing one its own line end when nothing closes the line at the
+/// landing's end (`at_line_end` false — which is also how a picture
+/// landing last in the document earns its trailing empty paragraph, §7).
+/// Returns the final insert text and (FINAL line index, parsed line,
+/// caption spans) stamps.
+fn plan_image_line_rebuild(
+    text: &str,
+    images: Vec<(usize, strop_core::markdown::ImageLine)>,
+    at_line_start: bool,
+    at_line_end: bool,
+) -> (
+    String,
+    Vec<(usize, strop_core::markdown::ImageLine, SpanSet)>,
+) {
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    let last_line = lines.len() - 1;
+    let first_is_img = images.iter().any(|(ix, _)| *ix == 0);
+    let last_is_img = images.iter().any(|(ix, _)| *ix == last_line);
+    let shift = usize::from(first_is_img && !at_line_start);
+    let mut stamps = Vec::with_capacity(images.len());
+    for (ix, line) in images {
+        let (caption, spans) = strop_core::markdown::caption_from_title(&line.caption);
+        lines[ix] = caption;
+        stamps.push((ix + shift, line, spans));
+    }
+    let mut final_text = lines.join("\n");
+    if shift == 1 {
+        final_text.insert(0, '\n');
+    }
+    if last_is_img && !at_line_end {
+        final_text.push('\n');
+    }
+    (final_text, stamps)
+}
+
+/// §7's landing math, pure: the gap between blocks nearest a doc-space y.
+/// `rows` are (top, height) per block, ascending. Each block's vertical
+/// midline splits its gap-above from its gap-below; above the first
+/// block's midline is gap 0, below the last's is the after-the-end gap
+/// (== rows.len()). Also returns the insertion rule's y: the middle of
+/// the inter-block gap, or a hair outside the outermost block.
+fn drop_gap_for_y(rows: &[(f32, f32)], y: f32) -> (usize, f32) {
+    if rows.is_empty() {
+        return (0, 0.);
+    }
+    let ix = rows.partition_point(|(top, h)| top + h <= y);
+    let gap = match rows.get(ix) {
+        Some((top, h)) if y < top + h / 2. => ix,
+        Some(_) => ix + 1,
+        None => rows.len(),
+    };
+    let rule_y = if gap == 0 {
+        rows[0].0 - 3.
+    } else if gap == rows.len() {
+        let (top, h) = rows[gap - 1];
+        top + h + 3.
+    } else {
+        let (atop, ah) = rows[gap - 1];
+        let (btop, _) = rows[gap];
+        (atop + ah + btop) / 2.
+    };
+    (gap, rule_y)
 }
 
 // ---- The history strip: painting & the floor ------------------------------
@@ -18011,9 +20852,17 @@ const CR_AVG_EN: f32 = 8.14;
 const CR_AVG_RU: f32 = 8.99;
 /// The S9 type-step re-evaluation runs at resize-end, not mid-drag.
 const CR_RESIZE_SETTLE_MS: u64 = 250;
-/// The reaction input card (L20): ~250px, chips over one line.
+/// The reaction input card (L20): ~250px, chips over a multi-line note (D3 —
+/// one pencil with the margin composer). The height token is only the
+/// above/below placement estimate; the card grows a line or two with content.
 const CR_INPUT_W: f32 = 250.;
 const CR_INPUT_H: f32 = 62.;
+/// D2 / LAW 2 — the transient-blur grace. A keyboard-layout / input-source
+/// switch fires a focus-out then a focus-in on the SAME field; committing on
+/// the bare focus-out would file the note mid-word (every switch, for a
+/// bilingual writer). Defer the blur commit this long and cancel it if focus
+/// has returned. ~100 ms is below perception yet clears the switch round-trip.
+const CR_FIELD_GRACE_MS: u64 = 100;
 /// The anchor quote in a lane card: ≤42 graphemes + an ellipsis (N9).
 const CR_QUOTE_GRAPHEMES: usize = 42;
 
@@ -18275,6 +21124,13 @@ struct CrDrag {
     zone: i8,
     selecting: bool,
     anchor: Option<Range<usize>>,
+    /// D1 — this press resolved an open note (the mousedown committed it). A
+    /// click that did so is CONSUMED: on mouseup it must not ALSO flip the
+    /// page (the one place C4's commit-AND-act becomes commit-only, because
+    /// the "act" would be a page turn the reader never asked for). A drag that
+    /// grows out of it still selects new words; only the in-place click is
+    /// swallowed.
+    resolved_input: bool,
 }
 
 /// One shaped, positioned paint op of the current page (page-local coords —
@@ -18517,7 +21373,7 @@ impl Editor {
             self.close_palette(window, cx);
         }
         self.editor_menu_open = false;
-        self.selection_popover = false;
+        self.flank_risen = false; // the reading room suppresses the flanks; reset on exit
         // L3: entry quietly checkpoints — fingerprint-guarded, reflex tier.
         // (On a legacy file mid-backfill the store defers silently —
         // accepted and named, regions 13.)
@@ -18737,9 +21593,17 @@ impl Editor {
     /// restores by predicate; caret and scroll were never touched. A Past
     /// read returns to the untouched parked frame (Time 7).
     fn exit_cold_read(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cold_read.take().is_none() {
+        if self.cold_read.is_none() {
             return;
         }
+        // Leaving the room is a writer gesture (LAW 2 / C4): an open note is
+        // committed, not dropped. Mirrors `cr_escape_impl`'s input-open check —
+        // Esc discards the note, but every OTHER exit (the doorknob toggle,
+        // ctrl-shift-l, ReadItCold) files its non-empty trimmed text first.
+        if self.cold_read.as_ref().is_some_and(|cr| cr.input.is_some()) {
+            self.cr_commit_input_inner(cx);
+        }
+        self.cold_read = None;
         *self.cr_page_bounds.borrow_mut() = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -18766,8 +21630,12 @@ impl Editor {
         self.pulse_cold_read(cx);
     }
 
-    fn cr_noop(&mut self, _: &CrNoop, _: &mut Window, _: &mut Context<Self>) {
-        // up/down inside the read: inert, without a pulse (Scopes 1).
+    fn cr_noop(&mut self, _: &CrNoop, _: &mut Window, cx: &mut Context<Self>) {
+        // up/down inside the read: inert, without a pulse (Scopes 1). While a
+        // note is open the field owns them (D1) — `cr_field_owns_keys`
+        // propagates so up/down reach the field (the multiline composer binds
+        // them at a deeper context, so this is belt), else the no-op stands.
+        self.cr_field_owns_keys(cx);
     }
 
     fn pulse_cold_read(&mut self, cx: &mut Context<Self>) {
@@ -18851,8 +21719,27 @@ impl Editor {
             .is_some_and(|cr| cr.drag.as_ref().is_some_and(|d| d.selecting))
     }
 
+    /// D1 — the open note owns ALL keys, structurally. An ambient cold-read
+    /// navigation binding (space, and any flip chord a future round adds)
+    /// that still fires while the reaction input is open hands the keystroke
+    /// BACK: `cx.propagate()` lets the char fall through to the focused
+    /// field's text input (`space` becomes a typed space, never a page flip),
+    /// and non-text chords simply die at the field. Every ambient nav handler
+    /// calls this FIRST, so the comment at the takeover's `on_key_down` ("the
+    /// open reaction input owns its keystrokes") is now true for the NEXT
+    /// binding too, not just today's two keys (spec §4 D1, Raskin's structural
+    /// reading).
+    fn cr_field_owns_keys(&self, cx: &mut Context<Self>) -> bool {
+        if self.cold_read.as_ref().is_some_and(|cr| cr.input.is_some()) {
+            cx.propagate();
+            true
+        } else {
+            false
+        }
+    }
+
     fn cr_next_page(&mut self, _: &CrNextPage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_mid_drag() {
+        if self.cr_field_owns_keys(cx) || self.cr_mid_drag() {
             return;
         }
         self.cr_commit_input(window, cx); // a flip files first (N1)
@@ -18863,7 +21750,7 @@ impl Editor {
     }
 
     fn cr_prev_page(&mut self, _: &CrPrevPage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_mid_drag() {
+        if self.cr_field_owns_keys(cx) || self.cr_mid_drag() {
             return;
         }
         self.cr_commit_input(window, cx);
@@ -18874,7 +21761,7 @@ impl Editor {
     }
 
     fn cr_first_page(&mut self, _: &CrFirstPage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_mid_drag() {
+        if self.cr_field_owns_keys(cx) || self.cr_mid_drag() {
             return;
         }
         self.cr_commit_input(window, cx);
@@ -18882,7 +21769,7 @@ impl Editor {
     }
 
     fn cr_last_page(&mut self, _: &CrLastPage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_mid_drag() {
+        if self.cr_field_owns_keys(cx) || self.cr_mid_drag() {
             return;
         }
         self.cr_commit_input(window, cx);
@@ -18972,14 +21859,16 @@ impl Editor {
     fn cr_page_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(bounds) = *self.cr_page_bounds.borrow() else { return };
         // A page mousedown is a blur of the open input: file-or-close first
-        // (N1), then act.
+        // (N1), then act. If a note WAS open, this click resolved it — mark the
+        // drag so the mouseup swallows the flip (D1 commit-only carve-out).
+        let resolved_input = self.cold_read.as_ref().is_some_and(|cr| cr.input.is_some());
         self.cr_commit_input(window, cx);
         let Some(cr) = self.cold_read.as_mut() else { return };
         let handle = cr.focus_handle.clone();
         let local = point(ev.position.x - bounds.origin.x, ev.position.y - bounds.origin.y);
         let zone = Self::cr_zone_at(cr, local);
         let anchor = cr.hit_token(local);
-        cr.drag = Some(CrDrag { start: local, zone, selecting: false, anchor });
+        cr.drag = Some(CrDrag { start: local, zone, selecting: false, anchor, resolved_input });
         window.focus(&handle, cx);
     }
 
@@ -19043,6 +21932,15 @@ impl Editor {
             cx.notify();
             return;
         }
+        // D1 — a click that resolved an open note is CONSUMED: the mousedown
+        // already committed it, and this in-place click must not also turn the
+        // page (the reader was closing the note, not asking for the next
+        // spread). A drag off the press still selects; only the bare click is
+        // swallowed here.
+        if drag.resolved_input {
+            cx.notify();
+            return;
+        }
         // A click in place: the armed flip fires (edges are dead zones —
         // click eaten, the folio corroborates); mid-page, nothing (no caret
         // exists; a stale selection collapses).
@@ -19094,44 +21992,85 @@ impl Editor {
             + if cr.geom.lane { CR_LANE_GAP + CR_LANE_W } else { 0. }
             - CR_INPUT_W;
         let x = anchor.0.clamp(0., max_x.max(0.));
-        let input = cx.new(|cx| TextField::single(cx, String::new()));
+        // D3 — one pencil: the reaction input is the margin composer's
+        // multiline field (NoteComposer context), so Enter files and
+        // Shift/Ctrl+Enter add a line break, one grammar for "writing a note
+        // to the text". The Commit/Cancel subscription below is unchanged —
+        // FieldCommit still emits Commit, FieldCancel still emits Cancel.
+        let input = cx.new(|cx| TextField::multiline(cx, String::new()));
         let handle = input.read(cx).focus_handle.clone();
-        cx.subscribe(&input, move |editor, _, ev: &TextFieldEvent, cx| match ev {
-            TextFieldEvent::Commit(text) => {
-                let t = text.trim().to_owned();
-                if t.is_empty() {
-                    return; // Enter on empty = no-op (Scopes 5)
+        // subscribe_IN: both exits must hand keyboard focus back to the DESK
+        // (report 2). The field's Commit/Cancel remove it from the tree; if
+        // focus stays on the dead handle, every later keystroke — the second
+        // Esc included — dispatches into a void outside the ColdRead context,
+        // and the room can never be left by keyboard.
+        cx.subscribe_in(
+            &input,
+            window,
+            move |editor, _, ev: &TextFieldEvent, window, cx| match ev {
+                TextFieldEvent::Commit(text) => {
+                    let t = text.trim().to_owned();
+                    if t.is_empty() {
+                        return; // Enter on empty = no-op (Scopes 5)
+                    }
+                    editor.cr_file_reaction(t, cx);
+                    if let Some(cr) = editor.cold_read.as_ref() {
+                        let handle = cr.focus_handle.clone();
+                        window.focus(&handle, cx);
+                    }
                 }
-                editor.cr_file_reaction(t, cx);
-            }
-            TextFieldEvent::Cancel => {
-                // Esc: the ONLY discard (N1) — close + collapse.
-                if let Some(cr) = editor.cold_read.as_mut() {
-                    cr.input = None;
-                    cr.input_range = None;
-                    cr.input_at = None;
-                    cr.selection = None;
-                    cx.notify();
+                TextFieldEvent::Cancel => {
+                    // Esc: the ONLY discard (N1) — close + collapse + refocus
+                    // the desk (one exit, cr_escape_impl's own path).
+                    editor.cr_discard_input(window, cx);
                 }
-            }
-        })
+            },
+        )
         .detach();
-        // The universal commit-on-blur law (N1): any focus loss files
-        // non-empty trimmed text exactly as Enter would.
+        // The commit-on-blur law (N1): a focus loss files non-empty trimmed
+        // text exactly as Enter would — but only a WRITER'S gesture is a real
+        // departure. LAW 2 (spec D2): a keyboard-layout / input-source switch
+        // fires a transient focus-out+focus-in on the same field; defer the
+        // commit ~100 ms and cancel it if focus has returned, and an app
+        // deactivation (alt-tab mid-note) never commits. Kept local and
+        // minimal at this ONE call site — assembly unifies this into the
+        // shared TextField machinery (the margin composer / rename / goal /
+        // checkpoint fields all fire the same transient blur, and this is the
+        // unification point). LAW 2.
         let this_input = input.clone();
+        let grace_handle = handle.clone();
         let weak = cx.entity().downgrade();
         window
-            .on_focus_out(&handle, cx, move |_, _window, cx| {
-                let Some(editor) = weak.upgrade() else { return };
-                editor.update_checked(cx, |editor, cx| {
-                    if editor
-                        .cold_read
-                        .as_ref()
-                        .is_some_and(|cr| cr.input.as_ref() == Some(&this_input))
-                    {
-                        editor.cr_commit_input_inner(cx);
-                    }
-                });
+            .on_focus_out(&handle, cx, move |_, window, cx| {
+                let this_input = this_input.clone();
+                let grace_handle = grace_handle.clone();
+                let weak = weak.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(CR_FIELD_GRACE_MS))
+                            .await;
+                        cx.update(|window, app| {
+                            // Focus came back to THIS field (the layout switch's
+                            // round-trip), or the app lost activation — no
+                            // departure, the note stays open.
+                            if grace_handle.is_focused(window) || !window.is_window_active() {
+                                return;
+                            }
+                            let Some(editor) = weak.upgrade() else { return };
+                            editor.update_checked(app, |editor, cx| {
+                                if editor
+                                    .cold_read
+                                    .as_ref()
+                                    .is_some_and(|cr| cr.input.as_ref() == Some(&this_input))
+                                {
+                                    editor.cr_commit_input_inner(cx);
+                                }
+                            });
+                        })
+                        .ok();
+                    })
+                    .detach();
             })
             .detach();
         window.focus(&handle, cx);
@@ -20268,7 +23207,7 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                     };
                     let shaped = ts.shape_line(
                         SharedString::from(caption.clone()),
-                        px(g.body * 0.8),
+                        px(g.body * crate::bookpage::CAPTION_SCALE),
                         &[run],
                         None,
                     );
@@ -20971,7 +23910,6 @@ mod tests {
             BlockKind::Image {
                 src: id,
                 alt: "cover".into(),
-                caption: String::new(),
             },
         );
         blocks.set_scrap_line(Some(1));
@@ -21270,6 +24208,57 @@ mod tests {
     }
 
     #[test]
+    fn flanks_visible_predicate_is_law_1() {
+        // (sel_empty, is_selecting, risen, latched, field_open)
+        let v = flanks_visible_pred;
+        // The one visible state: a settled, non-empty selection, prose focus,
+        // no field, no latch.
+        assert!(v(false, false, true, false, false), "settled selection raises the flanks");
+        // Each conjunct, negated in turn, takes them down — the derived predicate.
+        assert!(!v(true, false, true, false, false), "an empty selection lowers them");
+        assert!(!v(false, true, true, false, false), "never mid-drag");
+        assert!(!v(false, false, false, false, false), "not yet settled (the 250ms beat)");
+        assert!(!v(false, false, true, true, false), "a latch (annotate/aside/exile/collapse) hides them");
+        assert!(!v(false, false, true, false, true), "a transient field (the composer) hides them — C2");
+    }
+
+    #[test]
+    fn note_moment_label_is_elapsed_while_fresh_date_when_older() {
+        // A fixed "now": 2026-07-11 12:00 UTC (day 20645 * 86400 + 43200).
+        let day = 20645i64;
+        let now = day * 86_400 + 12 * 3600;
+        // Fresh notes use timezone-free elapsed time, messenger-style.
+        assert_eq!(note_moment_label(now, now), "now");
+        assert_eq!(note_moment_label(now - 59, now), "now");
+        assert_eq!(note_moment_label(now - 60, now), "1 min");
+        assert_eq!(note_moment_label(now - 59 * 60, now), "59 min");
+        assert_eq!(note_moment_label(now - 3600, now), "1 h");
+        assert_eq!(note_moment_label(now - 23 * 3600, now), "23 h");
+        // Older notes borrow the strip's relative date grammar.
+        assert_eq!(note_moment_label((day - 1) * 86_400 + 3600, now), "Yesterday");
+        // A diagnosis keeps its level word; a writer note shows the moment.
+        assert_eq!(
+            note_card_label(true, "Line", false, day * 86_400, now),
+            "Line",
+            "a diagnosis keeps its level word (that IS data)"
+        );
+        assert_eq!(
+            note_card_label(false, "", false, now - 2 * 3600, now),
+            "2 h",
+            "a writer note's caption is its creation moment"
+        );
+        // The detached marker survives on both families.
+        assert_eq!(
+            note_card_label(true, "Copy", true, day * 86_400, now),
+            "Copy · detached"
+        );
+        assert_eq!(
+            note_card_label(false, "", true, now - 2 * 3600, now),
+            "2 h · detached"
+        );
+    }
+
+    #[test]
     fn editor_face_is_a_priority_not_exclusive_states() {
         use EditorFace::*;
         let mk = |needs_setup, error, cooking, ready, door_open| {
@@ -21531,6 +24520,27 @@ mod tests {
         assert_eq!(next_word_boundary(&doc2, 4), len); // blank run -> doc end
     }
 
+    #[test]
+    fn word_delete_left_clamps_at_picture_below_styled_block() {
+        use BlockKind::*;
+        let kinds = vec![img(), Heading(2)];
+        assert_eq!(image_word_left_boundary(&kinds, 1, 9, 3), 9);
+        // The free word boundary remains available to caret motion, and a
+        // styled block without picture furniture keeps its ordinary reach.
+        assert_eq!(image_word_left_boundary(&[Paragraph, Heading(2)], 1, 9, 3), 3);
+        assert_eq!(image_word_left_boundary(&[img(), Paragraph], 1, 9, 3), 3);
+    }
+
+    #[test]
+    fn footnote_jump_excludes_picture_pixels_above_caption() {
+        let top = px(40.);
+        let text_top = px(120.);
+        assert!(!footnote_text_band_contains(top, text_top, px(159.)));
+        assert!(footnote_text_band_contains(top, text_top, px(160.)));
+        // Prose has no picture band, so its existing routing is unchanged.
+        assert!(footnote_text_band_contains(top, px(0.), top));
+    }
+
     // --- Margin-card interaction FSM (CardFocus) -------------------------
     // The class of bugs these guard: a committed note rendering blank, a
     // composer lingering on a deselected card, a draft leaking onto the wrong
@@ -21673,5 +24683,520 @@ mod tests {
         let cluster: String = "y\u{0301}".repeat(50);
         let qc = cr_quote(&cluster);
         assert!(qc.graphemes(true).count() <= 45);
+    }
+
+    // -- Inline images: the display-size law + the borrowed margin ---------
+    // (inline-images §11 / §3 — the geometry is pure, so the laws are
+    // pinned here; position and hit-test ride the rig.)
+
+    #[test]
+    fn image_fits_the_column_width_proportionally() {
+        // Wider than the column: width caps, height follows the ratio.
+        let (w, h) = image_display_size((1200., 600.), 600., 900.);
+        assert_eq!((w, h), (600., 300.));
+        // Natural size when it already fits both bounds.
+        let (w, h) = image_display_size((300., 200.), 600., 900.);
+        assert_eq!((w, h), (300., 200.));
+    }
+
+    #[test]
+    fn tall_image_caps_at_two_thirds_viewport_proportionally() {
+        // A tall portrait: 2/3 of a 900px viewport = 600px display height,
+        // and the width shrinks by the same factor — never a squeeze.
+        let (w, h) = image_display_size((300., 1800.), 600., 900.);
+        assert_eq!(h, 600.);
+        assert!((w - 100.).abs() < 1e-4, "proportional: {w}");
+        // Both caps at once: column first, then the height cap re-scales.
+        let (w, h) = image_display_size((1200., 2400.), 600., 900.);
+        assert_eq!(h, 600.);
+        assert!((w - 300.).abs() < 1e-4, "proportional through both: {w}");
+        // Degenerate inputs never divide by zero.
+        assert_eq!(image_display_size((0., 100.), 600., 900.), (0., 0.));
+        assert_eq!(image_display_size((100., 0.), 600., 900.), (0., 0.));
+    }
+
+    #[test]
+    fn empty_caption_slot_borrows_the_bottom_margin() {
+        // Default scale: gap 6 + caption line 22 = 28 = the paragraph gap
+        // exactly — manifestation costs no geometry (§3).
+        assert_eq!(image_gap_below(28., 22.), 28.);
+        // Small font scale: the body gap (16) runs under one caption caret
+        // (6 + 14 = 20) — the one-time bump makes room.
+        assert_eq!(image_gap_below(16., 14.), 20.);
+        // Large scale: the body gap (56) already hosts the caret (6 + 44).
+        assert_eq!(image_gap_below(56., 44.), 56.);
+    }
+
+    #[test]
+    fn debug_png_emits_wellformed_chunks() {
+        // The rig seed's generated PNG: signature, IHDR geometry, and the
+        // zlib stored-block framing that gpui's decoder will inflate.
+        let png = debug_png(3, 2, |x, y| [x as u8, y as u8, 7]);
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 3);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 2);
+        // One stored deflate block: BFINAL=1, LEN = 2 rows × (1 + 3·3).
+        let idat = &png[33 + 8..]; // past IHDR chunk + IDAT len/tag
+        assert_eq!(&png[37..41], b"IDAT");
+        assert_eq!(idat[2], 1, "final stored block");
+        assert_eq!(u16::from_le_bytes([idat[3], idat[4]]), 20);
+    }
+
+    // ---- The picture's doors (inline-images §5), row by row ----------------
+
+    fn img() -> BlockKind {
+        BlockKind::Image { src: "asset:x.png".into(), alt: String::new() }
+    }
+
+    #[test]
+    fn image_bounds_and_markdown_exclude_every_multibyte_separator() {
+        for separator in ["\r\n", "\u{0085}", "\u{2028}"] {
+            let text = format!("above{separator}caption{separator}below");
+            let doc = Document::new(
+                &text,
+                SpanSet::default(),
+                BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), BlockKind::Paragraph]),
+            );
+            let range = image_block_bounds_in(&doc, 1);
+            assert_eq!(doc.slice_bytes(range.0..range.1), "caption", "{separator:?}");
+            assert_eq!(doc.rope().char_to_byte(doc.rope().byte_to_char(range.0)), range.0);
+            assert_eq!(doc.rope().char_to_byte(doc.rope().byte_to_char(range.1)), range.1);
+
+            let markdown = image_block_markdown_in(&doc, 1).expect("image markdown");
+            assert!(markdown.contains("caption"), "{separator:?}");
+            assert!(!markdown.contains(['\r', '\u{0085}', '\u{2028}']), "{separator:?}");
+        }
+    }
+
+    #[test]
+    fn paragraph_and_footnote_bounds_exclude_crlf_whole() {
+        let doc = Document::new(
+            "paragraph\r\ndefinition\r\nafter",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                BlockKind::FootnoteDef { id: "note".into() },
+                BlockKind::Paragraph,
+            ]),
+        );
+        let paragraph = paragraph_bounds_in(&doc, 3);
+        assert_eq!(doc.slice_bytes(paragraph.0..paragraph.1), "paragraph");
+        assert_eq!(paragraph, (0, 9));
+
+        let footnote = block_bounds_in(&doc, 1);
+        assert_eq!(doc.slice_bytes(footnote.0..footnote.1), "definition");
+        assert_eq!(footnote, (11, 21));
+    }
+
+    #[test]
+    fn drop_anchor_keeps_its_byte_when_revision_is_unchanged() {
+        let doc = Document::new(
+            "above\nbelow",
+            SpanSet::default(),
+            BlockMap::new(2),
+        );
+        let anchor = DropAnchor { byte: 5, revision: doc.revision() };
+        assert_eq!(resolve_drop_anchor(&doc, Some(anchor)), Some(5));
+        assert_eq!(shift_drop_caret(5, Some(5), 2, 13), 5);
+        assert_eq!(shift_drop_caret(6, Some(5), 2, 13), 8);
+    }
+
+    #[test]
+    fn edited_drop_anchor_snaps_to_a_block_end_and_shifts_caret_from_it() {
+        let mut doc = Document::new(
+            "one\nsecond\nthird",
+            SpanSet::default(),
+            BlockMap::new(3),
+        );
+        let anchor = DropAnchor { byte: 10, revision: doc.revision() };
+        doc.edit_bytes(0..0, "long ");
+
+        let snapped = resolve_drop_anchor(&doc, Some(anchor)).expect("anchor");
+        assert_eq!(snapped, 15, "the stale byte was mid-block after the edit");
+        assert_eq!(snapped, line_text_end_bytes(doc.rope(), doc.block_of_byte(snapped)));
+
+        let before_len = doc.len_bytes();
+        doc.insert_image_block(snapped, "asset:dropped.png".into());
+        let delta = doc.len_bytes() - before_len;
+        assert_eq!(shift_drop_caret(14, Some(snapped), delta, doc.len_bytes()), 14);
+        let shifted = shift_drop_caret(16, Some(snapped), delta, doc.len_bytes());
+        assert_eq!(doc.slice_bytes(shifted..doc.len_bytes()), "third");
+        assert!(matches!(doc.blocks().kind(2), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn word_and_paragraph_walkers_cross_every_separator_without_slicing_it() {
+        for separator in ["\n", "\r\n", "\u{0085}", "\u{2028}"] {
+            let text = format!("alpha beta{separator}gamma delta");
+            let doc = Document::new(&text, SpanSet::default(), BlockMap::new(2));
+            let end0 = 10; // "alpha beta"
+            let start1 = end0 + separator.len();
+
+            // Forward from the first line's text end: over the break, then
+            // to the end of "gamma" — never a reversed or mid-break slice.
+            assert_eq!(next_word_boundary(&doc, end0), start1 + 5, "{separator:?}");
+            // Backward from the second line's start: the previous line's
+            // last word start.
+            assert_eq!(previous_word_boundary(&doc, start1), 6, "{separator:?}");
+
+            // Paragraph motion never pins at a multibyte break.
+            assert_eq!(next_paragraph_boundary_in(&doc, end0), doc.len_bytes(), "{separator:?}");
+            assert_eq!(previous_paragraph_boundary_in(&doc, start1), 0, "{separator:?}");
+        }
+    }
+
+    #[test]
+    fn shrunk_drop_anchor_at_a_multibyte_edge_is_safe_and_lands_at_a_block_end() {
+        let mut doc = Document::new(
+            "above\nmiddle\ntail",
+            SpanSet::default(),
+            BlockMap::new(3),
+        );
+        let anchor = DropAnchor { byte: 12, revision: doc.revision() };
+        let len = doc.len_bytes();
+        doc.edit_bytes(5..len, "\u{2028}");
+
+        let snapped = resolve_drop_anchor(&doc, Some(anchor)).expect("anchor");
+        assert_eq!(snapped, doc.len_bytes());
+        assert_eq!(doc.rope().char_to_byte(doc.rope().byte_to_char(snapped)), snapped);
+        assert_eq!(snapped, line_text_end_bytes(doc.rope(), doc.block_of_byte(snapped)));
+        doc.insert_image_block(snapped, "asset:dropped.png".into());
+        assert!(doc.blocks().kinds().iter().any(|kind| matches!(kind, BlockKind::Image { .. })));
+    }
+
+    #[test]
+    fn backspace_doors_follow_the_section_5_table() {
+        use BlockKind::*;
+        let kinds = vec![Paragraph, img(), Paragraph];
+        // Backspace at the start of the block BELOW the image → stages it.
+        assert_eq!(
+            image_backspace_door(&kinds, 2, true, false),
+            ImageDoor::Stage(1)
+        );
+        // Mid-block: not a boundary, the ordinary path proceeds.
+        assert_eq!(image_backspace_door(&kinds, 2, false, false), ImageDoor::Pass);
+        // In an EMPTY caption → stages the image block itself.
+        assert_eq!(
+            image_backspace_door(&kinds, 1, true, true),
+            ImageDoor::Stage(1)
+        );
+        // At the start of a NON-EMPTY caption → a wall, pure no-op.
+        assert_eq!(image_backspace_door(&kinds, 1, true, false), ImageDoor::Refuse);
+        // Plain prose boundary far from any picture: pass.
+        assert_eq!(image_backspace_door(&kinds, 0, true, false), ImageDoor::Pass);
+        // A styled block below the image keeps the strip-the-kind press:
+        // the first backspace demotes, only the SECOND meets the door.
+        let styled = vec![Paragraph, img(), Heading(2)];
+        assert_eq!(image_backspace_door(&styled, 2, true, false), ImageDoor::Pass);
+        // Two pictures stacked: the caption start of the lower one still
+        // refuses (its own wall outranks the neighbour door above).
+        let stacked = vec![img(), img(), Paragraph];
+        assert_eq!(image_backspace_door(&stacked, 1, true, false), ImageDoor::Refuse);
+        assert_eq!(image_backspace_door(&stacked, 1, true, true), ImageDoor::Stage(1));
+    }
+
+    #[test]
+    fn delete_doors_follow_the_section_5_table() {
+        use BlockKind::*;
+        let kinds = vec![Paragraph, img(), Paragraph];
+        // Delete at the end of the block ABOVE the image → stages it (the
+        // field repro's step 7: never fuses).
+        assert_eq!(image_delete_door(&kinds, 0, true), ImageDoor::Stage(1));
+        assert_eq!(image_delete_door(&kinds, 0, false), ImageDoor::Pass);
+        // Delete at caption end → a wall: prose never climbs into a
+        // caption, and a destructive key is never navigation.
+        assert_eq!(image_delete_door(&kinds, 1, true), ImageDoor::Refuse);
+        // Last block, nothing follows: pass (the ordinary no-op at end).
+        assert_eq!(image_delete_door(&kinds, 2, true), ImageDoor::Pass);
+    }
+
+    #[test]
+    fn exile_freshness_ladder_never_lets_autorepeat_cross() {
+        // The staging key, unreleased: its own presses are autorepeat.
+        assert!(!exile_press_is_fresh(Some("backspace"), "backspace"));
+        assert!(!exile_press_is_fresh(Some("delete"), "delete"));
+        // The OTHER deletion key is a fresh key-down by construction.
+        assert!(exile_press_is_fresh(Some("backspace"), "delete"));
+        assert!(exile_press_is_fresh(Some("delete"), "backspace"));
+        // After the key-up (hold cleared) — and for a click-born selection
+        // that never had a staging key — every press is fresh.
+        assert!(exile_press_is_fresh(None, "backspace"));
+        assert!(exile_press_is_fresh(None, "delete"));
+    }
+
+    #[test]
+    fn caption_enter_direction_rule() {
+        // Start of a non-empty caption: room ABOVE (caption stays with the
+        // picture). Everywhere else the ordinary split proceeds — and the
+        // empty-caption collision resolves to below (§6).
+        assert!(caption_enter_opens_above(true, false));
+        assert!(!caption_enter_opens_above(true, true));
+        assert!(!caption_enter_opens_above(false, false));
+        assert!(!caption_enter_opens_above(false, true));
+    }
+
+    // ---- Whole-block exile and its inverse, at the model (§5) --------------
+
+    #[test]
+    fn image_exile_takes_the_block_whole_and_put_back_restores_it() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        let mut doc = Document::new(
+            "above\ncaption words\nbelow",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), BlockKind::Paragraph]),
+        );
+        // The whole-block door: block text bounds, no separator (the door
+        // takes the bounding one itself).
+        let id = doc.exile_to_graveyard(6..19, String::new(), 0, false);
+        assert_eq!(doc.text(), "above\nbelow");
+        assert_eq!(doc.blocks().kinds().len(), 2);
+        assert!(doc.blocks().kinds().iter().all(|k| !k.is_furniture()));
+        let entry = doc.graveyard().get(id).expect("filed");
+        assert!(entry.whole_blocks, "the picture leaves through the block door");
+        // Post-exile caret law: the start of the block that now follows.
+        assert_eq!(6usize.min(doc.len_bytes()), 6, "caret = start of 'below'");
+        // Put back restores picture AND caption (P13's honest inverse).
+        let caret = doc.put_back(id).expect("returns");
+        assert_eq!(doc.text(), "above\ncaption words\nbelow");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        assert_eq!(caret, 6, "caret at the returned block's start");
+    }
+
+    #[test]
+    fn empty_caption_image_exiles_whole_and_returns() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        // The birth state of every inserted image: an EMPTY caption line.
+        let mut doc = Document::new(
+            "above\n\nbelow",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), BlockKind::Paragraph]),
+        );
+        let id = doc.exile_to_graveyard(6..6, String::new(), 0, false);
+        assert_eq!(doc.text(), "above\nbelow", "block AND separator went");
+        let entry = doc.graveyard().get(id).expect("filed");
+        assert!(entry.whole_blocks, "an empty line that is a whole block still is one");
+        doc.put_back(id).expect("returns");
+        assert_eq!(doc.text(), "above\n\nbelow");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn exiling_the_block_below_an_empty_caption_image_spares_the_picture() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        // [P, Image{empty}, P], exile the LAST paragraph: its whole-block
+        // cut eats the LEADING separator, whose start byte coincides with
+        // the empty caption line's own start — the restamp must know which
+        // block the door is taking, or it stamps the picture away (§5).
+        let mut doc = Document::new(
+            "AAA\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), BlockKind::Paragraph]),
+        );
+        doc.exile_to_graveyard(5..8, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\n");
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { .. }),
+            "the neighbour's exile must not destroy the picture"
+        );
+    }
+
+    #[test]
+    fn exiling_an_image_below_an_empty_caption_twin_takes_only_itself() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        // [P, img1{empty}, img2]: exiling img2 (leading-separator cut)
+        // must leave img1 standing AS img1 — the geometric restamp used to
+        // stamp img2's kind onto img1's line, so img2 stood live AND in
+        // the grave (Put back would clone it) while img1 died (§5).
+        let img2 = BlockKind::Image { src: "asset:two.png".into(), alt: String::new() };
+        let mut doc = Document::new(
+            "AAA\n\ncap2",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img(), img2]),
+        );
+        let id = doc.exile_to_graveyard(5..9, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\n");
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:x.png"),
+            "img1 survives as img1, not as a restamped img2"
+        );
+        let entry = doc.graveyard().get(id).expect("filed");
+        assert!(
+            matches!(&entry.kinds[..], [BlockKind::Image { src, .. }] if src == "asset:two.png"),
+            "img2 lives in the grave"
+        );
+        assert_eq!(
+            doc.blocks().kinds().iter().filter(|k| k.is_furniture()).count(),
+            1,
+            "img2 must not ALSO stand live"
+        );
+    }
+
+    #[test]
+    fn image_exiled_last_lands_the_caret_at_the_previous_blocks_end() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        let mut doc = Document::new(
+            "above\ncaption",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img()]),
+        );
+        doc.exile_to_graveyard(6..13, String::new(), 0, false);
+        // The leading separator went with it; the caret collapse
+        // (`file_cut`: range.start.min(len)) lands at the end of "above".
+        assert_eq!(doc.text(), "above");
+        assert_eq!(6usize.min(doc.len_bytes()), 5, "caret = end of previous block");
+    }
+
+    #[test]
+    fn lone_furniture_block_never_survives_its_own_exile() {
+        use strop_core::document::{BlockMap, Document, SpanSet};
+        // Degenerate by construction (insertion always leaves a neighbour),
+        // but the model must be safe on its own: the rope's one-line floor
+        // keeps the LINE — the kind must not keep the picture.
+        let mut doc = Document::new(
+            "caption",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img()]),
+        );
+        let id = doc.exile_to_graveyard(0..7, String::new(), 0, false);
+        assert_eq!(doc.text(), "");
+        assert!(
+            !doc.blocks().kind(0).is_furniture(),
+            "the remnant line is born-again prose, not a second picture"
+        );
+        assert!(doc.graveyard().get(id).is_some());
+    }
+
+    // ---- Travel: copy, cut, paste (§9) --------------------------------------
+
+    #[test]
+    fn range_copy_splices_whole_covered_images_to_markdown() {
+        // "AAA\ncap\nBBB": the image line 4..7 covered whole swaps for its
+        // Markdown form; everything around it stays the plain slice.
+        let images = vec![(4..7usize, r#"![alt](asset:a "cap")"#.to_owned())];
+        assert_eq!(
+            splice_image_markdown("AAA\ncap\nBBB", 0, &images),
+            "AAA\n![alt](asset:a \"cap\")\nBBB"
+        );
+        // Range starting mid-slice: offsets rebase against range_start.
+        assert_eq!(
+            splice_image_markdown("A\ncap\nB", 2, &images),
+            "A\n![alt](asset:a \"cap\")\nB"
+        );
+        // Image line at the copy's very edges.
+        assert_eq!(
+            splice_image_markdown("cap\nBBB", 4, &images),
+            "![alt](asset:a \"cap\")\nBBB"
+        );
+        assert_eq!(
+            splice_image_markdown("AAA\ncap", 0, &images),
+            "AAA\n![alt](asset:a \"cap\")"
+        );
+        // Two pictures in one sweep.
+        let two = vec![
+            (0..3usize, "![](asset:a)".to_owned()),
+            (8..11usize, "![](asset:b)".to_owned()),
+        ];
+        assert_eq!(
+            splice_image_markdown("cap\nmid\ncap", 0, &two),
+            "![](asset:a)\nmid\n![](asset:b)"
+        );
+        // No covered image: the identity.
+        assert_eq!(splice_image_markdown("plain\nprose", 0, &[]), "plain\nprose");
+    }
+
+    #[test]
+    fn paste_classification_rebuilds_only_resolving_image_lines() {
+        // The §9 oracle: only asset:a resolves in "this document".
+        let resolves = |src: &str| src == "asset:a";
+        let text = "prose above\n![cat](asset:a \"cap\")\n![dog](asset:b)\nnot ![ an image\nprose below";
+        let found = image_lines_in(text, &resolves);
+        assert_eq!(found.len(), 1, "the non-resolving line stays literal");
+        assert_eq!(found[0].0, 1);
+        assert_eq!(found[0].1.src, "asset:a");
+        assert_eq!(found[0].1.alt, "cat");
+        assert_eq!(found[0].1.caption, "cap");
+        // No image lines at all: the ordinary paste's cheap exit.
+        assert!(image_lines_in("plain\nprose", &resolves).is_empty());
+    }
+
+    #[test]
+    fn rebuild_plan_substitutes_captions_and_guards_the_wall() {
+        let il = |src: &str, cap: &str| strop_core::markdown::ImageLine {
+            src: src.into(),
+            alt: String::new(),
+            caption: cap.into(),
+        };
+        // Mid-line landing, image first AND last: separators on both
+        // sides — a rebuilt picture owns its whole line (§2's corollary).
+        let (text, stamps) = plan_image_line_rebuild(
+            "![](asset:a \"cap\")",
+            vec![(0, il("asset:a", "cap"))],
+            false,
+            false,
+        );
+        assert_eq!(text, "\ncap\n");
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps[0].0, 1, "the prepended separator shifts the stamp");
+        // Landing already on its own line: no separators added.
+        let (text, stamps) = plan_image_line_rebuild(
+            "![](asset:a \"cap\")",
+            vec![(0, il("asset:a", "cap"))],
+            true,
+            true,
+        );
+        assert_eq!(text, "cap");
+        assert_eq!(stamps[0].0, 0);
+        // A mid-text image line needs nothing: its separators ride the
+        // pasted text itself. The caption title's inline syntax parses
+        // out to text + spans (Strop↔Strop round-trips whole, §10).
+        let (text, stamps) = plan_image_line_rebuild(
+            "above\n![](asset:a \"*look*\")\nbelow",
+            vec![(1, il("asset:a", "*look*"))],
+            false,
+            false,
+        );
+        assert_eq!(text, "above\nlook\nbelow");
+        assert_eq!(stamps[0].0, 1);
+        assert_eq!(stamps[0].2.spans().len(), 1, "the caption's emphasis survives");
+        // Trailing image at the paste's end, mid-line landing: the
+        // appended separator is also how a picture landing last in the
+        // document earns its trailing empty paragraph (§7).
+        let (text, _) = plan_image_line_rebuild(
+            "above\n![](asset:a)",
+            vec![(1, il("asset:a", ""))],
+            false,
+            false,
+        );
+        assert_eq!(text, "above\n\n");
+    }
+
+    #[test]
+    fn drop_gap_math_targets_the_nearest_gap_never_the_caret() {
+        // Three blocks: 0..100, 120..220, 240..340 (top, height).
+        let rows = [(0., 100.), (120., 100.), (240., 100.)];
+        // Above the first block's midline: the topmost gap.
+        assert_eq!(drop_gap_for_y(&rows, -20.).0, 0);
+        assert_eq!(drop_gap_for_y(&rows, 30.).0, 0);
+        // Below block 0's midline / in the inter-block gap / above block
+        // 1's midline: all the SAME gap 1.
+        assert_eq!(drop_gap_for_y(&rows, 80.).0, 1);
+        assert_eq!(drop_gap_for_y(&rows, 110.).0, 1);
+        assert_eq!(drop_gap_for_y(&rows, 140.).0, 1);
+        // The inter-block rule y sits mid-gap.
+        assert_eq!(drop_gap_for_y(&rows, 110.).1, 110.);
+        // Below the last block's midline: the after-the-end gap.
+        assert_eq!(drop_gap_for_y(&rows, 300.).0, 3);
+        assert_eq!(drop_gap_for_y(&rows, 900.).0, 3);
+        // Degenerate empty frame: gap 0, no panic.
+        assert_eq!(drop_gap_for_y(&[], 50.).0, 0);
+    }
+
+    #[test]
+    fn clipboard_bitmap_format_follows_the_asset_extension() {
+        assert_eq!(image_format_for_src("asset:ab.png"), gpui::ImageFormat::Png);
+        assert_eq!(image_format_for_src("asset:ab.jpg"), gpui::ImageFormat::Jpeg);
+        assert_eq!(image_format_for_src("asset:ab.webp"), gpui::ImageFormat::Webp);
+        assert_eq!(image_format_for_src("asset:legacy"), gpui::ImageFormat::Png);
     }
 }

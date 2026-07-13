@@ -130,6 +130,16 @@ impl Buffer {
         self.undo_stack.push(Transaction { edits: Vec::new() });
     }
 
+    /// Drop the latest transaction only when it carries no text edits.
+    pub(crate) fn pop_empty_transaction(&mut self) -> bool {
+        if self.undo_stack.last().is_some_and(|tx| tx.edits.is_empty()) {
+            self.undo_stack.pop();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Apply one edit as part of the currently-open transaction, without
     /// starting a new undo boundary. The caller must have opened a transaction
     /// first (e.g. `push_empty_transaction`) — this groups several primitive

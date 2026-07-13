@@ -7,21 +7,29 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, ClipboardItem, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent,
-    TouchPhase, WindowHandle, point, px,
+    AnyWindowHandle, App, AppContext as _, ClipboardItem, ExternalPaths, FileDropEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+    ScrollDelta, ScrollWheelEvent, TouchPhase, WindowHandle, point, px,
 };
 
 /// Clipboard TRANSPORT shim for the headless rig only: gpui's wayland
 /// `write_to_clipboard` is silently dropped unless the window holds real
 /// seat focus, which a headless sway with WLR_LIBINPUT_NO_DEVICES never
-/// grants. The `clipb64:` token stores the text here too; the two paste
-/// read-sites fall back to it when the platform clipboard reads empty.
-/// Only the transport is shimmed — binding routing and insertion paths
-/// stay fully real. Never set outside a STROP_SMOKE run.
-static CLIP_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+/// grants. The `clipb64:` token stores here too; the paste read-sites
+/// fall back to it when the platform clipboard reads empty. The slot
+/// holds a whole `ClipboardItem` so §9's two-entry image form (Markdown
+/// line + bitmap) round-trips under the rig, not just text. Only the
+/// transport is shimmed — binding routing and insertion paths stay fully
+/// real. Never set outside a STROP_SMOKE run.
+static CLIP_OVERRIDE: Mutex<Option<ClipboardItem>> = Mutex::new(None);
 
+/// The text view of the shim (coldread copycheck compares text goldens).
 pub fn clipboard_override() -> Option<String> {
+    CLIP_OVERRIDE.lock().ok()?.clone()?.text()
+}
+
+/// The full-item view (the document paste path reads entries).
+pub fn clipboard_item_override() -> Option<ClipboardItem> {
     CLIP_OVERRIDE.lock().ok()?.clone()
 }
 
@@ -29,10 +37,15 @@ pub fn clipboard_override() -> Option<String> {
 /// back (the wayland write is dropped without real seat focus — see above).
 /// A no-op outside STROP_SMOKE runs.
 pub fn mirror_clipboard(text: &str) {
+    mirror_clipboard_item(&ClipboardItem::new_string(text.to_owned()));
+}
+
+/// `mirror_clipboard` for a multi-entry item (§9's image copy/cut).
+pub fn mirror_clipboard_item(item: &ClipboardItem) {
     if std::env::var("STROP_SMOKE").is_ok()
         && let Ok(mut slot) = CLIP_OVERRIDE.lock()
     {
-        *slot = Some(text.to_owned());
+        *slot = Some(item.clone());
     }
 }
 
@@ -70,9 +83,38 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
             // prints the layer-stack snapshot (H1 — DESIGN §0.6 checks).
             if let Some(b64) = key.strip_prefix("clipb64:") {
                 let text = decode_base64(b64).expect("bad clipb64 in STROP_SMOKE");
-                *CLIP_OVERRIDE.lock().expect("clipboard override poisoned") = Some(text.clone());
+                *CLIP_OVERRIDE.lock().expect("clipboard override poisoned") =
+                    Some(ClipboardItem::new_string(text.clone()));
                 cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
                 eprintln!("SMOKE {key}: clipboard set");
+                continue;
+            }
+            // `clipimg:PATH` seeds the clipboard with a BARE bitmap entry —
+            // a foreign clipboard in §9's terms (no Strop image line) — for
+            // driving the §5b fallback and §4's bitmap replace-in-place.
+            // `clipimg:PATH;B64MD` adds a base64 Markdown line as the text
+            // sibling — the §9 two-entry form with a non-resolving asset:
+            // src, for driving the ladder's import-sibling rung.
+            if let Some(spec) = key.strip_prefix("clipimg:") {
+                let (path, md) = match spec.split_once(';') {
+                    Some((p, b64)) => {
+                        (p, Some(decode_base64(b64).expect("bad clipimg md in STROP_SMOKE")))
+                    }
+                    None => (spec, None),
+                };
+                let bytes = std::fs::read(path).expect("bad clipimg path in STROP_SMOKE");
+                let mut entries = Vec::new();
+                if let Some(md) = md {
+                    entries.push(gpui::ClipboardEntry::String(gpui::ClipboardString::new(md)));
+                }
+                entries.push(gpui::ClipboardEntry::Image(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    bytes,
+                )));
+                let item = ClipboardItem { entries };
+                *CLIP_OVERRIDE.lock().expect("clipboard override poisoned") = Some(item.clone());
+                cx.update(|cx| cx.write_to_clipboard(item));
+                eprintln!("SMOKE {key}: bitmap clipboard set");
                 continue;
             }
             if let Some(spec) = key.strip_prefix("wheel:") {
@@ -192,8 +234,12 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:annotated: annotated paragraph seeded + selected");
                 continue;
             }
-            // Flanks (docs/impl/03-flanks.md §3): select the caret paragraph and
-            // raise the popover so `dump:ui`'s `flanks` object is observable.
+            // Flanks (docs/impl/03-flanks.md §3, papercuts-2026-07 §1 LAW 1):
+            // `select:para` raises the flanks via a settled selection so
+            // `dump:ui`'s `flanks` object is observable; `select:kbd` proves a
+            // KEYBOARD selection (shift+arrows, through `extend_cursor`) raises
+            // them identically. Follow either with `ctrl-m dump:ui` to prove the
+            // composer takes them DOWN (transient field ⇒ hidden, C2).
             if key == "select:para" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_select_para(cx))
@@ -202,6 +248,16 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(80))
                     .await;
                 eprintln!("SMOKE select:para: caret paragraph selected + flanks raised");
+                continue;
+            }
+            if key == "select:kbd" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_select_kbd(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE select:kbd: keyboard selection made + flanks raised");
                 continue;
             }
             if key == "exile:selection" {
@@ -264,6 +320,159 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(80))
                     .await;
                 eprintln!("SMOKE putback:last: newest cut put back");
+                continue;
+            }
+            // Inline images (docs/inline-images.md §11): `seed:image`
+            // builds a doc with a captioned picture, prose, and a tall
+            // uncaptioned portrait — through the real verbs (put_asset,
+            // insert_image_block, typing into the caption line) — so the
+            // rig can finally SEE pictures: caption under (never on),
+            // empty slot chrome-free, the two-thirds-viewport cap.
+            if key == "seed:image" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_image(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                eprintln!("SMOKE seed:image: captioned + tall pictures seeded");
+                continue;
+            }
+            // `seed:imgrepro` builds the round's FIELD REPRO exactly (empty
+            // paragraph, captioned picture, prose below — inline-images
+            // §11's acceptance shape); `img-geo` prints every picture's
+            // pixel-rect + caption targets (window coords) for `click:`.
+            if key == "seed:imgrepro" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_image_repro(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                eprintln!("SMOKE seed:imgrepro: empty para + picture + prose seeded");
+                continue;
+            }
+            if key == "img-geo" {
+                let geo = window
+                    .update(cx, |editor, _, _| editor.debug_images())
+                    .unwrap_or_default();
+                eprintln!("SMOKE img-geo:\n{geo}");
+                continue;
+            }
+            // `keyup:<key>` dispatches a real KeyUp through GPUI (the same
+            // path a physical release takes). dispatch_keystroke sends only
+            // KeyDown, so without this token the staged-exile freshness law
+            // (inline-images §5, R5: completion waits for the staging key's
+            // release) would refuse every scripted second press — exactly
+            // as it must for a real held key.
+            if let Some(k) = key.strip_prefix("keyup:") {
+                let keystroke = Keystroke::parse(k).expect("bad keyup in STROP_SMOKE");
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            // External file drag-and-drop (inline-images §7), synthesized
+            // as the PLATFORM events the compositor would send — the same
+            // FileDropEvent path gpui's window.rs:4602 translates, so the
+            // active_drag plumbing, the drag-over rule and the drop
+            // listeners all run for real. `dragenter:X,Y,PATH[;PATH…]`
+            // starts the drag over the window; `dragmove:X,Y` is a
+            // Pending hover (paints the §7 insertion rule); `dragdrop:X,Y`
+            // submits the drop at that position; `dragleave` exits.
+            if let Some(spec) = key.strip_prefix("dragenter:") {
+                let mut it = spec.splitn(3, ',');
+                let x: f32 = it.next().and_then(|v| v.parse().ok()).expect("bad dragenter x");
+                let y: f32 = it.next().and_then(|v| v.parse().ok()).expect("bad dragenter y");
+                let paths: Vec<std::path::PathBuf> = it
+                    .next()
+                    .expect("dragenter needs a path")
+                    .split(';')
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::FileDrop(FileDropEvent::Entered {
+                            position: point(px(x), px(y)),
+                            paths: ExternalPaths(paths.into_iter().collect()),
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if let Some(spec) = key.strip_prefix("dragmove:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .expect("bad dragmove in STROP_SMOKE")
+                };
+                let (x, y) = (next(), next());
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::FileDrop(FileDropEvent::Pending {
+                            position: point(px(x), px(y)),
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if let Some(spec) = key.strip_prefix("dragdrop:") {
+                let mut it = spec.split(',');
+                let mut next = || {
+                    it.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .expect("bad dragdrop in STROP_SMOKE")
+                };
+                let (x, y) = (next(), next());
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::FileDrop(FileDropEvent::Submit {
+                            position: point(px(x), px(y)),
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
+                // The drop's import runs on the background executor.
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let state = window
+                    .update(cx, |editor, _, _| editor.debug_cursor())
+                    .unwrap_or_default();
+                eprintln!("SMOKE {key}: {state}");
+                continue;
+            }
+            if key == "dragleave" {
+                cx.update_window(any, |_, window, cx| {
+                    window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Exited), cx);
+                })
+                .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
                 continue;
             }
             if key == "seed:many" {
@@ -441,6 +650,34 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 let glyph = glyph.to_owned();
                 window
                     .update(cx, |editor, _, cx| editor.debug_coldread_react(&glyph, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            // `coldread:raise` opens the reaction input on the current
+            // selection (drive the D1 multi-word regression by following it
+            // with real keystroke tokens, e.g. `h i space t h e r e enter`).
+            if key == "coldread:raise" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_coldread_raise(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            // `coldread:pageclick:Z` — a real page click in flip zone Z (-1/0/1)
+            // through the actual mouse handlers (D1's commit-only carve-out).
+            if let Some(z) = key.strip_prefix("coldread:pageclick:") {
+                let zone: i8 = z.parse().expect("bad coldread:pageclick zone");
+                window
+                    .update(cx, |editor, window, cx| {
+                        editor.debug_coldread_pageclick(zone, window, cx)
+                    })
                     .ok();
                 cx.background_executor()
                     .timer(Duration::from_millis(80))

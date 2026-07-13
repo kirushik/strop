@@ -79,21 +79,60 @@ fn char_slice(text: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
-/// The char position where the line break PRECEDING `line_start` begins —
-/// i.e. `line_start` minus its own leading break (one char, or two for CRLF,
-/// which ropey counts as one break but two chars). 0 stays 0.
-fn line_break_before(rope: &ropey::Rope, line_start: usize) -> usize {
-    if line_start == 0 {
+/// Length in chars of the line break ENDING exactly at `pos`: two for CRLF,
+/// one for every other break ropey recognises, and zero when none ends here.
+fn break_len_before(rope: &ropey::Rope, pos: usize) -> usize {
+    if pos == 0 {
         return 0;
     }
-    if rope.char(line_start - 1) == '\n'
-        && line_start >= 2
-        && rope.char(line_start - 2) == '\r'
-    {
-        line_start - 2
-    } else {
-        line_start - 1
+    match rope.char(pos - 1) {
+        '\n' if pos >= 2 && rope.char(pos - 2) == '\r' => 2,
+        '\n' | '\u{000B}' | '\u{000C}' | '\r' | '\u{0085}' | '\u{2028}'
+        | '\u{2029}' => 1,
+        _ => 0,
     }
+}
+
+/// Length in bytes of the line break ENDING exactly at `byte_pos`: two for
+/// CRLF and NEL, three for U+2028 / U+2029, one for the ASCII single-char
+/// breaks, and zero when none ends here. `byte_pos` is a char boundary.
+pub fn break_len_before_bytes(rope: &ropey::Rope, byte_pos: usize) -> usize {
+    let pos = rope.byte_to_char(byte_pos);
+    let break_chars = break_len_before(rope, pos);
+    byte_pos - rope.char_to_byte(pos - break_chars)
+}
+
+/// Byte position where `line`'s own text ends, excluding the line break
+/// ropey assigns to it. The final line ends at the rope's byte length.
+pub fn line_text_end_bytes(rope: &ropey::Rope, line: usize) -> usize {
+    if line + 1 < rope.len_lines() {
+        let next = rope.line_to_byte(line + 1);
+        next - break_len_before_bytes(rope, next)
+    } else {
+        rope.len_bytes()
+    }
+}
+
+/// Length in chars of the line break STARTING exactly at `pos`: two for CRLF,
+/// one for every other break ropey recognises, and zero when none starts here.
+fn break_len_at(rope: &ropey::Rope, pos: usize) -> usize {
+    if pos >= rope.len_chars() {
+        return 0;
+    }
+    match rope.char(pos) {
+        '\r' if pos + 1 < rope.len_chars() && rope.char(pos + 1) == '\n' => 2,
+        '\n' | '\u{000B}' | '\u{000C}' | '\r' | '\u{0085}' | '\u{2028}'
+        | '\u{2029}' => 1,
+        _ => 0,
+    }
+}
+
+/// The char position where the line break PRECEDING `line_start` begins —
+/// i.e. `line_start` minus its own leading break (one char, or two for CRLF,
+/// which ropey counts as one break but two chars). A position without a
+/// preceding break stays where it is.
+fn line_break_before(rope: &ropey::Rope, line_start: usize) -> usize {
+    line_start - break_len_before(rope, line_start)
 }
 
 /// Char range of the manuscript region of `rope` under `blocks`' boundary,
@@ -305,15 +344,31 @@ pub enum InlineAttr {
 }
 
 impl InlineAttr {
-    /// Peritext expansion: typing at the right edge continues the style.
-    /// Code and links must not grow under the caret.
+    /// Peritext expansion: typing at the right edge continues the style —
+    /// split by what the mark *means* (papercuts-2026-07 §1 A3, the
+    /// Peritext/ProseMirror `inclusive` distinction):
+    ///
+    /// - **Emphasis-class** (Strong, Emphasis, Underline): character styles a
+    ///   writer extends by typing — appending to a bold word keeps it bold.
+    /// - **Extent-class** (Highlight, Strikethrough, joining Code, Link,
+    ///   FootnoteRef): statements about a *fixed extent* of existing text —
+    ///   marked once, they do not grow by appending.
     pub fn expands(&self) -> bool {
-        !matches!(self, Self::Code | Self::Link(_) | Self::FootnoteRef(_))
+        matches!(self, Self::Strong | Self::Emphasis | Self::Underline)
     }
 }
 
 /// Per-block kind; lives beside the text, keyed by block index.
+///
+/// Serialization goes through `WireBlockKind` (docs/inline-images.md §10):
+/// the runtime `Image` variant lost its vestigial `caption` field — the
+/// block's own line IS the caption now — but the wire keeps the key in
+/// both directions, because a released build's strict serde errors on a
+/// missing field and falls back to the legacy token parser, which
+/// collapses every kind in the file and persists the wreck on its next
+/// save (same class as the boundary-key era rule).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "WireBlockKind", into = "WireBlockKind")]
 pub enum BlockKind {
     #[default]
     Paragraph,
@@ -331,11 +386,93 @@ pub enum BlockKind {
     Image {
         src: String,
         alt: String,
+    },
+    FootnoteDef {
+        id: String,
+    },
+}
+
+/// The persistence shape of `BlockKind` — identical to the runtime enum
+/// except that `Image` still carries the retired `caption` key. Writers
+/// emit it empty forever (until an era flip once pre-migration builds are
+/// extinct); readers accept it present or absent, and the open-time
+/// migration (`store`'s `migrate_image_captions`) is what moves a
+/// surviving non-empty value into the block's line. ~13 bytes per image
+/// block is the price of a released build never misreading our output
+/// (docs/inline-images.md §10; build plan, adjudicated pushback 2).
+#[derive(Serialize, Deserialize)]
+enum WireBlockKind {
+    Paragraph,
+    Heading(u8),
+    Blockquote,
+    ListItem {
+        ordered: bool,
+        depth: u8,
+    },
+    Divider,
+    CodeBlock {
+        info: String,
+    },
+    Image {
+        src: String,
+        alt: String,
+        #[serde(default)]
         caption: String,
     },
     FootnoteDef {
         id: String,
     },
+}
+
+impl From<BlockKind> for WireBlockKind {
+    fn from(kind: BlockKind) -> Self {
+        match kind {
+            BlockKind::Paragraph => Self::Paragraph,
+            BlockKind::Heading(n) => Self::Heading(n),
+            BlockKind::Blockquote => Self::Blockquote,
+            BlockKind::ListItem { ordered, depth } => Self::ListItem { ordered, depth },
+            BlockKind::Divider => Self::Divider,
+            BlockKind::CodeBlock { info } => Self::CodeBlock { info },
+            BlockKind::Image { src, alt } => Self::Image {
+                src,
+                alt,
+                caption: String::new(),
+            },
+            BlockKind::FootnoteDef { id } => Self::FootnoteDef { id },
+        }
+    }
+}
+
+impl From<WireBlockKind> for BlockKind {
+    fn from(kind: WireBlockKind) -> Self {
+        match kind {
+            WireBlockKind::Paragraph => Self::Paragraph,
+            WireBlockKind::Heading(n) => Self::Heading(n),
+            WireBlockKind::Blockquote => Self::Blockquote,
+            WireBlockKind::ListItem { ordered, depth } => Self::ListItem { ordered, depth },
+            WireBlockKind::Divider => Self::Divider,
+            WireBlockKind::CodeBlock { info } => Self::CodeBlock { info },
+            // The caption is dropped HERE, not migrated: this conversion
+            // also decodes checkpoint/history states, which are read-only
+            // past (build plan, pushback 3). Only the live document's
+            // open path moves a legacy caption into the line.
+            WireBlockKind::Image { src, alt, caption: _ } => Self::Image { src, alt },
+            WireBlockKind::FootnoteDef { id } => Self::FootnoteDef { id },
+        }
+    }
+}
+
+impl BlockKind {
+    /// The §2 class split (docs/inline-images.md, "the wall law"): block
+    /// kinds divide into **flowing** — made of words, following the
+    /// merge-keeps-first / split-clones-both rule — and **furniture**
+    /// (Image, Divider): things that stand in the column but are not made
+    /// of words, which no text mechanic may move, clone, or absorb. Every
+    /// wall law reads this predicate, nowhere else (build plan, "the
+    /// refactor, shaped").
+    pub fn is_furniture(&self) -> bool {
+        matches!(self, Self::Image { .. } | Self::Divider)
+    }
 }
 
 /// Which geometry a boundary index describes (the Scraps build,
@@ -520,16 +657,26 @@ impl BlockMap {
 
     /// Repair after a text edit. `block` is the block containing the edit
     /// start (pre-edit), `merged` how many newlines the edit deleted,
-    /// `splits` how many it inserted. Merges keep the first block's kind;
-    /// splits inherit it (Enter-at-heading-end is special-cased upstream).
+    /// `splits` how many it inserted. Merges keep the first block's kind,
+    /// and FLOWING splits inherit it (Enter-at-heading-end is special-cased
+    /// upstream). Furniture never clones (§2 wall law, docs/inline-images.md):
+    /// when the split-source block is furniture, the first fragment keeps
+    /// the kind and every inserted fragment is born a Paragraph. Merges
+    /// across a furniture wall never reach here unclamped — the Document
+    /// edit path decomposes them at the wall first (build plan R1).
     pub fn on_edit(&mut self, block: usize, merged: usize, splits: usize) {
         let block = block.min(self.kinds.len().saturating_sub(1));
         let drain_end = (block + 1 + merged).min(self.kinds.len());
         let removed = drain_end - (block + 1); // blocks actually spliced out
         self.kinds.drain(block + 1..drain_end);
         let kind = self.kinds[block].clone();
+        let born = if kind.is_furniture() {
+            BlockKind::Paragraph
+        } else {
+            kind
+        };
         for _ in 0..splits {
-            self.kinds.insert(block + 1, kind.clone());
+            self.kinds.insert(block + 1, born.clone());
         }
         self.adjust_boundary(block, removed, splits);
     }
@@ -579,6 +726,153 @@ impl BlockMap {
             };
         }
     }
+}
+
+/// A wall-clamped deletion, planned (§2 wall law, docs/inline-images.md;
+/// build plan R1). `cuts` are the surviving sub-deletions in ascending byte
+/// order over the PRE-EDIT rope — the executor runs them right-to-left so
+/// the earlier ranges stay valid — and `insert_at` is where a replacement's
+/// inserted text lands: the range start's side, stepped out of a surviving
+/// separator.
+#[derive(Debug, PartialEq, Eq)]
+struct ClampPlan {
+    cuts: Vec<Range<usize>>,
+    insert_at: usize,
+}
+
+/// Plan the §2 range clamp: decompose a deletion whose byte range crosses a
+/// furniture wall. The caller has already established the gate (the range
+/// deletes at least one line break and some block in its line span is
+/// furniture); this is pure geometry so the law is headlessly testable.
+///
+/// - A separator bounding a furniture block survives unless the deletion
+///   takes that block WHOLE: the bytes on each side go, the separator at
+///   the wall stands, both blocks stand (possibly emptied).
+/// - Whole cover (§5's range door): the range encloses the block's full
+///   line span — content plus every bounding separator it has — or covers
+///   a NON-EMPTY caption plus at least one bounding separator. An empty
+///   caption demands full enclosure, so a lone Backspace/Delete range at
+///   its wall can never silently drain the picture (§0, the today-bug).
+/// - Whole cover plus partial flanks decomposes into left-partial +
+///   whole-cover + right-partial in ONE transaction (adjudicated pushback
+///   5): the flanks do NOT fuse — the surviving separator stands between
+///   them.
+///
+/// Taking a block whole consumes exactly one bounding separator: the
+/// preceding one when it is coverable and unclaimed (`on_edit`'s
+/// merge-keeps-first then drains the furniture kind for free), else the
+/// following one — that form keeps the furniture kind on the merged line,
+/// so the executor restamps it to the first surviving block's kind
+/// (`edit_bytes_clamped`). Adjacent furniture chains resolve left to
+/// right: a following-separator cover claims the wall it shares with the
+/// next block, whose own cover then falls through to ITS following
+/// separator. A wall the previous block left merely PROTECTED (standing
+/// partial, or spared by its own prec-side cover) is still consumable —
+/// the cover reclaims it from the protected set.
+fn clamp_plan(rope: &ropey::Rope, blocks: &BlockMap, byte_range: &Range<usize>) -> ClampPlan {
+    let (s, e) = (byte_range.start, byte_range.end);
+    let last_line = rope.len_lines() - 1;
+    let start_line = rope.byte_to_line(s);
+    let end_line = rope.byte_to_line(e).min(last_line);
+    // Byte geometry of line `i`: [line_start, text_end) is the content,
+    // [text_end, next line_start) its trailing separator (empty on the
+    // last line).
+    let line_start = |i: usize| rope.line_to_byte(i);
+    let text_end = |i: usize| {
+        if i < last_line {
+            rope.char_to_byte(line_break_before(rope, rope.line_to_char(i + 1)))
+        } else {
+            rope.len_bytes()
+        }
+    };
+    // Separators the wall keeps standing, ascending, UNCLIPPED — a range
+    // starting mid-separator (a char-aligned start between CR and LF) must
+    // still land its replacement on the wall's left face, never inside the
+    // break. A bounding separator of every furniture block in the span
+    // lands here unless a whole-cover consumed it; the cut subtraction
+    // below clips to the range.
+    let mut protected: Vec<Range<usize>> = Vec::new();
+    let push_protected = |protected: &mut Vec<Range<usize>>, sep: &Range<usize>| {
+        if sep.start < e && sep.end > s && protected.last() != Some(sep) {
+            protected.push(sep.clone());
+        }
+    };
+    // The line whose FOLLOWING separator a whole-cover consumed — the wall
+    // it shares with the next block is spoken for.
+    let mut foll_claimed_by: Option<usize> = None;
+    for f in start_line..=end_line {
+        if !blocks.kind(f).is_furniture() {
+            continue;
+        }
+        let (cs, ce) = (line_start(f), text_end(f));
+        let prec = (f > 0).then(|| text_end(f - 1)..cs);
+        let foll = (f < last_line).then(|| ce..line_start(f + 1));
+        let covers = |sep: &Range<usize>| s <= sep.start && e >= sep.end;
+        let prec_covered = prec.as_ref().is_some_and(&covers);
+        let foll_covered = foll.as_ref().is_some_and(&covers);
+        let prec_claimed = f > 0 && foll_claimed_by == Some(f - 1);
+        let content_covered = s <= cs && e >= ce;
+        let enclosed = content_covered
+            && (prec.is_some() || foll.is_some())
+            && prec.as_ref().is_none_or(&covers)
+            && foll.as_ref().is_none_or(&covers);
+        let door = content_covered && ce > cs && ((prec_covered && !prec_claimed) || foll_covered);
+        let mut consume_prec = false;
+        let mut consume_foll = false;
+        if enclosed || door {
+            if prec_covered && !prec_claimed {
+                consume_prec = true;
+                // The consumed wall may already stand in `protected`: it is
+                // the previous furniture block's FOLLOWING separator, pushed
+                // while that block stood partial — or kept standing by its
+                // own prec-side cover. The whole-cover law (§2, §5's range
+                // door) outranks that push: reclaim the wall, or the cut
+                // subtraction below spares it and the enclosed picture
+                // drains to §0's ghost. Nothing of the neighbour is harmed —
+                // `on_edit`'s merge-keeps-first hands the merged line to the
+                // STANDING block's kind.
+                if protected.last() == prec.as_ref() {
+                    protected.pop();
+                }
+            } else if foll_covered {
+                consume_foll = true;
+                foll_claimed_by = Some(f);
+            }
+            // Neither consumable (its one coverable wall was claimed by the
+            // previous block's cover): demoted to a partial — both walls
+            // stand, only the caption bytes in range go.
+        }
+        if !consume_prec
+            && !prec_claimed
+            && let Some(sep) = &prec
+        {
+            push_protected(&mut protected, sep);
+        }
+        if !consume_foll
+            && let Some(sep) = &foll
+        {
+            push_protected(&mut protected, sep);
+        }
+    }
+    // The cuts: the range minus the standing walls.
+    let mut cuts: Vec<Range<usize>> = Vec::new();
+    let mut at = s;
+    for sep in &protected {
+        if sep.start > at {
+            cuts.push(at..sep.start);
+        }
+        at = at.max(sep.end);
+    }
+    if at < e {
+        cuts.push(at..e);
+    }
+    // Replacement text lands at the range start's side; a start inside a
+    // surviving separator steps back onto the wall's left face.
+    let insert_at = protected
+        .iter()
+        .find(|sep| sep.start <= s && s < sep.end)
+        .map_or(s, |sep| sep.start);
+    ClampPlan { cuts, insert_at }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -759,11 +1053,40 @@ impl SpanSet {
         out
     }
 
-    /// Keep all spans consistent across a text edit: delete `op.delete`
-    /// chars at `op.pos`, then insert `op.insert` there.
+    /// Keep all spans consistent across a text edit performed by the TYPING
+    /// hand: delete `op.delete` chars at `op.pos`, then insert `op.insert`
+    /// there, letting expanding styles absorb an appended insertion at their
+    /// right edge (the Peritext continuation).
     pub fn apply_op(&mut self, op: &TextOp) {
+        self.apply_op_inner(op, true);
+    }
+
+    /// Like `apply_op`, but for a MACHINE-performed insertion (put back,
+    /// paste): expansion never fires at a span's right edge (papercuts-2026-07
+    /// §1 A3 — "expansion is a typing affordance"). This is the belt that keeps
+    /// resurrected/pasted text from being dressed in a neighbour's bold before
+    /// its own spans re-add.
+    pub fn apply_op_verbatim(&mut self, op: &TextOp) {
+        self.apply_op_inner(op, false);
+    }
+
+    fn apply_op_inner(&mut self, op: &TextOp, by_typing: bool) {
         let del_end = op.pos + op.delete;
         let ins = op.insert.chars().count();
+        // The paragraph seam kills momentum (papercuts-2026-07 §1 A2): an
+        // expanding span at its right edge absorbs a typed insertion only up to
+        // the FIRST newline in it — a bold run grows by the pre-seam text and
+        // stops at the seam, never streaming onto the next paragraph. An
+        // insertion that OPENS with a newline expands nothing (pre-seam is
+        // empty); one with no newline expands fully. A newline typed strictly
+        // INSIDE a run still grows it (the split keeps both halves marked) —
+        // only the right-edge append is clamped. Checking `starts_with('\n')`
+        // alone missed an embedded seam ("text\nmore" typed at an edge swallowed
+        // the whole insertion); the pre-seam char count is the belt.
+        let edge_grow = match op.insert.find('\n') {
+            Some(nl) => op.insert[..nl].chars().count(),
+            None => ins,
+        };
         let clamp = |x: usize| {
             if x >= del_end {
                 x - op.delete
@@ -781,14 +1104,16 @@ impl SpanSet {
             if ins > 0 {
                 // Typing at the left edge stays outside (start shifts);
                 // strictly inside grows the span; at the right edge only
-                // expanding styles absorb the insertion.
+                // expanding styles absorb the insertion, and only when the
+                // typing hand appends non-seam text.
                 if span.range.start >= op.pos {
                     span.range.start += ins;
                 }
-                if span.range.end > op.pos
-                    || (span.range.end == op.pos && span.attr.expands())
-                {
+                if span.range.end > op.pos {
                     span.range.end += ins;
+                } else if span.range.end == op.pos && by_typing && span.attr.expands() {
+                    // Right-edge append: absorb only the pre-seam segment.
+                    span.range.end += edge_grow;
                 }
             }
         }
@@ -1264,6 +1589,13 @@ pub struct GraveEntry {
     /// a round trip; the whisper can honestly say "from scraps".
     #[serde(default)]
     pub region: GraveRegion,
+    /// Whether the exile verb read this cut as WHOLE paragraph block(s): the
+    /// cut took its bounding separator along (no empty grave in the prose,
+    /// papercuts-2026-07 §B1) and Put back rebuilds it as its own standing
+    /// block(s) rather than splicing it mid-paragraph (§B2). `serde` default
+    /// false keeps every pre-papercuts entry loading as a plain fragment.
+    #[serde(default)]
+    pub whole_blocks: bool,
 }
 
 /// The graveyard record: a side structure mirroring `Annotations` in every way
@@ -1326,6 +1658,8 @@ impl Graveyard {
     /// back is lossless (Bug D); a plain-text caller passes the defaults.
     /// `region` records which side of the seam the text left (Put back
     /// returns through the same door — graveyard-interplay 1/2).
+    /// `whole_blocks` records whether the exile verb read the cut as complete
+    /// paragraph block(s), so Put back rebuilds a paragraph, not a splice.
     #[allow(clippy::too_many_arguments)]
     pub fn file(
         &mut self,
@@ -1336,6 +1670,7 @@ impl Graveyard {
         spans: SpanSet,
         kinds: Vec<BlockKind>,
         region: GraveRegion,
+        whole_blocks: bool,
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
@@ -1350,6 +1685,7 @@ impl Graveyard {
             spans,
             kinds,
             region,
+            whole_blocks,
         });
         id
     }
@@ -1545,10 +1881,32 @@ impl Document {
     }
 
     fn absorb_buffer_ops(&mut self) {
+        self.absorb_buffer_ops_inner(true);
+    }
+
+    /// Absorb a MACHINE insertion (put back, paste): spans re-anchor without
+    /// right-edge expansion (the A3 machine-insertion law), so the inserted
+    /// text is never dressed in a neighbour's mark. Every other side structure
+    /// shifts identically to the typing path.
+    fn absorb_buffer_ops_verbatim(&mut self) {
+        self.absorb_buffer_ops_inner(false);
+    }
+
+    fn absorb_buffer_ops_inner(&mut self, by_typing: bool) {
         let ops = self.buffer.take_ops();
         let now = crate::journal::now_ms();
         for op in &ops {
-            if self.spans.affected_by(op) { self.spans.apply_op(op); }
+            // The `affected_by` gate rides OUTSIDE the typing/verbatim split:
+            // it is what keeps an untouched structure structurally shared, and
+            // the predicate carries the typing law (right-edge expansion), so
+            // it is a superset of what the verbatim path can move.
+            if self.spans.affected_by(op) {
+                if by_typing {
+                    self.spans.apply_op(op);
+                } else {
+                    self.spans.apply_op_verbatim(op);
+                }
+            }
             if self.notes.affected_by(op) { self.notes.apply_op(op); }
             if self.graveyard.affected_by(op) { self.graveyard.apply_op(op); }
             if self.provenance.affected_by(op) { self.provenance.apply_op(op); }
@@ -1824,8 +2182,12 @@ impl Document {
     /// REGION so the return can never cross the seam. `collapse_emptied`
     /// (the explicit Exile verb) folds the seam's evaporation into the same
     /// atom when the cut empties the pile; the auto-capture path passes
-    /// false and leaves that to the editor's retype-race guard. Returns the
-    /// new entry id.
+    /// false and leaves that to the editor's retype-race guard. The DELETION
+    /// is always exact-bytes (two verbs, two contracts — only exile widens),
+    /// but the ENTRY records `whole_blocks: true` when the normalized range
+    /// covered complete blocks, so a backspaced paragraph still returns as a
+    /// standing paragraph, never a splice glued to its neighbour (papercuts
+    /// follow-up, report 3). Returns the new entry id.
     pub fn cut_to_graveyard(
         &mut self,
         byte_range: Range<usize>,
@@ -1833,22 +2195,125 @@ impl Document {
         cut_unix: i64,
         collapse_emptied: bool,
     ) -> u64 {
+        let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.crosses_furniture_wall(block, merged) {
+            // §2 ("no text mechanic may move, clone, or absorb" furniture):
+            // the edit below CLAMPS, so walls and spared blocks inside
+            // `byte_range` survive the delete. Filing the raw slice would
+            // grave bytes still standing in the document — Put back then
+            // re-inserts the surviving separator and stamps the picture's
+            // kind onto a fresh line: a plain range delete minting a second
+            // picture. File the clamp's ACTUAL cuts instead, one
+            // region-honest entry per surviving sub-deletion; they all ride
+            // `edit_bytes`' one pre-cut snapshot, so a single undo still
+            // removes every entry with the text's return.
+            let cuts = clamp_plan(self.buffer.rope(), &self.blocks, &byte_range).cuts;
+            let mut pending = Vec::with_capacity(cuts.len());
+            let mut removed = 0usize;
+            for cut in &cuts {
+                let rope = self.buffer.rope();
+                let (s, e) = (rope.byte_to_char(cut.start), rope.byte_to_char(cut.end));
+                // Origins are POST-delete positions: each cut's start, less
+                // the chars the earlier cuts take (the walls between them
+                // stand, so nothing else shifts).
+                pending.push((self.grave_capture(s, e), s - removed));
+                removed += e - s;
+            }
+            self.edit_bytes(byte_range, ""); // re-plans identically; the clamped executor
+            self.revision += 1;
+            // A separator-only range plans no cuts and files nothing; the
+            // returned 0 is never a live entry id (`Graveyard::file` starts
+            // at 1) and every caller ignores it.
+            let mut id = 0;
+            for ((text, spans, kinds, region, whole), origin) in pending {
+                id = self.graveyard.file(
+                    text,
+                    origin_quote.clone(),
+                    origin,
+                    cut_unix,
+                    spans,
+                    kinds,
+                    region,
+                    whole,
+                );
+            }
+            if collapse_emptied && self.scraps_textless() {
+                self.evaporate_scraps_in_tx();
+            }
+            return id;
+        }
         let rope = self.buffer.rope();
         let start_char = rope.byte_to_char(byte_range.start);
         let end_char = rope.byte_to_char(byte_range.end);
-        let text: String = rope.slice(start_char..end_char).to_string();
+        let (text, spans, kinds, region, whole) = self.grave_capture(start_char, end_char);
+        // The non-coalescing edit always opens a fresh transaction, so the
+        // pre-cut snapshot is always taken and the filing below rides it.
+        self.edit_bytes(byte_range, "");
+        self.revision += 1;
+        let id = self.graveyard.file(
+            text,
+            origin_quote,
+            start_char,
+            cut_unix,
+            spans,
+            kinds,
+            region,
+            whole,
+        );
+        if collapse_emptied && self.scraps_textless() {
+            self.evaporate_scraps_in_tx();
+        }
+        id
+    }
+
+    /// The capture half of a graveyard filing, read BEFORE the delete
+    /// shifts anything: entry text, its formatting and per-line block
+    /// kinds (Bug D / P1 — Put back is lossless), the region it leaves,
+    /// and §B1's whole-block detection. Plain delete KEEPS exact-byte
+    /// deletion — that ruling stands — but the ENTRY records block-ness
+    /// when the selection was in fact one-or-more complete blocks
+    /// (papercuts follow-up, report 3): otherwise a backspaced paragraph
+    /// returns as a splice and glues to its neighbour. Reuses §B1's
+    /// normalization (a range ending at a block's char 0 reclassifies as
+    /// ending at the previous block's text end) for the DETECTION only —
+    /// a whole-block entry stores the NORMALIZED text (bounding separator
+    /// excluded, put_back rebuilds exactly one) so both doors feed §B2
+    /// the same shape; a fragment stores the exact deleted chars as ever.
+    fn grave_capture(
+        &self,
+        start_char: usize,
+        end_char: usize,
+    ) -> (String, SpanSet, Vec<BlockKind>, GraveRegion, bool) {
+        let rope = self.buffer.rope();
+        let mut norm_end = end_char;
+        let trailing_break = break_len_before(rope, norm_end);
+        if trailing_break > 0 && norm_end - start_char >= trailing_break {
+            norm_end -= trailing_break;
+        }
+        let first_line = rope.char_to_line(start_char);
+        let last_line = rope.char_to_line(norm_end);
+        let text_end_of_last = if last_line + 1 < rope.len_lines() {
+            line_break_before(rope, rope.line_to_char(last_line + 1))
+        } else {
+            rope.len_chars()
+        };
+        let whole = start_char < norm_end
+            && start_char == rope.line_to_char(first_line)
+            && norm_end == text_end_of_last
+            && region_of_char(rope, &self.blocks, start_char)
+                == region_of_char(rope, &self.blocks, norm_end);
+        let entry_end = if whole { norm_end } else { end_char };
+        let text: String = rope.slice(start_char..entry_end).to_string();
         let region = match region_of_char(rope, &self.blocks, start_char) {
             Region::Manuscript => GraveRegion::Manuscript,
             // A cut can't start ON the seam via any verb; the never-panic
             // mapping says the payload lies below it.
             Region::Seam | Region::Scraps => GraveRegion::Scraps,
         };
-        // Capture the cut's formatting and structure BEFORE the delete shifts
-        // them away, so Put back is lossless (Bug D / P1). One block kind per
-        // line the text will re-create (`count_line_breaks + 1`), so put_back
-        // can re-stamp them onto exactly the re-inserted blocks.
-        let spans = self.spans.slice(start_char..end_char);
-        let first_line = rope.char_to_line(start_char);
+        // One block kind per line the text will re-create
+        // (`count_line_breaks + 1`), so put_back can re-stamp them onto
+        // exactly the re-inserted blocks.
+        let spans = self.spans.slice(start_char..entry_end);
         let n_blocks = count_line_breaks(&text) + 1;
         let kinds: Vec<BlockKind> = self
             .blocks
@@ -1858,13 +2323,127 @@ impl Document {
             .take(n_blocks)
             .cloned()
             .collect();
-        // The non-coalescing edit always opens a fresh transaction, so the
-        // pre-cut snapshot is always taken and the filing below rides it.
-        self.edit_bytes(byte_range, "");
+        (text, spans, kinds, region, whole)
+    }
+
+    /// The exile verb's capture (papercuts-2026-07 §B1): interpret the
+    /// selection before cutting. A WHOLE-block selection — normalized, running
+    /// from a block's text start to a block's text end over one or more
+    /// complete blocks — takes its bounding separator along, so the prose is
+    /// left with exactly the separator that joined the neighbours and NO empty
+    /// grave; the entry records `whole_blocks: true` so Put back rebuilds a
+    /// paragraph (§B2). Anything else (a partial or mixed selection) falls
+    /// through to `cut_to_graveyard`'s exact-byte semantics — two verbs, two
+    /// contracts (plain delete stays exact-bytes; only exile interprets
+    /// intent). Cut and its consumed separator are ONE transaction, so plain
+    /// Ctrl+Z restores text + separator and removes the entry in one step.
+    /// Returns the new entry id.
+    pub fn exile_to_graveyard(
+        &mut self,
+        byte_range: Range<usize>,
+        origin_quote: String,
+        cut_unix: i64,
+        collapse_emptied: bool,
+    ) -> u64 {
+        let rope = self.buffer.rope();
+        let s = rope.byte_to_char(byte_range.start);
+        let mut e = rope.byte_to_char(byte_range.end);
+        // Normalize: a selection ending at a block's char 0 (triple-click and
+        // shift+down already include the trailing newline) is reclassified as
+        // ending at the previous block's text end — otherwise "consume one
+        // more" would eat two separators and fuse the neighbours.
+        let trailing_break = break_len_before(rope, e);
+        if trailing_break > 0 && e - s >= trailing_break {
+            e -= trailing_break;
+        }
+        // Whole-block detection on the normalized range: both ends sit on a
+        // block edge, and the two ends live in the same region (the exile verb
+        // never spans the seam — its separator math would otherwise chew the
+        // seam's own blank line).
+        let first_line = rope.char_to_line(s);
+        let last_line = rope.char_to_line(e);
+        let len_chars = rope.len_chars();
+        let text_start_of = |line: usize| rope.line_to_char(line);
+        let text_end_of = |line: usize| {
+            if line + 1 < rope.len_lines() {
+                line_break_before(rope, rope.line_to_char(line + 1))
+            } else {
+                len_chars
+            }
+        };
+        // `s <= e`, not `s < e`: an EMPTY line that IS a whole block — an
+        // image with an empty caption (inline-images §5: the block's text
+        // is the caption, and every picture is born captionless) — must go
+        // through this door too, or its exile would fall to the byte-range
+        // cut below, no-op, and strand the picture. The kind rides the
+        // entry, so Put back rebuilds the picture from an empty-text grave.
+        let whole = s <= e
+            && s == text_start_of(first_line)
+            && e == text_end_of(last_line)
+            && region_of_char(rope, &self.blocks, s) == region_of_char(rope, &self.blocks, e);
+        if !whole {
+            // Restore any normalization: the exact-byte path owns the raw
+            // selection so a partial cut behaves exactly as today.
+            return self.cut_to_graveyard(byte_range, origin_quote, cut_unix, collapse_emptied);
+        }
+
+        // Whole-block: the entry holds the block texts (internal separators
+        // kept) MINUS the bounding one; the delete takes that bounding
+        // separator too. Trailing when a same-region block follows; leading
+        // when this is the last block(s) of the region/document.
+        let region = match region_of_char(rope, &self.blocks, s) {
+            Region::Manuscript => GraveRegion::Manuscript,
+            Region::Seam | Region::Scraps => GraveRegion::Scraps,
+        };
+        let entry_text: String = rope.slice(s..e).to_string();
+        let n_blocks = last_line - first_line + 1;
+        let kinds: Vec<BlockKind> = self
+            .blocks
+            .kinds()
+            .iter()
+            .skip(first_line)
+            .take(n_blocks)
+            .cloned()
+            .collect();
+        let spans = self.spans.slice(s..e);
+        // A same-region block follows iff the char at `e` is a separator whose
+        // next line stays in this region.
+        let trailing_break = break_len_at(rope, e);
+        let trailing_sep = trailing_break > 0
+            && region_of_char(rope, &self.blocks, e + trailing_break)
+                == region_of_char(rope, &self.blocks, s);
+        let (del_start, del_end, origin) = if trailing_sep {
+            (s, e + trailing_break, s)
+        } else if break_len_before(rope, s) > 0 {
+            // Leading separator: eat the newline joining us to the block above.
+            let leading_break = break_len_before(rope, s);
+            (s - leading_break, e, s - leading_break)
+        } else {
+            // A lone block that is the entire region: no separator to take.
+            (s, e, s)
+        };
+        let del_byte = self.char_to_byte(del_start)..self.char_to_byte(del_end);
+        self.delete_bytes_whole_block(del_byte, first_line);
+        // A lone block that is the entire document leaves its LINE standing
+        // (the rope's one-line floor): furniture must not survive its own
+        // exile as a kind on the empty remnant — the picture would stand
+        // twice, live and in the grave (inline-images §5). The remnant is
+        // born-again prose; the pre-edit snapshot already covers the kind,
+        // so one undo restores text and furniture together.
+        if del_start == s && del_end == e && self.blocks.kind(first_line).is_furniture() {
+            self.blocks.set_kind(first_line, BlockKind::Paragraph);
+        }
         self.revision += 1;
-        let id = self
-            .graveyard
-            .file(text, origin_quote, start_char, cut_unix, spans, kinds, region);
+        let id = self.graveyard.file(
+            entry_text,
+            origin_quote,
+            origin,
+            cut_unix,
+            spans,
+            kinds,
+            region,
+            true,
+        );
         if collapse_emptied && self.scraps_textless() {
             self.evaporate_scraps_in_tx();
         }
@@ -1943,6 +2522,7 @@ impl Document {
                 above_spans,
                 above_kinds,
                 GraveRegion::Manuscript,
+                false,
             );
         }
         if capture && b_e - b_s >= capture_threshold && !below_text.is_empty() {
@@ -1957,6 +2537,7 @@ impl Document {
                 below_spans,
                 below_kinds,
                 GraveRegion::Scraps,
+                false,
             );
         }
         if self.scraps_textless() {
@@ -1990,6 +2571,79 @@ impl Document {
             },
         };
         let before_seam = self.blocks.scrap_line();
+        if !rebirth && entry.whole_blocks {
+            // Rebuild the exile as its OWN standing block(s) (papercuts §B2):
+            // snap the drifted origin to the nearest block boundary (never
+            // mid-paragraph) and reconstruct the one bounding separator, so the
+            // text stands alone wearing its own kinds and spans, nothing of the
+            // neighbours'. The insertion is verbatim (no neighbour mark dresses
+            // it — the machine-insertion belt) and separators + text + kinds +
+            // spans ride ONE transaction (the atomic suspenders).
+            let region = match entry.region {
+                GraveRegion::Manuscript => manuscript_range_of(rope, &self.blocks),
+                GraveRegion::Scraps => scraps_range_of(rope, &self.blocks)
+                    .unwrap_or_else(|| manuscript_range_of(rope, &self.blocks)),
+            };
+            let clamped = entry.origin_pos.clamp(region.start, region.end);
+            let line = rope.char_to_line(clamped);
+            let line_start = rope.line_to_char(line);
+            let next_start = if line + 1 < rope.len_lines() {
+                rope.line_to_char(line + 1)
+            } else {
+                rope.len_chars()
+            };
+            // Nearest of the two block edges bracketing the origin.
+            let boundary = if clamped - line_start <= next_start.saturating_sub(clamped) {
+                line_start
+            } else {
+                next_start
+            }
+            .clamp(region.start, region.end);
+            let at_end = boundary >= rope.len_chars();
+            let boundary_line = rope.char_to_line(boundary);
+            let boundary_start = rope.line_to_char(boundary_line);
+            let boundary_end = if boundary_line + 1 < rope.len_lines() {
+                line_break_before(rope, rope.line_to_char(boundary_line + 1))
+            } else {
+                rope.len_chars()
+            };
+            let empty_line = boundary == boundary_start
+                && boundary_start == boundary_end;
+            // A trailing separator when a block follows the landing; a leading
+            // one when the returned block is the last of the document; none at
+            // all into an empty document (no phantom blank block) — or into a
+            // trailing EMPTY block (the grave a plain delete leaves standing):
+            // the return fills that block rather than opening a second blank.
+            // Synthesized LF can mix with CRLF; Ropey and BlockMap stay aligned.
+            let (payload, text_offset) = if rope.len_chars() == 0 || empty_line {
+                (entry.text.clone(), 0)
+            } else if at_end {
+                if break_len_before(rope, rope.len_chars()) > 0 {
+                    (entry.text.clone(), 0)
+                } else {
+                    (format!("\n{}", entry.text), 1)
+                }
+            } else {
+                (format!("{}\n", entry.text), 0)
+            };
+            let at_byte = rope.char_to_byte(boundary);
+            self.edit_bytes_verbatim(at_byte..at_byte, &payload);
+            let text_start = boundary + text_offset;
+            let insert_block = self.buffer.rope().char_to_line(text_start);
+            for (i, kind) in entry.kinds.iter().enumerate() {
+                self.blocks.set_kind(insert_block + i, kind.clone());
+            }
+            for s in entry.spans.spans() {
+                self.spans.add(
+                    text_start + s.range.start..text_start + s.range.end,
+                    s.attr.clone(),
+                );
+            }
+            self.revision += 1;
+            self.graveyard.remove(id);
+            // Caret at the returned block's START (§B2: reveal the landing).
+            return Some(text_start);
+        }
         if rebirth {
             // "Emptying dissolves it" gets its inverse: returning re-creates
             // it. The entry lands as the sole scrap under a re-born seam, all
@@ -1997,7 +2651,7 @@ impl Document {
             let lines = self.buffer.rope().len_lines();
             let at_byte = self.buffer.len_bytes();
             let payload = format!("\n\n{}", entry.text);
-            self.edit_bytes(at_byte..at_byte, &payload);
+            self.edit_bytes_verbatim(at_byte..at_byte, &payload);
             let seam = lines;
             self.blocks.set_scrap_line(Some(seam));
             // The seam line is never kind-stamped; the payload re-stamps its
@@ -2019,7 +2673,10 @@ impl Document {
             return Some(text_start + entry.text.chars().count());
         }
         let at_byte = self.buffer.char_to_byte(at_char);
-        self.edit_bytes(at_byte..at_byte, &entry.text);
+        // Verbatim insert: the machine-insertion law protects partial entries
+        // too — the resurrected splice never absorbs into a neighbour's
+        // expanding span before its own spans re-add (papercuts §A3/§B2).
+        self.edit_bytes_verbatim(at_byte..at_byte, &entry.text);
         // Re-stamp the cut's block kinds and re-add its spans (Bug D / P1): a
         // heading comes back a heading, bold comes back bold. These ride the
         // transaction `edit_bytes` opened (no new snapshot), so one undo peels
@@ -2554,6 +3211,38 @@ impl Document {
         self.notes.get(id).map(|n| n.body.as_str())
     }
 
+    /// Remove a note outright (LAW 2 / C4 empty-discard: a never-written note the
+    /// writer clicked away from must not persist as a blank card). No undo
+    /// snapshot of its own — the `add_note` that created it already pushed one,
+    /// so the pair leaves the stack where it found it.
+    pub fn remove_note(&mut self, id: u64) -> Option<Annotation> {
+        self.revision += 1;
+        self.notes.remove(id)
+    }
+
+    /// Cancel a never-written note (LAW 2 / C4 empty-discard), removing its
+    /// paired empty undo step when still topmost and otherwise scrubbing every
+    /// history snapshot so no later undo or redo can resurrect the blank card.
+    pub fn cancel_provisional_note(&mut self, id: u64) -> Option<Annotation> {
+        self.revision += 1;
+        let removed = self.notes.remove(id)?;
+        let paired_add_is_top = self
+            .undo_states
+            .last()
+            .is_some_and(|(_, _, notes, _, _)| notes.get(id).is_none());
+        if paired_add_is_top && self.buffer.pop_empty_transaction() {
+            self.undo_states.pop();
+        } else {
+            for (_, _, notes, _, _) in &mut self.undo_states {
+                notes.remove(id);
+            }
+            for (_, _, notes, _, _) in &mut self.redo_states {
+                notes.remove(id);
+            }
+        }
+        Some(removed)
+    }
+
     /// Add a batch of diagnoses as ONE undoable transaction (one ctrl-z
     /// clears a whole pass).
     pub fn add_diagnoses(&mut self, diagnoses: Vec<Annotation>) {
@@ -2570,12 +3259,115 @@ impl Document {
         }
     }
 
+    /// The whole-block doors' own splice (the exile verb's delete): the §2
+    /// clamp gates ARBITRARY ranges — and deliberately demands full
+    /// enclosure before it lets an EMPTY furniture line go, so a stray
+    /// range can never silently drain a captionless picture. A door that
+    /// has already resolved its range to a whole block plus exactly ONE
+    /// bounding separator (inline-images §5) is the deliberate verb that
+    /// law protects, so it splices past the gate — keeping the clamped
+    /// executor's restamp discipline: a cut that takes a furniture line by
+    /// its following separator leaves the furniture kind on the merged
+    /// line under `on_edit`'s merge-keeps-first, and the first surviving
+    /// block's kind is restamped over it, captured before the drain.
+    ///
+    /// `taken` is the exiled block's own line, known to the door — the
+    /// restamp fires only when the cut STARTS on that block (the
+    /// trailing-separator form). Geometry alone cannot decide: a
+    /// leading-separator cut starts on the separator byte, and when the
+    /// block above is furniture with an EMPTY caption that byte IS its
+    /// line's start too — the geometric guard misread the neighbour as
+    /// the taken block and restamped the surviving picture away (§5).
+    fn delete_bytes_whole_block(&mut self, byte_range: Range<usize>, taken: usize) {
+        let (block, merged) = self.pre_edit_info(&byte_range);
+        let restamp = (merged > 0
+            && block == taken
+            && self.blocks.kind(block).is_furniture()
+            && byte_range.start == self.buffer.rope().line_to_byte(block))
+            .then(|| self.blocks.kind(block + merged).clone());
+        self.revision += 1;
+        if self.buffer.edit_bytes(byte_range, "") {
+            // Snapshot AFTER the buffer edit, BEFORE on_edit: spans/blocks/
+            // notes are still pre-edit here (edit_bytes' own pattern).
+            self.undo_states.push(self.snapshot());
+            self.redo_states.clear();
+        }
+        self.blocks.on_edit(block, merged, 0);
+        if let Some(kind) = restamp {
+            self.blocks.set_kind(block, kind);
+        }
+        self.absorb_buffer_ops();
+    }
+
+    /// The §2 wall gate, priced for the hot path: an edit clamps only when
+    /// it deletes at least one line break AND some block in its pre-edit
+    /// line span is furniture. The common keystroke pays one `merged == 0`
+    /// branch; only multi-line deletions pay the kind scan.
+    fn crosses_furniture_wall(&self, block: usize, merged: usize) -> bool {
+        if merged == 0 {
+            return false;
+        }
+        let kinds = self.blocks.kinds();
+        let lo = block.min(kinds.len());
+        let hi = (block + merged + 1).min(kinds.len());
+        kinds[lo..hi].iter().any(BlockKind::is_furniture)
+    }
+
+    /// Execute a wall-clamped edit (§2 wall law; build plan R1): the
+    /// deletion decomposes per `clamp_plan` and runs as grouped sub-edits
+    /// in ONE transaction — undo restores the pre-edit state in a single
+    /// step, exactly like the aside move — with the replacement text (if
+    /// any) landing at the range start's side. A cut that takes a
+    /// furniture line by its FOLLOWING separator keeps that line's kind
+    /// under `on_edit`'s merge-keeps-first, so the merged line is
+    /// restamped to the first surviving block's kind, captured before the
+    /// drain. A fully refused range (separators only) mutates nothing and
+    /// leaves no undo step behind.
+    fn edit_bytes_clamped(&mut self, byte_range: &Range<usize>, text: &str, by_typing: bool) {
+        let plan = clamp_plan(self.buffer.rope(), &self.blocks, byte_range);
+        if plan.cuts.is_empty() && text.is_empty() {
+            return;
+        }
+        self.revision += 1;
+        let snapshot = self.snapshot();
+        self.buffer.push_empty_transaction();
+        self.undo_states.push(snapshot);
+        self.redo_states.clear();
+        for cut in plan.cuts.iter().rev() {
+            let (block, merged) = self.pre_edit_info(cut);
+            let restamp = (merged > 0
+                && self.blocks.kind(block).is_furniture()
+                && cut.start == self.buffer.rope().line_to_byte(block))
+                .then(|| self.blocks.kind(block + merged).clone());
+            self.buffer.edit_bytes_grouped(cut.clone(), "");
+            self.blocks.on_edit(block, merged, 0);
+            if let Some(kind) = restamp {
+                self.blocks.set_kind(block, kind);
+            }
+        }
+        if !text.is_empty() {
+            let at = plan.insert_at..plan.insert_at;
+            let (block, _) = self.pre_edit_info(&at);
+            self.buffer.edit_bytes_grouped(at, text);
+            self.blocks.on_edit(block, 0, count_line_breaks(text));
+        }
+        if by_typing {
+            self.absorb_buffer_ops();
+        } else {
+            self.absorb_buffer_ops_verbatim();
+        }
+    }
+
     pub fn edit_bytes(&mut self, byte_range: Range<usize>, text: &str) {
         if byte_range.is_empty() && text.is_empty() {
             return;
         }
-        self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.crosses_furniture_wall(block, merged) {
+            self.edit_bytes_clamped(&byte_range, text, true);
+            return;
+        }
+        self.revision += 1;
         if self.buffer.edit_bytes(byte_range, text) {
             // The buffer edit mutates only the rope + its own undo stack;
             // spans/blocks/notes stay pre-edit until on_edit/absorb_buffer_ops
@@ -2589,12 +3381,40 @@ impl Document {
         self.absorb_buffer_ops();
     }
 
+    /// Like `edit_bytes`, but the insertion is MACHINE-performed (put back,
+    /// paste): spans re-anchor verbatim, without right-edge expansion (the A3
+    /// machine-insertion law). Used so a resurrected passage lands wearing its
+    /// OWN marks, never the neighbour's.
+    pub fn edit_bytes_verbatim(&mut self, byte_range: Range<usize>, text: &str) {
+        if byte_range.is_empty() && text.is_empty() {
+            return;
+        }
+        let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.crosses_furniture_wall(block, merged) {
+            self.edit_bytes_clamped(&byte_range, text, false);
+            return;
+        }
+        self.revision += 1;
+        if self.buffer.edit_bytes(byte_range, text) {
+            self.undo_states.push(self.snapshot());
+            self.redo_states.clear();
+        }
+        let splits = count_line_breaks(text);
+        if merged != 0 || splits != 0 { self.blocks.on_edit(block, merged, splits); }
+        self.absorb_buffer_ops_verbatim();
+    }
+
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
         if byte_range.is_empty() && text.is_empty() {
             return;
         }
-        self.revision += 1;
         let (block, merged) = self.pre_edit_info(&byte_range);
+        if self.crosses_furniture_wall(block, merged) {
+            // A wall IS a run boundary: the clamped edit never coalesces.
+            self.edit_bytes_clamped(&byte_range, text, true);
+            return;
+        }
+        self.revision += 1;
         if self.buffer.edit_bytes_coalescing(byte_range, text) {
             // Snapshot only when a new transaction actually opens. While
             // typing inside a word the buffer coalesces and returns false, so
@@ -2685,6 +3505,103 @@ impl Document {
     pub fn set_block_kind_in_current_tx(&mut self, block: usize, kind: BlockKind) {
         self.revision += 1;
         self.blocks.set_kind(block, kind);
+    }
+
+    /// Insert a dropped/pasted image as its OWN standing block after the
+    /// block holding `cursor_byte` (papercuts follow-up, report 4): an image
+    /// is never spliced mid-paragraph, and the caret must never land ON it —
+    /// typing at the image's line would write invisible text into the image
+    /// block. Separators are ensured (a trailing empty paragraph is opened
+    /// when the image lands last) and the returned caret BYTE is the start
+    /// of the block FOLLOWING the image. One transaction: the separator
+    /// insert and the kind stamp undo together.
+    pub fn insert_image_block(&mut self, cursor_byte: usize, src: String) -> usize {
+        self.insert_image_block_full(cursor_byte, src, String::new(), "", &SpanSet::default())
+    }
+
+    /// `insert_image_block` carrying the §9 travelling form's luggage: the
+    /// rebuilt picture lands with its alt AND its caption — text and spans
+    /// both — in the same one transaction, so a cross-clipboard rebuild is
+    /// one undo step exactly like a bare insert. `caption` must be one
+    /// line (the paste grammar guarantees it); `caption_spans` are
+    /// char-based, rebased to the caption's own start.
+    pub fn insert_image_block_full(
+        &mut self,
+        cursor_byte: usize,
+        src: String,
+        alt: String,
+        caption: &str,
+        caption_spans: &SpanSet,
+    ) -> usize {
+        debug_assert!(!caption.contains('\n'), "a caption is one line by grammar");
+        let rope = self.buffer.rope();
+        let cursor_char = rope.byte_to_char(cursor_byte.min(self.len_bytes()));
+        let line = rope.char_to_line(cursor_char);
+        let par_end_char = if line + 1 < rope.len_lines() {
+            rope.line_to_char(line + 1) - 1
+        } else {
+            rope.len_chars()
+        };
+        let has_following = par_end_char < rope.len_chars();
+        let par_end_byte = rope.char_to_byte(par_end_char);
+        // "\n" opens the image's own block (its line text = the caption)
+        // between this paragraph and the next; when nothing follows, the
+        // trailing "\n" ALSO opens the empty paragraph the caret needs to
+        // stand in (§7: there is always an after).
+        let payload = if has_following {
+            format!("\n{caption}")
+        } else {
+            format!("\n{caption}\n")
+        };
+        self.edit_bytes(par_end_byte..par_end_byte, &payload);
+        let image_block = line + 1;
+        self.set_block_kind_in_current_tx(image_block, BlockKind::Image { src, alt });
+        let cap_start = self.buffer.rope().line_to_char(image_block);
+        for s in caption_spans.spans() {
+            self.format_in_current_tx(
+                cap_start + s.range.start..cap_start + s.range.end,
+                s.attr.clone(),
+                true,
+            );
+        }
+        // Start of the block after the image: past the paragraph's end, the
+        // separator that opened the image block, and the caption line.
+        self.buffer.rope().line_to_byte(image_block + 1)
+    }
+
+    /// The §7 drop law's topmost gap: an image standing BEFORE the first
+    /// block. `insert_image_block` can only stand a block after the one
+    /// holding a byte, so the top gap gets its own splice: one "\n" opens
+    /// the new first line, then BOTH kinds are stamped deterministically —
+    /// the new line the picture, the pushed-down line its old kind — so
+    /// neither split law (flowing clones; furniture births Paragraph) can
+    /// misdress either side. One transaction; returns the byte after the
+    /// image block (the old first block's new start).
+    pub fn insert_image_block_before_first(&mut self, src: String) -> usize {
+        let old_kind = self.blocks.kind(0).clone();
+        self.edit_bytes(0..0, "\n");
+        self.set_block_kind_in_current_tx(
+            0,
+            BlockKind::Image {
+                src,
+                alt: String::new(),
+            },
+        );
+        self.set_block_kind_in_current_tx(1, old_kind);
+        1
+    }
+
+    /// Swap a picture's pixels in place (docs/inline-images.md §4's
+    /// replace-in-place, plan R4) — the "better export" verb. Same block,
+    /// alt untouched; the caption is the block's own line, so it is
+    /// untouched by construction. One undo step, via the `set_block_kind`
+    /// snapshot path. A non-image block is a no-op: the caller's picture
+    /// selection may have decayed under an async import.
+    pub fn replace_image_src(&mut self, block: usize, src: String) {
+        let BlockKind::Image { alt, .. } = self.blocks.kind(block).clone() else {
+            return;
+        };
+        self.set_block_kind(block, BlockKind::Image { src, alt });
     }
 
     /// Apply/clear an attribute inside the *current* transaction (sticky
@@ -2988,6 +3905,29 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_break_lengths_and_line_text_ends_cover_ropeys_full_set() {
+        for (separator, bytes) in [
+            ("\n", 1),
+            ("\u{000B}", 1),
+            ("\u{000C}", 1),
+            ("\r", 1),
+            ("\r\n", 2),
+            ("\u{0085}", 2),
+            ("\u{2028}", 3),
+            ("\u{2029}", 3),
+        ] {
+            let rope = ropey::Rope::from_str(&format!("alpha{separator}beta"));
+            let next = rope.line_to_byte(1);
+            assert_eq!(break_len_before_bytes(&rope, next), bytes, "{separator:?}");
+            assert_eq!(line_text_end_bytes(&rope, 0), 5, "{separator:?}");
+            assert_eq!(line_text_end_bytes(&rope, 1), rope.len_bytes(), "{separator:?}");
+        }
+
+        let rope = ropey::Rope::from_str("alpha beta");
+        assert_eq!(break_len_before_bytes(&rope, 5), 0);
+    }
 
     #[test]
     fn side_snapshots_share_unchanged_components_and_cow_only_the_mutated_one() {
@@ -3414,6 +4354,56 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_topmost_provisional_note_removes_its_empty_undo_step() {
+        let mut doc = Document::new("base", SpanSet::default(), BlockMap::default());
+        doc.edit_bytes(4..4, " edit");
+        let depth = doc.undo_states.len();
+        let id = doc.add_note(0..4, String::new(), 0);
+        assert_eq!(doc.undo_states.len(), depth + 1);
+        assert!(doc.cancel_provisional_note(id).is_some());
+        assert_eq!(doc.undo_states.len(), depth);
+        doc.undo();
+        assert_eq!(doc.text(), "base", "next undo reaches the real edit");
+    }
+
+    #[test]
+    fn cancelling_intervened_provisional_note_scrubs_undo_and_redo() {
+        let mut doc = Document::new("base", SpanSet::default(), BlockMap::default());
+        let id = doc.add_note(0..4, String::new(), 0);
+        doc.add_diagnoses(vec![Annotation {
+            id: 0,
+            range: 0..4,
+            body: "query".into(),
+            status: NoteStatus::Open,
+            created_unix: 0,
+            kind: NoteKind::Diagnosis,
+            title: "diagnosis".into(),
+            level: "line".into(),
+            orphaned: false,
+            pass_id: 1,
+            unverified: false,
+        }]);
+        assert!(doc.cancel_provisional_note(id).is_some());
+        doc.undo();
+        assert!(doc.notes().get(id).is_none(), "undo must not resurrect it");
+        doc.redo();
+        assert!(doc.notes().get(id).is_none(), "redo must not resurrect it");
+    }
+
+    #[test]
+    fn committed_note_keeps_its_existing_undo_and_redo_history() {
+        let mut doc = Document::new("base", SpanSet::default(), BlockMap::default());
+        let id = doc.add_note(0..4, String::new(), 0);
+        doc.set_note_body(id, "kept".into());
+        doc.undo();
+        assert_eq!(doc.notes().get(id).unwrap().body, "");
+        doc.undo();
+        assert!(doc.notes().get(id).is_none());
+        doc.redo();
+        assert!(doc.notes().get(id).is_some());
+    }
+
+    #[test]
     fn restore_reanchors_notes_to_their_content() {
         // A note follows the passage it covers to wherever that text lives in
         // the restored version — not collapsed to the document end.
@@ -3786,7 +4776,7 @@ mod tests {
     #[test]
     fn graveyard_apply_op_shifts_and_clamps_origin() {
         let mut g = Graveyard::default();
-        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript);
+        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
         assert_eq!(g.get(id).unwrap().words, 1);
         // Insert before the origin → shifts right (10 → 12).
         g.apply_op(&op(0, 0, "xx"));
@@ -3847,7 +4837,7 @@ mod tests {
         let base = doc.manuscript_base_char();
         assert!(base > 0);
         let mut g = Graveyard::default();
-        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript); // origin drifted into the pile
+        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false); // origin drifted into the pile
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
         assert!(doc.text().starts_with("cc\n\n"), "compost untouched: {}", doc.text());
@@ -3920,12 +4910,857 @@ mod tests {
         assert_eq!(e.origin_pos, 4);
         assert!(e.spans.spans().is_empty());
         assert!(e.kinds.is_empty());
+        // A pre-papercuts entry has no `whole_blocks` key: serde-default false,
+        // so it loads and puts back as a plain fragment (§B1).
+        assert!(!e.whole_blocks);
         // The whole record round-trips too.
         let g: Graveyard = serde_json::from_str(
             r#"{"entries":[{"id":1,"text":"x","origin_quote":"","origin_pos":0,"cut_unix":0,"words":1}],"next_id":1}"#,
         )
         .expect("legacy graveyard loads");
         assert_eq!(g.len(), 1);
+    }
+
+    // ---- papercuts-2026-07: A2 seam / A3 class split + machine law / B1 / B2 ----
+
+    #[test]
+    fn enter_ends_the_run_next_char_is_plain() {
+        // A2: an expanding span never absorbs an insertion across a newline —
+        // Enter at the end of a bold run opens a plain paragraph.
+        let mut doc = Document::new("", SpanSet::default(), BlockMap::default());
+        doc.edit_bytes_coalescing(0..0, "bold");
+        doc.toggle_format(0..4, InlineAttr::Strong);
+        // Caret at the right edge of the bold run; press Enter (typed).
+        doc.edit_bytes_coalescing(4..4, "\n");
+        // The seam did NOT swallow the newline: the run is still 0..4.
+        assert!(doc.spans().covers(0..4, &InlineAttr::Strong));
+        assert!(!doc.spans().covers(0..5, &InlineAttr::Strong));
+        // The next paragraph opens plain.
+        doc.edit_bytes_coalescing(5..5, "x");
+        assert_eq!(doc.text(), "bold\nx");
+        assert!(!doc.spans().covers(5..6, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn right_edge_append_with_an_embedded_seam_stops_at_the_newline() {
+        // A2 belt (papercuts finding 10): a typed insertion that CONTAINS a
+        // newline part-way through — "text\nmore" — is absorbed by an expanding
+        // right-edge span only up to the seam. `starts_with('\n')` alone would
+        // have let the whole thing stream onto the next paragraph.
+        let mut set = SpanSet::default();
+        set.add(0..4, InlineAttr::Strong);
+        set.apply_op(&op(4, 0, "text\nmore")); // typed at the right edge
+        // The span grew by "text" (4 chars) only, ending right at the seam.
+        assert_eq!(set.spans(), &[strong(0..8)]);
+        // An insertion that OPENS with the seam expands nothing.
+        let mut set = SpanSet::default();
+        set.add(0..4, InlineAttr::Strong);
+        set.apply_op(&op(4, 0, "\nmore"));
+        assert_eq!(set.spans(), &[strong(0..4)]);
+        // A machine insertion never expands at all, seam or no seam.
+        let mut set = SpanSet::default();
+        set.add(0..4, InlineAttr::Strong);
+        set.apply_op_verbatim(&op(4, 0, "text\nmore"));
+        assert_eq!(set.spans(), &[strong(0..4)]);
+    }
+
+    #[test]
+    fn enter_inside_a_run_splits_it_intact_and_undoes() {
+        // A2 (the seam kills momentum, never marks): Enter INSIDE a bold run
+        // splits it into two intact spans — both halves stay bold — and one
+        // undo restores the single pre-split span.
+        let mut doc = Document::new("bold", SpanSet::default(), BlockMap::default());
+        doc.toggle_format(0..4, InlineAttr::Strong);
+        doc.edit_bytes_coalescing(2..2, "\n"); // "bo\nld"
+        assert_eq!(doc.text(), "bo\nld");
+        // Both halves are bold (the newline grew the run to keep them marked).
+        assert!(doc.spans().covers(0..2, &InlineAttr::Strong)); // "bo"
+        assert!(doc.spans().covers(3..5, &InlineAttr::Strong)); // "ld"
+        // Undo the Enter: one span restored, caret state returned.
+        assert!(matches!(doc.undo(), Some(Some(_))));
+        assert_eq!(doc.text(), "bold");
+        assert_eq!(doc.spans().spans().len(), 1);
+        assert!(doc.spans().covers(0..4, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn extent_marks_do_not_grow_by_appending() {
+        // A3: Highlight and Strikethrough are extent-class — marked once, they
+        // do not grow when the writer types at their right edge. Strong stays
+        // emphasis-class (the typing hand extends it).
+        for extent in [InlineAttr::Highlight, InlineAttr::Strikethrough] {
+            let mut doc = Document::new("word", SpanSet::default(), BlockMap::default());
+            doc.toggle_format(0..4, extent.clone());
+            doc.edit_bytes_coalescing(4..4, "s"); // type at the right edge
+            assert_eq!(doc.text(), "words");
+            assert!(!doc.spans().covers(4..5, &extent), "{extent:?} must not grow");
+            assert!(doc.spans().covers(0..4, &extent), "{extent:?} keeps its extent");
+        }
+        // Bold at the right edge still grows (the convention).
+        let mut doc = Document::new("word", SpanSet::default(), BlockMap::default());
+        doc.toggle_format(0..4, InlineAttr::Strong);
+        doc.edit_bytes_coalescing(4..4, "s");
+        assert!(doc.spans().covers(0..5, &InlineAttr::Strong), "bold extends by typing");
+    }
+
+    #[test]
+    fn machine_insertion_never_absorbs_into_a_neighbour_span() {
+        // A3 machine-insertion law: put back of a partial entry at the right
+        // edge of a neighbour's Strong span is NOT dressed in that bold.
+        let mut spans = SpanSet::default();
+        spans.add(0..4, InlineAttr::Strong); // "bold" bold; "X" plain
+        let mut doc = Document::new("boldX", spans, BlockMap::default());
+        // Cut the trailing plain "X" (a partial, non-block cut).
+        let id = doc.cut_to_graveyard(4..5, String::new(), 0, false);
+        assert_eq!(doc.text(), "bold");
+        assert!(!doc.graveyard().get(id).unwrap().whole_blocks);
+        // Put it back at the bold run's right edge: verbatim, so no expansion.
+        doc.put_back(id);
+        assert_eq!(doc.text(), "boldX");
+        assert!(doc.spans().covers(0..4, &InlineAttr::Strong));
+        assert!(!doc.spans().covers(4..5, &InlineAttr::Strong), "X not absorbed into bold");
+    }
+
+    #[test]
+    fn whole_paragraph_exile_leaves_no_grave_and_undoes_in_one_step() {
+        // B1: exiling a whole middle paragraph takes its bounding separator —
+        // no empty block — and Ctrl+Z restores text + separator and drops the
+        // entry in one step.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(4..7, String::new(), 0, false); // "BBB"
+        assert_eq!(doc.text(), "AAA\nCCC");
+        assert_eq!(doc.blocks().len(), 2, "no empty block strands");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.whole_blocks);
+        assert_eq!(e.text, "BBB");
+        // One undo restores the paragraph AND its separator, entry gone.
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert_eq!(doc.blocks().len(), 3);
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn whole_block_exile_normalizes_trailing_newline_selection() {
+        // B1 normalization: a triple-click-shaped selection ending at the next
+        // block's char 0 (includes the trailing \n) yields the identical
+        // outcome — one separator consumed, never two.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(4..8, String::new(), 0, false); // "BBB\n"
+        assert_eq!(doc.text(), "AAA\nCCC");
+        assert_eq!(doc.blocks().len(), 2);
+        assert_eq!(doc.graveyard().get(id).unwrap().text, "BBB");
+    }
+
+    #[test]
+    fn whole_block_put_back_rebuilds_its_own_paragraph() {
+        // B2: a whole-block entry returns as its own standing paragraph wearing
+        // its own kind + spans, neighbours untouched, even after edits shift
+        // the origin.
+        let mut spans = SpanSet::default();
+        spans.add(4..7, InlineAttr::Strong); // "BBB" bold
+        let mut doc = Document::new("AAA\nBBB\nCCC", spans, BlockMap::default());
+        let id = doc.exile_to_graveyard(4..7, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\nCCC");
+        // An edit before the origin drifts it; put back must still land as a
+        // block, not a splice.
+        doc.edit_bytes(0..0, "Z"); // "ZAAA\nCCC"
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "ZAAA\nBBB\nCCC");
+        assert_eq!(doc.blocks().len(), 3, "BBB is its own block");
+        // BBB wears its own bold; the neighbours do not.
+        let bbb_start = doc.rope().char_to_line(caret); // caret is at BBB's start
+        assert_eq!(bbb_start, 1);
+        assert!(doc.spans().covers(5..8, &InlineAttr::Strong), "BBB bold restored");
+        assert!(!doc.spans().covers(0..4, &InlineAttr::Strong), "ZAAA not bold");
+        assert!(!doc.spans().covers(9..12, &InlineAttr::Strong), "CCC not bold");
+        assert_eq!(caret, 5, "caret at the returned block's start");
+    }
+
+    #[test]
+    fn whole_document_exile_and_put_back_has_no_phantom_block() {
+        // The lone-block case: exiling the whole document takes no separator
+        // (there is none), and put back into the emptied doc lands bare — no
+        // phantom leading blank block.
+        let mut doc = Document::new("only", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(0..4, String::new(), 0, false);
+        assert_eq!(doc.text(), "");
+        assert_eq!(doc.blocks().len(), 1);
+        doc.put_back(id);
+        assert_eq!(doc.text(), "only");
+        assert_eq!(doc.blocks().len(), 1);
+    }
+
+    #[test]
+    fn last_block_exile_and_put_back_round_trip() {
+        // B1/B2: the last block of the document consumes its LEADING separator
+        // on exile and rebuilds as a trailing block on put back.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(8..11, String::new(), 0, false); // "CCC"
+        assert_eq!(doc.text(), "AAA\nBBB");
+        assert_eq!(doc.blocks().len(), 2, "no trailing empty block");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert_eq!(doc.blocks().len(), 3);
+        assert_eq!(caret, 8, "caret at CCC's start");
+    }
+
+    // ---- papercuts follow-up (2026-07-11 owner round): reports 3 & 4 ----
+
+    #[test]
+    fn plain_deleted_whole_paragraph_returns_standing_not_spliced() {
+        // Report 3: select a full middle paragraph with the mouse (text only,
+        // no bounding \n), plain-delete it (auto-files, exact bytes), sweep
+        // the leftover empty line with a second Backspace, put back. The
+        // text must stand as its own paragraph wearing its own kind and
+        // spans — glued to nobody.
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Paragraph,
+            BlockKind::Heading(2),
+            BlockKind::Paragraph,
+        ]);
+        let mut spans = SpanSet::default();
+        spans.add(4..7, InlineAttr::Strong); // "BBB" bold
+        let mut doc = Document::new("AAA\nBBB\nCCC", spans, blocks);
+        let id = doc.cut_to_graveyard(4..7, String::new(), 0, false); // plain delete
+        // The exact-byte ruling stands: the empty grave line remains.
+        assert_eq!(doc.text(), "AAA\n\nCCC");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.whole_blocks, "a complete-block plain delete records block-ness");
+        assert_eq!(e.text, "BBB");
+        // The second Backspace sweeps the leftover empty line.
+        doc.edit_bytes(3..4, "");
+        assert_eq!(doc.text(), "AAA\nCCC");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC", "stands as its own paragraph");
+        assert_eq!(caret, 4, "caret at the returned block's start");
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Heading(2), "its own kind restored");
+        assert!(doc.spans().covers(4..7, &InlineAttr::Strong), "its own bold, nobody else's");
+        assert!(!doc.spans().covers(0..3, &InlineAttr::Strong));
+        assert!(!doc.spans().covers(8..11, &InlineAttr::Strong));
+    }
+
+    #[test]
+    fn plain_delete_with_trailing_newline_normalizes_and_returns_standing() {
+        // The reversed order: the selection grabbed the trailing separator
+        // too (shift+down / triple-click shape), so ONE Backspace leaves no
+        // empty line. B1's normalization classifies it; the entry sheds the
+        // separator so put back rebuilds exactly one, never two.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.cut_to_graveyard(4..8, String::new(), 0, false); // "BBB\n"
+        assert_eq!(doc.text(), "AAA\nCCC", "exact bytes: no leftover line this way");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.whole_blocks);
+        assert_eq!(e.text, "BBB", "the entry sheds the bounding separator");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert_eq!(caret, 4);
+        assert_eq!(doc.blocks().len(), 3);
+    }
+
+    #[test]
+    fn plain_deleted_last_paragraph_put_back_fills_the_leftover_grave() {
+        // Put back BEFORE the writer sweeps the empty line: the return fills
+        // the standing grave block rather than opening a second blank.
+        let mut doc = Document::new("AAA\nBBB", SpanSet::default(), BlockMap::default());
+        let id = doc.cut_to_graveyard(4..7, String::new(), 0, false); // "BBB"
+        assert_eq!(doc.text(), "AAA\n");
+        assert!(doc.graveyard().get(id).unwrap().whole_blocks);
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB", "fills the grave, no doubled blank");
+        assert_eq!(caret, 4);
+        assert_eq!(doc.blocks().len(), 2);
+    }
+
+    #[test]
+    fn immediate_middle_paragraph_put_back_fills_the_leftover_grave() {
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.cut_to_graveyard(4..7, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\n\nCCC");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert_eq!(caret, 4);
+        assert_eq!(doc.blocks().len(), 3);
+    }
+
+    #[test]
+    fn unicode_break_whole_block_doors_put_back_without_stray_break_chars() {
+        for sep in ["\n", "\r\n", "\r", "\u{0085}", "\u{2028}"] {
+            let original = format!("AAA{sep}BBB{sep}CCC");
+            let start = 3 + sep.len();
+            let end = start + 3;
+
+            let mut exiled =
+                Document::new(&original, SpanSet::default(), BlockMap::default());
+            let id = exiled.exile_to_graveyard(
+                start..end,
+                String::new(),
+                0,
+                false,
+            );
+            assert!(exiled.graveyard().get(id).unwrap().whole_blocks, "{sep:?}");
+            exiled.put_back(id).unwrap();
+            let authored = format!("AAA{sep}BBB\nCCC");
+            assert_eq!(exiled.text(), authored, "{sep:?}");
+            assert_eq!(exiled.blocks().len(), 3, "{sep:?}");
+
+            let mut deleted =
+                Document::new(&original, SpanSet::default(), BlockMap::default());
+            let id = deleted.cut_to_graveyard(start..end, String::new(), 0, false);
+            assert!(deleted.graveyard().get(id).unwrap().whole_blocks, "{sep:?}");
+            deleted.put_back(id).unwrap();
+            assert_eq!(deleted.text(), original, "{sep:?}");
+            assert_eq!(deleted.blocks().len(), 3, "{sep:?}");
+        }
+    }
+
+    #[test]
+    fn partial_selection_plain_delete_still_splices() {
+        // Anything short of complete blocks keeps today's fragment contract.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.cut_to_graveyard(5..7, String::new(), 0, false); // "BB" mid-block
+        assert!(!doc.graveyard().get(id).unwrap().whole_blocks);
+        assert_eq!(doc.text(), "AAA\nB\nCCC");
+        doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC", "a fragment splices back in place");
+        assert_eq!(doc.blocks().len(), 3);
+    }
+
+    #[test]
+    fn image_insert_stands_alone_and_carets_the_following_block() {
+        // Report 4: an image is its own block; the caret lands at the START
+        // of the following block, never on the image.
+        let mut doc = Document::new("AAA\nBBB", SpanSet::default(), BlockMap::default());
+        let caret = doc.insert_image_block(1, "asset:img1".into()); // cursor inside AAA
+        assert_eq!(doc.text(), "AAA\n\nBBB");
+        assert_eq!(doc.blocks().len(), 3);
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:img1")
+        );
+        assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
+        assert_eq!(caret, 5, "caret at the start of the FOLLOWING block");
+        assert_eq!(doc.block_of_byte(caret), 2, "typing lands after the image, never in it");
+        // Undo removes the block and its kind stamp in one step.
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\nBBB");
+        assert_eq!(doc.blocks().len(), 2);
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn image_insert_at_document_end_opens_a_paragraph_after() {
+        // The image landing last opens an empty paragraph for the caret.
+        let mut doc = Document::new("AAA", SpanSet::default(), BlockMap::default());
+        let caret = doc.insert_image_block(2, "asset:img2".into());
+        assert_eq!(doc.text(), "AAA\n\n");
+        assert_eq!(doc.blocks().len(), 3);
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
+        assert_eq!(caret, 5);
+        assert_eq!(doc.block_of_byte(caret), 2);
+    }
+
+    #[test]
+    fn image_insert_full_lands_caption_alt_and_spans_in_one_step() {
+        // §9's rebuild: the travelling form's caption (text + spans) and
+        // alt land WITH the block, one transaction, one undo step.
+        let mut doc = Document::new("AAA\nBBB", SpanSet::default(), BlockMap::default());
+        let mut spans = SpanSet::default();
+        spans.add(0..4, InlineAttr::Emphasis);
+        let caret =
+            doc.insert_image_block_full(1, "asset:img1".into(), "a cat".into(), "look here", &spans);
+        assert_eq!(doc.text(), "AAA\nlook here\nBBB");
+        assert!(matches!(
+            doc.blocks().kind(1),
+            BlockKind::Image { src, alt } if src == "asset:img1" && alt == "a cat"
+        ));
+        assert_eq!(caret, 14, "caret at the start of the FOLLOWING block");
+        assert!(
+            doc.spans().attrs_at(4).any(|a| *a == InlineAttr::Emphasis),
+            "caption spans re-anchor onto the caption line"
+        );
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\nBBB", "one undo takes the whole rebuild back");
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        assert_eq!(doc.spans().spans().len(), 0);
+    }
+
+    #[test]
+    fn image_insert_before_first_stamps_both_sides() {
+        // §7's topmost gap: the new picture stands BEFORE block 0, and the
+        // pushed-down line keeps its old kind — for a flowing first block
+        // and for a furniture one alike (neither split law may misdress).
+        let mut doc = Document::new(
+            "Head\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Heading(1), BlockKind::Paragraph]),
+        );
+        let after = doc.insert_image_block_before_first("asset:top".into());
+        assert_eq!(doc.text(), "\nHead\nBBB");
+        assert!(matches!(doc.blocks().kind(0), BlockKind::Image { src, .. } if src == "asset:top"));
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Heading(1));
+        assert_eq!(after, 1, "byte after the image block = the old first block");
+        doc.undo();
+        assert_eq!(doc.text(), "Head\nBBB");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(1));
+
+        // Furniture first block: the old picture keeps its pixels on the
+        // pushed-down line; the new one stands above it.
+        let mut doc = Document::new(
+            "cap\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:old"), BlockKind::Paragraph]),
+        );
+        doc.insert_image_block_before_first("asset:new".into());
+        assert_eq!(doc.text(), "\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(0), BlockKind::Image { src, .. } if src == "asset:new"));
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:old"));
+    }
+
+    // ---- the §2 wall law: furniture vs the edit path ------------------
+
+    fn img(src: &str) -> BlockKind {
+        BlockKind::Image {
+            src: src.into(),
+            alt: String::new(),
+        }
+    }
+
+    /// "AAA\ncap\nBBB" with the middle line an image whose caption is its
+    /// own text (the §1 ontology): AAA 0..3, sep 3, cap 4..7, sep 7,
+    /// BBB 8..11.
+    fn cap_doc() -> Document {
+        Document::new(
+            "AAA\ncap\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a"), BlockKind::Paragraph]),
+        )
+    }
+
+    fn plan(doc: &Document, range: Range<usize>) -> ClampPlan {
+        clamp_plan(doc.rope(), doc.blocks(), &range)
+    }
+
+    #[test]
+    fn clamp_plan_stops_partial_ranges_at_the_wall() {
+        let doc = cap_doc();
+        // Mid-paragraph into mid-caption: bytes on each side go, the
+        // separator at the wall survives.
+        assert_eq!(
+            plan(&doc, 1..5),
+            ClampPlan { cuts: vec![1..3, 4..5], insert_at: 1 }
+        );
+        // From inside the caption out below: same wall, other polarity.
+        assert_eq!(
+            plan(&doc, 5..9),
+            ClampPlan { cuts: vec![5..7, 8..9], insert_at: 5 }
+        );
+        // A separator-only range is refused whole — no cuts at all. Both
+        // walls, both polarities (the today-bug's Backspace drain, §0).
+        assert_eq!(plan(&doc, 3..4).cuts, Vec::<Range<usize>>::new());
+        assert_eq!(plan(&doc, 7..8).cuts, Vec::<Range<usize>>::new());
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
+    fn clamp_plan_takes_a_covered_block_whole() {
+        let doc = cap_doc();
+        // Separator + caption + separator: enclosed, taken by the PRECEDING
+        // separator (merge-keeps-first then drains the image kind); the
+        // following separator stands.
+        assert_eq!(plan(&doc, 3..8), ClampPlan { cuts: vec![3..7], insert_at: 3 });
+        // Whole-cover plus both partial flanks: left-partial + whole-cover
+        // + right-partial (adjudicated pushback 5). The flanks do NOT fuse —
+        // the surviving separator stands between them.
+        assert_eq!(
+            plan(&doc, 1..10),
+            ClampPlan { cuts: vec![1..7, 8..10], insert_at: 1 }
+        );
+        // A non-empty caption plus ONE separator is the §5 range door too.
+        assert_eq!(plan(&doc, 4..8), ClampPlan { cuts: vec![4..8], insert_at: 4 });
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
+    fn clamp_plan_empty_caption_demands_full_enclosure() {
+        // "AAA\n\nBBB": empty caption at 4..4, seps 3..4 and 4..5. A lone
+        // separator range must never drain the picture; both separators
+        // covered takes it whole (consuming the preceding one).
+        let doc = Document::new(
+            "AAA\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a"), BlockKind::Paragraph]),
+        );
+        assert_eq!(plan(&doc, 3..4).cuts, Vec::<Range<usize>>::new());
+        assert_eq!(plan(&doc, 4..5).cuts, Vec::<Range<usize>>::new());
+        assert_eq!(plan(&doc, 3..5), ClampPlan { cuts: vec![3..4], insert_at: 3 });
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
+    fn clamp_plan_walls_between_adjacent_furniture() {
+        // "AAA\nc1\nc2\nBBB", two images back to back: the shared separator
+        // is a wall for both; a range across it clamps on both sides.
+        let doc = Document::new(
+            "AAA\nc1\nc2\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                img("asset:a"),
+                img("asset:b"),
+                BlockKind::Paragraph,
+            ]),
+        );
+        assert_eq!(
+            plan(&doc, 5..8),
+            ClampPlan { cuts: vec![5..6, 7..8], insert_at: 5 }
+        );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
+    fn clamp_plan_whole_cover_reclaims_a_wall_the_neighbour_left_standing() {
+        // Two images back to back, the SECOND fully enclosed (content plus
+        // both bounding separators): the shared wall was already pushed as
+        // img1's protected FOLLOWING separator one iteration earlier, so
+        // consume_prec must reclaim it — or the cover is silently void and
+        // the enclosed picture drains to the §0 ghost (§2 whole cover,
+        // §5's range door).
+        let doc = Document::new(
+            "c1\nc2\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:a"), img("asset:b"), BlockKind::Paragraph]),
+        );
+        assert_eq!(plan(&doc, 2..6), ClampPlan { cuts: vec![2..5], insert_at: 2 });
+        // A chain of enclosed EMPTY captions resolves left to right: each
+        // cover consumes its own preceding separator — including the wall
+        // the previous cover just left protected.
+        let chain = Document::new(
+            "AAA\n\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                img("asset:a"),
+                img("asset:b"),
+                BlockKind::Paragraph,
+            ]),
+        );
+        assert_eq!(plan(&chain, 3..6), ClampPlan { cuts: vec![3..5], insert_at: 3 });
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
+    fn clamp_plan_furniture_at_document_edges() {
+        // Image first: no preceding separator exists, so enclosure covers
+        // content + the following one; the cover runs on into the flank.
+        let start = Document::new(
+            "cap\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:a"), BlockKind::Paragraph]),
+        );
+        assert_eq!(plan(&start, 0..6), ClampPlan { cuts: vec![0..6], insert_at: 0 });
+        // Image last: no following separator; the preceding one is the take.
+        let end = Document::new(
+            "AAA\ncap",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a")]),
+        );
+        assert_eq!(plan(&end, 1..7), ClampPlan { cuts: vec![1..7], insert_at: 1 });
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one-cut plans are table rows, not typos
+    fn clamp_plan_replacement_starting_in_a_wall_lands_left() {
+        // A replacement whose range STARTS inside a surviving separator
+        // steps back onto the wall's left face (the range start's side).
+        let doc = cap_doc();
+        assert_eq!(plan(&doc, 3..6), ClampPlan { cuts: vec![4..6], insert_at: 3 });
+        // A CRLF wall: '\r' and '\n' are separate chars, so a char-aligned
+        // range CAN start between them — the landing steps back onto the
+        // break's first byte, and the cut spares the break whole.
+        let crlf = Document::new(
+            "AAA\r\ncap\r\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a"), BlockKind::Paragraph]),
+        );
+        assert_eq!(plan(&crlf, 4..7), ClampPlan { cuts: vec![5..7], insert_at: 3 });
+    }
+
+    #[test]
+    fn wall_clamped_delete_spares_both_blocks_and_undoes_in_one_step() {
+        let mut doc = cap_doc();
+        doc.take_ops();
+        doc.edit_bytes(1..5, "");
+        assert_eq!(doc.text(), "A\nap\nBBB", "bytes on each side go, the wall stands");
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:a"),
+            "the picture never rides a text edit"
+        );
+        // The grouped cuts mirror to the store as ordinary ops.
+        let mut mirror: Vec<char> = "AAA\ncap\nBBB".chars().collect();
+        for op in doc.take_ops() {
+            mirror.splice(op.pos..op.pos + op.delete, op.insert.chars());
+        }
+        assert_eq!(mirror.iter().collect::<String>(), doc.text(), "Loro mirror diverged");
+        // One ctrl-z restores text AND kinds together.
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn wall_crossing_cut_files_only_the_deleted_bytes_and_put_back_never_clones() {
+        // A range cut from mid-paragraph into mid-caption: the clamp spares
+        // the wall and the picture, so the graveyard must record only what
+        // actually left — filing the raw slice graved a separator that
+        // still stands plus the Image kind, and Put back then re-inserted
+        // the separator and stamped a SECOND picture from a plain text
+        // gesture (§2: no text mechanic may move, clone, or absorb).
+        let mut doc = cap_doc();
+        doc.cut_to_graveyard(1..6, String::new(), 0, false);
+        assert_eq!(doc.text(), "A\np\nBBB", "the clamp spared the wall");
+        let images =
+            |doc: &Document| doc.blocks().kinds().iter().filter(|k| k.is_furniture()).count();
+        assert_eq!(images(&doc), 1);
+        let ids: Vec<u64> = doc.graveyard().entries().iter().map(|e| e.id).collect();
+        for id in ids {
+            doc.put_back(id).expect("every filed entry returns");
+        }
+        assert_eq!(doc.text(), "AAA\ncap\nBBB", "put back restores exactly the cut");
+        assert_eq!(images(&doc), 1, "a text mechanic must never clone the picture");
+        assert!(
+            matches!(doc.blocks().kind(1), BlockKind::Image { src, .. } if src == "asset:a")
+        );
+    }
+
+    #[test]
+    fn wall_refused_range_leaves_no_undo_step() {
+        // A separator-only deletion at the wall is refused whole: nothing
+        // changes and no empty transaction pollutes the undo stack.
+        let mut doc = cap_doc();
+        doc.edit_bytes(7..8, "");
+        assert_eq!(doc.text(), "AAA\ncap\nBBB");
+        assert_eq!(doc.undo(), None, "a refusal must not be undoable");
+    }
+
+    #[test]
+    fn wall_whole_cover_takes_the_picture_and_flanks_stand_apart() {
+        let mut doc = cap_doc();
+        doc.edit_bytes(1..10, "");
+        assert_eq!(doc.text(), "A\nB", "flanks do NOT fuse across the taken block");
+        assert_eq!(doc.blocks().kinds(), &[BlockKind::Paragraph, BlockKind::Paragraph]);
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn wall_whole_cover_at_document_start_restamps_the_merged_line() {
+        // The document-start image has no preceding separator, so the take
+        // consumes the FOLLOWING one — on_edit's merge-keeps-first would
+        // strand the image kind on the survivor's text; the restamp hands
+        // the line to the first surviving block's kind.
+        let mut doc = Document::new(
+            "cap\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:a"), BlockKind::Paragraph]),
+        );
+        doc.edit_bytes(0..6, "");
+        assert_eq!(doc.text(), "B");
+        assert_eq!(doc.blocks().kinds(), &[BlockKind::Paragraph]);
+        doc.undo();
+        assert_eq!(doc.text(), "cap\nBBB");
+        assert!(matches!(doc.blocks().kind(0), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn wall_whole_cover_beside_a_standing_twin_takes_the_enclosed_picture() {
+        // The executor run of the reclaim rule above: deleting the enclosed
+        // second image of an adjacent pair must take it WHOLE — never leave
+        // it standing with a drained caption (§2's forbidden ghost).
+        let mut doc = Document::new(
+            "c1\nc2\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![img("asset:a"), img("asset:b"), BlockKind::Paragraph]),
+        );
+        doc.edit_bytes(2..6, "");
+        assert_eq!(doc.text(), "c1\nBBB");
+        assert!(
+            matches!(doc.blocks().kind(0), BlockKind::Image { src, .. } if src == "asset:a"),
+            "the standing twin keeps its caption and kind"
+        );
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        // The empty-caption chain: both enclosed pictures go, the flanks
+        // stand apart on the surviving wall.
+        let mut chain = Document::new(
+            "AAA\n\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                img("asset:a"),
+                img("asset:b"),
+                BlockKind::Paragraph,
+            ]),
+        );
+        chain.edit_bytes(3..6, "");
+        assert_eq!(chain.text(), "AAA\nBBB");
+        assert_eq!(
+            chain.blocks().kinds(),
+            &[BlockKind::Paragraph, BlockKind::Paragraph],
+            "no drained ghost survives the enclosure"
+        );
+    }
+
+    #[test]
+    fn wall_replacement_clamps_the_delete_and_inserts_at_the_start_side() {
+        let mut doc = cap_doc();
+        doc.edit_bytes(1..5, "XY");
+        assert_eq!(doc.text(), "AXY\nap\nBBB", "text lands on the range start's side");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\ncap\nBBB");
+    }
+
+    #[test]
+    fn caption_edits_and_wall_insertions_never_clamp() {
+        // Entirely inside the caption: ordinary text mechanics, the image
+        // kind stays put (P3 — the caption IS text).
+        let mut doc = cap_doc();
+        doc.edit_bytes(4..6, "");
+        assert_eq!(doc.text(), "AAA\np\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        // A pure insertion at the wall is not a crossing: no clamp, and the
+        // separator count grows as typed.
+        let mut doc = cap_doc();
+        doc.edit_bytes(3..3, "x");
+        assert_eq!(doc.text(), "AAAx\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn split_never_clones_furniture() {
+        // §2 split law: the first fragment keeps the furniture kind; every
+        // further fragment is born a Paragraph — an Enter inside a caption
+        // can never mint a second picture (repro step 8).
+        let mut b = BlockMap::from_kinds(vec![BlockKind::Paragraph, img("asset:a"), BlockKind::Paragraph]);
+        b.on_edit(1, 0, 1);
+        assert!(matches!(b.kind(1), BlockKind::Image { .. }));
+        assert_eq!(b.kind(2), &BlockKind::Paragraph);
+        assert_eq!(b.kinds().iter().filter(|k| k.is_furniture()).count(), 1);
+        // The divider is the same furniture class, same law.
+        let mut b = BlockMap::from_kinds(vec![BlockKind::Divider]);
+        b.on_edit(0, 0, 2);
+        assert_eq!(
+            b.kinds(),
+            &[BlockKind::Divider, BlockKind::Paragraph, BlockKind::Paragraph]
+        );
+    }
+
+    #[test]
+    fn splitting_a_caption_yields_image_plus_paragraph() {
+        // Enter at caption end: the image keeps the head, the tail is a new
+        // Paragraph below (§6).
+        let mut doc = cap_doc();
+        doc.edit_bytes(7..7, "\n");
+        assert_eq!(doc.text(), "AAA\ncap\n\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
+        // Enter at caption START: the first fragment (now the empty line)
+        // keeps the picture; the caption text rides the new Paragraph. The
+        // editor's direction rule (§6, a later phase) will route around
+        // this, but the model law must hold on its own.
+        let mut doc = cap_doc();
+        doc.edit_bytes(4..4, "\n");
+        assert_eq!(doc.text(), "AAA\n\ncap\nBBB");
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+        assert_eq!(doc.blocks().kind(2), &BlockKind::Paragraph);
+        assert_eq!(doc.blocks().kinds().iter().filter(|k| k.is_furniture()).count(), 1);
+        // A multi-line paste into the caption: every inserted fragment is
+        // born a Paragraph — one picture, however many lines arrive.
+        let mut doc = cap_doc();
+        doc.edit_bytes(5..5, "x\ny\nz");
+        assert_eq!(doc.text(), "AAA\ncx\ny\nzap\nBBB");
+        assert_eq!(doc.blocks().kinds().iter().filter(|k| k.is_furniture()).count(), 1);
+        assert!(matches!(doc.blocks().kind(1), BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn replace_image_src_swaps_pixels_keeps_alt_and_caption_one_undo() {
+        // Spec inline-images §4: replace-in-place is a whole-block verb —
+        // new pixels, same block, alt untouched, the caption line never
+        // even enters the transaction. One undo step returns the old src.
+        let mut doc = Document::new("AAA\na caption\nBBB", SpanSet::default(), {
+            let mut b = BlockMap::new(3);
+            b.set_kind(1, BlockKind::Image { src: "asset:old.png".into(), alt: "cat".into() });
+            b
+        });
+        doc.replace_image_src(1, "asset:new.png".into());
+        assert_eq!(
+            doc.blocks().kind(1),
+            &BlockKind::Image { src: "asset:new.png".into(), alt: "cat".into() }
+        );
+        assert_eq!(doc.text(), "AAA\na caption\nBBB", "the caption line is untouched");
+        doc.undo();
+        assert_eq!(
+            doc.blocks().kind(1),
+            &BlockKind::Image { src: "asset:old.png".into(), alt: "cat".into() },
+            "one undo step restores the old pixels"
+        );
+        // A decayed selection (the block is no longer an image) is a no-op.
+        doc.replace_image_src(0, "asset:other.png".into());
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn image_kind_wire_keeps_the_caption_key_for_released_builds() {
+        // Build plan, adjudicated pushback 2: a released build's enum
+        // REQUIRES `caption`, and its serde error path falls back to the
+        // legacy token parser — collapsing the whole BlockMap. So the wire
+        // must keep emitting the key. This replica IS the released shape.
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum OldBlockKind {
+            #[allow(dead_code)]
+            Paragraph,
+            #[allow(dead_code)]
+            Heading(u8),
+            #[allow(dead_code)]
+            Blockquote,
+            #[allow(dead_code)]
+            ListItem { ordered: bool, depth: u8 },
+            #[allow(dead_code)]
+            Divider,
+            #[allow(dead_code)]
+            CodeBlock { info: String },
+            Image { src: String, alt: String, caption: String },
+            #[allow(dead_code)]
+            FootnoteDef { id: String },
+        }
+        let kinds = vec![
+            BlockKind::Paragraph,
+            BlockKind::Image { src: "asset:abc.png".into(), alt: "a]b".into() },
+        ];
+        let json = serde_json::to_string(&kinds).unwrap();
+        assert!(json.contains(r#""caption":"""#), "the wire keeps the key: {json}");
+        let old: Vec<OldBlockKind> = serde_json::from_str(&json)
+            .expect("a released build's REQUIRED-caption serde must parse our output");
+        assert_eq!(
+            old[1],
+            OldBlockKind::Image {
+                src: "asset:abc.png".into(),
+                alt: "a]b".into(),
+                caption: String::new(),
+            }
+        );
+        // The reverse door: an old build's output (caption present, maybe
+        // non-empty) parses into the two-field runtime enum, value dropped
+        // here (the open-time migration owns the value, not serde).
+        let legacy = r#"[{"Image":{"src":"asset:x.png","alt":"","caption":"fig 1"}}]"#;
+        let new: Vec<BlockKind> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(new[0], BlockKind::Image { src: "asset:x.png".into(), alt: String::new() });
+        // And a future captionless wire parses too (the era flip's far side).
+        let future = r#"[{"Image":{"src":"asset:y.png","alt":"a"}}]"#;
+        let new: Vec<BlockKind> = serde_json::from_str(future).unwrap();
+        assert_eq!(new[0], BlockKind::Image { src: "asset:y.png".into(), alt: "a".into() });
     }
 
     #[test]
@@ -4424,6 +6259,7 @@ mod tests {
             SpanSet::default(),
             Vec::new(),
             GraveRegion::Manuscript,
+            false,
         );
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
@@ -4467,7 +6303,7 @@ mod tests {
         let pile_note = doc.add_note(4..7, "pile note".into(), 0); // "one"
         let manu_note = doc.add_note(22..27, "manu note".into(), 0); // "piece"
         let mut g = Graveyard::default();
-        let gid = g.file("corpse".into(), String::new(), 22, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript);
+        let gid = g.file("corpse".into(), String::new(), 22, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
         doc.set_graveyard(g);
         // Give it an undo stack that could reach back across the flip.
         doc.edit_bytes(0..0, "Z");
@@ -4514,7 +6350,7 @@ mod tests {
             let mut b = BlockMap::new(3);
             b.set_kind(
                 1,
-                BlockKind::Image { src: "asset:img1".into(), alt: String::new(), caption: String::new() },
+                BlockKind::Image { src: "asset:img1".into(), alt: String::new() },
             );
             b
         });

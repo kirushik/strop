@@ -112,10 +112,11 @@ fn kind() -> impl Strategy<Value = BlockKind> {
         Just(BlockKind::CodeBlock { info: "rust".into() }),
         // Metadata with a ']' and an embedded newline — the exact shapes the
         // token format used to corrupt; JSON persistence must carry them.
+        // (The caption is the block's own line now — inline-images §10 —
+        // so alt carries the newline torture the field used to.)
         Just(BlockKind::Image {
             src: "asset:x.png".into(),
-            alt: "a]b".into(),
-            caption: "c\nd".into(),
+            alt: "a]b\nc".into(),
         }),
         Just(BlockKind::FootnoteDef { id: "1".into() }),
     ]
@@ -232,6 +233,118 @@ proptest! {
             "notes changed across save/reopen"
         );
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2b. The §2 wall law (docs/inline-images.md): furniture under arbitrary
+//     edit sequences.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+enum WallOp {
+    Insert(usize, String),
+    Delete(usize, usize),
+    Image(usize),
+    Divider(usize),
+    Undo,
+}
+
+fn wall_op() -> impl Strategy<Value = WallOp> {
+    prop_oneof![
+        3 => (0usize..32, "[ab\n ]{0,5}").prop_map(|(p, s)| WallOp::Insert(p, s)),
+        3 => (0usize..32, 0usize..32).prop_map(|(a, b)| WallOp::Delete(a, b)),
+        2 => (0usize..32).prop_map(WallOp::Image),
+        1 => (0usize..32).prop_map(WallOp::Divider),
+        1 => Just(WallOp::Undo),
+    ]
+}
+
+fn is_break(c: char) -> bool {
+    matches!(
+        c,
+        '\u{000A}' | '\u{000B}' | '\u{000C}' | '\u{000D}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// The §2 wall law as invariants (spec §11): after ANY edit sequence —
+    /// with the caption path never taken — (a) the block map stays
+    /// line-aligned, (b) no picture is ever cloned (every src born unique
+    /// stays unique), and (c) no edit leaves prose on a furniture block's
+    /// line the writer didn't put in its caption: this sequence types no
+    /// captions, so furniture lines must stay textless forever.
+    #[test]
+    fn furniture_survives_arbitrary_edit_sequences(
+        ops in proptest::collection::vec(wall_op(), 0..32)
+    ) {
+        let mut doc = Document::new("alpha\nbeta", SpanSet::default(), BlockMap::default());
+        let mut next_src = 0u32;
+        for o in ops {
+            let len = doc.rope().len_chars();
+            match o {
+                WallOp::Insert(p, s) => {
+                    let p = p.min(len);
+                    // The caption path is the ONLY legal writer of text on
+                    // a furniture line; this sequence never takes it.
+                    if !doc.blocks().kind(doc.rope().char_to_line(p)).is_furniture() {
+                        let b = doc.char_to_byte(p);
+                        doc.edit_bytes(b..b, &s);
+                    }
+                }
+                WallOp::Delete(a, b) => {
+                    let (s, e) = clamp_range(a, b, len);
+                    if s < e {
+                        let (bs, be) = (doc.char_to_byte(s), doc.char_to_byte(e));
+                        doc.edit_bytes(bs..be, "");
+                    }
+                }
+                WallOp::Image(p) => {
+                    let b = doc.char_to_byte(p.min(len));
+                    next_src += 1;
+                    doc.insert_image_block(b, format!("asset:{next_src}"));
+                }
+                WallOp::Divider(p) => {
+                    // Furniture is never minted under prose: stamp only a
+                    // textless Paragraph, like the editor's divider verb.
+                    let line = doc.rope().char_to_line(p.min(len));
+                    if doc.blocks().kind(line) == &BlockKind::Paragraph
+                        && doc.rope().line(line).chars().all(is_break)
+                    {
+                        doc.set_block_kind(line, BlockKind::Divider);
+                    }
+                }
+                WallOp::Undo => {
+                    doc.undo();
+                }
+            }
+            // (a) kinds stay aligned with the text's lines across every
+            // splice, clamped or not.
+            prop_assert_eq!(
+                doc.blocks().len(),
+                doc.rope().len_lines(),
+                "block map fell out of line alignment"
+            );
+            // (b) no clone: every Image src stays unique.
+            let mut srcs: Vec<&str> = doc.blocks().asset_refs().collect();
+            let born = srcs.len();
+            srcs.sort();
+            srcs.dedup();
+            prop_assert_eq!(srcs.len(), born, "an edit cloned a picture");
+            // (c) furniture lines stay textless: no merge ever moved prose
+            // onto a picture's or divider's line.
+            for (i, k) in doc.blocks().kinds().iter().enumerate() {
+                if k.is_furniture() {
+                    prop_assert!(
+                        doc.rope().line(i).chars().all(is_break),
+                        "prose flowed onto a furniture line: {:?}",
+                        doc.text()
+                    );
+                }
+            }
+        }
     }
 }
 

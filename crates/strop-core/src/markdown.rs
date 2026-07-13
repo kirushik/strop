@@ -136,12 +136,33 @@ fn inline_md(line: &str, base: usize, spans: &SpanSet) -> String {
 }
 
 pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
+    // A document block is a ropey line (document-model.md §6), including
+    // its full Unicode break set. Keep the separator's character length so
+    // document-global span offsets remain aligned; CRLF is one two-char break.
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+    let mut chars = text.char_indices().peekable();
+    while let Some((byte, c)) = chars.next() {
+        if !matches!(c, '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}') {
+            continue;
+        }
+        let mut separator_chars = 1usize;
+        let mut next_start = byte + c.len_utf8();
+        if c == '\r' && matches!(chars.peek(), Some((_, '\n'))) {
+            let (lf_byte, lf) = chars.next().unwrap();
+            separator_chars = 2;
+            next_start = lf_byte + lf.len_utf8();
+        }
+        lines.push((&text[line_start..byte], separator_chars, c == '\u{2028}'));
+        line_start = next_start;
+    }
+    lines.push((&text[line_start..], 0, false));
+
     let mut out = String::new();
     let mut base = 0usize; // char offset of the current block
     let mut ordered_no = 0usize;
     let mut in_code = false;
-    let lines: Vec<&str> = text.split('\n').collect();
-    for (ix, line) in lines.iter().enumerate() {
+    for (ix, &(line, separator_chars, hard_separator)) in lines.iter().enumerate() {
         let kind = blocks.kind(ix).clone();
         let is_code = matches!(kind, BlockKind::CodeBlock { .. });
         if in_code && !is_code {
@@ -175,7 +196,9 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
                 out.push_str("> ");
                 out.push_str(&inline_md(line, base, spans));
                 // Consecutive quote blocks stay one quote.
-                if matches!(blocks.kind(ix + 1), BlockKind::Blockquote) && ix + 1 < lines.len() {
+                if ix + 1 < lines.len()
+                    && matches!(blocks.kind(ix + 1), BlockKind::Blockquote)
+                {
                     out.push_str("\n>\n");
                 } else {
                     out.push_str("\n\n");
@@ -201,7 +224,7 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
                 out.push_str(&inline_md(line, base, spans));
                 out.push_str("\n\n");
             }
-            BlockKind::Image { src, alt, .. } => {
+            BlockKind::Image { src, alt } => {
                 // Escape the alt (it is author-editable and may hold ']' or
                 // emphasis markers that would otherwise break the `![...]`),
                 // and angle-bracket a src that contains whitespace or parens.
@@ -220,14 +243,41 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
                 } else {
                     src.clone()
                 };
-                out.push_str(&format!("![{esc_alt}]({src_field})\n\n"));
+                // The caption is the block's own LINE (inline-images §10),
+                // carried in the standard title slot: spans flatten to
+                // CommonMark inline syntax, soft breaks become spaces (the
+                // "\\\n" here is inline_md's soft-break emission — a line
+                // holds no literal '\n'). A conforming reader resolves ONE
+                // level of backslash escapes inside a title, so the
+                // finished inline markdown is re-escaped wholesale — '\'
+                // doubles, '"' hides — and what the parser hands back is
+                // exactly the inline syntax written (verified against
+                // pulldown-cmark; `caption_from_title` re-parses it).
+                let title = inline_md(line, base, spans).replace("\\\n", " ");
+                if title.is_empty() {
+                    out.push_str(&format!("![{esc_alt}]({src_field})\n\n"));
+                } else {
+                    let esc_title = title.replace('\\', "\\\\").replace('"', "\\\"");
+                    out.push_str(&format!("![{esc_alt}]({src_field} \"{esc_title}\")\n\n"));
+                }
             }
             BlockKind::Paragraph => {
                 out.push_str(&inline_md(line, base, spans));
-                out.push_str("\n\n");
+                let joins_paragraph = hard_separator
+                    && ix + 1 < lines.len()
+                    && !(ix + 1 == lines.len() - 1 && lines[ix + 1].0.is_empty())
+                    && matches!(blocks.kind(ix + 1), BlockKind::Paragraph);
+                if joins_paragraph {
+                    out.push_str("\\\n");
+                } else {
+                    // U+2028 only preserves its hard-break meaning between
+                    // prose paragraphs. Other kinds (and a trailing U+2028)
+                    // degrade through the ordinary block grammar.
+                    out.push_str("\n\n");
+                }
             }
         }
-        base += line.chars().count() + 1;
+        base += line.chars().count() + separator_chars;
     }
     if in_code {
         out.push_str("```\n");
@@ -319,6 +369,7 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
     let mut code_fresh = false; // first Text event of a brand-new fence?
     let mut footnote_def: Option<String> = None;
     let mut image_alt: Option<String> = None; // capturing alt text
+    let mut image_title = String::new(); // the pending image's title slot
     let mut inline_starts: Vec<(usize, InlineAttr)> = Vec::new();
     let mut underline_start: Option<usize> = None;
     let mut highlight_start: Option<usize> = None;
@@ -331,15 +382,22 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
         }};
     }
 
+    let begin_block_with = |text: &mut String,
+                                chars: &mut usize,
+                                kinds: &mut Vec<BlockKind>,
+                                separator: char,
+                                kind: BlockKind| {
+        if !kinds.is_empty() {
+            text.push(separator);
+            *chars += 1;
+        }
+        kinds.push(kind);
+    };
     let begin_block = |text: &mut String,
                            chars: &mut usize,
                            kinds: &mut Vec<BlockKind>,
                            kind: BlockKind| {
-        if !kinds.is_empty() {
-            text.push('\n');
-            *chars += 1;
-        }
-        kinds.push(kind);
+        begin_block_with(text, chars, kinds, '\n', kind);
     };
 
     let current_kind = |quote: usize,
@@ -417,8 +475,9 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
             Event::Rule => {
                 begin_block(&mut text, &mut chars, &mut kinds, BlockKind::Divider);
             }
-            Event::Start(Tag::Image { dest_url, .. }) => {
+            Event::Start(Tag::Image { dest_url, title, .. }) => {
                 image_alt = Some(String::new());
+                image_title = title.to_string();
                 begin_block(
                     &mut text,
                     &mut chars,
@@ -426,7 +485,6 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                     BlockKind::Image {
                         src: dest_url.to_string(),
                         alt: String::new(),
-                        caption: String::new(),
                     },
                 );
             }
@@ -434,6 +492,23 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                 let alt = image_alt.take().unwrap_or_default();
                 if let Some(BlockKind::Image { alt: slot, .. }) = kinds.last_mut() {
                     *slot = alt;
+                }
+                // The title slot carries the caption (inline-images §10):
+                // re-parse the inline syntax the exporter flattened into it
+                // onto the image block's own line — the caption IS the line
+                // — so Strop↔Strop round-trips whole. Alt Text events never
+                // moved `chars`, so the line is still empty here.
+                let title = std::mem::take(&mut image_title);
+                if !title.is_empty() {
+                    let (ctext, cspans) = caption_from_title(&title);
+                    let cbase = chars;
+                    push_str!(&ctext);
+                    for s in cspans.spans() {
+                        spans.add(
+                            cbase + s.range.start..cbase + s.range.end,
+                            s.attr.clone(),
+                        );
+                    }
                 }
             }
             Event::Start(Tag::Emphasis) => inline_starts.push((chars, InlineAttr::Emphasis)),
@@ -511,12 +586,169 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                 spans.add(start..chars, InlineAttr::FootnoteRef(id.to_string()));
             }
             Event::SoftBreak => push_str!(" "),
-            Event::HardBreak => push_str!("\u{2028}"),
+            Event::HardBreak => begin_block_with(
+                &mut text,
+                &mut chars,
+                &mut kinds,
+                '\u{2028}',
+                current_kind(quote, &lists, &footnote_def),
+            ),
             _ => {}
         }
     }
 
     (text, spans, BlockMap::from_kinds(kinds))
+}
+
+/// A caption, recovered from a Markdown image title — the import half of
+/// inline-images §10, shared with §9's paste precedence. The title slot is
+/// a plain string, so the inline syntax the exporter flattened into it is
+/// parsed back out to text + spans (spans rebased to 0; the caller offsets
+/// them to the caption line's position). Captions are one line of prose by
+/// our grammar; a foreign multi-line title soft-wraps to spaces, as does
+/// any block structure a foreign title smuggles in.
+pub fn caption_from_title(title: &str) -> (String, SpanSet) {
+    if title.is_empty() {
+        return (String::new(), SpanSet::default());
+    }
+    let flatten_breaks = |s: &str, preserve_markdown_hard_break: bool| {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if matches!(c, '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}') {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                let hard_break = preserve_markdown_hard_break
+                    && matches!(c, '\r' | '\n')
+                    && (out.ends_with('\\') || out.ends_with("  "));
+                out.push(if hard_break { '\n' } else { ' ' });
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let oneline = flatten_breaks(title, true);
+    let (text, spans, _) = from_markdown(&oneline);
+    (flatten_breaks(&text, false), spans)
+}
+
+/// One parsed Strop image line — the §9 paste-precedence grammar:
+/// `![alt](src "caption")`, quoting rules exactly matching the exporter's.
+/// `alt` is plain text (escapes resolved); `caption` is the title's inline-
+/// markdown string with ONE escape level resolved — the same intermediate a
+/// conforming Markdown parser hands over — so `caption_from_title` turns it
+/// into text + spans. `src` is deliberately NOT validated as an `asset:` id:
+/// the grammar recognizes any image line and the caller decides what an
+/// unresolvable src means (§9: paste imports a foreign line as visible
+/// literal text, per the boundary rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageLine {
+    pub src: String,
+    pub alt: String,
+    pub caption: String,
+}
+
+/// Recognize one whole image line (leading/trailing whitespace tolerated,
+/// nothing else on the line — an image stands alone as its own block). See
+/// `ImageLine` for what the parts mean. Backslash resolution follows
+/// CommonMark: '\' escapes ASCII punctuation, and is literal otherwise.
+pub fn parse_image_line(text: &str) -> Option<ImageLine> {
+    let s = text.trim();
+    if s.contains('\n') || s.contains('\r') {
+        return None; // one line by grammar; range copies split first
+    }
+    let chars: Vec<char> = s.strip_prefix("![")?.chars().collect();
+    let mut i = 0usize;
+    // One escape level, CommonMark's rule. Returns chars consumed.
+    let unescape = |i: usize, out: &mut String| -> Option<usize> {
+        match chars.get(i + 1) {
+            Some(c) if c.is_ascii_punctuation() => {
+                out.push(*c);
+                Some(2)
+            }
+            Some(c) => {
+                out.push('\\');
+                out.push(*c);
+                Some(2)
+            }
+            None => None, // a trailing lone backslash never closes the form
+        }
+    };
+    let mut alt = String::new();
+    loop {
+        match chars.get(i)? {
+            '\\' => i += unescape(i, &mut alt)?,
+            ']' => {
+                i += 1;
+                break;
+            }
+            c => {
+                alt.push(*c);
+                i += 1;
+            }
+        }
+    }
+    if chars.get(i) != Some(&'(') {
+        return None;
+    }
+    i += 1;
+    while chars.get(i) == Some(&' ') {
+        i += 1;
+    }
+    let mut src = String::new();
+    if chars.get(i) == Some(&'<') {
+        i += 1;
+        loop {
+            match chars.get(i)? {
+                '>' => {
+                    i += 1;
+                    break;
+                }
+                c => {
+                    src.push(*c);
+                    i += 1;
+                }
+            }
+        }
+    } else {
+        while let Some(c) = chars.get(i) {
+            if *c == ')' || c.is_whitespace() {
+                break;
+            }
+            src.push(*c);
+            i += 1;
+        }
+    }
+    if src.is_empty() {
+        return None; // a picture must point somewhere
+    }
+    while chars.get(i) == Some(&' ') {
+        i += 1;
+    }
+    let mut caption = String::new();
+    if chars.get(i) == Some(&'"') {
+        i += 1;
+        loop {
+            match chars.get(i)? {
+                '\\' => i += unescape(i, &mut caption)?,
+                '"' => {
+                    i += 1;
+                    break;
+                }
+                c => {
+                    caption.push(*c);
+                    i += 1;
+                }
+            }
+        }
+        while chars.get(i) == Some(&' ') {
+            i += 1;
+        }
+    }
+    (chars.get(i) == Some(&')') && i + 1 == chars.len())
+        .then_some(ImageLine { src, alt, caption })
 }
 
 #[cfg(test)]
@@ -554,6 +786,73 @@ mod tests {
             md,
             "## Заголовок\n\n**Жирный** *курсив* и `код`.\n\n> цитата\n\n\
              1. первый\n2. второй\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n"
+        );
+    }
+
+    #[test]
+    fn export_uses_the_document_line_break_set() {
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Paragraph,
+            BlockKind::Blockquote,
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+            },
+        ]);
+        let expected = to_markdown("alpha\nbeta\ngamma", &SpanSet::default(), &blocks);
+        for separator in ["\r\n", "\u{0085}", "\u{2028}", "\u{2029}"] {
+            let text = ["alpha", "beta", "gamma"].join(separator);
+            assert_eq!(to_markdown(&text, &SpanSet::default(), &blocks), expected);
+        }
+    }
+
+    #[test]
+    fn crlf_export_keeps_block_kinds_aligned() {
+        let text = "title\r\nprose\r\none\r\ntwo";
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Heading(2),
+            BlockKind::Paragraph,
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+            },
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+            },
+        ]);
+        let md = to_markdown(text, &SpanSet::default(), &blocks);
+        assert_eq!(md, "## title\n\nprose\n\n- one\n- two\n");
+        assert!(!md.contains('\r'));
+    }
+
+    #[test]
+    fn crlf_export_keeps_second_block_spans_aligned() {
+        let text = "first\r\nright place";
+        let mut spans = SpanSet::default();
+        spans.add(7..12, InlineAttr::Strong); // "right"
+        let md = to_markdown(text, &spans, &BlockMap::new(2));
+        assert_eq!(md, "first\n\n**right** place\n");
+    }
+
+    #[test]
+    fn crlf_export_handles_code_and_spanned_image_caption() {
+        let text = "let x = 1;\r\ncaption";
+        let mut spans = SpanSet::default();
+        spans.add(12..19, InlineAttr::Strong); // "caption"
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::CodeBlock {
+                info: "rust".into(),
+            },
+            BlockKind::Image {
+                src: "asset:cat.png".into(),
+                alt: "cat".into(),
+            },
+        ]);
+        let md = to_markdown(text, &spans, &blocks);
+        assert_eq!(
+            md,
+            "```rust\nlet x = 1;\n```\n\n![cat](asset:cat.png \"**caption**\")\n"
         );
     }
 
@@ -599,7 +898,21 @@ mod tests {
         let (text, _, blocks) = from_markdown("строка раз\nстрока два\\\nстрока три\n");
         // Soft wrap joins with a space; hard break becomes U+2028.
         assert_eq!(text, "строка раз строка два\u{2028}строка три");
-        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks.kinds(), &[BlockKind::Paragraph, BlockKind::Paragraph]);
+    }
+
+    #[test]
+    fn hard_break_import_keeps_rope_lines_and_kinds_aligned() {
+        let cases = [
+            ("alpha\\\nbeta\n", BlockKind::Paragraph),
+            ("> alpha\\\n> beta\n", BlockKind::Blockquote),
+            ("- alpha\\\n  beta\n", BlockKind::ListItem { ordered: false, depth: 0 }),
+        ];
+        for (md, expected_kind) in cases {
+            let (text, _, blocks) = from_markdown(md);
+            assert_eq!(blocks.len(), ropey::Rope::from_str(&text).len_lines());
+            assert_eq!(blocks.kinds(), &[expected_kind.clone(), expected_kind]);
+        }
     }
 
     #[test]
@@ -687,7 +1000,6 @@ mod tests {
         let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
             src: "a.png".into(),
             alt: "a]b".into(),
-            caption: String::new(),
         }]);
         let md = to_markdown("", &SpanSet::default(), &blocks);
         let (_, _, blocks2) = from_markdown(&md);
@@ -707,27 +1019,164 @@ mod tests {
         let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
             src: "asset:abc.png".into(),
             alt: "plain".into(),
-            caption: String::new(),
         }]);
         let md = to_markdown("", &SpanSet::default(), &blocks);
         assert_eq!(md, "![plain](asset:abc.png)\n");
     }
 
     #[test]
+    fn image_caption_line_exports_as_title_and_roundtrips() {
+        // The caption IS the block's line (inline-images §10): it rides the
+        // title slot with its spans flattened to inline syntax, and import
+        // re-parses them, so Strop↔Strop round-trips whole.
+        let text = "look, a kitten";
+        let mut spans = SpanSet::default();
+        spans.add(0..4, InlineAttr::Emphasis); // "look"
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "asset:abc.png".into(),
+            alt: "cat".into(),
+        }]);
+        let md = to_markdown(text, &spans, &blocks);
+        assert_eq!(md, "![cat](asset:abc.png \"*look*, a kitten\")\n");
+        // Import: the carrier paragraph pulldown wraps a lone image in
+        // arrives as an empty block before it (pre-existing shape); the
+        // caption lands on the image block's OWN line, spans re-parsed.
+        let (text2, spans2, blocks2) = from_markdown(&md);
+        assert_eq!(text2, "\nlook, a kitten");
+        assert!(spans2.covers(1..5, &InlineAttr::Emphasis));
+        assert!(!spans2.covers(5..6, &InlineAttr::Emphasis));
+        assert_eq!(
+            blocks2.kinds()[1],
+            BlockKind::Image { src: "asset:abc.png".into(), alt: "cat".into() }
+        );
+    }
+
+    #[test]
+    fn image_caption_torture_quotes_brackets_stars_backslashes() {
+        // A title is a plain string a conforming reader unescapes once; the
+        // exporter's double-escaping must survive every marker character
+        // the caption can legally hold.
+        let text = "a\"b ]c *d \\e =f g";
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "asset:abc.png".into(),
+            alt: "he said \"hi\" a\\b".into(),
+        }]);
+        let md = to_markdown(text, &SpanSet::default(), &blocks);
+        let (text2, _, blocks2) = from_markdown(&md);
+        assert_eq!(text2, "\na\"b ]c *d \\e =f g", "escapes hold; the soft break spaces");
+        assert_eq!(
+            blocks2.kinds()[1],
+            BlockKind::Image {
+                src: "asset:abc.png".into(),
+                alt: "he said \"hi\" a\\b".into(),
+            }
+        );
+        // The hand parser agrees with the real one on the exported line.
+        let il = parse_image_line(md.trim_end()).unwrap();
+        assert_eq!(il.src, "asset:abc.png");
+        assert_eq!(il.alt, "he said \"hi\" a\\b");
+        assert_eq!(caption_from_title(&il.caption).0, "a\"b ]c *d \\e =f g");
+        // A hard break in a foreign title is flattened with the rest of
+        // the title-slot block grammar (§10).
+        assert_eq!(caption_from_title("a\"b ]c *d \\e =f\u{2028}g").0,
+                   "a\"b ]c *d \\e =f g");
+        assert_eq!(caption_from_title("a\"b ]c *d \\e =f\\\ng").0,
+                   "a\"b ]c *d \\e =f g");
+    }
+
+    #[test]
+    fn image_empty_caption_emits_no_title() {
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "asset:abc.png".into(),
+            alt: String::new(),
+        }]);
+        let md = to_markdown("", &SpanSet::default(), &blocks);
+        assert_eq!(md, "![](asset:abc.png)\n");
+    }
+
+    #[test]
+    fn foreign_title_newline_soft_wraps_to_space() {
+        let (text, _, blocks) = from_markdown("![a](b.png \"line\none\")\n");
+        assert_eq!(text, "\nline one");
+        assert!(matches!(blocks.kinds()[1], BlockKind::Image { .. }));
+    }
+
+    #[test]
+    fn parse_image_line_grammar() {
+        // The §9 paste-precedence parser: our export grammar, exactly.
+        assert_eq!(
+            parse_image_line("![cat](asset:abc.png \"*look*, a kitten\")"),
+            Some(ImageLine {
+                src: "asset:abc.png".into(),
+                alt: "cat".into(),
+                caption: "*look*, a kitten".into(),
+            })
+        );
+        // No title; whitespace around the line is tolerated.
+        assert_eq!(
+            parse_image_line("  ![](asset:abc.png)\n"),
+            Some(ImageLine {
+                src: "asset:abc.png".into(),
+                alt: String::new(),
+                caption: String::new(),
+            })
+        );
+        // Escapes resolve one level, in alt and title alike.
+        assert_eq!(
+            parse_image_line(r#"![a\]b](x.png "q\"r \\s")"#),
+            Some(ImageLine {
+                src: "x.png".into(),
+                alt: "a]b".into(),
+                caption: "q\"r \\s".into(),
+            })
+        );
+        // Angle-bracketed src carries spaces.
+        assert_eq!(
+            parse_image_line("![a](<a b.png> \"t\")").map(|il| il.src),
+            Some("a b.png".into())
+        );
+        // A non-asset src still parses — the CALLER decides what an
+        // unresolvable src means (documented on ImageLine).
+        assert_eq!(
+            parse_image_line("![a](https://e.x/p.png)").map(|il| il.src),
+            Some("https://e.x/p.png".into())
+        );
+    }
+
+    #[test]
+    fn parse_image_line_rejections() {
+        for bad in [
+            "text ![a](b.png)",          // prefix prose: not a lone image line
+            "![a](b.png) tail",          // trailing prose
+            "![a](b.png",                // unterminated form
+            "![a b.png)",                // no closing bracket
+            "![a]()",                    // a picture must point somewhere
+            "![a](b.png \"unterminated", // open title
+            "![a](b.png \"t\") x",       // garbage past the close
+            "![a](b.png)\n![b](c.png)",  // two lines: the caller splits first
+            "plain prose",
+        ] {
+            assert_eq!(parse_image_line(bad), None, "must reject {bad:?}");
+        }
+    }
+
+    #[test]
     fn trailing_hard_break_drops_cleanly() {
-        // A hard break at the very end of a block can't be represented; export
-        // must not leave a stray backslash that re-imports as '\' (pre-fix the
-        // round-trip yielded "a\\").
+        // A hard break at EOF can't be represented; export must not leave a
+        // stray backslash that re-imports as '\' (pre-fix: "a\\").
         let text = "a\u{2028}";
-        let md = to_markdown(text, &SpanSet::default(), &BlockMap::new(1));
+        let blocks = BlockMap::new(ropey::Rope::from_str(text).len_lines());
+        let md = to_markdown(text, &SpanSet::default(), &blocks);
         assert!(!md.contains('\\'), "no stray backslash exported: {md:?}");
         let (text2, _, _) = from_markdown(&md);
         assert_eq!(text2, "a");
-        // A mid-block hard break still survives the full round-trip.
+        // A mid-paragraph hard break survives with the model alignment.
         let mid = "a\u{2028}b";
-        let md2 = to_markdown(mid, &SpanSet::default(), &BlockMap::new(1));
-        let (text3, _, _) = from_markdown(&md2);
+        let mid_blocks = BlockMap::new(ropey::Rope::from_str(mid).len_lines());
+        let md2 = to_markdown(mid, &SpanSet::default(), &mid_blocks);
+        let (text3, _, blocks3) = from_markdown(&md2);
         assert_eq!(text3, mid);
+        assert_eq!(blocks3.len(), mid_blocks.len());
     }
 
     #[test]

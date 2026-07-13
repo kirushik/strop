@@ -122,6 +122,43 @@ expect "its ghost lingers for the fade"    1 "$(field "$D1" departing)"
 expect "the ghost is gone after the fade"  0 "$(field "$D2" departing)"
 expect "the lane stands re-packed"         3 "$(field "$D2" visible)"
 
+# C4 / LAW 2 — no dead zones: a click in the margin BESIDE a composing card
+# resolves the composer (report 1: the lane lives outside the editor column's
+# hitbox, so only the ROOT handler sees the click — light_dismiss carries the
+# resolution). An empty draft is discarded (no stray blank card); a typed
+# draft commits; both exits restore the caret/selection saved at open.
+echo "rig-check: a click beside the card still lands — the composer resolves (C4)"
+DOCC4=$(mktemp --suffix=.md); cp "$DOC2" "$DOCC4"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCC4" "select:para ctrl-m dump:ui click:1274,700 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+C1=$(echo "$OUT" | sed -n 1p); C2=$(echo "$OUT" | sed -n 2p)
+[ -n "$C2" ] || { echo "  FAIL no dump (composer C4)"; exit 1; }
+rm -f "$DOCC4" "$DOCC4.strop"
+expect "ctrl-m opens the composer"            '"NoteComposer"' "$(field "$C1" focused)"
+expect "a margin-blank click closes it"       '"Editor"' "$(field "$C2" focused)"
+expect "the empty draft is discarded"         0 "$(field "$C2" open_notes)"
+DOCC5=$(mktemp --suffix=.md); cp "$DOC2" "$DOCC5"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCC5" "select:para dump:ui ctrl-m h i click:1274,700 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+C1=$(echo "$OUT" | sed -n 1p); C2=$(echo "$OUT" | sed -n 2p)
+[ -n "$C2" ] || { echo "  FAIL no dump (composer C4 commit)"; exit 1; }
+rm -f "$DOCC5" "$DOCC5.strop"
+expect "a typed draft commits on the click"   1 "$(field "$C2" open_notes)"
+expect "focus returns to the prose"           '"Editor"' "$(field "$C2" focused)"
+SEL1=$(echo "$C1" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')
+SEL2=$(echo "$C2" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')
+expect "the dead-zone exit restores the saved caret" "$SEL1" "$SEL2"
+
+echo "rig-check: keyboard composer exits share the empty-discard law"
+DOCC6=$(mktemp --suffix=.md); cp "$DOC2" "$DOCC6"
+OUT=$(WRUN_TAIL=40 scripts/wrun.sh "$DOCC6" "select:para ctrl-m enter dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+rm -f "$DOCC6" "$DOCC6.strop"
+[ -n "$OUT" ] || { echo "  FAIL no dump (keyboard empty-discard)"; exit 1; }
+expect "Enter discards an untouched composer"  0 "$(field "$OUT" open_notes)"
+DOCC7=$(mktemp --suffix=.md); cp "$DOC2" "$DOCC7"
+OUT=$(WRUN_TAIL=40 scripts/wrun.sh "$DOCC7" "select:para ctrl-m h i enter dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+rm -f "$DOCC7" "$DOCC7.strop"
+[ -n "$OUT" ] || { echo "  FAIL no dump (keyboard typed-commit)"; exit 1; }
+expect "Enter commits a typed composer"         1 "$(field "$OUT" open_notes)"
+
 echo "rig-check: off-screen cards land in exactly one honest bucket"
 # Scroll the anchors far off the top: culled cards count as 'above' — EXCEPT
 # the selected card, which is exempt from the cull (you're working it) and
@@ -553,6 +590,61 @@ expect "a second reaction joins the lane"     2 "$(field "$CR2" lane)"
 expect "both are ordinary open notes"         2 "$(field "$D2" open_notes)"
 expect "they live on after the room closes"   2 "$(field "$D3" open_notes)"
 
+echo "rig-check: quit flushes an open cold-read reaction"
+DOCQ=$(mktemp --suffix=.md); cp "$DOC" "$DOCQ"
+WRUN_TAIL=80 scripts/wrun.sh "$DOCQ" "coldread:open coldread:select:5,40 coldread:raise h i" >/dev/null 2>&1
+OUT=$(WRUN_TAIL=40 scripts/wrun.sh "$DOCQ" "dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+rm -f "$DOCQ" "$DOCQ.strop"
+[ -n "$OUT" ] || { echo "  FAIL no dump (quit-flush cold read)"; exit 1; }
+expect "quit files the unfinished reaction"    1 "$(field "$OUT" open_notes)"
+
+# D1 — the open note owns its keys. The original bug: a space mid-note flipped
+# the page (which files the note first), so a two-word reaction became "one word
+# per note". Typed through REAL key dispatch: `space` must land IN the field.
+echo "rig-check: cold read — a multi-word note owns the keyboard (D1)"
+DOCK=$(mktemp --suffix=.md); cp "$DOC" "$DOCK"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCK" "coldread:open coldread:select:5,40 coldread:raise h i space t h e r e enter dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D=$(echo "$OUT" | tail -1)
+rm -f "$DOCK" "$DOCK.strop"
+CR=$(echo "$D" | grep -oE '"coldread":\{[^}]*\}')
+expect "the space typed INTO the note"        '"hi there"' "$(field "$CR" last_body)"
+expect "one note carries the whole phrase"    1 "$(field "$CR" lane)"
+expect "the page never flipped mid-note"      0 "$(field "$CR" page)"
+expect "the input closed on commit"           false "$(field "$CR" input)"
+# Report 2's sibling: the commit exit must hand the keys back to the DESK —
+# focus stranded on the removed field left the room Esc-proof.
+expect "commit hands the keys back to the desk" '"ColdRead"' "$(field "$D" focused)"
+
+# Report 2 — two-level Esc with the pencil up: the first Esc discards the
+# note (FieldCancel at the NoteComposer context) and refocuses the desk; the
+# second leaves the room. Pre-fix, the field's exits left focus on the dead
+# field, so the second Esc dispatched into a void and the room never closed.
+echo "rig-check: cold read — Esc closes the note, Esc again leaves the room"
+DOCK3=$(mktemp --suffix=.md); cp "$DOC" "$DOCK3"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCK3" "coldread:open coldread:select:5,40 coldread:raise h i escape dump:ui escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p)
+[ -n "$D2" ] || { echo "  FAIL no dump (two-level Esc)"; exit 1; }
+rm -f "$DOCK3" "$DOCK3.strop"
+CR1=$(echo "$D1" | grep -oE '"coldread":\{[^}]*\}')
+expect "the first Esc closes the note input"  false "$(field "$CR1" input)"
+expect "…and discards the draft"              0 "$(field "$CR1" lane)"
+expect "…and the desk holds the keys again"   '"ColdRead"' "$(field "$D1" focused)"
+expect "the second Esc leaves the room"       null "$(field "$D2" coldread)"
+
+# D1 mouse — a click that resolves an open note commits it but must NOT also
+# flip the page (commit-only, the one carve-out in C4's commit-AND-act rule).
+echo "rig-check: cold read — a resolving click never flips (D1 mouse)"
+DOCK2=$(mktemp --suffix=.md); cp "$DOC" "$DOCK2"
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCK2" "coldread:open coldread:select:5,40 coldread:raise h i dump:ui coldread:pageclick:1 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p)
+rm -f "$DOCK2" "$DOCK2.strop"
+CR1=$(echo "$D1" | grep -oE '"coldread":\{[^}]*\}')
+CR2=$(echo "$D2" | grep -oE '"coldread":\{[^}]*\}')
+expect "the input is up before the click"     true "$(field "$CR1" input)"
+expect "a right-zone click resolves the note" false "$(field "$CR2" input)"
+expect "…files it as an ordinary note"        '"hi"' "$(field "$CR2" last_body)"
+expect "…and does NOT flip the page"          0 "$(field "$CR2" page)"
+
 echo "rig-check: cold read — Past-from-parked round trip (Time 7, regions 13)"
 DOCL=$(mktemp --suffix=.md); echo "A live line for the legacy litmus." > "$DOCL"
 # The md import writes a "Started" birth checkpoint (index 0), so the seeded
@@ -617,6 +709,268 @@ P1=$(field "$CR1" page)
 if [ "${P1:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   a caret in the last chapter opens the read mid-book (page $((P1+1)))"; else
   echo "  FAIL over-threshold entry stayed at page 1 (page=$P1)"; fail=1; fi
 expect "a caret at the top reads from page 1"  0 "$(field "$CR2" page)"
+
+# ---------------- Inline images (docs/inline-images.md §11) -----------------
+# The §11 acceptance script: the round's field repro driven end-to-end through
+# REAL key dispatch (stage / refuse / exile / put back), then the travel verbs
+# (copy, cut, paste, replace-in-place, external drop). Every law that has a
+# state channel is asserted programmatically — the SMOKE per-key lines carry
+# `imgsel=<block> door=<caret> hold=<key>`, `img-geo` carries every picture's
+# rect + caption line + asset id, `dump:ui` carries doc hash/chars and the
+# graveyard census; pixels are judged by the stills at the end, never diffed.
+# Two limits stand recorded, untestable under the rig: real compositor
+# drag-and-drop (the rig synthesizes the FileDropEvent stream gpui's window
+# would translate — the translation itself is the fork's, not ours) and
+# cross-document/cross-app clipboard travel (one process per document; Linux
+# offers text-only MIMEs cross-app — spec §9's recorded platform cost).
+
+# Two tiny PNG fixtures (64x48 red, 48x64 blue), embedded so the check stays
+# self-contained; content addressing gives each a distinct, stable asset id.
+IMG_A=$(mktemp --suffix=.png)
+IMG_B=$(mktemp --suffix=.png)
+base64 -d > "$IMG_A" <<'PNG'
+iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAAZElEQVR4nO3PUQkAIBTAwBfHEPbH
+WIbw4xAGC3Cbs9fXDRc0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCA
+FjSgBQ1oQQNa0IAWNKAFDWhBA1rw2AUOKBDTbVK3WwAAAABJRU5ErkJggg==
+PNG
+base64 -d > "$IMG_B" <<'PNG'
+iVBORw0KGgoAAAANSUhEUgAAADAAAABACAIAAADTQmMRAAAATUlEQVR4nO3OQQ0AIAwAsclBE4qR
+hQuOR5MK6Kx9vjL5QEhISKgeCAkJCdUDISEhoXogJCQkVA+EhISE6oGQkJBQPRASEhKqB0JCQo9d
+Elh44ohqjGcAAAAASUVORK5CYII=
+PNG
+
+# One img-geo line -> a named value. Format:
+#   img IX @X,Y w=W h=H cap@CX,CY src=asset:...
+imgv() { # line field(ix|x|y|w|h|capy|src)
+  echo "$1" | awk -v want="$2" '{
+    split($3, c, /[@,]/); split($6, k, /[@,]/);
+    v["ix"]=$2; v["x"]=c[2]; v["y"]=c[3];
+    v["w"]=substr($4,3); v["h"]=substr($5,3);
+    v["capy"]=k[3]; v["src"]=substr($7,5);
+    print v[want] }'
+}
+selof() { echo "$1" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://'; }
+
+echo "rig-check: inline images — under never on, and the fit law (seed:image)"
+# The gallery fixture: a captioned landscape and a tall uncaptioned portrait
+# (300x1800). The caption's line-center must clear the picture's bottom edge
+# on BOTH (the typover died this round), and the portrait must cap at roughly
+# two-thirds of the viewport with proportional fit — never the natural 1800.
+DI0=$(mktemp --suffix=.md)
+GEO=$(WRUN_TAIL=40 scripts/wrun.sh "$DI0" "seed:image img-geo" 2>/dev/null | grep '^img ')
+rm -f "$DI0" "$DI0.strop"
+expect "both seeded pictures render"        2 "$(echo "$GEO" | grep -c '^img ')"
+GW=$(echo "$GEO" | sed -n 1p); GT=$(echo "$GEO" | sed -n 2p)
+for L in "$GW" "$GT"; do
+  IX=$(imgv "$L" ix)
+  if awk -v y="$(imgv "$L" y)" -v h="$(imgv "$L" h)" -v cy="$(imgv "$L" capy)" \
+       'BEGIN{exit !(cy > y + h/2)}'; then
+    echo "  ok   picture $IX: the caption line sits below the pixels"
+  else
+    echo "  FAIL picture $IX: caption at $(imgv "$L" capy) is ON the pixels (typover)"; fail=1
+  fi
+done
+TH=$(imgv "$GT" h); TW=$(imgv "$GT" w)
+if [ "${TH:-0}" -ge 400 ] 2>/dev/null && [ "${TH:-0}" -le 800 ] 2>/dev/null; then
+  echo "  ok   the tall portrait caps at ~2/3 viewport (h=$TH)"
+else
+  echo "  FAIL tall portrait h=$TH — the fit law is broken"; fail=1
+fi
+if awk -v w="$TW" -v h="$TH" 'BEGIN{d = w*6 - h; exit !(d > -12 && d < 12)}'; then
+  echo "  ok   …with proportional fit (w=$TW, 6w≈h)"
+else
+  echo "  FAIL tall portrait w=$TW h=$TH — the cap squashed the aspect"; fail=1
+fi
+
+echo "rig-check: the field repro — the Delete door (stage, refuse, exile, put back)"
+# seed:imgrepro is the origin bug's exact shape: an EMPTY paragraph, a
+# captioned picture, a prose paragraph below; caret parked in the prose.
+# Arrow up climbs into the caption (a text line like any other); Delete at
+# the empty block above STAGES (never fuses — the doc hash is the witness);
+# the same key's next press (no key-up seen) is autorepeat and is refused;
+# a key-up then a fresh press completes the exile; Put back restores the
+# picture AND its caption whole, the same asset — never a twin.
+DI1=$(mktemp --suffix=.md)
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DI1" "seed:imgrepro img-geo dump:ui up up dump:ui ctrl-home delete dump:ui delete dump:ui keyup:delete delete dump:ui img-geo putback:last dump:ui img-geo" 2>/dev/null)
+rm -f "$DI1" "$DI1.strop"
+DU=$(echo "$OUT" | grep 'UI-DUMP')
+D1=$(echo "$DU" | sed -n 1p); D3=$(echo "$DU" | sed -n 3p); D4=$(echo "$DU" | sed -n 4p)
+D5=$(echo "$DU" | sed -n 5p); D6=$(echo "$DU" | sed -n 6p)
+[ -n "$D6" ] || { echo "  FAIL missing dumps (field repro)"; exit 1; }
+UP2=$(echo "$OUT" | grep '^SMOKE up' | sed -n 2p)
+DL1=$(echo "$OUT" | grep '^SMOKE delete' | sed -n 1p)
+DL2=$(echo "$OUT" | grep '^SMOKE delete' | sed -n 2p)
+IMGS=$(echo "$OUT" | grep '^img ')
+expect "arrow up lands in the caption"      1 "$(echo "$UP2" | grep -c 'kind=Image')"
+expect "Delete at the empty block stages"   1 "$(echo "$DL1" | grep -c 'imgsel=1 door=0 hold=delete')"
+expect "the stage parks the caret at the door" '[0,0]' "$(selof "$D3")"
+expect "staging never fuses (doc untouched)" "$(field "$D1" doc_hash)" "$(field "$D3" doc_hash)"
+expect "the held key's repeat is refused"   1 "$(echo "$DL2" | grep -c 'imgsel=1')"
+expect "a refused press mutates nothing"    "$(field "$D1" doc_hash)" "$(field "$D4" doc_hash)"
+expect "a fresh Delete after key-up exiles" 1 "$(field "$D5" grave_entries)"
+expect "picture AND caption leave together" 132 "$(field "$D5" doc_chars)"
+expect "Put back restores both, whole"      "$(field "$D1" doc_hash)" "$(field "$D6" doc_hash)"
+expect "…and empties the graveyard"         0 "$(field "$D6" grave_entries)"
+# Two img-geo calls flank the exile (1 picture each); the one between saw
+# none — so 2 lines total, and one asset id across them (content addressing).
+expect "the picture returns, never a twin"  2 "$(echo "$IMGS" | grep -c '^img ')"
+expect "…under the same asset id"           "$(imgv "$(echo "$IMGS" | sed -n 1p)" src)" \
+                                            "$(imgv "$(echo "$IMGS" | sed -n 2p)" src)"
+
+echo "rig-check: the field repro — a HELD Backspace stops at the stage"
+# 31 rights park the caret 5 chars into the prose; 8 backspaces with NO
+# key-up between them are one held run: five walk the prose, the sixth
+# stages at the wall, the last two are autorepeat and refuse — the picture
+# survives. Esc then returns the door caret and drops the state; a fresh
+# press re-stages, and press–release–press completes the exile (§5's
+# freshness ladder, R5 — never trusting is_held).
+DI2=$(mktemp --suffix=.md)
+KEYS="seed:imgrepro ctrl-home"
+for _ in $(seq 1 31); do KEYS="$KEYS right"; done
+for _ in $(seq 1 8); do KEYS="$KEYS backspace"; done
+KEYS="$KEYS dump:ui img-geo escape dump:ui backspace dump:ui keyup:backspace backspace dump:ui img-geo"
+OUT=$(WRUN_TAIL=140 scripts/wrun.sh "$DI2" "$KEYS" 2>/dev/null)
+rm -f "$DI2" "$DI2.strop"
+DU=$(echo "$OUT" | grep 'UI-DUMP')
+D1=$(echo "$DU" | sed -n 1p); D2=$(echo "$DU" | sed -n 2p); D4=$(echo "$DU" | sed -n 4p)
+[ -n "$D4" ] || { echo "  FAIL missing dumps (held backspace)"; exit 1; }
+BS6=$(echo "$OUT" | grep '^SMOKE backspace' | sed -n 6p)
+BS9=$(echo "$OUT" | grep '^SMOKE backspace' | sed -n 9p)
+ESC=$(echo "$OUT" | grep '^SMOKE escape' | sed -n 1p)
+expect "five presses walk the prose, three refuse" 152 "$(field "$D1" doc_chars)"
+expect "the sixth press stages at the wall" 1 "$(echo "$BS6" | grep -c 'imgsel=1 door=26 hold=backspace')"
+expect "no refused press reaches the grave" 0 "$(field "$D1" grave_entries)"
+expect "the picture survives the held run"  1 "$(echo "$OUT" | grep -c '^img 1 ')"
+expect "Esc returns the door caret"         '[26,26]' "$(selof "$D2")"
+expect "…and drops the selection"           0 "$(echo "$ESC" | grep -c 'imgsel')"
+expect "a fresh press re-stages"            1 "$(echo "$BS9" | grep -c 'imgsel=1 door=26 hold=backspace')"
+expect "press, release, press exiles"       1 "$(field "$D4" grave_entries)"
+expect "the remnant is exact (caption gone with it)" 127 "$(field "$D4" doc_chars)"
+
+echo "rig-check: the field repro — Enter never duplicates the picture"
+# §6's one law, all three stances: at caption END the split opens below (the
+# tail is born a Paragraph — R6, the model's split law); at the START of a
+# non-empty caption the room opens ABOVE (the picture's block index rises);
+# on the SELECTED picture Enter opens below and the selection decays. One
+# picture stands at the end of all three.
+DI3=$(mktemp --suffix=.md)
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DI3" "seed:imgrepro up up enter dump:ui ctrl-home right enter dump:ui click:798,470 enter dump:ui img-geo" 2>/dev/null)
+rm -f "$DI3" "$DI3.strop"
+DU=$(echo "$OUT" | grep 'UI-DUMP')
+D1=$(echo "$DU" | sed -n 1p); D2=$(echo "$DU" | sed -n 2p); D3=$(echo "$DU" | sed -n 3p)
+[ -n "$D3" ] || { echo "  FAIL missing dumps (enter rules)"; exit 1; }
+EN1=$(echo "$OUT" | grep '^SMOKE enter' | sed -n 1p)
+EN2=$(echo "$OUT" | grep '^SMOKE enter' | sed -n 2p)
+EN3=$(echo "$OUT" | grep '^SMOKE enter' | sed -n 3p)
+CLK=$(echo "$OUT" | grep '^SMOKE click' | sed -n 1p)
+expect "at caption end the split opens below"  1 "$(echo "$EN1" | grep -c 'kind=Paragraph')"
+expect "at caption start the room opens above" 1 "$(echo "$EN2" | grep -c 'kind=Image')"
+expect "a click on the pixels selects"         1 "$(echo "$CLK" | grep -c 'imgsel=2 door=- hold=-')"
+expect "on the selection Enter opens below"    1 "$(echo "$EN3" | grep -c 'kind=Paragraph')"
+expect "three Enters, one picture"             1 "$(echo "$OUT" | grep -c '^img ')"
+expect "…each made room, none destroyed"       160 "$(field "$D3" doc_chars)"
+
+echo "rig-check: travel — copy then paste resolves to the SAME asset id (§9)"
+# Click-born selection, ctrl-c (the two-entry form rides the clipboard shim),
+# Esc parks at the caption start (the click-born origin), paste at the end:
+# the copy travels as `![alt](src "caption")`, so the pasted picture carries
+# the caption AND resolves by asset hash — the ladder's first rung.
+DI4=$(mktemp --suffix=.md)
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DI4" "seed:imgrepro img-geo click:798,318 ctrl-c escape dump:ui ctrl-end ctrl-v wait:600 img-geo dump:ui" 2>/dev/null)
+rm -f "$DI4" "$DI4.strop"
+DU=$(echo "$OUT" | grep 'UI-DUMP')
+D1=$(echo "$DU" | sed -n 1p); D2=$(echo "$DU" | sed -n 2p)
+[ -n "$D2" ] || { echo "  FAIL missing dumps (copy/paste)"; exit 1; }
+CLK=$(echo "$OUT" | grep '^SMOKE click' | sed -n 1p)
+expect "the click selects, click-born"      1 "$(echo "$CLK" | grep -c 'imgsel=1 door=- hold=-')"
+expect "Esc parks at the caption start"     '[1,1]' "$(selof "$D1")"
+expect "the paste lands a second picture"   3 "$(echo "$OUT" | grep -c '^img ')"
+expect "one asset id across the pair"       1 "$(echo "$OUT" | grep '^img ' | grep -oE 'src=[^ ]+' | sort -u | wc -l)"
+expect "the caption travelled with it"      183 "$(field "$D2" doc_chars)"
+
+echo "rig-check: travel — cut files the grave, paste puts the picture back"
+# §9 cut = copy + leave-whole: the block exits by the §5 whole-block door
+# (the graveyard records it), and the clipboard holds the travelling form —
+# paste re-inserts the SAME asset. The grave record stays: cut filed a real
+# departure, and paste is a copy, not an un-filing (Put back is the other door).
+DI5=$(mktemp --suffix=.md)
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DI5" "seed:imgrepro img-geo click:798,318 ctrl-x dump:ui ctrl-v wait:600 dump:ui img-geo" 2>/dev/null)
+rm -f "$DI5" "$DI5.strop"
+DU=$(echo "$OUT" | grep 'UI-DUMP')
+D1=$(echo "$DU" | sed -n 1p); D2=$(echo "$DU" | sed -n 2p)
+[ -n "$D2" ] || { echo "  FAIL missing dumps (cut/paste-back)"; exit 1; }
+expect "cut exiles picture + caption whole" 132 "$(field "$D1" doc_chars)"
+expect "…and files one grave entry"         1 "$(field "$D1" grave_entries)"
+expect "paste-back lands the same asset"    1 "$(echo "$OUT" | grep '^img ' | grep -oE 'src=[^ ]+' | sort -u | wc -l)"
+expect "two sightings flank the cut"        2 "$(echo "$OUT" | grep -c '^img ')"
+expect "the grave record honestly stays"    1 "$(field "$D2" grave_entries)"
+
+echo "rig-check: travel — replace-in-place is one undo step (§4)"
+# A foreign bitmap on the clipboard (clipimg — no Strop line, §9's fallback),
+# pasted onto the SELECTED picture: the src swaps in place, the caption and
+# the block stand untouched — and ONE ctrl-z returns the old picture.
+DI6=$(mktemp --suffix=.md)
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DI6" "seed:imgrepro img-geo clipimg:$IMG_B click:798,318 ctrl-v wait:600 img-geo dump:ui ctrl-z wait:300 img-geo dump:ui" 2>/dev/null)
+rm -f "$DI6" "$DI6.strop"
+DU=$(echo "$OUT" | grep 'UI-DUMP')
+D1=$(echo "$DU" | sed -n 1p); D2=$(echo "$DU" | sed -n 2p)
+[ -n "$D2" ] || { echo "  FAIL missing dumps (replace-in-place)"; exit 1; }
+L1=$(echo "$OUT" | grep '^img ' | sed -n 1p)
+L2=$(echo "$OUT" | grep '^img ' | sed -n 2p)
+L3=$(echo "$OUT" | grep '^img ' | sed -n 3p)
+expect "one picture at every station"       3 "$(echo "$OUT" | grep -c '^img ')"
+if [ -n "$L2" ] && [ "$(imgv "$L2" src)" != "$(imgv "$L1" src)" ]; then
+  echo "  ok   the paste swapped the src in place"
+else
+  echo "  FAIL replace-in-place did not swap the src"; fail=1
+fi
+expect "the caption survives the swap"      157 "$(field "$D1" doc_chars)"
+expect "ONE undo returns the old picture"   "$(imgv "$L1" src)" "$(imgv "$L3" src)"
+expect "…and only the src had moved"        157 "$(field "$D2" doc_chars)"
+
+echo "rig-check: travel — a drop lands at the pointer's gap, the caret stays (§7)"
+# The synthesized compositor stream (Entered → Pending → Submit) drops a file
+# at the gap ABOVE the picture while the caret sits at the prose end. The new
+# picture is born at that gap (block 1, its own 64px width names it); the old
+# one stands below; the caret never moves — and the newborn's EMPTY caption
+# answers a click in the band under its pixels with a caret, no selection.
+DI7=$(mktemp --suffix=.md)
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DI7" "seed:imgrepro dragenter:798,100,$IMG_A dragmove:798,110 dragdrop:798,110 wait:600 img-geo dump:ui click:798,213 dump:ui" 2>/dev/null)
+rm -f "$DI7" "$DI7.strop"
+DU=$(echo "$OUT" | grep 'UI-DUMP')
+D1=$(echo "$DU" | sed -n 1p)
+[ -n "$D1" ] || { echo "  FAIL missing dumps (drop)"; exit 1; }
+DRP=$(echo "$OUT" | grep '^SMOKE dragdrop' | sed -n 1p)
+CLK=$(echo "$OUT" | grep '^SMOKE click' | sed -n 1p)
+LN=$(echo "$OUT" | grep '^img ' | sed -n 1p)
+LO=$(echo "$OUT" | grep '^img ' | sed -n 2p)
+expect "the drop adds one picture"          2 "$(echo "$OUT" | grep -c '^img ')"
+expect "the newborn stands at the gap"      1 "$(imgv "$LN" ix)"
+expect "…at its own natural size"           64 "$(imgv "$LN" w)"
+expect "the old picture stands below it"    604 "$(imgv "$LO" w)"
+expect "the caret never moved for the drop" 1 "$(echo "$DRP" | grep -c 'tail="es the wall." kind=Paragraph')"
+expect "the empty slot's band answers with a caret" 1 "$(echo "$CLK" | grep -c 'off=1 sel=1\.\.1')"
+expect "…a caret in the caption, no selection" 0 "$(echo "$CLK" | grep -c 'imgsel')"
+
+echo "rig-check: inline images — stills for the eyes"
+# What only eyes can judge: the block-wide selection wash + the alt strip
+# (image-wash), caption optics / the chrome-free empty slot / the capped
+# portrait in one page (image-page), and the drop-gap rule painted mid-drag
+# (image-drop-gap). P6's refused-press still-identity is covered above by
+# the model (hash + caret unchanged); these frames are for the record.
+SHOTS="${RIG_SHOTS:-target/rig-shots}"; mkdir -p "$SHOTS"
+DIS=$(mktemp --suffix=.md)
+scripts/wshot.sh "$SHOTS/image-wash.png" 1 "$DIS" "seed:imgrepro click:798,318" >/dev/null 2>&1
+rm -f "$DIS" "$DIS.strop"; DIS=$(mktemp --suffix=.md)
+scripts/wshot.sh "$SHOTS/image-page.png" 1 "$DIS" "seed:image" >/dev/null 2>&1
+rm -f "$DIS" "$DIS.strop"; DIS=$(mktemp --suffix=.md)
+scripts/wshot.sh "$SHOTS/image-drop-gap.png" 1 "$DIS" "seed:imgrepro dragenter:798,100,$IMG_A dragmove:798,110" >/dev/null 2>&1
+rm -f "$DIS" "$DIS.strop"
+for s in image-wash image-page image-drop-gap; do
+  if [ -s "$SHOTS/$s.png" ]; then echo "  ok   still $SHOTS/$s.png"; else
+    echo "  FAIL still $s.png did not render"; fail=1; fi
+done
+rm -f "$IMG_A" "$IMG_B"
 
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"
 exit "$fail"

@@ -79,6 +79,12 @@ pub const MARKER_GAP_EM: f32 = 0.5;
 /// wants the same input to paginate identically every time.
 pub const IMAGE_PLACEHOLDER_HEIGHT: f32 = 56.0;
 
+/// The caption face relative to body (~0.8× muted italic, both doors —
+/// inline-images §11's caption-optics parity). The paginator's measure
+/// clamp and the paint's font size share this one number, so the width
+/// the clamp reasons about IS the width the ink takes.
+pub const CAPTION_SCALE: f32 = 0.8;
+
 const EPS: f32 = 0.01;
 
 // ---- The abstract oracles --------------------------------------------------
@@ -370,6 +376,16 @@ pub fn chapter_start(text: &str, blocks: &BlockMap, caret: usize) -> Option<usiz
 
 // ---- Pipeline entry ----------------------------------------------------------
 
+/// Ropey's line-break set — the same one `strop_core` splits blocks by. A line
+/// carries its OWN terminator, and it is not always '\n': markdown's hard break
+/// sets U+2028, and a paste of PDF- or classic-Mac-copied text arrives ended by
+/// CR / VT / FF / NEL / U+2028 / U+2029. None of them may reach the shaper.
+fn is_line_break(c: char) -> bool {
+    matches!(c,
+        '\n' | '\r' | '\u{000B}' | '\u{000C}'
+        | '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
 /// Paginate a manuscript slice triple (the output of `manuscript_slice_of` —
 /// F1) into a book. Pure over the two oracles; same input → same layout,
 /// bit for bit (the determinism gate).
@@ -394,7 +410,11 @@ pub fn paginate(
         let kind = blocks.kind(i).clone();
         let cstart = rope.line_to_char(i);
         let mut ptext = rope.line(i).to_string();
-        while ptext.ends_with('\n') || ptext.ends_with('\r') {
+        // The line's own terminator goes, whichever break it is: a '\n'-only
+        // pop leaves VT / FF / NEL / U+2028 / U+2029 standing, and the set
+        // line would carry a break character into the shaper (a caption's
+        // width check and its ellipsis would measure it too).
+        while ptext.ends_with(is_line_break) {
             ptext.pop();
         }
         if !matches!(kind, BlockKind::ListItem { .. }) {
@@ -404,11 +424,38 @@ pub fn paginate(
             // Definitions stay off-page (v1 law; regions 11): the paginator
             // skips the block entirely — refs superscript at paint.
             BlockKind::FootnoteDef { .. } => continue,
-            BlockKind::Image { src, caption, .. } => {
+            BlockKind::Image { src, .. } => {
                 // Deterministic box: natural size when the measurer knows
                 // it, the editor's decoding placeholder otherwise
                 // (regions 12). Scale to the measure; move-or-scale onto a
-                // page is the assembler's call.
+                // page is the assembler's call. The caption is the block's
+                // OWN line (inline-images §10), rendered as one dead line
+                // under the box — N10 KEPT, adjudicated at the Phase-3
+                // parity pass: real anchors would mean running the caption
+                // through the breaker as a new centered Role with
+                // keep-together pagination and teaching every anchor
+                // consumer (hit_token, range_boxes, resume anchors) a
+                // second item shape — a balloon, not a contained edit. The
+                // two doors agree on caption OPTICS instead (CAPTION_SCALE
+                // muted italic centered, both sides); soft breaks flatten
+                // so the single set line never carries a break character.
+                // A long caption CLAMPS to the measure with an ellipsis —
+                // the one dead line must not run past the page edges
+                // (§11's parity floor); real wrapped set lines stay the
+                // recorded reopening condition.
+                let mut caption = ptext.replace('\u{2028}', " ");
+                let cap_style = Style { italic: true, ..Style::default() };
+                let cap_w = |m: &mut dyn Measure, s: &str| {
+                    m.width(s, Role::Body, &[(s.len(), cap_style)]) * CAPTION_SCALE
+                };
+                if !caption.trim().is_empty() && cap_w(m, &caption) > metrics.measure {
+                    while !caption.is_empty()
+                        && cap_w(m, &format!("{}…", caption.trim_end())) > metrics.measure
+                    {
+                        caption.pop();
+                    }
+                    caption = format!("{}…", caption.trim_end());
+                }
                 let (w, hpx) = match m.image_size(src) {
                     Some((nw, nh)) if nw > 0.0 && nh > 0.0 => {
                         let w = nw.min(metrics.measure);
@@ -416,12 +463,13 @@ pub fn paginate(
                     }
                     _ => (metrics.measure, IMAGE_PLACEHOLDER_HEIGHT),
                 };
+                let caption_h = if caption.trim().is_empty() { 0.0 } else { body_h };
                 flows.push(Flow::Image(ImageFlow {
                     src: src.clone(),
-                    caption: caption.clone(),
+                    caption,
                     w,
                     h: hpx,
-                    caption_h: if caption.trim().is_empty() { 0.0 } else { body_h },
+                    caption_h,
                     block: i,
                     anchor: cstart,
                 }));
@@ -1888,7 +1936,6 @@ mod tests {
             BlockKind::Image {
                 src: "known.png".into(),
                 alt: String::new(),
-                caption: "cap".into(),
             },
             BlockKind::Paragraph,
         ];
@@ -1916,7 +1963,7 @@ mod tests {
         let (w, h, x, caption) = img.expect("the image box exists");
         assert_eq!((w, h), (300.0, 150.0), "natural size fits the measure");
         assert_eq!(x, 150.0, "centered");
-        assert_eq!(caption, "cap");
+        assert_eq!(caption, "image-line", "the caption is the block's own line");
     }
 
     /// Images keep whole: move to the next page when the room is short,
@@ -1930,7 +1977,6 @@ mod tests {
             BlockKind::Image {
                 src: "known.png".into(),
                 alt: String::new(),
-                caption: "cap".into(),
             },
         ]);
         let book = lay(&text, blocks, 170.0, 4);
@@ -1942,10 +1988,11 @@ mod tests {
         assert_eq!(*y, 0.0);
         assert!(*width < 170.0, "aspect kept while scaling");
         // Unknown src: the editor's 56 px placeholder at full measure.
-        let text = format!("{}\nimg", prose(1));
+        // (Empty image line — an uncaptioned picture, the birth state.)
+        let text = format!("{}\n", prose(1));
         let blocks = BlockMap::from_kinds(vec![
             BlockKind::Paragraph,
-            BlockKind::Image { src: "missing.png".into(), alt: String::new(), caption: String::new() },
+            BlockKind::Image { src: "missing.png".into(), alt: String::new() },
         ]);
         let book = lay(&text, blocks, 170.0, 4);
         let PageItem::Image { height, width, .. } = &book.pages[0].items[1] else {
@@ -1953,6 +2000,61 @@ mod tests {
         };
         assert_eq!(*height, IMAGE_PLACEHOLDER_HEIGHT);
         assert_eq!(*width, 170.0);
+    }
+
+    /// A long caption still sets as ONE dead line (N10 kept) — but clamped
+    /// to the measure with an ellipsis, never run off the page edges; real
+    /// wrapped set lines stay the recorded reopening.
+    #[test]
+    fn long_image_caption_clamps_to_the_measure_with_an_ellipsis() {
+        // Measure 200 at FakeM's 10 px/char and CAPTION_SCALE: 25 caption
+        // chars fit; a 41-char caption must ellipsize.
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "known.png".into(),
+            alt: String::new(),
+        }]);
+        let long = "a caption far too long for the measure!!";
+        let book = lay(long, blocks, 200.0, 10);
+        let PageItem::Image { caption, .. } = &book.pages[0].items[0] else {
+            panic!("an image box")
+        };
+        assert!(caption.ends_with('…'), "clamped with an ellipsis: {caption:?}");
+        assert!(
+            caption.chars().count() as f32 * 10.0 * CAPTION_SCALE <= 200.0,
+            "the set line fits the measure: {caption:?}"
+        );
+        // A caption that fits stays verbatim.
+        let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
+            src: "known.png".into(),
+            alt: String::new(),
+        }]);
+        let book = lay("fits", blocks, 200.0, 10);
+        let PageItem::Image { caption, .. } = &book.pages[0].items[0] else {
+            panic!("an image box")
+        };
+        assert_eq!(caption, "fits");
+    }
+
+    /// A line's terminator is not always '\n': markdown's hard break sets
+    /// U+2028, and a paste of PDF- or classic-Mac-copied text ends lines with
+    /// CR / VT / FF / NEL / U+2029. Ropey ends the line on every one of them,
+    /// so the set line sheds every one of them — the caption is measured and
+    /// painted raw (it never meets the tokenizer, which would have eaten a
+    /// stray break as whitespace), and a survivor would both pad its width
+    /// check and reach the shaper as a glyph.
+    #[test]
+    fn a_caption_sheds_its_own_break_character_whichever_break_it_is() {
+        for brk in ['\n', '\r', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}'] {
+            let blocks = BlockMap::from_kinds(vec![
+                BlockKind::Image { src: "known.png".into(), alt: String::new() },
+                BlockKind::Paragraph,
+            ]);
+            let book = lay(&format!("cap{brk}prose"), blocks, 200.0, 10);
+            let PageItem::Image { caption, .. } = &book.pages[0].items[0] else {
+                panic!("an image box")
+            };
+            assert_eq!(caption, "cap", "the caption sheds a {brk:?} terminator");
+        }
     }
 
     /// Blank in-slice paragraphs keep their line; the empty slice sets one

@@ -151,7 +151,24 @@ pub fn all() -> &'static [Command] {
             "Format",
             Some("ctrl-."),
             TogglePopover,
-            ["popover", "toolbar", "формат"]
+            [
+                "popover",
+                "toolbar",
+                "формат",
+                "formatting",
+                "flank",
+                // Format-word aliases so a "strikethrough"-shaped search SURFACES
+                // the flank — prefixed so the direct Toggle command still wins the
+                // tie (table order) and this row appears alongside, not above it.
+                "format bold",
+                "format italic",
+                "format underline",
+                "format strikethrough",
+                "format highlight",
+                "format code",
+                "format link",
+                "format heading"
+            ]
         ),
         // ctrl-1..3 is the promoted chord (iA/Bear/Typora convention);
         // ctrl-alt-1..3 stay bound as silent aliases in bind_keys.
