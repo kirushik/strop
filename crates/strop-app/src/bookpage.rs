@@ -376,6 +376,16 @@ pub fn chapter_start(text: &str, blocks: &BlockMap, caret: usize) -> Option<usiz
 
 // ---- Pipeline entry ----------------------------------------------------------
 
+/// Ropey's line-break set — the same one `strop_core` splits blocks by. A line
+/// carries its OWN terminator, and it is not always '\n': markdown's hard break
+/// sets U+2028, and a paste of PDF- or classic-Mac-copied text arrives ended by
+/// CR / VT / FF / NEL / U+2028 / U+2029. None of them may reach the shaper.
+fn is_line_break(c: char) -> bool {
+    matches!(c,
+        '\n' | '\r' | '\u{000B}' | '\u{000C}'
+        | '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
 /// Paginate a manuscript slice triple (the output of `manuscript_slice_of` —
 /// F1) into a book. Pure over the two oracles; same input → same layout,
 /// bit for bit (the determinism gate).
@@ -400,7 +410,11 @@ pub fn paginate(
         let kind = blocks.kind(i).clone();
         let cstart = rope.line_to_char(i);
         let mut ptext = rope.line(i).to_string();
-        while ptext.ends_with('\n') || ptext.ends_with('\r') {
+        // The line's own terminator goes, whichever break it is: a '\n'-only
+        // pop leaves VT / FF / NEL / U+2028 / U+2029 standing, and the set
+        // line would carry a break character into the shaper (a caption's
+        // width check and its ellipsis would measure it too).
+        while ptext.ends_with(is_line_break) {
             ptext.pop();
         }
         if !matches!(kind, BlockKind::ListItem { .. }) {
@@ -2019,6 +2033,28 @@ mod tests {
             panic!("an image box")
         };
         assert_eq!(caption, "fits");
+    }
+
+    /// A line's terminator is not always '\n': markdown's hard break sets
+    /// U+2028, and a paste of PDF- or classic-Mac-copied text ends lines with
+    /// CR / VT / FF / NEL / U+2029. Ropey ends the line on every one of them,
+    /// so the set line sheds every one of them — the caption is measured and
+    /// painted raw (it never meets the tokenizer, which would have eaten a
+    /// stray break as whitespace), and a survivor would both pad its width
+    /// check and reach the shaper as a glyph.
+    #[test]
+    fn a_caption_sheds_its_own_break_character_whichever_break_it_is() {
+        for brk in ['\n', '\r', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}'] {
+            let blocks = BlockMap::from_kinds(vec![
+                BlockKind::Image { src: "known.png".into(), alt: String::new() },
+                BlockKind::Paragraph,
+            ]);
+            let book = lay(&format!("cap{brk}prose"), blocks, 200.0, 10);
+            let PageItem::Image { caption, .. } = &book.pages[0].items[0] else {
+                panic!("an image box")
+            };
+            assert_eq!(caption, "cap", "the caption sheds a {brk:?} terminator");
+        }
     }
 
     /// Blank in-slice paragraphs keep their line; the empty slice sets one
