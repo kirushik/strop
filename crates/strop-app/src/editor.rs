@@ -20754,7 +20754,7 @@ mod tests {
             let path = root.join(format!("copy-{index}.md"));
             let asset = ExportAsset::from_untrusted_id(id, vec![index as u8], 0);
             assert!(
-                !asset.file_name.contains(|c| matches!(c, '/' | '\\')),
+                !asset.file_name.contains(['/', '\\']),
                 "generated export basename must contain no separators"
             );
             MarkdownExport {
