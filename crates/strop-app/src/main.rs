@@ -27,6 +27,7 @@ mod paths;
 mod single_instance;
 mod smoke;
 mod strip;
+mod startup_error;
 mod text_field;
 mod theme;
 mod tutorial;
@@ -45,6 +46,17 @@ use draw_guard::EntityUpdateExt as _;
 use editor::Editor;
 
 actions!(strop, [Quit]);
+
+fn register_unhandled_quit(
+    cx: &mut App,
+    listener: impl Fn(&mut App) + 'static,
+) {
+    // Action handlers in a rendered window stop propagation by default. The
+    // editor therefore keeps ownership of its durable-save preflight, while
+    // this app-level fallback makes Ctrl-Q work in startup/recovery and any
+    // future auxiliary window that has no document lifecycle to protect.
+    cx.on_action(move |_: &Quit, cx| listener(cx));
+}
 
 // The PT superfamily (ParaType, OFL): serif body, sans headings, mono code —
 // drawn as independent fonts with the four canonical styles per family, and
@@ -170,7 +182,7 @@ fn main() {
 
         editor::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        register_unhandled_quit(cx, |cx| cx.quit());
 
         // Smoke runs must not steal the user's OS focus — keystroke dispatch
         // uses GPUI's internal focus, which we set explicitly below. They
@@ -218,7 +230,7 @@ fn main() {
                         Err(e) => eprintln!("strop: single-instance check failed: {e}"),
                     }
                 }
-                match Store::open(store_path) {
+                match Store::open(&store_path) {
                     Ok(opened) => {
                         if !smoke {
                             files::push_recent(opened.0.path());
@@ -227,36 +239,50 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("strop: cannot open {}: {e}", p.display());
-                        // `None` is reserved for the intentional storeless
-                        // smoke fixture below. Falling through used to open
-                        // SAMPLE under the requested filename; every edit was
-                        // then RAM-only, a dangerously convincing wrong-doc
-                        // fallback. Never open an editor when its durable
-                        // document could not be loaded.
-                        std::process::exit(1);
+                        // Release the rendezvous before Try Again launches a
+                        // fresh process for the same path.
+                        drop(instance_guard.take());
+                        startup_error::show(
+                            startup_error::OpenFailure::from_io(
+                                startup_error::OpenOperation::Open,
+                                store_path,
+                                &e,
+                            ),
+                            cx,
+                        );
+                        return;
                     }
                 }
             }
         };
         // Opening a .md imports it into a sibling .strop (existing .strop
         // wins — the durable file is the source of truth once it exists).
-        let md_import: Option<(String, SpanSet, BlockMap)> = doc_path.as_ref().and_then(|arg| {
-            if arg.extension().is_some_and(|e| e == "md") && !arg.with_extension("strop").exists()
-            {
-                match std::fs::read_to_string(arg) {
-                    Ok(md) => {
-                        let (text, spans, blocks) = strop_core::markdown::from_markdown(&md);
-                        Some((text, spans, blocks))
-                    }
-                    Err(e) => {
-                        eprintln!("strop: cannot import {}: {e}", arg.display());
-                        std::process::exit(1);
-                    }
+        let md_import: Option<(String, SpanSet, BlockMap)> = if let Some(arg) = &doc_path
+            && arg.extension().is_some_and(|e| e == "md")
+            && !arg.with_extension("strop").exists()
+        {
+            match std::fs::read_to_string(arg) {
+                Ok(md) => {
+                    let (text, spans, blocks) = strop_core::markdown::from_markdown(&md);
+                    Some((text, spans, blocks))
                 }
-            } else {
-                None
+                Err(e) => {
+                    eprintln!("strop: cannot import {}: {e}", arg.display());
+                    drop(instance_guard.take());
+                    startup_error::show(
+                        startup_error::OpenFailure::from_io(
+                            startup_error::OpenOperation::Import,
+                            arg.clone(),
+                            &e,
+                        ),
+                        cx,
+                    );
+                    return;
+                }
             }
-        });
+        } else {
+            None
+        };
 
         let mut tutorial_notes = None;
         let (initial_text, initial_spans, initial_blocks, initial_history) = match &store {
@@ -420,28 +446,19 @@ fn main() {
                 // Single-window app: route an OS-driven close request (the macOS
                 // traffic-light close — now our only window control there since we
                 // hide our own; or a compositor/WM close on Linux/Windows) to
-                // quit, so `on_app_quit` (below) flushes the document + exit state.
+                // the same save preflight as ctrl-q and the drawn close control.
                 // macOS does NOT terminate on last-window-close by default, so
-                // without this the native close would just hide the window. Our own
-                // "×" (shown off-macOS) calls cx.quit() directly.
+                // without this the native close would just hide the window.
                 //
                 // Return `false` to VETO the platform's synchronous window close
-                // and let cx.quit() be the sole teardown driver — mirroring Zed's
-                // own handler (crates/zed/src/zed.rs). Returning `true` would let
-                // the platform close and DROP the Editor entity *before* quit's
-                // shutdown() runs `on_app_quit`, turning its save_now()/
-                // record_exit_state() into a silent no-op (the handler below uses
-                // update_checked). shutdown() runs on_app_quit *before* clearing
-                // windows, so vetoing keeps the Editor alive until it's saved.
-                //
-                // Calling cx.quit() synchronously here is fine — a clean close of a
-                // normal document exits in ~0.1s. A *slow* close is a separate
-                // problem: the `on_app_quit` save below is synchronous, so a large
-                // document (a multi-MB Loro doc with mark churn) can block teardown
-                // for several seconds and trip the compositor's not-responding
-                // watchdog. That's an engine save-perf issue, not a quit-path one.
-                window.on_window_should_close(cx, |_, cx| {
-                    cx.quit();
+                // until the ordered worker reports the newest generation durable.
+                // Returning `true` would drop the Editor — and its recovery UI —
+                // before a failed final write could be handled.
+                let close_editor = editor.clone();
+                window.on_window_should_close(cx, move |window, cx| {
+                    close_editor.update_checked(cx, |editor, cx| {
+                        editor.request_quit(&Quit, window, cx);
+                    });
                     false
                 });
                 editor
@@ -449,16 +466,14 @@ fn main() {
         )
         .expect("failed to open window");
 
-        // Flush the document on quit; the idle-save loop covers the rest.
+        // Normal quit paths preflight the newest save generation while the
+        // window is still alive. Quit observers cannot veto shutdown.
         let editor = window
             .update(cx, |_, _, cx| cx.entity())
             .expect("window just opened");
         let window_for_quit = window;
         cx.on_app_quit(move |cx| {
             editor.update_checked(cx, |editor, _| {
-                if let Err(e) = editor.flush_saves() {
-                    eprintln!("strop: final save failed: {e}");
-                }
                 // Caret remembered for next open (resume mid-sentence);
                 // never a question, never a dialog (DESIGN §4b tension 6).
                 editor.record_exit_state();
@@ -499,4 +514,95 @@ fn main() {
             cx.activate(true);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{
+        FocusHandle, Focusable, IntoElement, Render, TestAppContext, VisualTestContext, Window, div,
+    };
+
+    use super::*;
+
+    struct QuitSurface {
+        local_quits: Option<Rc<Cell<usize>>>,
+        focus_handle: FocusHandle,
+    }
+
+    impl Focusable for QuitSurface {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for QuitSurface {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut root = div();
+            if let Some(local_quits) = self.local_quits.clone() {
+                root = root.on_action(move |_: &Quit, _, _| {
+                    local_quits.set(local_quits.get() + 1);
+                });
+            }
+            root.track_focus(&self.focus_handle)
+        }
+    }
+
+    fn quit_window(
+        cx: &mut TestAppContext,
+        local_quits: Option<Rc<Cell<usize>>>,
+    ) -> VisualTestContext {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let surface = cx.new(|cx| QuitSurface {
+                    local_quits,
+                    focus_handle: cx.focus_handle(),
+                });
+                window.focus(&surface.focus_handle(cx), cx);
+                surface
+            })
+            .unwrap()
+        });
+        VisualTestContext::from_window(window.into(), cx)
+    }
+
+    #[gpui::test]
+    fn unhandled_quit_reaches_the_app_fallback(cx: &mut TestAppContext) {
+        let fallback_quits = Rc::new(Cell::new(0));
+        cx.update({
+            let fallback_quits = fallback_quits.clone();
+            move |cx| {
+                register_unhandled_quit(cx, move |_| {
+                    fallback_quits.set(fallback_quits.get() + 1);
+                });
+            }
+        });
+        let mut window = quit_window(cx, None);
+
+        window.dispatch_action(Quit);
+
+        assert_eq!(fallback_quits.get(), 1);
+    }
+
+    #[gpui::test]
+    fn window_quit_handler_keeps_ownership_of_preflight(cx: &mut TestAppContext) {
+        let fallback_quits = Rc::new(Cell::new(0));
+        let local_quits = Rc::new(Cell::new(0));
+        cx.update({
+            let fallback_quits = fallback_quits.clone();
+            move |cx| {
+                register_unhandled_quit(cx, move |_| {
+                    fallback_quits.set(fallback_quits.get() + 1);
+                });
+            }
+        });
+        let mut window = quit_window(cx, Some(local_quits.clone()));
+
+        window.dispatch_action(Quit);
+
+        assert_eq!(local_quits.get(), 1);
+        assert_eq!(fallback_quits.get(), 0);
+    }
 }

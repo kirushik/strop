@@ -279,6 +279,14 @@ impl Buffer {
         self.group_open = false;
     }
 
+    pub(crate) fn undo_len(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    pub(crate) fn redo_len(&self) -> usize {
+        self.redo_stack.len()
+    }
+
     /// A transaction's edits are valid only against the text state they
     /// were recorded for. Persisted history is saved atomically with that
     /// text, but guard against corrupted/foreign files anyway. Edits apply
