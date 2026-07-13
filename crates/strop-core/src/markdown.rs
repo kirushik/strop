@@ -136,12 +136,33 @@ fn inline_md(line: &str, base: usize, spans: &SpanSet) -> String {
 }
 
 pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
+    // A document block is a ropey line (document-model.md §6), including
+    // its full Unicode break set. Keep the separator's character length so
+    // document-global span offsets remain aligned; CRLF is one two-char break.
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+    let mut chars = text.char_indices().peekable();
+    while let Some((byte, c)) = chars.next() {
+        if !matches!(c, '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}') {
+            continue;
+        }
+        let mut separator_chars = 1usize;
+        let mut next_start = byte + c.len_utf8();
+        if c == '\r' && matches!(chars.peek(), Some((_, '\n'))) {
+            let (lf_byte, lf) = chars.next().unwrap();
+            separator_chars = 2;
+            next_start = lf_byte + lf.len_utf8();
+        }
+        lines.push((&text[line_start..byte], separator_chars, c == '\u{2028}'));
+        line_start = next_start;
+    }
+    lines.push((&text[line_start..], 0, false));
+
     let mut out = String::new();
     let mut base = 0usize; // char offset of the current block
     let mut ordered_no = 0usize;
     let mut in_code = false;
-    let lines: Vec<&str> = text.split('\n').collect();
-    for (ix, line) in lines.iter().enumerate() {
+    for (ix, &(line, separator_chars, hard_separator)) in lines.iter().enumerate() {
         let kind = blocks.kind(ix).clone();
         let is_code = matches!(kind, BlockKind::CodeBlock { .. });
         if in_code && !is_code {
@@ -175,7 +196,9 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
                 out.push_str("> ");
                 out.push_str(&inline_md(line, base, spans));
                 // Consecutive quote blocks stay one quote.
-                if matches!(blocks.kind(ix + 1), BlockKind::Blockquote) && ix + 1 < lines.len() {
+                if ix + 1 < lines.len()
+                    && matches!(blocks.kind(ix + 1), BlockKind::Blockquote)
+                {
                     out.push_str("\n>\n");
                 } else {
                     out.push_str("\n\n");
@@ -240,10 +263,21 @@ pub fn to_markdown(text: &str, spans: &SpanSet, blocks: &BlockMap) -> String {
             }
             BlockKind::Paragraph => {
                 out.push_str(&inline_md(line, base, spans));
-                out.push_str("\n\n");
+                let joins_paragraph = hard_separator
+                    && ix + 1 < lines.len()
+                    && !(ix + 1 == lines.len() - 1 && lines[ix + 1].0.is_empty())
+                    && matches!(blocks.kind(ix + 1), BlockKind::Paragraph);
+                if joins_paragraph {
+                    out.push_str("\\\n");
+                } else {
+                    // U+2028 only preserves its hard-break meaning between
+                    // prose paragraphs. Other kinds (and a trailing U+2028)
+                    // degrade through the ordinary block grammar.
+                    out.push_str("\n\n");
+                }
             }
         }
-        base += line.chars().count() + 1;
+        base += line.chars().count() + separator_chars;
     }
     if in_code {
         out.push_str("```\n");
@@ -348,15 +382,22 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
         }};
     }
 
+    let begin_block_with = |text: &mut String,
+                                chars: &mut usize,
+                                kinds: &mut Vec<BlockKind>,
+                                separator: char,
+                                kind: BlockKind| {
+        if !kinds.is_empty() {
+            text.push(separator);
+            *chars += 1;
+        }
+        kinds.push(kind);
+    };
     let begin_block = |text: &mut String,
                            chars: &mut usize,
                            kinds: &mut Vec<BlockKind>,
                            kind: BlockKind| {
-        if !kinds.is_empty() {
-            text.push('\n');
-            *chars += 1;
-        }
-        kinds.push(kind);
+        begin_block_with(text, chars, kinds, '\n', kind);
     };
 
     let current_kind = |quote: usize,
@@ -545,7 +586,13 @@ pub fn from_markdown(md: &str) -> (String, SpanSet, BlockMap) {
                 spans.add(start..chars, InlineAttr::FootnoteRef(id.to_string()));
             }
             Event::SoftBreak => push_str!(" "),
-            Event::HardBreak => push_str!("\u{2028}"),
+            Event::HardBreak => begin_block_with(
+                &mut text,
+                &mut chars,
+                &mut kinds,
+                '\u{2028}',
+                current_kind(quote, &lists, &footnote_def),
+            ),
             _ => {}
         }
     }
@@ -564,9 +611,27 @@ pub fn caption_from_title(title: &str) -> (String, SpanSet) {
     if title.is_empty() {
         return (String::new(), SpanSet::default());
     }
-    let oneline = title.replace(['\r', '\n'], " ");
+    let flatten_breaks = |s: &str, preserve_markdown_hard_break: bool| {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if matches!(c, '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}') {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                let hard_break = preserve_markdown_hard_break
+                    && matches!(c, '\r' | '\n')
+                    && (out.ends_with('\\') || out.ends_with("  "));
+                out.push(if hard_break { '\n' } else { ' ' });
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let oneline = flatten_breaks(title, true);
     let (text, spans, _) = from_markdown(&oneline);
-    (text.replace('\n', " "), spans)
+    (flatten_breaks(&text, false), spans)
 }
 
 /// One parsed Strop image line — the §9 paste-precedence grammar:
@@ -725,6 +790,73 @@ mod tests {
     }
 
     #[test]
+    fn export_uses_the_document_line_break_set() {
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Paragraph,
+            BlockKind::Blockquote,
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+            },
+        ]);
+        let expected = to_markdown("alpha\nbeta\ngamma", &SpanSet::default(), &blocks);
+        for separator in ["\r\n", "\u{0085}", "\u{2028}", "\u{2029}"] {
+            let text = ["alpha", "beta", "gamma"].join(separator);
+            assert_eq!(to_markdown(&text, &SpanSet::default(), &blocks), expected);
+        }
+    }
+
+    #[test]
+    fn crlf_export_keeps_block_kinds_aligned() {
+        let text = "title\r\nprose\r\none\r\ntwo";
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::Heading(2),
+            BlockKind::Paragraph,
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+            },
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+            },
+        ]);
+        let md = to_markdown(text, &SpanSet::default(), &blocks);
+        assert_eq!(md, "## title\n\nprose\n\n- one\n- two\n");
+        assert!(!md.contains('\r'));
+    }
+
+    #[test]
+    fn crlf_export_keeps_second_block_spans_aligned() {
+        let text = "first\r\nright place";
+        let mut spans = SpanSet::default();
+        spans.add(7..12, InlineAttr::Strong); // "right"
+        let md = to_markdown(text, &spans, &BlockMap::new(2));
+        assert_eq!(md, "first\n\n**right** place\n");
+    }
+
+    #[test]
+    fn crlf_export_handles_code_and_spanned_image_caption() {
+        let text = "let x = 1;\r\ncaption";
+        let mut spans = SpanSet::default();
+        spans.add(12..19, InlineAttr::Strong); // "caption"
+        let blocks = BlockMap::from_kinds(vec![
+            BlockKind::CodeBlock {
+                info: "rust".into(),
+            },
+            BlockKind::Image {
+                src: "asset:cat.png".into(),
+                alt: "cat".into(),
+            },
+        ]);
+        let md = to_markdown(text, &spans, &blocks);
+        assert_eq!(
+            md,
+            "```rust\nlet x = 1;\n```\n\n![cat](asset:cat.png \"**caption**\")\n"
+        );
+    }
+
+    #[test]
     fn import_roundtrips_through_export() {
         let md = "## Заголовок\n\n**Жирный** *курсив* и `код`.\n\n> цитата\n\n\
                   1. первый\n2. второй\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n\n\
@@ -766,7 +898,21 @@ mod tests {
         let (text, _, blocks) = from_markdown("строка раз\nстрока два\\\nстрока три\n");
         // Soft wrap joins with a space; hard break becomes U+2028.
         assert_eq!(text, "строка раз строка два\u{2028}строка три");
-        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks.kinds(), &[BlockKind::Paragraph, BlockKind::Paragraph]);
+    }
+
+    #[test]
+    fn hard_break_import_keeps_rope_lines_and_kinds_aligned() {
+        let cases = [
+            ("alpha\\\nbeta\n", BlockKind::Paragraph),
+            ("> alpha\\\n> beta\n", BlockKind::Blockquote),
+            ("- alpha\\\n  beta\n", BlockKind::ListItem { ordered: false, depth: 0 }),
+        ];
+        for (md, expected_kind) in cases {
+            let (text, _, blocks) = from_markdown(md);
+            assert_eq!(blocks.len(), ropey::Rope::from_str(&text).len_lines());
+            assert_eq!(blocks.kinds(), &[expected_kind.clone(), expected_kind]);
+        }
     }
 
     #[test]
@@ -909,9 +1055,8 @@ mod tests {
     fn image_caption_torture_quotes_brackets_stars_backslashes() {
         // A title is a plain string a conforming reader unescapes once; the
         // exporter's double-escaping must survive every marker character
-        // the caption can legally hold. Soft breaks flatten to spaces —
-        // the recorded fidelity cost of the title slot (§10).
-        let text = "a\"b ]c *d \\e =f\u{2028}g";
+        // the caption can legally hold.
+        let text = "a\"b ]c *d \\e =f g";
         let blocks = BlockMap::from_kinds(vec![BlockKind::Image {
             src: "asset:abc.png".into(),
             alt: "he said \"hi\" a\\b".into(),
@@ -931,6 +1076,12 @@ mod tests {
         assert_eq!(il.src, "asset:abc.png");
         assert_eq!(il.alt, "he said \"hi\" a\\b");
         assert_eq!(caption_from_title(&il.caption).0, "a\"b ]c *d \\e =f g");
+        // A hard break in a foreign title is flattened with the rest of
+        // the title-slot block grammar (§10).
+        assert_eq!(caption_from_title("a\"b ]c *d \\e =f\u{2028}g").0,
+                   "a\"b ]c *d \\e =f g");
+        assert_eq!(caption_from_title("a\"b ]c *d \\e =f\\\ng").0,
+                   "a\"b ]c *d \\e =f g");
     }
 
     #[test]
@@ -1011,19 +1162,21 @@ mod tests {
 
     #[test]
     fn trailing_hard_break_drops_cleanly() {
-        // A hard break at the very end of a block can't be represented; export
-        // must not leave a stray backslash that re-imports as '\' (pre-fix the
-        // round-trip yielded "a\\").
+        // A hard break at EOF can't be represented; export must not leave a
+        // stray backslash that re-imports as '\' (pre-fix: "a\\").
         let text = "a\u{2028}";
-        let md = to_markdown(text, &SpanSet::default(), &BlockMap::new(1));
+        let blocks = BlockMap::new(ropey::Rope::from_str(text).len_lines());
+        let md = to_markdown(text, &SpanSet::default(), &blocks);
         assert!(!md.contains('\\'), "no stray backslash exported: {md:?}");
         let (text2, _, _) = from_markdown(&md);
         assert_eq!(text2, "a");
-        // A mid-block hard break still survives the full round-trip.
+        // A mid-paragraph hard break survives with the model alignment.
         let mid = "a\u{2028}b";
-        let md2 = to_markdown(mid, &SpanSet::default(), &BlockMap::new(1));
-        let (text3, _, _) = from_markdown(&md2);
+        let mid_blocks = BlockMap::new(ropey::Rope::from_str(mid).len_lines());
+        let md2 = to_markdown(mid, &SpanSet::default(), &mid_blocks);
+        let (text3, _, blocks3) = from_markdown(&md2);
         assert_eq!(text3, mid);
+        assert_eq!(blocks3.len(), mid_blocks.len());
     }
 
     #[test]
