@@ -45,7 +45,27 @@ use unicode_segmentation::UnicodeSegmentation;
 /// with it; destination-specific relative links are written in `write_to`.
 struct MarkdownExport {
     markdown: String,
-    assets: Vec<(String, Vec<u8>)>,
+    assets: Vec<ExportAsset>,
+}
+
+struct ExportAsset {
+    source_id: String,
+    file_name: String,
+    bytes: Vec<u8>,
+}
+
+impl ExportAsset {
+    fn from_untrusted_id(source_id: &str, bytes: Vec<u8>, index: usize) -> Self {
+        Self {
+            source_id: source_id.to_owned(),
+            file_name: format!(
+                "asset-{}.{}",
+                index + 1,
+                safe_asset_extension(source_id).to_ascii_lowercase()
+            ),
+            bytes,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -54,6 +74,53 @@ struct SaveRevision(u64);
 struct PendingSave {
     generation: SaveGeneration,
     revision: SaveRevision,
+}
+
+struct LatestSave<T> {
+    pending: Option<T>,
+}
+
+impl<T> Default for LatestSave<T> {
+    fn default() -> Self {
+        Self { pending: None }
+    }
+}
+
+impl<T> LatestSave<T> {
+    fn queued(&mut self, pending: T) {
+        self.pending = Some(pending);
+    }
+
+    fn preparation_failed(&mut self) {
+        // A completion for an older snapshot must not be allowed to clear the
+        // newest attempt's error or cancel its retry.
+        self.pending = None;
+    }
+
+    fn is_none(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    fn is_some(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn as_ref(&self) -> Option<&T> {
+        self.pending.as_ref()
+    }
+
+    fn take(&mut self) -> Option<T> {
+        self.pending.take()
+    }
+}
+
+fn safe_asset_extension(id: &str) -> &str {
+    id.rsplit_once('.')
+        .map(|(_, ext)| ext)
+        .filter(|ext| {
+            !ext.is_empty() && ext.len() <= 10 && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+        .unwrap_or("bin")
 }
 
 #[derive(Default)]
@@ -70,10 +137,18 @@ impl MarkdownExport {
     fn prepare(doc: &Document, store: &Store) -> Self {
         let (text, spans, blocks) = doc.manuscript_slice();
         let markdown = strop_core::markdown::to_markdown(&text, &spans, &blocks);
-        let assets = blocks
-            .asset_refs()
-            .filter_map(|id| store.get_asset(id).map(|bytes| (id.to_owned(), bytes)))
-            .collect();
+        let mut seen = HashSet::new();
+        let mut assets = Vec::new();
+        for id in blocks.asset_refs() {
+            if !seen.insert(id.to_owned()) {
+                continue;
+            }
+            let Some(bytes) = store.get_asset(id) else { continue };
+            // The source id belongs to the document and is untrusted. Only a
+            // generated basename reaches `Path::join`; the id is retained
+            // solely for exact Markdown-link replacement.
+            assets.push(ExportAsset::from_untrusted_id(id, bytes, assets.len()));
+        }
         Self { markdown, assets }
     }
 
@@ -86,13 +161,12 @@ impl MarkdownExport {
                 .to_owned();
             let dir = path.with_file_name(format!("{stem}.assets"));
             std::fs::create_dir_all(&dir)?;
-            for (id, bytes) in self.assets {
-                let file = id.trim_start_matches("asset:");
-                std::fs::write(dir.join(file), bytes)?;
-                let rel = format!("{stem}.assets/{file}");
+            for asset in self.assets {
+                std::fs::write(dir.join(&asset.file_name), asset.bytes)?;
+                let rel = format!("{stem}.assets/{}", asset.file_name);
                 self.markdown = self
                     .markdown
-                    .replace(&format!("]({id})"), &format!("]({rel})"));
+                    .replace(&format!("]({})", asset.source_id), &format!("]({rel})"));
             }
         }
         std::fs::write(path, self.markdown)
@@ -1109,7 +1183,7 @@ pub struct Editor {
     /// ordered filesystem worker.
     save_worker: Option<SaveWorker>,
     save_revision: SaveRevision,
-    latest_save: Option<PendingSave>,
+    latest_save: LatestSave<PendingSave>,
     /// A failed autosave stays dirty but backs off instead of synchronously
     /// reserializing the document every one-second heartbeat.
     save_retry_at: Option<Instant>,
@@ -1735,7 +1809,7 @@ impl Editor {
             store_dirty: false,
             save_worker: None,
             save_revision: SaveRevision(0),
-            latest_save: None,
+            latest_save: LatestSave::default(),
             save_retry_at: None,
             save_retry_delay: Duration::from_secs(1),
             save_error: None,
@@ -1850,7 +1924,7 @@ impl Editor {
                         && editor.last_input.elapsed() >= Duration::from_secs(1)
                         && editor.save_retry_at.is_none_or(|at| Instant::now() >= at)
                     {
-                        editor.save_now();
+                        let _ = editor.save_now();
                     }
                     // Idle gap seals a writing session — checkpoints are
                     // navigation markers for "a sitting", not safety.
@@ -2082,7 +2156,7 @@ impl Editor {
         }
         self.sync_mutations();
         self.word_count = self.manuscript_word_count();
-        self.save_now();
+        let _ = self.save_now();
         if let Some(store) = &self.store {
             store.add_checkpoint("Migrated", false);
         }
@@ -2098,7 +2172,7 @@ impl Editor {
         // (Checkpoint::state), and the store's spans/blocks/annotations are
         // only as fresh as the last save. Checkpointing implying durability
         // is the right property anyway.
-        self.save_now();
+        let _ = self.save_now();
         if let Some(store) = &self.store {
             let name = format!("Checkpoint {}", store.checkpoints().len() + 1);
             store.add_checkpoint(&name, true);
@@ -2581,7 +2655,7 @@ impl Editor {
         // writer text into a system label — P8's born-from bug class. The
         // sage arc already points at the source (P10: words don't repeat
         // what the arc says).
-        self.save_now();
+        let _ = self.save_now();
         let Some(store) = &self.store else { return };
         store.add_checkpoint("Before restore", false);
         self.doc.restore_state(&text, spans, blocks);
@@ -2619,7 +2693,7 @@ impl Editor {
                 from_unix,
                 len_chars,
             });
-        self.save_now();
+        let _ = self.save_now();
         if let Some(store) = &self.store {
             store.add_checkpoint("Restored", false);
         }
@@ -3462,7 +3536,7 @@ impl Editor {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
-        self.save_now();
+        let _ = self.save_now();
         let Some(store) = &self.store else {
             eprintln!("strop: no document to copy");
             return;
@@ -5671,8 +5745,9 @@ impl Editor {
         )
     }
 
-    pub fn save_now(&mut self) {
+    pub fn save_now(&mut self) -> std::io::Result<Option<SaveGeneration>> {
         let perf = std::env::var_os("STROP_PERF").map(|_| std::time::Instant::now());
+        let mut queued = None;
         self.sync_mutations();
         // Settle the journal's tail run: persisted runs are immutable once
         // written, so the store only ever pushes finished items. Saves fire
@@ -5701,10 +5776,11 @@ impl Editor {
                         .as_mut()
                         .expect("attached Store has a save worker")
                         .request(save);
-                    self.latest_save = Some(PendingSave {
+                    self.latest_save.queued(PendingSave {
                         generation,
                         revision: self.save_revision,
                     });
+                    queued = Some(generation);
                 }
                 Err(e) => {
                     let message = format!("Not saved: {e}");
@@ -5712,12 +5788,15 @@ impl Editor {
                     self.save_error = Some(message);
                     self.save_retry_at = Some(Instant::now() + self.save_retry_delay);
                     self.save_retry_delay = (self.save_retry_delay * 2).min(Duration::from_secs(60));
+                    self.latest_save.preparation_failed();
+                    return Err(e);
                 }
             }
         }
         if let Some(t) = perf {
             eprintln!("strop-perf: save_now {:?}", t.elapsed());
         }
+        Ok(queued)
     }
 
     fn apply_save_completion(&mut self, completion: SaveCompletion) {
@@ -5730,7 +5809,7 @@ impl Editor {
             return;
         }
         let saved_revision = pending.revision;
-        self.latest_save = None;
+        let _ = self.latest_save.take();
         match completion.result {
             Ok(()) => {
                 if self.save_revision == saved_revision {
@@ -5763,13 +5842,10 @@ impl Editor {
 
     /// Queue the newest snapshot and wait only at a shutdown/rename boundary.
     pub fn flush_saves(&mut self) -> std::io::Result<()> {
-        self.save_now();
-        let Some(generation) = self.latest_save.as_ref().map(|pending| pending.generation) else {
-            return self
-                .save_error
-                .as_ref()
-                .map_or(Ok(()), |m| Err(std::io::Error::other(m.clone())));
-        };
+        // Use the generation produced by THIS attempt. Consulting editor
+        // state here could accidentally select an older queued snapshot after
+        // preparation of the newest revision failed.
+        let Some(generation) = self.save_now()? else { return Ok(()) };
         let completion = self
             .save_worker
             .as_ref()
@@ -5797,7 +5873,7 @@ impl Editor {
         self.sync_active_note_draft(cx);
         self.quit_guard = QuitGuard::Saving;
         window.focus(&self.quit_focus, cx);
-        self.save_now();
+        let _ = self.save_now();
         self.finish_quit_if_ready(cx);
         cx.notify();
     }
@@ -5810,7 +5886,7 @@ impl Editor {
         // save is in flight. Chase that newer revision instead of either
         // closing over stale bytes or making the writer press Retry.
         if self.store_dirty && self.save_error.is_none() {
-            self.save_now();
+            let _ = self.save_now();
             return;
         }
         if self.store_dirty || self.save_error.is_some() {
@@ -9541,7 +9617,7 @@ impl Editor {
         self.doc.set_aside_boundary(Some(1));
         self.sync_mutations();
         self.word_count = self.manuscript_word_count();
-        self.save_now();
+        let _ = self.save_now();
         cx.notify();
     }
 
@@ -18421,7 +18497,7 @@ impl Editor {
         // F8: entry's first act — the open composer resolves (the universal
         // blur law commits the draft), and entry ends with CardFocus::Idle.
         self.finish_composing(window, cx);
-        self.save_now();
+        let _ = self.save_now();
         // Time 1: the canvas showing the PAST guards the Live verb with the
         // pulse; a strip open AT NOW closes and entry proceeds.
         if self.strip.is_parked() {
@@ -20821,6 +20897,62 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn failed_preparation_supersedes_an_older_pending_save() {
+        let mut latest = LatestSave::default();
+        latest.queued("older snapshot");
+
+        latest.preparation_failed();
+
+        assert!(latest.is_none(), "an older completion must become irrelevant");
+    }
+
+    #[test]
+    fn markdown_export_never_uses_asset_ids_as_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "strop-markdown-path-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        for (index, id) in [
+            "asset:../../escape.png",
+            "asset:../escape",
+            "asset:/absolute.png",
+            "asset:nested/file.svg",
+            "asset:..\\windows.png",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = root.join(format!("copy-{index}.md"));
+            let asset = ExportAsset::from_untrusted_id(id, vec![index as u8], 0);
+            assert!(
+                !asset.file_name.contains(['/', '\\']),
+                "generated export basename must contain no separators"
+            );
+            MarkdownExport {
+                markdown: format!("![image]({id})\n"),
+                assets: vec![asset],
+            }
+            .write_to(&path)
+            .unwrap();
+
+            let markdown = std::fs::read_to_string(&path).unwrap();
+            assert!(markdown.contains(&format!("copy-{index}.assets/asset-1.")));
+            let files = std::fs::read_dir(root.join(format!("copy-{index}.assets")))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(std::fs::read(files[0].path()).unwrap(), vec![index as u8]);
+        }
+
+        assert!(!root.join("escape.png").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn markdown_copy_excludes_scraps_and_materializes_assets() {
