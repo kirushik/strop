@@ -566,3 +566,60 @@ surface; cold read), assembled, then hardened by two waves:
   into the TextField layer (LAW 2's letter; the behavior is
   uniform, the code is not); restoring an armed-but-unspent sticky
   attr on undo of Enter; the flank-cell table.
+
+## 8. Second review round (2026-07-13) — two outside readers
+
+An independent agent review (eight findings) and Copilot's PR pass
+(two) landed against a mid-branch commit; all ten adjudicated and
+fixed. The rulings that go beyond mechanical repair:
+
+- **Quit's resolution boundary is broader than any gesture's**: the
+  quit flush gains the link field and the cold-read reaction input
+  (`commit_transient_fields_on_quit`). The rig now proves it with a
+  two-phase run — type into the reaction field, let the app die,
+  reopen and count notes.
+- **Deactivation is not a departure — now enforced, not just
+  stated.** Both the shared blur grace and the composer's check
+  `is_window_active()` after the grace, the pattern the cold-read
+  field already had; the composer's `armed` bool (a
+  blur/focus/blur race) is replaced by the per-blur generation.
+  Alt-Tab can no longer rename the file.
+- **One resolution law for the composer.** Keyboard exits went
+  through an older always-persist path, so Enter on an untouched
+  composer minted a blank card while click-away discarded it.
+  `resolve_composer` is deleted; every exit funnels through
+  `resolve_composer_draft` (C4 empty-discard).
+- **Empty-discard is now undo-aligned.**
+  `Document::cancel_provisional_note`: when the add's empty
+  transaction is still topmost it is popped (no ghost Ctrl-Z step);
+  when a background pass intervened, the note id is scrubbed from
+  every history snapshot so no undo/redo resurrects a blank card.
+- **Put back fills the standing grave anywhere, not only at EOF**:
+  the middle-of-document branch now reuses an empty block at the
+  landing boundary — immediate Put back of a middle paragraph no
+  longer leaves a phantom blank line.
+- **The whole-block doors honor the Unicode break set.** New
+  `break_len_before`/`break_len_at` helpers (CRLF is one break, two
+  chars) replace the hardcoded `'\n'` arithmetic in capture,
+  normalization, separator consumption, and Put back; round-trips
+  are tested across LF, CRLF, CR, NEL, and U+2028. Separators we
+  synthesize stay `\n` — a CRLF document may end up mixed, and
+  Ropey/BlockMap stay aligned either way.
+- **The flank ring may not outlive its focus**: opening the Link
+  field exits flank navigation (the honest, stateless option — no
+  return-to-grid ghost state).
+- **The card caption stops telling UTC time.** Fresh notes read as
+  elapsed time ("now", "12 min", "3 h") — timezone-free and honest
+  with zero dependencies, per the crate-trimming posture; older
+  notes keep the strip's date grammar. Local civil time (a real
+  wall clock) is *deferred until the project accepts a time
+  dependency* — `jiff` is the candidate when that day comes. The
+  formatter is now pure over its inputs (the rig's frozen-clock
+  override moved to the UI boundary), and the narrow drawer reads
+  the clock once per render like the wide lane (V13c).
+
+Also in this round: the branch head had a broken strop-core test
+build (a leftover `caption` field from the image-model retirement —
+CI caught it, nothing local did), and cargo-deny gained the
+RUSTSEC-2026-0206 acknowledgment (`rustybuzz` unmaintained,
+transitive via gpui's usvg/resvg; harfrust is upstream's move).
