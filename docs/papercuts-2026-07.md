@@ -623,3 +623,56 @@ build (a leftover `caption` field from the image-model retirement —
 CI caught it, nothing local did), and cargo-deny gained the
 RUSTSEC-2026-0206 acknowledgment (`rustybuzz` unmaintained,
 transitive via gpui's usvg/resvg; harfrust is upstream's move).
+
+## 9. Third review round (2026-07-13) — after the durable-save merge
+
+A second outside reading, against the pre-merge head. One finding
+refuted, four fixed; the U+2028 adjudication below went past the
+review into the model itself.
+
+- **Refuted: "quit-time save failures still discard content."** True
+  at the reviewed commit; the origin/main merge is itself the fix the
+  reviewer prescribed. `request_quit` holds quit open on a failed
+  save (`QuitGuard::Failed` → retry / save-a-copy / quit-anyway), and
+  `on_app_quit` — the paths with no window left to hold — WAITS via
+  `flush_saves()` rather than enqueue-and-exit.
+- **Every editor block end learns the byte-domain break set.** The
+  editor computed "line end = next line start − 1" in image bounds,
+  paragraph bounds, footnote-def bounds, the picture arrows, and the
+  word/paragraph walkers — mid-character for NEL/U+2028/U+2029,
+  `\r`-retaining for CRLF; copying a picture in a U+2028 document
+  panicked in `slice_bytes`. strop-core now exports
+  `break_len_before_bytes` / `line_text_end_bytes`, and every one of
+  those sites goes through them. The walkers' byte-wise `±1` stepping
+  (a reversed-range panic at a CRLF paragraph end, a caret pinned at
+  a multibyte break) is replaced by whole-break steps.
+- **An async image drop may not trust a stale byte.** The drop's gap
+  anchor now carries the document revision; when an edit intervened
+  during decode, the clamped byte SNAPS to the text end of its
+  surviving line — the nearest block gap, always a char boundary —
+  and the caret shift uses the snapped anchor. Unchanged revision
+  behaves exactly as before.
+- **Import and export agree on what a hard break is.** The ruling:
+  a block line never contains a break char; a U+2028 SEPARATOR means
+  "hard break" (continuation), every other separator is a plain block
+  break. `from_markdown`'s HardBreak used to push U+2028 into the
+  text with NO matching block entry — `Document::new` repairs such a
+  mismatch by discarding every kind, so importing any .md with a
+  hard break silently demoted all headings/lists/images to
+  paragraphs. HardBreak now begins a same-kind block with a U+2028
+  separator; `to_markdown` splits on the full break set (CRLF one
+  two-char separator, span bases exact) and exports a U+2028 join
+  between two Paragraph blocks as a CommonMark hard break. Recorded
+  fidelity cost: U+2028 keeps hard-break meaning only between prose
+  paragraphs; elsewhere it degrades through the block grammar.
+  Captions flatten the whole break set to spaces, not just `\n`.
+- **The rig stops reading the developer's provider config.** The
+  editor-face assertions test the deliberate NeedsSetup > Ready
+  priority, so they flipped on any machine whose real
+  `~/.config/strop` disagreed with the rig author's. Every `wrun.sh`
+  run now gets a throwaway `XDG_CONFIG_HOME` with a
+  configured-but-unreachable provider (port 9); verified both ways —
+  fake provider reads `reading`, empty config reads `needs_setup`.
+- Whitespace: the `git diff --check` complaints (a trailing space in
+  `inline-images.md`, a blank line ending `cold-history.md`) are
+  gone.
