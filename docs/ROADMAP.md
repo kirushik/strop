@@ -163,6 +163,16 @@ unless they'd be expensive to reverse.
   file-manager, and OS-session launches on all three platforms. Treat this as
   a recovery-system design task, not another dialog-polish pass.
 
+- **Writer-native manuscript length.** Whitespace words are not a universal
+  writing unit: Chinese submission calls use characters, Japanese and Korean
+  traditions commonly use fixed-character manuscript pages, while Thai
+  guidance may still use words or formatted pages. Research creative-writing
+  practice per supported language, including punctuation/space rules, then
+  test a `words | characters | manuscript pages` readout with writers. This is
+  document-language UI data, separate from the conservative LLM token safety
+  estimator. Evidence and initial questions live in
+  [the LLM pipeline review](research/llm-pipeline-review-2026-07.md#backlog-manuscript-length-in-the-writers-own-unit).
+
 - [x] **Asset GC** (2026-06-11): save-time reachability sweep — an asset
   survives if the current blocks, any persisted undo/redo state, or any
   checkpoint still references it; otherwise deleted (tested).

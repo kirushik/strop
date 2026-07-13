@@ -120,11 +120,18 @@ Replace the silent 24,000-character prefix with an explicit internal scope
 object carrying the source snapshot, exact target document range, context
 range, pass kind, language, and whole/selection/local strategy.
 
-Ten thousand words is the initial per-request manuscript-source ceiling,
-including TARGET plus all CONTEXT and an explicit select-all. It is a product
-cost/quality guard, not a claim about model context. Keep it as one named
-constant so evaluation can move it. Never submit a partial prefix or paragraph
-and call it the manuscript.
+Two independent fuses apply to all submitted manuscript source, including
+TARGET plus CONTEXT and an explicit select-all:
+
+- 10,000 whitespace-delimited words;
+- 40,000 conservatively estimated source tokens.
+
+The second closes the word counter's hole for Chinese, Japanese, Thai, and
+other densely written or unsegmented text. English-like whitespace runs count
+as at least two tokens, other spaced-language runs as four, dense-script runs
+by Unicode scalar, and unusually long runs retain a character-derived floor.
+This is deliberately rough and local. Neither fuse is a claim about model
+context, and neither may cut a target or paragraph silently.
 
 When the writer selects a passage, the selection is the target. Add up to two
 complete paragraphs before and after it as read-only context, as the remaining
@@ -135,25 +142,34 @@ boundary.
 
 Without a selection:
 
-- at or below 10k words, whole-piece passes receive the whole manuscript;
-- above 10k, every 0.2 pass declines the whole-piece read and asks for a
-  shorter explicit selection. No pass silently chooses a caret or chapter
+- while both source fuses hold, whole-piece passes receive the whole
+  manuscript;
+- above either fuse, every 0.2 pass declines the whole-piece read and asks for
+  a shorter explicit selection. No pass silently chooses a caret or chapter
   window because the existing unselected action means a whole-piece read.
 
-For a conservative sanity estimate, budget submitted source as two tokens per
-English word and four per non-English word, then leave prompt, output, and
-safety reserve. At 10k words this estimates at most 20k or 40k source tokens,
-well below the 100k-token planning baseline used for hosted models. This is a
-cost fuse and rough forecast, not a tokenizer or a provider guarantee. Small
-local Ollama contexts remain best effort and may fail truthfully.
+The 40k estimated-token ceiling, not 100k, is Strop's source operating limit.
+A 100k-token hosted-model context is only a reference envelope demonstrating
+roughly 50–60k tokens of room for prompts, output, estimation error, and
+provider variation. It is not Strop's target request size and is not guaranteed
+by any provider. Small local Ollama contexts and arbitrary compatible endpoints
+remain best effort and may fail truthfully below either product fuse.
 
 Scope stays automatic in 0.2. A quiet whole-piece/current-chapter indication
 inside existing “Ask an editor” action copy is backlog work requiring UX tests.
+Writer-facing manuscript length is separate backlog work. Chinese calls for
+submissions commonly specify characters (`字数`); Japanese and Korean literary
+calls commonly specify 400- and 200-character manuscript pages respectively;
+Thai guidance can still specify words or formatted pages. Strop should research
+and test a language/community-native length unit instead of labelling every
+writer's work in whitespace words. That display unit must never become the LLM
+token estimator.
 
 Acceptance:
 
 - text after character 24,000 is included when the whole piece is eligible;
 - oversized manuscripts are never silently truncated;
+- unsegmented text cannot evade the safety ceiling by containing few spaces;
 - a selected result cannot anchor to repeated text outside the selection;
 - context can inform a card but cannot become its anchor;
 - edits made while a request is in flight cannot move a card to unrelated
@@ -217,8 +233,8 @@ quality with decisive evidence at the opening, middle, and end.
 
 1. Truthful errors and response metadata.
 2. Robust parsing, partial salvage, and bounded retry/recovery.
-3. Range-preserving scope, neighboring passage context, and the 10k-word
-   total-source safety ceiling.
+3. Range-preserving scope, neighboring passage context, and the word/token
+   total-source safety fuses.
 4. Deterministic local language detection and enforcement.
 5. Partial-result repair delivery after UX review in
    `docs/impl/11-llm-repair-flow.md`.

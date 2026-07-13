@@ -447,21 +447,52 @@ usable source budget = model context limit
 
 Exact tokenizers and provider counting endpoints may improve later telemetry,
 but they are not required for the 0.2 safety policy. Use a deliberately rough
-upper estimate of two tokens per English word and four per non-English word,
-then add prompt/output reserve. The useful accuracy here is the conservative
-factor, not a false provider-specific digit. Cut context only at paragraph or
-structural boundaries and never cut the selected target.
+local estimate: at least two tokens per English-like whitespace run, four per
+other spaced-language run, one per Unicode scalar in a densely written script,
+and a character-derived floor for unusually long runs. The useful accuracy is
+the conservative factor, not a false provider-specific digit. Cut context only
+at paragraph or structural boundaries and never cut the selected target.
 
-Product decision after review: start with a 10,000-word total submitted-source
-ceiling, including TARGET, CONTEXT, and an explicit select-all. This is a
-deliberate cost/quality fuse against accidentally sending book-scale text, not
-a provider or model-context claim. At the heuristic above, 10k words consumes
-at most about 20k English or 40k non-English source tokens before reserves,
-comfortably inside a rough 100k hosted-model planning baseline. Local Ollama
-remains best effort even when its configured context is smaller. Under the cap,
-send the whole piece whenever the pass implies global visibility. Over it in
-0.2, visibly decline a no-selection read and ask for a shorter selection—never
-take a prefix or silently substitute a local window.
+Product decision after review: apply both a 10,000 whitespace-word ceiling and
+a 40,000 estimated-source-token ceiling to TARGET plus CONTEXT. The latter
+prevents an unsegmented manuscript from counting as one “word.” These are
+deliberate cost/quality fuses against accidentally sending book-scale text, not
+provider or model-context claims. Typical admitted English and other spaced
+text estimates around 20k and 40k source tokens respectively. A 100k hosted-
+model context is only a reference envelope showing substantial room for prompt,
+output, and estimation error; it is neither the operating target nor a provider
+guarantee. Local Ollama remains best effort even when its configured context is
+smaller. Under both fuses, send the whole piece whenever the pass implies global
+visibility. Over either in 0.2, visibly decline a no-selection read and ask for
+a shorter selection—never take a prefix or silently substitute a local window.
+
+### Backlog: manuscript length in the writer's own unit
+
+The safety estimate and the writer's sense of a work's length are different
+products. Preliminary publishing evidence rejects a single “non-whitespace
+language” rule:
+
+- Chinese literary calls specify `字数`, including China Writers Association
+  calls that set fiction ranges in tens of thousands of characters
+  ([example](https://www.chinawriter.com.cn/n1/2024/1105/c403988-40354413.html));
+- Japanese fiction prizes commonly specify the equivalent number of
+  400-character manuscript sheets
+  ([Kawade](https://www.kawade.co.jp/smp/bungei_award.html),
+  [Oita Prefecture](https://www.pref.oita.jp/soshiki/10310/bungakusyo-bosyu.html));
+- Korean publishers commonly use 200-character manuscript sheets
+  ([Hankyoreh Publishing](https://www.hanibook.co.kr/jsp/intro/cusnotice_view.jsp?centergb=HANIBOOK&s_menu_lcode=0000000001&s_menucd=CM&sa=v&sno=50),
+  [Changbi](https://www.changbi.com/contest?type=2));
+- Thai-language submission guidance may specify words
+  ([Journal of Thai Studies](https://so04.tci-thaijo.org/index.php/TSDJ/authorguidelineinthai))
+  or formatted pages, so orthographic spacing alone does not determine the
+  convention.
+
+Post-0.2 work should survey creative-writing submissions and writing tools per
+target language, settle whether spaces and punctuation count, and test the
+labels with writers. Strop can then expose a native `words | characters |
+manuscript pages` work-length value based on resolved document language, with a
+stable fallback and perhaps a later explicit override. That value is UI data;
+the provider safety fuse remains the separate conservative token estimate.
 
 ### Is the cap supported by surrounding code?
 
@@ -478,17 +509,17 @@ safe and avoided a byte-slice panic. Beyond that, support was weak:
 
 Implementation note, 2026-07-13: the first remediation removed that prefix,
 added an exact target/context scope and range-aware anchoring, and visibly
-declines an oversized whole read. The follow-up caps TARGET plus CONTEXT at
-10,000 words and drops only whole neighboring passages when the context budget
-is tight. The fixed output reserve and post-0.2 hierarchical workflow remain
-open work.
+declines an oversized whole read. The follow-ups cap TARGET plus CONTEXT at
+10,000 words and 40,000 estimated source tokens, dropping only whole neighboring
+passages when either context budget is tight. The fixed output reserve and
+post-0.2 hierarchical workflow remain open work.
 
-The cold-reading behavior does not fill this gap. For manuscripts over 10,000
-words, cold read opens at the caret's current chapter. Its chapter heuristic
-finds the shallowest heading level that occurs at least twice, then the nearest
-such heading at or before the caret. This changes the opening page of a
-whole-manuscript reading snapshot. It does not change what an LLM pass sees,
-and the diagnosis path does not call it.
+The cold-reading behavior does not fill this gap. For sufficiently long
+manuscripts, cold read opens at the caret's current chapter. Its chapter
+heuristic finds the shallowest heading level that occurs at least twice, then
+the nearest such heading at or before the caret. This changes the opening page
+of a whole-manuscript reading snapshot. It does not change what an LLM pass
+sees, and the diagnosis path does not call it.
 
 The heuristic may become a useful structural primitive for later AI scope.
 “Where cold read opens” and “what the model receives” remain separate product
@@ -522,9 +553,9 @@ chunk would also destroy the prompts' intended scarcity.
 
 ### Recommended long-document workflow
 
-For 0.2, prefer full text whenever it fits the 10,000-word product cap. Strop
-targets essays, talks, and chapters, so many normal documents fit without
-chunking. Above it, visibly decline a no-selection read and retain the hard cap
+For 0.2, prefer full text whenever it fits both product fuses. Strop targets
+essays, talks, and chapters, so many normal documents fit without chunking.
+Above either, visibly decline a no-selection read and retain the hard boundary
 until a separately designed long-document system is ready.
 
 After 0.2, measured model capability and pass quality can inform a movable cap.
@@ -693,7 +724,8 @@ silently—with little provider-specific code.
 ### Phase 4 — correct scope
 
 - Introduce `PassScope` and range-preserving anchoring.
-- Replace the character cap with the 10,000-word total-source safety fuse.
+- Replace the character cap with the 10,000-word and 40,000-estimated-token
+  total-source safety fuses.
 - Run whole-text passes under it; visibly decline unselected reads above it.
 - Keep selected context to complete paragraphs inside the same source budget.
 - Backlog local line/copy windows and hierarchical global passes rather than
@@ -726,7 +758,7 @@ unsafe for whole-piece passes.
 The smallest coherent improvement was not “increase 24,000.” It was to carry
 an explicit scope and language contract from request through validation and
 anchoring, while collecting enough response metadata to tell truncation,
-refusal, provider incompatibility, and schema failure apart. The 10,000-word
-fuse now supplies the honest 0.2 boundary. Later whole-document and overflow
+refusal, provider incompatibility, and schema failure apart. The word/token
+fuses now supply the honest 0.2 boundary. Later whole-document and overflow
 strategies should be introduced only when their evidence, summary provenance,
 and UI meaning can be judged with fixtures rather than intuition.

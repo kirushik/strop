@@ -40,6 +40,7 @@ pub struct ParseReport {
 }
 
 pub const REQUEST_SOURCE_MAX_WORDS: usize = 10_000;
+pub const REQUEST_SOURCE_MAX_ESTIMATED_TOKENS: usize = 40_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptScope {
@@ -53,17 +54,27 @@ pub struct PromptScope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeTooLarge {
-    pub words: usize,
+    pub amount: usize,
     pub limit: usize,
+    pub unit: ScopeSizeUnit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeSizeUnit {
+    Words,
+    EstimatedTokens,
 }
 
 impl std::fmt::Display for ScopeTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unit = match self.unit {
+            ScopeSizeUnit::Words => "words",
+            ScopeSizeUnit::EstimatedTokens => "estimated source tokens",
+        };
         write!(
             f,
-            "this read contains {} words of manuscript source; one editor read stops at {}",
-            self.words,
-            self.limit
+            "this read contains {} {unit}; one editor read stops at {}",
+            self.amount, self.limit
         )
     }
 }
@@ -245,19 +256,14 @@ pub fn prompt_scope(
         let start = selection.start.min(manuscript_chars);
         let end = selection.end.min(manuscript_chars).max(start);
         let target = char_slice(manuscript, start..end);
-        let words = target.split_whitespace().count();
-        if words > REQUEST_SOURCE_MAX_WORDS {
-            return Err(ScopeTooLarge {
-                words,
-                limit: REQUEST_SOURCE_MAX_WORDS,
-            });
+        if let Some(error) = source_limit_error(source_size(&[&target])) {
+            return Err(error);
         }
         let (context_before, context_after) = best_context(
             manuscript,
             start,
             end,
-            words,
-            REQUEST_SOURCE_MAX_WORDS,
+            &target,
         );
         return Ok(PromptScope {
             target_range: start..end,
@@ -267,12 +273,8 @@ pub fn prompt_scope(
             whole_manuscript: false,
         });
     }
-    let words = manuscript.split_whitespace().count();
-    if words > REQUEST_SOURCE_MAX_WORDS {
-        return Err(ScopeTooLarge {
-            words,
-            limit: REQUEST_SOURCE_MAX_WORDS,
-        });
+    if let Some(error) = source_limit_error(source_size(&[manuscript])) {
+        return Err(error);
     }
     Ok(PromptScope {
         target_range: 0..manuscript_chars,
@@ -346,8 +348,7 @@ fn best_context(
     manuscript: &str,
     start: usize,
     end: usize,
-    target_words: usize,
-    limit: usize,
+    target: &str,
 ) -> (String, String) {
     let before = (0..=2)
         .map(|paragraphs| {
@@ -372,10 +373,12 @@ fn best_context(
         (0, 2), (1, 0), (0, 1), (0, 0),
     ];
     for (before_count, after_count) in choices {
-        let source_words = target_words
-            + before[before_count].split_whitespace().count()
-            + after[after_count].split_whitespace().count();
-        if source_words <= limit {
+        let size = source_size(&[
+            target,
+            &before[before_count],
+            &after[after_count],
+        ]);
+        if source_limit_error(size).is_none() {
             return (
                 before[before_count].clone(),
                 after[after_count].clone(),
@@ -383,6 +386,79 @@ fn best_context(
         }
     }
     (String::new(), String::new())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceSize {
+    words: usize,
+    estimated_tokens: usize,
+}
+
+/// A deliberately conservative, tokenizer-free safety estimate. Ordinary
+/// English-like whitespace runs count as two tokens; other spaced language
+/// runs count as four. Runs containing a densely written script count by
+/// Unicode scalar, while unusually long spaced-script runs retain a character
+/// floor.
+/// This is a request fuse, never a writer-facing claim about manuscript length.
+fn source_size(parts: &[&str]) -> SourceSize {
+    let english_like = parts
+        .iter()
+        .flat_map(|part| part.chars())
+        .filter(|c| c.is_alphabetic() && !is_dense_script_char(*c))
+        .all(|c| c.is_ascii());
+    let word_tokens = if english_like { 2 } else { 4 };
+    let mut words = 0;
+    let mut estimated_tokens = 0;
+    for part in parts {
+        for run in part.split_whitespace() {
+            words += 1;
+            let chars = run.chars().count();
+            let run_tokens = if run.chars().any(is_dense_script_char) {
+                chars
+            } else {
+                word_tokens.max(chars.div_ceil(4))
+            };
+            estimated_tokens += run_tokens;
+        }
+    }
+    SourceSize {
+        words,
+        estimated_tokens,
+    }
+}
+
+fn source_limit_error(size: SourceSize) -> Option<ScopeTooLarge> {
+    if size.words > REQUEST_SOURCE_MAX_WORDS {
+        return Some(ScopeTooLarge {
+            amount: size.words,
+            limit: REQUEST_SOURCE_MAX_WORDS,
+            unit: ScopeSizeUnit::Words,
+        });
+    }
+    if size.estimated_tokens > REQUEST_SOURCE_MAX_ESTIMATED_TOKENS {
+        return Some(ScopeTooLarge {
+            amount: size.estimated_tokens,
+            limit: REQUEST_SOURCE_MAX_ESTIMATED_TOKENS,
+            unit: ScopeSizeUnit::EstimatedTokens,
+        });
+    }
+    None
+}
+
+fn is_dense_script_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1000..=0x109f
+            | 0x0e00..=0x0eff
+            | 0x1780..=0x17ff
+            | 0x3040..=0x30ff
+            | 0x31f0..=0x31ff
+            | 0x3400..=0x9fff
+            | 0xac00..=0xd7af
+            | 0xf900..=0xfaff
+            | 0xff65..=0xff9f
+            | 0x20000..=0x323af
+    )
 }
 
 /// Backward-compatible convenience parser for tests and non-pass callers.
@@ -649,7 +725,8 @@ mod tests {
         assert!(prompt_scope(&at_limit, None).unwrap().whole_manuscript);
         let over = format!("{at_limit} extra");
         let error = prompt_scope(&over, None).unwrap_err();
-        assert_eq!(error.words, REQUEST_SOURCE_MAX_WORDS + 1);
+        assert_eq!(error.amount, REQUEST_SOURCE_MAX_WORDS + 1);
+        assert_eq!(error.unit, ScopeSizeUnit::Words);
         assert!(prompt_scope(&over, Some(0..over.chars().count())).is_err());
         let tail = over.chars().count() - 5;
         let selected = prompt_scope(&over, Some(tail..tail + 5)).unwrap();
@@ -692,6 +769,49 @@ mod tests {
         assert!(scope.context_before.trim().is_empty());
         assert!(scope.context_after.trim().is_empty());
         assert_eq!(submitted_words, REQUEST_SOURCE_MAX_WORDS - 1);
+    }
+
+    #[test]
+    fn source_estimate_handles_spaced_and_dense_scripts_conservatively() {
+        assert_eq!(source_size(&["one two three"]).estimated_tokens, 6);
+        assert_eq!(source_size(&["один два три"]).estimated_tokens, 12);
+        for text in ["日本語の原稿です", "ภาษาไทย", "한국어원고"] {
+            assert_eq!(source_size(&[text]).estimated_tokens, text.chars().count());
+        }
+        assert_eq!(source_size(&["abcdefghijklmnopqrst"]).estimated_tokens, 5);
+    }
+
+    #[test]
+    fn dense_script_scope_has_an_estimated_token_ceiling() {
+        let at_limit = "界".repeat(REQUEST_SOURCE_MAX_ESTIMATED_TOKENS);
+        assert!(prompt_scope(&at_limit, None).unwrap().whole_manuscript);
+
+        let over = format!("{at_limit}界");
+        let error = prompt_scope(&over, None).unwrap_err();
+        assert_eq!(error.amount, REQUEST_SOURCE_MAX_ESTIMATED_TOKENS + 1);
+        assert_eq!(error.limit, REQUEST_SOURCE_MAX_ESTIMATED_TOKENS);
+        assert_eq!(error.unit, ScopeSizeUnit::EstimatedTokens);
+        assert!(error.to_string().contains("estimated source tokens"));
+    }
+
+    #[test]
+    fn selected_context_obeys_the_estimated_token_ceiling_too() {
+        let target = std::iter::repeat_n("слово", 9_999)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!("before\n{target}\nafter");
+        let start = "before\n".chars().count();
+        let end = start + target.chars().count();
+        let scope = prompt_scope(&text, Some(start..end)).unwrap();
+        let size = source_size(&[
+            &scope.target,
+            &scope.context_before,
+            &scope.context_after,
+        ]);
+
+        assert_eq!(size.estimated_tokens, REQUEST_SOURCE_MAX_ESTIMATED_TOKENS);
+        assert_eq!(scope.context_before, "before\n");
+        assert!(scope.context_after.trim().is_empty());
     }
 
     #[test]
