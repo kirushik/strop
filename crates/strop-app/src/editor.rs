@@ -738,8 +738,8 @@ pub fn bind_keys(cx: &mut App) {
 ///
 /// Every one of those was two booleans that drifted apart. Here they cannot:
 /// the composer's identity and its `NoteInput` live in the same variant, and
-/// the SINGLE exit from `Composing` (`resolve_composer`) persists the draft to
-/// the note it actually belongs to. New interaction states force every
+/// the SINGLE exit from `Composing` (`resolve_composer_draft`) resolves the
+/// draft on the note it actually belongs to. New interaction states force every
 /// `match` below to be updated (exhaustiveness), so this class can't silently
 /// regrow. See `card_body` for the render-side counterpart.
 enum CardFocus {
@@ -2591,31 +2591,36 @@ impl Editor {
         }
         let still = std::rc::Rc::new(still);
         window
-            .on_focus_out(&handle, cx, move |_, _window, cx| {
+            .on_focus_out(&handle, cx, move |_, window, cx| {
                 let Some(editor) = weak.upgrade() else { return };
                 let my_gen = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let generation = generation.clone();
                 let still = still.clone();
-                editor.update_checked(cx, |_editor, cx| {
-                    cx.spawn(async move |this, cx| {
+                let weak = editor.downgrade();
+                window
+                    .spawn(cx, async move |cx| {
                         cx.background_executor()
                             .timer(Duration::from_millis(FIELD_BLUR_GRACE_MS))
                             .await;
-                        if generation.load(std::sync::atomic::Ordering::Relaxed) != my_gen {
-                            return; // a later focus-in/out superseded this blur
-                        }
-                        this.update(cx, |editor: &mut Editor, cx| {
-                            if let Some(field) = still(editor) {
-                                let text = field.read(cx).content.clone();
-                                field.update_checked(cx, |_, fcx| {
-                                    fcx.emit(TextFieldEvent::Commit(text))
-                                });
+                        cx.update(|window, app| {
+                            if generation.load(std::sync::atomic::Ordering::Relaxed) != my_gen
+                                || !window.is_window_active()
+                            {
+                                return; // superseded, or app deactivation — not a departure
                             }
+                            let Some(editor) = weak.upgrade() else { return };
+                            editor.update_checked(app, |editor, cx| {
+                                if let Some(field) = still(editor) {
+                                    let text = field.read(cx).content.clone();
+                                    field.update_checked(cx, |_, fcx| {
+                                        fcx.emit(TextFieldEvent::Commit(text))
+                                    });
+                                }
+                            });
                         })
                         .ok();
                     })
                     .detach();
-                });
             })
             .detach();
     }
@@ -3757,30 +3762,6 @@ impl Editor {
         cx.notify();
     }
 
-    /// The SINGLE exit from `Composing`: persist the open composer's current
-    /// text onto the note it edits, then demote that card to `Selected`. Every
-    /// focus-changing action calls this first, so a composer is never stranded
-    /// on a deselected card and its draft is never committed to a card the
-    /// writer merely clicked. No-op unless a composer is actually open.
-    fn resolve_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (id, body) = match &self.focus {
-            CardFocus::Composing { id, input } => (*id, input.read(cx).content.clone()),
-            _ => return,
-        };
-        self.composer_return = None; // this exit does not restore; keyboard/dead-zone took it first
-        self.doc.set_note_body(id, body);
-        self.focus = CardFocus::Selected(id);
-        self.mark_dirty();
-        // The composer field just left the tree; hand keyboard control back to
-        // the document so the next keystroke edits prose, not nothing. This is
-        // the SINGLE place a composer exit restores focus — because EVERY exit
-        // funnels through here, a lane click (selecting another card, done/×)
-        // can no longer strand the keyboard the way it did when only
-        // finish_composing refocused. Callers that want a *different* target
-        // (open_composer focuses the new field) just re-focus after us.
-        window.focus(&self.focus_handle, cx);
-    }
-
     /// The shared resolve (V15a): apply an open composer's draft to the doc —
     /// empty trimmed body → C4 empty-DISCARD (no blank card manufactured), else
     /// commit — and settle CardFocus accordingly. Focus and notify are the
@@ -3792,7 +3773,10 @@ impl Editor {
         };
         self.composer_return = None;
         if body.trim().is_empty() {
-            self.doc.remove_note(id);
+            // Undo-aligned cancel: drops the add's paired empty undo step when
+            // still topmost, else scrubs history so no undo/redo resurrects a
+            // blank card (review finding 4).
+            self.doc.cancel_provisional_note(id);
             self.focus = CardFocus::Idle;
         } else {
             self.doc.set_note_body(id, body);
@@ -3856,11 +3840,24 @@ impl Editor {
         }
     }
 
+    /// Quit is the one resolution boundary broader than writer gestures: every
+    /// durable transient field must reach the document before `save_now`.
+    pub(crate) fn commit_transient_fields_on_quit(&mut self, cx: &mut Context<Self>) {
+        self.commit_transient_fields_on_gesture(cx);
+        if let Some(field) = self.link_input.as_ref().map(|(_, field)| field.clone()) {
+            let text = field.read(cx).content.clone();
+            field.update_checked(cx, |_, fcx| fcx.emit(TextFieldEvent::Commit(text)));
+        }
+        self.cr_commit_input_inner(cx);
+    }
+
     /// Leave the composer by KEYBOARD (Enter/Escape). The draft is already the
     /// note's text; the exit restores the writer's saved caret (LAW 2).
     fn finish_composing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ret = self.composer_return.take();
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         self.apply_composer_return(ret, cx);
         cx.notify();
     }
@@ -3869,14 +3866,18 @@ impl Editor {
     /// its anchor). Resolves any open composer first so the previous note's
     /// draft is saved and its composer never lingers.
     fn select_card(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         self.focus = CardFocus::Selected(id);
     }
 
     /// Drop all card selection (a click that hits no anchor). Resolves any
     /// open composer first.
     fn deselect_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         self.focus = CardFocus::Idle;
     }
 
@@ -3888,7 +3889,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         // Switching composers: commit the one we're leaving before opening this.
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         let input = cx.new(|cx| TextField::multiline(cx, body));
         cx.subscribe_in(
             &input,
@@ -3901,45 +3904,48 @@ impl Editor {
         )
         .detach();
         // Click-away commits — but only on a real DEPARTURE (LAW 2 / D2): a
-        // transient focus-out (keyboard-layout switch, app deactivation) that
-        // returns focus within the grace is never a commit. The `armed` flag is
-        // shared with this field's own focus-in, which disarms on return; the
-        // grace timer commits only if still armed. Empty ⇒ discard (C4). Guarded
-        // on THIS composer still being open so a switch/click that already
-        // resolved it can't double-commit.
+        // transient focus-out (keyboard-layout switch, app deactivation) is
+        // never a commit. Each blur owns a generation, so a blur/focus/blur
+        // bounce cannot let the first timer commit on the second blur's behalf.
+        // Empty ⇒ discard (C4). Guarded on THIS composer still being open so a
+        // switch/click that already resolved it can't double-commit.
         let handle = input.read(cx).focus_handle.clone();
         let weak = cx.entity().downgrade();
-        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
-            let armed = armed.clone();
+            let generation = generation.clone();
             window
                 .on_focus_in(&handle, cx, move |_window, _cx| {
-                    armed.store(false, std::sync::atomic::Ordering::Relaxed);
+                    generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 })
                 .detach();
         }
         window
-            .on_focus_out(&handle, cx, move |_, _window, cx| {
-                let Some(editor) = weak.upgrade() else { return };
-                armed.store(true, std::sync::atomic::Ordering::Relaxed);
-                let armed = armed.clone();
-                editor.update_checked(cx, |_editor, cx| {
-                    cx.spawn(async move |this, cx| {
+            .on_focus_out(&handle, cx, move |_, window, cx| {
+                let my_gen = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let generation = generation.clone();
+                let weak = weak.clone();
+                window
+                    .spawn(cx, async move |cx| {
                         cx.background_executor()
                             .timer(Duration::from_millis(FIELD_BLUR_GRACE_MS))
                             .await;
-                        if !armed.load(std::sync::atomic::Ordering::Relaxed) {
-                            return; // focus returned within the grace — not a departure
-                        }
-                        this.update(cx, |editor: &mut Editor, cx| {
-                            if editor.focus.composing_id() == Some(id) {
-                                editor.commit_composer_no_focus(cx);
+                        cx.update(|window, app| {
+                            if generation.load(std::sync::atomic::Ordering::Relaxed) != my_gen
+                                || !window.is_window_active()
+                            {
+                                return;
                             }
+                            let Some(editor) = weak.upgrade() else { return };
+                            editor.update_checked(app, |editor, cx| {
+                                if editor.focus.composing_id() == Some(id) {
+                                    editor.commit_composer_no_focus(cx);
+                                }
+                            });
                         })
                         .ok();
                     })
                     .detach();
-                });
             })
             .detach();
         let input_focus = input.read(cx).focus_handle.clone();
@@ -3956,7 +3962,9 @@ impl Editor {
     ) {
         // Commit any open draft first (the click may be on this card's own
         // done/×, or on another card while this one composes).
-        self.resolve_composer(window, cx);
+        if self.resolve_composer_draft(cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         // A resolved card leaves with a brief exit fade rather than blinking
         // out: snapshot its rendered slot BEFORE the model change (afterwards
         // it has no card to snapshot). The model itself commits immediately —
@@ -6164,6 +6172,9 @@ impl Editor {
         self.commit_field_on_blur(&input, window, cx, |e| {
             e.link_input.as_ref().map(|(_, f)| f.clone())
         });
+        if self.flank_focused {
+            self.exit_flank(window, cx);
+        }
         let handle = input.read(cx).focus_handle.clone();
         window.focus(&handle, cx);
         self.link_input = Some((range, input));
@@ -17009,20 +17020,19 @@ struct MarginCard {
     created_unix: i64,
 }
 
-/// A writer note's creation MOMENT, messenger-style (C3, papercuts §3): the
-/// time of day for a note made today (a lane of "14:32"s reads at a glance),
-/// the strip's quiet relative date for older ones ("Yesterday", "Tue 1 Jul").
-/// Pure over its inputs so the caption formatter is unit-testable headlessly;
-/// the visual rig's STROP_TEST_STILL freezes it like every other timestamp.
+/// A writer note's creation MOMENT, messenger-style (C3, papercuts §3): a
+/// timezone-free elapsed label while fresh, then the strip's quiet relative
+/// date for older ones ("Yesterday", "Tue 1 Jul"). Pure over its inputs so the
+/// caption formatter is unit-testable headlessly. Review finding 8: local civil
+/// time is deferred until the project accepts a time dependency.
 fn note_moment_label(created_unix: i64, now_secs: i64) -> String {
-    if test_still() {
-        return "00:00".into();
-    }
-    let day = created_unix.div_euclid(86_400);
-    let today = now_secs.div_euclid(86_400);
-    if day == today {
-        let rem = created_unix.rem_euclid(86_400);
-        format!("{:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+    let elapsed = now_secs.saturating_sub(created_unix).max(0);
+    if elapsed < 60 {
+        "now".into()
+    } else if elapsed < 3600 {
+        format!("{} min", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{} h", elapsed / 3600)
     } else {
         strip::date_label(created_unix, now_secs)
     }
@@ -17052,6 +17062,26 @@ fn note_card_label(
         format!("{base} · detached")
     } else {
         base
+    }
+}
+
+/// UI boundary for the visual rig's frozen clock; the label grammar above
+/// remains pure, while still screenshots keep their constant caption.
+fn note_card_label_for_ui(
+    is_diagnosis: bool,
+    level: &str,
+    orphaned: bool,
+    created_unix: i64,
+    now_secs: i64,
+) -> String {
+    if !is_diagnosis && test_still() {
+        if orphaned {
+            "00:00 · detached".into()
+        } else {
+            "00:00".into()
+        }
+    } else {
+        note_card_label(is_diagnosis, level, orphaned, created_unix, now_secs)
     }
 }
 
@@ -18552,7 +18582,13 @@ impl Editor {
                         .then(|| self.focus.input().cloned())
                         .flatten();
                     let is_diagnosis = kind == NoteKind::Diagnosis;
-                    let label = note_card_label(is_diagnosis, &level, orphaned, created_unix, now_secs);
+                    let label = note_card_label_for_ui(
+                        is_diagnosis,
+                        &level,
+                        orphaned,
+                        created_unix,
+                        now_secs,
+                    );
                     // The caption's hover expands the moment to the full timestamp
                     // (P9 — hover only completes what is shown); writer notes only.
                     // The stamp itself builds lazily, in the tooltip closure — a
@@ -19238,6 +19274,9 @@ impl Editor {
         let vw = f32::from(window.viewport_size().width);
         let vh = f32::from(window.viewport_size().height);
         let panel_w = (vw - 24.).min(340.);
+        // Match the wide lane's V13c discipline: every card in this drawer
+        // renders against one clock sample.
+        let now_secs = strop_core::journal::now_ms() / 1000;
         let mut list = div()
             .id("narrow-notes-list")
             .flex()
@@ -19278,7 +19317,7 @@ impl Editor {
             );
         } else {
             for card in &cards {
-                list = list.child(self.narrow_note_card(card, cx));
+                list = list.child(self.narrow_note_card(card, now_secs, cx));
             }
         }
         Some(
@@ -19304,7 +19343,12 @@ impl Editor {
     /// One card in the narrow drawer: the same content the margin shows, in a
     /// stacked (non-absolute) box. No inline composer — a writer's note opens
     /// the bottom strip on click; diagnoses are read-only here as everywhere.
-    fn narrow_note_card(&self, card: &MarginCard, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn narrow_note_card(
+        &self,
+        card: &MarginCard,
+        now_secs: i64,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         // The caret-block's provenance rides the narrow drawer exactly as
         // cards do (surfaces-attention 6) — same quiet row, same Put back.
         if let Some(rec_id) = card.provenance {
@@ -19342,8 +19386,13 @@ impl Editor {
         let MarginCard { id, body, kind, title, level, orphaned, created_unix, .. } = card;
         let (id, kind) = (*id, *kind);
         let is_diagnosis = kind == NoteKind::Diagnosis;
-        let now_secs = strop_core::journal::now_ms() / 1000;
-        let label = note_card_label(is_diagnosis, level, *orphaned, *created_unix, now_secs);
+        let label = note_card_label_for_ui(
+            is_diagnosis,
+            level,
+            *orphaned,
+            *created_unix,
+            now_secs,
+        );
         let body = body.clone();
         let title = title.clone();
         div()
@@ -23592,13 +23641,17 @@ mod tests {
     }
 
     #[test]
-    fn note_moment_label_is_time_today_date_older() {
+    fn note_moment_label_is_elapsed_while_fresh_date_when_older() {
         // A fixed "now": 2026-07-11 12:00 UTC (day 20645 * 86400 + 43200).
         let day = 20645i64;
         let now = day * 86_400 + 12 * 3600;
-        // A note made today reads as its time of day, messenger-style.
-        assert_eq!(note_moment_label(day * 86_400 + 14 * 3600 + 32 * 60, now), "14:32");
-        assert_eq!(note_moment_label(day * 86_400 + 9 * 3600 + 5 * 60, now), "09:05");
+        // Fresh notes use timezone-free elapsed time, messenger-style.
+        assert_eq!(note_moment_label(now, now), "now");
+        assert_eq!(note_moment_label(now - 59, now), "now");
+        assert_eq!(note_moment_label(now - 60, now), "1 min");
+        assert_eq!(note_moment_label(now - 59 * 60, now), "59 min");
+        assert_eq!(note_moment_label(now - 3600, now), "1 h");
+        assert_eq!(note_moment_label(now - 23 * 3600, now), "23 h");
         // Older notes borrow the strip's relative date grammar.
         assert_eq!(note_moment_label((day - 1) * 86_400 + 3600, now), "Yesterday");
         // A diagnosis keeps its level word; a writer note shows the moment.
@@ -23608,8 +23661,8 @@ mod tests {
             "a diagnosis keeps its level word (that IS data)"
         );
         assert_eq!(
-            note_card_label(false, "", false, day * 86_400 + 14 * 3600 + 32 * 60, now),
-            "14:32",
+            note_card_label(false, "", false, now - 2 * 3600, now),
+            "2 h",
             "a writer note's caption is its creation moment"
         );
         // The detached marker survives on both families.
@@ -23618,8 +23671,8 @@ mod tests {
             "Copy · detached"
         );
         assert_eq!(
-            note_card_label(false, "", true, day * 86_400 + 14 * 3600 + 32 * 60, now),
-            "14:32 · detached"
+            note_card_label(false, "", true, now - 2 * 3600, now),
+            "2 h · detached"
         );
     }
 

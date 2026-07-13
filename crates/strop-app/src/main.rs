@@ -445,13 +445,13 @@ fn main() {
         cx.on_app_quit(move |cx| {
             // Finding 7 / LAW 2: an open transient field must not lose its
             // content to the quit. Flush the composer (synchronous doc mutation)
-            // and the single-line fields (rename/goal/alt, via their Commit
-            // subscriptions) in a SEPARATE update, so those subscriptions'
-            // effects deliver — writing their edits into the doc — BEFORE the
-            // save update below serializes it.
+            // and every single-line field (including link and cold-read
+            // reaction) in a SEPARATE update, so their resolution effects
+            // deliver — writing edits into the doc — BEFORE the save update
+            // below serializes it.
             editor.update_checked(cx, |editor, cx| {
                 editor.commit_composer_no_focus(cx);
-                editor.commit_transient_fields_on_gesture(cx);
+                editor.commit_transient_fields_on_quit(cx);
             });
             editor.update_checked(cx, |editor, _| {
                 editor.save_now();

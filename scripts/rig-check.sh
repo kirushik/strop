@@ -147,6 +147,18 @@ SEL1=$(echo "$C1" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')
 SEL2=$(echo "$C2" | grep -oE '"sel":\[[0-9]+,[0-9]+\]' | sed 's/"sel"://')
 expect "the dead-zone exit restores the saved caret" "$SEL1" "$SEL2"
 
+echo "rig-check: keyboard composer exits share the empty-discard law"
+DOCC6=$(mktemp --suffix=.md); cp "$DOC2" "$DOCC6"
+OUT=$(WRUN_TAIL=40 scripts/wrun.sh "$DOCC6" "select:para ctrl-m enter dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+rm -f "$DOCC6" "$DOCC6.strop"
+[ -n "$OUT" ] || { echo "  FAIL no dump (keyboard empty-discard)"; exit 1; }
+expect "Enter discards an untouched composer"  0 "$(field "$OUT" open_notes)"
+DOCC7=$(mktemp --suffix=.md); cp "$DOC2" "$DOCC7"
+OUT=$(WRUN_TAIL=40 scripts/wrun.sh "$DOCC7" "select:para ctrl-m h i enter dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+rm -f "$DOCC7" "$DOCC7.strop"
+[ -n "$OUT" ] || { echo "  FAIL no dump (keyboard typed-commit)"; exit 1; }
+expect "Enter commits a typed composer"         1 "$(field "$OUT" open_notes)"
+
 echo "rig-check: off-screen cards land in exactly one honest bucket"
 # Scroll the anchors far off the top: culled cards count as 'above' — EXCEPT
 # the selected card, which is exempt from the cull (you're working it) and
@@ -577,6 +589,14 @@ expect "the lane carries the session card"    1 "$(field "$CR1" lane)"
 expect "a second reaction joins the lane"     2 "$(field "$CR2" lane)"
 expect "both are ordinary open notes"         2 "$(field "$D2" open_notes)"
 expect "they live on after the room closes"   2 "$(field "$D3" open_notes)"
+
+echo "rig-check: quit flushes an open cold-read reaction"
+DOCQ=$(mktemp --suffix=.md); cp "$DOC" "$DOCQ"
+WRUN_TAIL=80 scripts/wrun.sh "$DOCQ" "coldread:open coldread:select:5,40 coldread:raise h i" >/dev/null 2>&1
+OUT=$(WRUN_TAIL=40 scripts/wrun.sh "$DOCQ" "dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+rm -f "$DOCQ" "$DOCQ.strop"
+[ -n "$OUT" ] || { echo "  FAIL no dump (quit-flush cold read)"; exit 1; }
+expect "quit files the unfinished reaction"    1 "$(field "$OUT" open_notes)"
 
 # D1 — the open note owns its keys. The original bug: a space mid-note flipped
 # the page (which files the note first), so a two-word reaction became "one word
