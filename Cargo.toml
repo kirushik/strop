@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
-strop-core = { path = "crates/strop-core" }
+strop-core = { path = "crates/strop-core", version = "0.1.1" }
 ropey = "1.6"
 loro = "1"
 serde = { version = "1", features = ["derive"] }
@@ -23,8 +23,8 @@ similar = { version = "3", features = ["unicode"] }
 glob = "0.3"
 
 # Pinned to a FORK of zed-industries/zed — github.com/kirushik/zed, branch
-# `strop-patches-on-main`, tip `c0a1cafa`: the two gpui-tree fixes below rebased
-# onto upstream main (origin/main @ 69b602c7, 2026-06-18) plus an `image` trim.
+# `strop-patches-on-main`, tip `994cdfd1`: the two gpui-tree fixes below rebased
+# onto upstream stable v1.10.2 (adc60ccf, 2026-07-10), plus dependency trims.
 # 2026-06-19 dependency review (docs/dependency-review-2026-06.md): -43 crates vs
 # the old f3f236eb pin (826 -> 783) — async-std/async-tar gone (cleared
 # RUSTSEC-2025-0052). The image trim additionally stops compiling avif(rav1e)/exr
@@ -43,6 +43,8 @@ glob = "0.3"
 #     glyph corruption (docs/UPSTREAM-gpui-scale-bug.md).
 #   - gpui: narrow `image` to png/jpeg/webp/gif/bmp/tiff/ico/pnm in the
 #     gpui-family crates (default features drag in the rav1e AV1 encoder, exr, qoi).
+#   - gpui: put SVG text/font support behind `svg-text`; Strop deliberately does
+#     not enable it, so SVG shapes/images remain while rustybuzz is absent.
 # The two bug-fix commits head upstream as separate PRs; point back at
 # zed-industries/zed once they land. Apps need both the `gpui` facade and
 # `gpui_platform` (selects gpui_linux/gpui_wgpu on Linux):
@@ -56,8 +58,8 @@ glob = "0.3"
 # whole UI renders invisible. That was issue #10 (github.com/kirushik/strop/
 # issues/10); the flag is a no-op on the Linux build (gpui_macos is a
 # cfg(target_os = "macos") dep, so nothing forwards there).
-gpui = { git = "https://github.com/kirushik/zed", rev = "c0a1cafaef4e8d8060fa62e0a66c530433b353ba", default-features = false, features = ["font-kit", "wayland", "x11"] }
-gpui_platform = { git = "https://github.com/kirushik/zed", rev = "c0a1cafaef4e8d8060fa62e0a66c530433b353ba", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui = { git = "https://github.com/kirushik/zed", rev = "994cdfd1a274030628911b607fcee96cedbce059", version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/kirushik/zed", rev = "994cdfd1a274030628911b607fcee96cedbce059", version = "0.1.0", default-features = false, features = ["font-kit", "wayland", "x11"] }
 
 [profile.dev]
 # gpui is a huge dep tree; keep its codegen optimized even in dev builds
