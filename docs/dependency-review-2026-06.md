@@ -50,7 +50,11 @@ where the big cuts were made.
 
 ## Changes made
 
-### Fork (`kirushik/zed`, branch `strop-patches-on-main`, tip `c0a1cafa`)
+### Fork (`kirushik/zed`, branch `strop-patches-on-main`, then-tip `c0a1cafa`)
+
+> Historical section: these measurements describe the June 2026 pin. The living
+> pin and patch list moved to upstream stable `v1.10.2` on 2026-07-13; see
+> [`gpui-fork.md`](gpui-fork.md).
 
 1. **Rebased the two gpui-tree patches onto upstream `main`** (origin/main @
    `69b602c7`, 2026-06-18 — 122 commits past the old base). Both patch files are
@@ -122,7 +126,7 @@ upstreamed), not a manifest tweak. Rough sizes in Strop's current tree:
 | Accessibility: `accesskit`/`accesskit_unix`/`atspi*` | ~25 | hard deps in gpui + gpui_linux, woven through window/div/text | `zbus` would stay (see below). |
 | Keyring: `oo7` (+ `aes`/`cipher`) | ~10–15 | hard dep in gpui_linux, 3 call sites in `linux/platform.rs` | `zbus` stays — `ashpd` needs it for the file dialogs Strop *does* use. |
 
-## Finalize — done
+## Finalize — done (June 2026 snapshot)
 
 1. **Fork pushed:** `strop-patches-on-main` is on `kirushik/zed`, tip
    `c0a1cafaef4e8d8060fa62e0a66c530433b353ba` (re-signed — byte-identical tree to
@@ -134,7 +138,7 @@ upstreamed), not a manifest tweak. Rough sizes in Strop's current tree:
    as well. The remaining three ignores (`paste`, `atomic-polyfill`,
    `proc-macro-error2`) are still present in the tree and stay.
 
-Standing fork details (branch, the three commits, re-sync recipe) live in
+Current fork details (stable base, four commits, re-sync recipe) live in
 [`gpui-fork.md`](gpui-fork.md).
 
 ## How to re-measure
