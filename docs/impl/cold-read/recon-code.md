@@ -230,11 +230,10 @@ main.rs:46–52 — Literata was replaced after variable-font-derived statics
 corrupted in gpui's shaping/atlas path; **prefer static-instance TTFs for
 any new face**.
 
-**gpui registration API** (fork provenance: strop's Cargo.toml:59–60 pins
-`gpui`/`gpui_platform` to `github.com/kirushik/zed` rev `c0a1cafa`; the
-local checkout is `/home/kirushik/Code/Thirdparty/zed` — NOT
-`Personal/Thirdparty` — branch `strop-patches-on-main`, one macOS-only
-commit ahead of the pin):
+**gpui registration API** (fork provenance updated 2026-07-13: Strop's root
+Cargo.toml pins `gpui`/`gpui_platform` to `github.com/kirushik/zed` rev
+`994cdfd1`, branch `strop-patches-on-main`, based on stable `v1.10.2` plus the
+four patches documented in `docs/gpui-fork.md`):
 - `TextSystem::add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) ->
   Result<()>` — crates/gpui/src/text_system.rs:102; trait method
   platform.rs:813. Platform impls: Linux cosmic-text
