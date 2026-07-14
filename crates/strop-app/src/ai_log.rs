@@ -16,9 +16,14 @@ pub struct PassLog<'a> {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub retries: u8,
-    pub repair_attempted: bool,
+    pub latency_ms: u64,
+    pub request_id: Option<&'a str>,
     pub accepted: usize,
     pub rejected: usize,
+    pub language: &'a str,
+    pub language_source: &'a str,
+    pub language_confidence: Option<f64>,
+    pub language_reliable: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -65,12 +70,16 @@ pub fn now_ms() -> i64 {
 }
 
 pub fn provider_host(base_url: &str) -> String {
-    base_url
+    let authority = base_url
         .trim_start_matches("https://")
         .trim_start_matches("http://")
-        .split('/')
+        .split(['/', '?', '#'])
         .next()
-        .unwrap_or("custom")
+        .unwrap_or("custom");
+    authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
         .to_owned()
 }
 
@@ -85,5 +94,9 @@ mod tests {
             "example.test"
         );
         assert_eq!(provider_host("http://localhost:11434/v1"), "localhost:11434");
+        assert_eq!(
+            provider_host("https://user:sk-live-abc@example.test/v1"),
+            "example.test"
+        );
     }
 }

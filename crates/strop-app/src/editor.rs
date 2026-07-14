@@ -338,6 +338,13 @@ struct DeferredPass {
     scope: Option<strop_core::diagnose::PromptScope>,
     generation: u64,
 }
+
+#[derive(Clone)]
+struct AiLanguageCache {
+    revision: u64,
+    configured: String,
+    resolved: strop_core::language::ResolvedLanguage,
+}
 /// At most this many AI (Layer-B) cards render FULL-SIZE at once; past the
 /// budget, older passes RECEDE to a one-line card at their anchor — smaller,
 /// never hidden (dense marginalia shrink; they don't get filed in a drawer).
@@ -1276,6 +1283,9 @@ pub struct Editor {
     /// AI pass lifecycle, rendered as the margin's first card (PLAN.md
     /// E3): teaches setup, shows progress, names failures actionably.
     ai_status: Option<AiStatus>,
+    /// Whole-manuscript language resolution is provider-independent and shared
+    /// by every selection until either the document or [ai].language changes.
+    ai_language_cache: Option<AiLanguageCache>,
     /// Bumped on every run and on cancel: an in-flight response from an
     /// older generation is silently dropped.
     ai_generation: u64,
@@ -2067,6 +2077,7 @@ impl Editor {
             config: Config::default(),
             focus: CardFocus::Idle,
             ai_status: None,
+            ai_language_cache: None,
             pending_pass: None,
             deferred_pass: None,
             last_text_edit: None,
@@ -4315,6 +4326,27 @@ impl Editor {
         }
     }
 
+    fn resolved_ai_language(
+        &mut self,
+        manuscript: &str,
+    ) -> strop_core::language::ResolvedLanguage {
+        let revision = self.doc.revision();
+        let configured = self.config.ai.language.trim().to_owned();
+        if let Some(cache) = &self.ai_language_cache
+            && cache.revision == revision
+            && cache.configured == configured
+        {
+            return cache.resolved.clone();
+        }
+        let resolved = strop_core::language::resolve(manuscript, &configured);
+        self.ai_language_cache = Some(AiLanguageCache {
+            revision,
+            configured,
+            resolved: resolved.clone(),
+        });
+        resolved
+    }
+
     fn run_pass(&mut self, kind: PassKind, cx: &mut Context<Self>) {
         if matches!(self.ai_status, Some(AiStatus::Running { .. })) {
             return;
@@ -4377,11 +4409,7 @@ impl Editor {
                 return;
             }
         };
-        let target_language = match self.config.language {
-            crate::config::Language::Ru => "ru",
-            crate::config::Language::En => "en",
-            crate::config::Language::Auto => "the dominant language of TARGET",
-        };
+        let target_language = self.resolved_ai_language(&manuscript);
         self.ai_generation += 1;
         let generation = self.ai_generation;
         self.ai_status = Some(AiStatus::Running {
@@ -4408,82 +4436,38 @@ impl Editor {
                         &scope.target,
                         &scope.context_before,
                         &scope.context_after,
-                        target_language,
+                        &target_language.prompt_name,
                     );
+                    let schema = strop_core::diagnose::response_schema(kind.mode_str());
                     let response = client
-                        .chat(&system, &user, 2048)
+                        .chat_structured(&system, &user, 2048, &schema)
                         .map_err(AiFailure::Llm)?;
                     if let Some(refusal) = &response.refusal {
-                        return Err(AiFailure::Parse(format!(
-                            "the model refused this request: {refusal}"
-                        )));
+                        return Err(AiFailure::Refusal(refusal.clone()));
                     }
-                    let first = strop_core::diagnose::parse_for(
+                    let report = match strop_core::diagnose::parse_for(
                         &response.content,
                         kind.mode_str(),
-                    );
-                    let mut parse_error = None;
-                    let (mut diagnoses, repair_items, rejected) = match first {
-                        Ok(report) => {
-                            let rejected = report.rejected.len();
-                            (report.diagnoses, report.rejected, rejected)
-                        }
+                    ) {
+                        Ok(report) => report,
                         Err(error) => {
-                            let stop = response
+                            if response
                                 .finish_reason
                                 .as_deref()
-                                .map(|reason| format!("; completion stopped: {reason}"))
-                                .unwrap_or_default();
-                            parse_error = Some(format!("{error}{stop}"));
-                            (Vec::new(), Vec::new(), 1)
+                                .is_some_and(|reason| reason == "length")
+                            {
+                                return Err(AiFailure::Truncated(error));
+                            }
+                            return Err(AiFailure::Parse(error));
                         }
                     };
-                    let initial_valid = diagnoses.len();
-                    if rejected > 0 {
-                        let repair_system =
-                            strop_core::diagnose::repair_system_prompt(kind.mode_str());
-                        let repair_user = strop_core::diagnose::repair_user_prompt(
-                            &response.content,
-                            &scope,
-                            target_language,
-                            &repair_items,
-                        );
-                        match client.chat(&repair_system, &repair_user, 2048) {
-                            Ok(repair) if repair.refusal.is_none() => {
-                                if let Ok(report) = strop_core::diagnose::parse_for(
-                                    &repair.content,
-                                    kind.mode_str(),
-                                ) {
-                                    for diagnosis in report.diagnoses {
-                                        let duplicate = diagnoses.iter().any(|existing| {
-                                            existing.quote == diagnosis.quote
-                                                && existing.problem == diagnosis.problem
-                                        });
-                                        if !duplicate {
-                                            diagnoses.push(diagnosis);
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) if diagnoses.is_empty() => {
-                                return Err(AiFailure::Parse(format!(
-                                    "{}; repair request failed: {error}",
-                                    parse_error.as_deref().unwrap_or("invalid diagnosis reply")
-                                )));
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                    if diagnoses.is_empty() && rejected > 0 {
+                    if report.diagnoses.is_empty() && !report.rejected.is_empty() {
                         return Err(AiFailure::Parse(
-                            parse_error.unwrap_or_else(|| {
-                                "the reply contained no valid diagnosis items".into()
-                            }),
+                            strop_core::diagnose::rejection_summary(&report),
                         ));
                     }
-                    let recovered = diagnoses.len().saturating_sub(initial_valid);
-                    let unrecovered = rejected.saturating_sub(recovered);
+                    let rejected = report.rejected.len();
+                    let diagnoses = report.diagnoses;
                     crate::ai_log::record(&crate::ai_log::PassLog {
                         t_unix_ms: crate::ai_log::now_ms(),
                         provider: crate::ai_log::provider_host(&base_url),
@@ -4499,11 +4483,16 @@ impl Editor {
                         prompt_tokens: response.usage.prompt_tokens,
                         completion_tokens: response.usage.completion_tokens,
                         retries: response.retries,
-                        repair_attempted: rejected > 0,
+                        latency_ms: response.latency_ms,
+                        request_id: response.request_id.as_deref(),
                         accepted: diagnoses.len(),
-                        rejected: unrecovered,
+                        rejected,
+                        language: &target_language.code,
+                        language_source: target_language.source.as_str(),
+                        language_confidence: target_language.confidence,
+                        language_reliable: target_language.reliable,
                     });
-                    Ok((diagnoses, unrecovered, scope))
+                    Ok((diagnoses, rejected, scope))
                 })
                 .await;
             this.update(cx, |editor: &mut Editor, cx| {
@@ -17320,6 +17309,8 @@ enum AiStatus {
 /// next action, never a bare status code.
 enum AiFailure {
     Llm(strop_core::llm::LlmError),
+    Refusal(String),
+    Truncated(String),
     Parse(String),
 }
 
@@ -17431,13 +17422,7 @@ fn pick_local_model(models: Vec<String>) -> Option<String> {
 }
 
 fn host_of(base_url: &str) -> String {
-    base_url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or(base_url)
-        .to_owned()
+    crate::ai_log::provider_host(base_url)
 }
 
 fn env_key_set() -> bool {
@@ -17462,6 +17447,8 @@ impl AiFailure {
             Self::Llm(E::Provider(_)) => "provider",
             Self::Llm(E::Network(_)) => "network",
             Self::Llm(E::Shape(_)) => "response_shape",
+            Self::Refusal(_) => "refusal",
+            Self::Truncated(_) => "output_length",
             Self::Parse(_) => "diagnosis_contract",
         }
     }
@@ -17477,6 +17464,11 @@ impl AiFailure {
             Self::Llm(E::Provider(m)) => (format!("{host} returned an error"), m),
             Self::Llm(E::Network(m)) => (format!("Couldn't reach {host}"), m),
             Self::Llm(E::Shape(m)) => (format!("Unusable reply from {model}"), m),
+            Self::Refusal(m) => (format!("{model} declined this read"), m),
+            Self::Truncated(m) => (
+                format!("{model}'s reply ended before it was complete"),
+                m,
+            ),
             Self::Parse(m) => (
                 format!("{model} replied, but the diagnosis could not be read"),
                 m,

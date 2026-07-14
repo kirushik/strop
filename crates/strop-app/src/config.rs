@@ -52,6 +52,9 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Generated editorial fields: "auto" or any ISO/BCP-47-style language
+    /// tag. This is independent of the narrow top-level typograph language.
+    pub language: String,
     /// Default levels-of-edit depth: "developmental" | "line" | "copy".
     pub mode: String,
 }
@@ -88,6 +91,9 @@ base_url = ""
 # and export STROP_API_KEY instead (the environment variable wins).
 api_key = ""
 model = ""
+# Reply language for generated card titles and questions. Auto resolves the
+# whole manuscript locally; selections inherit it. Any language tag is allowed.
+language = "auto"
 # Default depth of the editorial pass: "developmental" | "line" | "copy".
 mode = "line"
 
@@ -176,6 +182,7 @@ mod tests {
         assert_eq!(config.language, Language::Ru);
         assert_eq!(config.ai.base_url, "https://api.poe.com/v1");
         assert!(config.ai.api_key.is_empty());
+        assert!(config.ai.language.is_empty(), "old configs default to auto");
         // Empty/missing input is fine too.
         let default: Config = toml::from_str("").unwrap();
         assert!(!default.auto_copy_selection);
@@ -190,6 +197,7 @@ mod template_tests {
     fn template_parses_as_valid_config() {
         let config: Config = toml::from_str(TEMPLATE).expect("template must stay valid TOML");
         assert!(!config.ai.configured(), "template starts unconfigured");
+        assert_eq!(config.ai.language, "auto");
         assert_eq!(config.ai.mode, "line");
     }
 }

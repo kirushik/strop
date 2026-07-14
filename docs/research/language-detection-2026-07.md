@@ -105,6 +105,15 @@ an eight-word draft correctly. A small multilingual fixture suite plus opt-in,
 redacted tester reports should decide that threshold before it becomes a hard
 contract.
 
+Implementation note, 2026-07-14: the unrestricted detector now resolves the
+whole manuscript and is cached by document revision plus configured override.
+`[ai].language` accepts `auto` or a sanitized language tag independently of the
+top-level English/Russian typograph setting. The provisional deterministic
+boundary is twenty alphabetic characters; shorter material falls back to
+English unless explicitly tagged. Diagnostics record only the code, source,
+confidence, and reliability. Corpus-backed adjustment of that boundary remains
+evaluation work.
+
 ## Release evaluation
 
 Build fixtures at three scales: shared/ambiguous phrases, 1–3 ordinary

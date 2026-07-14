@@ -7,12 +7,13 @@
 //!   a dummy header).
 //! - `max_completion_tokens`, except base URLs that look like ollama
 //!   (the one holdout still documenting only `max_tokens`).
-//! - NO universal `response_format`: structured output stays a prompt-and-
-//!   validate contract until an endpoint-specific shim proves otherwise.
+//! - JSON Schema output on the three endpoints that document it (OpenAI,
+//!   OpenRouter, Ollama); prompt-and-validate remains authoritative everywhere.
 //! - OpenRouter can put errors inside an HTTP 200 body — always check.
 //! - Blocking ureq; callers run this on a background thread.
 
 use std::time::Duration;
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -55,6 +56,7 @@ pub struct ChatResult {
     pub usage: TokenUsage,
     pub request_id: Option<String>,
     pub retries: u8,
+    pub latency_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -111,36 +113,96 @@ impl LlmClient {
         body
     }
 
-    /// Blocking chat-completion call. Run on a background thread. A transient
-    /// network failure or 429 gets one retry; auth and response errors do not.
-    pub fn chat(&self, system: &str, user: &str, max_tokens: u32) -> Result<ChatResult, LlmError> {
-        let body = self.request_body(system, user, max_tokens);
-        match self.chat_once(&body) {
-            Ok(result) => Ok(result),
-            Err(LlmError::Network(_)) | Err(LlmError::RateLimited(_)) => {
-                std::thread::sleep(Duration::from_millis(300));
-                self.chat_once(&body).map(|mut result| {
-                    result.retries = 1;
-                    result
-                })
-            }
-            Err(error) => Err(error),
-        }
+    fn supports_json_schema(&self) -> bool {
+        self.base_url.contains("api.openai.com")
+            || self.base_url.contains("openrouter.ai")
+            || self.base_url.contains("11434")
+            || self.base_url.contains("ollama")
     }
 
-    fn chat_once(&self, body: &serde_json::Value) -> Result<ChatResult, LlmError> {
-        let mut response = self
+    pub fn structured_request_body(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        schema: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut body = self.request_body(system, user, max_tokens);
+        if self.supports_json_schema() {
+            body["response_format"] = json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "strop_diagnoses",
+                    "strict": true,
+                    "schema": schema,
+                },
+            });
+        }
+        body
+    }
+
+    /// Blocking chat-completion call. Run on a background thread. A transient
+    /// network failure, 429, or selected 5xx gets one bounded retry; auth and
+    /// stable request errors do not.
+    pub fn chat(&self, system: &str, user: &str, max_tokens: u32) -> Result<ChatResult, LlmError> {
+        let body = self.request_body(system, user, max_tokens);
+        self.chat_body(&body)
+    }
+
+    pub fn chat_structured(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        schema: &serde_json::Value,
+    ) -> Result<ChatResult, LlmError> {
+        let body = self.structured_request_body(system, user, max_tokens, schema);
+        self.chat_body(&body)
+    }
+
+    fn chat_body(&self, body: &serde_json::Value) -> Result<ChatResult, LlmError> {
+        let started = Instant::now();
+        let first = self.chat_once(body);
+        let (result, retries) = if first.retryable {
+            std::thread::sleep(first.retry_after.unwrap_or_else(fallback_retry_delay));
+            (self.chat_once(body).result, 1)
+        } else {
+            (first.result, 0)
+        };
+        result.map(|mut result| {
+            result.retries = retries;
+            result.latency_ms = started.elapsed().as_millis() as u64;
+            result
+        })
+    }
+
+    fn chat_once(&self, body: &serde_json::Value) -> ChatAttempt {
+        let response = self
             .agent
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", &format!("Bearer {}", self.api_key))
-            .send_json(body)
-            .map_err(|e| LlmError::Network(e.to_string()))?;
+            .send_json(body);
+        let mut response = match response {
+            Ok(response) => response,
+            Err(error) => return ChatAttempt::retryable(LlmError::Network(error.to_string()), None),
+        };
         let status = response.status().as_u16();
-        let text = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| LlmError::Network(e.to_string()))?;
-        parse_chat_response(status, &text)
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(retry_after_delay);
+        let text = match response.body_mut().read_to_string() {
+            Ok(text) => text,
+            Err(error) => {
+                return ChatAttempt::retryable(LlmError::Network(error.to_string()), retry_after);
+            }
+        };
+        ChatAttempt {
+            result: parse_chat_response(status, &text),
+            retryable: retryable_status(status),
+            retry_after,
+        }
     }
 
     /// GET {base}/models — the answer to "model not found": list what the
@@ -162,6 +224,44 @@ impl LlmClient {
             .map_err(|e| LlmError::Network(e.to_string()))?;
         parse_models_response(status, &text)
     }
+}
+
+struct ChatAttempt {
+    result: Result<ChatResult, LlmError>,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+impl ChatAttempt {
+    fn retryable(error: LlmError, retry_after: Option<Duration>) -> Self {
+        Self {
+            result: Err(error),
+            retryable: true,
+            retry_after,
+        }
+    }
+}
+
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// LLM providers normally send delta-seconds. Clamp an upstream value so a
+/// malformed or hostile header cannot park the one background request forever.
+fn retry_after_delay(value: &str) -> Option<Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| Duration::from_secs(seconds.min(30)))
+}
+
+fn fallback_retry_delay() -> Duration {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_millis() as u64 % 200)
+        .unwrap_or(0);
+    Duration::from_millis(500 + jitter)
 }
 
 #[derive(Deserialize)]
@@ -248,6 +348,7 @@ fn parse_chat_response(status: u16, text: &str) -> Result<ChatResult, LlmError> 
         usage: response.usage,
         request_id: response.id,
         retries: 0,
+        latency_ms: 0,
     })
 }
 
@@ -339,6 +440,40 @@ mod tests {
         let body = ollama.request_body("s", "u", 500);
         assert_eq!(body["max_tokens"], 500);
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn structured_output_is_an_opportunistic_host_shim() {
+        let schema = json!({"type":"object"});
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            "http://localhost:11434/v1",
+        ] {
+            let client = LlmClient::new(base_url, "k", "model");
+            let body = client.structured_request_body("s", "u", 100, &schema);
+            assert_eq!(body["response_format"]["type"], "json_schema");
+            assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        }
+
+        let poe = LlmClient::new("https://api.poe.com/v1", "k", "model");
+        assert!(poe
+            .structured_request_body("s", "u", 100, &schema)
+            .get("response_format")
+            .is_none());
+    }
+
+    #[test]
+    fn retry_policy_covers_transient_status_and_bounds_provider_delay() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(retryable_status(status));
+        }
+        for status in [400, 401, 403, 404, 501] {
+            assert!(!retryable_status(status));
+        }
+        assert_eq!(retry_after_delay("7"), Some(Duration::from_secs(7)));
+        assert_eq!(retry_after_delay("999"), Some(Duration::from_secs(30)));
+        assert_eq!(retry_after_delay("tomorrow"), None);
     }
 
     #[test]

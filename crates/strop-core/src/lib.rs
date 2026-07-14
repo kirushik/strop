@@ -10,6 +10,7 @@ pub mod diff;
 pub mod document;
 pub mod images;
 pub mod journal;
+pub mod language;
 pub mod llm;
 pub mod markdown;
 pub mod store;

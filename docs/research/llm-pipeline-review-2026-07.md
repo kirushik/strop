@@ -514,6 +514,14 @@ declines an oversized whole read. The follow-ups cap TARGET plus CONTEXT at
 passages when either context budget is tight. The fixed output reserve and
 post-0.2 hierarchical workflow remain open work.
 
+Audit follow-up, 2026-07-14: the estimator now applies a whole-source
+`characters / 4` floor, including whitespace, so the token fuse also bounds raw
+request size. Paragraph context walks linearly and really includes the promised
+two passages on either side. Tibetan, Bopomofo, and decomposed Hangul Jamo join
+the dense-script table. The prematurely implemented semantic repair call was
+removed: valid siblings land after one response, while a later repair phase
+remains gated on the UX and state-machine review in `impl/11-llm-repair-flow.md`.
+
 The cold-reading behavior does not fill this gap. For sufficiently long
 manuscripts, cold read opens at the caret's current chapter. Its chapter
 heuristic finds the shallowest heading level that occurs at least twice, then
@@ -694,10 +702,12 @@ labelled unknown rather than guessed.
 - Implement the deterministic parse ladder.
 - Validate items independently and report partial success.
 - Enforce hard invariants; measure soft editorial constraints.
-- Add one bounded repair turn and separate transport retry policy.
+- Add opportunistic provider-side JSON Schema and a separate bounded transport
+  retry policy. Keep semantic repair deferred until its reviewed UX exists.
 
-Success criterion: malformed presentation no longer loses valid cards, repair
-never creates an ungrounded card, and retries are bounded and visible.
+Success criterion: malformed presentation no longer loses valid siblings,
+surplus output never causes another paid call, and transport retries are
+bounded.
 
 ### Phase 2 — explicit language
 
@@ -708,6 +718,12 @@ never creates an ungrounded card, and retries are bounded and visible.
 
 Success criterion: repeated Russian runs produce Russian `problem` and `query`
 fields at the agreed threshold, independent of English system prompts.
+
+Implementation note, 2026-07-14: unrestricted Whatlang resolution now runs on
+the whole manuscript and is cached by document revision. `[ai].language`
+accepts `auto` or a sanitized language tag independently of the narrow
+English/Russian typograph setting. The prompt names `problem` and `query`
+separately so the title cannot be mistaken for schema chrome.
 
 ### Phase 3 — minimal provider shims
 
