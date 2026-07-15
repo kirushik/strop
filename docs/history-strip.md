@@ -132,7 +132,16 @@ lays the first flecks and the sheet grows rightward from there.
 writer added are amber `#C8A951`; words the writer cut are the darker
 burnt amber `#8A6D35` (value contrast — legible colorblind, P10; both
 warm — the writer did both, and the fabric's warmth is the standing
-proof the machine never writes).
+proof the machine never writes). One honesty debt, named by the v3
+panel (Tufte): v0.2 never counted cut words — the journal drops the
+deleted text and the strip estimates its words from character count
+at a fixed ratio, so half the quant was an estimate wearing a law.
+v3 counts the words *before the text is let go* (`del_words` on the
+run, §6); legacy runs keep the estimate, and an estimate may never
+grow expressiveness of its own. And a boundary the same panel forced
+into words: a run's *bounds and counts* are testimony; the placement
+of grains within those bounds is typography — deterministic, seeded,
+carrying no meaning — and no reading may ever depend on it.
 
 **x = working time, one fixed scale** (1 px ≈ 30 s, product-wide,
 never per-document). Gaps over ~15 min fold into **wells** — recessed
@@ -178,7 +187,15 @@ reach for zoom is served without it:
 If a future round finds a visit these four cannot serve, it argues
 here first. Density-adaptive rebinning, three-altitude modes, and
 held "focus" emphasis states were all re-examined this round and
-re-killed (§5).
+re-killed (§5). The strongest standing objection is recorded rather
+than resolved: the v3 panel's three analytical lenses (Tufte's macro
+reading, Victor's whole-trail-as-object, Engelbart's level-clipping)
+independently converged on the same wound — at year scale the fixed
+quant shows the whole story to no one, only a slit onto it. If that
+visit (the mirror, the story of the draft — V9/V10) proves real, the
+answer is a second *portrayal* of the same record living OUTSIDE the
+strip — the sessions outline v2 §5 already reserved — never a
+re-scaled fabric.
 
 ### 1d. The rail, the page, the envelope — unchanged law
 
@@ -247,7 +264,9 @@ before it, the record doesn't say.* No dotted segment reaches back to
 the raise — a dotted line still draws a y, which is the same lie
 restyled. If nothing before today is provable, the card shows only
 its terminal; if a closed card left no surviving annotation, it shows
-nothing. A restore the record cannot carry a card across breaks the
+nothing. (Rig gate, panel-demanded: the diamond must read as "the
+record begins here", never as the card's raise — if corridor testing
+shows it read as an event, it dies and plain absence ships.) A restore the record cannot carry a card across breaks the
 thread: two solid segments separated by a 6-px blank with opposing
 3-px cap ticks — *a break in a thread is a restore the record could
 not carry the card across.*
@@ -502,8 +521,14 @@ truthful about grain.)*
 - **`CardsRebased`** — a restore is a wholesale swap, deliberately
   unjournaled as runs; card correspondence across it is therefore a
   wholesale fact too, recorded as its own event (post-restore ranges,
-  statuses, dispositions — no bodies). A crash between Restore and
-  its rebase leaves the gap honest: threads break (§1e).
+  statuses, dispositions — no bodies). Restore and its rebase are one
+  logical act and commit as ONE durable generation — the panel
+  (Engelbart) correctly refused a designed two-write crash window
+  dressed as honesty. Broken threads (§1e) are for legacy records and
+  true damage, never for our own writes.
+- **`EditRun` gains `del_words`** — counted at record time, while the
+  deleted text is still in hand (the text itself stays unstored; the
+  count is cheap and makes the quant true — §1b).
 - Checkpoints store a **cursor** into this stream, never copies of it.
 - **The past margin is a pure projection**: (frozen card index, t) →
   cards. Built once at strip open; scrubbing binary-searches it and
