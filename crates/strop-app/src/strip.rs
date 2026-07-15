@@ -1210,6 +1210,94 @@ pub fn format_readout(wall_ms: i64, words: usize, now_ms: i64) -> String {
     )
 }
 
+pub fn format_word_delta(a: usize, b: usize, include_words: bool) -> String {
+    let delta = b as i64 - a as i64;
+    if delta == 0 {
+        "no word-count change".to_owned()
+    } else if include_words {
+        format!("{delta:+} words")
+    } else {
+        format!("{delta:+}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompareChipTier {
+    Full,
+    SharedDate,
+    ShortDates,
+    ActiveOnly,
+}
+
+pub struct CompareReadouts {
+    pub full_a: String,
+    pub full_b: String,
+    pub shared_date: Option<(String, String, String)>,
+    pub short_a: String,
+    pub short_b: String,
+}
+
+pub fn compare_readouts(
+    a_ms: i64,
+    a_words: usize,
+    b_ms: i64,
+    b_words: usize,
+    now_ms: i64,
+) -> CompareReadouts {
+    let a = civil(a_ms / 1000);
+    let b = civil(b_ms / 1000);
+    let (now_y, ..) = civil(now_ms / 1000);
+    let delta_words = format_word_delta(a_words, b_words, true);
+    let delta_count = format_word_delta(a_words, b_words, false);
+    let short = |(y, m, d, hh, mm, _): (i64, u32, u32, u32, u32, usize), words| {
+        let date = if y == now_y {
+            format!("{d} {}", MONTHS[(m - 1) as usize])
+        } else {
+            format!("{d} {} {y}", MONTHS[(m - 1) as usize])
+        };
+        format!("{date}, {hh:02}:{mm:02} · {} words", group_thousands(words))
+    };
+    let shared_date = (a.0, a.1, a.2).eq(&(b.0, b.1, b.2)).then(|| {
+        let prefix = if a.0 == now_y {
+            format!("{} {}", a.2, MONTHS[(a.1 - 1) as usize])
+        } else {
+            format!("{} {} {}", a.2, MONTHS[(a.1 - 1) as usize], a.0)
+        };
+        (
+            prefix,
+            format!("A · {:02}:{:02} · {} words", a.3, a.4, group_thousands(a_words)),
+            format!("B · {:02}:{:02} · {} words · {delta_count}",
+                b.3, b.4, group_thousands(b_words)),
+        )
+    });
+    CompareReadouts {
+        full_a: format!("A · {}", format_readout(a_ms, a_words, now_ms)),
+        full_b: format!("B · {} · {delta_words}", format_readout(b_ms, b_words, now_ms)),
+        shared_date,
+        short_a: format!("A · {}", short(a, a_words)),
+        short_b: format!("B · {} · {delta_count}", short(b, b_words)),
+    }
+}
+
+/// Choose the first semantic compare readout that fits. Widths are shaped
+/// measurements supplied by the caller; no datum is ever clipped or elided.
+pub fn compare_chip_tier(
+    available: f32,
+    full: f32,
+    shared_date: Option<f32>,
+    short_dates: f32,
+) -> CompareChipTier {
+    if full <= available {
+        CompareChipTier::Full
+    } else if shared_date.is_some_and(|w| w <= available) {
+        CompareChipTier::SharedDate
+    } else if short_dates <= available {
+        CompareChipTier::ShortDates
+    } else {
+        CompareChipTier::ActiveOnly
+    }
+}
+
 /// A session-start date for the bottom lane (spec §1): "Today" / "Yesterday" /
 /// "Tue 1 Jul" — real dates, never "day 12"; year when it isn't the current.
 pub fn date_label(day_secs: i64, now_secs: i64) -> String {
@@ -1358,8 +1446,12 @@ impl Strip {
     }
 
     pub fn past_margin(&self) -> Vec<PastCard<'_>> {
+        self.past_margin_at(self.pos_ms)
+    }
+
+    pub fn past_margin_at(&self, at_ms: i64) -> Vec<PastCard<'_>> {
         self.bake.as_ref().and_then(|b| b.card_history.as_ref())
-            .map_or_else(Vec::new, |index| index.past_margin(self.pos_ms))
+            .map_or_else(Vec::new, |index| index.past_margin(at_ms))
     }
 }
 
@@ -1418,6 +1510,19 @@ mod tests {
         assert_eq!(index.past_margin(10)[0].body.body, "first");
         assert_eq!(index.past_margin(20)[0].body.body, "second");
         assert!(index.past_margin(30).is_empty());
+    }
+
+    #[test]
+    fn compare_sides_project_independently_across_a_card_boundary() {
+        let mut j = Journal::default();
+        j.events.push(raised(10, 7, 4..8, "A-only card"));
+        j.events.push(JournalEvent::CardClosed { t: 30, id: 7, resolved: true });
+        let index = card_history_index(&j).unwrap();
+        let a = index.past_margin(20);
+        let b = index.past_margin(40);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].body.body, "A-only card");
+        assert!(b.is_empty(), "B must not inherit A's card across the close boundary");
     }
 
     #[test]
@@ -1616,6 +1721,37 @@ mod tests {
         assert!(s.contains("3,412"));
         // No station name, no "after", no verb — the template ban.
         assert!(!s.to_lowercase().contains("after"));
+    }
+
+    #[test]
+    fn compare_delta_has_all_three_exact_forms() {
+        assert_eq!(format_word_delta(2800, 3412, true), "+612 words");
+        assert_eq!(format_word_delta(3412, 2800, true), "-612 words");
+        assert_eq!(format_word_delta(3412, 3412, true), "no word-count change");
+        for delta in [
+            format_word_delta(2800, 3412, true),
+            format_word_delta(3412, 2800, true),
+            format_word_delta(3412, 3412, true),
+        ] {
+            assert!(!delta.contains("since"));
+        }
+    }
+
+    #[test]
+    fn compare_chip_tiers_follow_measured_widths() {
+        assert_eq!(compare_chip_tier(500., 480., Some(360.), 410.), CompareChipTier::Full);
+        assert_eq!(
+            compare_chip_tier(400., 480., Some(360.), 410.),
+            CompareChipTier::SharedDate
+        );
+        assert_eq!(
+            compare_chip_tier(420., 480., None, 410.),
+            CompareChipTier::ShortDates
+        );
+        assert_eq!(
+            compare_chip_tier(300., 480., Some(360.), 410.),
+            CompareChipTier::ActiveOnly
+        );
     }
 
     #[test]

@@ -407,6 +407,25 @@ const STRIP_PULSE_FRAMES: u64 = 9;
 /// shift every overlay's window-origin coordinates); the top band doubling
 /// as a resize handle over the titlebar is the conventional CSD behavior.
 const RESIZE_INSET: f32 = 8.;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StripCenterMode {
+    Naming,
+    Parked,
+    Comparing,
+}
+
+fn strip_center_mode(parked: bool, pinned: bool) -> StripCenterMode {
+    match (parked, pinned) {
+        (true, true) => StripCenterMode::Comparing,
+        (true, false) => StripCenterMode::Parked,
+        (false, _) => StripCenterMode::Naming,
+    }
+}
+
+fn compare_columns_fit(width: f32, cold_read_min: f32) -> bool {
+    (width - 72.) / 2. >= cold_read_min
+}
 /// Client-side decoration shadow gutter (docs/research/window-decorations-csd.md):
 /// on Wayland CSD the compositor draws no shadow, so the window blends into the
 /// desktop. We reserve a transparent margin on each untiled edge and paint our
@@ -1298,6 +1317,14 @@ pub struct Editor {
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
+    /// Compare's immutable A state. B remains `history_preview`, preserving
+    /// the established incremental scrub path and its frozen bake.
+    compare_preview: Option<PreviewDoc>,
+    compare_show_b: bool,
+    compare_changes: bool,
+    compare_scroll: ScrollHandle,
+    /// Quotable-past selection in the reading room: side B?, byte range.
+    compare_selection: Option<(bool, Range<usize>)>,
     /// A legacy-checkpoint backfill is in flight (one at a time; the result
     /// persists, so it can never need to run twice for the same file).
     history_backfill_running: bool,
@@ -2115,6 +2142,11 @@ impl Editor {
             quit_guard: QuitGuard::Idle,
             history_view: None,
             history_preview: None,
+            compare_preview: None,
+            compare_show_b: false,
+            compare_changes: false,
+            compare_scroll: ScrollHandle::new(),
+            compare_selection: None,
             history_backfill_running: false,
             dirty_since_checkpoint: false,
             image_assets: HashMap::new(),
@@ -3154,6 +3186,9 @@ impl Editor {
             self.strip.parked = false;
             self.strip.scrubbing = false;
             self.strip.pin_ms = None;
+            self.compare_preview = None;
+            self.compare_changes = false;
+            self.compare_selection = None;
             self.strip.pos_ms = now;
             self.strip.scratch = None;
             self.strip.view_offset = f32::MAX; // back to the tail with the new data
@@ -3196,6 +3231,9 @@ impl Editor {
         self.strip.open = true;
         self.strip.parked = false;
         self.strip.pin_ms = None;
+        self.compare_preview = None;
+        self.compare_changes = false;
+        self.compare_selection = None;
         self.strip.pos_ms = now;
         // Pin the view to the TAIL: the strip opens where the writer just was
         // (v1 opened on the oldest screenful, playhead off-screen right). The
@@ -3212,6 +3250,9 @@ impl Editor {
         self.strip.parked = false;
         self.strip.scrubbing = false;
         self.strip.pin_ms = None;
+        self.compare_preview = None;
+        self.compare_changes = false;
+        self.compare_selection = None;
         self.strip.scratch = None;
         self.strip.bake = None;
         self.strip_pulse = None;
@@ -3633,6 +3674,9 @@ impl Editor {
         self.strip.parked = false;
         self.strip.scrubbing = false;
         self.strip.pin_ms = None;
+        self.compare_preview = None;
+        self.compare_changes = false;
+        self.compare_selection = None;
         self.strip.pos_ms = now;
         self.strip.scratch = None;
         // Re-pin the view to the tail — returning to now also returns the eye.
@@ -3692,11 +3736,75 @@ impl Editor {
         });
         if clear {
             self.strip.pin_ms = None;
+            self.compare_preview = None;
+            self.compare_changes = false;
+            self.compare_selection = None;
         } else {
             self.strip.pin_ms = Some(pos_ms);
             self.strip.pin_words = self.strip_word_count_at(pos_ms);
+            // Shift-click remains an expert entrance. If it targets the
+            // parked frame, cache exactly the already reconstructed state.
+            // An arbitrary A is materialized once by the same replay helper.
+            self.compare_preview = if pos_ms == self.strip.pos_ms {
+                self.history_preview.clone()
+            } else {
+                self.strip_preview_at(pos_ms)
+            };
+            self.compare_show_b = false;
+            self.compare_changes = false;
+            self.compare_selection = None;
         }
         cx.notify();
+    }
+
+    fn strip_begin_compare(&mut self, cx: &mut Context<Self>) {
+        if !self.strip.is_parked() {
+            return;
+        }
+        self.strip.pin_ms = Some(self.strip.pos_ms);
+        self.strip.pin_words = self.strip.words_at;
+        self.compare_preview = self.history_preview.clone();
+        self.compare_show_b = false;
+        self.compare_changes = false;
+        self.compare_selection = None;
+        cx.notify();
+    }
+
+    fn strip_done_comparing(&mut self, cx: &mut Context<Self>) {
+        self.strip.pin_ms = None;
+        self.compare_preview = None;
+        self.compare_changes = false;
+        self.compare_selection = None;
+        cx.notify();
+    }
+
+    fn strip_preview_at(&self, pos_ms: i64) -> Option<PreviewDoc> {
+        let bake = self.strip.bake.as_ref()?;
+        let anchor_ms = strip::anchor_index(&bake.anchor_ms, pos_ms).map(|i| bake.anchor_ms[i]);
+        let (text, spans, blocks) = match anchor_ms {
+            Some(a) => self.checkpoint_state_at_ms(a)
+                .unwrap_or_else(|| (String::new(), SpanSet::default(), BlockMap::default())),
+            None => (String::new(), SpanSet::default(), BlockMap::default()),
+        };
+        let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
+        let mut replay = strop_core::journal::ReplayDoc::new(&text, spans, blocks, applied);
+        replay.seams_applied = anchor_ms.map_or(0, |a| self.doc.journal().seams_until(a));
+        replay.advance(self.doc.journal(), pos_ms);
+        let text = replay.text();
+        let mut idx: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+        idx.push(text.len());
+        let byte = |ci: usize| idx.get(ci).copied().unwrap_or(text.len());
+        let spans_bytes = replay.spans.spans().iter()
+            .map(|s| (byte(s.range.start)..byte(s.range.end), s.attr.clone()))
+            .collect();
+        Some(PreviewDoc {
+            text,
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+            spans_bytes,
+            kinds: replay.blocks.kinds().to_vec(),
+            boundary: replay.blocks.boundary(),
+        })
     }
 
     /// Word count of the reconstruction at `pos_ms`, computed on a THROWAWAY
@@ -8871,7 +8979,11 @@ impl Editor {
         // close it (spec §2 / review mid — restores the app-wide Esc-closes rule).
         if self.strip.open {
             if self.strip.parked {
-                self.strip_return_to_now(cx);
+                if self.strip.pin_ms.is_some() {
+                    self.strip_done_comparing(cx);
+                } else {
+                    self.strip_return_to_now(cx);
+                }
             } else {
                 self.close_strip(cx);
             }
@@ -9809,6 +9921,14 @@ impl Editor {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((side_b, range)) = self.compare_selection.clone() {
+            let (Some(a), Some(b)) = (
+                self.compare_preview.as_ref(), self.history_preview.as_ref()) else { return };
+            let text = compare_selected_text(a, b, side_b, range);
+            crate::smoke::mirror_clipboard(&text);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
         if self.selected_range.is_empty() {
             // §9: the selected picture travels as TWO entries — the
             // Markdown line (caption + alt, the honest text form) and the
@@ -17799,6 +17919,46 @@ struct PreviewDoc {
     boundary: Option<(strop_core::document::BoundaryEra, usize)>,
 }
 
+/// A deliberately structural, formatting-blind passage diff for Compare's
+/// forensic view. Common prefix/suffix stay prose; the changed middle is
+/// presented as one removal in the gutter and one warm insertion.
+fn structural_diff(a: &str, b: &str) -> (String, String, String, String) {
+    let mut prefix = 0;
+    for ((ai, ac), (bi, bc)) in a.char_indices().zip(b.char_indices()) {
+        if ai == bi && ac == bc {
+            prefix = ai + ac.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let mut a_end = a.len();
+    let mut b_end = b.len();
+    for (ac, bc) in a[prefix..].chars().rev().zip(b[prefix..].chars().rev()) {
+        if ac != bc {
+            break;
+        }
+        a_end -= ac.len_utf8();
+        b_end -= bc.len_utf8();
+    }
+    (
+        b[..prefix].to_owned(),
+        a[prefix..a_end].to_owned(),
+        b[prefix..b_end].to_owned(),
+        b[b_end..].to_owned(),
+    )
+}
+
+fn compare_selected_text(
+    a: &PreviewDoc,
+    b: &PreviewDoc,
+    side_b: bool,
+    range: Range<usize>,
+) -> String {
+    let source = if side_b { b } else { a };
+    let range = range.start.min(source.text.len())..range.end.min(source.text.len());
+    source.text.get(range).unwrap_or("").to_owned()
+}
+
 struct MarginLayout {
     /// Cards to render — packed and at least partly in view.
     cards: Vec<MarginCard>,
@@ -20856,6 +21016,10 @@ impl Render for Editor {
                 Some(banner) => d.child(banner),
                 None => d,
             })
+            .map(|d| match self.render_compare_room(window, cx) {
+                Some(room) => d.child(room),
+                None => d,
+            })
             // The cold read (impl 05 Wave B): the reading-room takeover —
             // banner + desk + page + lane, one subtree, painted over every
             // suppressed surface. The strip's parked STATE survives beneath
@@ -21956,6 +22120,126 @@ fn cr_quote(text: &str) -> String {
 }
 
 impl Editor {
+    fn render_compare_room(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let a = self.compare_preview.as_ref()?;
+        let b = self.history_preview.as_ref()?;
+        let pin = self.strip.pin_ms?;
+        let now = self.strip.bake.as_ref()?.now_ms;
+        let wide = compare_columns_fit(
+            f32::from(window.viewport_size().width), DOC_MIN_WIDTH);
+        let header = |letter: &'static str, ms, words| {
+            div().pb(px(8.)).mb(px(12.)).border_b_1().border_color(rgb(RULE_COLOR))
+                .font_family("PT Sans").text_size(px(11.)).text_color(rgb(MUTED_COLOR))
+                .child(format!("{letter} · {}", strip::format_readout(ms, words, now)))
+        };
+        let prose = |text: String| {
+            div().font_family("PT Serif").text_size(px(18.)).line_height(px(30.))
+                .text_color(rgb(TEXT_COLOR))
+                .children(text.lines().map(|line| div().child(line.to_owned())))
+        };
+        let (before, removed, added, after) = structural_diff(&a.text, &b.text);
+        let column = |letter, is_b, text: String| {
+            let text_len = text.len();
+            let selected = self.compare_selection.as_ref()
+                .is_some_and(|(side_b, range)| *side_b == is_b && !range.is_empty());
+            let (ms, words) = if is_b {
+                (self.strip.pos_ms, self.strip.words_at)
+            } else {
+                (pin, self.strip.pin_words)
+            };
+            let cards: Vec<(String, String, bool)> = self.strip.past_margin_at(ms)
+                .into_iter()
+                .map(|card| (
+                    card.body.title.clone(),
+                    card.body.body.clone(),
+                    card.anchor.is_none() || card.body.unverified,
+                ))
+                .collect();
+            div().flex_1().min_w(px(DOC_MIN_WIDTH)).max_w(px(COL_MAX_WIDTH))
+                .px(px(28.)).py(px(24.)).child(header(letter, ms, words))
+                .when(selected, |d| d.bg(rgba(0xC8A95116)))
+                // The reading room is read-only but quotable. A press selects
+                // this column's source as one continuous passage; Copy then
+                // slices that side, never the live document or the other side.
+                .on_mouse_down(MouseButton::Left,
+                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                        editor.compare_selection = Some((is_b, 0..text_len));
+                        cx.notify();
+                    }))
+                .when(self.compare_changes && is_b && !removed.is_empty(), |d| {
+                    d.child(div().ml(px(-24.)).mb(px(12.)).pl(px(8.))
+                        .border_l_2().border_color(rgb(0x8A6D35))
+                        .font_family("PT Serif").text_size(px(14.))
+                        .text_color(rgb(MUTED_COLOR))
+                        .children(removed.lines()
+                            .map(|line| div().child(line.to_owned()))))
+                })
+                .when(self.compare_changes && is_b && !added.is_empty(), |d| {
+                    d.child(prose(before.clone()))
+                        .child(div().bg(rgba(0xC8A95124)).child(prose(added.clone())))
+                        .child(prose(after.clone()))
+                })
+                .when(self.compare_changes && is_b && added.is_empty(), |d| {
+                    d.child(prose(format!("{before}{after}")))
+                })
+                .when(!self.compare_changes || !is_b, |d| d.child(prose(text)))
+                .when(!cards.is_empty(), |d| d.child(
+                    div().mt(px(20.)).pt(px(12.)).border_t_1()
+                        .border_color(rgb(RULE_COLOR)).flex().flex_col().gap(px(8.))
+                        .children(cards.into_iter().map(|(title, body, uncertain)| {
+                            div().pl(px(8.)).border_l_2()
+                                .border_color(if uncertain {
+                                    rgb(MUTED_COLOR)
+                                } else {
+                                    rgb(0x73858A)
+                                })
+                                .font_family("PT Sans").text_size(px(11.))
+                                .text_color(rgb(MUTED_COLOR))
+                                .when(!title.is_empty(), |d| {
+                                    d.child(div().font_weight(FontWeight::BOLD).child(title))
+                                })
+                                .child(body)
+                        }))
+                ))
+        };
+        let controls = div().absolute().top(px(BAR_HEIGHT + 8.)).right(px(20.))
+            .flex().items_center().gap(px(8.))
+            .child(div().id("compare-changes").cursor(CursorStyle::PointingHand)
+                .text_size(px(11.)).text_color(rgb(MUTED_COLOR)).child("Changes")
+                .on_mouse_down(MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.compare_changes = !editor.compare_changes;
+                        cx.notify();
+                    })))
+            .when(!wide, |d| d
+                .child(div().id("compare-a").cursor(CursorStyle::PointingHand).child("A")
+                    .on_mouse_down(MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            editor.compare_show_b = false; cx.notify();
+                        })))
+                .child(div().id("compare-b").cursor(CursorStyle::PointingHand).child("B")
+                    .on_mouse_down(MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            editor.compare_show_b = true; cx.notify();
+                        }))));
+        Some(div().id("compare-room").absolute().top(px(BAR_HEIGHT)).bottom(px(strip::STRIP_H))
+            .left_0().right_0().occlude().bg(rgb(0xF7F5EF)).overflow_hidden()
+            .track_scroll(&self.compare_scroll).overflow_y_scroll()
+            .flex().justify_center().gap(px(24.))
+            .when(wide, |d| d.child(column("A", false, a.text.clone()))
+                .child(column("B", true, b.text.clone())))
+            .when(!wide && !self.compare_show_b,
+                |d| d.child(column("A", false, a.text.clone())))
+            .when(!wide && self.compare_show_b,
+                |d| d.child(column("B", true, b.text.clone())))
+            .child(controls).into_any_element())
+    }
+
     /// `Read it cold` (ctrl-shift-l): enter the reading room; inside it, the
     /// same chord is the toggle-exit (Time 9 — the strip/palette precedent).
     pub(crate) fn read_it_cold(
@@ -23879,16 +24163,10 @@ impl Editor {
             .bake
             .as_ref()
             .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
-        // The readout: at now → the live count; parked → the reconstructed
-        // moment, plus any Compare delta folded into the SAME single line.
+        let center_mode = strip_center_mode(parked, self.strip.pin_ms.is_some());
+        let comparing = center_mode == StripCenterMode::Comparing;
         let readout = if parked {
-            let mut s = strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms);
-            if let Some(pin) = self.strip.pin_ms {
-                let delta = self.strip.words_at as i64 - self.strip.pin_words as i64;
-                let when = strip::date_label(pin / 1000, now_ms / 1000);
-                s = format!("{s} · {delta:+} since {when}");
-            }
-            s
+            strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms)
         } else {
             strip::format_readout(now_ms, self.word_count, now_ms)
         };
@@ -23906,15 +24184,56 @@ impl Editor {
                 .child(label)
         };
 
-        let readout_chip = chip(readout.into(), true)
-            .id("strip-readout")
-            .occlude()
-            .text_size(px(12.))
-            // Reserved width: scrubbing may only change the numerals, never
-            // re-flow the chip's neighbours (the stability law, §3).
-            .min_w(px(220.))
-            // The readout is fixed at the left end and NEVER parks (design §3).
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let readout_chip = if let Some(pin) = self.strip.pin_ms.filter(|_| parked) {
+            let forms = strip::compare_readouts(
+                pin, self.strip.pin_words, self.strip.pos_ms,
+                self.strip.words_at, now_ms);
+            let measure = |s: &str| {
+                let run = TextRun {
+                    len: s.len(),
+                    font: window.text_style().font(),
+                    color: rgb(0xE7E1D0).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                f32::from(window.text_system()
+                    .shape_line(s.into(), px(12.), &[run], None).width()) + 16.
+            };
+            let available = (desk_w - 190.).max(120.);
+            let full_w = measure(&forms.full_a) + measure(&forms.full_b) + 6.;
+            let shared_w = forms.shared_date.as_ref().map(|(date, a, b)| {
+                measure(date) + measure(a) + measure(b) + 12.
+            });
+            let short_w = measure(&forms.short_a) + measure(&forms.short_b) + 6.;
+            let tier = strip::compare_chip_tier(
+                available, full_w, shared_w, short_w);
+            let (a, b, date) = match tier {
+                strip::CompareChipTier::Full =>
+                    (Some(forms.full_a), forms.full_b, None),
+                strip::CompareChipTier::SharedDate => {
+                    let (date, a, b) = forms.shared_date
+                        .expect("the shared-date tier requires a shared date");
+                    (Some(a), b, Some(date))
+                }
+                strip::CompareChipTier::ShortDates =>
+                    (Some(forms.short_a), forms.short_b, None),
+                strip::CompareChipTier::ActiveOnly =>
+                    (None, forms.full_b, None),
+            };
+            let b_chip = chip(b.into(), true).text_size(px(12.));
+            div().id("strip-readout").occlude().flex().items_center().gap(px(6.))
+                .when_some(date, |d, date| d.child(
+                    chip(date.into(), false).text_size(px(12.))))
+                .when_some(a, |d, a| d.child(
+                    chip(a.into(), false).text_size(px(12.))))
+                .child(b_chip)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        } else {
+            div().id("strip-readout").occlude()
+                .child(chip(readout.into(), true).text_size(px(12.)).min_w(px(220.)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
 
         let restore_btn = div()
             .id("strip-restore")
@@ -23995,7 +24314,15 @@ impl Editor {
                 })
                 .child(label)
         };
-        let center = if let Some(input) = self.strip_name_input.clone() {
+        let center = if comparing {
+            quiet_action("Done comparing").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.strip_done_comparing(cx);
+                }),
+            )
+        } else if let Some(input) = self.strip_name_input.clone() {
             let empty = input.read(cx).content.is_empty();
             div()
                 .relative()
@@ -24021,13 +24348,23 @@ impl Editor {
             } else {
                 "Name version"
             };
-            quiet_action(label).on_mouse_down(
+            let naming = quiet_action(label).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     editor.open_strip_name(window, cx);
                 }),
-            )
+            );
+            div().flex().items_center().gap(px(12.)).child(naming)
+                .when(center_mode == StripCenterMode::Parked, |d| d.child(
+                    quiet_action("Compare").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.strip_begin_compare(cx);
+                        }),
+                    )
+                ))
         } else {
             quiet_action("…").on_mouse_down(
                 MouseButton::Left,
@@ -24661,6 +24998,75 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn plain_preview(text: &str) -> PreviewDoc {
+        PreviewDoc {
+            text: text.to_owned(),
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+            spans_bytes: Vec::new(),
+            kinds: vec![BlockKind::default()],
+            boundary: None,
+        }
+    }
+
+    #[test]
+    fn structural_compare_keeps_removals_out_of_inline_prose() {
+        let (before, removed, added, after) =
+            structural_diff("one old passage three", "one new passage three");
+        assert_eq!(before, "one ");
+        assert_eq!(removed, "old");
+        assert_eq!(added, "new");
+        assert_eq!(after, " passage three");
+    }
+
+    #[test]
+    fn compare_copy_slices_the_selected_side_only() {
+        let a = plain_preview("alpha passage");
+        let b = plain_preview("bravo passage");
+        assert_eq!(compare_selected_text(&a, &b, false, 0..5), "alpha");
+        assert_eq!(compare_selected_text(&a, &b, true, 0..5), "bravo");
+    }
+
+    #[test]
+    fn compare_verb_exists_only_on_the_parked_center_group() {
+        assert_eq!(strip_center_mode(false, false), StripCenterMode::Naming);
+        assert_eq!(strip_center_mode(false, true), StripCenterMode::Naming);
+        assert_eq!(strip_center_mode(true, false), StripCenterMode::Parked);
+        assert_eq!(strip_center_mode(true, true), StripCenterMode::Comparing);
+    }
+
+    #[test]
+    fn compare_falls_back_when_either_column_misses_cold_read_measure() {
+        assert!(compare_columns_fit(872., 400.));
+        assert!(!compare_columns_fit(871., 400.));
+    }
+
+    #[gpui::test]
+    fn parked_compare_caches_a_and_done_returns_to_the_same_park(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|cx| Editor::new(
+            cx, "now", SpanSet::default(), BlockMap::default()));
+        editor.update(cx, |editor, cx| {
+            editor.strip.open = true;
+            editor.strip.parked = true;
+            editor.strip.pos_ms = 20;
+            editor.strip.words_at = 3;
+            editor.history_preview = Some(plain_preview("A stays put"));
+            editor.strip_begin_compare(cx);
+            assert_eq!(editor.strip.pin_ms, Some(20));
+            editor.history_preview = Some(plain_preview("B keeps scrubbing"));
+            assert_eq!(editor.compare_preview.as_ref().unwrap().text, "A stays put");
+            editor.strip_done_comparing(cx);
+            assert!(editor.strip.parked);
+            assert!(editor.strip.pin_ms.is_none());
+            assert_eq!(editor.history_preview.as_ref().unwrap().text, "B keeps scrubbing");
+            editor.strip_return_to_now(cx);
+            assert!(!editor.strip.parked);
+            assert!(editor.history_preview.is_none());
+        });
+    }
 
     #[test]
     fn sheet_tail_and_rail_obey_young_fit_overflow_and_minute_one() {
