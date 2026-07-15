@@ -211,6 +211,7 @@ unverified and unsigned.
 - Configuration via `~/.config/strop/config.toml`.
 - GPL-3.0-or-later. Supply-chain gating (cargo-deny) and three-OS CI.
 
-[Unreleased]: https://github.com/kirushik/strop/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/kirushik/strop/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kirushik/strop/releases/tag/v0.2.0
 [0.1.1]: https://github.com/kirushik/strop/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kirushik/strop/releases/tag/v0.1.0

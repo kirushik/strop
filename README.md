@@ -34,7 +34,7 @@ working as a question, and never rewrites a line.
 
 ## Where it's at
 
-Strop is early, and built in the open. **[v0.2.0](https://github.com/kirushik/strop/releases/latest)** is the second cut — the release where the interface grew into itself; see the [changelog](CHANGELOG.md). **Linux (Wayland)** is the primary runtime-tested platform; macOS text rendering was fixed in this release and verified by an outside tester, and Windows binaries build and pass a headless launch smoke. All binaries are unsigned — Gatekeeper and SmartScreen will grumble. Building from source is the supported path: see **[DEVELOPMENT.md](DEVELOPMENT.md)**.
+Strop is early, and built in the open. **[v0.2.0](https://github.com/kirushik/strop/releases/tag/v0.2.0)** is the second cut — the release where the interface grew into itself; see the [changelog](CHANGELOG.md). **Linux (Wayland)** is the primary runtime-tested platform; macOS text rendering was fixed in this release and verified by an outside tester, and Windows binaries build and pass a headless launch smoke. All binaries are unsigned — Gatekeeper and SmartScreen will grumble. Building from source is the supported path: see **[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
 ## License
 
