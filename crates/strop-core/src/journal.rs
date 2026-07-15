@@ -12,7 +12,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::TextOp;
-use crate::document::{count_line_breaks, BlockMap, SpanSet};
+use crate::document::{count_line_breaks, BlockMap, NoteKind, NoteStatus, SpanSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardDisposition {
+    Anchored,
+    Orphaned,
+    Migrated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardRebaseEntry {
+    pub id: u64,
+    pub range: Range<usize>,
+    pub status: NoteStatus,
+    pub title: String,
+    pub level: String,
+    pub pass_id: u64,
+    pub orphaned: bool,
+    pub unverified: bool,
+    pub disposition: CardDisposition,
+}
 
 /// A pause longer than this starts a new run — the journal's time grain.
 /// Word-level detail inside a run is jittered by the strip, never recorded.
@@ -32,6 +53,10 @@ pub struct EditRun {
     pub t1: i64,
     pub pos: usize,
     pub del_chars: usize,
+    /// Exact count from deleted text. `None` means a legacy run whose count
+    /// was never recorded; it must remain distinguishable from exact zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub del_words: Option<usize>,
     pub ins: String,
 }
 
@@ -44,6 +69,15 @@ impl EditRun {
         self.ins.split_whitespace().count()
     }
 
+    /// Deleted words and whether the count is exact. Legacy runs retain the
+    /// fixed character-ratio estimate without gaining false precision.
+    pub fn deleted_words(&self) -> (usize, bool) {
+        match self.del_words {
+            Some(words) => (words, true),
+            None => ((self.del_chars as f32 / 5.5).round() as usize, false),
+        }
+    }
+
     /// Net char growth (negative on cuts) — the envelope's derivative.
     pub fn delta_chars(&self) -> i64 {
         self.ins.chars().count() as i64 - self.del_chars as i64
@@ -53,19 +87,43 @@ impl EditRun {
 /// Non-edit history the strip draws: passes, card closures, restores,
 /// exports — and every SEAM mutation (time-persistence 2: boundary changes
 /// were invisible to the record; a scrub-restore across a park silently
-/// re-scoped the pile as manuscript). Raise-times live on the cards
-/// themselves (`created_unix`); checkpoints carry their own `created_unix`
-/// — neither is duplicated here.
+/// re-scoped the pile as manuscript). Card lifecycle snapshots join that
+/// stream in v3; checkpoints continue to carry their own creation time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JournalEvent {
     /// An AI read landed: `mode` is developmental|line|copy (or "believing").
     Pass { t: i64, mode: String, cards: u32 },
+    CardRaised {
+        t: i64,
+        id: u64,
+        card_kind: NoteKind,
+        range: Range<usize>,
+        body: String,
+        title: String,
+        level: String,
+        pass_id: u64,
+        status: NoteStatus,
+        orphaned: bool,
+        unverified: bool,
+    },
+    CardEdited {
+        t: i64,
+        id: u64,
+        body: String,
+        title: String,
+        level: String,
+        pass_id: u64,
+        status: NoteStatus,
+        orphaned: bool,
+        unverified: bool,
+    },
     /// A card left the margin by the writer's hand.
     CardClosed { t: i64, id: u64, resolved: bool },
     /// A restore appended: the document became `len_chars` long, copied
     /// from the state at `from_unix` (seconds, matching checkpoints).
     Restore { t: i64, from_unix: i64, len_chars: usize },
+    CardsRebased { t: i64, entries: Vec<CardRebaseEntry> },
     Export { t: i64 },
     /// The scrap line moved: born, shifted, or evaporated (`at: None`).
     /// Recorded by every boundary mutation — park, chord-park, adoption,
@@ -80,8 +138,11 @@ impl JournalEvent {
     pub fn t(&self) -> i64 {
         match self {
             Self::Pass { t, .. }
+            | Self::CardRaised { t, .. }
+            | Self::CardEdited { t, .. }
             | Self::CardClosed { t, .. }
             | Self::Restore { t, .. }
+            | Self::CardsRebased { t, .. }
             | Self::Export { t }
             | Self::Seam { t, .. } => *t,
         }
@@ -103,6 +164,10 @@ pub struct Journal {
     /// caller records the honest event instead. Transient.
     #[serde(skip)]
     paused: bool,
+    /// Deleted text for the open tail only. It is reduced to `del_words`
+    /// eagerly and discarded at settle; deleted prose never reaches the wire.
+    #[serde(skip)]
+    deleted_text: String,
 }
 
 /// Wall clock in unix milliseconds. Callers clamp against the journal's own
@@ -123,6 +188,7 @@ impl Journal {
             events,
             open: false,
             paused: false,
+            deleted_text: String::new(),
         }
     }
 
@@ -149,6 +215,7 @@ impl Journal {
     /// this first, so persisted runs are immutable once written.
     pub fn settle(&mut self) {
         self.open = false;
+        self.deleted_text.clear();
     }
 
     /// Record one applied text op at wall time `t` (ms). Coalescing mirrors
@@ -156,6 +223,16 @@ impl Journal {
     /// extends forward, backspace eats backward, forward-delete stays put —
     /// split by pauses (RUN_SPLIT_MS) and the smear cap (RUN_MAX_MS).
     pub fn record(&mut self, op: &TextOp, t: i64) {
+        self.record_inner(op, t, None);
+    }
+
+    /// Record an op with deleted text captured by the buffer before release.
+    /// The text lives only in the open-run accumulator and is never serialized.
+    pub fn record_deleted(&mut self, op: &TextOp, t: i64, deleted: &str) {
+        self.record_inner(op, t, Some(deleted));
+    }
+
+    fn record_inner(&mut self, op: &TextOp, t: i64, deleted: Option<&str>) {
         if self.paused || (op.delete == 0 && op.insert.is_empty()) {
             return;
         }
@@ -176,22 +253,42 @@ impl Journal {
                     // Backspace eats backward.
                     last.pos = op.pos;
                     last.del_chars += op.delete;
+                    if last.del_words.is_some() {
+                        if let Some(deleted) = deleted {
+                            self.deleted_text.push_str(deleted);
+                            last.del_words = Some(self.deleted_text.split_whitespace().count());
+                        } else {
+                            last.del_words = None;
+                            self.deleted_text.clear();
+                        }
+                    }
                     last.t1 = t;
                     return;
                 }
                 if op.pos == last.pos {
                     // Forward-delete stays in place.
                     last.del_chars += op.delete;
+                    if last.del_words.is_some() {
+                        if let Some(deleted) = deleted {
+                            self.deleted_text.push_str(deleted);
+                            last.del_words = Some(self.deleted_text.split_whitespace().count());
+                        } else {
+                            last.del_words = None;
+                            self.deleted_text.clear();
+                        }
+                    }
                     last.t1 = t;
                     return;
                 }
             }
         }
+        self.deleted_text = deleted.unwrap_or_default().to_owned();
         self.runs.push(EditRun {
             t0: t,
             t1: t,
             pos: op.pos,
             del_chars: op.delete,
+            del_words: deleted.map(|_| self.deleted_text.split_whitespace().count()),
             ins: op.insert.clone(),
         });
         self.open = true;
@@ -206,6 +303,15 @@ impl Journal {
                 mode,
                 cards,
             },
+            JournalEvent::CardRaised { id, card_kind, range, body, title, level, pass_id,
+                status, orphaned, unverified, .. } => JournalEvent::CardRaised {
+                t: clamped, id, card_kind, range, body, title, level, pass_id,
+                status, orphaned, unverified,
+            },
+            JournalEvent::CardEdited { id, body, title, level, pass_id, status,
+                orphaned, unverified, .. } => JournalEvent::CardEdited {
+                t: clamped, id, body, title, level, pass_id, status, orphaned, unverified,
+            },
             JournalEvent::CardClosed { id, resolved, .. } => JournalEvent::CardClosed {
                 t: clamped,
                 id,
@@ -219,6 +325,10 @@ impl Journal {
                 t: clamped,
                 from_unix,
                 len_chars,
+            },
+            JournalEvent::CardsRebased { entries, .. } => JournalEvent::CardsRebased {
+                t: clamped,
+                entries,
             },
             JournalEvent::Export { .. } => JournalEvent::Export { t: clamped },
             JournalEvent::Seam { at, .. } => JournalEvent::Seam { t: clamped, at },
@@ -461,6 +571,58 @@ mod tests {
         assert_eq!(j.runs.len(), 2, "settled tail never re-opens");
     }
 
+    #[test]
+    fn deleted_words_are_exact_and_legacy_stays_distinct() {
+        let mut j = Journal::default();
+        j.record_deleted(&del(0, 11), 1_000, "hello world");
+        assert_eq!(j.runs[0].deleted_words(), (2, true));
+        let legacy: EditRun = serde_json::from_str(
+            r#"{"t0":1,"t1":1,"pos":0,"del_chars":11,"ins":""}"#,
+        ).unwrap();
+        assert_eq!(legacy.del_words, None);
+        assert_eq!(legacy.deleted_words(), (2, false));
+        let exact_zero = EditRun { del_words: Some(0), ..legacy.clone() };
+        assert_eq!(exact_zero.deleted_words(), (0, true));
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("del_words"));
+        assert!(serde_json::to_string(&exact_zero).unwrap().contains("del_words"));
+    }
+
+    #[test]
+    fn charwise_deletes_count_the_coalesced_deleted_text() {
+        let text = "hello world";
+        let mut backspace = Journal::default();
+        for (i, ch) in text.chars().rev().enumerate() {
+            backspace.record_deleted(&del(text.chars().count() - i - 1, 1),
+                1_000 + i as i64, &ch.to_string());
+        }
+        assert_eq!(backspace.runs.len(), 1);
+        assert_eq!(backspace.runs[0].del_words, Some(2));
+
+        let mut forward = Journal::default();
+        for (i, ch) in text.chars().enumerate() {
+            forward.record_deleted(&del(0, 1), 1_000 + i as i64, &ch.to_string());
+        }
+        assert_eq!(forward.runs.len(), 1);
+        assert_eq!(forward.runs[0].del_words, Some(2));
+    }
+
+    #[test]
+    fn mixed_exact_and_legacy_deletion_degrades_and_text_never_serializes() {
+        let mut mixed = Journal::default();
+        mixed.record_deleted(&del(1, 1), 1_000, "o");
+        mixed.record(&del(0, 1), 1_001);
+        assert_eq!(mixed.runs[0].del_words, None);
+
+        let mut exact = Journal::default();
+        exact.record_deleted(&del(0, 11), 1_000, "hello world");
+        exact.settle();
+        let json = serde_json::to_string(&exact).unwrap();
+        assert!(json.contains("\"del_words\":2"));
+        assert!(!json.contains("hello"));
+        assert!(!json.contains("world"));
+        assert!(!json.contains("deleted_text"));
+    }
+
     /// The property the whole strip stands on: replaying the journal onto
     /// the starting state reproduces the live document, edit for edit.
     #[test]
@@ -504,6 +666,7 @@ mod tests {
             t1: 0,
             pos: 999,
             del_chars: 999,
+            del_words: None,
             ins: "!".into(),
         });
         assert_eq!(replay.text(), "short!");

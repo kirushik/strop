@@ -3028,6 +3028,7 @@ impl Editor {
         // `history_preview`) so the live restored document is what shows.
         self.exit_history(cx);
         self.sync_mutations();
+        let rebased = self.doc.notes().notes().to_vec();
         // A restore can orphan writer notes (reanchor sets `orphaned` when a
         // passage vanished): migrate their text to the compost (spec §3).
         self.migrate_orphans_after_restore(cx);
@@ -3037,13 +3038,34 @@ impl Editor {
         // restored state as the reconstruction anchor (review B6: without
         // it, text_at(now) would rebuild the PRE-restore document).
         let len_chars = self.doc.rope().len_chars();
-        self.doc
-            .journal_mut()
-            .record_event(strop_core::journal::JournalEvent::Restore {
-                t: strop_core::journal::now_ms(),
+        let t = strop_core::journal::now_ms();
+        let entries = rebased.into_iter().map(|n| {
+            let disposition = if self.doc.notes().get(n.id).is_none() {
+                strop_core::journal::CardDisposition::Migrated
+            } else if n.orphaned {
+                strop_core::journal::CardDisposition::Orphaned
+            } else {
+                strop_core::journal::CardDisposition::Anchored
+            };
+            strop_core::journal::CardRebaseEntry {
+                id: n.id,
+                range: n.range,
+                status: n.status,
+                title: n.title,
+                level: n.level,
+                pass_id: n.pass_id,
+                orphaned: n.orphaned,
+                unverified: n.unverified,
+                disposition,
+            }
+        }).collect();
+        let journal = self.doc.journal_mut();
+        journal.record_event(strop_core::journal::JournalEvent::Restore {
+                t,
                 from_unix,
                 len_chars,
             });
+        journal.record_event(strop_core::journal::JournalEvent::CardsRebased { t, entries });
         let _ = self.save_now();
         if let Some(store) = &self.store {
             store.add_checkpoint("Restored", false);
@@ -3087,6 +3109,9 @@ impl Editor {
         if self.strip.open {
             return;
         }
+        // History freezes committed card bodies. Resolve an open composer
+        // before baking so the record and its projection share one boundary.
+        self.resolve_composer_draft(cx);
         // Strip and panel never coexist (spec §0): the panel yields.
         if self.history_view.is_some() {
             self.exit_history(cx);
@@ -11931,6 +11956,7 @@ impl Editor {
                         t1: t0 + 9_000,
                         pos: (len / 3).min(len),
                         del_chars: del.min(len),
+                        del_words: None,
                         ins: String::new(),
                     });
                     len = len.saturating_sub(del).max(200);
@@ -11949,6 +11975,7 @@ impl Editor {
                         t1: t0 + 12_000,
                         pos: len.saturating_sub(k as usize % 40),
                         del_chars: 0,
+                        del_words: None,
                         ins: ins.clone(),
                     });
                     len += ins.chars().count();

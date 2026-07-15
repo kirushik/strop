@@ -541,10 +541,7 @@ impl StripBake {
                     let y0 = depth_y(pos as i64).min(page_bot - FLECK);
                     let y1 = depth_y((pos + run.del_chars.max(ins_chars)) as i64).min(page_bot);
                     let ins = run.ins_words();
-                    // Deleted words are estimated from del_chars (the text
-                    // itself is not stored — forward replay never needs it):
-                    // ~5.5 chars/word.
-                    let del = (run.del_chars as f32 / 5.5).round() as usize;
+                    let (del, _exact) = run.deleted_words();
                     let n = (ins + del).min(FLECK_CAP);
                     for k in 0..n {
                         let (jx, jy) = jitter(*i as u64, k);

@@ -938,6 +938,35 @@ impl Store {
         self.add_checkpoint_with_state(name, manual, state);
     }
 
+    /// Name a caller-reconstructed moment without checking out or mutating
+    /// the live document. Names are intentionally not unique.
+    pub fn add_checkpoint_at(
+        &self,
+        name: &str,
+        timestamp_ms: i64,
+        state: CheckpointState,
+    ) {
+        self.doc.commit();
+        let checkpoint = Checkpoint {
+            name: name.to_owned(),
+            created_unix: timestamp_ms / 1000,
+            created_ms: Some(timestamp_ms),
+            frontiers: self.doc.oplog_frontiers().encode(),
+            manual: true,
+            state: Some(state),
+        };
+        match serde_json::to_string(&checkpoint) {
+            Ok(json) => {
+                let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
+                if let Err(e) = list.push(json) {
+                    eprintln!("strop: record checkpoint: {e}");
+                }
+                self.doc.commit();
+            }
+            Err(e) => eprintln!("strop: encode checkpoint: {e}"),
+        }
+    }
+
     /// `add_checkpoint` with the state supplied by a caller that already
     /// holds it (open-time sealing) — skips re-deriving it from the doc.
     fn add_checkpoint_with_state(
@@ -1738,6 +1767,7 @@ mod tests {
             t1: 3_100,
             pos: 5,
             del_chars: 0,
+            del_words: None,
             ins: " идёт".into(),
         });
         store
@@ -2010,7 +2040,8 @@ manuscript opens here");
         buf.edit(6..6, ", мир");
         buf.edit(0..1, "П");
         buf.undo(); // undo is mirrored as an ordinary op
-        store.apply(&buf.take_ops());
+        let ops: Vec<TextOp> = buf.take_ops().into_iter().map(|(op, _)| op).collect();
+        store.apply(&ops);
         assert_eq!(store.text(), buf.text());
         assert_eq!(buf.text(), "привет, мир");
 
@@ -2701,7 +2732,8 @@ manuscript opens here");
             buf.edit_bytes_coalescing(i..i, &ch.to_string());
         }
         buf.edit_bytes(2..5, "…"); // typograph substitution
-        store.apply(&buf.take_ops());
+        let ops: Vec<TextOp> = buf.take_ops().into_iter().map(|(op, _)| op).collect();
+        store.apply(&ops);
         assert_eq!(store.text(), "so…");
         assert_eq!(store.text(), buf.text());
 
@@ -2812,6 +2844,26 @@ manuscript opens here");
             "a missing boundary key degrades to no rail"
         );
         assert_eq!(loaded.blocks.kinds()[0], BlockKind::Heading(1), "kinds still load");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn names_an_arbitrary_moment_without_moving_the_live_document() {
+        let path = temp_path("named-arbitrary-moment");
+        let _ = fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        store.seed("live");
+        let state = CheckpointState {
+            text: "past".into(),
+            spans: SpanSet::default(),
+            blocks: BlockMap::new(1),
+        };
+        store.add_checkpoint_at("Draft", 1_234_567, state.clone());
+        store.add_checkpoint_at("Draft", 1_234_567, state);
+        assert_eq!(store.read_state().0, "live");
+        let checkpoints = store.checkpoints();
+        assert_eq!(checkpoints.len(), 2, "duplicate names are allowed");
+        assert!(checkpoints.iter().all(|c| c.manual && c.created_ms == Some(1_234_567)));
         let _ = fs::remove_file(&path);
     }
 }
