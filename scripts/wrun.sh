@@ -5,6 +5,10 @@
 set -e
 DOC="$1"; shift
 KEYS="$*"
+# One cleanup path for every exit — normal, set -e, or Ctrl-C: the
+# background compositor and the temp dirs must never outlive the run.
+SWAY=; CFG=; CFGHOME=; RUNDIR=
+trap '[ -n "$SWAY" ] && kill $SWAY 2>/dev/null; rm -rf "$CFG" "$CFGHOME" "$RUNDIR"' EXIT
 CFG=$(mktemp); printf 'output HEADLESS-1 mode 1600x1200\n' > "$CFG"
 # Hermetic config: the app must never read the developer's real
 # ~/.config/strop — the editor-face assertions test the DELIBERATE
@@ -35,8 +39,6 @@ for _ in $(seq 1 50); do
 done
 if [ -z "$WD" ]; then
   echo "wrun: headless sway failed to start (no wayland socket in $RUNDIR)" >&2
-  kill $SWAY 2>/dev/null || true
-  rm -rf "$CFG" "$CFGHOME" "$RUNDIR"
   exit 2
 fi
 # WRUN_TAIL widens the output window (dump:ui smoke runs need every
@@ -44,5 +46,3 @@ fi
 env -u DISPLAY XDG_RUNTIME_DIR="$RUNDIR" WAYLAND_DISPLAY="$WD" \
   STROP_SMOKE="$KEYS" XDG_CONFIG_HOME="$CFGHOME" \
   timeout 60 "$PWD/target/debug/strop" "$DOC" 2>&1 | tail -"${WRUN_TAIL:-2}"
-kill $SWAY 2>/dev/null || true
-rm -rf "$CFG" "$CFGHOME" "$RUNDIR"
