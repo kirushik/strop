@@ -1403,6 +1403,8 @@ pub struct Editor {
     /// top-centre field that finds (plain), runs commands (`>`) or jumps to
     /// headings (`@`). `palette_*` is its backing state across all modes.
     palette_input: Option<Entity<TextField>>,
+    /// The strip's inline "Name this version" composer (§3c).
+    strip_name_input: Option<Entity<TextField>>,
     palette_selected: usize,
     /// The omni-list's scroll state (`render_omni`'s "omni-list" div),
     /// persisted across frames so it survives the per-frame rebuild. Mouse
@@ -2144,6 +2146,7 @@ impl Editor {
             // a pass ran); a plain line diagnosis is the sensible default.
             last_pass: PassKind::Diagnostic("line".to_owned()),
             palette_input: None,
+            strip_name_input: None,
             palette_selected: 0,
             omni_scroll: ScrollHandle::new(),
             palette_query: String::new(),
@@ -2470,23 +2473,96 @@ impl Editor {
         self.mark_dirty();
     }
 
-    /// Record a named version snapshot in the document file.
-    fn add_checkpoint(&mut self, _: &AddCheckpoint, _: &mut Window, cx: &mut Context<Self>) {
+    /// Route the palette/shortcut verb into the strip's naming composer.
+    fn add_checkpoint(&mut self, _: &AddCheckpoint, window: &mut Window, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
-        // Save first: the checkpoint materializes its state from the store
-        // (Checkpoint::state), and the store's spans/blocks/annotations are
-        // only as fresh as the last save. Checkpointing implying durability
-        // is the right property anyway.
-        let _ = self.save_now();
-        if let Some(store) = &self.store {
-            let name = format!("Checkpoint {}", store.checkpoints().len() + 1);
-            store.add_checkpoint(&name, true);
-            self.dirty_since_checkpoint = false;
-            self.mark_dirty();
-            eprintln!("strop: recorded \"{name}\"");
+        if !self.strip.open {
+            self.open_strip(window, cx);
         }
+        self.open_strip_name(window, cx);
+    }
+
+    fn open_strip_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip_name_input.is_some() {
+            return;
+        }
+        if self.strip.saved_sel.is_none() {
+            self.strip.saved_sel = Some(self.selected_range.clone());
+        }
+        let input = cx.new(|cx| TextField::single(cx, String::new()));
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, _, event: &TextFieldEvent, window, cx| match event {
+                TextFieldEvent::Commit(name) => editor.commit_strip_name(name, window, cx),
+                TextFieldEvent::Cancel => editor.cancel_strip_name(window, cx),
+            },
+        )
+        .detach();
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        let focus = input.read(cx).focus_handle.clone();
+        window.focus(&focus, cx);
+        self.strip_name_input = Some(input);
+        cx.notify();
+    }
+
+    fn cancel_strip_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip_name_input.take().is_none() {
+            return;
+        }
+        if !self.strip.parked && let Some(selection) = self.strip.saved_sel.take() {
+            self.selected_range = selection;
+        }
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn commit_strip_name(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let Some(store) = &self.store else { return };
+        let before = store.checkpoints().len();
+        let timestamp_ms = if self.strip.parked {
+            self.strip.pos_ms
+        } else {
+            strop_core::journal::now_ms()
+        };
+        let state = if self.strip.parked {
+            let Some(scratch) = self.strip.scratch.as_ref() else { return };
+            strop_core::store::CheckpointState {
+                text: scratch.replay.text(),
+                spans: scratch.replay.spans.clone(),
+                blocks: scratch.replay.blocks.clone(),
+            }
+        } else {
+            strop_core::store::CheckpointState {
+                text: self.doc.text(),
+                spans: self.doc.spans().clone(),
+                blocks: self.doc.blocks().clone(),
+            }
+        };
+        store.add_checkpoint_at(name, timestamp_ms, state);
+        if store.checkpoints().len() == before {
+            return;
+        }
+        let now = self.strip.bake.as_ref().map_or(timestamp_ms, |b| b.now_ms);
+        self.strip_bake(now);
+        self.strip_name_input = None;
+        self.dirty_since_checkpoint = false;
+        self.mark_dirty();
+        if !self.strip.parked && let Some(selection) = self.strip.saved_sel.take() {
+            self.selected_range = selection;
+        }
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -3131,6 +3207,7 @@ impl Editor {
     }
 
     fn close_strip(&mut self, cx: &mut Context<Self>) {
+        self.strip_name_input = None;
         self.strip.open = false;
         self.strip.parked = false;
         self.strip.scrubbing = false;
@@ -10694,6 +10771,9 @@ impl Editor {
     /// the window root — the layers themselves stop propagation, so only
     /// genuinely-outside clicks arrive here.
     fn light_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip_name_input.is_some() {
+            self.cancel_strip_name(window, cx);
+        }
         // LAW 2 / C4 — no dead zones ANYWHERE: the margin lane, the titlebar
         // blank and the gutters all live OUTSIDE the editor column's hitbox,
         // so the column's own `on_mouse_down` (which resolves fields for
@@ -16454,8 +16534,9 @@ impl Editor {
             .child("Restore")
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
+                    editor.cancel_strip_name(window, cx);
                     editor.strip_restore(cx);
                 }),
             );
@@ -16736,7 +16817,7 @@ impl Editor {
                             .truncate()
                             .text_color(rgb(MUTED_COLOR))
                             .child(format!(
-                                "{n} auto-checkpoint{}",
+                                "{n} automatic version{}",
                                 if n == 1 { "" } else { "s" }
                             )),
                     )
@@ -16805,7 +16886,7 @@ impl Editor {
                                 rgb(MUTED_COLOR)
                             })
                             .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                            .tooltip(tip("Show only named checkpoints", None))
+                            .tooltip(tip("Show only named versions", None))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|editor, _: &MouseDownEvent, _, cx| {
@@ -23717,7 +23798,7 @@ impl Editor {
     /// drag pattern) and pans the fabric on wheel.
     fn render_strip(
         &self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         if !self.strip.open {
@@ -23729,6 +23810,14 @@ impl Editor {
             return None;
         }
         let parked = self.strip.parked;
+        let desk_w = f32::from(window.viewport_size().width);
+        // The fixed groups reserve their actual laid-out widths: the readout
+        // has a 220 px floor, Restore adds its measured-label allowance, and
+        // Now + dismiss occupy the fixed right cluster. The center may use
+        // only the interval left between those group bounds.
+        let left_edge = strip::SIDE_PAD - 8. + 220. + if parked { 76. } else { 0. };
+        let right_edge = desk_w - 92.;
+        let free_interval = (right_edge - left_edge - 32.).max(0.);
         let now_ms = self
             .strip
             .bake
@@ -23803,8 +23892,9 @@ impl Editor {
             .hover(|d| d.bg(rgb(0x2E2C22)))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
+                    editor.cancel_strip_name(window, cx);
                     editor.strip_return_to_now(cx);
                 }),
             );
@@ -23833,6 +23923,65 @@ impl Editor {
                 }),
             );
 
+        let quiet_action = |label: &'static str| {
+            div()
+                .px(px(6.))
+                .py(px(3.))
+                .border_b_1()
+                .border_color(rgba(0x00000000))
+                .cursor(CursorStyle::PointingHand)
+                .font_family("PT Sans")
+                .text_size(px(11.))
+                .text_color(rgb(0x8F8A7C))
+                .hover(|d| {
+                    d.text_color(rgb(0xE7E1D0))
+                        .border_color(rgb(0xE7E1D0))
+                })
+                .child(label)
+        };
+        let center = if let Some(input) = self.strip_name_input.clone() {
+            let empty = input.read(cx).content.is_empty();
+            div()
+                .relative()
+                .w(px(free_interval.min(280.).max(160.)))
+                .h(px(22.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .when(empty, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left(px(7.))
+                            .top(px(3.))
+                            .font_family("PT Sans")
+                            .text_size(px(13.))
+                            .text_color(rgb(0x8F8A7C))
+                            .child("Version name"),
+                    )
+                })
+                .child(input)
+        } else if free_interval >= 104. {
+            let label = if free_interval >= 132. {
+                "Name this version"
+            } else {
+                "Name version"
+            };
+            quiet_action(label).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    editor.open_strip_name(window, cx);
+                }),
+            )
+        } else {
+            quiet_action("…").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    editor.open_strip_name(window, cx);
+                }),
+            )
+        };
+
         Some(
             div()
                 .absolute()
@@ -23851,8 +24000,9 @@ impl Editor {
                 // it started in.
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|editor, ev: &MouseDownEvent, _, cx| {
+                    cx.listener(|editor, ev: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
+                        editor.cancel_strip_name(window, cx);
                         editor.strip_park_at_x(
                             f32::from(ev.position.x),
                             f32::from(ev.position.y),
@@ -23918,6 +24068,18 @@ impl Editor {
                         .gap(px(6.))
                         .child(readout_chip)
                         .when(parked, |d| d.child(restore_btn)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(left_edge + 16.))
+                        .right(px(desk_w - right_edge + 16.))
+                        .top(px(4.))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(center),
                 )
                 // Now + close, fixed at the far right.
                 .child(
