@@ -17,8 +17,8 @@ use std::sync::Arc;
 use gpui::{
     Animation, AnimationExt,
     AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
-    Decorations, DragMoveEvent, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla,
-    RenderImage,
+    Decorations, DragMoveEvent, Element, ElementId, ElementInputHandler, ExternalPaths,
+    Hitbox, HitboxBehavior, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PaintQuad,
@@ -1624,6 +1624,8 @@ pub struct Editor {
     /// inside the draw pass (the 2026-06-12 corruption rule, like
     /// `zone_row_bounds`).
     strip_rail: std::rc::Rc<std::cell::RefCell<Option<StripGeom>>>,
+    /// Painted date-control bounds and sitting targets, from strip prepaint.
+    strip_date_hits: std::rc::Rc<std::cell::RefCell<Vec<StripDateHit>>>,
     /// The cold read (impl 05 Wave B): the writer-invoked, read-only, paged
     /// takeover — the reading room. `Some` while the room is up; beside
     /// `history_preview` per the state-on-Editor + render-switch precedent.
@@ -2190,6 +2192,7 @@ impl Editor {
             last_frame: None,
             strip: Strip::default(),
             strip_rail: std::rc::Rc::default(),
+            strip_date_hits: std::rc::Rc::default(),
             cold_read: None,
             cr_page_bounds: std::rc::Rc::default(),
         }
@@ -3256,6 +3259,26 @@ impl Editor {
     }
 
     fn strip_park_at_x(&mut self, x: f32, y: f32, pin: bool, cx: &mut Context<Self>) {
+        let date_pos = self
+            .strip_date_hits
+            .borrow()
+            .iter()
+            .find(|hit| hit.bounds.contains(&point(px(x), px(y))))
+            .map(|hit| hit.at_ms);
+        if let Some(pos) = date_pos {
+            if self.strip_has_past() {
+                if !self.strip.parked {
+                    self.strip.saved_sel = Some(self.selected_range.clone());
+                    let c = self.selected_range.end;
+                    self.selected_range = c..c;
+                }
+                self.strip.parked = true;
+                self.strip.scrubbing = false;
+                self.strip.scrub_fabric = false;
+                self.strip_scrub_to(pos, true, cx);
+            }
+            return;
+        }
         // Two hit lanes, matching what each looks like (P7): the rail row and
         // everything above it is the seek bar — a click maps a FRACTION of the
         // whole history; the fabric below is the cloth itself — a click lands
@@ -3303,6 +3326,12 @@ impl Editor {
         let geom = (*self.strip_rail.borrow())?;
         let bake = self.strip.bake.as_ref()?;
         let travel = strip_travel(geom.rail_x1 - geom.rail_x0, bake.timeline.total_work);
+        if travel <= 0. {
+            return Some(bake.now_ms);
+        }
+        if x < geom.rail_x0 || x > geom.rail_x0 + travel {
+            return None;
+        }
         let frac = ((x - geom.rail_x0) / travel).clamp(0., 1.);
         Some(bake.timeline.wall_at(frac * bake.timeline.total_work))
     }
@@ -3327,7 +3356,10 @@ impl Editor {
     fn strip_pos_at_fabric_x(&self, x: f32) -> Option<i64> {
         let geom = (*self.strip_rail.borrow())?;
         let bake = self.strip.bake.as_ref()?;
-        let work = (x - geom.rail_x0 + self.strip_view()).clamp(0., bake.timeline.total_work);
+        let work = x - geom.rail_x0 + self.strip_view();
+        if work < 0. || work > bake.timeline.total_work {
+            return None;
+        }
         Some(bake.timeline.wall_at(work))
     }
 
@@ -21193,11 +21225,22 @@ pub struct StripGeom {
     band_top: f32,
 }
 
+#[derive(Clone)]
+struct StripDateHit {
+    bounds: Bounds<Pixels>,
+    at_ms: i64,
+}
+
 /// The thumb's travel: `min(total_work, rail_width)` (design §1). When the
 /// history fits, the rail and the fixed-scale fabric coincide 1:1; when it
 /// overflows, the thumb compresses the whole duration into the rail.
 fn strip_travel(rail_w: f32, total_work: f32) -> f32 {
-    total_work.min(rail_w).max(1.)
+    total_work.min(rail_w).max(0.)
+}
+
+/// Window x of the sheet's cream tail edge for the current fixed-scale view.
+fn strip_sheet_tail(rail_x0: f32, rail_x1: f32, total_work: f32, view: f32) -> f32 {
+    (rail_x0 + total_work - view).clamp(rail_x0, rail_x1)
 }
 
 /// An rgb constant with an explicit alpha — the strip's translucent fabric
@@ -23770,7 +23813,7 @@ impl Editor {
                 .left_0()
                 .right_0()
                 .h(px(strip::STRIP_H))
-                .bg(rgb(strip::GROUND))
+                .bg(rgb(strip::DESK))
                 .border_t_1()
                 .border_color(rgb(0x3A382E))
                 .occlude()
@@ -23792,6 +23835,18 @@ impl Editor {
                     }),
                 )
                 .on_mouse_move(cx.listener(|editor, ev: &MouseMoveEvent, _, cx| {
+                    if !editor.strip.scrubbing {
+                        let hover = editor
+                            .strip_date_hits
+                            .borrow()
+                            .iter()
+                            .find(|hit| hit.bounds.contains(&ev.position))
+                            .map(|hit| hit.at_ms);
+                        if hover != editor.strip.hover_date_ms {
+                            editor.strip.hover_date_ms = hover;
+                            cx.notify();
+                        }
+                    }
                     if editor.strip.scrubbing && ev.pressed_button == Some(MouseButton::Left) {
                         let fabric = editor.strip.scrub_fabric;
                         let pos = if fabric {
@@ -23870,6 +23925,7 @@ impl IntoElement for StripElement {
 struct StripText {
     origin: Point<Pixels>,
     line: gpui::ShapedLine,
+    at_ms: Option<i64>,
 }
 
 #[derive(Default)]
@@ -23880,6 +23936,7 @@ struct StripPrepaint {
     view: f32,
     labels: Vec<StripText>,
     dates: Vec<StripText>,
+    date_hitboxes: Vec<Hitbox>,
 }
 
 impl Element for StripElement {
@@ -23938,6 +23995,7 @@ impl Element for StripElement {
             .view_offset
             .clamp(0., (bake.timeline.total_work - (rail_x1 - rail_x0)).max(0.));
         let fab_x = |work: f32| rail_x0 + work - view;
+        let tail_x = strip_sheet_tail(rail_x0, rail_x1, bake.timeline.total_work, view);
         let shape = |text: &str, size: f32, color: u32, w: &mut Window| {
             let run = TextRun {
                 len: text.len(),
@@ -23976,6 +24034,7 @@ impl Element for StripElement {
             labels.push(StripText {
                 origin: point(px(lx), px(ly)),
                 line,
+                at_ms: None,
             });
         }
         // Date lane — thinned by real shaped width: a checkpoint-dense era
@@ -23990,7 +24049,16 @@ impl Element for StripElement {
             if wx < rail_x0 - 40. || wx > rail_x1 + 40. {
                 continue;
             }
-            let line = shape(&dt.label, 10.5, 0x9C9684, window);
+            let text = if editor.strip.hover_date_ms == Some(dt.at_ms) {
+                strip::date_span_label(dt)
+            } else {
+                dt.label.clone()
+            };
+            let line = shape(&text, 10.5, 0x9C9684, window);
+            let expanded = editor.strip.hover_date_ms == Some(dt.at_ms);
+            if !expanded && wx + 2. + f32::from(line.width) > tail_x {
+                continue;
+            }
             if wx < last_right + 14. {
                 if i + 1 != bake.dates.len() {
                     continue;
@@ -24002,11 +24070,32 @@ impl Element for StripElement {
                 }
             }
             last_right = wx + f32::from(line.width);
+            let lx = if expanded && wx + 2. + f32::from(line.width) > tail_x {
+                (tail_x - f32::from(line.width)).max(rail_x0)
+            } else {
+                wx + 2.
+            };
             dates.push(StripText {
-                origin: point(px(wx + 2.), px(band_top + strip::STRIP_H - strip::DATE_LANE_H)),
+                origin: point(px(lx), px(band_top + strip::STRIP_H - strip::DATE_LANE_H)),
                 line,
+                at_ms: Some(dt.at_ms),
             });
         }
+        let mut date_hits = Vec::new();
+        let mut date_hitboxes = Vec::new();
+        for date in &dates {
+            let bounds = Bounds::new(
+                date.origin,
+                size(date.line.width + px(4.), px(strip::DATE_LANE_H)),
+            );
+            let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+            date_hitboxes.push(hitbox);
+            date_hits.push(StripDateHit {
+                bounds,
+                at_ms: date.at_ms.expect("date text carries a sitting target"),
+            });
+        }
+        *editor.strip_date_hits.borrow_mut() = date_hits;
         StripPrepaint {
             rail_x0,
             rail_x1,
@@ -24014,6 +24103,7 @@ impl Element for StripElement {
             view,
             labels,
             dates,
+            date_hitboxes,
         }
     }
 
@@ -24029,6 +24119,9 @@ impl Element for StripElement {
     ) {
         let _guard = DrawGuard::enter();
         let editor = self.editor.read(cx);
+        for hitbox in &prepaint.date_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
         let rail_x0 = prepaint.rail_x0;
         let rail_x1 = prepaint.rail_x1;
         let band_top = prepaint.band_top;
@@ -24045,9 +24138,15 @@ impl Element for StripElement {
         // A thin quad, clipped to the rail's x-window. `window` is a parameter
         // (not captured), so the direct paint_quad calls below — thumb, flecks,
         // playhead — never fight this helper for the mutable window borrow.
-        let rect = |window: &mut Window, x: f32, y: f32, w: f32, h: f32, color: gpui::Rgba| {
+        let rect_to = |window: &mut Window,
+                       clip_x1: f32,
+                       x: f32,
+                       y: f32,
+                       w: f32,
+                       h: f32,
+                       color: gpui::Rgba| {
             let xa = x.max(rail_x0);
-            let xb = (x + w).min(rail_x1);
+            let xb = (x + w).min(clip_x1);
             if xb <= xa || h <= 0. {
                 return;
             }
@@ -24058,8 +24157,6 @@ impl Element for StripElement {
         };
 
         let Some(bake) = editor.strip.bake.as_ref() else {
-            // Degraded (no bake yet): just the rail line, so the floor exists.
-            rect(window, rail_x0, rail_y, rail_w, 2., tint(strip::GREY, 0.6));
             return;
         };
         let view = prepaint.view;
@@ -24068,6 +24165,20 @@ impl Element for StripElement {
         let fab_x = |work: f32| rail_x0 + work - view;
         let fab_top = rail_y; // the page hangs from the rail
         let fab_bot = fab_top + strip::FABRIC_H;
+        let tail_x = strip_sheet_tail(rail_x0, rail_x1, total, view);
+        let rect = |window: &mut Window, x: f32, y: f32, w: f32, h: f32, color: gpui::Rgba| {
+            rect_to(window, tail_x, x, y, w, h, color);
+        };
+
+        // The recorded sheet overlays the darker desk only as far as now.
+        rect(
+            window,
+            rail_x0,
+            band_top + strip::TOP_ROW_H,
+            tail_x - rail_x0,
+            strip::STRIP_H - strip::TOP_ROW_H,
+            rgb(strip::GROUND),
+        );
 
         // --- Wells first: a folded gap is a recessed full-height column ------
         for s in &bake.seams {
@@ -24122,10 +24233,7 @@ impl Element for StripElement {
             } else {
                 tint(strip::FLECK_INS, strip::FLECK_INS_ALPHA)
             };
-            window.paint_quad(fill(
-                Bounds::new(point(px(x), px(band_top + f.y)), size(px(strip::FLECK), px(strip::FLECK))),
-                color,
-            ));
+            rect(window, x, band_top + f.y, strip::FLECK, strip::FLECK, color);
         }
 
         // --- Threads: a card's open life — a cool hairline at anchor depth
@@ -24182,6 +24290,16 @@ impl Element for StripElement {
         // end read as unreachable future).
         let travel = strip_travel(rail_w, total);
         rect(window, rail_x0, rail_y - 1., travel, 2., tint(strip::GREY, 0.55));
+
+        // The manuscript's now: always visible when the tail is in view,
+        // including minute one where it stands without a fabricated rail.
+        window.paint_quad(fill(
+            Bounds::new(
+                point(px(tail_x - 0.5), px(fab_top)),
+                size(px(1.), px(strip::FABRIC_H + strip::DATE_LANE_H)),
+            ),
+            rgb(strip::CREAM),
+        ));
 
         // --- The not-yet: everything right of a parked playhead dims one
         // alpha step — a STATIC encoding of position, so any paused frame
@@ -24253,6 +24371,18 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn sheet_tail_and_rail_obey_young_fit_overflow_and_minute_one() {
+        assert_eq!(strip_travel(400., 0.), 0., "minute one fabricates no rail");
+        assert_eq!(strip_sheet_tail(28., 428., 0., 0.), 28.);
+        assert_eq!(strip_travel(400., 75.), 75.);
+        assert_eq!(strip_sheet_tail(28., 428., 75., 0.), 103.);
+        assert_eq!(strip_travel(400., 400.), 400.);
+        assert_eq!(strip_sheet_tail(28., 428., 400., 0.), 428.);
+        assert_eq!(strip_travel(400., 900.), 400.);
+        assert_eq!(strip_sheet_tail(28., 428., 900., 500.), 428.);
+    }
 
     #[test]
     fn failed_preparation_supersedes_an_older_pending_save() {

@@ -92,6 +92,8 @@ pub const FLECK_CAP: usize = 70;
 /// The machine-room dark ground and the readout chip (spec §0 — new inline
 /// values in that family; NOT theme tokens, chrome fills stay at use sites).
 pub const GROUND: u32 = 0x26251F;
+/// The desk beyond the manuscript's recorded extent (spec v3 §1a).
+pub const DESK: u32 = 0x211F1A;
 pub const READOUT_CHIP: u32 = 0x111009;
 /// The cream page-fill under the envelope and the envelope stroke itself
 /// (design §1 — the corridor fix filled the rail→envelope band faint so it
@@ -423,6 +425,11 @@ pub struct Seam {
 pub struct DateTick {
     pub x: f32,
     pub label: String,
+    /// The sitting's first recorded moment: the date control seeks here.
+    pub at_ms: i64,
+    /// First/last run time, used only by the visible hover expansion.
+    pub span_start_ms: i64,
+    pub span_end_ms: i64,
 }
 
 /// The immutable view model (spec §1). Built once per open/Restore from
@@ -620,15 +627,22 @@ impl StripBake {
             .collect();
 
         // --- Stations (checkpoints) + Restore/Export ticks -------------------
-        // Session starts are bare ticks — the date lane carries the day, and
-        // the words "Session start" taught nothing while colliding with
-        // themselves on every sitting (spec §2: the honest automatics are
-        // Started/Restored/Exported). The one exception: the document's very
-        // first station keeps a name — its birth is data.
+        // Sitting seals remain durable replay anchors and arrow-step targets,
+        // but are not marks: neither their tick nor their internal name may
+        // reach the strip (v3 §1b). The birth station alone reads "Started"
+        // once the record has distinguishable extent (v3 §1a).
         let first_ms = stations.iter().map(|s| s.created_ms).min();
         let mut baked: Vec<Station> = Vec::new();
         for st in stations {
-            let label = if st.name == "Session start" && Some(st.created_ms) == first_ms {
+            let session = st.name == "Session start" || st.name == "Session";
+            let birth = Some(st.created_ms) == first_ms
+                && (st.name == "Session start"
+                    || st.name == "Started"
+                    || st.name == "Fresh tutorial");
+            if (session && !birth) || (birth && timeline.total_work <= 0.) {
+                continue;
+            }
+            let label = if birth {
                 "Started".into()
             } else {
                 station_display(&st.name)
@@ -732,48 +746,40 @@ impl StripBake {
     }
 }
 
-/// Dates for the bottom lane, one label per calendar day, placed at that day's
-/// earliest anchor along the axis. Anchors are run session-starts (the first
-/// run, and each after a >15 min gap — a new sitting) AND every checkpoint: a
-/// LEGACY era carries no runs, so its checkpoints are the only time record the
-/// lane has to date (Bug A).
+/// Dates for the bottom lane, one control per sitting. Its position and target
+/// are the sitting's first run; its hover span is the first/last run.
 fn build_dates(
     runs: &[EditRun],
     stations: &[StationSnap],
     timeline: &Timeline,
     now_ms: i64,
 ) -> Vec<DateTick> {
-    let mut anchors: Vec<i64> = Vec::new();
+    let mut spans: Vec<(i64, i64)> = Vec::new();
     let mut prev_t1 = i64::MIN;
     for run in runs {
         if prev_t1 == i64::MIN || run.t0 - prev_t1 > GAP_FOLD_MS {
-            anchors.push(run.t0);
+            spans.push((run.t0, run.t1));
+        } else if let Some(span) = spans.last_mut() {
+            span.1 = run.t1.max(span.1);
         }
         prev_t1 = run.t1;
     }
-    anchors.extend(stations.iter().map(|s| s.created_ms));
-    anchors.sort_unstable();
-    let mut dates: Vec<DateTick> = Vec::new();
-    let mut last_day = i64::MIN;
-    for t in anchors {
-        let day = t.div_euclid(86_400_000);
-        if day != last_day {
-            dates.push(DateTick {
-                x: timeline.work_at(t),
-                label: date_label(t / 1000, now_ms / 1000),
-            });
-            last_day = day;
-        }
+    // A legacy checkpoint-only era has no runs from which to prove a sitting
+    // span. Its materialized moments remain usable date controls, without a
+    // fabricated duration.
+    if spans.is_empty() {
+        spans.extend(stations.iter().map(|s| (s.created_ms, s.created_ms)));
     }
-    // A document with nothing recorded yet still stands on today — the one
-    // honest word an empty strip can say (the axis does extend to now).
-    if dates.is_empty() {
-        dates.push(DateTick {
-            x: timeline.work_at(now_ms),
-            label: "Today".into(),
-        });
-    }
-    dates
+    spans
+        .into_iter()
+        .map(|(start, end)| DateTick {
+            x: timeline.work_at(start),
+            label: date_label(start / 1000, now_ms / 1000),
+            at_ms: start,
+            span_start_ms: start,
+            span_end_ms: end,
+        })
+        .collect()
 }
 
 // ---- Ranked omission -------------------------------------------------------
@@ -800,7 +806,11 @@ fn station_rank(name: &str, manual: bool) -> u8 {
         RANK_EXPORT
     } else if name.contains("seal") || name == "Draft complete" {
         RANK_SEAL
-    } else if name == "Session start" || name == "Started" || name == "Fresh tutorial" {
+    } else if name == "Session start"
+        || name == "Session"
+        || name == "Started"
+        || name == "Fresh tutorial"
+    {
         RANK_SESSION
     } else if name.starts_with("Checkpoint ") {
         RANK_REFLEX
@@ -816,7 +826,7 @@ fn station_rank(name: &str, manual: bool) -> u8 {
 /// says when a sitting began, and a lane full of "Session start" echoes was
 /// the doubled-print smear. Everything else shows its own name.
 fn station_display(name: &str) -> String {
-    if name.starts_with("Checkpoint ") || name == "Session start" {
+    if name.starts_with("Checkpoint ") || name == "Session start" || name == "Session" {
         String::new()
     } else {
         name.to_owned()
@@ -990,6 +1000,14 @@ pub fn date_label(day_secs: i64, now_secs: i64) -> String {
     }
 }
 
+/// The date control's hover face: expand the existing visible label, never
+/// add a second annotation (P9).
+pub fn date_span_label(date: &DateTick) -> String {
+    let (_, _, _, sh, sm, _) = civil(date.span_start_ms / 1000);
+    let (_, _, _, eh, em, _) = civil(date.span_end_ms / 1000);
+    format!("{}, {sh:02}:{sm:02}–{eh:02}:{em:02}", date.label)
+}
+
 /// 1234 → "1,234" (the titlebar's convention, mirrored so the readout at now
 /// reads identically to the titlebar count).
 fn group_thousands(n: usize) -> String {
@@ -1056,6 +1074,8 @@ pub struct Strip {
     /// moment-under-cursor mapping, view never yanks) rather than on the rail
     /// (fraction-of-the-whole seek, view locked to the thumb).
     pub scrub_fabric: bool,
+    /// Sitting whose already-visible date is under the pointer.
+    pub hover_date_ms: Option<i64>,
     /// Fabric horizontal pan (px) — auto-scroll keeps the playhead in view at
     /// novel scale; wheel pans it. NOT part of the bake (review B7).
     pub view_offset: f32,
@@ -1087,6 +1107,7 @@ impl Default for Strip {
             parked: false,
             scrubbing: false,
             scrub_fabric: false,
+            hover_date_ms: None,
             view_offset: 0.,
             bakes: 0,
             bake: None,
@@ -1322,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn session_starts_are_bare_ticks_except_the_first() {
+    fn session_marks_die_but_sitting_shoulders_remain_steps() {
         let day = 86_400_000i64;
         let base = 1_700_000_000_000i64;
         let stations = vec![
@@ -1332,10 +1353,32 @@ mod tests {
         ];
         let j = Journal::default();
         let bake = StripBake::build(&j, &stations, &[], 0, base + 3 * day);
+        assert_eq!(
+            bake.stations.len(),
+            1,
+            "only the distinguishable birth remains"
+        );
         assert_eq!(bake.stations[0].label, "Started", "the birth keeps a name");
         assert!(
-            bake.stations[1].label.is_empty() && bake.stations[2].label.is_empty(),
-            "later session starts are bare ticks — the date lane carries the day"
+            stations.iter().all(|st| bake.snap_ms.contains(&st.created_ms)),
+            "invisible sitting boundaries remain arrow steps"
+        );
+        assert!(
+            bake.stations.iter().all(|st| !st.label.to_lowercase().contains("session"))
+        );
+    }
+
+    #[test]
+    fn idle_session_name_never_reaches_the_bake() {
+        let base = 1_700_000_000_000i64;
+        let stations = vec![
+            station(base, "Started", 10, 60),
+            station(base + 20_000, "Session", 20, 120),
+        ];
+        let bake = StripBake::build(&Journal::default(), &stations, &[], 0, base + 30_000);
+        assert!(bake.stations.iter().all(|st| st.at_ms != base + 20_000));
+        assert!(
+            bake.stations.iter().all(|st| !st.label.to_lowercase().contains("session"))
         );
     }
 
@@ -1427,6 +1470,36 @@ mod tests {
         assert!(bake.flecks.is_empty());
         assert!(bake.envelope.is_empty());
         assert_eq!(bake.timeline.total_work, 0.);
+        assert!(bake.dates.is_empty(), "minute one has an empty date lane");
+    }
+
+    #[test]
+    fn zero_extent_birth_station_lays_no_mark() {
+        let now = 1_700_000_000_000;
+        let birth = vec![station(now, "Session start", 0, 0)];
+        let bake = StripBake::build(&Journal::default(), &birth, &[], 0, now);
+        assert!(bake.stations.is_empty());
+    }
+
+    #[test]
+    fn date_control_targets_the_sittings_first_recorded_moment() {
+        let j = fixture();
+        let now = j.runs.last().unwrap().t1 + 1000;
+        let bake = StripBake::build(&j, &[], &[], 0, now);
+        assert_eq!(bake.dates.len(), 3, "the fixture has three sittings");
+        let starts: Vec<i64> = j
+            .runs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, run)| {
+                (i == 0 || run.t0 - j.runs[i - 1].t1 > GAP_FOLD_MS).then_some(run.t0)
+            })
+            .collect();
+        for (date, first) in bake.dates.iter().zip(starts) {
+            assert_eq!(date.at_ms, first);
+            assert!(date.span_end_ms >= date.span_start_ms);
+        }
+        assert!(date_span_label(&bake.dates[0]).contains('–'));
     }
 
     // A materialized checkpoint snapshot for the merged-axis tests (Bug A).
