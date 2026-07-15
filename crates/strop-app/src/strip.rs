@@ -345,12 +345,14 @@ pub struct StationSnap {
 /// stayed open). Times in ms; `raised_ms` is the note's `created_unix × 1000`.
 #[derive(Clone, Copy, Debug)]
 pub struct CardSnap {
+    pub id: u64,
     pub raised_ms: i64,
     pub closed_ms: Option<i64>,
     /// The anchor's position in chars (today's text) — mapped through the
     /// envelope's own y-scale at bake, so the thread sits inside the page.
     pub anchor: usize,
     pub resolved: bool,
+    pub kind: strop_core::document::NoteKind,
 }
 
 // ---- Baked geometry --------------------------------------------------------
@@ -375,13 +377,213 @@ pub struct Veil {
 
 /// A card's open life as a 1-px cool thread; `sage` terminal when resolved,
 /// grey when dismissed, `open` runs to the right edge (still open).
-#[derive(Clone, Copy, Debug)]
-pub struct Thread {
-    pub x0: f32,
-    pub x1: f32,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThreadPoint {
+    pub x: f32,
     pub y: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Thread {
+    pub segments: Vec<Vec<ThreadPoint>>,
     pub resolved: bool,
     pub open: bool,
+    pub origin_proven: bool,
+    pub uncertain_start: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardBodySnapshot {
+    pub at_ms: i64,
+    pub body: String,
+    pub title: String,
+    pub level: String,
+    pub status: strop_core::document::NoteStatus,
+    pub orphaned: bool,
+    pub unverified: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardAnchorSnapshot {
+    pub at_ms: i64,
+    pub range: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardHistory {
+    pub id: u64,
+    pub kind: strop_core::document::NoteKind,
+    pub raised_ms: i64,
+    pub closed_ms: Option<i64>,
+    pub bodies: Vec<CardBodySnapshot>,
+    pub anchors: Vec<CardAnchorSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CardHistoryIndex {
+    pub cards: Vec<CardHistory>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PastCard<'a> {
+    pub id: u64,
+    pub kind: strop_core::document::NoteKind,
+    pub body: &'a CardBodySnapshot,
+    pub anchor: Option<&'a std::ops::Range<usize>>,
+}
+
+impl CardHistoryIndex {
+    pub fn past_margin(&self, at_ms: i64) -> Vec<PastCard<'_>> {
+        self.cards.iter().filter_map(|card| {
+            if at_ms < card.raised_ms || card.closed_ms.is_some_and(|t| at_ms >= t) {
+                return None;
+            }
+            let body = card.bodies.get(
+                card.bodies.partition_point(|b| b.at_ms <= at_ms).checked_sub(1)?
+            )?;
+            let anchor = card.anchors
+                .get(card.anchors.partition_point(|a| a.at_ms <= at_ms).checked_sub(1)?)
+                .and_then(|a| a.range.as_ref());
+            Some(PastCard { id: card.id, kind: card.kind, body, anchor })
+        }).collect()
+    }
+}
+
+fn push_thread_point(points: &mut Vec<ThreadPoint>, point: ThreadPoint) {
+    if let Some(last) = points.last()
+        && (last.x - point.x).abs() < 0.5
+        && (last.y - point.y).abs() < 0.5
+    {
+        return;
+    }
+    if points.len() >= 2 {
+        let a = points[points.len() - 2];
+        let b = points[points.len() - 1];
+        let cross = (b.x - a.x) * (point.y - b.y) - (b.y - a.y) * (point.x - b.x);
+        if cross.abs() < 0.25 {
+            points.pop();
+        }
+    }
+    points.push(point);
+}
+
+/// Recover only the legacy suffix whose inverse is unique. Reaching the
+/// beginning of the available run record is a proof boundary, not evidence
+/// that the card occupied its present y all the way back to its raise.
+fn legacy_reverse_vertices(
+    journal: &Journal,
+    raised_ms: i64,
+    today_anchor: usize,
+    now_ms: i64,
+) -> Vec<(i64, usize)> {
+    let mut anchor = today_anchor;
+    let mut rev = vec![(now_ms, anchor)];
+    let restores: Vec<i64> = journal.events.iter().filter_map(|e| match e {
+        JournalEvent::Restore { t, .. } => Some(*t),
+        _ => None,
+    }).collect();
+    let mut ceiling = now_ms;
+    for run in journal.runs.iter().rev().filter(|r| r.t0 >= raised_ms) {
+        if restores.iter().any(|t| *t > run.t0 && *t <= ceiling) {
+            break;
+        }
+        ceiling = run.t0;
+        let ins = run.ins.chars().count();
+        // A post-edit anchor inside replacement text, or at the collapse point
+        // of a deletion, has more than one possible pre-edit coordinate.
+        if (anchor > run.pos && anchor < run.pos + ins)
+            || (run.del_chars > 0 && anchor == run.pos)
+        {
+            break;
+        }
+        if anchor >= run.pos + ins {
+            anchor = anchor + run.del_chars - ins;
+        }
+        rev.push((run.t0, anchor));
+    }
+    rev.reverse();
+    rev
+}
+
+fn card_history_index(journal: &Journal) -> Option<CardHistoryIndex> {
+    use strop_core::buffer::TextOp;
+    use strop_core::document::transform_annotation_range;
+
+    let mut cards = Vec::new();
+    for raised in &journal.events {
+        let JournalEvent::CardRaised { t, id, card_kind, range, body, title, level,
+            status, orphaned, unverified, .. } = raised else { continue };
+        let mut history = CardHistory {
+            id: *id,
+            kind: *card_kind,
+            raised_ms: *t,
+            closed_ms: None,
+            bodies: vec![CardBodySnapshot {
+                at_ms: *t,
+                body: body.clone(),
+                title: title.clone(),
+                level: level.clone(),
+                status: *status,
+                orphaned: *orphaned,
+                unverified: *unverified,
+            }],
+            anchors: vec![CardAnchorSnapshot { at_ms: *t, range: Some(range.clone()) }],
+        };
+        enum CardStep<'a> { Run(&'a EditRun), Event(&'a JournalEvent) }
+        let mut steps: Vec<(i64, u8, CardStep<'_>)> = journal.runs.iter()
+            .filter(|r| r.t0 >= *t)
+            .map(|r| (r.t0, 1, CardStep::Run(r))).collect();
+        steps.extend(journal.events.iter().filter(|e| e.t() > *t)
+            .map(|e| (e.t(), 0, CardStep::Event(e))));
+        steps.sort_by_key(|s| (s.0, s.1));
+        let mut anchor = range.clone();
+        let mut proven = true;
+        for (at, _, step) in steps {
+            match step {
+                CardStep::Run(run) if proven => {
+                    let op = TextOp { pos: run.pos, delete: run.del_chars, insert: run.ins.clone() };
+                    let next = transform_annotation_range(&anchor, &op);
+                    if next.start != anchor.start {
+                        history.anchors.push(CardAnchorSnapshot { at_ms: at, range: Some(next.clone()) });
+                    }
+                    anchor = next;
+                }
+                CardStep::Event(JournalEvent::Restore { .. }) => {
+                    proven = false;
+                    history.anchors.push(CardAnchorSnapshot { at_ms: at, range: None });
+                }
+                CardStep::Event(JournalEvent::CardsRebased { entries, .. }) => {
+                    if let Some(entry) = entries.iter().find(|e| e.id == *id) {
+                        anchor = entry.range.clone();
+                        proven = entry.disposition != strop_core::journal::CardDisposition::Orphaned;
+                        history.anchors.push(CardAnchorSnapshot {
+                            at_ms: at, range: proven.then(|| anchor.clone())
+                        });
+                        if let Some(previous) = history.bodies.last() {
+                            history.bodies.push(CardBodySnapshot { at_ms: at,
+                                body: previous.body.clone(), title: entry.title.clone(),
+                                level: entry.level.clone(), status: entry.status,
+                                orphaned: entry.orphaned, unverified: entry.unverified });
+                        }
+                    }
+                }
+                CardStep::Event(JournalEvent::CardEdited { id: event_id, body, title,
+                    level, status, orphaned, unverified, .. }) if event_id == id => {
+                    history.bodies.push(CardBodySnapshot { at_ms: at, body: body.clone(),
+                        title: title.clone(), level: level.clone(), status: *status,
+                        orphaned: *orphaned, unverified: *unverified });
+                }
+                CardStep::Event(JournalEvent::CardClosed { id: event_id, .. })
+                    if event_id == id => {
+                    history.closed_ms = Some(at);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        cards.push(history);
+    }
+    (!cards.is_empty()).then_some(CardHistoryIndex { cards })
 }
 
 /// A checkpoint tick + its (possibly omitted) label. `restore` draws it sage
@@ -441,6 +643,7 @@ pub struct StripBake {
     pub flecks: Vec<Fleck>,
     pub veils: Vec<Veil>,
     pub threads: Vec<Thread>,
+    pub card_history: Option<CardHistoryIndex>,
     pub stations: Vec<Station>,
     pub envelope: Vec<EnvPoint>,
     pub seams: Vec<Seam>,
@@ -600,28 +803,58 @@ impl StripBake {
             })
             .collect();
 
-        // --- Threads (card lifespans) ----------------------------------------
-        // Anchor depth on the chars axis (inside the page, like everything
-        // else). `anchor` is the note's position in TODAY'S text — the
-        // historical offset isn't recorded — an honest approximation that
-        // stays within the page because pos ≤ len ≤ max.
-        let threads: Vec<Thread> = cards
-            .iter()
-            .map(|c| {
-                let x0 = timeline.work_at(c.raised_ms);
-                let (x1, open) = match c.closed_ms {
-                    Some(t) => (timeline.work_at(t).max(x0 + 1.), false),
-                    None => (timeline.total_work, true),
-                };
-                Thread {
-                    x0,
-                    x1,
-                    y: depth_y(c.anchor as i64).clamp(FAB_Y0 + 2., FAB_Y0 + FABRIC_H),
-                    resolved: c.resolved,
-                    open,
+        // --- Threads + their immutable past-margin sibling ------------------
+        let card_history = card_history_index(journal);
+        let point = |at_ms: i64, anchor: usize| ThreadPoint {
+            x: timeline.work_at(at_ms),
+            y: depth_y(anchor as i64).clamp(FAB_Y0 + 2., FAB_Y0 + FABRIC_H),
+        };
+        let mut threads = Vec::new();
+        if let Some(index) = &card_history {
+            for card in index.cards.iter().filter(|c| {
+                c.kind == strop_core::document::NoteKind::Diagnosis
+            }) {
+                let mut segments: Vec<Vec<ThreadPoint>> = Vec::new();
+                let mut current = Vec::new();
+                for anchor in &card.anchors {
+                    match &anchor.range {
+                        Some(range) => {
+                            let p = point(anchor.at_ms, range.start);
+                            push_thread_point(&mut current, p);
+                        }
+                        None => {
+                            if !current.is_empty() { segments.push(std::mem::take(&mut current)); }
+                        }
+                    }
                 }
-            })
-            .collect();
+                if !current.is_empty() { segments.push(current); }
+                let end_ms = card.closed_ms.unwrap_or(now_ms);
+                if let Some(last) = segments.last_mut().and_then(|s| s.last().copied()) {
+                    let terminal = ThreadPoint { x: timeline.work_at(end_ms).max(last.x), y: last.y };
+                    if terminal.x > last.x { segments.last_mut().unwrap().push(terminal); }
+                }
+                let resolved = journal.events.iter().find_map(|e| match e {
+                    JournalEvent::CardClosed { id, resolved, .. } if *id == card.id => Some(*resolved),
+                    _ => None,
+                }).unwrap_or(false);
+                threads.push(Thread { segments, resolved, open: card.closed_ms.is_none(),
+                    origin_proven: true, uncertain_start: false });
+            }
+        }
+        // Legacy cards have no raise snapshot. Walk backwards only while the
+        // inverse is unique; silence becomes absent geometry, never a guess.
+        for card in cards.iter().filter(|c| c.kind == strop_core::document::NoteKind::Diagnosis
+            && !journal.events.iter().any(|e| matches!(e,
+                JournalEvent::CardRaised { id, .. } if *id == c.id))) {
+            if card.closed_ms.is_some() { continue; }
+            let rev: Vec<ThreadPoint> = legacy_reverse_vertices(
+                journal, card.raised_ms, card.anchor, now_ms
+            ).into_iter().map(|(at, anchor)| point(at, anchor)).collect();
+            let uncertain_start = rev.len() > 1;
+            let segments = if uncertain_start { vec![rev] } else { vec![vec![point(now_ms, card.anchor)]] };
+            threads.push(Thread { segments, resolved: card.resolved, open: true,
+                origin_proven: false, uncertain_start });
+        }
 
         // --- Stations (checkpoints) + Restore/Export ticks -------------------
         // Sitting seals remain durable replay anchors and arrow-step targets,
@@ -732,6 +965,7 @@ impl StripBake {
             flecks,
             veils,
             threads,
+            card_history,
             stations: baked,
             envelope,
             seams,
@@ -1122,12 +1356,18 @@ impl Strip {
     pub fn is_parked(&self) -> bool {
         self.open && self.parked
     }
+
+    pub fn past_margin(&self) -> Vec<PastCard<'_>> {
+        self.bake.as_ref().and_then(|b| b.card_history.as_ref())
+            .map_or_else(Vec::new, |index| index.past_margin(self.pos_ms))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use strop_core::buffer::TextOp;
+    use strop_core::document::{NoteKind, NoteStatus};
     use strop_core::journal::Journal;
 
     fn ins(pos: usize, text: &str) -> TextOp {
@@ -1136,6 +1376,126 @@ mod tests {
             delete: 0,
             insert: text.into(),
         }
+    }
+
+    fn raised(t: i64, id: u64, range: std::ops::Range<usize>, body: &str) -> JournalEvent {
+        JournalEvent::CardRaised { t, id, card_kind: NoteKind::Diagnosis, range,
+            body: body.into(), title: "Question".into(), level: "line".into(),
+            pass_id: 1, status: NoteStatus::Open, orphaned: false, unverified: false }
+    }
+
+    #[test]
+    fn card_path_uses_the_live_range_transform() {
+        let mut j = Journal::default();
+        j.events.push(raised(10, 7, 10..14, "first"));
+        let ops = [
+            TextOp { pos: 2, delete: 0, insert: "abc".into() },
+            TextOp { pos: 20, delete: 0, insert: "z".into() },
+            TextOp { pos: 13, delete: 2, insert: String::new() },
+            TextOp { pos: 13, delete: 0, insert: "q".into() },
+            TextOp { pos: 10, delete: 20, insert: String::new() },
+        ];
+        let mut expected = 10..14;
+        for (i, op) in ops.iter().enumerate() {
+            j.record(op, 20 + i as i64 * 10);
+            j.settle();
+            expected = strop_core::document::transform_annotation_range(&expected, op);
+        }
+        let index = card_history_index(&j).unwrap();
+        assert_eq!(index.cards[0].anchors.last().unwrap().range, Some(expected));
+    }
+
+    #[test]
+    fn past_projection_obeys_lifespan_and_committed_body_boundaries() {
+        let mut j = Journal::default();
+        j.events.push(raised(10, 7, 4..8, "first"));
+        j.events.push(JournalEvent::CardEdited { t: 20, id: 7, body: "second".into(),
+            title: "Question".into(), level: "line".into(), pass_id: 1,
+            status: NoteStatus::Open, orphaned: false, unverified: false });
+        j.events.push(JournalEvent::CardClosed { t: 30, id: 7, resolved: true });
+        let index = card_history_index(&j).unwrap();
+        assert!(index.past_margin(9).is_empty());
+        assert_eq!(index.past_margin(10)[0].body.body, "first");
+        assert_eq!(index.past_margin(20)[0].body.body, "second");
+        assert!(index.past_margin(30).is_empty());
+    }
+
+    #[test]
+    fn pre_card_record_history_has_no_past_margin_index() {
+        assert!(card_history_index(&Journal::default()).is_none());
+    }
+
+    fn run(t: i64, pos: usize, del: usize, insert: &str) -> EditRun {
+        EditRun { t0: t, t1: t + 1, pos, del_chars: del,
+            del_words: Some(0), ins: insert.into() }
+    }
+
+    #[test]
+    fn legacy_reverse_walk_stops_at_overlap_without_false_geometry() {
+        let mut j = Journal::default();
+        j.runs = vec![run(20, 6, 5, ""), run(30, 2, 0, "aa")];
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 40);
+        assert_eq!(vertices, vec![(30, 6), (40, 8)]);
+        assert!(vertices.iter().all(|(t, _)| *t > 20), "no line crosses the ambiguous edit");
+    }
+
+    #[test]
+    fn legacy_reverse_walk_stops_at_restore_without_rebase() {
+        let mut j = Journal::default();
+        j.runs = vec![run(20, 1, 0, "a"), run(40, 1, 0, "b")];
+        j.events.push(JournalEvent::Restore { t: 30, from_unix: 0, len_chars: 4 });
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 50);
+        assert_eq!(vertices, vec![(40, 7), (50, 8)]);
+        assert!(vertices.iter().all(|(t, _)| *t > 30), "restore gap has no invented y");
+    }
+
+    #[test]
+    fn legacy_reverse_walk_stops_at_the_journal_coverage_gap() {
+        let mut j = Journal::default();
+        j.runs = vec![run(50, 2, 0, "aa")];
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 60);
+        assert_eq!(vertices, vec![(50, 6), (60, 8)]);
+        assert_ne!(vertices[0].0, 10, "the unrecorded raise-to-journal span stays absent");
+    }
+
+    #[test]
+    fn thread_points_coalesce_subpixel_and_collinear_runs() {
+        let mut points = Vec::new();
+        push_thread_point(&mut points, ThreadPoint { x: 0., y: 10. });
+        push_thread_point(&mut points, ThreadPoint { x: 1., y: 10.1 });
+        push_thread_point(&mut points, ThreadPoint { x: 2., y: 10.2 });
+        push_thread_point(&mut points, ThreadPoint { x: 2.2, y: 10.3 });
+        assert_eq!(points.len(), 2, "straight and sub-pixel drafting collapses to endpoints");
+    }
+
+    #[test]
+    fn writer_notes_lay_no_thread() {
+        let mut j = Journal::default();
+        let mut event = raised(10, 7, 4..8, "note");
+        if let JournalEvent::CardRaised { card_kind, .. } = &mut event {
+            *card_kind = NoteKind::Note;
+        }
+        j.events.push(event);
+        let bake = StripBake::build(&j, &[], &[], 0, 20);
+        assert!(bake.threads.is_empty());
+        assert_eq!(bake.card_history.unwrap().cards.len(), 1);
+    }
+
+    #[test]
+    fn past_projection_across_events_does_not_rebake() {
+        let mut j = Journal::default();
+        j.events.push(raised(10, 7, 4..8, "first"));
+        j.events.push(JournalEvent::CardEdited { t: 20, id: 7, body: "second".into(),
+            title: "Question".into(), level: "line".into(), pass_id: 1,
+            status: NoteStatus::Open, orphaned: false, unverified: false });
+        j.events.push(JournalEvent::CardClosed { t: 30, id: 7, resolved: true });
+        let mut strip = Strip { open: true, parked: true, bakes: 1,
+            bake: Some(StripBake::build(&j, &[], &[], 0, 40)), ..Strip::default() };
+        for at in [9, 10, 20, 30] {
+            strip.pos_ms = at;
+            let _ = strip.past_margin();
+        }
+        assert_eq!(strip.bakes, 1);
     }
 
     // A fortnight fixture: three sittings a day apart, each a burst of runs.

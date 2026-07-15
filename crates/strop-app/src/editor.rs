@@ -3297,10 +3297,12 @@ impl Editor {
             .map(|n| {
                 let closed = closes.get(&n.id);
                 strip::CardSnap {
+                    id: n.id,
                     raised_ms: n.created_unix * 1000,
                     closed_ms: closed.map(|(t, _)| *t),
                     anchor: n.range.start,
                     resolved: closed.map_or(n.status == NoteStatus::Done, |(_, r)| *r),
+                    kind: n.kind,
                 }
             })
             .collect()
@@ -19660,6 +19662,55 @@ impl Editor {
         )
     }
 
+    /// Frozen §3b projection. It deliberately has no ids, listeners, hover
+    /// styling, composer, or verbs: the past is readable evidence, not a
+    /// second live margin.
+    fn render_past_margin(&self, window: &Window) -> Option<gpui::AnyElement> {
+        if !self.margin_fits(window) || !self.strip.is_parked() {
+            return None;
+        }
+        self.strip.bake.as_ref()?.card_history.as_ref()?;
+        let cards = self.strip.past_margin();
+        if cards.is_empty() { return None; }
+        let col_right = self.column_right(window);
+        let lane_left = col_right + 20.;
+        let lane_h = f32::from(window.viewport_size().height) - 96.;
+        let doc_len = self.strip.scratch.as_ref()
+            .map(|s| s.replay.rope.len_chars()).unwrap_or(1).max(1);
+        let mut orphan_top = lane_h - 8.;
+        let children = cards.into_iter().map(|card| {
+            let detached = card.anchor.is_none() || card.body.orphaned;
+            let top = if let Some(range) = card.anchor {
+                48. + (range.start.min(doc_len) as f32 / doc_len as f32) * (lane_h - 140.)
+            } else {
+                orphan_top -= 76.;
+                orphan_top
+            };
+            let machine = card.kind == NoteKind::Diagnosis;
+            div().absolute().top(px(top.max(8.))).left(px(8.))
+                .w(px(MARGIN_WIDTH - 8.)).p(px(8.))
+                .rounded(px(if machine { 3. } else { 9. }))
+                .bg(rgb(if card.body.unverified { STALE_BG } else if machine {
+                    DIAGNOSIS_CARD_BG
+                } else { NOTE_CARD_BG }))
+                .border_1().border_color(rgb(RULE_COLOR))
+                .font_family("PT Serif").text_size(px(13.))
+                .text_color(rgb(if card.body.unverified { MUTED_COLOR } else { TEXT_COLOR }))
+                .when(machine && !card.body.title.is_empty(), |d| {
+                    d.child(div().font_weight(FontWeight::BOLD).child(card.body.title.clone()))
+                })
+                .child(if card.body.body.is_empty() && !machine {
+                    "(empty note)".to_string()
+                } else { card.body.body.clone() })
+                .when(detached, |d| d.child(
+                    div().mt(px(4.)).text_size(px(10.)).text_color(rgb(MUTED_COLOR))
+                        .child("◇ detached")
+                )).into_any_element()
+        }).collect::<Vec<_>>();
+        Some(div().absolute().left(px(lane_left)).top_0().bottom_0()
+            .w(px(MARGIN_WIDTH)).children(children).into_any_element())
+    }
+
     /// The door's visible state (DESIGN §4.4, principle 5 — no hidden modes):
     /// a thin rail at the lane top that names what the closed door is holding
     /// ("3 resting · open") and opens it on a click; in reviewing it instead
@@ -20757,8 +20808,13 @@ impl Render for Editor {
                 // (S10; F7: machine states sleep, Error/NeedsSetup survive
                 // to exit by construction) — and the lane/margin
                 // mutual-exclusion switch (N6).
-                if self.history_view.is_some() || self.strip.is_parked() || self.cold_read.is_some()
-                {
+                if self.strip.is_parked() {
+                    return match self.render_past_margin(window) {
+                        Some(margin) => d.child(margin),
+                        None => d,
+                    };
+                }
+                if self.history_view.is_some() || self.cold_read.is_some() {
                     return d;
                 }
                 let d = match self.render_margin(window, cx) {
@@ -24430,11 +24486,41 @@ impl Element for StripElement {
         // terminal where it closed. Open threads run quieter than closed
         // ones ended: eight open questions must not grid the cloth.
         for t in &bake.threads {
-            let x0 = fab_x(t.x0);
-            let x1 = fab_x(t.x1);
-            let y = band_top + t.y;
-            rect(window, x0, y, x1 - x0, 1., tint(strip::THREAD, if t.open { 0.28 } else { 0.42 }));
-            if x0 >= rail_x0 && x0 <= rail_x1 {
+            let alpha = if t.open { 0.28 } else { 0.42 };
+            for (segment_ix, segment) in t.segments.iter().enumerate() {
+                for (pair_ix, pair) in segment.windows(2).enumerate() {
+                    let mut a = pair[0];
+                    let mut b = pair[1];
+                    if segment_ix > 0 && pair_ix == 0 { a.x += 3.; }
+                    if segment_ix + 1 < t.segments.len() && pair_ix + 2 == segment.len() {
+                        b.x -= 3.;
+                    }
+                    let dx = b.x - a.x;
+                    let dy = b.y - a.y;
+                    let steps = dx.abs().max(dy.abs()).ceil().max(1.) as usize;
+                    for i in 0..steps {
+                        let f = i as f32 / steps as f32;
+                        rect(window, fab_x(a.x + dx * f), band_top + a.y + dy * f,
+                            1., 1., tint(strip::THREAD, alpha));
+                    }
+                }
+                if segment_ix + 1 < t.segments.len() {
+                    if let Some(end) = segment.last() {
+                        let x = fab_x(end.x - 3.);
+                        rect(window, x, band_top + end.y - 3., 1., 3., tint(strip::THREAD, 0.58));
+                    }
+                    if let Some(start) = t.segments[segment_ix + 1].first() {
+                        let x = fab_x(start.x + 3.);
+                        rect(window, x, band_top + start.y, 1., 3., tint(strip::THREAD, 0.58));
+                    }
+                }
+            }
+            let first = t.segments.first().and_then(|s| s.first()).copied();
+            if t.origin_proven && first.is_some() {
+                let p = first.unwrap();
+                let x0 = fab_x(p.x);
+                let y = band_top + p.y;
+                if x0 >= rail_x0 && x0 <= rail_x1 {
                 let mut ring = fill(
                     Bounds::new(point(px(x0 - 2.), px(y - 2.)), size(px(4.), px(4.))),
                     tint(strip::THREAD, 0.),
@@ -24443,8 +24529,23 @@ impl Element for StripElement {
                 ring.border_widths = gpui::Edges::all(px(1.));
                 ring.border_color = tint(strip::THREAD, 0.7).into();
                 window.paint_quad(ring);
+                }
             }
-            if !t.open {
+            if t.uncertain_start && let Some(p) = first {
+                let x = fab_x(p.x);
+                let y = band_top + p.y;
+                rect(window, x, y - 2., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x - 1., y - 1., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x + 1., y - 1., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x - 2., y, 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x + 2., y, 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x - 1., y + 1., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x + 1., y + 1., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x, y + 2., 1., 1., tint(strip::THREAD, 0.78));
+            }
+            if !t.open && let Some(p) = t.segments.last().and_then(|s| s.last()) {
+                let x1 = fab_x(p.x);
+                let y = band_top + p.y;
                 let dot = if t.resolved { strip::SAGE } else { strip::GREY };
                 rect(window, x1 - 1.5, y - 1.5, 3., 3., tint(dot, 0.9));
             }
