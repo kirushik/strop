@@ -362,6 +362,11 @@ const FULL_DIAGNOSIS_CAP: usize = 5;
 /// plus padding and border. The render forces exactly this height so the
 /// packer's no-overlap math and the painted card can never disagree.
 const COLLAPSED_CARD_H: f32 = 24.;
+/// The conservative 0.2 setup/failure card owns this fixed lane band. Detail
+/// scrolls inside it, so actions remain reachable and anchored cards receive
+/// the exact same floor rather than sharing an absolute coordinate.
+const AI_RECOVERY_WIDE_H: f32 = 176.;
+const AI_RECOVERY_GAP: f32 = 8.;
 /// The prose column's capped width — everything else (centering, the note
 /// lane, the narrow-width left-shift) is measured against it.
 const COL_MAX_WIDTH: f32 = 660.;
@@ -657,8 +662,8 @@ actions!(
         OpenFile, SaveCopyAs, AddNote, RunDiagnosis, RunBelieving, Find, Replace, EscapeMode,
         ToggleHistory, ToggleStrip, TogglePalette, TogglePopover, PaletteUp, PaletteDown, NewDocument,
         RenameDocument, RevealInFiles, CopyDocumentPath, OpenAiConfig, TestAiConnection,
-        CancelAiRun, DiagnosisModeDevelopmental, DiagnosisModeLine, DiagnosisModeCopy,
-        ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown, SaveAiSettings,
+        CancelAiRun, ShowShortcuts, OpenWelcome, OpenAiSettings, SettingsUp, SettingsDown,
+        SaveAiSettings,
         ScrapsTravel, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
         MoveToManuscript, PutBackScrap, ToggleGraveyard, ReadItCold, CrRefuse, CrNoop,
         CrCopy, CrEscape, CrNextPage, CrPrevPage, CrFirstPage, CrLastPage,
@@ -957,10 +962,9 @@ fn card_body(composing_here: bool) -> CardBody {
 /// deferred/pending round-trips — `pending_pass`/`last_pass` collapse doubting
 /// onto believing. So the pass identity is an enum, threaded end to end.
 ///
-/// `Diagnostic` carries its levels-of-edit mode WITH it, which is the fix for
-/// the sticky-mode trap (review mid): a menu row pins its depth into the run
-/// itself rather than mutating the persistent `diagnosis_mode` session override
-/// (which would silently re-aim the next ctrl-shift-d).
+/// `Diagnostic` carries its levels-of-edit mode WITH it: a menu row pins its
+/// depth into the run itself, while ctrl-shift-d keeps using the configured
+/// default. There is no second, sticky session-mode control grammar.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum PassKind {
     /// Elbow's believing game — strengths named as mechanisms.
@@ -1006,12 +1010,15 @@ impl PassKind {
 enum EditorFace {
     /// No provider configured — routes to setup (the card lives on render_ai_status).
     NeedsSetup,
-    /// The last read failed — hover carries the message; the card stays too.
+    /// The last read failed — the persistent recovery card carries meaning.
     Error,
     /// A read is cooking — pulse dot; hover names the read.
     Cooking,
     /// A completed read is parked behind the reveal clock ("a read is ready").
     Ready,
+    /// A valid read completed with no new queries and has not yet been
+    /// acknowledged through the attached menu.
+    Empty,
     /// The door is open — "Reading · {n} open".
     Reading,
     /// Drafting, nothing pending — the bare "Ask the editor ▾".
@@ -1027,6 +1034,7 @@ impl EditorFace {
             EditorFace::Error => "error",
             EditorFace::Cooking => "cooking",
             EditorFace::Ready => "ready",
+            EditorFace::Empty => "empty",
             EditorFace::Reading => "reading",
             EditorFace::Idle => "idle",
         }
@@ -1040,11 +1048,12 @@ struct FaceInputs {
     error: bool,
     cooking: bool,
     ready: bool,
+    empty: bool,
     door_open: bool,
 }
 
 /// The priority function itself, pure and table-tested. Order is the spec's:
-/// NeedsSetup > Error > cooking > read-ready > Reading·N > idle.
+/// NeedsSetup > Error > cooking > read-ready > empty > Reading·N > idle.
 fn face_for(i: &FaceInputs) -> EditorFace {
     if i.needs_setup {
         EditorFace::NeedsSetup
@@ -1054,6 +1063,8 @@ fn face_for(i: &FaceInputs) -> EditorFace {
         EditorFace::Cooking
     } else if i.ready {
         EditorFace::Ready
+    } else if i.empty {
+        EditorFace::Empty
     } else if i.door_open {
         EditorFace::Reading
     } else {
@@ -1280,9 +1291,13 @@ pub struct Editor {
     /// `active_note` + `composing_note` + `note_input`, so they cannot drift
     /// out of sync (see `CardFocus`).
     focus: CardFocus,
-    /// AI pass lifecycle, rendered as the margin's first card (PLAN.md
-    /// E3): teaches setup, shows progress, names failures actionably.
+    /// AI pass lifecycle. Running state lives on the editor control/menu;
+    /// only setup and actionable failures render outside that anchor in 0.2.
     ai_status: Option<AiStatus>,
+    /// The last valid empty result. Its button marker remains until the
+    /// attached menu closes; the menu's quiet data row remains until the next
+    /// read supersedes it. "Acknowledged" is interaction, never gaze tracking.
+    ai_empty_result: Option<AiEmptyResult>,
     /// Whole-manuscript language resolution is provider-independent and shared
     /// by every selection until either the document or [ai].language changes.
     ai_language_cache: Option<AiLanguageCache>,
@@ -1292,9 +1307,6 @@ pub struct Editor {
     /// Monotonic review-pass counter; each successful diagnosis pass bumps it
     /// and stamps its new cards' `pass_id`, so a later pass can rest older ones.
     diagnosis_pass: u64,
-    /// Session override of the levels-of-edit depth; None = config's
-    /// [ai].mode (the thesis switch, editorial-foundations §2.2).
-    diagnosis_mode: Option<String>,
     /// What the last pass was, so an error card's Retry can repeat it exactly
     /// (believing / doubting / a diagnosis at its pinned depth).
     last_pass: PassKind,
@@ -1386,13 +1398,6 @@ pub struct Editor {
     /// ordering): loaded from disk at palette open, written through on
     /// every palette execution — the palette becomes *your* instrument.
     palette_freq: HashMap<String, u32>,
-    /// The chord whisper (DESIGN §3.5, VimGolf's engine): after a palette
-    /// execution of a chorded command, one muted bottom-right one-liner
-    /// names the chord, then fades. Bederson's flow rules cap it at once
-    /// per session (the bool); the generation guards the fade timer.
-    chord_whisper: Option<String>,
-    chord_whisper_shown: bool,
-    chord_whisper_generation: u64,
     /// In-titlebar document rename (PLAN.md E2).
     doc_rename_input: Option<Entity<TextField>>,
     /// The keyboard-map overlay (PLAN.md E4, ctrl-?).
@@ -1407,6 +1412,9 @@ pub struct Editor {
     /// replaces the current match; the All button replaces every match (one
     /// undo). The current-match index is `palette_selected` (find mode).
     replace_input: Option<Entity<TextField>>,
+    /// Replace All's result data, kept in the initiating omnibar until the
+    /// query/replacement changes or the surface closes.
+    replace_result: Option<String>,
     /// Rename-in-place for a history row: (entry index, composer).
     rename_input: Option<(usize, Entity<TextField>)>,
     /// Alt-text composer for an image block: (block index, composer).
@@ -1510,6 +1518,11 @@ pub struct Editor {
     /// id) — an appear/disappear/anchor change is caret travel, and the lane
     /// SNAPS around it (never slides against the writer's own movement).
     lane_prov_last: Option<u64>,
+    /// Whether the fixed recovery surface owned the top of the lane on the
+    /// last motion-diffed frame. Its arrival/departure changes the lane floor;
+    /// cards snap around that ownership hand-off so they never travel through
+    /// the recovery surface while re-packing.
+    lane_recovery_last: bool,
     /// The park receipt's origin ghost, `None` at rest (see `ParkGhost`).
     park_ghost: Option<(ParkGhost, Instant)>,
     /// The graveyard tail section (docs/impl/02-asides.md §4, Bug B): entries
@@ -2077,6 +2090,7 @@ impl Editor {
             config: Config::default(),
             focus: CardFocus::Idle,
             ai_status: None,
+            ai_empty_result: None,
             ai_language_cache: None,
             pending_pass: None,
             deferred_pass: None,
@@ -2095,7 +2109,6 @@ impl Editor {
             drafting: true,
             ai_generation: 0,
             diagnosis_pass: 0,
-            diagnosis_mode: None,
             // Never read before the first pass sets it (Retry only exists after
             // a pass ran); a plain line diagnosis is the sensible default.
             last_pass: PassKind::Diagnostic("line".to_owned()),
@@ -2105,14 +2118,12 @@ impl Editor {
             palette_query: String::new(),
             omni_return: None,
             palette_freq: HashMap::new(),
-            chord_whisper: None,
-            chord_whisper_shown: false,
-            chord_whisper_generation: 0,
             doc_rename_input: None,
             shortcuts_open: false,
             ai_settings: None,
             ai_settings_generation: 0,
             replace_input: None,
+            replace_result: None,
             rename_input: None,
             alt_input: None,
             image_sel: None,
@@ -2135,6 +2146,7 @@ impl Editor {
             chip_pulse_seq: 0,
             prov_rest: None,
             lane_prov_last: None,
+            lane_recovery_last: false,
             park_ghost: None,
             grave_expanded: Vec::new(),
             last_manuscript_caret: 0,
@@ -4171,9 +4183,8 @@ impl Editor {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
-        // ctrl-shift-d honours the session depth (`diagnosis_mode`, else config);
-        // the mode is resolved HERE and pinned into the run, so a later menu row
-        // can pin a different depth without disturbing this default.
+        // ctrl-shift-d honours the configured default. Menu rows pin their
+        // own depth into a run without creating a second sticky mode.
         self.run_pass(PassKind::Diagnostic(self.effective_mode()), cx);
     }
 
@@ -4241,13 +4252,10 @@ impl Editor {
             .count()
     }
 
-    /// The effective levels-of-edit depth: session override, else config,
-    /// else "line" (Perkins' default register).
+    /// The configured levels-of-edit default, else "line" (Perkins' default
+    /// register). Direct menu requests carry their own depth in `PassKind`.
     fn effective_mode(&self) -> String {
-        let mode = self
-            .diagnosis_mode
-            .clone()
-            .unwrap_or_else(|| self.config.ai.mode.clone());
+        let mode = self.config.ai.mode.clone();
         match mode.as_str() {
             "developmental" | "copy" => mode,
             _ => "line".to_owned(),
@@ -4265,6 +4273,10 @@ impl Editor {
             error: matches!(self.ai_status, Some(AiStatus::Error { .. })),
             cooking: matches!(self.ai_status, Some(AiStatus::Running { .. })),
             ready: self.deferred_pass.is_some(),
+            empty: self
+                .ai_empty_result
+                .as_ref()
+                .is_some_and(|result| result.unacknowledged),
             door_open: !self.drafting,
         }
     }
@@ -4314,7 +4326,10 @@ impl Editor {
         if self.editor_menu_open {
             self.palette_input = None;
             self.replace_input = None;
+            self.replace_result = None;
             self.omni_return = None;
+        } else {
+            self.acknowledge_empty_result();
         }
         cx.notify();
     }
@@ -4322,7 +4337,14 @@ impl Editor {
     fn close_editor_menu(&mut self, cx: &mut Context<Self>) {
         if self.editor_menu_open {
             self.editor_menu_open = false;
+            self.acknowledge_empty_result();
             cx.notify();
+        }
+    }
+
+    fn acknowledge_empty_result(&mut self) {
+        if let Some(result) = &mut self.ai_empty_result {
+            result.unacknowledged = false;
         }
     }
 
@@ -4351,6 +4373,8 @@ impl Editor {
         if matches!(self.ai_status, Some(AiStatus::Running { .. })) {
             return;
         }
+        // A new request supersedes the attached menu's last-result record.
+        self.ai_empty_result = None;
         // Re-read the config: edit → save → retry must work without a
         // restart (the guided config-file flow's contract).
         self.config = crate::config::load();
@@ -4394,6 +4418,7 @@ impl Editor {
             self.ai_status = Some(AiStatus::Error {
                 title: "The editor reads manuscript passages".into(),
                 detail: "Select text in the manuscript and ask again.".into(),
+                recovery: AiRecovery::ManuscriptSelection,
             });
             cx.notify();
             return;
@@ -4404,6 +4429,7 @@ impl Editor {
                 self.ai_status = Some(AiStatus::Error {
                     title: "This is too long for one editor read".into(),
                     detail: format!("{error}. Select a shorter passage for now."),
+                    recovery: AiRecovery::DismissOnly,
                 });
                 cx.notify();
                 return;
@@ -4445,21 +4471,30 @@ impl Editor {
                     if let Some(refusal) = &response.refusal {
                         return Err(AiFailure::Refusal(refusal.clone()));
                     }
+                    match response.finish_reason.as_deref() {
+                        Some("length") => {
+                            return Err(AiFailure::Truncated(
+                                "the provider stopped at its output limit".into(),
+                            ));
+                        }
+                        Some("content_filter") => {
+                            return Err(AiFailure::Refusal(
+                                "the provider's content filter stopped the reply".into(),
+                            ));
+                        }
+                        Some("stop") | None => {}
+                        Some(reason) => {
+                            return Err(AiFailure::Parse(format!(
+                                "the completion ended with finish reason {reason}"
+                            )));
+                        }
+                    }
                     let report = match strop_core::diagnose::parse_for(
                         &response.content,
                         kind.mode_str(),
                     ) {
                         Ok(report) => report,
-                        Err(error) => {
-                            if response
-                                .finish_reason
-                                .as_deref()
-                                .is_some_and(|reason| reason == "length")
-                            {
-                                return Err(AiFailure::Truncated(error));
-                            }
-                            return Err(AiFailure::Parse(error));
-                        }
+                        Err(error) => return Err(AiFailure::Parse(error)),
                     };
                     if report.diagnoses.is_empty() && !report.rejected.is_empty() {
                         return Err(AiFailure::Parse(
@@ -4532,25 +4567,6 @@ impl Editor {
         .detach();
     }
 
-    /// Success notes fade; errors and setup cards stay until acted on.
-    fn schedule_status_fade(&mut self, generation: u64, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(6))
-                .await;
-            this.update(cx, |editor: &mut Editor, cx| {
-                if editor.ai_generation == generation
-                    && matches!(editor.ai_status, Some(AiStatus::Note { .. }))
-                {
-                    editor.ai_status = None;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     fn cancel_ai_run(&mut self, _: &CancelAiRun, _: &mut Window, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
@@ -4561,6 +4577,7 @@ impl Editor {
         // but drop it eagerly so nothing lingers.
         self.ai_generation += 1;
         self.ai_status = None;
+        self.ai_empty_result = None;
         self.pending_pass = None;
         self.deferred_pass = None;
         cx.notify();
@@ -4576,7 +4593,8 @@ impl Editor {
     }
 
     /// Integrate a completed pass into the document NOW: anchor the quotes
-    /// against the current text, add the cards, and say out loud what stuck.
+    /// against the current text and route its outcome to cards, recovery, or
+    /// the editor control's zero-result state.
     /// The single landing site for both the direct path (results arrive in a
     /// lull) and the deferred path (flushed after a burst).
     fn integrate_pass(
@@ -4584,7 +4602,7 @@ impl Editor {
         diagnoses: Vec<strop_core::diagnose::Diagnosis>,
         rejected: usize,
         scope: Option<strop_core::diagnose::PromptScope>,
-        generation: u64,
+        _generation: u64,
         cx: &mut Context<Self>,
     ) {
         let now = std::time::SystemTime::now()
@@ -4603,16 +4621,24 @@ impl Editor {
         // into the same target so suppression still matches.
         let base = self.doc.manuscript_base_char();
         let mtext = self.doc.manuscript_slice().0;
-        let (target_start, target_text) = scope
+        let resolved_target = scope
             .as_ref()
-            .and_then(|scope| strop_core::diagnose::resolve_target(&mtext, scope))
-            .unwrap_or_else(|| {
-                if scope.is_some() {
-                    (mtext.chars().count(), String::new())
-                } else {
-                    (0, mtext.clone())
-                }
-            });
+            .and_then(|scope| strop_core::diagnose::resolve_target(&mtext, scope));
+        let target_missing = scope.is_some() && resolved_target.is_none();
+        let (target_start, target_text) = resolved_target.unwrap_or_else(|| {
+            if scope.is_some() {
+                (mtext.chars().count(), String::new())
+            } else {
+                (0, mtext.clone())
+            }
+        });
+        // Exact quote visibility separates a valid "no NEW queries" result
+        // (including already-open duplicates) from a response whose targets
+        // became stale while the request was in flight.
+        let groundable = diagnoses
+            .iter()
+            .filter(|diagnosis| target_text.contains(&diagnosis.quote))
+            .count();
         let target_end = target_start + target_text.chars().count();
         let target_doc_start = base + target_start;
         let target_doc_end = base + target_end;
@@ -4668,30 +4694,40 @@ impl Editor {
             })
             .detach();
         }
-        // Silent success is the second invisibility bug:
-        // 0 anchored must be said out loud.
-        self.ai_status = Some(AiStatus::Note {
-            title: match kept {
-                0 if count == 0 => {
-                    "Pass complete — the editor found nothing to flag".to_owned()
-                }
-                0 => "Pass complete — no quote matched the current text".to_owned(),
-                n => format!("{n} margin quer{} anchored", if n == 1 { "y" } else { "ies" }),
-            },
-            detail: match (rejected, count.saturating_sub(kept)) {
-                (0, 0) => String::new(),
-                (bad, 0) => format!(
-                    "{bad} malformed item{} dropped",
-                    if bad == 1 { "" } else { "s" }
-                ),
-                (0, stale) => format!(
-                    "{stale} stale quote{} dropped",
-                    if stale == 1 { "" } else { "s" }
-                ),
-                (bad, stale) => format!("{bad} malformed, {stale} stale quotes dropped"),
-            },
-        });
-        self.schedule_status_fade(generation, cx);
+        match ai_landing(count, rejected, groundable, target_missing, kept) {
+            AiLanding::Cards => {
+                // The cards are the result. Malformed/stale sibling counts
+                // remain in diagnostics; backend maintenance is not writer work.
+                self.ai_status = None;
+                self.ai_empty_result = None;
+            }
+            AiLanding::Invalid => {
+                self.ai_empty_result = None;
+                self.ai_status = Some(AiStatus::Error {
+                    title: "The editor's reply could not be read".into(),
+                    detail: "Try the read again. Operational details are in the AI diagnostics log."
+                        .into(),
+                    recovery: AiRecovery::Retry,
+                });
+            }
+            AiLanding::Stale => {
+                self.ai_empty_result = None;
+                self.ai_status = Some(AiStatus::Error {
+                    title: "The draft changed before the read landed".into(),
+                    detail: "The old quotes were not attached to different text.".into(),
+                    recovery: AiRecovery::ReadAgain,
+                });
+            }
+            AiLanding::Empty => {
+                // Structurally valid, normally completed, no rejected or
+                // stale items, and no NEW cards. The control carries receipt.
+                self.ai_status = None;
+                self.ai_empty_result = Some(AiEmptyResult {
+                    kind: self.last_pass.clone(),
+                    unacknowledged: true,
+                });
+            }
+        }
         cx.notify();
     }
 
@@ -4825,6 +4861,7 @@ impl Editor {
                 self.ai_status = Some(AiStatus::Error {
                     title: "Couldn't save the local provider".to_owned(),
                     detail: e,
+                    recovery: AiRecovery::RetryLocal(model),
                 });
                 cx.notify();
             }
@@ -4842,102 +4879,33 @@ impl Editor {
         self.run_pass(kind, cx);
     }
 
-    /// Guided config-file flow: ensure the commented template exists,
-    /// open it in the system editor, and say what happens next.
+    /// Guided config-file escape hatch: ensure the commented template exists
+    /// and open it. The opened editor is its own receipt; the template carries
+    /// its instructions.
     fn open_ai_config(&mut self, _: &OpenAiConfig, _: &mut Window, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
         let path = crate::config::write_template_if_missing();
         crate::files::open_external(&path);
-        self.ai_generation += 1;
-        let generation = self.ai_generation;
-        self.ai_status = Some(AiStatus::Note {
-            title: "Opened config.toml in your editor".to_owned(),
-            detail: "Fill [ai] base_url / api_key / model, save, and run the pass again — \
-                     Strop re-reads the file every time."
-                .to_owned(),
-        });
-        self.schedule_status_fade(generation, cx);
         cx.notify();
     }
 
-    /// A 1-token chat call: moves 401s from run-time to setup-time. On a
-    /// provider error it also fetches /models — that list IS the picker.
-    fn test_ai_connection(&mut self, _: &TestAiConnection, _: &mut Window, cx: &mut Context<Self>) {
+    /// The palette's legacy Test command now routes into the owning settings
+    /// form and reports Running/OK/Failed inline there.
+    fn test_ai_connection(
+        &mut self,
+        _: &TestAiConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
-        self.config = crate::config::load();
-        let ai = self.config.ai.clone();
-        if !ai.configured() {
-            self.ai_generation += 1;
-            self.ai_status = Some(AiStatus::NeedsSetup { local_model: None });
-            self.probe_local_model(self.ai_generation, cx);
-            cx.notify();
-            return;
+        self.open_ai_settings(&OpenAiSettings, window, cx);
+        if self.ai_settings.is_some() {
+            self.ai_settings_test(cx);
         }
-        self.ai_generation += 1;
-        let generation = self.ai_generation;
-        self.ai_status = Some(AiStatus::Running {
-            label: format!("testing {} · {}", host_of(&ai.base_url), ai.model),
-        });
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let api_key = ai.resolved_api_key();
-            let base_url = ai.base_url.clone();
-            let model = ai.model.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let client = strop_core::llm::LlmClient::new(&base_url, &api_key, &model);
-                    let started = std::time::Instant::now();
-                    match client.chat("Reply with exactly: ok", "ok?", 16) {
-                        Ok(_) => Ok(started.elapsed().as_millis() as u64),
-                        Err(e) => {
-                            let models = match &e {
-                                strop_core::llm::LlmError::Provider(_) => {
-                                    client.list_models().ok()
-                                }
-                                _ => None,
-                            };
-                            Err((e, models))
-                        }
-                    }
-                })
-                .await;
-            this.update(cx, |editor: &mut Editor, cx| {
-                if editor.ai_generation != generation {
-                    return;
-                }
-                editor.ai_status = Some(match result {
-                    Ok(ms) => {
-                        editor.schedule_status_fade(generation, cx);
-                        AiStatus::Note {
-                            title: format!(
-                                "OK — {} via {} · {ms}ms",
-                                ai.model,
-                                host_of(&ai.base_url)
-                            ),
-                            detail: String::new(),
-                        }
-                    }
-                    Err((e, models)) => {
-                        let mut status = AiFailure::Llm(e).into_status(&ai.base_url, &ai.model);
-                        if let (AiStatus::Error { detail, .. }, Some(list)) = (&mut status, models)
-                            && !list.is_empty()
-                        {
-                            let shown: Vec<String> = list.into_iter().take(8).collect();
-                            detail.push_str(&format!("\nAvailable models: {}", shown.join(", ")));
-                        }
-                        status
-                    }
-                });
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// The AI settings panel (F4): the in-app surface for the core
@@ -5111,7 +5079,7 @@ impl Editor {
                         editor.ai_settings_list_models(cx);
                     }
                     Err(e) => {
-                        let AiStatus::Error { title, detail } =
+                        let AiStatus::Error { title, detail, .. } =
                             AiFailure::Llm(e).into_status(&base_url, &model)
                         else {
                             unreachable!("into_status always errors")
@@ -5209,12 +5177,22 @@ impl Editor {
         .detach();
     }
 
-    /// [Save] / ctrl-enter: write through toml_edit (comments and unknown
-    /// keys survive), reload the live config, close, confirm in the margin.
+    /// [Save] / ctrl-enter: validate and write through toml_edit (comments and
+    /// unknown keys survive), then close. The changed editor control is the
+    /// receipt; incomplete settings remain inline instead of closing as success.
     fn save_ai_settings(&mut self, _: &SaveAiSettings, window: &mut Window, cx: &mut Context<Self>) {
         let Some((base_url, key, model)) = self.ai_settings_values(cx) else {
             return;
         };
+        if base_url.is_empty() || model.is_empty() {
+            if let Some(panel) = &mut self.ai_settings {
+                panel.test = AiSettingsTest::Failed {
+                    message: "base URL and model are both needed before saving".into(),
+                };
+            }
+            cx.notify();
+            return;
+        }
         // STROP_API_KEY wins over the file; never write a key the
         // environment is already supplying (the panel says so too).
         let key_from_env = env_key_set();
@@ -5230,20 +5208,7 @@ impl Editor {
                 if self.config.ai.configured() && self.pending_pass.is_some() {
                     self.run_pending_pass(cx);
                 } else {
-                    let generation = self.ai_generation;
-                    self.ai_status = Some(AiStatus::Note {
-                        title: if self.config.ai.configured() {
-                            format!("AI configured: {model} via {}", host_of(&base_url))
-                        } else {
-                            "AI settings saved (provider still incomplete)".to_owned()
-                        },
-                        detail: if self.config.ai.configured() {
-                            "Run a pass with ctrl-shift-d.".to_owned()
-                        } else {
-                            String::new()
-                        },
-                    });
-                    self.schedule_status_fade(generation, cx);
+                    self.ai_status = None;
                 }
             }
             Err(e) => {
@@ -5253,49 +5218,6 @@ impl Editor {
             }
         }
         cx.notify();
-    }
-
-    fn set_diagnosis_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
-        self.diagnosis_mode = Some(mode.to_owned());
-        self.ai_generation += 1;
-        let generation = self.ai_generation;
-        self.ai_status = Some(AiStatus::Note {
-            title: format!("Diagnosis mode: {mode}"),
-            detail: match mode {
-                "developmental" => "Structure and argument — what the piece wants to be.",
-                "copy" => "Consistency, usage, mechanics — nothing stylistic.",
-                _ => "Clarity, momentum, dead weight — the default register.",
-            }
-            .to_owned(),
-        });
-        self.schedule_status_fade(generation, cx);
-        cx.notify();
-    }
-
-    fn mode_developmental(
-        &mut self,
-        _: &DiagnosisModeDevelopmental,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.cr_guard(cx) {
-            return; // the reading room refuses with the pulse (F4 belt 2)
-        }
-        self.set_diagnosis_mode("developmental", cx);
-    }
-
-    fn mode_line(&mut self, _: &DiagnosisModeLine, _: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_guard(cx) {
-            return; // the reading room refuses with the pulse (F4 belt 2)
-        }
-        self.set_diagnosis_mode("line", cx);
-    }
-
-    fn mode_copy(&mut self, _: &DiagnosisModeCopy, _: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_guard(cx) {
-            return; // the reading room refuses with the pulse (F4 belt 2)
-        }
-        self.set_diagnosis_mode("copy", cx);
     }
 
     /// The omnibox (DESIGN §2-omnibox): one top-centre field, prefix-
@@ -5313,6 +5235,7 @@ impl Editor {
         cx.observe(&input, |editor, input, cx| {
             let q = input.read(cx).content.clone();
             editor.palette_query = q.clone();
+            editor.replace_result = None;
             editor.palette_selected = 0; // query changed: selection restarts
             // Find previews live — the match scrolls into view as you type,
             // behind the omnibox (this is what dissolves the old bottom-strip
@@ -5379,6 +5302,7 @@ impl Editor {
         self.omni_return = Some(self.selected_range.clone());
         self.palette_input = Some(input);
         self.replace_input = None;
+        self.replace_result = None;
         self.palette_selected = 0;
         self.palette_query = initial.clone();
         // The handle outlives any one open/close cycle (it lives on the
@@ -5530,6 +5454,7 @@ impl Editor {
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_input = None;
         self.replace_input = None;
+        self.replace_result = None;
         self.omni_return = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -5730,7 +5655,6 @@ impl Editor {
                 // §3.3) — disk and the session's in-memory copy together.
                 let count = crate::files::bump_palette_freq(cmd.label);
                 self.palette_freq.insert(cmd.label.to_owned(), count);
-                self.maybe_whisper_chord(cmd, cx);
                 // Close first: focus returns to the document, so the action
                 // lands exactly as if its chord had been pressed there.
                 self.close_palette(window, cx);
@@ -5761,44 +5685,6 @@ impl Editor {
                 self.set_cursor(byte.min(self.doc.len_bytes()), false, cx);
             }
         }
-    }
-
-    /// The solution reveal, post-hoc and opt-out-by-ignoring (DESIGN
-    /// §3.5): a palette execution of a chorded command earns one muted
-    /// "that chord exists" whisper — at most once per app session
-    /// (VimGolf's engine; Bederson's flow rules forbid more), fading on
-    /// the same timer pattern as AI status notes. Chord-less commands
-    /// never whisper: there is nothing faster to reveal.
-    fn maybe_whisper_chord(&mut self, cmd: &crate::commands::Command, cx: &mut Context<Self>) {
-        let Some(keys) = cmd.keys else { return };
-        if self.chord_whisper_shown {
-            return;
-        }
-        self.chord_whisper_shown = true;
-        self.whisper(format!("Chord: {keys} does this directly"), cx);
-    }
-
-    /// The status whisper (the muted bottom-right one-liner): one quiet
-    /// sentence that fades on the AI-note timer window. The chord reveal and
-    /// the replace-all announcement share this one surface.
-    fn whisper(&mut self, text: String, cx: &mut Context<Self>) {
-        self.chord_whisper = Some(text);
-        self.chord_whisper_generation += 1;
-        let generation = self.chord_whisper_generation;
-        cx.spawn(async move |this, cx| {
-            // Same fade window as schedule_status_fade's success notes.
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(6))
-                .await;
-            this.update(cx, |editor: &mut Editor, cx| {
-                if editor.chord_whisper_generation == generation {
-                    editor.chord_whisper = None;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
     }
 
     fn palette_up(&mut self, _: &PaletteUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -6080,46 +5966,68 @@ impl Editor {
                                     .border_b_1()
                                     .border_color(rgb(RULE_COLOR))
                                     .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .text_size(px(13.))
-                                    .child(div().flex_shrink_0().text_color(rgb(MUTED_COLOR)).child("Replace"))
-                                    .child(div().flex_1().min_w(px(0.)).child(rep))
-                                    .child({
-                                        // The All button wears its scope
-                                        // (P12; scopes-search 2): the sweep
-                                        // is manuscript-only, and the button
-                                        // says so BEFORE the click.
-                                        let label = {
-                                            let matches = self.omni_match_ranges();
-                                            let (piece, scraps, capped) =
-                                                self.find_split(&matches);
-                                            if capped {
-                                                "All · 500+ in the piece".to_owned()
-                                            } else if scraps > 0 {
-                                                format!("All · {piece} in the piece")
-                                            } else {
-                                                "All".to_owned()
-                                            }
-                                        };
+                                    .flex_col()
+                                    .gap(px(5.))
+                                    .child(
                                         div()
-                                            .id("replace-all")
-                                            .flex_shrink_0()
-                                            .px(px(8.))
-                                            .py(px(1.))
-                                            .rounded(px(4.))
-                                            .cursor(CursorStyle::PointingHand)
-                                            .bg(rgb(0xE8DFC8))
-                                            .hover(|d| d.bg(rgb(0xDFD3B0)))
-                                            .text_size(px(12.))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                                                    cx.stop_propagation();
-                                                    editor.replace_all(cx);
-                                                }),
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .text_size(px(13.))
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_color(rgb(MUTED_COLOR))
+                                                    .child("Replace"),
                                             )
-                                            .child(label)
+                                            .child(div().flex_1().min_w(px(0.)).child(rep))
+                                            .child({
+                                                // The All button wears its scope
+                                                // (P12; scopes-search 2): the sweep
+                                                // is manuscript-only, and the button
+                                                // says so BEFORE the click.
+                                                let label = {
+                                                    let matches = self.omni_match_ranges();
+                                                    let (piece, scraps, capped) =
+                                                        self.find_split(&matches);
+                                                    if capped {
+                                                        "All · 500+ in the piece".to_owned()
+                                                    } else if scraps > 0 {
+                                                        format!("All · {piece} in the piece")
+                                                    } else {
+                                                        "All".to_owned()
+                                                    }
+                                                };
+                                                div()
+                                                    .id("replace-all")
+                                                    .flex_shrink_0()
+                                                    .px(px(8.))
+                                                    .py(px(1.))
+                                                    .rounded(px(4.))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .bg(rgb(0xE8DFC8))
+                                                    .hover(|d| d.bg(rgb(0xDFD3B0)))
+                                                    .text_size(px(12.))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(
+                                                            |editor, _: &MouseDownEvent, _, cx| {
+                                                                cx.stop_propagation();
+                                                                editor.replace_all(cx);
+                                                            },
+                                                        ),
+                                                    )
+                                                    .child(label)
+                                            }),
+                                    )
+                                    .when_some(self.replace_result.clone(), |d, result| {
+                                        d.child(
+                                            div()
+                                                .pl(px(58.))
+                                                .text_size(px(11.))
+                                                .text_color(rgb(MUTED_COLOR))
+                                                .child(result),
+                                        )
                                     }),
                             )
                         })
@@ -6143,7 +6051,11 @@ impl Editor {
             return;
         }
         let input = cx.new(|cx| TextField::single(cx, String::new()));
-        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        cx.observe(&input, |editor, _, cx| {
+            editor.replace_result = None;
+            cx.notify();
+        })
+        .detach();
         cx.subscribe_in(
             &input,
             window,
@@ -6168,6 +6080,7 @@ impl Editor {
 
     /// Replace the current match and advance to the next.
     fn replace_current(&mut self, replacement: String, cx: &mut Context<Self>) {
+        self.replace_result = None;
         let (OmniMode::Find, query) = omni_mode(&self.palette_query) else {
             return;
         };
@@ -6236,17 +6149,13 @@ impl Editor {
         self.mark_dirty();
         self.palette_selected = 0;
         self.omni_scroll_into_view(0);
-        // The refusal IS the announcement (scopes-search 2): after the sweep
-        // the status whisper names both halves; the scrap matches stay in
-        // the row list, each wearing its region.
-        if skipped > 0 {
-            self.whisper(
-                format!("Replaced {count} in the piece · {skipped} in scraps untouched"),
-                cx,
-            );
+        // The refusal IS the result data (scopes-search 2), retained beside
+        // the initiating Replace controls rather than broadcast globally.
+        self.replace_result = Some(if skipped > 0 {
+            format!("Replaced {count} in the piece · {skipped} in scraps untouched")
         } else {
-            self.whisper(format!("Replaced {count} in the piece"), cx);
-        }
+            format!("Replaced {count} in the piece")
+        });
         self.bump_activity();
         cx.notify();
     }
@@ -11235,6 +11144,9 @@ impl Editor {
                 "overlap": overlap,
                 "has_active": self.focus.active_id().is_some(),
                 "active_visible": layout.cards.iter().any(|c| c.active),
+                "min_top": layout.cards.iter().map(|c| c.top)
+                    .min_by(|a, b| a.total_cmp(b)),
+                "floor": self.margin_card_floor(),
                 // Receded one-line cards (over the full-size budget) — visible
                 // counts them too: they are IN the lane, just smaller.
                 "collapsed": layout.cards.iter().filter(|c| c.collapsed).count(),
@@ -11293,6 +11205,14 @@ impl Editor {
                 "open": !self.drafting,
                 "cooking": matches!(self.ai_status, Some(AiStatus::Running { .. })),
                 "ready": self.deferred_pass.is_some(),
+                "empty_unack": self.ai_empty_result.as_ref()
+                    .is_some_and(|result| result.unacknowledged),
+                "last_result": self.ai_empty_result.as_ref()
+                    .map(|result| format!("{}/0", result.kind.mode_str())),
+                "menu_cancel": self.editor_menu_open
+                    && matches!(self.ai_status, Some(AiStatus::Running { .. })),
+                "recovery": self.ai_recovery_visible(),
+                "margin_floor": self.margin_floor(),
                 "open_count": self.open_query_count(),
             },
             // The history strip (P1). `bakes` is session-monotonic — the
@@ -11880,6 +11800,47 @@ impl Editor {
         cx.notify();
     }
 
+    /// Rig hook (`ebtn:close`): close through the real acknowledgement path.
+    pub fn debug_close_editor_menu(&mut self, cx: &mut Context<Self>) {
+        self.close_editor_menu(cx);
+    }
+
+    /// Rig hook (`ai:empty`): a valid line read with zero new queries.
+    pub fn debug_ai_empty(&mut self, cx: &mut Context<Self>) {
+        self.config.ai.base_url = "http://rig.invalid/v1".into();
+        self.config.ai.model = "rig-model".into();
+        self.ai_status = None;
+        self.ai_empty_result = Some(AiEmptyResult {
+            kind: PassKind::Diagnostic("line".into()),
+            unacknowledged: true,
+        });
+        cx.notify();
+    }
+
+    /// Rig hook (`ai:running`): an active read without making a network call.
+    pub fn debug_ai_running(&mut self, cx: &mut Context<Self>) {
+        self.config.ai.base_url = "http://rig.invalid/v1".into();
+        self.config.ai.model = "rig-model".into();
+        self.last_pass = PassKind::Diagnostic("line".into());
+        self.ai_empty_result = None;
+        self.ai_status = Some(AiStatus::Running {
+            label: "line read · rig-model".into(),
+        });
+        cx.notify();
+    }
+
+    /// Rig hook (`ai:error`): a transient failure with Retry/Dismiss actions.
+    pub fn debug_ai_error(&mut self, cx: &mut Context<Self>) {
+        self.config.ai.base_url = "http://rig.invalid/v1".into();
+        self.config.ai.model = "rig-model".into();
+        self.ai_status = Some(AiStatus::Error {
+            title: "Couldn't reach rig.invalid".into(),
+            detail: "network unavailable".into(),
+            recovery: AiRecovery::Retry,
+        });
+        cx.notify();
+    }
+
     /// Rig hook (`ebtn:door`): the menu footer's presence verb — flush a parked
     /// pass and flip the door, exactly the path a click on it takes.
     pub fn debug_toggle_door(&mut self, cx: &mut Context<Self>) {
@@ -12281,7 +12242,6 @@ impl Editor {
             }
             Some(AiStatus::NeedsSetup { local_model: None }) => " ai=needs-setup".to_owned(),
             Some(AiStatus::Running { .. }) => " ai=running".to_owned(),
-            Some(AiStatus::Note { .. }) => " ai=note".to_owned(),
             Some(AiStatus::Error { .. }) => " ai=error".to_owned(),
         };
         let pending = if self.pending_pass.is_some() { " ai_pending=1" } else { "" };
@@ -12317,9 +12277,8 @@ impl Editor {
         if self.session_had_edits {
             session += " edits=1";
         }
-        // F6 explorability tags: the palette's first row for the live
-        // query (Frequent/ prefix marks the frequency section) and the
-        // chord whisper's visibility window.
+        // F6 explorability tag: the palette's first row for the live query
+        // (Frequent/ prefix marks the frequency section).
         if self.palette_input.is_some() {
             let top = match self.omni_rows(&self.palette_query).into_iter().next() {
                 Some(OmniRow::Frequent(cmd)) => Some(format!("Frequent/{}", cmd.label)),
@@ -12330,11 +12289,6 @@ impl Editor {
                 None => None,
             };
             session += &format!(" palette_top={:?}", top.unwrap_or_default());
-        }
-        if self.chord_whisper.is_some() {
-            // The generation stays at 1 for the whole session if the
-            // once-per-session rule holds.
-            session += &format!(" whisper=chord/{}", self.chord_whisper_generation);
         }
         // Inline-images §4/§5 tags: the live picture selection (block, its
         // door caret, the unreleased staging key) — the rig's window into
@@ -15240,8 +15194,7 @@ impl Editor {
         // Never cover the lane-top furniture the writer needs (the door rail /
         // ai_status band): clamp below it when present (finding 60), else just
         // below the titlebar — the same floor the cards clear.
-        let has_top_furniture = self.margin_rail_count().is_some() || self.ai_status.is_some();
-        let floor = BAR_HEIGHT + 8. + if has_top_furniture { 30. } else { 0. };
+        let floor = self.margin_card_floor();
         const MENU_H_EST: f32 = 132.; // four carrier rows
         let top = layout
             .right_top
@@ -15936,6 +15889,7 @@ impl Editor {
                             "Ask the editor".to_owned()
                         }
                         EditorFace::Ready => "Ask the editor · a read is ready".to_owned(),
+                        EditorFace::Empty => "Ask the editor · 0 new".to_owned(),
                         EditorFace::Reading if n > 0 => {
                             format!("Reading · {n} open · Ask the editor")
                         }
@@ -15948,15 +15902,15 @@ impl Editor {
                         EditorFace::Error => Some(ERROR),
                         _ => None,
                     };
-                    // Hover names the read while cooking, carries the message on a
-                    // failure (the full card still lives on render_ai_status), and
-                    // teaches the chord in every state.
+                    // Hover expands what the control already shows; failure
+                    // meaning remains on the persistent recovery card.
                     let tip_label: SharedString = match (face, self.ai_status.as_ref()) {
                         (EditorFace::Cooking, Some(AiStatus::Running { label })) => {
                             format!("Running: {label}").into()
                         }
                         (EditorFace::Error, Some(AiStatus::Error { title, .. })) => title.clone().into(),
                         (EditorFace::NeedsSetup, _) => "Ask the editor — set up a provider".into(),
+                        (EditorFace::Empty, _) => "Last read · 0 new queries".into(),
                         _ => "Ask the editor".into(),
                     };
                     div()
@@ -17282,8 +17236,82 @@ fn omni_child_index(rows: &[OmniRow], grouped: bool, ix: usize) -> usize {
     child
 }
 
-/// The AI surface's state machine (PLAN.md E3). Status lives where the
-/// results will land — the margin — not in a toast or a titlebar whisper.
+/// A valid zero-query read, recorded at the AI subsystem's anchor control.
+struct AiEmptyResult {
+    kind: PassKind,
+    unacknowledged: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AiLanding {
+    Cards,
+    Empty,
+    Stale,
+    Invalid,
+}
+
+fn ai_landing(
+    accepted: usize,
+    rejected: usize,
+    groundable: usize,
+    target_missing: bool,
+    kept: usize,
+) -> AiLanding {
+    if kept > 0 {
+        AiLanding::Cards
+    } else if rejected > 0 {
+        AiLanding::Invalid
+    } else if accepted > 0 && (target_missing || groundable == 0) {
+        AiLanding::Stale
+    } else {
+        AiLanding::Empty
+    }
+}
+
+/// Recovery verbs for a persistent failure card. The enum makes it
+/// impossible for an unrelated Set up or Retry button to leak onto every
+/// error merely because every error shares one visual surface.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum AiRecovery {
+    /// Authentication/configuration must change before another useful call.
+    Setup,
+    /// A transient provider/network/contract failure can repeat the last read.
+    Retry,
+    /// The manuscript changed before quotes could be grounded; rerun afresh.
+    ReadAgain,
+    /// Scope/refusal/truncation has no truthful automatic remedy in 0.2.
+    DismissOnly,
+    /// A selection in Scraps can return through the existing travel verb.
+    ManuscriptSelection,
+    /// Saving the detected local provider can repeat the exact write.
+    RetryLocal(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AiRecoveryAction {
+    Setup,
+    Retry,
+    ReadAgain,
+    RetryLocal,
+    ReturnToManuscript,
+    Dismiss,
+}
+
+fn ai_recovery_actions(recovery: &AiRecovery) -> &'static [AiRecoveryAction] {
+    use AiRecoveryAction::*;
+    match recovery {
+        AiRecovery::Setup => &[Setup, Dismiss],
+        AiRecovery::Retry => &[Retry, Dismiss],
+        AiRecovery::ReadAgain => &[ReadAgain, Dismiss],
+        AiRecovery::DismissOnly => &[Dismiss],
+        AiRecovery::ManuscriptSelection => &[ReturnToManuscript, Dismiss],
+        AiRecovery::RetryLocal(_) => &[RetryLocal, Setup, Dismiss],
+    }
+}
+
+/// AI request state. Running state is read by the editor button/menu; only
+/// setup and actionable failures render as the conservative 0.2 recovery
+/// card. Successful results never become generic margin notifications.
 enum AiStatus {
     /// No provider configured: the empty state teaches setup. `local_model`
     /// is filled by the background Ollama probe — when present, the card
@@ -17293,15 +17321,11 @@ enum AiStatus {
     Running {
         label: String,
     },
-    /// Success/info; fades after a few seconds.
-    Note {
-        title: String,
-        detail: String,
-    },
     /// Persistent until dismissed, retried, or superseded.
     Error {
         title: String,
         detail: String,
+        recovery: AiRecovery,
     },
 }
 
@@ -17456,25 +17480,55 @@ impl AiFailure {
     fn into_status(self, base_url: &str, model: &str) -> AiStatus {
         use strop_core::llm::LlmError as E;
         let host = host_of(base_url);
-        let (title, detail) = match self {
-            Self::Llm(E::Auth(m)) => (format!("{host} rejected the API key"), m),
+        let (title, detail, recovery) = match self {
+            Self::Llm(E::Auth(m)) => (
+                format!("{host} rejected the API key"),
+                m,
+                AiRecovery::Setup,
+            ),
             Self::Llm(E::RateLimited(m)) => {
-                (format!("Rate limited by {host} — try again in a moment"), m)
+                (
+                    format!("Rate limited by {host} — try again in a moment"),
+                    m,
+                    AiRecovery::Retry,
+                )
             }
-            Self::Llm(E::Provider(m)) => (format!("{host} returned an error"), m),
-            Self::Llm(E::Network(m)) => (format!("Couldn't reach {host}"), m),
-            Self::Llm(E::Shape(m)) => (format!("Unusable reply from {model}"), m),
-            Self::Refusal(m) => (format!("{model} declined this read"), m),
+            Self::Llm(E::Provider(m)) => (
+                format!("{host} returned an error"),
+                m,
+                AiRecovery::Retry,
+            ),
+            Self::Llm(E::Network(m)) => (
+                format!("Couldn't reach {host}"),
+                m,
+                AiRecovery::Retry,
+            ),
+            Self::Llm(E::Shape(m)) => (
+                format!("Unusable reply from {model}"),
+                m,
+                AiRecovery::Retry,
+            ),
+            Self::Refusal(m) => (
+                format!("{model} declined this read"),
+                m,
+                AiRecovery::DismissOnly,
+            ),
             Self::Truncated(m) => (
                 format!("{model}'s reply ended before it was complete"),
-                m,
+                format!("{m}. Select a shorter passage before asking again."),
+                AiRecovery::DismissOnly,
             ),
             Self::Parse(m) => (
                 format!("{model} replied, but the diagnosis could not be read"),
                 m,
+                AiRecovery::Retry,
             ),
         };
-        AiStatus::Error { title, detail }
+        AiStatus::Error {
+            title,
+            detail,
+            recovery,
+        }
     }
 }
 
@@ -18267,7 +18321,7 @@ impl Editor {
         // the active card hold their anchors, inactive diagnoses yield around
         // them, the selected card is kept fully in view, and no two overlap.
         // `top` currently holds each card's anchor target.
-        let floor = BAR_HEIGHT + 8.;
+        let floor = self.margin_card_floor();
         let viewport_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
         let items: Vec<PlaceItem> = cards
             .iter()
@@ -18365,9 +18419,13 @@ impl Editor {
             .find_map(|c| c.provenance.map(|_| c.id));
         let prov_changed = prov_now != self.lane_prov_last;
         self.lane_prov_last = prov_now;
+        let recovery_now = self.ai_recovery_visible();
+        let recovery_changed = recovery_now != self.lane_recovery_last;
+        self.lane_recovery_last = recovery_now;
         let snap = scrolled
             || resized
             || prov_changed
+            || recovery_changed
             || self.focus.composing_id().is_some()
             || self.typing_burst_live()
             // The margin is hidden under the reading room: keep its tops
@@ -18526,7 +18584,27 @@ impl Editor {
     fn lane_has_content(&self) -> bool {
         self.has_margin_cards()
             || self.margin_rail_count().is_some()
-            || self.ai_status.is_some()
+            || self.ai_recovery_visible()
+    }
+
+    fn ai_recovery_visible(&self) -> bool {
+        matches!(self.ai_status, Some(AiStatus::NeedsSetup { .. } | AiStatus::Error { .. }))
+    }
+
+    /// Shared top ownership for every object in the wide margin lane.
+    fn margin_floor(&self) -> f32 {
+        BAR_HEIGHT
+            + 8.
+            + if self.ai_recovery_visible() {
+                AI_RECOVERY_WIDE_H + AI_RECOVERY_GAP
+            } else {
+                0.
+            }
+    }
+
+    fn margin_card_floor(&self) -> f32 {
+        self.margin_floor()
+            + if self.margin_rail_count().is_some() { 30. } else { 0. }
     }
 
     /// The prose column's geometry — (left inset, width) — as a function of
@@ -18601,63 +18679,58 @@ impl Editor {
         )
     }
 
-    /// The chord whisper (DESIGN §3.5): a muted one-liner in the bottom
-    /// right corner — its own tiny surface, deliberately NOT ai_status
-    /// (no card, no title) and never over prose; it fades on its timer
-    /// or dies with the next repaint after it.
-    fn render_chord_whisper(&self) -> Option<impl IntoElement> {
-        let text = self.chord_whisper.clone()?;
-        Some(
-            div()
-                .absolute()
-                .bottom(px(8.))
-                .right(px(12.))
-                .px(px(8.))
-                .py(px(3.))
-                .rounded(px(4.))
-                // Translucent paper: in wide windows the corner is margin
-                // lane (prose-free); in narrow ones it can graze the
-                // viewport's last clipped line, and the translucency
-                // keeps even that readable for the 6s the whisper lives.
-                .bg(rgba(0xFBFAF8D9u32))
-                .font_family("PT Sans")
-                .text_size(px(11.))
-                .text_color(rgb(MUTED_COLOR))
-                .child(text),
-        )
-    }
-
-    /// The AI surface (PLAN.md E3), pinned where results land: top of the
-    /// margin lane when it fits, a floating top-right card otherwise.
-    /// With no status and an empty margin, a one-line hint teaches the
-    /// chord — the AI must be visible before the chord is known.
-    fn render_ai_status(&self, window: &Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// The conservative 0.2 setup/recovery exception. Running, successful,
+    /// and empty-result state live on the editor control/menu; this surface
+    /// exists only when the writer has a truthful remediation action.
+    fn render_ai_status(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !matches!(self.ai_status, Some(AiStatus::NeedsSetup { .. } | AiStatus::Error { .. })) {
+            return None;
+        }
         let fits = self.margin_fits(window);
+        // At narrow widths writer-owned bottom fields and the history strip
+        // win. The persistent recovery state remains on the editor button and
+        // reappears when that deliberate surface closes; no timer is spent.
+        if !fits
+            && (self.focus.input().is_some()
+                || self.alt_input.is_some()
+                || self.strip.open
+                || self.narrow_notes_open
+                || !self.visible_footnotes().0.is_empty())
+        {
+            return None;
+        }
         let (left, width) = if fits {
             let col_right = self.column_right(window);
             (col_right + MARGIN_GAP + 8., MARGIN_WIDTH - 8.)
         } else {
-            (0., 0.) // narrow: bottom strip, never floating over prose
+            (0., 0.)
         };
         let card = move |bg: u32| {
-            // Wide window: a card at the top of the margin lane. Narrow:
-            // a full-width strip at the bottom — status must never sit on
-            // top of the user's text (Kirill's "insult to injury").
             if fits {
                 div()
                     .absolute()
                     .top(px(BAR_HEIGHT + 8.))
                     .left(px(left))
                     .w(px(width))
+                    .h(px(AI_RECOVERY_WIDE_H))
+                    .overflow_hidden()
                     .rounded(px(6.))
                     .flex_col()
             } else {
-                // Narrow window: a full-width strip pinned to the bottom,
-                // never over prose. Stack the content (title · detail ·
-                // actions) so the buttons can't be pushed off the right edge
-                // by a long privacy line — the default-sized window lands
-                // here, so the setup actions must always be reachable.
-                div().absolute().bottom_0().left_0().right_0().border_t_1().flex_col()
+                // Footer chips keep their own 30px band. Other bottom owners
+                // suppress this card above, so paint order never hides actions.
+                div()
+                    .absolute()
+                    .bottom(px(34.))
+                    .left_0()
+                    .right_0()
+                    .max_h(px(210.))
+                    .border_t_1()
+                    .flex_col()
             }
             .p(px(10.))
             .bg(rgb(bg))
@@ -18682,43 +18755,10 @@ impl Editor {
                 .text_size(px(11.))
                 .child(label)
         };
-        let mode = self.effective_mode();
         Some(match self.ai_status.as_ref() {
-            None => {
-                // Idle hint, only in the wide margin and only when the margin
-                // is otherwise empty. The door rail (render_margin_rail) claims
-                // the same top-of-lane slot whenever it's holding something
-                // back; in drafting that happens with zero visible cards, so
-                // margin_cards being empty isn't enough — check the rail's own
-                // condition too, or the hint paints straight over it (Image-4).
-                let rail_showing = if self.drafting {
-                    self.resting_diagnoses() > 0
-                } else {
-                    self.suppressed_copy() > 0
-                };
-                if !fits
-                    || self.has_margin_cards()
-                    || rail_showing
-                    || self.doc.len_bytes() == 0
-                {
-                    return None;
-                }
-                div()
-                    .absolute()
-                    .top(px(BAR_HEIGHT + 12.))
-                    .left(px(left))
-                    .w(px(width))
-                    .font_family("PT Serif")
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED_COLOR))
-                    .child(format!("Margin: ctrl-shift-d — {mode} read"))
-                    .into_any_element()
-            }
             Some(AiStatus::NeedsSetup { local_model }) => {
                 let base = card(CARD_BG);
                 match local_model.clone() {
-                    // The cliff is gone: a local model answered the probe.
-                    // Lead with the one-click, key-free, private path.
                     Some(model) => base
                         .child(
                             div()
@@ -18726,12 +18766,13 @@ impl Editor {
                                 .child("A local model is ready"),
                         )
                         .child(div().text_color(rgb(MUTED_COLOR)).child(format!(
-                            "{model} is running on this machine. Diagnose with it now — no \
-                             key, no account, and your text never leaves your computer.",
+                            "{model} · this machine · no account · text stays local",
                         )))
                         .child(
                             div()
+                                .mt_auto()
                                 .flex()
+                                .flex_wrap()
                                 .gap(px(6.))
                                 .child(
                                     action_button("ai-use-local", "Run with this model")
@@ -18760,27 +18801,24 @@ impl Editor {
                         )
                         .into_any_element(),
                     None => base
-                        .child(div().font_weight(FontWeight::BOLD).child("Diagnosis needs a model"))
-                        .child(div().text_color(rgb(MUTED_COLOR)).child(
-                            "Strop sends your text directly to the OpenAI-compatible endpoint you \
-                             configure — only when you run a pass, never while you type.",
-                        ))
+                        .child(div().font_weight(FontWeight::BOLD).child("The editor needs a model"))
+                        .child(
+                            div().text_color(rgb(MUTED_COLOR)).child(
+                                "Choose an OpenAI-compatible provider. Text is sent only when \
+                                 you ask for a read.",
+                            ),
+                        )
                         .child(
                             div()
+                                .mt_auto()
                                 .flex()
+                                .flex_wrap()
                                 .gap(px(6.))
                                 .child(action_button("ai-setup", "Set up…").on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                         cx.stop_propagation();
                                         editor.open_ai_settings(&OpenAiSettings, window, cx);
-                                    }),
-                                ))
-                                .child(action_button("ai-test", "Test connection").on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        editor.test_ai_connection(&TestAiConnection, window, cx);
                                     }),
                                 ))
                                 .child(action_button("ai-setup-dismiss", "Dismiss").on_mouse_down(
@@ -18794,63 +18832,100 @@ impl Editor {
                         .into_any_element(),
                 }
             }
-            Some(AiStatus::Running { label }) => card(CARD_BG)
-                .child(div().text_color(rgb(MUTED_COLOR)).child(format!("Running: {label}…")))
-                .child(
-                    div().flex().child(action_button("ai-cancel", "Cancel").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            editor.cancel_ai_run(&CancelAiRun, window, cx);
-                        }),
-                    )),
-                )
-                .into_any_element(),
-            Some(AiStatus::Note { title, detail }) => card(0xF2F4EC)
-                .child(div().child(title.clone()))
-                .when(!detail.is_empty(), |d| {
-                    d.child(div().text_color(rgb(MUTED_COLOR)).child(detail.clone()))
-                })
-                .into_any_element(),
-            Some(AiStatus::Error { title, detail }) => card(0xFAF0EC)
-                .child(div().font_weight(FontWeight::BOLD).child(title.clone()))
-                .when(!detail.is_empty(), |d| {
-                    d.child(
+            Some(AiStatus::Error { title, detail, recovery }) => {
+                let mut actions = Vec::new();
+                for action in ai_recovery_actions(recovery) {
+                    let button = match action {
+                        AiRecoveryAction::Setup => action_button("ai-err-config", "Set up…")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.pending_pass = Some(editor.last_pass.clone());
+                                    editor.open_ai_settings(&OpenAiSettings, window, cx);
+                                }),
+                            ),
+                        AiRecoveryAction::Retry => action_button("ai-err-retry", "Retry")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    editor.ai_status = None;
+                                    let kind = editor.last_pass.clone();
+                                    editor.run_pass(kind, cx);
+                                }),
+                            ),
+                        AiRecoveryAction::ReadAgain => action_button("ai-err-read", "Read again")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    editor.ai_status = None;
+                                    let kind = editor.last_pass.clone();
+                                    editor.run_pass(kind, cx);
+                                }),
+                            ),
+                        AiRecoveryAction::RetryLocal => {
+                            let AiRecovery::RetryLocal(model) = recovery else {
+                                unreachable!("local action belongs to local recovery")
+                            };
+                            let model = model.clone();
+                            action_button("ai-err-local", "Try saving again").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    editor.use_local_model(model.clone(), cx);
+                                }),
+                            )
+                        }
+                        AiRecoveryAction::ReturnToManuscript => {
+                            action_button("ai-err-manuscript", "Return to manuscript")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        |editor, _: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            editor.ai_status = None;
+                                            editor.scraps_travel(&ScrapsTravel, window, cx);
+                                        },
+                                    ),
+                                )
+                        }
+                        AiRecoveryAction::Dismiss => action_button("ai-err-dismiss", "Dismiss")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.cancel_ai_run(&CancelAiRun, window, cx);
+                                }),
+                            ),
+                    };
+                    actions.push(button.into_any_element());
+                }
+                card(0xFAF0EC)
+                    .child(div().font_weight(FontWeight::BOLD).child(title.clone()))
+                    .when(!detail.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .id("ai-error-detail")
+                                .max_h(px(84.))
+                                .overflow_y_scroll()
+                                .text_color(rgb(MUTED_COLOR))
+                                .text_size(px(11.))
+                                .child(detail.clone()),
+                        )
+                    })
+                    .child(
                         div()
-                            .text_color(rgb(MUTED_COLOR))
-                            .text_size(px(11.))
-                            .child(detail.clone()),
+                            .mt_auto()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(6.))
+                            .children(actions),
                     )
-                })
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(6.))
-                        .child(action_button("ai-err-config", "Set up…").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.open_ai_settings(&OpenAiSettings, window, cx);
-                            }),
-                        ))
-                        .child(action_button("ai-err-retry", "Retry").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                editor.ai_status = None;
-                                let kind = editor.last_pass.clone();
-                                editor.run_pass(kind, cx);
-                            }),
-                        ))
-                        .child(action_button("ai-err-dismiss", "Dismiss").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.cancel_ai_run(&CancelAiRun, window, cx);
-                            }),
-                        )),
-                )
-                .into_any_element(),
+                    .into_any_element()
+            }
+            _ => unreachable!("non-recovery AI state returned above"),
         })
     }
 
@@ -18918,7 +18993,7 @@ impl Editor {
             })
             .collect();
         let (above_n, below_n) = (above.len(), below.len());
-        let floor = BAR_HEIGHT + 8.;
+        let floor = self.margin_card_floor();
         // A quiet pill at a lane edge when cards are hidden past it — the honest
         // "there's more here, it didn't vanish" cue (DESIGN principle 2).
         let edge_chip = move |label: String, at_bottom: bool| {
@@ -19353,7 +19428,7 @@ impl Editor {
         }
         let col_right = self.column_right(window);
         let lane_left = col_right + MARGIN_GAP + 8.;
-        let top = BAR_HEIGHT + 8.;
+        let top = self.margin_floor();
         let drafting = self.drafting;
         let n = self.margin_rail_count()?;
         let label = if drafting {
@@ -19410,8 +19485,8 @@ impl Editor {
 
     /// One menu row (impl 04 §0): a carrier sentence ("A believing read — …")
     /// that teaches the craft word in place. Its `kind` is pinned into the run
-    /// directly, so choosing a depth never mutates the persistent
-    /// `diagnosis_mode` (the sticky-mode trap). Inert rows stay VISIBLE but
+    /// directly, so choosing a depth never creates a sticky mode. Inert rows
+    /// stay VISIBLE but
     /// unclickable (review H33: cooking or a history preview must not dispatch);
     /// a `gate` reason livens the copy row's `when` line — the only row that
     /// explains, because the gate is data (no "usually after…" advice anywhere).
@@ -19423,8 +19498,8 @@ impl Editor {
     /// accents — the control is the indicator: the row whose read the machine
     /// holds right now (cooking, or parked behind the reveal clock) wears the
     /// same cool dot the button pulses, and the row ctrl-shift-d currently
-    /// aims at teaches its chord as a keycap chip (the chip FOLLOWS the
-    /// session depth, so the default read is always marked).
+    /// aims at teaches its chord as a keycap chip (the chip follows the
+    /// configured default, so the default read is always marked).
     fn editor_menu_row(
         &self,
         id: &'static str,
@@ -19585,6 +19660,60 @@ impl Editor {
         // too narrow for that cedes width, never the button's edge.
         let menu_w = 430f32.min(vw - menu_right - 8.);
         let door_open = !self.drafting;
+        let active_read = match &self.ai_status {
+            Some(AiStatus::Running { label }) => Some(
+                div()
+                    .px(px(12.))
+                    .py(px(7.))
+                    .border_b_1()
+                    .border_color(rgb(RULE_COLOR))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .text_size(px(11.))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(MUTED_COLOR))
+                            .child(format!("Reading · {label}")),
+                    )
+                    .child(
+                        div()
+                            .id("editor-menu-cancel")
+                            .flex_shrink_0()
+                            .px(px(7.))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(rgb(RULE_COLOR))
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                            .child("Cancel read")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.cancel_ai_run(&CancelAiRun, window, cx);
+                                }),
+                            ),
+                    )
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
+        let last_result = self.ai_empty_result.as_ref().map(|result| {
+            div()
+                .px(px(12.))
+                .py(px(5.))
+                .border_b_1()
+                .border_color(rgb(RULE_COLOR))
+                .text_size(px(11.))
+                .text_color(rgb(MUTED_COLOR))
+                .child(format!("Last: {} · 0 new queries", result.kind.run_label()))
+                .into_any_element()
+        });
         let footer = div()
             .pt(px(7.))
             .px(px(12.))
@@ -19682,6 +19811,8 @@ impl Editor {
                         .text_color(rgb(MUTED_COLOR))
                         .child("Ask the editor for…"),
                 )
+                .when_some(active_read, |d, active| d.child(active))
+                .when_some(last_result, |d, result| d.child(result))
                 .child(self.editor_menu_row(
                     "er-believing",
                     ("A believing read", "— what's alive here, what it's secretly about"),
@@ -20149,9 +20280,6 @@ impl Render for Editor {
             .on_action(cx.listener(Self::run_diagnosis))
             .on_action(cx.listener(Self::run_believing))
             .on_action(cx.listener(Self::toggle_review))
-            .on_action(cx.listener(Self::mode_developmental))
-            .on_action(cx.listener(Self::mode_line))
-            .on_action(cx.listener(Self::mode_copy))
             .on_action(cx.listener(Self::open_ai_config))
             .on_action(cx.listener(Self::open_ai_settings))
             .on_action(cx.listener(Self::test_ai_connection))
@@ -20285,9 +20413,6 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::open_ai_settings))
                     .on_action(cx.listener(Self::test_ai_connection))
                     .on_action(cx.listener(Self::cancel_ai_run))
-                    .on_action(cx.listener(Self::mode_developmental))
-                    .on_action(cx.listener(Self::mode_line))
-                    .on_action(cx.listener(Self::mode_copy))
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::open_welcome))
                     .on_action(cx.listener(Self::read_it_cold))
@@ -20374,7 +20499,7 @@ impl Render for Editor {
             })
             .map(|d| {
                 // The panel displaces the margin lane while open (DESIGN
-                // §2-history) — and the AI status card that rides it. The strip
+                // §2-history) — and the AI recovery surface that rides it. The strip
                 // hides the lane + rail only while PREVIEWING the past (parked):
                 // cards anchored to the live document must not float over past
                 // text (review H36). At now, with the strip open, the live doc
@@ -20432,10 +20557,6 @@ impl Render for Editor {
             // a Past read untouched (Time 7); only its pixels yield.
             .map(|d| match self.render_cold_read(window, cx) {
                 Some(room) => d.child(room),
-                None => d,
-            })
-            .map(|d| match self.render_chord_whisper() {
-                Some(whisper) => d.child(whisper),
                 None => d,
             })
             // The two rhymed footer chips (08 §2): warm Scraps + drained
@@ -24448,30 +24569,50 @@ mod tests {
     #[test]
     fn editor_face_is_a_priority_not_exclusive_states() {
         use EditorFace::*;
-        let mk = |needs_setup, error, cooking, ready, door_open| {
-            face_for(&FaceInputs { needs_setup, error, cooking, ready, door_open })
+        let mk = |needs_setup, error, cooking, ready, empty, door_open| {
+            face_for(&FaceInputs {
+                needs_setup,
+                error,
+                cooking,
+                ready,
+                empty,
+                door_open,
+            })
         };
         // The spec's order, top-down: NeedsSetup > Error > cooking > ready >
-        // Reading·N > idle. Each row lights SEVERAL inputs and asserts the
-        // winner, so the priority is what's tested, not a lucky single input.
-        assert_eq!(mk(true, true, true, true, true), NeedsSetup, "setup outranks all");
-        assert_eq!(mk(false, true, true, true, true), Error, "error outranks cooking");
-        assert_eq!(mk(false, false, true, true, true), Cooking, "cooking outranks a parked read");
-        assert_eq!(mk(false, false, false, true, true), Ready, "a parked read outranks the door");
-        assert_eq!(mk(false, false, false, false, true), Reading, "door open, nothing pending");
-        assert_eq!(mk(false, false, false, false, false), Idle, "drafting, quiet");
+        // empty > Reading·N > idle. Each row lights SEVERAL inputs.
+        assert_eq!(mk(true, true, true, true, true, true), NeedsSetup, "setup outranks all");
+        assert_eq!(mk(false, true, true, true, true, true), Error, "error outranks cooking");
+        assert_eq!(
+            mk(false, false, true, true, true, true),
+            Cooking,
+            "cooking outranks a parked read"
+        );
+        assert_eq!(
+            mk(false, false, false, true, true, true),
+            Ready,
+            "a parked read outranks empty"
+        );
+        assert_eq!(
+            mk(false, false, false, false, true, true),
+            Empty,
+            "empty outranks the door"
+        );
+        assert_eq!(mk(false, false, false, false, false, true), Reading, "door open, nothing pending");
+        assert_eq!(mk(false, false, false, false, false, false), Idle, "drafting, quiet");
         // The two combinations the review named (H32): door open × cooking, and
         // door open × a parked read, each resolve to exactly ONE face.
-        assert_eq!(mk(false, false, true, false, true), Cooking);
-        assert_eq!(mk(false, false, false, true, true), Ready);
+        assert_eq!(mk(false, false, true, false, false, true), Cooking);
+        assert_eq!(mk(false, false, false, true, false, true), Ready);
         // Every face round-trips to its rig token.
-        for f in [NeedsSetup, Error, Cooking, Ready, Reading, Idle] {
+        for f in [NeedsSetup, Error, Cooking, Ready, Empty, Reading, Idle] {
             assert_eq!(
                 face_for(&FaceInputs {
                     needs_setup: f == NeedsSetup,
                     error: f == Error,
                     cooking: f == Cooking,
                     ready: f == Ready,
+                    empty: f == Empty,
                     door_open: f == Reading,
                 }),
                 f,
@@ -24479,6 +24620,54 @@ mod tests {
                 f.token()
             );
         }
+    }
+
+    #[test]
+    fn ai_recovery_actions_are_typed_to_the_failure() {
+        use AiRecoveryAction::*;
+        assert_eq!(
+            ai_recovery_actions(&AiRecovery::Setup),
+            &[Setup, Dismiss]
+        );
+        assert_eq!(
+            ai_recovery_actions(&AiRecovery::Retry),
+            &[Retry, Dismiss]
+        );
+        assert_eq!(
+            ai_recovery_actions(&AiRecovery::ReadAgain),
+            &[ReadAgain, Dismiss]
+        );
+        assert_eq!(
+            ai_recovery_actions(&AiRecovery::DismissOnly),
+            &[Dismiss]
+        );
+        assert_eq!(
+            ai_recovery_actions(&AiRecovery::ManuscriptSelection),
+            &[ReturnToManuscript, Dismiss]
+        );
+        assert_eq!(
+            ai_recovery_actions(&AiRecovery::RetryLocal("llama".into())),
+            &[RetryLocal, Setup, Dismiss]
+        );
+    }
+
+    #[test]
+    fn ai_landing_separates_empty_stale_and_invalid_results() {
+        use AiLanding::*;
+        assert_eq!(ai_landing(0, 0, 0, false, 0), Empty);
+        assert_eq!(
+            ai_landing(2, 0, 2, false, 0),
+            Empty,
+            "grounded duplicates mean no new queries, not a failed read"
+        );
+        assert_eq!(ai_landing(2, 0, 0, false, 0), Stale);
+        assert_eq!(ai_landing(2, 0, 2, true, 0), Stale);
+        assert_eq!(ai_landing(0, 1, 0, false, 0), Invalid);
+        assert_eq!(
+            ai_landing(2, 1, 1, false, 1),
+            Cards,
+            "valid cards land despite malformed siblings"
+        );
     }
 
     #[test]
@@ -24496,7 +24685,7 @@ mod tests {
             "developmental read"
         );
         // The three kinds are distinct, and a pinned depth is carried by value
-        // (the fix for the sticky-mode trap — no diagnosis_mode mutation).
+        // (the fix for the sticky-mode trap — no hidden default mutation).
         assert_ne!(PassKind::Doubting, PassKind::Believing);
         assert_ne!(PassKind::Diagnostic("line".into()), PassKind::Diagnostic("copy".into()));
     }

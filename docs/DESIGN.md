@@ -103,7 +103,8 @@ of the design, and its psychological value is mostly unextracted today.
 
 Current inventory: titlebar (title/rename, format buttons, history
 ring, hamburger, window controls), command palette, keyboard map,
-margin (notes/diagnoses/AI status), footnote zone, find/replace strip,
+margin (notes/diagnoses plus the temporary 0.2 AI-recovery exception),
+footnote zone, find/replace strip,
 history dropdown + inline diff, bottom strips (narrow-window variants).
 
 Resolved against the surfaces research (2026-06-13):
@@ -247,10 +248,10 @@ audit this section heads):
   (`pending_pass`) and runs the moment a provider exists — Save reads
   "Save & run", the local one-click runs it directly. No "now press the
   chord again" dead end.
-- **Bottom-strip robustness**: the default-sized window renders AI status
-  as the bottom strip (margin doesn't fit); it now stacks title · detail ·
-  actions so a long privacy line can never push the setup buttons off the
-  edge.
+- **Recovery-surface robustness**: the default-sized window renders only
+  setup/actionable failure recovery as a bottom strip when the margin does
+  not fit. It yields to writer-owned bottom fields and reappears intact;
+  running and successful state stay on the editor control/menu.
 
 ## 3. The explorability layer (the Bryce verdict, suit on)
 
@@ -273,9 +274,10 @@ preview, undo — never new nouns):
 4. **Teach by document**: the tutorial is a Papert microworld — extend
    it to *invite* breaking things ("delete this paragraph, then press
    ctrl-alt-h and watch it come back").
-5. **Solution reveal, post-hoc, opt-in**: after a clumsy manual
-   operation, one dismissible whisper "that's ctrl-shift-x" — max once
-   per session (VimGolf's engine; Bederson's flow rules forbid more).
+5. **Shortcuts rest on their controls**: palette rows and tooltips carry
+   chords when the writer asks for them. The old software-initiated
+   post-hoc chord whisper was retired under P2/P4; using a command is not
+   permission for the software to start a lesson.
 6. **First diagnosis on the house**: the tutorial ships with margin
    queries pre-seeded — the first encounter with the thesis is reading,
    not invoking (low floor on the core feature). Shipped in E4.

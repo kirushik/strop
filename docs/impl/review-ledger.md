@@ -100,7 +100,8 @@ deferred/pending state (H27). The doubting row's copy goes
 form-neutral: "the strongest case against it" (H34). Button face uses
 the glossary word: `Reading · {n} open` (never "Reviewing") and the
 face is a priority function over (ai_status, parked, door, count):
-NeedsSetup > Error > cooking > read-ready > Reading·N > idle (H31,
+NeedsSetup > Error > cooking > read-ready > unacknowledged-empty >
+Reading·N > idle (H31,
 H32). The button disables its rows while a history preview is up —
 the pass must not diagnose a document the screen isn't showing (H33).
 End Session is retired WITH the intent question (its only real job —

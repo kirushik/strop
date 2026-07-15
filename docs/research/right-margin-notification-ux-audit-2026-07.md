@@ -472,6 +472,27 @@ not.”
 
 ## Decisions requested before implementation
 
+Decision record (2026-07-14):
+
+- For 0.2, retain the actionable setup/failure card as an explicitly temporary
+  exception, type its actions, and fix its geometry. Revisit the surface before
+  0.3.
+- For 0.2, a valid empty read shows `0 new` on the editor button without a
+  timeout. Closing its attached menu acknowledges the marker; the menu keeps a
+  quiet last-result record until another read supersedes it. This records
+  interaction exposure, not inferred gaze. Revisit and user-test before 0.3.
+- Retire the three palette diagnosis-mode commands now.
+
+The resulting 0.2 implementation removes all `AiStatus::Note` producers and
+the idle/running margin surfaces; adds active-read/Cancel and last-empty data
+to the editor menu; routes connection testing into the settings panel; types
+every retained recovery action; gives recovery, rail, cards, and the selection
+menu one shared wide-lane floor; parks narrow recovery under writer-owned
+bottom surfaces; retires the diagnosis-mode commands and chord whisper; and
+keeps Replace All counts inline in the omnibar. Rig states cover running,
+empty acknowledgement, and recovery/card geometry. The two temporary product
+decisions are also recorded as a pre-0.3 gate in `docs/ROADMAP.md`.
+
 1. For 0.2, should actionable setup/error details remain as the conservative
    margin/bottom exception, or should this pass move them into the attached
    editor menu too? My recommendation is **retain them for 0.2, but type their

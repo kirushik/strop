@@ -15,7 +15,8 @@ unfinished tail of the writer's original request. Therefore:
 
 - the editor button remains the subsystem's one anchor object (P11);
 - its existing cooking pulse remains the running indicator (P12);
-- the existing status card remains the detailed state and Cancel surface;
+- the attached editor menu is the detailed state and Cancel surface; no
+  running card enters the prose-adjacent margin;
 - valid first-round cards enter the existing reveal clock immediately;
 - no toast, modal, completion pip, badge, or new notification channel appears;
 - repaired cards join the same logical pass and use the same card grammar.
@@ -87,28 +88,22 @@ phase timings and provider request IDs, but never source or raw completions.
 
 ## 4 · Layout hazard
 
-Partial cards and the running status card will coexist. The current card packer
-always starts at `BAR_HEIGHT + 8` and does not reserve the status card at all;
-the selection-flank menu separately uses an approximate 30 px allowance. Both
-are insufficient geometry contracts for a variable-height status surface plus
-anchored results. Before implementation, expose one measured top-furniture
-height to the packer and transient flank, and exercise the equivalent bottom
-strip in narrow layouts. Cancel must remain reachable and no card may overlap
-status, prose, or another card in any transition frame (P1, P6).
-
-Do not solve this by moving Cancel into hover, removing the status card while
-work remains, or placing a banner across the manuscript. Hover may expand
-meaning but cannot own it (P9), and the running control must indicate the work
-it initiates (P12).
+Partial cards and an active repair may coexist. The 0.2 AI UX pass established
+the ownership contract before repair implementation: the editor button/menu
+owns running state and Cancel; only persistent setup/failure recovery owns the
+shared wide-lane floor, and narrow recovery yields to writer-owned bottom
+surfaces. A later repair must reuse that contract. It may not restore a running
+status card, move Cancel into hover, or place a banner across the manuscript
+(P1, P6, P9, P12).
 
 ## 5 · Failure severity
 
 Partial success is not a failed reading. If at least one grounded card survives
-and the repair tail fails, keep those cards and use the existing neutral,
-self-fading `Note`: for example, title `5 queries ready`, detail `2 more could
-not be read.` This is factual state, not an action demand. The normal editor
-button face is determined by the landed/deferred cards. Red error styling and
-Retry are reserved for a run that yields no usable result or a provider/
+and the repair tail fails, keep those cards and record the tail failure only in
+the redacted diagnostic log. The cards are already the visible result; a second
+status surface would turn backend maintenance into writer work. The normal
+editor button face is determined by the landed/deferred cards. Error styling
+and Retry are reserved for a run that yields no usable result or a provider/
 authentication failure requiring action. Color is never the only distinction
 (P10).
 

@@ -512,6 +512,16 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE ebtn:open: editor menu opened");
                 continue;
             }
+            if key == "ebtn:close" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_close_editor_menu(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ebtn:close: editor menu closed");
+                continue;
+            }
             if key == "ebtn:door" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_toggle_door(cx))
@@ -520,6 +530,32 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(80))
                     .await;
                 eprintln!("SMOKE ebtn:door: door toggled");
+                continue;
+            }
+            if key == "ai:empty" {
+                window.update(cx, |editor, _, cx| editor.debug_ai_empty(cx)).ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ai:empty: valid zero-query result seeded");
+                continue;
+            }
+            if key == "ai:running" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_ai_running(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ai:running: active read seeded");
+                continue;
+            }
+            if key == "ai:error" {
+                window.update(cx, |editor, _, cx| editor.debug_ai_error(cx)).ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE ai:error: retryable failure seeded");
                 continue;
             }
             // History strip (P1): `seed:journal` installs a synthetic fortnight;

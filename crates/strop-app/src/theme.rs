@@ -63,7 +63,7 @@ pub const RULE_COLOR: u32 = 0xE8E4DC;
 
 // --- Card fills (the writer/AI distinction, DESIGN two-layer model) -------
 
-/// Generic card chrome (AI-status card, edge-count pills, the narrow-notes
+/// Generic card chrome (AI recovery, edge-count pills, the narrow-notes
 /// panel): a neutral near-white, no warm/cool lean — it carries no layer
 /// meaning, it's just "a small surface".
 pub const CARD_BG: u32 = 0xFFFDF6;

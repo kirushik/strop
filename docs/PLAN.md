@@ -103,21 +103,14 @@ here. Sequenced so dogfooding unblocks as early as possible.
   commented template (Poe/OpenRouter/Ollama examples, STROP_API_KEY env
   precedence documented and implemented) and opens it via xdg-open;
   every pass re-reads config.toml, so edit→save→retry needs no restart.
-  AiStatus state machine rendered where results land (margin lane top,
-  floating card on narrow windows): NeedsSetup teaching card with the
-  privacy line + Open config + Test connection; Running card with
-  UI-level Cancel (generation counter drops stale responses); success
-  Note that names kept/dropped counts (0-anchored is said out loud) and
-  fades; Error cards with named causes (key rejected / rate limited /
-  unreachable / unusable reply / not-diagnosis-format) + Open config /
-  Retry (repeats the same pass kind) / Dismiss. "Test AI Connection" =
-  1-token chat that moves 401s to setup time; on provider errors it
-  GETs /models and lists the first 8 ids — that IS the model picker.
-  **Levels-of-edit mode switch shipped** (the thesis surface, editorial-foundations
-  §2.2): Diagnosis Mode Developmental/Line/Copy palette commands +
-  [ai].mode config default + idle margin hint showing the current mode;
-  debug_cursor reports ai=/mode= for smoke. Deferred: ticking elapsed
-  display, margin-header mode chips (post-dogfood).
+  The 0.2 UX pass superseded E3's generic status-card grammar: running
+  and valid-empty state now live on the editor control/menu; successful
+  cards announce themselves; connection testing stays inline in settings;
+  only setup and typed actionable failures retain a persistent recovery
+  card. The three sticky Diagnosis Mode palette commands and idle hint
+  retired; menu rows request each depth directly and `[ai].mode` remains
+  ctrl-shift-d's configured default. See impl spec 04 and the notification
+  audit for the current state machine and pre-0.3 review gate.
 - [x] **E4. First-run tutorial + keyboard map** (shipped 2026-06-12):
   first launch (and palette "Open Welcome Guide" / `--welcome`) seeds
   "Welcome to Strop.strop" — built at runtime from markdown, real
@@ -347,17 +340,10 @@ section. Ordering: root-fix verification first, then highest-leverage.
   section — top 5 by count, min count 2, rows repeating in their home
   sections (the Obsidian pattern); typed queries get +min(count,20) —
   enough to break ties between equal matches, never enough to beat a
-  plainly better one. **Chord whisper** (§3.5, VimGolf's engine):
-  executing a *chorded* command from the palette earns one muted
-  bottom-right one-liner — "Chord: ctrl-shift-o does this directly" —
-  at most once per app session (Bederson's flow rules), fading on the
-  6s status-note timer; translucent paper, never a card, chord-less
-  commands never whisper. Verified: freq round-trip at injected path +
-  ranked-boost/cap + frequent-section unit tests; X11 smoke
-  (palette_top=/whisper=chord/N debug tags: execute twice → restart →
-  empty palette leads with Frequent/…; chordless execution whispers
-  nothing; the once-per-session generation stays 1); pixel pass on all
-  three (FREQUENT header, corner whisper, tutorial Rewind + closing).
+  plainly better one. The later 0.2 UX pass retired the chord whisper
+  under P2/P4; chords remain on the palette rows and tooltips where the
+  writer reaches for them. Replace All's legitimate count now remains
+  inline in the initiating omnibar row.
 
 **Phase F complete** (2026-06-12): the designed shell is built — F0
 keystone through F6 explorability. Every DESIGN §1–§4 surface that
