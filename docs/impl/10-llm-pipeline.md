@@ -124,9 +124,12 @@ Acceptance:
 
 ## 4 · Scope identity and the 10k safety ceiling
 
-Replace the silent 24,000-character prefix with an explicit internal scope
-object carrying the source snapshot, exact target document range, context
-range, pass kind, language, and whole/selection/local strategy.
+The 0.2 scope replaces the silent 24,000-character prefix with an explicit
+`PromptScope`: the exact target snapshot and manuscript-relative range,
+separate before/after context blocks, and whole-versus-selection identity.
+Co-locating pass kind, resolved language, context ranges, local strategy, and
+structural provenance in one richer scope object is deferred until those
+fields have consumers; 0.2 keeps them in the existing orchestration values.
 
 Two independent fuses apply to all submitted manuscript source, including
 TARGET plus CONTEXT and an explicit select-all:
@@ -145,10 +148,11 @@ neither may cut a target or paragraph silently.
 
 When the writer selects a passage, the selection is the target. Add up to two
 complete paragraphs before and after it as read-only context, as the remaining
-source budget allows, plus the containing heading where practical. Never trim
-the selection to make room for context. The model may read context but may
-return quotes only from the target. Validation and anchoring enforce that
-boundary.
+source budget allows. Containing-heading discovery is deferred: 0.2 walks
+paragraph boundaries only and does not yet interpret block structure as prompt
+context. Never trim the selection to make room for context. The model may read
+context but may return quotes only from the target. Validation and anchoring
+enforce that boundary.
 
 Without a selection:
 

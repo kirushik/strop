@@ -92,7 +92,8 @@ base_url = ""
 api_key = ""
 model = ""
 # Reply language for generated card titles and questions. Auto resolves the
-# whole manuscript locally; selections inherit it. Any language tag is allowed.
+# whole manuscript locally; selections inherit it. ISO/BCP-47-style tags are
+# accepted; POSIX underscores and whitespace separators are normalized.
 language = "auto"
 # Default depth of the editorial pass: "developmental" | "line" | "copy".
 mode = "line"
@@ -155,16 +156,25 @@ fn save_ai_to(
 }
 
 pub fn load() -> Config {
-    match std::fs::read_to_string(config_path()) {
-        Ok(text) => match toml::from_str(&text) {
-            Ok(config) => config,
-            Err(e) => {
-                eprintln!("strop: config.toml ignored: {e}");
-                Config::default()
-            }
-        },
-        Err(_) => Config::default(),
+    if !config_path().exists() {
+        return Config::default();
     }
+    match try_load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("strop: config.toml ignored: {error}");
+            Config::default()
+        }
+    }
+}
+
+/// Reload without inventing a replacement configuration. Live callers use
+/// this so a partially-written or malformed file cannot erase their last-good
+/// provider/settings snapshot; startup may still deliberately fall back.
+pub fn try_load() -> Result<Config, String> {
+    let text = std::fs::read_to_string(config_path())
+        .map_err(|error| error.to_string())?;
+    toml::from_str(&text).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

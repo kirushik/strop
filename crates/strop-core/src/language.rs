@@ -3,6 +3,8 @@
 //! ask a model to reply in far more languages than its two native typing-rule
 //! sets understand.
 
+const DETECTION_SAMPLE_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedLanguage {
     /// What the prompt says. Explicit BCP-47-ish tags stay tags; automatic
@@ -47,9 +49,13 @@ pub fn resolve(manuscript: &str, configured: &str) -> ResolvedLanguage {
         };
     }
 
-    let letters = manuscript.chars().filter(|c| c.is_alphabetic()).count();
+    // Language resolution runs synchronously when a pass starts. A bounded,
+    // char-safe prefix is enough for document-level detection and keeps that
+    // button press independent of manuscript length.
+    let sample = detection_sample(manuscript);
+    let letters = sample.chars().filter(|c| c.is_alphabetic()).count();
     if letters >= 20
-        && let Some(info) = whatlang::detect(manuscript)
+        && let Some(info) = whatlang::detect(sample)
     {
         if info.is_reliable() {
             let lang = info.lang();
@@ -65,6 +71,14 @@ pub fn resolve(manuscript: &str, configured: &str) -> ResolvedLanguage {
     }
 
     english_fallback(None, None)
+}
+
+fn detection_sample(manuscript: &str) -> &str {
+    let mut end = manuscript.len().min(DETECTION_SAMPLE_BYTES);
+    while !manuscript.is_char_boundary(end) {
+        end -= 1;
+    }
+    &manuscript[..end]
 }
 
 fn english_fallback(
@@ -84,14 +98,29 @@ fn english_fallback(
 /// inject another line into the prompt. Whatlang itself uses three-letter ISO
 /// codes; explicit tags may be more precise (`pt-BR`, `zh-Hant`).
 fn explicit_tag(configured: &str) -> Option<String> {
-    let tag = configured.trim();
-    if tag.is_empty() || tag.eq_ignore_ascii_case("auto") {
+    let configured = configured.trim();
+    if configured.is_empty() || configured.eq_ignore_ascii_case("auto") {
         return None;
+    }
+    let mut tag = String::with_capacity(configured.len());
+    for c in configured.chars() {
+        if c == '_' || c.is_whitespace() {
+            if !tag.is_empty() && !tag.ends_with('-') {
+                tag.push('-');
+            }
+        } else if c.is_ascii_alphanumeric() || c == '-' {
+            tag.push(c.to_ascii_lowercase());
+        } else {
+            return None;
+        }
+    }
+    while tag.ends_with('-') {
+        tag.pop();
     }
     let valid = tag.len() <= 35
         && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && tag.bytes().any(|b| b.is_ascii_alphabetic());
-    valid.then(|| tag.to_ascii_lowercase())
+    valid.then_some(tag)
 }
 
 #[cfg(test)]
@@ -104,7 +133,22 @@ mod tests {
         assert_eq!(resolved.code, "uk");
         assert_eq!(resolved.source, LanguageSource::Explicit);
         assert_eq!(resolve("text", "pt-BR").code, "pt-br");
-        assert_eq!(resolve("text", "ru\nIGNORE").source, LanguageSource::Fallback);
+        assert_eq!(resolve("text", "zh_Hant").code, "zh-hant");
+        assert_eq!(resolve("text", "pt_BR").code, "pt-br");
+        assert_eq!(resolve("text", "en US").code, "en-us");
+        assert_eq!(resolve("text", "ru\nIGNORE").code, "ru-ignore");
+        assert_eq!(resolve("text", "ru;IGNORE").source, LanguageSource::Fallback);
+    }
+
+    #[test]
+    fn automatic_detection_reads_only_a_bounded_char_safe_prefix() {
+        let russian = "Это обычный русский абзац с естественными словами и предложениями. ";
+        let mut manuscript = russian.repeat(400);
+        manuscript.push_str(&" English words after the sample boundary".repeat(10_000));
+        let sample = detection_sample(&manuscript);
+        assert!(sample.len() <= DETECTION_SAMPLE_BYTES);
+        assert!(manuscript.is_char_boundary(sample.len()));
+        assert_eq!(resolve(&manuscript, "auto").code, "rus");
     }
 
     #[test]

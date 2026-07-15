@@ -42,6 +42,9 @@ pub struct ParseReport {
 
 pub const REQUEST_SOURCE_MAX_WORDS: usize = 10_000;
 pub const REQUEST_SOURCE_MAX_ESTIMATED_TOKENS: usize = 40_000;
+const QUOTE_MAX_CHARS: usize = 120;
+const PROBLEM_MAX_CHARS: usize = 200;
+const QUERY_MAX_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptScope {
@@ -181,10 +184,6 @@ verbs (cut, add, rewrite, change, consider) are BANNED — objections and \
 questions only. If the piece is strong, return fewer, truer doubts — scarcity \
 is the credibility signal. Write in the language of the manuscript."
         .to_owned()
-}
-
-pub fn user_prompt(text: &str) -> String {
-    user_prompt_scoped(text, "", "", "unspecified")
 }
 
 /// The target is the only source from which a card may quote. Neighboring
@@ -440,19 +439,8 @@ fn is_dense_script_char(c: char) -> bool {
     )
 }
 
-/// Backward-compatible convenience parser for tests and non-pass callers.
-/// The application uses `parse_for` so it can report partial salvage.
-pub fn parse(response: &str) -> Result<Vec<Diagnosis>, String> {
-    let report = parse_for(response, "line")?;
-    if report.diagnoses.is_empty() && !report.rejected.is_empty() {
-        return Err(rejection_summary(&report));
-    }
-    Ok(report.diagnoses)
-}
-
 /// Parse and validate each item independently. One malformed sibling never
-/// destroys valid cards; the caller decides whether rejected items warrant a
-/// bounded repair consultation.
+/// destroys valid cards; the caller decides how rejected items are surfaced.
 pub fn parse_for(response: &str, pass: &str) -> Result<ParseReport, String> {
     let (items, presentation) = json_array(response)?;
     let source_items = items.len();
@@ -520,13 +508,18 @@ pub fn response_schema(pass: &str) -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "quote": {"type": "string"},
+                        "quote": {
+                            "type": "string",
+                            "maxLength": QUOTE_MAX_CHARS,
+                        },
                         "problem": {
                             "type": "string",
+                            "maxLength": PROBLEM_MAX_CHARS,
                             "description": "Card title; write in TARGET_LANGUAGE",
                         },
                         "query": {
                             "type": "string",
+                            "maxLength": QUERY_MAX_CHARS,
                             "description": "Card body; write in TARGET_LANGUAGE",
                         },
                         "level": {"type": "string", "enum": levels},
@@ -543,14 +536,22 @@ fn validate(diagnosis: Diagnosis, levels: &[&str]) -> Result<Diagnosis, String> 
     if diagnosis.quote.trim().is_empty() {
         return Err("empty quote".into());
     }
-    if diagnosis.quote.chars().count() > 120 {
-        return Err("quote is longer than 120 characters".into());
+    if diagnosis.quote.chars().count() > QUOTE_MAX_CHARS {
+        return Err(format!("quote is longer than {QUOTE_MAX_CHARS} characters"));
     }
     if diagnosis.problem.trim().is_empty() {
         return Err("empty problem".into());
     }
     if diagnosis.query.trim().is_empty() {
         return Err("empty query".into());
+    }
+    if diagnosis.problem.chars().count() > PROBLEM_MAX_CHARS {
+        return Err(format!(
+            "problem is longer than {PROBLEM_MAX_CHARS} characters"
+        ));
+    }
+    if diagnosis.query.chars().count() > QUERY_MAX_CHARS {
+        return Err(format!("query is longer than {QUERY_MAX_CHARS} characters"));
     }
     if !levels.contains(&diagnosis.level.as_str()) {
         return Err(format!("unknown level {:?}", diagnosis.level));
@@ -580,7 +581,10 @@ fn json_array(response: &str) -> Result<(Vec<Value>, ParsePresentation), String>
         let Some(Ok(value)) = values.next() else {
             continue;
         };
-        if let Some(items) = value.as_array() {
+        if let Some(items) = value
+            .as_array()
+            .filter(|items| items.iter().all(Value::is_object))
+        {
             return Ok((items.clone(), ParsePresentation::Embedded));
         }
     }
@@ -632,6 +636,7 @@ pub fn to_annotations(
     pass_id: u64,
 ) -> Vec<Annotation> {
     let mut out = Vec::new();
+    let mut suppression = existing.clone();
     let mut cursor = 0usize;
     for d in diagnoses {
         let Some(range) = anchor(text, &d.quote, cursor) else {
@@ -644,10 +649,10 @@ pub fn to_annotations(
         cursor = range.end;
         // Skip what the writer already dismissed (don't re-nag) AND what an open
         // card already covers (don't stack a duplicate on a re-run).
-        if existing.is_suppressed(&range, &d.problem) {
+        if suppression.is_suppressed(&range, &d.problem) {
             continue;
         }
-        out.push(Annotation {
+        let annotation = Annotation {
             id: 0, // assigned by Annotations::push
             range,
             body: d.query,
@@ -659,7 +664,9 @@ pub fn to_annotations(
             orphaned: false,
             pass_id,
             unverified: false,
-        });
+        };
+        suppression.push(annotation.clone());
+        out.push(annotation);
     }
     out
 }
@@ -674,7 +681,7 @@ mod tests {
         let response = "Вот разбор:\n```json\n[{\"quote\": \"зарыта мысль\", \
 \"problem\": \"похороненный лид\", \"query\": \"Почему главное — в третьем абзаце?\", \
 \"level\": \"developmental\"}]\n```";
-        let diagnoses = parse(response).unwrap();
+        let diagnoses = parse_for(response, "line").unwrap().diagnoses;
         assert_eq!(diagnoses.len(), 1);
         let text = "Здесь зарыта мысль, и зарыта мысль глубоко.";
         let range = anchor(text, &diagnoses[0].quote, 0).unwrap();
@@ -712,6 +719,16 @@ mod tests {
     }
 
     #[test]
+    fn embedded_parser_skips_non_diagnosis_arrays() {
+        let response = "Footnote [1]. Then the reply: \
+[{\"quote\":\"one\",\"problem\":\"p\",\"query\":\"q?\",\"level\":\"line\"}]";
+        let report = parse_for(response, "line").unwrap();
+        assert_eq!(report.presentation, ParsePresentation::Embedded);
+        assert_eq!(report.diagnoses.len(), 1);
+        assert_eq!(report.diagnoses[0].quote, "one");
+    }
+
+    #[test]
     fn parser_accepts_the_common_named_object_envelope() {
         let item = "{\"quote\":\"one\",\"problem\":\"p\",\"query\":\"q?\",\"level\":\"line\"}";
         for response in [
@@ -722,6 +739,23 @@ mod tests {
             assert_eq!(report.diagnoses.len(), 1);
             assert_eq!(report.diagnoses[0].quote, "one");
         }
+    }
+
+    #[test]
+    fn parser_bounds_persisted_generated_fields() {
+        let item = |problem: String, query: String| {
+            format!(
+                "[{{\"quote\":\"one\",\"problem\":{problem:?},\"query\":{query:?},\"level\":\"line\"}}]"
+            )
+        };
+        let problem = parse_for(&item("p".repeat(PROBLEM_MAX_CHARS + 1), "q".into()), "line")
+            .unwrap();
+        assert_eq!(problem.diagnoses.len(), 0);
+        assert!(problem.rejected[0].reason.contains("problem is longer"));
+        let query = parse_for(&item("p".into(), "q".repeat(QUERY_MAX_CHARS + 1)), "line")
+            .unwrap();
+        assert_eq!(query.diagnoses.len(), 0);
+        assert!(query.rejected[0].reason.contains("query is longer"));
     }
 
     #[test]
@@ -1009,5 +1043,25 @@ mod tests {
         // A different problem at the same span still comes through.
         let other = to_annotations(text, vec![mk("passive voice")], &existing, 2, 2);
         assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_inside_one_reply_is_suppressed() {
+        let text = "only this phrase exists";
+        let diagnosis = Diagnosis {
+            quote: "this phrase".into(),
+            problem: "same problem".into(),
+            query: "Same question?".into(),
+            level: "line".into(),
+        };
+        let out = to_annotations(
+            text,
+            vec![diagnosis.clone(), diagnosis],
+            &Annotations::default(),
+            1,
+            1,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].range, 5..16);
     }
 }

@@ -339,6 +339,13 @@ struct DeferredPass {
     generation: u64,
 }
 
+struct CompletedAiPass {
+    diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+    rejected: usize,
+    scope: strop_core::diagnose::PromptScope,
+    log: crate::ai_log::PassLog,
+}
+
 #[derive(Clone)]
 struct AiLanguageCache {
     revision: u64,
@@ -1000,6 +1007,21 @@ impl PassKind {
     }
 }
 
+/// Bound completion space by the pass contract, with extra room for languages
+/// whose generated prose commonly needs more tokens per character than
+/// English. This is an allowance, not a target: providers bill actual output.
+fn output_token_budget(kind: &PassKind, language_code: &str) -> u32 {
+    let items = match kind {
+        PassKind::Believing | PassKind::Doubting => 5,
+        PassKind::Diagnostic(_) => 7,
+    };
+    let english = language_code == "eng"
+        || language_code == "en"
+        || language_code.starts_with("en-");
+    let per_item = if english { 512 } else { 1_024 };
+    items * per_item
+}
+
 /// The editor button's face (impl 04 §0, review H31/H32). The real state is
 /// multi-dimensional — AI lifecycle × a parked read × the door — so the face is
 /// a PRIORITY over it, not four exclusive states: a cooking pass while the door
@@ -1304,6 +1326,11 @@ pub struct Editor {
     /// Bumped on every run and on cancel: an in-flight response from an
     /// older generation is silently dropped.
     ai_generation: u64,
+    /// The blocking ureq worker outlives UI cancellation. Keep its slot until
+    /// it really returns so cancel/re-ask cannot stack background requests.
+    ai_worker_active: bool,
+    /// At most one replacement read waits for that unabortable worker.
+    queued_ai_pass: Option<PassKind>,
     /// Monotonic review-pass counter; each successful diagnosis pass bumps it
     /// and stamps its new cards' `pass_id`, so a later pass can rest older ones.
     diagnosis_pass: u64,
@@ -2108,6 +2135,8 @@ impl Editor {
             // pass.
             drafting: true,
             ai_generation: 0,
+            ai_worker_active: false,
+            queued_ai_pass: None,
             diagnosis_pass: 0,
             // Never read before the first pass sets it (Retry only exists after
             // a pass ran); a plain line diagnosis is the sensible default.
@@ -4370,6 +4399,14 @@ impl Editor {
     }
 
     fn run_pass(&mut self, kind: PassKind, cx: &mut Context<Self>) {
+        if self.ai_worker_active {
+            self.queued_ai_pass = Some(kind);
+            self.ai_status = Some(AiStatus::Running {
+                label: "waiting for the previous read to finish".into(),
+            });
+            cx.notify();
+            return;
+        }
         if matches!(self.ai_status, Some(AiStatus::Running { .. })) {
             return;
         }
@@ -4377,7 +4414,9 @@ impl Editor {
         self.ai_empty_result = None;
         // Re-read the config: edit → save → retry must work without a
         // restart (the guided config-file flow's contract).
-        self.config = crate::config::load();
+        if let Ok(config) = crate::config::try_load() {
+            self.config = config;
+        }
         let ai = self.config.ai.clone();
         if !ai.configured() {
             // Remember what was asked: once a provider exists, THIS exact
@@ -4436,8 +4475,10 @@ impl Editor {
             }
         };
         let target_language = self.resolved_ai_language(&manuscript);
+        let max_tokens = output_token_budget(&kind, &target_language.code);
         self.ai_generation += 1;
         let generation = self.ai_generation;
+        self.ai_worker_active = true;
         self.ai_status = Some(AiStatus::Running {
             label: format!("{} · {}", kind.run_label(), ai.model),
         });
@@ -4466,16 +4507,17 @@ impl Editor {
                     );
                     let schema = strop_core::diagnose::response_schema(kind.mode_str());
                     let response = client
-                        .chat_structured(&system, &user, 2048, &schema)
+                        .chat_structured(&system, &user, max_tokens, &schema)
                         .map_err(AiFailure::Llm)?;
                     if let Some(refusal) = &response.refusal {
                         return Err(AiFailure::Refusal(refusal.clone()));
                     }
                     match response.finish_reason.as_deref() {
                         Some("length") => {
-                            return Err(AiFailure::Truncated(
-                                "the provider stopped at its output limit".into(),
-                            ));
+                            return Err(AiFailure::Truncated {
+                                message: "the provider stopped at its output limit".into(),
+                                whole_manuscript: scope.whole_manuscript,
+                            });
                         }
                         Some("content_filter") => {
                             return Err(AiFailure::Refusal(
@@ -4503,43 +4545,55 @@ impl Editor {
                     }
                     let rejected = report.rejected.len();
                     let diagnoses = report.diagnoses;
-                    crate::ai_log::record(&crate::ai_log::PassLog {
+                    let log = crate::ai_log::PassLog {
                         t_unix_ms: crate::ai_log::now_ms(),
                         provider: crate::ai_log::provider_host(&base_url),
-                        model: &model,
-                        pass: kind.mode_str(),
+                        model,
+                        pass: kind.mode_str().to_owned(),
                         scope: if scope.whole_manuscript {
-                            "whole"
+                            "whole".to_owned()
                         } else {
-                            "selection"
+                            "selection".to_owned()
                         },
                         target_chars: scope.target.chars().count(),
-                        finish_reason: response.finish_reason.as_deref(),
+                        finish_reason: response.finish_reason,
                         prompt_tokens: response.usage.prompt_tokens,
                         completion_tokens: response.usage.completion_tokens,
                         retries: response.retries,
                         latency_ms: response.latency_ms,
-                        request_id: response.request_id.as_deref(),
+                        request_id: response.request_id,
                         accepted: diagnoses.len(),
                         rejected,
-                        language: &target_language.code,
-                        language_source: target_language.source.as_str(),
+                        language: target_language.code,
+                        language_source: target_language.source.as_str().to_owned(),
                         language_confidence: target_language.confidence,
                         language_reliable: target_language.reliable,
-                    });
-                    Ok((diagnoses, rejected, scope))
+                    };
+                    Ok(CompletedAiPass {
+                        diagnoses,
+                        rejected,
+                        scope,
+                        log,
+                    })
                 })
                 .await;
             this.update(cx, |editor: &mut Editor, cx| {
+                editor.ai_worker_active = false;
                 if editor.ai_generation != generation {
+                    if let Some(queued) = editor.queued_ai_pass.take() {
+                        editor.run_pass(queued, cx);
+                    } else {
+                        cx.notify();
+                    }
                     return; // cancelled or superseded — drop silently
                 }
                 match result {
-                    Ok((diagnoses, rejected, scope)) => {
+                    Ok(completed) => {
+                        crate::ai_log::record(&completed.log);
                         editor.deliver_pass_report(
-                            diagnoses,
-                            rejected,
-                            Some(scope),
+                            completed.diagnoses,
+                            completed.rejected,
+                            Some(completed.scope),
                             generation,
                             cx,
                         )
@@ -4559,6 +4613,9 @@ impl Editor {
                             &editor.config.ai.model,
                         ));
                     }
+                }
+                if let Some(queued) = editor.queued_ai_pass.take() {
+                    editor.run_pass(queued, cx);
                 }
                 cx.notify();
             })
@@ -4580,6 +4637,7 @@ impl Editor {
         self.ai_empty_result = None;
         self.pending_pass = None;
         self.deferred_pass = None;
+        self.queued_ai_pass = None;
         cx.notify();
     }
 
@@ -4614,52 +4672,10 @@ impl Editor {
         // that no longer match are dropped.
         self.diagnosis_pass += 1;
         let pass_id = self.diagnosis_pass;
-        // Resolve the submitted target within the CURRENT manuscript, anchor
-        // only there, then rebase every range by the manuscript and target
-        // bases. A card therefore cannot land in context, compost, or an
-        // unrelated copy of a selected sentence. Existing notes are rebased
-        // into the same target so suppression still matches.
-        let base = self.doc.manuscript_base_char();
-        let mtext = self.doc.manuscript_slice().0;
-        let resolved_target = scope
-            .as_ref()
-            .and_then(|scope| strop_core::diagnose::resolve_target(&mtext, scope));
-        let target_missing = scope.is_some() && resolved_target.is_none();
-        let (target_start, target_text) = resolved_target.unwrap_or_else(|| {
-            if scope.is_some() {
-                (mtext.chars().count(), String::new())
-            } else {
-                (0, mtext.clone())
-            }
-        });
-        // Exact quote visibility separates a valid "no NEW queries" result
-        // (including already-open duplicates) from a response whose targets
-        // became stale while the request was in flight.
-        let groundable = diagnoses
-            .iter()
-            .filter(|diagnosis| target_text.contains(&diagnosis.quote))
-            .count();
-        let target_end = target_start + target_text.chars().count();
-        let target_doc_start = base + target_start;
-        let target_doc_end = base + target_end;
-        let mut existing = Annotations::default();
-        for n in self.doc.notes().notes() {
-            // Only MANUSCRIPT-anchored notes join the suppression set: the
-            // old `>= base` gate inverts under the tail era (scopes-search
-            // 4), where the manuscript is the document's head.
-            if n.range.start >= target_doc_start && n.range.start <= target_doc_end {
-                let mut n = n.clone();
-                n.range = (n.range.start - target_doc_start)
-                    ..(n.range.end.min(target_doc_end) - target_doc_start);
-                existing.push(n);
-            }
-        }
-        let mut annotations =
-            strop_core::diagnose::to_annotations(&target_text, diagnoses, &existing, now, pass_id);
-        for a in &mut annotations {
-            a.range.start += base + target_start;
-            a.range.end += base + target_start;
-        }
+        let grounded = ground_diagnoses(&self.doc, diagnoses, scope.as_ref(), now, pass_id);
+        let groundable = grounded.groundable;
+        let target_missing = grounded.target_missing;
+        let annotations = grounded.annotations;
         let kept = annotations.len();
         self.doc.add_diagnoses(annotations);
         // The strip's veil: which read landed, when, how many queries.
@@ -4765,6 +4781,11 @@ impl Editor {
                 scope,
                 generation,
             });
+            // The provider call is complete. Ready outranks neither a real
+            // worker nor an error, so clear Running before the button derives
+            // its face; this also removes Cancel from a result that is already
+            // safely parked for reveal.
+            self.ai_status = None;
             self.watch_for_lull(cx);
         } else {
             self.integrate_pass(diagnoses, rejected, scope, generation, cx);
@@ -11788,6 +11809,9 @@ impl Editor {
     /// asserts the cards landed — the whole clock against a real window.
     pub fn debug_deliver_pass(&mut self, cx: &mut Context<Self>) {
         self.drafting = false; // a real pass opens the door at request time
+        self.ai_status = Some(AiStatus::Running {
+            label: "line read · rig-model".into(),
+        });
         let generation = self.ai_generation;
         self.deliver_pass(Self::demo_diagnoses(), generation, cx);
         cx.notify();
@@ -17242,6 +17266,68 @@ struct AiEmptyResult {
     unacknowledged: bool,
 }
 
+struct GroundedDiagnoses {
+    groundable: usize,
+    target_missing: bool,
+    annotations: Vec<Annotation>,
+}
+
+/// Resolve and anchor one completed pass against the live document. Keeping
+/// the compost base and selection offset in this single testable boundary
+/// prevents either coordinate term from being lost during orchestration edits.
+fn ground_diagnoses(
+    doc: &Document,
+    diagnoses: Vec<strop_core::diagnose::Diagnosis>,
+    scope: Option<&strop_core::diagnose::PromptScope>,
+    created_unix: i64,
+    pass_id: u64,
+) -> GroundedDiagnoses {
+    let base = doc.manuscript_base_char();
+    let manuscript = doc.manuscript_slice().0;
+    let resolved = scope.and_then(|scope| {
+        strop_core::diagnose::resolve_target(&manuscript, scope)
+    });
+    let target_missing = scope.is_some() && resolved.is_none();
+    let (target_start, target_text) = resolved.unwrap_or_else(|| {
+        if scope.is_some() {
+            (manuscript.chars().count(), String::new())
+        } else {
+            (0, manuscript.clone())
+        }
+    });
+    let groundable = diagnoses
+        .iter()
+        .filter(|diagnosis| target_text.contains(&diagnosis.quote))
+        .count();
+    let target_doc_start = base + target_start;
+    let target_doc_end = target_doc_start + target_text.chars().count();
+    let mut existing = Annotations::default();
+    for note in doc.notes().notes() {
+        if note.range.start >= target_doc_start && note.range.start <= target_doc_end {
+            let mut note = note.clone();
+            note.range = (note.range.start - target_doc_start)
+                ..(note.range.end.min(target_doc_end) - target_doc_start);
+            existing.push(note);
+        }
+    }
+    let mut annotations = strop_core::diagnose::to_annotations(
+        &target_text,
+        diagnoses,
+        &existing,
+        created_unix,
+        pass_id,
+    );
+    for annotation in &mut annotations {
+        annotation.range.start += target_doc_start;
+        annotation.range.end += target_doc_start;
+    }
+    GroundedDiagnoses {
+        groundable,
+        target_missing,
+        annotations,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AiLanding {
     Cards,
@@ -17334,7 +17420,10 @@ enum AiStatus {
 enum AiFailure {
     Llm(strop_core::llm::LlmError),
     Refusal(String),
-    Truncated(String),
+    Truncated {
+        message: String,
+        whole_manuscript: bool,
+    },
     Parse(String),
 }
 
@@ -17468,11 +17557,12 @@ impl AiFailure {
         match self {
             Self::Llm(E::Auth(_)) => "authentication",
             Self::Llm(E::RateLimited(_)) => "rate_limit",
+            Self::Llm(E::Request(_)) => "request",
             Self::Llm(E::Provider(_)) => "provider",
             Self::Llm(E::Network(_)) => "network",
             Self::Llm(E::Shape(_)) => "response_shape",
             Self::Refusal(_) => "refusal",
-            Self::Truncated(_) => "output_length",
+            Self::Truncated { .. } => "output_length",
             Self::Parse(_) => "diagnosis_contract",
         }
     }
@@ -17493,6 +17583,11 @@ impl AiFailure {
                     AiRecovery::Retry,
                 )
             }
+            Self::Llm(E::Request(m)) => (
+                format!("{host} rejected this read"),
+                m,
+                AiRecovery::Setup,
+            ),
             Self::Llm(E::Provider(m)) => (
                 format!("{host} returned an error"),
                 m,
@@ -17513,11 +17608,22 @@ impl AiFailure {
                 m,
                 AiRecovery::DismissOnly,
             ),
-            Self::Truncated(m) => (
-                format!("{model}'s reply ended before it was complete"),
-                format!("{m}. Select a shorter passage before asking again."),
-                AiRecovery::DismissOnly,
-            ),
+            Self::Truncated { message, whole_manuscript } => {
+                let detail = if whole_manuscript {
+                    format!(
+                        "{message}. The whole-piece reply was too long; select the passage you most want read before asking again."
+                    )
+                } else {
+                    format!(
+                        "{message}. Select a shorter passage before asking again."
+                    )
+                };
+                (
+                    format!("{model}'s reply ended before it was complete"),
+                    detail,
+                    AiRecovery::DismissOnly,
+                )
+            }
             Self::Parse(m) => (
                 format!("{model} replied, but the diagnosis could not be read"),
                 m,
@@ -18000,6 +18106,9 @@ fn ghost_card(card: &MarginCard) -> gpui::Div {
                 card.title.clone()
             }));
     }
+    // AI fields are untrusted generated plain text. Keep them as direct text
+    // children: no Markdown/linkification, HTML interpretation, or action
+    // extraction may be introduced here without a new security review.
     base.p(px(8.))
         .text_size(px(13.))
         .line_height(px(CARD_LINE_H))
@@ -24153,6 +24262,150 @@ mod tests {
         latest.preparation_failed();
 
         assert!(latest.is_none(), "an older completion must become irrelevant");
+    }
+
+    #[test]
+    fn output_budget_follows_pass_cardinality_and_language() {
+        assert_eq!(
+            output_token_budget(&PassKind::Diagnostic("line".into()), "eng"),
+            3_584
+        );
+        assert_eq!(output_token_budget(&PassKind::Believing, "rus"), 5_120);
+        assert_eq!(
+            output_token_budget(&PassKind::Diagnostic("copy".into()), "uk-UA"),
+            7_168
+        );
+    }
+
+    #[gpui::test]
+    fn grounding_rebases_compost_and_selection_and_suppresses_existing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut blocks = BlockMap::new(3);
+        blocks.set_aside_boundary(Some(1));
+        let editor = cx.new(|cx| {
+            Editor::new(
+                cx,
+                "scrap\n\nlead TARGET tail",
+                SpanSet::default(),
+                blocks,
+            )
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            let base = editor.doc.manuscript_base_char();
+            assert!(base > 0, "fixture needs a real compost coordinate base");
+            let target_start = 5;
+            let target_end = target_start + "TARGET".chars().count();
+            editor.doc.add_diagnoses(vec![Annotation {
+                id: 0,
+                range: (base + target_start)..(base + target_end),
+                body: "Already asked?".into(),
+                status: NoteStatus::Open,
+                created_unix: 0,
+                kind: NoteKind::Diagnosis,
+                title: "duplicate".into(),
+                level: "line".into(),
+                orphaned: false,
+                pass_id: 1,
+                unverified: false,
+            }]);
+            let scope = strop_core::diagnose::PromptScope {
+                target_range: target_start..target_end,
+                target: "TARGET".into(),
+                context_before: "lead ".into(),
+                context_after: " tail".into(),
+                whole_manuscript: false,
+            };
+            let diagnosis = |problem: &str| strop_core::diagnose::Diagnosis {
+                quote: "TARGET".into(),
+                problem: problem.into(),
+                query: "Question?".into(),
+                level: "line".into(),
+            };
+
+            editor.integrate_pass(
+                vec![diagnosis("duplicate"), diagnosis("new issue")],
+                0,
+                Some(scope),
+                1,
+                cx,
+            );
+
+            let notes = editor.doc.notes().notes();
+            assert_eq!(notes.len(), 2, "one existing card plus one new card");
+            let landed = notes.iter().find(|note| note.title == "new issue").unwrap();
+            assert_eq!(
+                landed.range,
+                (base + target_start)..(base + target_end)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn completed_mid_burst_read_is_ready_not_running(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "text", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            editor.config.ai.base_url = "http://rig.invalid/v1".into();
+            editor.config.ai.model = "model".into();
+            editor.last_text_edit = Some(Instant::now());
+            editor.ai_status = Some(AiStatus::Running {
+                label: "line read · model".into(),
+            });
+
+            editor.deliver_pass_report(Vec::new(), 0, None, editor.ai_generation, cx);
+
+            assert!(editor.deferred_pass.is_some());
+            assert!(!matches!(editor.ai_status, Some(AiStatus::Running { .. })));
+            assert_eq!(editor.editor_face(), EditorFace::Ready);
+        });
+    }
+
+    #[gpui::test]
+    fn replacement_read_queues_behind_cancelled_blocking_worker(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "text", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            editor.ai_worker_active = true;
+            editor.ai_status = None;
+
+            editor.run_pass(PassKind::Doubting, cx);
+
+            assert_eq!(editor.queued_ai_pass, Some(PassKind::Doubting));
+            assert!(matches!(editor.ai_status, Some(AiStatus::Running { .. })));
+        });
+    }
+
+    #[test]
+    fn permanent_request_and_truncation_choose_truthful_recovery() {
+        let request = AiFailure::Llm(strop_core::llm::LlmError::Request(
+            "model not found".into(),
+        ))
+        .into_status("https://example.test/v1", "missing-model");
+        assert!(matches!(
+            request,
+            AiStatus::Error { recovery: AiRecovery::Setup, .. }
+        ));
+        let whole = AiFailure::Truncated {
+            message: "output limit".into(),
+            whole_manuscript: true,
+        }
+        .into_status("https://example.test/v1", "model");
+        let selected = AiFailure::Truncated {
+            message: "output limit".into(),
+            whole_manuscript: false,
+        }
+        .into_status("https://example.test/v1", "model");
+        let AiStatus::Error { detail: whole, .. } = whole else { panic!() };
+        let AiStatus::Error { detail: selected, .. } = selected else { panic!() };
+        assert!(whole.contains("whole-piece reply"));
+        assert!(selected.contains("shorter passage"));
     }
 
     #[test]

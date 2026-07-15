@@ -24,8 +24,10 @@ pub enum LlmError {
     Auth(String),
     /// 429 — retryable upstream, surfaced after one bounded retry.
     RateLimited(String),
-    /// 4xx/5xx/in-body errors; message passed through verbatim (the only
-    /// cross-provider constant).
+    /// Stable 4xx request errors — model/settings must change before retrying.
+    Request(String),
+    /// 5xx/in-body errors; message passed through verbatim (the only
+    /// cross-provider constant). These may be transient.
     Provider(String),
     Network(String),
     /// Response arrived but no usable content.
@@ -37,6 +39,7 @@ impl std::fmt::Display for LlmError {
         match self {
             Self::Auth(m) => write!(f, "authentication failed: {m}"),
             Self::RateLimited(m) => write!(f, "rate limited: {m}"),
+            Self::Request(m) => write!(f, "request rejected: {m}"),
             Self::Provider(m) => write!(f, "provider error: {m}"),
             Self::Network(m) => write!(f, "network error: {m}"),
             Self::Shape(m) => write!(f, "unexpected response: {m}"),
@@ -157,7 +160,24 @@ impl LlmClient {
         schema: &serde_json::Value,
     ) -> Result<ChatResult, LlmError> {
         let body = self.structured_request_body(system, user, max_tokens, schema);
-        self.chat_body(&body)
+        let has_schema = body.get("response_format").is_some();
+        let started = Instant::now();
+        match self.chat_body(&body) {
+            Err(LlmError::Request(_)) if has_schema => {
+                // Schema output is prevention, never the portable contract. A
+                // host/model pair may reject it even when another model on the
+                // same endpoint accepts it; retry once with prompt + local
+                // validation rather than turning a capability miss into a
+                // settings loop.
+                let fallback = self.request_body(system, user, max_tokens);
+                self.chat_body(&fallback).map(|mut result| {
+                    result.retries = result.retries.saturating_add(1);
+                    result.latency_ms = started.elapsed().as_millis() as u64;
+                    result
+                })
+            }
+            other => other,
+        }
     }
 
     fn chat_body(&self, body: &serde_json::Value) -> Result<ChatResult, LlmError> {
@@ -184,7 +204,14 @@ impl LlmClient {
             .send_json(body);
         let mut response = match response {
             Ok(response) => response,
-            Err(error) => return ChatAttempt::retryable(LlmError::Network(error.to_string()), None),
+            Err(error) => {
+                let retryable = retryable_network_error(&error);
+                return ChatAttempt {
+                    result: Err(LlmError::Network(error.to_string())),
+                    retryable,
+                    retry_after: None,
+                };
+            }
         };
         let status = response.status().as_u16();
         let retry_after = response
@@ -195,7 +222,11 @@ impl LlmClient {
         let text = match response.body_mut().read_to_string() {
             Ok(text) => text,
             Err(error) => {
-                return ChatAttempt::retryable(LlmError::Network(error.to_string()), retry_after);
+                return ChatAttempt {
+                    result: Err(LlmError::Network(error.to_string())),
+                    retryable: retryable_network_error(&error),
+                    retry_after,
+                };
             }
         };
         ChatAttempt {
@@ -232,18 +263,12 @@ struct ChatAttempt {
     retry_after: Option<Duration>,
 }
 
-impl ChatAttempt {
-    fn retryable(error: LlmError, retry_after: Option<Duration>) -> Self {
-        Self {
-            result: Err(error),
-            retryable: true,
-            retry_after,
-        }
-    }
-}
-
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+fn retryable_network_error(error: &ureq::Error) -> bool {
+    !matches!(error, ureq::Error::Timeout(_))
 }
 
 /// LLM providers normally send delta-seconds. Clamp an upstream value so a
@@ -319,7 +344,12 @@ fn parse_chat_response(status: u16, text: &str) -> Result<ChatResult, LlmError> 
                 error_message.unwrap_or_else(|| "HTTP 429".into()),
             ));
         }
-        s if s >= 400 => {
+        s @ 400..=499 => {
+            return Err(LlmError::Request(
+                error_message.unwrap_or_else(|| format!("HTTP {s}: {text}")),
+            ));
+        }
+        s if s >= 500 => {
             return Err(LlmError::Provider(
                 error_message.unwrap_or_else(|| format!("HTTP {s}: {text}")),
             ));
@@ -338,7 +368,10 @@ fn parse_chat_response(status: u16, text: &str) -> Result<ChatResult, LlmError> 
         .next()
         .ok_or_else(|| LlmError::Shape("no choices in response".into()))?;
     let content = message_text(&choice.message.content);
-    if content.is_empty() && choice.message.refusal.is_none() {
+    if content.is_empty()
+        && choice.message.refusal.is_none()
+        && matches!(choice.finish_reason.as_deref(), None | Some("stop"))
+    {
         return Err(LlmError::Shape("choice contained no text".into()));
     }
     Ok(ChatResult {
@@ -400,7 +433,12 @@ fn parse_models_response(status: u16, text: &str) -> Result<Vec<String>, LlmErro
                 error_message.unwrap_or_else(|| "HTTP 429".into()),
             ));
         }
-        s if s >= 400 => {
+        s @ 400..=499 => {
+            return Err(LlmError::Request(
+                error_message.unwrap_or_else(|| format!("HTTP {s}: {}", body_preview(text))),
+            ));
+        }
+        s if s >= 500 => {
             return Err(LlmError::Provider(
                 error_message.unwrap_or_else(|| format!("HTTP {s}: {}", body_preview(text))),
             ));
@@ -427,6 +465,9 @@ fn body_preview(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::TcpListener;
+    use serde_json::Value;
 
     #[test]
     fn request_body_picks_token_field_by_provider() {
@@ -464,6 +505,66 @@ mod tests {
     }
 
     #[test]
+    fn structured_output_downgrades_once_after_a_request_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line
+                        .to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                    {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                bodies.push(serde_json::from_slice::<Value>(&body).unwrap());
+                let (status, response) = if index == 0 {
+                    ("400 Bad Request", r#"{"error":{"message":"unsupported response_format"}}"#)
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"finish_reason":"stop","message":{"content":"[]"}}]}"#,
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+            bodies
+        });
+        let client = LlmClient::new(
+            &format!("http://{address}/ollama"),
+            "key",
+            "model",
+        );
+
+        let result = client
+            .chat_structured("system", "user", 100, &json!({"type":"array"}))
+            .unwrap();
+        let bodies = server.join().unwrap();
+
+        assert_eq!(result.content, "[]");
+        assert_eq!(result.retries, 1);
+        assert!(bodies[0].get("response_format").is_some());
+        assert!(bodies[1].get("response_format").is_none());
+    }
+
+    #[test]
     fn retry_policy_covers_transient_status_and_bounds_provider_delay() {
         for status in [429, 500, 502, 503, 504] {
             assert!(retryable_status(status));
@@ -474,6 +575,10 @@ mod tests {
         assert_eq!(retry_after_delay("7"), Some(Duration::from_secs(7)));
         assert_eq!(retry_after_delay("999"), Some(Duration::from_secs(30)));
         assert_eq!(retry_after_delay("tomorrow"), None);
+        assert!(!retryable_network_error(&ureq::Error::Timeout(
+            ureq::Timeout::Global
+        )));
+        assert!(retryable_network_error(&ureq::Error::HostNotFound));
     }
 
     #[test]
@@ -499,6 +604,11 @@ mod tests {
         assert!(matches!(
             parse_chat_response(429, "{}"),
             Err(LlmError::RateLimited(_))
+        ));
+        // Stable request error, distinct from a retryable upstream failure.
+        assert!(matches!(
+            parse_chat_response(404, r#"{"error":{"message":"model not found"}}"#),
+            Err(LlmError::Request(m)) if m == "model not found"
         ));
         // Garbage body.
         assert!(matches!(
@@ -538,6 +648,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_completion_preserves_actionable_finish_reason() {
+        for reason in ["length", "content_filter"] {
+            let body = format!(
+                "{{\"choices\":[{{\"finish_reason\":\"{reason}\",\"message\":{{\"content\":\"\"}}}}]}}"
+            );
+            let parsed = parse_chat_response(200, &body).unwrap();
+            assert!(parsed.content.is_empty());
+            assert_eq!(parsed.finish_reason.as_deref(), Some(reason));
+        }
+        let stopped = r#"{"choices":[{"finish_reason":"stop","message":{"content":""}}]}"#;
+        assert!(matches!(
+            parse_chat_response(200, stopped),
+            Err(LlmError::Shape(_))
+        ));
+    }
+
+    #[test]
     fn models_response_surfaces_failures_but_keeps_empty_list_ok() {
         // 401 with a provider error body must become Auth, not Ok([]).
         let bad_key = r#"{"error":{"message":"bad key"}}"#;
@@ -552,6 +679,10 @@ mod tests {
         assert!(matches!(
             parse_models_response(500, r#"{"error":{"message":"boom"}}"#),
             Err(LlmError::Provider(m)) if m == "boom"
+        ));
+        assert!(matches!(
+            parse_models_response(404, r#"{"error":{"message":"missing"}}"#),
+            Err(LlmError::Request(m)) if m == "missing"
         ));
         // Happy path: ids extracted in order.
         let ok = r#"{"data":[{"id":"gpt-x"},{"id":"gpt-y"}]}"#;
