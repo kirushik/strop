@@ -42,6 +42,9 @@ pub const HYPHEN_PENALTY: f32 = 50.0;
 /// \exhyphenpenalty 50: a line ending at a PRE-EXISTING compound hyphen
 /// («какой-» / “re-” of “re-entry”) — allowed, charged, nothing inserted.
 pub const EXHYPHEN_PENALTY: f32 = 50.0;
+/// Discourages adjacent hyphen-ended lines without making the second one
+/// illegal: a sufficiently better-fitting hyphenated line may still win.
+pub const HYPHEN_PAIR_PENALTY: f32 = 1_000.0;
 /// Charged when a candidate would make the THIRD consecutive hyphen-ended
 /// line (research §4: “2 preferred; 3 hard cap”). Larger than BADNESS_AWFUL
 /// plus both hyphen penalties, so it only ever wins when no clean break
@@ -794,20 +797,31 @@ fn badness(widths: f32, gaps: f32, avail: f32) -> f32 {
     (100.0 * r * r * r).min(BADNESS_AWFUL)
 }
 
-/// The consecutive-hyphen charge. `forced` marks the empty-line case (a
-/// word wider than the measure): there the only alternative is an overfull
-/// overflow, so the cap yields — LARGE-charged, never forbidden.
-fn streak_charge(streak: usize, ends_hyphen: bool, forced: bool) -> Option<f32> {
-    if !ends_hyphen {
-        return Some(0.0);
-    }
+#[derive(Clone, Copy)]
+enum EndpointKind {
+    Clean,
+    InsertedHyphen,
+    ExistingHyphen,
+}
+
+/// All endpoint-dependent cost. `forced` marks the empty-line case (a word
+/// wider than the measure): there the cap yields to guarantee progress.
+fn endpoint_cost(kind: EndpointKind, streak: usize, forced: bool) -> Option<f32> {
+    let endpoint = match kind {
+        EndpointKind::Clean => return Some(0.0),
+        EndpointKind::InsertedHyphen => HYPHEN_PENALTY,
+        EndpointKind::ExistingHyphen => EXHYPHEN_PENALTY,
+    };
     if streak + 1 > HYPHEN_STREAK_CAP && !forced {
         return None;
     }
-    if streak + 1 >= HYPHEN_STREAK_CAP {
-        return Some(HYPHEN_STREAK_PENALTY);
-    }
-    Some(0.0)
+    let pair = if streak >= 1 { HYPHEN_PAIR_PENALTY } else { 0.0 };
+    let third = if streak + 1 >= HYPHEN_STREAK_CAP {
+        HYPHEN_STREAK_PENALTY
+    } else {
+        0.0
+    };
+    Some(endpoint + pair + third)
 }
 
 /// Strip leading/trailing punctuation, then ask the hyphenator for the
@@ -914,12 +928,9 @@ fn break_para(
         let mut best: Option<Option<(Frag, Frag)>> = None;
         if !cur.is_empty() {
             let eh = cur.last().unwrap().class == BreakClass::AtHyphen;
-            let mut cost = badness(cur_w, cur_g, avail);
-            if eh {
-                cost += EXHYPHEN_PENALTY;
-            }
-            if let Some(extra) = streak_charge(streak, eh, false) {
-                best_cost = cost + extra;
+            let kind = if eh { EndpointKind::ExistingHyphen } else { EndpointKind::Clean };
+            if let Some(extra) = endpoint_cost(kind, streak, false) {
+                best_cost = badness(cur_w, cur_g, avail) + extra;
                 best = Some(None);
             }
         }
@@ -936,10 +947,14 @@ fn break_para(
                 if w + g * min_factor > avail + EPS {
                     continue; // even at minimum spacing the prefix misses
                 }
-                let Some(extra) = streak_charge(streak, true, cur.is_empty()) else {
+                let Some(extra) = endpoint_cost(
+                    EndpointKind::InsertedHyphen,
+                    streak,
+                    cur.is_empty(),
+                ) else {
                     continue;
                 };
-                let cost = badness(w, g, avail) + HYPHEN_PENALTY + extra;
+                let cost = badness(w, g, avail) + extra;
                 if cost < best_cost {
                     best_cost = cost;
                     best = Some(Some((prefix, rest)));
@@ -1442,6 +1457,71 @@ mod tests {
         line.frags.iter().map(|f| f.text.as_str()).collect()
     }
 
+    #[test]
+    fn endpoint_cost_grades_inserted_and_existing_hyphen_pairs() {
+        for kind in [
+            EndpointKind::InsertedHyphen,
+            EndpointKind::ExistingHyphen,
+        ] {
+            let first = endpoint_cost(kind, 0, false).unwrap();
+            let pair = endpoint_cost(kind, 1, false).unwrap();
+            assert_eq!(first, 50.0);
+            assert_eq!(pair, 1_050.0);
+            assert!(900.0 < pair, "a sub-1,000 clean loss avoids the pair");
+            assert!(pair < 1_100.0, "a greater clean loss keeps the pair legal");
+        }
+        assert_eq!(
+            endpoint_cost(EndpointKind::InsertedHyphen, 2, false),
+            Some(101_050.0),
+        );
+        assert_eq!(endpoint_cost(EndpointKind::ExistingHyphen, 3, false), None);
+        assert_eq!(
+            endpoint_cost(EndpointKind::ExistingHyphen, 3, true),
+            Some(101_050.0),
+        );
+    }
+
+    #[test]
+    fn compound_hyphen_pairs_remain_legal_under_pressure() {
+        let text = "aaaaaa-b dddd-eee tail";
+        let book = paginate(text, &SpanSet::default(), &BlockMap::new(1),
+            &metrics(70.0, 100), &mut FakeM, &mut NoHyphen);
+        let ls = lines(&book);
+        assert!(ls[0].ends_hyphen && ls[1].ends_hyphen);
+    }
+
+    #[test]
+    fn final_token_never_calls_the_hyphenator_or_inserts_a_hyphen() {
+        struct PanicH;
+        impl Hyphenate for PanicH {
+            fn breaks(&mut self, _: &str) -> Vec<usize> {
+                panic!("the final token must not reach the hyphenator")
+            }
+        }
+        let book = paginate("extraordinarilylong", &SpanSet::default(),
+            &BlockMap::new(1), &metrics(40.0, 30), &mut FakeM, &mut PanicH);
+        let ls = lines(&book);
+        assert!(ls[0].overfull && !ls[0].ends_hyphen);
+        assert_eq!(words(ls[0]), vec!["extraordinarilylong"]);
+    }
+
+    #[test]
+    fn forced_progress_line_ranges_reconstruct_source() {
+        let text = "extraordinarilylong tiny anotherextraordinarilylong tail";
+        let book = lay(text, BlockMap::new(1), 35.0, 100);
+        let ls = lines(&book);
+        assert!(ls.iter().any(|l| l.overfull));
+        assert!(ls.windows(2).all(|w| w[0].anchor < w[1].anchor));
+        let chars: Vec<char> = text.chars().collect();
+        let mut rebuilt = String::new();
+        for (i, line) in ls.iter().enumerate() {
+            let end = ls.get(i + 1).map(|next| next.anchor).unwrap_or(chars.len());
+            assert!(line.anchor < end);
+            rebuilt.extend(chars[line.anchor..end].iter());
+        }
+        assert_eq!(rebuilt, text);
+    }
+
     /// Both directions of the §3.2 candidate choice, both feasible: at 260 px
     /// the hyphenated end is tighter (badness 24+50 < 219); at 254 px the
     /// clean break is (112 < 100+50).
@@ -1480,6 +1560,10 @@ mod tests {
             max_streak = max_streak.max(streak);
         }
         assert!(hyphens > 0, "the fixture must actually hyphenate");
+        assert!(ls[0].ends_hyphen && ls[1].ends_hyphen,
+            "a pair remains legal when its fit saves more than 1,000");
+        assert!(!ls[2].ends_hyphen,
+            "a viable clean endpoint prevents the third hyphen");
         assert_eq!(max_streak, 2, "the third consecutive hyphen is LARGE-charged away");
     }
 
