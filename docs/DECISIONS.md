@@ -156,3 +156,19 @@ Round 1:
       whether generation ever ships.
 - [ ] Diagnostic engine: one engine with mode rulesets vs three (editorial-foundations §4.2).
 - [ ] Williams-vs-Klinkenborg stance setting (editorial-foundations §4.1).
+
+## Rulings 2026-07-15 (closing the cold-read round's open items, pre-0.2.0)
+
+- **Wheel-flip in cold read: postponed to 0.3.0.** The v1 eaten-wheel verdict
+  (impl/cold-read/adjudications.md S3) stands through 0.2.x. The pre-named v2
+  candidate — ±1 page per accumulated detent, ~250ms cooldown, edge dead
+  zones honored — is the design to build *if corridor testers reach for the
+  wheel*; evidence first, gesture engine second.
+- **Writer's marks never drain.** The writer's own inputs are sacred: a
+  highlight, note, or any mark the writer has made a home of is permanent ink
+  until the writer removes it — the tool never fades, ages, or hides it for a
+  design abstraction. Draining toward neutral remains exclusively the
+  *machine's* grammar (stale diagnosis anchors, the editor's side-notes —
+  color-language.md already draws this line: warm = writer = full ink,
+  drained = machine material receding from life). Any future "drain"
+  proposal must name machine material as its subject or it is out of order.

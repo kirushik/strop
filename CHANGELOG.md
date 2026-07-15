@@ -7,6 +7,123 @@ versions may still break things).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-15
+
+The interface release. The writing–editing–checkpointing loop that 0.1 kept in
+a sidebar got its real shape: a scrubbable history strip, places for text that
+isn't (yet, or anymore) manuscript, a formatting toolbar that answers to the
+selection, and a book-typography reading room. Underneath it, the engine
+stopped stalling on real, long-lived documents. macOS text rendering is fixed —
+this is the first release verified by an outside macOS tester. Binaries are
+still unsigned, and Linux (Wayland) remains the primary runtime-tested platform.
+
+### Added
+- **The history strip** — the history sidebar grew into a scrubbable strip
+  along the top edge of the page: drag it like a seek bar to move through the
+  document's whole past, at one fixed time scale, with your absences shown as
+  quiet recessed wells rather than gaps to feel guilty about. Restoring an old
+  version is one click, and always undoable.
+- **Compost and graveyard** — two places for words that aren't manuscript. The
+  compost rail (left) is where ideas, clippings and todos live until they're
+  promoted into the draft; the graveyard (document footer) automatically
+  catches every paragraph you cut, so deletion is never a silent loss — "Put
+  back" returns it whole, with its own formatting. Both are plain text:
+  editable, selectable, formattable.
+- **Selection flanks** — select anything (mouse *or* keyboard) and a small
+  formatting grid appears beside it — bold, italic, highlight, headings, link —
+  with selection actions on the other flank: add a note, set aside, send to
+  the graveyard, ask the editor about this. `ctrl-.` jumps into it from the
+  keyboard.
+- **The editor button** — one titlebar home for everything AI: request a
+  believing, developmental or line read, see what the editor is doing in plain
+  words — **Reading** or **Away** — and find results counted honestly
+  ("1 read ready", "0 new") instead of appearing as mystery badges.
+- **The omnibar** — the top-center control is now a real search field: text
+  search, heading jump (`@`), commands (`>`), results hanging live from the
+  field's own edge.
+- **Margin cards, packed and paced** — your own margin notes and the editor's
+  cards now share the right margin, visually distinct (warm vs. cool), packed
+  to never overlap, and paced: results arriving mid-sentence wait for a lull
+  in your typing before they animate in, and an over-full margin recedes cards
+  in place to one line instead of hiding them. Off-screen cards show as
+  clickable counts. Honest motion: your own material never fades or slides.
+- **Cold read** — a reading room for your finished draft: book typography
+  (URW Bookman), justified and properly hyphenated, no caret, pages that flip
+  instead of scroll. You read, and file reactions in the margin — the room
+  keeps you from fiddling with sentences when the job is judging the whole.
+- **Inline images, done right** — pasted or dropped images are furniture now:
+  ordinary text editing can't merge prose onto them, clone them, or silently
+  delete them; removing one is a deliberate, staged act. The caption is real
+  prose on the image's own line, not a hidden field.
+- **The editor speaks your language** — an editorial read now detects the
+  manuscript's dominant language and writes its margin commentary in it
+  (quotes stay byte-exact). The reply pipeline recovers valid cards from
+  partially malformed model output, runs one bounded repair round for the
+  rest, and reports failures truthfully (refusal, length stop, invalid JSON)
+  instead of guessing.
+
+### Changed
+- **History is instant.** Versions record their full state when sealed instead
+  of being replayed on demand: opening history on a 13-checkpoint document
+  went from 71 s to 190 µs, and restore is immediate even on old files.
+- **Saves got honest.** A save with no changes writes zero bytes; saving runs
+  off the UI thread so typing never stalls behind it; a failed final save
+  keeps the editor alive and recoverable instead of losing the last words.
+- **One color language.** Warm amber is always you, cool blue is always the
+  machine, drained neutral is stale, red is reserved for errors, sage for a
+  goal reached — across cards, strip, selection and flashes.
+- **Highlight and strikethrough now mark a fixed extent** — typing at their
+  edge no longer grows them (bold/italic/underline still extend as you type,
+  matching every other editor). If highlights seemed to "follow" your typing
+  before, that was a bug, not a feature.
+- **Every text field behaves the same** — note composer, rename, session goal,
+  checkpoint name, reaction input: real caret and selection, commit on a
+  deliberate gesture, and no field silently closes because focus blinked
+  (Alt-Tab and keyboard-layout switches no longer eat your half-written note).
+- **The margin scrolls on its own** when it overflows, without moving the page.
+
+### Fixed
+- **macOS: text was invisible** (#10). The build was missing the `font-kit`
+  feature on `gpui_platform`, so macOS shaped text but painted no glyphs —
+  caret and selection moved over an empty page. One feature flag; verified by
+  the reporting tester on a real Mac.
+- **Multi-second stalls on real documents**, three separate causes, all
+  variants of treating history as a routine read: the idle-save asset scan
+  (6.8 s → 24 ms), history-sidebar open (71 s → 190 µs), and a hidden
+  formatting-marks cost that taxed open and save (4.7 s for 5.7 KB of prose —
+  gone).
+- **A 4.8 MB file for 5.7 KB of prose** — idle saves rewrote every channel
+  every time; now guarded by change fingerprints, and bloated files from
+  0.1.x compact themselves at open (4.77 MB → 82 KB, cold open 5.8 s → 4.9 ms,
+  with a `.pre-compact.bak` safety copy).
+- **Letter shortcuts under non-Latin keyboard layouts** (e.g. `Ctrl+Shift+P`
+  on Cyrillic) — fixed in the gpui fork, now on all platforms.
+- **Glyph corruption after a display-scale change** (moving the window to a
+  differently-scaled monitor) — fixed in the gpui fork.
+- **Editing could corrupt images**: Delete could merge text onto a picture's
+  line, Enter could clone the picture onto both halves of a split, Backspace
+  could silently swallow it. All walled off by the furniture model.
+- **A margin-note draft could leak onto an AI card**, and the composer showed
+  only the first line of a multi-line note.
+- **Redo wasn't invalidated on every path that should clear it.**
+- **U+2028 in imported Markdown discarded block formatting** — the line
+  separator is now modeled as a real hard break; import and export agree on
+  what a hard break is.
+
+### Internal
+- **gpui fork rebased onto Zed stable v1.10.2** (from a June main snapshot),
+  carrying four patches: Windows layout-independent letter keys, per-glyph
+  scale context (the Wayland scale fix), image-format trimming, and opt-in
+  SVG text rendering — the last lets Strop drop `rustybuzz` entirely
+  (RUSTSEC-2026-0206). See `docs/gpui-fork.md`.
+- A separate `dist` build profile (thin LTO, stripped), a trimmed dependency
+  tree, tightened `cargo-deny`, Dependabot now watching actions and cargo,
+  and faster CI on all three platforms.
+- The undo engine shares side-state structurally (`Arc` + copy-on-write):
+  the 5,000-block stress fixture went from ten million map clones to one
+  live allocation. In-session undo depth remains uncapped; only the
+  persisted cross-session tail was trimmed.
+
 ## [0.1.1] — 2026-06-19
 
 Windows papercuts and layout-independent shortcuts. Still unsigned, and only
@@ -94,6 +211,7 @@ unverified and unsigned.
 - Configuration via `~/.config/strop/config.toml`.
 - GPL-3.0-or-later. Supply-chain gating (cargo-deny) and three-OS CI.
 
-[Unreleased]: https://github.com/kirushik/strop/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/kirushik/strop/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kirushik/strop/releases/tag/v0.2.0
 [0.1.1]: https://github.com/kirushik/strop/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kirushik/strop/releases/tag/v0.1.0
