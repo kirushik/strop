@@ -281,6 +281,28 @@ expect "two scrubs later it has NOT re-baked" 1   "$(field "$S3" bakes)"
 expect "parked hides the live margin"       true  "$(field "$D2" margin_hidden)"
 expect "Now brings the margin back"         false "$(field "$D4" margin_hidden)"
 
+echo "rig-check: card-history threads bend, project, and mark legacy uncertainty"
+DOCS2=$(mktemp --suffix=.md); cp "$DOC" "$DOCS2"
+# Six equal ~100-minute sittings put the fifth sitting around 4/6..5/6 of
+# working time; 0.75 is after Card B's +5m raise and before Card A's end close.
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCS2" "seed:cards strip:open dump:ui strip:scrub:0.75 dump:ui strip:now dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p)
+S1=$(echo "$D1" | grep -oE '"strip":\{[^}]*\}'); S2=$(echo "$D2" | grep -oE '"strip":\{[^}]*\}'); S3=$(echo "$D3" | grep -oE '"strip":\{[^}]*\}')
+[ -n "$S1" ] || { echo "  FAIL no card-history strip dump"; exit 1; }
+PC=$(field "$S2" past_cards)
+if [ "${PC:-0}" -ge 2 ] 2>/dev/null; then echo "  ok   parked margin projects both live cards ($PC)"; else
+  echo "  FAIL past_cards=$PC (expected at least 2)"; fail=1; fi
+expect "the legacy suffix starts at one diamond" 1 "$(field "$S2" diamonds)"
+TH=$(field "$S2" threads)
+if [ "${TH:-0}" -ge 3 ] 2>/dev/null; then echo "  ok   all card threads are baked ($TH)"; else
+  echo "  FAIL threads=$TH (expected at least 3)"; fail=1; fi
+TP=$(field "$S2" thread_pts)
+if [ "${TP:-0}" -gt $((2 * ${TH:-0})) ] 2>/dev/null; then echo "  ok   thread paths bend ($TP vertices across $TH threads)"; else
+  echo "  FAIL thread_pts=$TP is not greater than 2*threads=$((2 * ${TH:-0}))"; fail=1; fi
+expect "Now clears the past-card projection" 0 "$(field "$S3" past_cards)"
+expect "card scrubbing does NOT re-bake" 1 "$(field "$S3" bakes)"
+rm -f "$DOCS2" "$DOCS2.strop"
+
 echo "rig-check: legacy history renders a real axis + a visible parked banner (Bug A/B)"
 # A legacy file — six materialized checkpoints across two weeks, EMPTY journal.
 # Before the fix the axis read only the journal, so every tick landed at x=0 and

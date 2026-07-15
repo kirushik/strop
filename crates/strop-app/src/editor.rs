@@ -11505,6 +11505,11 @@ impl Editor {
                 "runs": self.doc.journal().runs.len(),
                 "events": self.doc.journal().events.len(),
                 "stations": b.stations.len(),
+                "threads": b.threads.len(),
+                "thread_pts": b.threads.iter().flat_map(|thread| &thread.segments)
+                    .map(Vec::len).sum::<usize>(),
+                "diamonds": b.threads.iter().filter(|thread| thread.uncertain_start).count(),
+                "past_cards": if self.strip.parked { self.strip.past_margin().len() } else { 0 },
                 "words_at": self.strip.words_at,
                 "bakes": self.strip.bakes,
                 // Axis width in working px — non-zero even for a LEGACY era
@@ -12198,6 +12203,105 @@ impl Editor {
             }
         }
         self.doc.set_journal(Journal::from_parts(runs, events));
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Rig hook (`seed:cards`): the synthetic fortnight plus three card-history
+    /// shapes — exact closed/open paths and one deliberately legacy suffix.
+    pub fn debug_seed_cards(&mut self, cx: &mut Context<Self>) {
+        use strop_core::document::{Annotation, NoteKind, NoteStatus,
+            transform_annotation_range};
+        use strop_core::journal::{EditRun, JournalEvent};
+        use strop_core::buffer::TextOp;
+
+        self.debug_seed_journal(cx);
+        let now = strop_core::journal::now_ms();
+        let day = 86_400_000i64;
+        let sitting = |days_ago: i64| now - days_ago * day - 4 * 3_600_000;
+        self.doc.journal_mut().runs.push(EditRun {
+            t0: sitting(0) + 10_000, t1: sitting(0) + 19_000,
+            pos: 100, del_chars: 12, del_words: None, ins: String::new(),
+        });
+        self.doc.journal_mut().runs.sort_by_key(|run| run.t0);
+        let len_at = |at: i64| self.doc.journal().runs.iter()
+            .filter(|run| run.t0 <= at)
+            .fold(0usize, |len, run| {
+                len.saturating_sub(run.del_chars.min(len)) + run.ins.chars().count()
+            });
+        let third_end = sitting(8) + 149 * 40_000 + 12_000;
+        let fifth_start = sitting(2);
+        let a_range = {
+            let start = len_at(third_end).saturating_sub(900);
+            start..start + 80
+        };
+        let b_range = {
+            let start = len_at(fifth_start).saturating_sub(500);
+            start..start + 70
+        };
+
+        // Pick the legacy card's present anchor by carrying the first today's
+        // rework collapse forward. Reverse replay therefore stops exactly at
+        // that ambiguous cut, after proving a non-empty suffix.
+        let today_runs: Vec<_> = self.doc.journal().runs.iter()
+            .filter(|run| run.t0 >= sitting(0)).collect();
+        let doc_len = self.doc.text().chars().count();
+        let mut legacy_range = today_runs.iter().enumerate().filter(|(_, run)| run.del_chars > 0)
+            .find_map(|(cut_ix, cut)| {
+                let mut range = cut.pos..cut.pos;
+                for run in &today_runs[cut_ix + 1..] {
+                    range = transform_annotation_range(&range, &TextOp {
+                        pos: run.pos, delete: run.del_chars, insert: run.ins.clone(),
+                    });
+                }
+                (range.start < doc_len).then_some(range)
+            }).expect("card fixture needs a legacy anchor inside today's document");
+        legacy_range.end = (legacy_range.start + 1).min(doc_len);
+        let live_range = |numerator: usize| {
+            let start = doc_len.saturating_mul(numerator) / 4;
+            start..(start + 1).min(doc_len)
+        };
+
+        let make = |range, body: &str, title: &str, level: &str, created_ms| Annotation {
+            id: 0, range, body: body.into(), status: NoteStatus::Open,
+            created_unix: created_ms / 1000, kind: NoteKind::Diagnosis,
+            title: title.into(), level: level.into(), orphaned: false,
+            pass_id: 41, unverified: false,
+        };
+        let previous_id = self.doc.notes().notes().iter().map(|note| note.id).max().unwrap_or(0);
+        self.doc.add_diagnoses(vec![
+            make(live_range(1), "Does this turn arrive too late?", "Late turn", "line", third_end),
+            make(live_range(2), "What does this choice cost her?", "Missing cost", "developmental", fifth_start + 300_000),
+            make(legacy_range, "Is this image carrying the scene?", "Image weight", "line", sitting(0)),
+        ]);
+        let mut ids: Vec<u64> = self.doc.notes().notes().iter()
+            .filter(|note| note.id > previous_id).map(|note| note.id).collect();
+        ids.sort_unstable();
+        let [a, b, c] = ids.as_slice() else { panic!("card fixture ids") };
+        self.doc.journal_mut().events.retain(|event| !matches!(event,
+            JournalEvent::CardRaised { id, .. } | JournalEvent::CardClosed { id, .. }
+                if id == a || id == b || id == c));
+        self.doc.journal_mut().events.extend([
+            JournalEvent::CardRaised { t: third_end, id: *a, card_kind: NoteKind::Diagnosis,
+                range: a_range, body: "Does this turn arrive too late?".into(),
+                title: "Late turn".into(), level: "line".into(), pass_id: 41,
+                status: NoteStatus::Open, orphaned: false, unverified: false },
+            JournalEvent::CardRaised { t: fifth_start + 300_000, id: *b,
+                card_kind: NoteKind::Diagnosis, range: b_range,
+                body: "What does this choice cost her?".into(), title: "Missing cost".into(),
+                level: "developmental".into(), pass_id: 42, status: NoteStatus::Open,
+                orphaned: false, unverified: false },
+            JournalEvent::CardEdited { t: fifth_start + 600_000, id: *a,
+                body: "Does the revised turn still arrive too late?".into(),
+                title: "Late turn".into(), level: "line".into(), pass_id: 41,
+                status: NoteStatus::Open, orphaned: false, unverified: false },
+            JournalEvent::CardClosed { t: fifth_start + 150 * 40_000 + 300_000,
+                id: *a, resolved: true },
+        ]);
+        // fixture-level simulation of a v0.2 file
+        self.doc.journal_mut().events.retain(|event| !matches!(event,
+            JournalEvent::CardRaised { id, .. } if id == c));
+        self.doc.journal_mut().events.sort_by_key(JournalEvent::t);
         self.mark_dirty();
         cx.notify();
     }
