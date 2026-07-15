@@ -13,12 +13,14 @@ subsystem's single home (`window_button` idiom for the control,
 count), not four exclusive states (review H32), and the door word is
 the glossary's presence pair, never "Reviewing" (review H31):
 1. NeedsSetup: `Ask the editor · needs setup ▾` (routes to settings)
-2. Error: error-tinted dot + `Ask the editor ▾` (hover carries the
-   message; render_ai_status keeps the full card)
-3. cooking: pulse dot + `Ask the editor ▾` (hover names the read)
+2. Error: error-tinted dot + `Ask the editor ▾` (the persistent typed
+   recovery card carries the full meaning and actions; hover only repeats)
+3. cooking: pulse dot + `Ask the editor ▾` (the attached menu names
+   the read and carries `Cancel read`)
 4. parked results: `Ask the editor · a read is ready ▾`
-5. door open: `Reading · {n} open · Ask the editor ▾`
-6. idle/drafting: `Ask the editor ▾`
+5. unacknowledged valid empty read: `Ask the editor · 0 new ▾`
+6. door open: `Reading · {n} open · Ask the editor ▾`
+7. idle/drafting: `Ask the editor ▾`
 
 **The menu**, glued flush under the button (right edges aligned, the
 lab's fix for the detached-dropdown sin):
@@ -38,6 +40,23 @@ lab's fix for the detached-dropdown sin):
   verb `Reading ⇄ Away` (= the door: Away ⇔ `drafting`; toggling
   routes through the existing `toggle_review` flush semantics).
 
+While a read runs, a data row below the carrier names it and offers
+`Cancel read`; no running card enters the margin. A valid, normally
+completed response with zero rejected or stale items records
+`Last: {kind} read · 0 new queries` in the menu. Its `0 new` button face is
+an **unacknowledged-interaction latch**, not gaze tracking: no timer
+clears it; closing the menu acknowledges the result, while the menu
+record remains until the next read supersedes it. If the menu was
+already open when the result landed, its later close is the same
+acknowledgement.
+
+Only provider setup and typed, actionable failure recovery remain as
+the conservative 0.2 margin/bottom-card exception. Their wide card
+owns a fixed, shared lane band; cards, the rail, and the selection menu
+all read the same floor. At narrow widths it yields to writer-owned
+bottom fields, the narrow notes drawer, and history/footnote surfaces,
+then reappears because it has no expiry timer.
+
 Menu rows dispatch through `run_pass` REFACTORED from its bool to a
 `PassKind` enum — Believing | Doubting | Diagnostic(mode) — threaded
 through `pending_pass`/`deferred_pass`/`last_pass_believing` and the
@@ -50,6 +69,14 @@ diagnose a document the screen isn't showing).
 ## 1. What this retires
 
 - The old diagnose-toggle mini-card icon (the button replaces it).
+- Generic informational AI cards: running, successful reads, opened
+  config, connection-test success, saved settings, and mode-change
+  receipts.
+- The three sticky `Diagnosis Mode: …` palette commands. The editor
+  menu runs each depth directly; ctrl-shift-d keeps using `[ai].mode`.
+- The software-initiated shortcut whisper. Replace All result data
+  remains inside its initiating omnibar row until the operation/query
+  changes or the omnibar closes.
 - **The intent banner and `next_intent`** — re-entry is SHELVED
   (golden-path §9.3); the banner render, the field, and the
   End-Session intent question are removed. Review H28 corrected the
@@ -64,8 +91,8 @@ diagnose a document the screen isn't showing).
 - Pass already cooking + row clicked → the existing single-flight
   guard (`ai_generation`) applies; the row is inert while cooking
   (menu shows the pulse in the button; no queueing in v1).
-- `ai.configured()` false → menu rows disabled with the existing
-  NeedsSetup affordance routed from `render_ai_status`.
+- `ai.configured()` false → choosing a menu row keeps the exact request
+  pending and opens the NeedsSetup recovery path.
 - Door toggling with parked results → existing flush-deferred
   semantics (toggle_review already flushes).
 - Copy-gate release: developmental queries all closed → gated row
@@ -76,7 +103,9 @@ diagnose a document the screen isn't showing).
 
 ## 3. Tests & rig
 
-- Dump gains `editor_btn: {face, open, cooking, ready, open_count}`.
-- Smoke: `ebtn:open`, `ebtn:door`. Rig asserts the door law (cards
+- Dump gains editor-button empty/recovery/menu-Cancel state and the
+  shared margin floor.
+- Smoke: `ebtn:open`, `ebtn:close`, `ebtn:door`, `ai:empty`,
+  `ai:running`, `ai:error`. Rig asserts the door law (cards
   rest while drafting even with the menu open) and face transitions
   through seed:deliver.

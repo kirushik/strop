@@ -51,8 +51,9 @@ in `deliver_pass` **and** in the lull watcher's flush condition. Exit
 of the takeover joins scroll/door/new-pass as an explicit attention
 shift: `flush_deferred_pass` in the exit path, after the suppressed
 surfaces are restored — cards then land in a *visible* lane with their
-250ms enter fade, and `integrate_pass`'s `AiStatus::Note` fires when
-the titlebar can show it. The read itself is none of the flush triggers
+250ms enter fade. The cards are the visible result; the later AI UX
+pass retired the redundant informational status note. The read itself
+is none of the flush triggers
 (flipping pages, filing reactions, the banner pulse — none may flush).
 Rig: `coldread:open` → `seed:deliver` → assert `ai_deferred:true` and
 `appearing:0` while open; `escape` → assert cards landed + fade marked.
@@ -330,16 +331,13 @@ re-pagination including step changes.
 mid-read.
 
 **What is undefined / goes wrong.** `render_ai_status` renders the
-Running card, the Error card, and the NeedsSetup card into the margin
-lane's slot or a bottom strip (editor.rs:15009–15046). It already
+persistent Error and NeedsSetup recovery cards into the margin lane's
+slot or a bottom strip. It already
 rides the same render block the suppression predicate will gate
 (16575–16589) — so gating that block hides all of them. Is that
-right? Running: yes — the room has no tools, the machine works
-silently (P2; the cooking dot's home, the editor button, is hidden by
-§4.1 anyway — and the dot is a static color cue, editor.rs:12318–12322,
-no animation loop to leak). Error: `AiStatus::Error` has **no fade**
-(set at 3851 with no `schedule_status_fade`) — it is persistent state,
-so hiding it costs nothing; it surfaces intact on exit. But nothing in
+right? Running state now lives only on the editor control/menu, which
+the room hides under §4.1. Error is persistent state, so hiding its
+recovery surface costs nothing; it surfaces intact on exit. But nothing in
 the spec *says* any of this, and a builder who suppresses the margin
 without the shared block (or vice versa) ships a cool machine card
 floating over the desk — L24's "no AI cards materialize in the reading
@@ -347,10 +345,10 @@ lane", violated by a status card instead of a note card.
 
 **Resolution.** Name it in the spec: the ColdRead suppression predicate
 gates the one shared block (margin + rail + `render_ai_status`
-together, the code's existing shape), so Running/Error/NeedsSetup/idle-
-hint all sleep with the lane. Persistent states (Error, NeedsSetup,
-Ready face) survive to exit by construction; transient Notes are
-covered by case 1's parking (they fire at exit-flush, visible). Rig:
+together, the code's existing shape), so Error/NeedsSetup recovery
+sleeps with the lane. Persistent states survive to exit by construction;
+successful results are covered by case 1's parking and land visibly on
+exit. Rig:
 error-path smoke → `coldread:open` → dump has no status overlay bit →
 exit → Error card present.
 

@@ -8,8 +8,7 @@
 use gpui::Action;
 
 use crate::editor::{
-    AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, DiagnosisModeCopy,
-    DiagnosisModeDevelopmental, DiagnosisModeLine, ExportMarkdown, Find, Heading1,
+    AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, ExportMarkdown, Find, Heading1,
     Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, ReadItCold, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     MoveToManuscript, PutBackScrap, SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
@@ -303,27 +302,6 @@ pub fn all() -> &'static [Command] {
             ["comment", "заметка на полях"]
         ),
         cmd!(
-            "Diagnosis Mode: Developmental",
-            "Margin & AI",
-            None,
-            DiagnosisModeDevelopmental,
-            ["structure", "argument", "структура"]
-        ),
-        cmd!(
-            "Diagnosis Mode: Line",
-            "Margin & AI",
-            None,
-            DiagnosisModeLine,
-            ["style", "clarity", "стиль"]
-        ),
-        cmd!(
-            "Diagnosis Mode: Copy",
-            "Margin & AI",
-            None,
-            DiagnosisModeCopy,
-            ["mechanics", "usage", "вычитка", "корректура"]
-        ),
-        cmd!(
             "Set Up AI Provider…",
             "Margin & AI",
             None,
@@ -594,6 +572,14 @@ mod tests {
                 assert!(seen.insert(k), "duplicate binding {k}");
             }
         }
+    }
+
+    #[test]
+    fn read_depths_have_one_control_grammar() {
+        assert!(
+            all().iter().all(|command| !command.label.starts_with("Diagnosis Mode:")),
+            "read depths belong to the editor menu, not sticky palette state"
+        );
     }
 
     #[test]

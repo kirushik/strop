@@ -52,6 +52,9 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Generated editorial fields: "auto" or any ISO/BCP-47-style language
+    /// tag. This is independent of the narrow top-level typograph language.
+    pub language: String,
     /// Default levels-of-edit depth: "developmental" | "line" | "copy".
     pub mode: String,
 }
@@ -88,6 +91,10 @@ base_url = ""
 # and export STROP_API_KEY instead (the environment variable wins).
 api_key = ""
 model = ""
+# Reply language for generated card titles and questions. Auto resolves the
+# whole manuscript locally; selections inherit it. ISO/BCP-47-style tags are
+# accepted; POSIX underscores and whitespace separators are normalized.
+language = "auto"
 # Default depth of the editorial pass: "developmental" | "line" | "copy".
 mode = "line"
 
@@ -149,16 +156,25 @@ fn save_ai_to(
 }
 
 pub fn load() -> Config {
-    match std::fs::read_to_string(config_path()) {
-        Ok(text) => match toml::from_str(&text) {
-            Ok(config) => config,
-            Err(e) => {
-                eprintln!("strop: config.toml ignored: {e}");
-                Config::default()
-            }
-        },
-        Err(_) => Config::default(),
+    if !config_path().exists() {
+        return Config::default();
     }
+    match try_load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("strop: config.toml ignored: {error}");
+            Config::default()
+        }
+    }
+}
+
+/// Reload without inventing a replacement configuration. Live callers use
+/// this so a partially-written or malformed file cannot erase their last-good
+/// provider/settings snapshot; startup may still deliberately fall back.
+pub fn try_load() -> Result<Config, String> {
+    let text = std::fs::read_to_string(config_path())
+        .map_err(|error| error.to_string())?;
+    toml::from_str(&text).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -176,6 +192,7 @@ mod tests {
         assert_eq!(config.language, Language::Ru);
         assert_eq!(config.ai.base_url, "https://api.poe.com/v1");
         assert!(config.ai.api_key.is_empty());
+        assert!(config.ai.language.is_empty(), "old configs default to auto");
         // Empty/missing input is fine too.
         let default: Config = toml::from_str("").unwrap();
         assert!(!default.auto_copy_selection);
@@ -190,6 +207,7 @@ mod template_tests {
     fn template_parses_as_valid_config() {
         let config: Config = toml::from_str(TEMPLATE).expect("template must stay valid TOML");
         assert!(!config.ai.configured(), "template starts unconfigured");
+        assert_eq!(config.ai.language, "auto");
         assert_eq!(config.ai.mode, "line");
     }
 }

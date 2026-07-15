@@ -142,6 +142,17 @@ unless they'd be expensive to reverse.
 
 ## Backlog (researched properly, not squeezed in)
 
+- **Pre-0.3 AI status-surface review.** The 0.2 release deliberately keeps
+  actionable provider-setup and failure recovery as a typed margin/bottom-card
+  exception, while valid empty reads use `0 new` on the editor button until
+  the attached menu closes and retain `Last: {kind} read · 0 new queries` inside
+  that menu. Before 0.3, test both decisions with writers: whether recovery
+  should move entirely into the editor menu, and whether the zero-result
+  acknowledgement/last-result mechanics are noticed, understood, and calm at
+  wide and narrow widths. Do not generalize either 0.2 exception into a toast
+  system. Inventory, risks, and corridor tasks live in
+  [the right-margin notification audit](research/right-margin-notification-ux-audit-2026-07.md).
+
 - **Bounded-memory, unbounded exact history.** The 0.2 Arc/COW change removes
   duplicate live side-state structures without capping in-session undo, but
   the current persisted 50-entry tail still expands shared values into full
@@ -162,6 +173,16 @@ unless they'd be expensive to reverse.
   question; announce failures accessibly; and behave coherently for desktop,
   file-manager, and OS-session launches on all three platforms. Treat this as
   a recovery-system design task, not another dialog-polish pass.
+
+- **Writer-native manuscript length.** Whitespace words are not a universal
+  writing unit: Chinese submission calls use characters, Japanese and Korean
+  traditions commonly use fixed-character manuscript pages, while Thai
+  guidance may still use words or formatted pages. Research creative-writing
+  practice per supported language, including punctuation/space rules, then
+  test a `words | characters | manuscript pages` readout with writers. This is
+  document-language UI data, separate from the conservative LLM token safety
+  estimator. Evidence and initial questions live in
+  [the LLM pipeline review](research/llm-pipeline-review-2026-07.md#backlog-manuscript-length-in-the-writers-own-unit).
 
 - [x] **Asset GC** (2026-06-11): save-time reachability sweep — an asset
   survives if the current blocks, any persisted undo/redo state, or any
@@ -323,9 +344,9 @@ places, three avoidable. Fixed (full rationale in DESIGN.md §2 AI panel
   teaches `ctrl-shift-d`. The margin idle hint was suppressed exactly in
   the tutorial state (cards present), so first-run discovery rested on one
   sentence of prose.
-- [x] **Bottom-strip stacking**: the default-sized window renders AI status
-  as the bottom strip; it now stacks title/detail/actions so the setup
-  buttons can't be clipped by the privacy line.
+- [x] **Bottom-strip stacking** (superseded by the recovery-only 0.2
+  grammar): the default-sized window keeps typed setup/failure actions
+  reachable; running and informational state no longer enter this strip.
 - [x] **Tutorial copy**: names the demo cards' provenance ("an editorial
   pass wrote these") and describes the new, gentler setup path. The three
   anchored demo quotes are preserved verbatim.

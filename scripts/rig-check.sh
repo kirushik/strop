@@ -229,6 +229,37 @@ M=$(echo "$OUT" | grep -oE '"margin":\{[^}]*\}')
 expect "mid-burst the face says ready"      '"ready"' "$(field "$B" face)"
 expect "and the door law holds (no cards)"  0 "$(field "$M" visible)"
 
+echo "rig-check: zero-query acknowledgement and run recovery stay on their owners"
+DOCB3=$(mktemp --suffix=.md); cp "$DOC" "$DOCB3"
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCB3" "ai:empty dump:ui ebtn:open dump:ui ebtn:close dump:ui" 2>/dev/null | grep 'UI-DUMP')
+E1=$(echo "$OUT" | sed -n 1p); E3=$(echo "$OUT" | sed -n 3p)
+B1=$(echo "$E1" | grep -oE '"editor_btn":\{[^}]*\}')
+B3=$(echo "$E3" | grep -oE '"editor_btn":\{[^}]*\}')
+expect "an empty read marks the button"     '"empty"' "$(field "$B1" face)"
+expect "the marker begins unacknowledged"   true      "$(field "$B1" empty_unack)"
+expect "closing the menu acknowledges it"  false     "$(field "$B3" empty_unack)"
+expect "the menu keeps the last result"     '"line/0"' "$(field "$B3" last_result)"
+DOCB4=$(mktemp --suffix=.md); cp "$DOC" "$DOCB4"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCB4" "ai:running ebtn:open dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+B=$(echo "$OUT" | grep -oE '"editor_btn":\{[^}]*\}')
+expect "running stays on the editor control" '"cooking"' "$(field "$B" face)"
+expect "the attached menu owns Cancel"       true        "$(field "$B" menu_cancel)"
+DOCB5=$(mktemp --suffix=.md); cp "$DOC" "$DOCB5"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCB5" "seed:diag ai:error dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+B=$(echo "$OUT" | grep -oE '"editor_btn":\{[^}]*\}')
+M=$(echo "$OUT" | grep -oE '"margin":\{[^}]*\}')
+expect "a failure retains recovery"          true  "$(field "$B" recovery)"
+expect "recovery and cards do not overlap"   false "$(field "$M" overlap)"
+TOP=$(field "$M" min_top); FLOOR=$(field "$M" floor)
+if awk "BEGIN { exit !($TOP >= $FLOOR) }"; then
+  echo "  ok   recovery owns the lane floor ($TOP >= $FLOOR)"
+else
+  echo "  FAIL card crossed recovery floor ($TOP < $FLOOR)"; fail=1
+fi
+rm -f "$DOCB1" "$DOCB1.strop" "$DOCB2" "$DOCB2.strop" \
+  "$DOCB3" "$DOCB3.strop" "$DOCB4" "$DOCB4.strop" \
+  "$DOCB5" "$DOCB5.strop"
+
 echo "rig-check: the strip scrubs without re-baking, and hides the margin while parked"
 # bakes is session-monotonic: open bakes once; TWO scrubs later it is STILL 1
 # (the stability law — scrubbing may never rebuild the fabric). Parking hides

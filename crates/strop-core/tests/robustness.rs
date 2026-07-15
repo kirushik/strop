@@ -4,7 +4,7 @@
 //!    boundary confusion; these properties feed arbitrary (multibyte) input to
 //!    every parsing/anchoring entry point and assert it returns rather than
 //!    unwinds. (`Store::open` on arbitrary bytes, `from_markdown`,
-//!    `import_image`, `extract_json_array`, `diagnose::anchor`,
+//!    `import_image`, `diagnose::parse_for`, `diagnose::anchor`,
 //!    `typograph::process`.)
 //! 2. Full save -> reopen STATE round-trip — the biggest gap model.rs left
 //!    open: it only mirrors the live `store.text()` and never closes the disk
@@ -18,11 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use proptest::prelude::*;
 
 use strop_core::Store;
-use strop_core::diagnose::anchor;
+use strop_core::diagnose::{anchor, parse_for};
 use strop_core::diff::{DiffOp, prose_diff_blocks};
 use strop_core::document::{BlockKind, BlockMap, Document, InlineAttr, SpanSet};
 use strop_core::images::import_image;
-use strop_core::llm::extract_json_array;
 use strop_core::markdown::from_markdown;
 use strop_core::typograph::{Lang, process};
 
@@ -71,8 +70,8 @@ proptest! {
     }
 
     #[test]
-    fn extract_json_array_never_panics(s in ".*") {
-        let _ = extract_json_array(&s);
+    fn diagnose_parse_never_panics(s in ".*") {
+        let _ = parse_for(&s, "line");
     }
 
     #[test]
