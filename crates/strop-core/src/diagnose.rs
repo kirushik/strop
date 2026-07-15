@@ -2,6 +2,7 @@
 //! a parser. Named problems as queries to the author; zero rewrites; the
 //! Gaiman guardrail; voice is never a defect.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use serde::Deserialize;
@@ -282,21 +283,22 @@ fn char_slice(text: &str, range: Range<usize>) -> String {
 }
 
 fn paragraph_context_start(text: &str, target: usize, paragraphs: usize) -> usize {
-    let mut starts = text
-        .chars()
-        .take(target)
-        .enumerate()
-        .filter(|(_, c)| *c == '\n')
-        .map(|(char_index, _)| char_index + 1)
-        .collect::<Vec<_>>();
-    starts.push(0);
-    starts.sort_unstable();
-    starts.dedup();
-    starts
-        .into_iter()
-        .rev()
-        .nth(paragraphs)
-        .unwrap_or(0)
+    // Only the last `paragraphs + 1` starts can affect the answer. Retaining
+    // them avoids both a prefix copy and a manuscript-sized newline vector
+    // when a small selection sits near the end of a long piece.
+    let keep = paragraphs.saturating_add(1);
+    let mut starts = VecDeque::with_capacity(keep);
+    starts.push_back(0);
+    for (char_index, c) in text.chars().take(target).enumerate() {
+        if c != '\n' {
+            continue;
+        }
+        if starts.len() == keep {
+            starts.pop_front();
+        }
+        starts.push_back(char_index + 1);
+    }
+    starts.front().copied().unwrap_or(0)
 }
 
 fn paragraph_context_end(text: &str, target: usize, paragraphs: usize) -> usize {
