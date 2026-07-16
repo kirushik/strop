@@ -654,11 +654,37 @@ fi
 expect "the pile survived the flip"            1 "$(field "$OUT" compost_blocks)"
 expect "the count never teleported (07 N3)"    "$MW1" "$(field "$OUT" manuscript_words)"
 
+echo "rig-check: lazy birth — a glanced .md litters nothing, the first edit births"
+# The default-.md-opener promise: open, read, quit — the folder is exactly
+# as it was. Only the first document mutation creates the sidecar (and its
+# "Started" seal; the editor-level tests assert the seal's state).
+DOCLZ=$(mktemp --suffix=.md); cp "$DOC" "$DOCLZ"
+# The app maps foo.md to sibling foo.strop (extension REPLACED).
+SIDECAR="${DOCLZ%.md}.strop"
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCLZ" "wheel:800,400,-240 dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+[ -n "$OUT" ] || { echo "  FAIL no dump (lazy birth, glance run)"; exit 1; }
+if [ -e "$SIDECAR" ]; then
+  echo "  FAIL a no-edit open littered $SIDECAR"; fail=1
+else
+  echo "  ok   a read-only glance created nothing"
+fi
+OUT=$(WRUN_TAIL=60 scripts/wrun.sh "$DOCLZ" "x dump:ui" 2>/dev/null | grep 'UI-DUMP' | tail -1)
+[ -n "$OUT" ] || { echo "  FAIL no dump (lazy birth, edit run)"; exit 1; }
+if [ -e "$SIDECAR" ]; then
+  echo "  ok   the first edit materialized the sidecar"
+else
+  echo "  FAIL the first edit left no .strop behind"; fail=1
+fi
+rm -f "$DOCLZ" "$SIDECAR"
+
 # ---------------- The cold read (impl 05 Wave B) ----------------------------
 
 echo "rig-check: cold read — entry/exit round-trip (scroll, checkpoints, focus, margin)"
+# The leading keystroke births the imported .md (lazy birth: no edit, no
+# .strop, no seals) so entry's L3 checkpoint has a record to land in. The
+# born doc holds TWO checkpoints: "Started" (birth) + "Cold read" (L3).
 DOCR=$(mktemp --suffix=.md); cp "$DOC" "$DOCR"
-OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCR" "wheel:800,400,-240 dump:ui coldread:open dump:ui escape dump:ui coldread:open escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
+OUT=$(WRUN_TAIL=200 scripts/wrun.sh "$DOCR" "x wheel:800,400,-240 dump:ui coldread:open dump:ui escape dump:ui coldread:open escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
 D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
 [ -n "$D4" ] || { echo "  FAIL missing dumps"; exit 1; }
 rm -f "$DOCR" "$DOCR.strop"
@@ -668,11 +694,11 @@ expect "the room is up with a real book"      true "$(field "$CR2" open)"
 expect "page 1 under the ritual threshold"    0 "$(field "$CR2" page)"
 expect "the takeover holds focus (F8)"        '"ColdRead"' "$(field "$D2" focused)"
 expect "the margin sleeps under the desk"     true "$(field "$D2" margin_hidden)"
-expect "entry checkpointed once (L3)"         1 "$(field "$D2" checkpoints)"
+expect "entry checkpointed once (L3)"         2 "$(field "$D2" checkpoints)"
 expect "Esc drops the room"                   null "$(field "$D3" coldread)"
 expect "the margin gate reopens"              false "$(field "$D3" margin_hidden)"
 expect "scroll untouched by the round trip"   "$SY1" "$SY3"
-expect "double-open dedupes the checkpoint"   1 "$(field "$D4" checkpoints)"
+expect "double-open dedupes the checkpoint"   2 "$(field "$D4" checkpoints)"
 
 echo "rig-check: cold read — guard pulses (the pierce table, F4)"
 DOCG=$(mktemp --suffix=.md); cp "$DOC" "$DOCG"
@@ -793,8 +819,9 @@ expect "…and does NOT flip the page"          0 "$(field "$CR2" page)"
 
 echo "rig-check: cold read — Past-from-parked round trip (Time 7, regions 13)"
 DOCL=$(mktemp --suffix=.md); echo "A live line for the legacy litmus." > "$DOCL"
-# The md import writes a "Started" birth checkpoint (index 0), so the seeded
-# legacy plan sits at indexes 1..7 — the Top-era tick is coldread:past:7.
+# seed:legacy materializes the lazy import first (a seed IS a mutation), so
+# the "Started" birth checkpoint keeps index 0 and the seeded legacy plan
+# sits at indexes 1..7 — the Top-era tick is coldread:past:7.
 OUT=$(WRUN_TAIL=300 scripts/wrun.sh "$DOCL" "seed:legacy dump:ui coldread:open dump:ui escape strip:open strip:scrub:0.5 coldread:past:7 dump:ui escape dump:ui" 2>/dev/null | grep 'UI-DUMP')
 D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
 rm -f "$DOCL" "$DOCL.strop"

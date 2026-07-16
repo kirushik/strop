@@ -33,7 +33,7 @@ mod text_field;
 mod theme;
 mod tutorial;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
@@ -131,6 +131,21 @@ fn data_file() -> (PathBuf, bool) {
     (files::welcome_path(), true)
 }
 
+/// Where a document path durably lives, and whether opening it means a
+/// Markdown import: a .md maps to its sibling .strop, importing only when
+/// that sibling does not exist yet — once born, the .strop is the source
+/// of truth and wins every later open. The import itself is LAZY (see
+/// `Editor::stage_import_birth`): deciding `true` here creates nothing.
+fn open_target(doc_path: &Path) -> (PathBuf, bool) {
+    if doc_path.extension().is_some_and(|e| e == "md") {
+        let store_path = doc_path.with_extension("strop");
+        let import = !store_path.exists();
+        (store_path, import)
+    } else {
+        (doc_path.to_owned(), false)
+    }
+}
+
 fn main() {
     // gpui_platform::application() replaced gpui::Application::new() after
     // the facade/platform crate split. The asset source feeds gpui's svg()
@@ -203,14 +218,14 @@ fn main() {
                 (Some(p), welcome)
             };
         let mut instance_guard: Option<single_instance::InstanceGuard> = None;
+        // Where the durable file lives and whether this open is a Markdown
+        // import — decided once, up front (`open_target`): the answer gates
+        // both the store below and the lazy-birth staging at the end.
+        let open_plan = doc_path.as_ref().map(|p| open_target(p));
         let store = match &doc_path {
             None => None,
             Some(p) => {
-                let store_path = if p.extension().is_some_and(|e| e == "md") {
-                    p.with_extension("strop")
-                } else {
-                    p.clone()
-                };
+                let (store_path, _) = open_plan.clone().expect("doc_path is Some");
                 let require_existing = std::env::var_os("STROP_REQUIRE_EXISTING").is_some();
                 if !require_existing
                     && !store_path.exists()
@@ -290,9 +305,13 @@ fn main() {
         };
         // Opening a .md imports it into a sibling .strop (existing .strop
         // wins — the durable file is the source of truth once it exists).
+        // The import is READ here but BORN lazily: the state is staged on
+        // the editor (`stage_import_birth`) and the .strop file — plus its
+        // "Started" birth seal — appears only at the first mutation, so a
+        // user whose default .md opener is Strop can glance at any folder
+        // without littering it (quit-without-edits is byte-identical).
         let md_import: Option<(String, SpanSet, BlockMap)> = if let Some(arg) = &doc_path
-            && arg.extension().is_some_and(|e| e == "md")
-            && !arg.with_extension("strop").exists()
+            && open_plan.as_ref().is_some_and(|(_, import)| *import)
         {
             match std::fs::read_to_string(arg) {
                 Ok(md) => {
@@ -338,17 +357,14 @@ fn main() {
                 }
                 None => match &md_import {
                     Some((text, spans, blocks)) => {
-                        store.seed(text);
-                        // The import is the document's birth: a materialized
-                        // "Started" checkpoint. Without it the journal-era
-                        // strip believes the doc began EMPTY — its envelope
-                        // shrinks to today's churn, and a scrub past the
-                        // first keystroke replays an imported novel away.
-                        store.seal_session_with(
-                            "Started",
-                            false,
-                            (text.clone(), spans.clone(), blocks.clone()),
-                        );
+                        // Lazy birth: NOTHING is seeded or sealed here. The
+                        // store stays an empty doc over a missing file; the
+                        // staged state below seeds it — and seals "Started",
+                        // the birth checkpoint the journal-era strip anchors
+                        // on — at the first mutation (Editor::materialize_
+                        // store). Until then the editor is fully functional
+                        // over the imported text, and a quit leaves the
+                        // filesystem exactly as the open found it.
                         (text.clone(), spans.clone(), blocks.clone(), None)
                     }
                     None if welcome => {
@@ -465,6 +481,12 @@ fn main() {
                         editor.restore_session(entry);
                     }
                     editor.start_blink(cx);
+                    // Lazy birth staging must ride with the store: both are
+                    // in hand before the writer's first act can possibly
+                    // reach `materialize_store`.
+                    if let Some((text, spans, blocks)) = md_import {
+                        editor.stage_import_birth(text, spans, blocks);
+                    }
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);
                     }
@@ -618,6 +640,34 @@ mod tests {
             .unwrap()
         });
         VisualTestContext::from_window(window.into(), cx)
+    }
+
+    #[test]
+    fn open_target_routes_md_imports_and_the_sibling_strop_wins() {
+        let dir = std::env::temp_dir()
+            .join(format!("strop-open-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("essay.md");
+        std::fs::write(&md, "# hi").unwrap();
+        assert_eq!(
+            open_target(&md),
+            (dir.join("essay.strop"), true),
+            "a lone .md maps to its sibling and imports (lazily)"
+        );
+        std::fs::write(dir.join("essay.strop"), b"x").unwrap();
+        assert_eq!(
+            open_target(&md),
+            (dir.join("essay.strop"), false),
+            "an existing sibling .strop wins — never a re-import"
+        );
+        let strop = dir.join("direct.strop");
+        assert_eq!(
+            open_target(&strop),
+            (strop.clone(), false),
+            "a .strop opens as itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui::test]

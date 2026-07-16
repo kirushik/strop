@@ -1429,6 +1429,13 @@ pub struct Editor {
     last_input: Instant,
     /// Durable layer; edits mirror into it, a background task saves when idle.
     store: Option<Store>,
+    /// Lazy birth (a .md opened without a sibling .strop): the imported
+    /// state, held here instead of seeded into the store, so glancing at a
+    /// Markdown file creates NOTHING on disk. The first persistent mutation
+    /// takes it (`materialize_store`), seeds the store and seals "Started"
+    /// with this state — the journal-era birth checkpoint. While this is
+    /// `Some`, `save_now` refuses to touch the filesystem.
+    pending_birth: Option<(String, SpanSet, BlockMap)>,
     store_dirty: bool,
     /// Loro export stays on this thread; only immutable bytes cross into the
     /// ordered filesystem worker.
@@ -2362,6 +2369,7 @@ impl Editor {
             cursor_visible: true,
             last_input: Instant::now(),
             store: None,
+            pending_birth: None,
             store_dirty: false,
             save_worker: None,
             save_revision: SaveRevision(0),
@@ -2559,11 +2567,40 @@ impl Editor {
         .detach();
     }
 
+    /// Lazy birth, staged (main.rs, the .md import path): the store stays
+    /// an empty doc over a missing file, and this holds what the import
+    /// read. Must be called before the writer can act — main stages it in
+    /// the same closure that attaches the store.
+    pub fn stage_import_birth(&mut self, text: String, spans: SpanSet, blocks: BlockMap) {
+        self.pending_birth = Some((text, spans, blocks));
+    }
+
+    /// The moment of birth: the first persistent mutation seeds the store
+    /// with the IMPORTED state and seals "Started" — the checkpoint the
+    /// journal-era strip anchors on (without it the record believes the doc
+    /// began empty, and a scrub past the first keystroke replays an
+    /// imported novel away). Until this runs, nothing exists on disk and
+    /// `save_now` refuses to write; a no-edit open quits byte-identical.
+    /// Idempotent — every caller past the first is a no-op.
+    fn materialize_store(&mut self) {
+        if self.store.is_none() {
+            return; // storeless (smoke): the birth state stays parked
+        }
+        let Some((text, spans, blocks)) = self.pending_birth.take() else { return };
+        let store = self.store.as_ref().expect("checked just above");
+        store.seed(&text);
+        store.seal_session_with("Started", false, (text, spans, blocks));
+    }
+
     /// The single "the document changed, it must be saved" chokepoint. Every
     /// mutation site routes through here instead of poking `store_dirty`
     /// directly, so no field can silently skip persistence the way the note
     /// composer once did. Keep this the ONLY place that sets the flag true.
     fn mark_dirty(&mut self) {
+        // A persistent mutation is exactly what ends lazy birth — cards,
+        // goals and every other non-text channel route through here, so an
+        // unborn import materializes before its first save can be gated.
+        self.materialize_store();
         self.store_dirty = true;
         self.save_revision.0 = self
             .save_revision
@@ -2619,6 +2656,10 @@ impl Editor {
         // from a lull (deferred_pass), so caret moves must never touch it.
         self.last_text_edit = Some(Instant::now());
         self.word_count = self.manuscript_word_count();
+        // Lazy birth ends HERE, before the mirror: these ops are positioned
+        // against the imported text, so the seed must land under them first
+        // (applying an op at char N to an unseeded empty doc would panic).
+        self.materialize_store();
         // Apply to the store before releasing the borrow, so the dirty-flag
         // chokepoint (mark_dirty) can take &mut self.
         match &self.store {
@@ -2932,6 +2973,10 @@ impl Editor {
         if name.is_empty() {
             return false;
         }
+        // Naming a version is a deliberate act of record: an unborn import
+        // materializes first, so the checkpoint lands on a seeded store
+        // (and after the "Started" seal, keeping the birth first).
+        self.materialize_store();
         let Some(store) = &self.store else { return false };
         let before = store.checkpoints().len();
         let timestamp_ms = if self.strip.parked {
@@ -3491,6 +3536,11 @@ impl Editor {
         from_unix: i64,
         cx: &mut Context<Self>,
     ) {
+        // A restore IS a document mutation: an unborn import materializes
+        // before the record below snapshots the store (unreachable today —
+        // pre-birth there is no history to restore FROM — but this keeps
+        // the invariant local instead of relying on that distance).
+        self.materialize_store();
         // Save first so the "Before restore" checkpoint materializes the
         // present exactly as it stands (see add_checkpoint). Its name is a
         // bare automatic: inlining the source version's title composed
@@ -7218,6 +7268,13 @@ impl Editor {
         let perf = std::env::var_os("STROP_PERF").map(|_| std::time::Instant::now());
         let mut queued = None;
         self.sync_mutations();
+        // Unborn import (lazy birth): sync_mutations above would have
+        // materialized any pending ops, so a birth still pending here means
+        // NO persistent mutation has ever happened — and no file may be
+        // created. Every save path funnels through this one refusal.
+        if self.pending_birth.is_some() {
+            return Ok(None);
+        }
         // Settle the journal's tail run: persisted runs are immutable once
         // written, so the store only ever pushes finished items. Saves fire
         // at ≥1s idle, a natural run boundary anyway.
@@ -7314,13 +7371,18 @@ impl Editor {
     /// own flags cover marked mutations and in-flight/failed saves; the
     /// store's frontier baseline (`Store::needs_save`) covers doc mutations
     /// that never route through the dirty chokepoint — open-time session
-    /// seals, idle-gap checkpoints — and the journal's unpersisted tail.
+    /// seals, idle-gap checkpoints — and the journal's unpersisted tail. An
+    /// unborn import (lazy birth) is clean BY LAW: nothing exists on disk,
+    /// and a mere close must not create anything.
     fn quit_close_clean(&mut self) -> bool {
         // Fold any just-committed transient-field ops in first — they are
         // exactly the bytes LAW 2 exists to protect.
         self.sync_mutations();
         if self.store_dirty || self.latest_save.is_some() || self.save_error.is_some() {
             return false;
+        }
+        if self.pending_birth.is_some() {
+            return true;
         }
         match &self.store {
             Some(store) => !store.needs_save(self.doc.journal()),
@@ -13190,6 +13252,9 @@ impl Editor {
         use strop_core::journal::{EditRun, Journal, JournalEvent};
         use strop_core::store::CheckpointState;
 
+        // Birth-first, like seed:legacy: the fixture's checkpoints must land
+        // AFTER the "Started" seal, never before it.
+        self.materialize_store();
         let now = strop_core::journal::now_ms();
         let day = 86_400_000i64;
         let hour = 3_600_000i64;
@@ -13308,6 +13373,11 @@ impl Editor {
     pub fn debug_seed_legacy(&mut self, cx: &mut Context<Self>) {
         use strop_core::journal::Journal;
         use strop_core::store::CheckpointState;
+        // A seed IS a persistent mutation: an unborn .md fixture materializes
+        // first, so the "Started" birth seal keeps index 0 and the seeded
+        // plan lands at 1.. — the order the rig's index-addressed scrubs
+        // (coldread:past:N) and the record's birth-first law both expect.
+        self.materialize_store();
         let Some(store) = self.store.as_ref() else {
             eprintln!("strop: seed:legacy needs a document file");
             return;
@@ -23980,8 +24050,13 @@ impl Editor {
         self.flank_risen = false; // the reading room suppresses the flanks; reset on exit
         // L3: entry quietly checkpoints — fingerprint-guarded, reflex tier.
         // (On a legacy file mid-backfill the store defers silently —
-        // accepted and named, regions 13.)
-        if let Some(store) = &self.store {
+        // accepted and named, regions 13.) An unborn import skips it too:
+        // reading is not a mutation, the seal would snapshot an unseeded
+        // (empty) store, and lazy birth forbids creating a record before
+        // the first edit — the .md itself still holds this exact state.
+        if self.pending_birth.is_none()
+            && let Some(store) = &self.store
+        {
             store.add_checkpoint_if_changed("Cold read", false);
         }
         self.dirty_since_checkpoint = false;
@@ -28745,7 +28820,7 @@ mod tests {
         assert_eq!(space_mark_hit(&marks, 20.), None, "padding never magnetizes track");
     }
 
-    // ---- Quit guard (see request_quit / settle_quit) ----
+    // ---- Quit guard + lazy birth (see request_quit / materialize_store) ----
 
     fn quit_test_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("strop-quit-test-{}-{tag}.strop", std::process::id()))
@@ -28756,10 +28831,14 @@ mod tests {
         cx: &mut gpui::TestAppContext,
         text: &str,
         store: Store,
+        birth: bool,
     ) -> gpui::Entity<Editor> {
         let text = text.to_owned();
         cx.new(|cx| {
             let mut editor = Editor::new(cx, &text, SpanSet::default(), BlockMap::default());
+            if birth {
+                editor.stage_import_birth(text, SpanSet::default(), BlockMap::default());
+            }
             editor.attach_store(store, cx);
             editor
         })
@@ -28779,7 +28858,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let (store, loaded) = Store::open(&path).unwrap();
         let loaded = loaded.unwrap();
-        let editor = editor_with_store(cx, &loaded.text, store);
+        let editor = editor_with_store(cx, &loaded.text, store, false);
         cx.update_entity(&editor, |editor, cx| {
             editor.quit_guard = QuitGuard::Saving; // as request_quit sets before deferring
             editor.settle_quit(cx);
@@ -28799,7 +28878,7 @@ mod tests {
         let path = quit_test_path("dirty-close");
         let _ = std::fs::remove_file(&path);
         let (store, _) = Store::open(&path).unwrap();
-        let editor = editor_with_store(cx, "", store);
+        let editor = editor_with_store(cx, "", store, false);
         cx.update_entity(&editor, |editor, cx| {
             editor.doc.edit_bytes(0..0, "dirty bytes");
             editor.quit_guard = QuitGuard::Saving;
@@ -28832,7 +28911,7 @@ mod tests {
         let path = quit_test_path("law-two");
         let _ = std::fs::remove_file(&path);
         let (store, _) = Store::open(&path).unwrap();
-        let editor = editor_with_store(cx, "", store);
+        let editor = editor_with_store(cx, "", store, false);
         cx.update_entity(&editor, |editor, cx| {
             editor.doc.edit_bytes(0..0, "unflushed");
             editor.sync_mutations();
@@ -28888,7 +28967,7 @@ mod tests {
         // Occupy the destination with a DIRECTORY: the atomic replace
         // cannot land, so the final write genuinely fails.
         std::fs::create_dir_all(&path).unwrap();
-        let editor = editor_with_store(cx, "", store);
+        let editor = editor_with_store(cx, "", store, false);
         cx.update_entity(&editor, |editor, cx| {
             editor.doc.edit_bytes(0..0, "doomed");
             editor.quit_guard = QuitGuard::Saving;
@@ -28913,5 +28992,57 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_file(path.with_extension("strop.tmp"));
+    }
+
+    #[gpui::test]
+    fn an_unborn_import_quits_without_creating_the_strop(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("unborn");
+        let _ = std::fs::remove_file(&path);
+        let (store, existing) = Store::open(&path).unwrap();
+        assert!(existing.is_none());
+        let editor = editor_with_store(cx, "imported prose", store, true);
+        cx.update_entity(&editor, |editor, cx| {
+            // Even explicit save requests refuse to write before birth.
+            assert!(
+                editor.save_now().unwrap().is_none(),
+                "an unborn import never queues a save"
+            );
+            editor.flush_saves().unwrap();
+            editor.quit_guard = QuitGuard::Saving;
+            editor.settle_quit(cx);
+            assert!(matches!(editor.quit_guard, QuitGuard::Bypass));
+        });
+        assert!(!path.exists(), "glancing at a .md must not litter a .strop");
+    }
+
+    #[gpui::test]
+    fn the_first_edit_births_the_store_with_the_started_seal(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("birth");
+        let _ = std::fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        let editor = editor_with_store(cx, "imported prose", store, true);
+        cx.update_entity(&editor, |editor, _| {
+            let end = editor.doc.rope().len_bytes();
+            editor.doc.edit_bytes(end..end, " and more");
+            // flush_saves waits for the generation: the birth write lands
+            // before the assertions below reopen the file.
+            editor.flush_saves().unwrap();
+        });
+        assert!(path.exists(), "the first edit materializes the file");
+        let (store, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.text, "imported prose and more");
+        let checkpoints = store.checkpoints();
+        assert_eq!(
+            checkpoints.first().map(|cp| cp.name.as_str()),
+            Some("Started"),
+            "birth seals the journal-era anchor checkpoint"
+        );
+        let birth_state = checkpoints[0].state.as_ref().expect("materialized state");
+        assert_eq!(
+            birth_state.text, "imported prose",
+            "the seal holds the state AS IMPORTED, not as edited"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
