@@ -7586,6 +7586,25 @@ impl Editor {
         cx.quit();
     }
 
+    /// The unhandled-quit salvage: when the last-ditch flush fails there is
+    /// no window left for the Failed dialog, so LAW 2's final line is a full
+    /// snapshot into the machine-local state dir — announced on stderr,
+    /// never silently abandoned.
+    pub fn salvage_recovery_copy(&self) {
+        let Some(store) = &self.store else { return };
+        let stem = store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document");
+        let dir = crate::paths::state_dir().join("recovery");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("strop: recovery dir failed too: {e}");
+            return;
+        }
+        let path = dir.join(format!("{stem} {}.strop", strop_core::journal::now_ms()));
+        match store.prepare_copy_to(&path).map(|save| save.write()) {
+            Ok(Ok(())) => eprintln!("strop: salvaged a full copy at {}", path.display()),
+            Ok(Err(e)) | Err(e) => eprintln!("strop: recovery copy failed: {e}"),
+        }
+    }
+
     fn save_quit_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let QuitGuard::Failed(previous_error) = &self.quit_guard else { return };
         let previous_error = previous_error.clone();
@@ -21407,6 +21426,11 @@ impl Editor {
         let lane_left = col_right + MARGIN_GAP + 8.;
         let top = self.margin_floor();
         let drafting = self.drafting;
+        // The rail's readout owns this band while the hand is on the rail
+        // (impl/15 §4): the chip yields rather than overprint.
+        if self.space_drag_offset.is_some() || self.space_readout_fade.is_some() {
+            return None;
+        }
         let (n, drained) = self.door_chip_count()?;
         let ready = self.deferred_pass.is_some();
         let label = format!("⌇ {n}");
@@ -21721,6 +21745,31 @@ impl Editor {
                         .text_color(rgb(MUTED_COLOR))
                         .child("Ask the editor for…"),
                 )
+                // The conditional setup row (impl/14 §5): with no provider
+                // configured, the menu's first verb is the one that makes
+                // the others possible.
+                .when(self.editor_face() == EditorFace::NeedsSetup, |d| {
+                    d.child(
+                        div()
+                            .id("er-setup")
+                            .px(px(12.))
+                            .py(px(7.))
+                            .border_b_1()
+                            .border_color(rgb(RULE_COLOR))
+                            .text_size(px(12.))
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.editor_menu_open = false;
+                                    editor.open_ai_settings(&OpenAiSettings, window, cx);
+                                }),
+                            )
+                            .child("Set up the editor…"),
+                    )
+                })
                 .when_some(active_read, |d, active| d.child(active))
                 .child(self.editor_menu_row(
                     "er-believing",
@@ -21792,7 +21841,6 @@ impl Editor {
             return None;
         }
         let open = self.narrow_notes_open;
-        let noun = if count == 1 { "note" } else { "notes" };
         Some(
             div()
                 .id("narrow-notes-pill")
@@ -21824,7 +21872,9 @@ impl Editor {
                 )
                 // The note-card mark, so the pill rhymes with what it holds.
                 .child(icon(icons::NOTE, 13., MUTED_COLOR))
-                .child(format!("{count} {noun}"))
+                // The mark is the noun (impl/14 §6: no count+word in any
+                // language); the icon beside the numeral carries "of what".
+                .child(format!("{count}"))
                 .into_any_element(),
         )
     }
@@ -22127,10 +22177,29 @@ impl Editor {
         let mark_hits_down = mark_hits.clone();
         let mark_ys_down: Vec<f32> = mark_hits_down.iter().map(|(y, _)| *y).collect();
         let mark_ys: Vec<f32> = mark_hits.iter().map(|(y, _)| *y).collect();
-        let rail_left = col_x + col_w - SPACE_RAIL_W;
-        let bright = self.space_hover || self.space_drag_offset.is_some();
-        let mut rail = div().id("space-rail").absolute().left(px(rail_left)).top(px(BAR_HEIGHT))
-            .w(px(SPACE_RAIL_W)).h(px(track_h)).cursor(CursorStyle::PointingHand)
+        // The rail is the frame's outermost furniture: right of the margin
+        // lane, never between the prose and its cards (impl/15 §1 — a strip
+        // of chrome inside the lane would cut the card-to-span tie). Narrow
+        // windows without a lane keep it at the column edge.
+        let vw = f32::from(window.viewport_size().width);
+        let lane = if self.margin_fits(window) { NOTE_LANE_TOTAL } else { 0. };
+        let rail_left = (col_x + col_w + lane - SPACE_RAIL_W).min(vw - SPACE_RAIL_W);
+        let dragging = self.space_drag_offset.is_some();
+        // A held drag follows the hand anywhere (P7): the hit surface grows
+        // to the whole viewport for the drag's lifetime. Maximized windows
+        // have no resize gutter, so the resting hit region bleeds to the
+        // true screen edge and throw-right lands (Fitts, recovered where
+        // it is free).
+        let (hit_left, hit_w) = if dragging {
+            (0., vw)
+        } else if window.is_maximized() {
+            (rail_left, vw - rail_left)
+        } else {
+            (rail_left, SPACE_RAIL_W)
+        };
+        let bright = self.space_hover || dragging;
+        let rail = div().id("space-rail").absolute().left(px(hit_left)).top(px(BAR_HEIGHT))
+            .w(px(hit_w)).h(px(track_h)).cursor(CursorStyle::PointingHand)
             .on_hover(cx.listener(|editor, hover: &bool, _, cx| {
                 editor.space_hover = *hover;
                 if !*hover {
@@ -22141,6 +22210,9 @@ impl Editor {
             .on_mouse_down(MouseButton::Left, cx.listener(move |editor, ev: &MouseDownEvent, _, cx| {
                 cx.stop_propagation();
                 editor.space_readout_fade = None;
+                // A rail jump moves the text under any exit-fade ghosts,
+                // exactly like a wheel scroll — drop them (fleet finding).
+                editor.departing.clear();
                 let local = f32::from(ev.position.y) - BAR_HEIGHT;
                 if let Some(ix) = space_mark_hit(&mark_ys_down, local) {
                     let target = mark_hits_down[ix].1;
@@ -22167,6 +22239,7 @@ impl Editor {
                     return;
                 }
                 let offset = editor.space_drag_offset.expect("checked above");
+                editor.departing.clear();
                 editor.scroll_top = px(((local - offset) / (track_h - thumb_h).max(1.))
                     .clamp(0., 1.) * max_scroll);
                 cx.notify();
@@ -22177,28 +22250,32 @@ impl Editor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(|editor, _: &MouseUpEvent, _, cx| {
                 editor.finish_space_drag(cx);
             }));
+        // The painted rail keeps its exact 14px geometry regardless of how
+        // wide the hit surface currently is.
+        let mut paint = div().absolute().left(px(rail_left - hit_left)).top_0()
+            .w(px(SPACE_RAIL_W)).h(px(track_h));
         for (mark_ix, (_, y, w, dot)) in marks.into_iter().enumerate() {
             let hovered = self.space_hover_mark == Some(mark_ix);
-            rail = rail.child(div().absolute().top(px(y - if dot { 1. } else { 0.5 }))
+            paint = paint.child(div().absolute().top(px(y - if dot { 1. } else { 0.5 }))
                 .right(px(0.)).w(px(w)).h(px(if dot { 2. } else { 1. }))
                 .bg(rgba(alpha_ink(MUTED_COLOR, if hovered { 0xBF } else { 0x8C }))));
         }
         if let Some(seam) = frame.seam_top {
             let y = space_mark_y(f32::from(seam), max_scroll, track_h, thumb_h);
-            rail = rail.child(div().absolute().top(px(y)).left_0().w_full().h(px(1.))
+            paint = paint.child(div().absolute().top(px(y)).left_0().w_full().h(px(1.))
                 .bg(rgba(alpha_ink(MUTED_COLOR, 0x8C))));
         }
         let caret_y = frame.paragraphs.iter().find(|p| {
             p.range.start <= self.cursor_offset() && self.cursor_offset() <= p.range.end
         }).map(|p| space_mark_y(f32::from(p.top), max_scroll, track_h, thumb_h));
-        rail = rail.child(div().absolute().top(px(thumb_y)).left(px(4.))
+        paint = paint.child(div().absolute().top(px(thumb_y)).left(px(4.))
             .w(px(SPACE_THUMB_W)).h(px(thumb_h)).rounded(px(3.))
             .bg(rgba(alpha_ink(MUTED_COLOR, if bright { 0xBF } else { 0x73 }))));
         if let Some(y) = caret_y {
             let paint_y = if space_fleck_on_thumb(y, thumb_y, thumb_h) {
                 y.clamp(thumb_y + 1., thumb_y + thumb_h - 1.)
             } else { y };
-            rail = rail.child(div().absolute().top(px(paint_y - 1.)).left(px(6.))
+            paint = paint.child(div().absolute().top(px(paint_y - 1.)).left(px(6.))
                 .w(px(2.)).h(px(2.)).rounded(px(1.)).bg(rgb(ACTIVE_BORDER))
                 .on_mouse_down(MouseButton::Left, cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
@@ -22207,6 +22284,7 @@ impl Editor {
                     cx.notify();
                 })));
         }
+        let rail = rail.child(paint);
         let mut out = div().absolute().inset_0().child(rail);
         if (self.space_drag_offset.is_some() || self.space_readout_fade.is_some())
             && let Some(label) = governing.filter(|s| !s.is_empty())
@@ -23599,16 +23677,23 @@ impl crate::bookpage::Measure for CrMeasure<'_> {
 }
 
 /// Paginate a slice triple at `geom` — same input, same layout, bit for bit.
+/// The measuring apparatus cr_layout borrows for one pagination: image
+/// sizes, the shaped-width cache, and the window's text system.
+struct CrLayoutMeasure<'a> {
+    sizes: &'a HashMap<String, (f32, f32)>,
+    widths: &'a mut HashMap<CrWidthKey, f32>,
+    ts: &'a std::sync::Arc<gpui::WindowTextSystem>,
+}
+
 fn cr_layout(
     text: &str,
     spans: &SpanSet,
     blocks: &BlockMap,
     geom: &CrGeom,
     language: typograph::Lang,
-    sizes: &HashMap<String, (f32, f32)>,
-    widths: &mut HashMap<CrWidthKey, f32>,
-    ts: &std::sync::Arc<gpui::WindowTextSystem>,
+    measure: CrLayoutMeasure<'_>,
 ) -> crate::bookpage::BookLayout {
+    let CrLayoutMeasure { sizes, widths, ts } = measure;
     let mut metrics = geom.metrics();
     metrics.language = Some(language);
     let mut m = CrMeasure { ts: ts.clone(), widths, sizes, body: geom.body };
@@ -24259,7 +24344,8 @@ impl Editor {
             Language::Auto => typograph::detect_lang(text.chars()),
         };
         let book = cr_layout(
-            &text, &spans, &blocks, &geom, language, &image_sizes, &mut widths, &ts,
+            &text, &spans, &blocks, &geom, language,
+            CrLayoutMeasure { sizes: &image_sizes, widths: &mut widths, ts: &ts },
         );
         let page = entry_char.map_or(0, |c| book.page_of_char(c));
         let paper = crate::paths::asset_file("paper-noise-256.png").and_then(|p| {
@@ -24955,7 +25041,8 @@ impl Editor {
         let (text, spans, blocks) = (cr.text.clone(), cr.spans.clone(), cr.blocks.clone());
         let sizes = cr.image_sizes.clone();
         let book = cr_layout(
-            &text, &spans, &blocks, &geom, cr.language, &sizes, &mut cr.widths, &ts,
+            &text, &spans, &blocks, &geom, cr.language,
+            CrLayoutMeasure { sizes: &sizes, widths: &mut cr.widths, ts: &ts },
         );
         cr.page = book.page_of_char(top_char);
         cr.book = book;
@@ -25006,8 +25093,8 @@ impl Editor {
                             (cr.text.clone(), cr.spans.clone(), cr.blocks.clone());
                         let sizes = cr.image_sizes.clone();
                         let book = cr_layout(
-                            &text, &spans, &blocks, &geom, cr.language, &sizes,
-                            &mut cr.widths, &ts,
+                            &text, &spans, &blocks, &geom, cr.language,
+                            CrLayoutMeasure { sizes: &sizes, widths: &mut cr.widths, ts: &ts },
                         );
                         cr.page = book.page_of_char(top_char);
                         cr.book = book;

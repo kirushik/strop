@@ -225,9 +225,14 @@ fn main() {
         let store = match &doc_path {
             None => None,
             Some(p) => {
-                let (store_path, _) = open_plan.clone().expect("doc_path is Some");
+                let (store_path, planned_import) = open_plan.clone().expect("doc_path is Some");
                 let require_existing = std::env::var_os("STROP_REQUIRE_EXISTING").is_some();
+                // Intentional birth at an explicit CLI path may create its
+                // parent; a LAZY .md import must not — its sidecar's parent
+                // is the .md's own directory, and a glance creates nothing
+                // (fleet finding: failed lazy opens littered empty dirs).
                 if !require_existing
+                    && !planned_import
                     && !store_path.exists()
                     && let Some(parent) = store_path.parent()
                     && let Err(e) = std::fs::create_dir_all(parent)
@@ -547,7 +552,13 @@ fn main() {
                 // the process exit with the bytes still in flight. A graceful
                 // quit has already saved by this point, and the fingerprint
                 // guards make this second call a no-op that writes nothing.
-                let _ = editor.flush_saves();
+                if let Err(e) = editor.flush_saves() {
+                    // LAW 2's last line: the process may not exit with
+                    // dirty bytes and no witness. Salvage a full snapshot
+                    // into the state dir and say where it went.
+                    eprintln!("strop: final save failed at quit: {e}");
+                    editor.salvage_recovery_copy();
+                }
                 // Caret remembered for next open (resume mid-sentence);
                 // never a question, never a dialog (DESIGN §4b tension 6).
                 editor.record_exit_state();

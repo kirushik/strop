@@ -107,7 +107,11 @@ leaving the span, click elsewhere, or Esc — but **typing inside the
 span keeps it** (the glance's purpose is fixing the flagged sentence;
 the card is the worksheet — writer's scenario 3 depends on this).
 The chip does not react to glances (its count is glance-invariant by
-construction).
+construction). A glance may transiently occlude a writer-note card
+packed at the same anchor — lawful: the glance is a self-terminating
+ghost the writer summoned, and it displaces nothing (adjudicated at
+the fix wave over a paint workaround; the overlap ends with the
+glance).
 
 ## 4. The Away landing — the answer waits at the door
 

@@ -593,9 +593,8 @@ pub fn paginate(
             0.0
         };
         let first_avail = (avail - first_indent).max(1.0);
-        let broken = break_para(
-            &ctx, frags, avail, first_avail, first_indent, mode, role, m, h,
-        );
+        let widths = BreakWidths { avail, first_avail, indent: first_indent };
+        let broken = break_para(&ctx, frags, widths, mode, role, m, h);
         let n = broken.len();
         let params = LineParams {
             avail,
@@ -948,17 +947,25 @@ fn split_at(
     Some((prefix, rest))
 }
 
+/// The line widths a paragraph breaks against: the block measure, the
+/// first line's narrower share under a paragraph indent, and the indent
+/// itself (the last-line demerit reads it).
+struct BreakWidths {
+    avail: f32,
+    first_avail: f32,
+    indent: f32,
+}
+
 fn break_para(
     ctx: &ParaCtx,
     frags: Vec<Frag>,
-    avail: f32,
-    first_avail: f32,
-    para_indent: f32,
+    widths: BreakWidths,
     mode: Mode,
     role: Role,
     m: &mut dyn Measure,
     h: &mut dyn Hyphenate,
 ) -> Vec<BrokenLine> {
+    let BreakWidths { avail, first_avail, indent: para_indent } = widths;
     // Bound-glued fragments form unbreakable units («слово —» — the
     // tokenizer's only Bound source). Hyphenation inside a bound group is
     // skipped: conservative, and the dash never starts a line either way.
