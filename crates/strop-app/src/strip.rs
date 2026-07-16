@@ -507,35 +507,61 @@ fn push_thread_point(points: &mut Vec<ThreadPoint>, point: ThreadPoint) {
 /// Recover only the legacy suffix whose inverse is unique. Reaching the
 /// beginning of the available run record is a proof boundary, not evidence
 /// that the card occupied its present y all the way back to its raise.
+///
+/// `end_ms` is the thread's TERMINAL — `now_ms` for a live card, its close for
+/// a closed one (the record already holds the `CardClosed` time; a closed
+/// card's path up to that moment is real history, not to be dropped). The note
+/// still tracks the text after it closes, so `today_anchor` is the present
+/// position: post-terminal runs are rolled back (no vertex) to recover the
+/// close-time anchor, and a post-terminal ambiguity/restore — where that
+/// position becomes unknowable — yields no thread at all.
 fn legacy_reverse_vertices(
     journal: &Journal,
     raised_ms: i64,
     today_anchor: usize,
+    end_ms: i64,
     now_ms: i64,
 ) -> Vec<(i64, usize)> {
-    let mut anchor = today_anchor;
-    let mut rev = vec![(now_ms, anchor)];
     let restores: Vec<i64> = journal.events.iter().filter_map(|e| match e {
         JournalEvent::Restore { t, .. } => Some(*t),
         _ => None,
     }).collect();
-    let mut ceiling = now_ms;
-    for run in journal.runs.iter().rev().filter(|r| r.t0 >= raised_ms) {
-        if restores.iter().any(|t| *t > run.t0 && *t <= ceiling) {
-            break;
-        }
-        ceiling = run.t0;
+    let ambiguous = |anchor: usize, run: &EditRun| -> bool {
         let ins = run.ins.chars().count();
         // A post-edit anchor inside replacement text, or at the collapse point
         // of a deletion, has more than one possible pre-edit coordinate.
-        if (anchor > run.pos && anchor < run.pos + ins)
+        (anchor > run.pos && anchor < run.pos + ins)
             || (run.del_chars > 0 && anchor == run.pos)
-        {
+    };
+    let invert = |anchor: usize, run: &EditRun| -> usize {
+        let ins = run.ins.chars().count();
+        if anchor >= run.pos + ins { anchor + run.del_chars - ins } else { anchor }
+    };
+    // A restore after the terminal severs the invertible chain from the present
+    // back to the close position — the close-time anchor is unrecoverable, so
+    // the thread is absent (for a live card `end_ms == now_ms`: vacuous).
+    if restores.iter().any(|t| *t > end_ms && *t <= now_ms) {
+        return Vec::new();
+    }
+    let mut anchor = today_anchor;
+    // Roll the present anchor back to its position at `end_ms`. Runs after the
+    // terminal moved the still-tracking note but lie outside its thread; an
+    // ambiguous one there leaves the close position unknowable.
+    for run in journal.runs.iter().rev().filter(|r| r.t0 > end_ms && r.t0 >= raised_ms) {
+        if ambiguous(anchor, run) {
+            return Vec::new();
+        }
+        anchor = invert(anchor, run);
+    }
+    // The thread proper: from the terminal back while the inverse stays unique.
+    let mut rev = vec![(end_ms, anchor)];
+    let mut ceiling = end_ms;
+    for run in journal.runs.iter().rev().filter(|r| r.t0 >= raised_ms && r.t0 <= end_ms) {
+        if restores.iter().any(|t| *t > run.t0 && *t <= ceiling) || ambiguous(anchor, run) {
             break;
         }
-        if anchor >= run.pos + ins {
-            anchor = anchor + run.del_chars - ins;
-        }
+        ceiling = run.t0;
+        anchor = invert(anchor, run);
         rev.push((run.t0, anchor));
     }
     rev.reverse();
@@ -667,6 +693,18 @@ pub struct Seam {
     pub w: f32,
     pub start_ms: i64,
     pub end_ms: i64,
+}
+
+impl Seam {
+    /// The two-day tier (§1b): does this well carry a hover-duration datum?
+    /// Decided from the WALL-CLOCK gap the fold spans, never from the derived
+    /// pixel width `w`. `w` is `work1 - work0` after a long accumulation of f32
+    /// additions, so `w == SEAM_WIDE_PX` starts missing genuinely wide seams
+    /// once the axis grows (drift reaches a whole tier step past ~1M px). The
+    /// gap span is the integer the fold decision was made from — exact forever.
+    pub fn wide(&self) -> bool {
+        self.end_ms - self.start_ms >= SEAM_WIDE_MS
+    }
 }
 
 /// Plain data carried by a wide well. It is baked with the fold so neither
@@ -864,7 +902,7 @@ impl StripBake {
             .collect();
         let well_data = seams
             .iter()
-            .filter(|s| s.w == SEAM_WIDE_PX)
+            .filter(|s| s.wide())
             .map(|s| WellDatum {
                 x: s.x + s.w / 2.,
                 label: format_well_duration(s.end_ms - s.start_ms),
@@ -918,14 +956,18 @@ impl StripBake {
         for card in cards.iter().filter(|c| c.kind == strop_core::document::NoteKind::Diagnosis
             && !journal.events.iter().any(|e| matches!(e,
                 JournalEvent::CardRaised { id, .. } if *id == c.id))) {
-            if card.closed_ms.is_some() { continue; }
+            // A closed legacy card is not dropped: its path up to the close it
+            // already recorded is real history. The reverse walk terminates at
+            // that close (else at `now`), and the thread renders terminated.
+            let end_ms = card.closed_ms.unwrap_or(now_ms);
             let rev: Vec<ThreadPoint> = legacy_reverse_vertices(
-                journal, card.raised_ms, card.anchor, now_ms
+                journal, card.raised_ms, card.anchor, end_ms, now_ms
             ).into_iter().map(|(at, anchor)| point(at, anchor)).collect();
+            if rev.is_empty() { continue; }
             let uncertain_start = rev.len() > 1;
-            let segments = if uncertain_start { vec![rev] } else { vec![vec![point(now_ms, card.anchor)]] };
-            threads.push(Thread { card_id: card.id, segments, resolved: card.resolved, open: true,
-                origin_proven: false, uncertain_start });
+            let segments = vec![rev];
+            threads.push(Thread { card_id: card.id, segments, resolved: card.resolved,
+                open: card.closed_ms.is_none(), origin_proven: false, uncertain_start });
         }
 
         // --- Stations (checkpoints) + Restore/Export ticks -------------------
@@ -1639,7 +1681,7 @@ mod tests {
     fn legacy_reverse_walk_stops_at_overlap_without_false_geometry() {
         let mut j = Journal::default();
         j.runs = vec![run(20, 6, 5, ""), run(30, 2, 0, "aa")];
-        let vertices = legacy_reverse_vertices(&j, 10, 8, 40);
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 40, 40);
         assert_eq!(vertices, vec![(30, 6), (40, 8)]);
         assert!(vertices.iter().all(|(t, _)| *t > 20), "no line crosses the ambiguous edit");
     }
@@ -1649,7 +1691,7 @@ mod tests {
         let mut j = Journal::default();
         j.runs = vec![run(20, 1, 0, "a"), run(40, 1, 0, "b")];
         j.events.push(JournalEvent::Restore { t: 30, from_unix: 0, len_chars: 4 });
-        let vertices = legacy_reverse_vertices(&j, 10, 8, 50);
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 50, 50);
         assert_eq!(vertices, vec![(40, 7), (50, 8)]);
         assert!(vertices.iter().all(|(t, _)| *t > 30), "restore gap has no invented y");
     }
@@ -1658,9 +1700,45 @@ mod tests {
     fn legacy_reverse_walk_stops_at_the_journal_coverage_gap() {
         let mut j = Journal::default();
         j.runs = vec![run(50, 2, 0, "aa")];
-        let vertices = legacy_reverse_vertices(&j, 10, 8, 60);
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 60, 60);
         assert_eq!(vertices, vec![(50, 6), (60, 8)]);
         assert_ne!(vertices[0].0, 10, "the unrecorded raise-to-journal span stays absent");
+    }
+
+    #[test]
+    fn legacy_reverse_walk_terminates_a_closed_card_at_its_close() {
+        // A closed legacy card: the note still tracks the text after it closes
+        // (`run(60)` postdates the close at 40), so the present anchor is rolled
+        // back through that run — no vertex — to recover the close-time
+        // position, and the thread ends at the close, not at `now`.
+        let mut j = Journal::default();
+        j.runs = vec![run(20, 0, 0, "aa"), run(60, 0, 0, "bb")];
+        let vertices = legacy_reverse_vertices(&j, 10, 12, 40, 100);
+        assert_eq!(vertices, vec![(20, 8), (40, 10)],
+            "the thread spans raise→close, terminating at 40 (not 100)");
+    }
+
+    #[test]
+    fn closed_legacy_card_keeps_a_terminated_thread_through_the_bake() {
+        // The whole bake path: a legacy diagnosis (no CardRaised record) closed
+        // mid-history keeps its thread — nothing is lost — and it renders
+        // terminated (open == false), ending at the close, not the playhead.
+        let mut j = Journal::default();
+        j.runs = vec![run(20, 0, 0, "aa"), run(60, 0, 0, "bb")];
+        let now = 100;
+        let closed = 40;
+        let card = CardSnap { id: 7, raised_ms: 10, closed_ms: Some(closed),
+            anchor: 12, resolved: true, kind: NoteKind::Diagnosis };
+        let bake = StripBake::build(&j, &[], &[card], 0, now);
+        let thread = bake.threads.iter().find(|t| t.card_id == 7)
+            .expect("the closed legacy card keeps its thread");
+        assert!(!thread.open, "a closed card's thread is terminated, not live");
+        let last = thread.segments.last().unwrap().last().unwrap();
+        let close_x = bake.timeline.work_at(closed);
+        assert!((last.x - close_x).abs() < 0.5,
+            "the thread ends at the close ({close_x}), not now: {}", last.x);
+        assert!(close_x < bake.timeline.work_at(now),
+            "a closed thread must not reach the playhead");
     }
 
     #[test]
@@ -1953,6 +2031,43 @@ mod tests {
         assert_eq!(widths.len(), 2, "two folded gaps: {widths:?}");
         assert_eq!(widths[0], SEAM_PX, "an overnight break is the thin well");
         assert_eq!(widths[1], SEAM_WIDE_PX, "days away earn the wide well");
+    }
+
+    #[test]
+    fn wide_well_tier_reads_the_wall_gap_not_the_derived_width() {
+        // `Seam::w` is `work1 - work0` after a long f32 accumulation, so a
+        // genuinely wide seam drifts off the 20.0 nominal (empirically a whole
+        // tier step past ~1M px). The tier is decided from the exact wall-clock
+        // gap, so the well keeps its duration datum however `w` rounded.
+        let day = 86_400_000i64;
+        let drifted = SEAM_WIDE_PX + f32::EPSILON * SEAM_WIDE_PX;
+        assert_ne!(drifted, SEAM_WIDE_PX, "the pixel width really has drifted");
+        let seam = Seam { x: 1_000., w: drifted, start_ms: 0, end_ms: 3 * day };
+        assert!(seam.wide(), "a 3-day gap is wide however `w` rounded");
+        // The retired `w == SEAM_WIDE_PX` predicate would have dropped this.
+        assert!(seam.w != SEAM_WIDE_PX);
+        let thin = Seam { x: 0., w: SEAM_WIDE_PX, start_ms: 0, end_ms: day };
+        assert!(!thin.wide(), "a one-day gap stays the thin tier");
+    }
+
+    #[test]
+    fn wide_gap_bakes_a_duration_datum() {
+        // The real bake path: a >2-day gap yields exactly one wide-well datum.
+        let day = 86_400_000i64;
+        let base = 1_700_000_000_000i64;
+        let mut j = Journal::default();
+        let mut pos = 0usize;
+        for t0 in [base, base + 5 * day] {
+            for k in 0..5i64 {
+                j.record(&ins(pos, "word "), t0 + k * 400);
+                pos += 5;
+            }
+            j.settle();
+        }
+        let bake = StripBake::build(&j, &[], &[], 0, base + 5 * day + 10_000);
+        assert_eq!(bake.well_data.len(), 1, "the >2-day gap carries one datum");
+        let datum = &bake.well_data[0];
+        assert_eq!(datum.label, format_well_duration(datum.end_ms - datum.start_ms));
     }
 
     #[test]
