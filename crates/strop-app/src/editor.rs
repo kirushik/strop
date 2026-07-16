@@ -17494,12 +17494,23 @@ impl Editor {
     /// viewing, with the one verb (Restore) and the exit. It lives in the
     /// column's top padding — never over prose.
     fn render_history_banner(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let (name, stamp) = self
+        // The banner obeys the strip's law too (history-strip §2): a
+        // session-ranked automatic never prints its internal name — the
+        // timestamp is the whole datum. Unnamed autos say "Auto-save", the
+        // panel row's word.
+        let label = self
             .history_view
             .as_ref()
             .map(|hv| {
                 let e = &hv.entries[hv.selected];
-                (e.name.clone(), format_unix(e.created_unix))
+                let stamp = format_unix(e.created_unix);
+                if strip::session_named(&e.name, e.manual) {
+                    stamp
+                } else if e.name.is_empty() {
+                    format!("Auto-save · {stamp}")
+                } else {
+                    format!("{} · {stamp}", e.name)
+                }
             })
             .unwrap_or_default();
         div()
@@ -17524,7 +17535,7 @@ impl Editor {
                     .min_w(px(0.))
                     .truncate()
                     .text_color(rgb(TEXT_COLOR))
-                    .child(format!("{name} · {stamp}")),
+                    .child(label),
             )
             .child(div().flex_1())
             .child(
@@ -17655,6 +17666,12 @@ impl Editor {
             let stamp = format_unix(e.created_unix);
             let (_, time) = stamp.split_once(' ').unwrap_or((stamp.as_str(), ""));
             let time = time.to_owned();
+            // The strip's law applies to the panel too (history-strip §2: no
+            // string containing "session" reaches the chrome, ever): a
+            // session-ranked automatic's datum is its TIMESTAMP, never the
+            // internal name. Writer-named rows are untouched — a manual name
+            // outranks the vocabulary in `session_named`.
+            let session = strip::session_named(&e.name, e.manual);
             // Word delta against the previous version, spelled with its
             // unit (the bare "+412 −0" read as a riddle).
             let (ins, del) = e.delta;
@@ -17726,12 +17743,18 @@ impl Editor {
                                             } else {
                                                 rgb(TEXT_COLOR)
                                             })
-                                            .when(e.manual, |d| {
+                                            // Bold marks a writer's deliberate
+                                            // name, never a stamped datum.
+                                            .when(e.manual && !session, |d| {
                                                 d.font_weight(FontWeight::BOLD)
                                             })
                                             // Autos have no name: label them so
                                             // the row never reads as a blank.
-                                            .child(if e.name.is_empty() {
+                                            // Session-ranked automatics show
+                                            // their timestamp as the datum.
+                                            .child(if session {
+                                                stamp.clone()
+                                            } else if e.name.is_empty() {
                                                 "Auto-save".to_owned()
                                             } else {
                                                 e.name.clone()
@@ -17748,7 +17771,12 @@ impl Editor {
                                 .gap(px(6.))
                                 .text_size(px(11.))
                                 .child(
-                                    div().text_color(rgb(MUTED_COLOR)).child(if delta.is_empty() {
+                                    // A session row's stamp IS the datum on
+                                    // the left; repeating the time here would
+                                    // print it twice. The delta still shows.
+                                    div().text_color(rgb(MUTED_COLOR)).child(if session {
+                                        delta
+                                    } else if delta.is_empty() {
                                         time
                                     } else {
                                         format!("{time} · {delta}")
