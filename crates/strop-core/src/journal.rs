@@ -294,9 +294,17 @@ impl Journal {
         self.open = true;
     }
 
-    /// Append a non-edit event (time clamped monotonic like runs).
+    /// Append a non-edit event. An event is a boundary in the record: the
+    /// open run seals (no run smears across it), and its moment sorts
+    /// STRICTLY after every run already written — a card raised in the same
+    /// millisecond as a keystroke was still raised after it, and replay must
+    /// not re-apply that keystroke to a range that already contains it.
+    /// Events may still share a millisecond with each other (Restore +
+    /// CardsRebased are one deliberate pair).
     pub fn record_event(&mut self, ev: JournalEvent) {
-        let clamped = self.clamp(ev.t());
+        let run_floor = self.runs.last().map_or(i64::MIN, |r| r.t1 + 1);
+        let clamped = self.clamp(ev.t()).max(run_floor);
+        self.settle();
         let ev = match ev {
             JournalEvent::Pass { mode, cards, .. } => JournalEvent::Pass {
                 t: clamped,
@@ -569,6 +577,33 @@ mod tests {
         j.settle();
         j.record(&ins(1, "b"), 1_050);
         assert_eq!(j.runs.len(), 2, "settled tail never re-opens");
+    }
+
+    #[test]
+    fn a_card_event_seals_the_burst_and_sorts_past_it() {
+        let mut j = Journal::default();
+        j.record(&ins(0, "hi"), 1_000);
+        j.record_event(JournalEvent::CardRaised {
+            t: 1_000, id: 7, card_kind: NoteKind::Note, range: 0..2,
+            body: "note".into(), title: String::new(), level: String::new(),
+            pass_id: 0, status: NoteStatus::Open, orphaned: false, unverified: false,
+        });
+        assert_eq!(j.events[0].t(), 1_001, "a same-ms raise still lands after the keystroke");
+        // The burst sealed: typing 100ms later (well inside RUN_SPLIT_MS)
+        // starts a new run on the event's far side.
+        j.record(&ins(2, "!"), 1_100);
+        assert_eq!(j.runs.len(), 2, "no run smears across an event");
+        assert!(j.runs[1].t0 >= j.events[0].t());
+    }
+
+    #[test]
+    fn restore_and_rebase_still_share_their_millisecond() {
+        let mut j = Journal::default();
+        j.record(&ins(0, "x"), 1_000);
+        j.record_event(JournalEvent::Restore { t: 2_000, from_unix: 2, len_chars: 1 });
+        j.record_event(JournalEvent::CardsRebased { t: 2_000, entries: Vec::new() });
+        assert_eq!((j.events[0].t(), j.events[1].t()), (2_000, 2_000),
+            "the restore pair is one deliberate moment");
     }
 
     #[test]

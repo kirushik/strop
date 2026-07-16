@@ -1696,6 +1696,10 @@ pub struct Editor {
     strip_thread_hits: std::rc::Rc<std::cell::RefCell<Vec<StripThreadHit>>>,
     strip_hover_thread: Option<u64>,
     past_card_focus: Option<(u64, Instant)>,
+    /// Rig witness: "Now" stamps the parked margin actually BUILT this
+    /// render — counted at the element, not recomputed from the model, so
+    /// deleting the stamp fails the gate while the skeleton flag survives.
+    past_stamps: std::cell::Cell<usize>,
     /// One-shot: reveal this PREVIEW byte once the parked layout exists.
     /// Computing a y against `last_frame` at click time reads the PREVIOUS
     /// moment's geometry — the reveal must wait for its own frame.
@@ -2338,6 +2342,7 @@ impl Editor {
             strip_thread_hits: std::rc::Rc::default(),
             strip_hover_thread: None,
             past_card_focus: None,
+            past_stamps: std::cell::Cell::new(0),
             strip_reveal_byte: None,
             strip_drag_moved: false,
             cold_read: None,
@@ -3390,10 +3395,14 @@ impl Editor {
                 len_chars,
             });
         journal.record_event(strop_core::journal::JournalEvent::CardsRebased { t, entries });
-        let _ = self.save_now();
+        // The anchor goes in BEFORE the save: one durable generation holds
+        // the restored text, both events, and the materialized post-restore
+        // checkpoint together — a crash between two saves must never leave
+        // the record with a restore it cannot replay past.
         if let Some(store) = &self.store {
             store.add_checkpoint("Restored", false);
         }
+        let _ = self.save_now();
         // F3, the strip epilogue (hoisted from `strip_restore` so EVERY
         // entrance — panel, strip, the book's Restore chip — leaves an open
         // strip unparked, snapped to now, and re-baked over the new data).
@@ -3408,6 +3417,7 @@ impl Editor {
             self.strip.scratch = None;
             self.strip.view_offset = f32::MAX; // back to the tail with the new data
             self.history_preview = None;
+            self.strip_reveal_byte = None;
             self.strip_bake(now);
             cx.notify();
         }
@@ -3491,8 +3501,10 @@ impl Editor {
         } else {
             self.strip.saved_scroll = None;
         }
-        // Drop any preview so the live document returns.
+        // Drop any preview so the live document returns; a reveal the
+        // preview never painted dies with it.
         self.history_preview = None;
+        self.strip_reveal_byte = None;
         *self.strip_rail.borrow_mut() = None;
         cx.notify();
     }
@@ -3649,11 +3661,7 @@ impl Editor {
             &self.strip_station_hits.borrow(), point(px(x), px(y)));
         if let Some(pos) = station_pos {
             if self.strip_has_past() {
-                if !self.strip.parked {
-                    self.strip.saved_sel = Some(self.selected_range.clone());
-                    let c = self.selected_range.end;
-                    self.selected_range = c..c;
-                }
+                self.strip_save_live_locus();
                 self.strip.parked = true;
                 self.strip.scrubbing = false;
                 self.strip.scrub_fabric = false;
@@ -3666,11 +3674,7 @@ impl Editor {
             .find(|hit| hit.bounds.contains(&point(px(x), px(y)))).cloned();
         if let Some(hit) = thread_hit {
             let Some(pos) = self.strip_pos_at_fabric_x(x) else { return };
-            if !self.strip.parked {
-                self.strip.saved_sel = Some(self.selected_range.clone());
-                let c = self.selected_range.end;
-                self.selected_range = c..c;
-            }
+            self.strip_save_live_locus();
             self.strip.parked = true;
             self.strip.scrubbing = false;
             self.strip.scrub_fabric = false;
@@ -3716,11 +3720,7 @@ impl Editor {
             .map(|hit| hit.at_ms);
         if let Some(pos) = date_pos {
             if self.strip_has_past() {
-                if !self.strip.parked {
-                    self.strip.saved_sel = Some(self.selected_range.clone());
-                    let c = self.selected_range.end;
-                    self.selected_range = c..c;
-                }
+                self.strip_save_live_locus();
                 self.strip.parked = true;
                 self.strip.scrubbing = false;
                 self.strip.scrub_fabric = false;
@@ -3752,14 +3752,7 @@ impl Editor {
             self.strip_toggle_pin(pos, cx);
             return;
         }
-        // A live-doc selection's offsets mean nothing against the preview
-        // text — save it for the return and collapse, rather than wash the
-        // wrong words (P6).
-        if !self.strip.parked {
-            self.strip.saved_sel = Some(self.selected_range.clone());
-            let c = self.selected_range.end;
-            self.selected_range = c..c;
-        }
+        self.strip_save_live_locus();
         self.strip.parked = true;
         self.strip.scrubbing = true;
         self.strip.scrub_fabric = fabric;
@@ -3873,6 +3866,23 @@ impl Editor {
         Some(bake.timeline.wall_at(work))
     }
 
+    /// The one live→parked seam: save the writer's live locus — the selection
+    /// (P6: its offsets mean nothing against preview text, so it collapses)
+    /// and the scroll — so EVERY departure hands the present back exactly as
+    /// she left it. A no-op while already parked: the locus of record is the
+    /// last live moment, not the last click; re-arming here is what lets a
+    /// second dwell in one open-strip session return home too (the first
+    /// departure consumed the values open_strip armed).
+    fn strip_save_live_locus(&mut self) {
+        if self.strip.parked {
+            return;
+        }
+        self.strip.saved_sel = Some(self.selected_range.clone());
+        let c = self.selected_range.end;
+        self.selected_range = c..c;
+        self.strip.saved_scroll = Some(f32::from(self.scroll_top));
+    }
+
     /// One scrub step: move the playhead and reconstruct the past (the mutable
     /// half of the stability law — the bake never moves; only these do).
     ///
@@ -3888,6 +3898,11 @@ impl Editor {
         // changed her mind mid-return, and a stale StayOpen must not answer
         // for (or swallow) the next close — the rig's park-during-beat race.
         self.strip_departure = None;
+        // Every scrub voids an unconsumed reveal — it was computed for the
+        // moment a CLICK parked, and must not land on whatever frame a later
+        // drag or keystroke happens to paint. The discrete paths that want a
+        // reveal re-arm it right after this call (§3a: one park, one reveal).
+        self.strip_reveal_byte = None;
         self.strip.pos_ms = pos_ms;
         self.strip_reconstruct(pos_ms);
         if lock {
@@ -3925,6 +3940,7 @@ impl Editor {
             bake.snap_ms.iter().find(|&&t| t > pos).copied()
         };
         if let Some(t) = next {
+            self.strip_save_live_locus();
             self.strip.parked = true;
             self.strip_scrub_to(t, true, cx);
         }
@@ -4099,6 +4115,10 @@ impl Editor {
         }
         self.restore_strip_scroll();
         self.history_preview = None;
+        // An unpainted reveal dies with the preview it aimed at — left alive,
+        // the next LIVE frame would consume the past byte and drag the just-
+        // restored scroll to wherever that moment's edit happened to be.
+        self.strip_reveal_byte = None;
         self.strip_departure = Some((continuation, Instant::now(), from_ms));
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -12000,6 +12020,15 @@ impl Editor {
                 "compare_b_max": f32::from(self.compare_scroll_b.max_offset().y),
                 "gutter_regions": self.compare_alignment.borrow().as_ref()
                     .map_or(0, |(_, _, marks)| marks.len()),
+                // Coverage witnesses: marks must single out paragraphs, not
+                // wash the column — the rig asserts marked_b < b_paras (a
+                // quiet middle survives the diff).
+                "gutter_marked_b": self.compare_alignment.borrow().as_ref()
+                    .map_or(0, |(_, _, marks)| marks.iter()
+                        .filter(|m| m.new_par.is_some()).count()),
+                "gutter_b_paras": self.history_preview.as_ref()
+                    .map(|p| p.text.split('\n').count()),
+                "past_stamps": self.past_stamps.get(),
                 "words_at": self.strip.words_at,
                 "bakes": self.strip.bakes,
                 // Axis width in working px — non-zero even for a LEGACY era
@@ -12017,6 +12046,13 @@ impl Editor {
             // preview frame answered for the live key. The rig asserts the
             // count round-trips across park → close.
             "frame_paras": self.last_frame.as_ref().map(|f| f.paragraphs.len()),
+            // Floor-law witnesses: at max scroll the clearance below the
+            // painted content is line_h (breathing) + 24 (the floor's own
+            // clearance); the rig asserts floor_gap - line_h >= 24, which
+            // dies with the `+ px(24.)` in TextFrame::max_scroll.
+            "floor_gap": self.last_frame.as_ref().map(|f|
+                f32::from(f.viewport_height - f.content_height + f.scroll_top)),
+            "line_h": self.last_frame.as_ref().map(|f| f32::from(f.line_height)),
             // Presentation gate: the margin lane + rail render only when no
             // history surface is previewing (review H36) and the reading
             // room is down — the model above is ungated, so the rig asserts
@@ -13145,14 +13181,9 @@ impl Editor {
             .as_ref()
             .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
         if let Some(pos) = pos {
-            // The same park entrance the click path takes: the live selection
-            // is saved+collapsed, so the rig exercises the real invariants
-            // (review: five-lens pass, interaction).
-            if !self.strip.parked {
-                self.strip.saved_sel = Some(self.selected_range.clone());
-                let c = self.selected_range.end;
-                self.selected_range = c..c;
-            }
+            // The same park entrance the click path takes, so the rig
+            // exercises the real invariants (review: five-lens pass).
+            self.strip_save_live_locus();
             self.strip.parked = true;
             self.strip.scrubbing = false;
             self.strip_scrub_to(pos, true, cx);
@@ -13176,10 +13207,7 @@ impl Editor {
         let pos = self.strip.bake.as_ref().and_then(|b| b.stations.iter()
             .find(|station| station.label == label).map(|station| station.at_ms));
         if let Some(pos) = pos {
-            if !self.strip.parked {
-                self.strip.saved_sel = Some(self.selected_range.clone());
-                self.selected_range = self.selected_range.end..self.selected_range.end;
-            }
+            self.strip_save_live_locus();
             self.strip.parked = true;
             self.strip_scrub_to(pos, true, cx);
         }
@@ -15224,7 +15252,12 @@ impl Element for EditorElement {
         // moment's own paragraphs exist, land the requested byte a third
         // down the viewport — computing this at click time read the previous
         // moment's geometry.
-        let reveal = self.editor.read(cx).strip_reveal_byte;
+        // Gated on the preview: a reveal is meaningless against the live
+        // page (every exit clears it; this keeps the worst case impossible).
+        let reveal = {
+            let editor = self.editor.read(cx);
+            editor.history_preview.is_some().then_some(editor.strip_reveal_byte).flatten()
+        };
         if let Some(byte) = reveal
             && let Some(par) = paragraphs.iter().find(|p| byte <= p.range.end)
         {
@@ -20569,6 +20602,7 @@ impl Editor {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        self.past_stamps.set(0);
         if !self.margin_fits(window) || !self.strip.is_parked() {
             return None;
         }
@@ -20649,10 +20683,13 @@ impl Editor {
                     }))
                 .font_family("PT Serif").text_size(px(13.))
                 .text_color(rgb(if card.unverified { MUTED_COLOR } else { TEXT_COLOR }))
-                .when(card.skeleton, |d| d.child(
-                    div().mb(px(3.)).font_family("PT Sans").text_size(px(10.))
-                        .text_color(rgb(MUTED_COLOR)).child("Now")
-                ))
+                .when(card.skeleton, |d| {
+                    self.past_stamps.set(self.past_stamps.get() + 1);
+                    d.child(
+                        div().mb(px(3.)).font_family("PT Sans").text_size(px(10.))
+                            .text_color(rgb(MUTED_COLOR)).child("Now")
+                    )
+                })
                 .when(machine && !card.title.is_empty(), |d| {
                     d.child(div().font_weight(FontWeight::BOLD).child(card.title.clone()))
                 })

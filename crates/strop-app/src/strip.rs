@@ -593,6 +593,11 @@ fn card_history_index(journal: &Journal) -> Option<CardHistoryIndex> {
             anchors: vec![CardAnchorSnapshot { at_ms: *t, range: Some(range.clone()) }],
         };
         enum CardStep<'a> { Run(&'a EditRun), Event(&'a JournalEvent) }
+        // `t0 >= t` is exact, not approximate: record_event seals the open
+        // run and clamps a card event strictly past every written run, so a
+        // run sharing the raise's millisecond was recorded after it and a
+        // pre-raise run can never straddle it. (Legacy files recorded before
+        // that law keep the events-before-runs tie-break below: best effort.)
         let mut steps: Vec<(i64, u8, CardStep<'_>)> = journal.runs.iter()
             .filter(|r| r.t0 >= *t)
             .map(|r| (r.t0, 1, CardStep::Run(r))).collect();
@@ -971,15 +976,22 @@ impl StripBake {
         }
 
         // --- Stations (checkpoints) + Restore/Export ticks -------------------
-        // Every checkpoint remains a replay/arrow anchor. Only writer names
-        // and the two sanctioned automatic labels reach the label lane.
+        // A tick means exactly one thing: a deliberate mark (§1b, §2) — a
+        // named version, a seal, an export, a restore. Session and reflex
+        // checkpoints stay replay anchors in the store, but bake NO station:
+        // no tick, no hit target, no arrow stop. The wells and the dates
+        // carry the sittings — a tick beside a well is duplicate grammar.
         let mut baked: Vec<Station> = Vec::new();
         for st in stations {
+            let rank = station_rank(&st.name, st.manual);
+            if rank >= RANK_SESSION {
+                continue;
+            }
             let label = station_display(&st.name, st.manual);
             baked.push(Station {
                 x: timeline.work_at(st.created_ms),
                 label,
-                rank: station_rank(&st.name, st.manual),
+                rank,
                 restore: st.name == "Restored",
                 arc_to: None,
                 row: 0,
@@ -1042,10 +1054,12 @@ impl StripBake {
             v
         };
 
-        // Step destinations: stations, the shoulders of every ≥150-word run
-        // (a big cut's corners), the two ends.
+        // Step destinations: baked stations (deliberate marks only — an
+        // invisible session seal must not attract an arrow or a detent),
+        // the shoulders of every ≥150-word run (a big cut's corners), the
+        // two ends.
         let snap_ms: Vec<i64> = {
-            let mut v: Vec<i64> = stations.iter().map(|s| s.created_ms).collect();
+            let mut v: Vec<i64> = baked.iter().map(|s| s.at_ms).collect();
             for run in &journal.runs {
                 if run.delta_chars().unsigned_abs() >= 800 {
                     v.push(run.t0);
@@ -1672,6 +1686,25 @@ mod tests {
         assert!(card_history_index(&Journal::default()).is_none());
     }
 
+    #[test]
+    fn a_same_millisecond_keystroke_is_never_reapplied_to_a_fresh_card() {
+        let mut j = Journal::default();
+        // Five chars land at the head; the card is raised in the SAME
+        // millisecond, its recorded range already in post-edit coordinates —
+        // the recording law (record_event) orders the raise strictly past
+        // the keystroke, so replay must leave the anchor alone.
+        j.record(&ins(0, "abcde"), 100);
+        j.record_event(raised(100, 7, 10..14, "fresh"));
+        let index = card_history_index(&j).unwrap();
+        assert_eq!(index.cards[0].anchors.len(), 1,
+            "the pre-raise run must not transform the anchor it already shaped");
+        assert_eq!(index.cards[0].anchors[0].range, Some(10..14));
+        // A keystroke AFTER the raise still walks it forward.
+        j.record(&ins(0, "xy"), index.cards[0].raised_ms);
+        let index = card_history_index(&j).unwrap();
+        assert_eq!(index.cards[0].anchors.last().unwrap().range, Some(12..16));
+    }
+
     fn run(t: i64, pos: usize, del: usize, insert: &str) -> EditRun {
         EditRun { t0: t, t1: t + 1, pos, del_chars: del,
             del_words: Some(0), ins: insert.into() }
@@ -2071,7 +2104,10 @@ mod tests {
     }
 
     #[test]
-    fn session_marks_die_but_sitting_shoulders_remain_steps() {
+    fn session_marks_die_entirely_the_dates_carry_the_sittings() {
+        // §1b, §2: a session checkpoint lays NO tick, NO hit target, NO
+        // arrow stop — not an unlabeled one. The date lane alone carries
+        // the sittings.
         let day = 86_400_000i64;
         let base = 1_700_000_000_000i64;
         let stations = vec![
@@ -2081,15 +2117,12 @@ mod tests {
         ];
         let j = Journal::default();
         let bake = StripBake::build(&j, &stations, &[], 0, base + 3 * day);
-        assert_eq!(bake.stations.len(), 3, "automatic stations remain exact ticks");
-        assert!(bake.stations.iter().all(|st| st.label.is_empty()));
+        assert!(bake.stations.is_empty(), "session checkpoints bake no station at all");
         assert!(
-            stations.iter().all(|st| bake.snap_ms.contains(&st.created_ms)),
-            "invisible sitting boundaries remain arrow steps"
+            !bake.snap_ms.contains(&(base + day)) && !bake.snap_ms.contains(&(base + 2 * day)),
+            "an invisible seal must not attract an arrow or a detent"
         );
-        assert!(
-            bake.stations.iter().all(|st| !st.label.to_lowercase().contains("session"))
-        );
+        assert!(!bake.dates.is_empty(), "the sittings stay reachable through the date lane");
     }
 
     #[test]
@@ -2100,10 +2133,7 @@ mod tests {
             automatic_station(base + 20_000, "Session", 20, 120),
         ];
         let bake = StripBake::build(&Journal::default(), &stations, &[], 0, base + 30_000);
-        assert!(bake.stations.iter().any(|st| st.at_ms == base + 20_000));
-        assert!(
-            bake.stations.iter().all(|st| !st.label.to_lowercase().contains("session"))
-        );
+        assert!(bake.stations.is_empty(), "Started and Session are not deliberate marks");
     }
 
     #[test]
@@ -2202,8 +2232,8 @@ mod tests {
         let now = 1_700_000_000_000;
         let birth = vec![automatic_station(now, "Session start", 0, 0)];
         let bake = StripBake::build(&Journal::default(), &birth, &[], 0, now);
-        assert_eq!(bake.stations.len(), 1, "the replay anchor remains");
-        assert!(bake.stations[0].label.is_empty());
+        assert!(bake.stations.is_empty(), "a birth seal is not a deliberate mark");
+        assert_eq!(bake.anchor_ms, vec![now], "the replay anchor remains");
     }
 
     #[test]
@@ -2262,7 +2292,10 @@ mod tests {
         ];
         let bake = StripBake::build(&Journal::default(), &stations, &[], 0, base + 10);
         let labels: Vec<_> = bake.stations.iter().map(|st| st.label.as_str()).collect();
-        assert_eq!(labels, ["", "", "", "Restored", "Exported", "Started", ""]);
+        // The three session-ranked automatics (and the manual legacy
+        // "Fresh tutorial" carve-out) bake no station at all now — only
+        // deliberate marks survive, each carrying its label.
+        assert_eq!(labels, ["Restored", "Exported", "Started"]);
     }
 
     #[test]

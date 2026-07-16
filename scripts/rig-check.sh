@@ -285,8 +285,9 @@ echo "rig-check: card-history threads bend, project, and mark legacy uncertainty
 DOCS2=$(mktemp --suffix=.md); cp "$DOC" "$DOCS2"
 # Six equal ~100-minute sittings put the fifth sitting around 4/6..5/6 of
 # working time; 0.75 is after Card B's +5m raise and before Card A's end close.
-OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCS2" "seed:cards strip:open dump:ui strip:scrub:0.75 dump:ui strip:now dump:ui strip:scrub:0.6 ctrl-alt-h dump:ui" 2>/dev/null | grep 'UI-DUMP')
-D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCS2" "seed:cards strip:open dump:ui strip:scrub:0.75 dump:ui scroll:0.4 dump:ui strip:scrub:0.9 dump:ui strip:now dump:ui strip:scrub:0.6 ctrl-alt-h dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D2S=$(echo "$OUT" | sed -n 3p)
+D2K=$(echo "$OUT" | sed -n 4p); D3=$(echo "$OUT" | sed -n 5p); D4=$(echo "$OUT" | sed -n 6p)
 S1=$(echo "$D1" | grep -oE '"strip":\{[^}]*\}'); S2=$(echo "$D2" | grep -oE '"strip":\{[^}]*\}'); S3=$(echo "$D3" | grep -oE '"strip":\{[^}]*\}')
 [ -n "$S1" ] || { echo "  FAIL no card-history strip dump"; exit 1; }
 # The stale-preview regression (2026-07-16 field report): what is ON GLASS
@@ -303,6 +304,19 @@ expect "close repaints the present on glass" "$FP1" "$FP4"
 PC=$(field "$S2" past_cards)
 if [ "${PC:-0}" -ge 2 ] 2>/dev/null; then echo "  ok   parked margin projects both live cards ($PC)"; else
   echo "  FAIL past_cards=$PC (expected at least 2)"; fail=1; fi
+# Placement, not just projection: the first anchored card stands at a real
+# frame y, and RIDES the preview's scroll (a fixed-stack approximation
+# would hold its y while the prose moved under it).
+PCY=$(field "$D2" past_card_y); PCYS=$(field "$D2S" past_card_y)
+if [ -n "$PCY" ] && [ "$PCY" != "null" ]; then echo "  ok   past card stands at a frame anchor (y=$PCY)"; else
+  echo "  FAIL past_card_y=$PCY (no anchored placement)"; fail=1; fi
+if [ "$PCYS" != "$PCY" ]; then echo "  ok   past card rides the preview scroll ($PCY -> $PCYS)"; else
+  echo "  FAIL past card ignored the scroll (y=$PCY)"; fail=1; fi
+expect "scrolling the preview does not re-bake" 1 "$(field "$D2S" bakes)"
+# The legacy card's skeleton is STAMPED at the element (render witness):
+# deleting the stamp keeps the model's skeleton flag but zeroes this. The
+# skeleton exists only past its diamond (0.9 is beyond it; 0.75 is not).
+expect "the legacy skeleton wears its Now stamp" 1 "$(field "$D2K" past_stamps)"
 expect "the legacy suffix starts at one diamond" 1 "$(field "$S2" diamonds)"
 TH=$(field "$S2" threads)
 if [ "${TH:-0}" -ge 3 ] 2>/dev/null; then echo "  ok   all card threads are baked ($TH)"; else
@@ -346,12 +360,24 @@ if echo "$NS1" | grep -qE '2 wk|3 wk|mo'; then echo "  ok   a wide well carries 
 if echo "$NS1" | grep -q '17 h'; then echo "  FAIL overnight well was labelled"; fail=1; else
   echo "  ok   the overnight well stays mute"; fi
 expect "max scroll reaches the strip-open floor" "$(field "$NS2" max_scroll)" "$(field "$NS2" live_scroll)"
+# The floor's own 24px: at max scroll the gap under the painted content is
+# breathing (one line) + clearance; this dies with `+ px(24.)` in max_scroll.
+FG=$(field "$N2" floor_gap); LH=$(field "$N2" line_h)
+if awk -v g="$FG" -v l="$LH" 'BEGIN{exit !(g - l >= 23.5)}' 2>/dev/null; then
+  echo "  ok   the floor keeps its 24px clearance (gap=$FG line=$LH)"; else
+  echo "  FAIL floor clearance short (gap=$FG line=$LH)"; fail=1; fi
 if [ "$(field "$NS3" compare_a_max)" != "0.0" ] && [ "$(field "$NS3" compare_b_max)" != "0.0" ]; then
   echo "  ok   both compare columns have reading extents"; else echo "  FAIL compare extent collapsed"; fail=1; fi
 if [ "$(field "$NS4" compare_a_offset)" != "$(field "$NS4" compare_b_offset)" ]; then
   echo "  ok   compare sides scroll independently"; else echo "  FAIL compare offsets did not diverge"; fail=1; fi
 if [ "$(field "$NS4" gutter_regions)" -ge 4 ] 2>/dev/null; then echo "  ok   change gutter has regions"; else
   echo "  FAIL gutter regions=$(field "$NS4" gutter_regions)"; fail=1; fi
+# Marks single paragraphs out; a wash (the retired prefix/suffix single
+# region class) would mark the whole column and leave no quiet middle.
+GM=$(field "$NS4" gutter_marked_b); GT=$(field "$NS4" gutter_b_paras)
+if [ "${GM:-0}" -ge 1 ] && [ "${GM:-0}" -lt "${GT:-0}" ] 2>/dev/null; then
+  echo "  ok   the gutter leaves a quiet middle ($GM of $GT B paragraphs marked)"; else
+  echo "  FAIL gutter coverage wrong (marked=$GM of $GT)"; fail=1; fi
 expect "station target parks at its exact timestamp" "$(field "$NS5" blue_oar_ms)" "$(field "$NS5" pos_ms)"
 if [ "$(field "$NS6" pos_ms)" != "$(field "$NS5" pos_ms)" ]; then echo "  ok   fabric remains continuous between stations"; else
   echo "  FAIL fabric scrub snapped to station"; fail=1; fi
@@ -360,7 +386,11 @@ if [ "$(field "$NS7" focused_past_card)" != "null" ]; then echo "  ok   thread c
 for S in "$NS2" "$NS3" "$NS4" "$NS5" "$NS6" "$NS7"; do
   expect "novel interaction does not rebake" 1 "$(field "$S" bakes)"
 done
-expect "exit restores the captured scroll exactly" "$(field "$NS1" saved_scroll)" "$(field "$N8" scroll_y)"
+# The exit restores the scroll of the LAST LIVE MOMENT, not of the open:
+# the scenario scrolled the live doc (scroll:1) with the strip open before
+# parking, so THAT scroll — NS2's — is where the return must land. (Before
+# the re-arm fix, only the first park in a session had a scroll to restore.)
+expect "exit restores the last live scroll exactly" "$(field "$NS2" live_scroll)" "$(field "$N8" scroll_y)"
 expect "novel frame returns to live paragraphs" "$(field "$N1" frame_paras)" "$(field "$N8" frame_paras)"
 rm -f "$DOCN" "$DOCN.strop"
 
@@ -374,9 +404,11 @@ OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCL1" "seed:legacy strip:open dump:ui stri
 D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
 S1=$(echo "$D1" | grep -oE '"strip":\{[^}]*\}'); S2=$(echo "$D2" | grep -oE '"strip":\{[^}]*\}'); S3=$(echo "$D3" | grep -oE '"strip":\{[^}]*\}')
 [ -n "$S1" ] || { echo "  FAIL no strip dump (legacy)"; exit 1; }
+# Five of the six checkpoints are deliberate marks; the automatic
+# "Started" lays no tick under §1b/§2 (session marks die entirely).
 ST=$(field "$S1" stations)
-if [ "${ST:-0}" -ge 6 ] 2>/dev/null; then echo "  ok   the checkpoint era has stations ($ST)"; else
-  echo "  FAIL stations=$ST (checkpoints not on the axis?)"; fail=1; fi
+if [ "${ST:-0}" -eq 5 ] 2>/dev/null; then echo "  ok   the deliberate marks have stations ($ST of 6 checkpoints)"; else
+  echo "  FAIL stations=$ST (want 5: the automatic Started lays no tick)"; fail=1; fi
 WK=$(field "$S1" work); WKI=${WK%.*}
 if [ "${WKI:-0}" -gt 0 ] 2>/dev/null; then echo "  ok   the axis is non-degenerate (work=$WK)"; else
   echo "  FAIL work=$WK (axis collapsed to zero?)"; fail=1; fi

@@ -679,9 +679,14 @@ Restore now passes through one visible **return to now**:
 
 1. any open composer resolves or cancels;
 2. the pin drops, the live document returns to the glass;
-3. the caret, selection, AND scroll captured at open are restored —
-   the eye lands where the writer left, which no past frame can
-   imitate;
+3. the caret, selection, AND scroll captured at the LAST live→parked
+   crossing are restored — the eye lands where the writer left the
+   present, which no past frame can imitate. Captured at the
+   crossing, not at open: an open strip is not a mode, and a writer
+   who scrolls or selects in the live document between two dwells
+   has moved home — the second exit must honor the move (the
+   first cut of this law armed the capture once at open, and every
+   dwell after the first returned to nothing);
 4. the playhead travels to the selvage and the banner falls;
 5. the frame holds one short beat (~180 ms) — a real present frame,
    not an animation for its own sake (under `reduce_motion`, a
@@ -813,6 +818,14 @@ truthful about grain.)*
 - **`EditRun` gains `del_words`** — counted at record time, while the
   deleted text is still in hand (the text itself stays unstored; the
   count is cheap and makes the quant true — §1b).
+- **An event is a boundary** (review round, 2026-07-16): recording
+  any journal event seals the open run and lands strictly after every
+  run already written — a card raised in the same millisecond as a
+  keystroke was still raised *after* it, and no run may smear across
+  an event (a raise mid-burst would otherwise lose the burst's
+  post-raise keystrokes from the anchor's replay). Events may share a
+  millisecond with each other (Restore + CardsRebased are one pair);
+  files recorded before this law replay ties as best effort.
 - Checkpoints store a **cursor** into this stream, never copies of it.
 - **The past margin is a pure projection**: (frozen card index, t) →
   cards. Built once at strip open; scrubbing binary-searches it and
