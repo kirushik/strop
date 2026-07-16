@@ -38,13 +38,24 @@ Report every command actually run with its real exit status.
 "not_run" and "failed" are legitimate outcomes; never report an
 unrun or interrupted test as passed.
 
-Known environment quirk: the `single_instance` tests bind unix
-sockets and fail with ReadOnlyFilesystem under the default sandbox
-runtime dir. Run the workspace suite as
-`mkdir -p /tmp/strop-runtime && XDG_RUNTIME_DIR=/tmp/strop-runtime
-cargo test --workspace` (pinned toolchain as above). Those three
-tests failing under the default runtime dir is environmental, not
-a regression — but say so explicitly rather than reporting green.
+Test isolation (HARD RULE — protects the operator's desktop): every
+test or app invocation outside `scripts/wrun.sh` runs with the
+display env scrubbed and a PRIVATE runtime dir:
+
+```
+mkdir -p /tmp/strop-runtime
+env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR=/tmp/strop-runtime \
+  $TC/cargo test --workspace   # (RUSTC/PATH as above)
+```
+
+Why both halves: rendezvous sockets are keyed by document path in
+the REAL runtime dir — a test that touches a fixed path (Welcome)
+can surface the operator's live window; an inherited
+WAYLAND_DISPLAY lets a test-spawned binary open real windows on
+the operator's screen, which also lets stray keystrokes corrupt
+the run. The private dir additionally fixes the `single_instance`
+ReadOnlyFilesystem failures under sandboxes. Anything that truly
+needs a compositor goes through wrun.sh, which brings its own.
 
 ## Scope
 
