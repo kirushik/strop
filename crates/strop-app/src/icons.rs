@@ -30,6 +30,7 @@ static ICONS: &[(&str, &[u8])] = &[
     ("icons/link.svg", include_bytes!("../../../assets/icons/link.svg")),
     ("icons/menu.svg", include_bytes!("../../../assets/icons/menu.svg")),
     ("icons/note.svg", include_bytes!("../../../assets/icons/note.svg")),
+    ("icons/squiggle.svg", include_bytes!("../../../assets/icons/squiggle.svg")),
     ("icons/win-close.svg", include_bytes!("../../../assets/icons/win-close.svg")),
     ("icons/win-maximize.svg", include_bytes!("../../../assets/icons/win-maximize.svg")),
     ("icons/win-minimize.svg", include_bytes!("../../../assets/icons/win-minimize.svg")),
@@ -45,6 +46,7 @@ pub const HISTORY: &str = "icons/history.svg";
 pub const LINK: &str = "icons/link.svg";
 pub const MENU: &str = "icons/menu.svg";
 pub const NOTE: &str = "icons/note.svg";
+pub const SQUIGGLE: &str = "icons/squiggle.svg";
 pub const WIN_CLOSE: &str = "icons/win-close.svg";
 pub const WIN_MAXIMIZE: &str = "icons/win-maximize.svg";
 pub const WIN_MINIMIZE: &str = "icons/win-minimize.svg";

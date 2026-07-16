@@ -17524,43 +17524,6 @@ impl Editor {
                     )
                     .into_any_element(),
             })
-            // Navigation by name and navigation by time share the omnibar
-            // neighborhood. The clock sits on the field's right flank, away
-            // from the book/window-control cluster.
-            .child(
-                div()
-                    .id("history-toggle")
-                    .occlude()
-                    .flex_shrink_0()
-                    .size(px(28.))
-                    .ml(px(8.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.))
-                    .map(|d| {
-                        if in_cold {
-                            d.opacity(0.55).tooltip(tip("History", None))
-                        } else {
-                            d.cursor(CursorStyle::PointingHand)
-                                .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
-                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                                .tooltip(tip("History", Some("ctrl-alt-h")))
-                        }
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            editor.toggle_strip(&ToggleStrip, window, cx);
-                        }),
-                    )
-                    .child(icon(
-                        icons::HISTORY,
-                        13.,
-                        if self.strip.open && !in_cold { TEXT_COLOR } else { MUTED_COLOR },
-                    )),
-            )
             // Right third — mirrors the left (equal claims keep the centre
             // still): history, the editor button, then the OS verbs behind
             // a drag-surface moat (no app verb adjacent to window controls).
@@ -17572,6 +17535,46 @@ impl Editor {
                     .flex()
                     .items_center()
                     .justify_end()
+                // History keeps its Docs/Time-Machine top-right residency —
+                // an icon on the omnibar's flank read as the field's Submit
+                // button (product-owner catch). The wide elastic Ask button
+                // is the moat between the two icon twins: a stray click on
+                // history's neighbour opens a menu (Esc, free), never enters
+                // the reading room or the OS verbs.
+                .child(
+                    div()
+                        .id("history-toggle")
+                        .occlude()
+                        .flex_shrink_0()
+                        .size(px(28.))
+                        .mr(px(8.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .map(|d| {
+                            if in_cold {
+                                d.opacity(0.55).tooltip(tip("History", None))
+                            } else {
+                                d.cursor(CursorStyle::PointingHand)
+                                    .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
+                                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                    .tooltip(tip("History", Some("ctrl-alt-h")))
+                            }
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.toggle_strip(&ToggleStrip, window, cx);
+                            }),
+                        )
+                        .child(icon(
+                            icons::HISTORY,
+                            13.,
+                            if self.strip.open && !in_cold { TEXT_COLOR } else { MUTED_COLOR },
+                        )),
+                )
                 // The editor button (impl 04 §0): the AI subsystem's single home,
                 // where its results live — just left of the margin side. The old
                 // drawn mini-card is gone; the control now WEARS its state (a
@@ -21433,7 +21436,6 @@ impl Editor {
         }
         let (n, drained) = self.door_chip_count()?;
         let ready = self.deferred_pass.is_some();
-        let label = format!("⌇ {n}");
         let styled = |d: gpui::Div| {
             d.absolute()
                 .top(px(top))
@@ -21443,6 +21445,7 @@ impl Editor {
                 .flex()
                 .items_center()
                 .justify_center()
+                .gap(px(4.))
                 .rounded_full()
                 .border_1()
                 // A waiting read is the machine's state — the ready ring is
@@ -21453,7 +21456,11 @@ impl Editor {
                 .text_size(px(10.5))
                 .text_color(rgb(MUTED_COLOR))
                 .when(drained, |d| d.opacity(0.55))
-                .child(label.clone())
+                // The anchor's own mark, drawn — the same horizontal
+                // squiggle the prose wears (one mark family, every place
+                // the editor's notes are counted).
+                .child(icon(icons::SQUIGGLE, 13., MUTED_COLOR))
+                .child(format!("{n}"))
         };
         let chip = styled(div())
                 .id("margin-door-chip")
@@ -21943,7 +21950,11 @@ impl Editor {
                             cx.notify();
                         }),
                     )
-                    .child(format!("⌇ {n}")),
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(icon(icons::SQUIGGLE, 12., MUTED_COLOR))
+                    .child(format!("{n}")),
             );
         } else {
             for card in &cards {
@@ -22125,8 +22136,6 @@ impl Editor {
 
     fn render_space_rail(
         &self,
-        col_x: f32,
-        col_w: f32,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
@@ -22177,26 +22186,21 @@ impl Editor {
         let mark_hits_down = mark_hits.clone();
         let mark_ys_down: Vec<f32> = mark_hits_down.iter().map(|(y, _)| *y).collect();
         let mark_ys: Vec<f32> = mark_hits.iter().map(|(y, _)| *y).collect();
-        // The rail is the frame's outermost furniture: right of the margin
-        // lane, never between the prose and its cards (impl/15 §1 — a strip
-        // of chrome inside the lane would cut the card-to-span tie). Narrow
-        // windows without a lane keep it at the column edge.
+        // The window IS the page (the round's ontology: since the left
+        // drawer died, the whole window is the writer's sheet — the column
+        // is a typewriter's line on it, the cards are notes stuck beside
+        // it). The rail therefore lives at the TRUE window edge, where
+        // every scrollbar the corridor knows lives — never mid-desk, where
+        // it would partition the sheet into page-and-not-page
+        // (product-owner adjudication over the frame-edge draft; Word's
+        // bar is at the window, not the page).
         let vw = f32::from(window.viewport_size().width);
-        let lane = if self.margin_fits(window) { NOTE_LANE_TOTAL } else { 0. };
-        let rail_left = (col_x + col_w + lane - SPACE_RAIL_W).min(vw - SPACE_RAIL_W);
+        let rail_left = vw - SPACE_RAIL_W;
         let dragging = self.space_drag_offset.is_some();
         // A held drag follows the hand anywhere (P7): the hit surface grows
-        // to the whole viewport for the drag's lifetime. Maximized windows
-        // have no resize gutter, so the resting hit region bleeds to the
-        // true screen edge and throw-right lands (Fitts, recovered where
-        // it is free).
-        let (hit_left, hit_w) = if dragging {
-            (0., vw)
-        } else if window.is_maximized() {
-            (rail_left, vw - rail_left)
-        } else {
-            (rail_left, SPACE_RAIL_W)
-        };
+        // to the whole viewport for the drag's lifetime. At rest the column
+        // already touches the screen edge — throw-right lands by geometry.
+        let (hit_left, hit_w) = if dragging { (0., vw) } else { (rail_left, SPACE_RAIL_W) };
         let bright = self.space_hover || dragging;
         let rail = div().id("space-rail").absolute().left(px(hit_left)).top(px(BAR_HEIGHT))
             .w(px(hit_w)).h(px(track_h)).cursor(CursorStyle::PointingHand)
@@ -22706,7 +22710,7 @@ impl Render for Editor {
             })
             // The standing space rail owns its reserved column and paints
             // after the opaque footnote zone and margin furniture.
-            .map(|d| match self.render_space_rail(col_x, col_w, window, cx) {
+            .map(|d| match self.render_space_rail(window, cx) {
                 Some(rail) => d.child(rail),
                 None => d,
             })

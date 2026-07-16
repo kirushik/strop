@@ -19,13 +19,18 @@ the text.)
 
 ## 1. Geometry (exact)
 
-- Reserved **14px column at the content's right edge** (content
-  space, inside the CSD inset — never the shadow gutter).
-  `NOTE_LANE_TOTAL` grows by 8 (= gap + margin + 16): **nothing
-  renders in the rail's column but the rail** — no card, pill, or
-  popover, ever. The rail is topmost window furniture. (Today's 8px
-  moat would have the lane eat the rail at every narrow window — the
-  strip's v1 occlusion bug re-shipped.)
+- **The rail lives at the TRUE window edge** (product-owner
+  adjudication 2026-07-17, superseding this spec's frame-edge
+  draft): since the left drawer died, the whole window IS the
+  writer's sheet — the column is a typewriter's line on it, the
+  cards are notes stuck beside it — and a rail standing mid-desk
+  would partition the sheet into page-and-not-page. Every scrollbar
+  the corridor knows lives at the window edge (Word's bar is at the
+  window, not the page), and maximized-Fitts comes free.
+  **Nothing renders in the rail's 14px edge column but the rail** —
+  no card, pill, or popover, ever (`NOTE_LANE_TOTAL` keeps its +8
+  breathing so the lane never reaches it). The rail is topmost
+  window furniture.
 - **Thumb:** 6px wide, 3px radius, centered (4px off the content
   edge), **min-height 32px** (below the clamp the thumb is a handle,
   not a measure — a real, named distortion every ancestor ships;

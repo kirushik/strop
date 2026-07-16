@@ -164,17 +164,17 @@ word; tooltips carry sanctioned verbs only.
 
 ## 7. Titlebar
 
-**History moves left, to the omnibar's right flank** (2-of-3 panel;
-Norman's argument decides: the misclick is a description-similarity
-slip — "small muted glyph in the top-right cluster" — and only
-changing the *neighborhood* changes the description; also
-navigation-by-name beside navigation-by-time is a natural mapping).
-Birman's counterarguments are answered in the layout: the palette
-menu-glyph (≡) and the history clock are dissimilar forms (the
-titlebar twins were two *pictorial* siblings), and every icon target
-grows to **≥24×24px hit area (28 preferred), ≥8px between targets**
-(WCAG 2.5.8; today's 25×17/2px fails it) — glyphs stay 13px; the
-hitbox grows, not the ink. The book keeps the Ask button as its left
+**History stays top-right, in Birman's order — [↺ history]
+[Ask the editor] [book] [moat] [window verbs]** (REVERSED
+2026-07-17: Norman's omnibar-flank placement shipped and the
+product owner read it instantly as the field's Submit/search
+button — an icon on a text field's right flank IS the field's
+action button in every form the corridor knows. Birman's original
+layout wins: the wide elastic Ask button is the moat between the
+two icon twins, a stray click opens an Esc-free menu, and history
+keeps its Docs/Time-Machine residency). Every icon target stays at
+**≥24×24px hit area (28 preferred), ≥8px between targets** (WCAG
+2.5.8) — glyphs 13px; the hitbox grows, not the ink. The book keeps the Ask button as its left
 moat and the drag moat right (moat law upheld). Both view toggles
 wear visible latch faces (P12), and the two view states are mutually
 exclusive: entering one visibly unlatches the other (screenshot test
