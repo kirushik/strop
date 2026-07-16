@@ -2137,6 +2137,24 @@ fn seed_prose(words: usize) -> String {
     out
 }
 
+fn novel_prose() -> String {
+    let mut paragraphs = Vec::new();
+    paragraphs.push("At first light Mara found the blue oar standing upright in the mud, though the tide had gone out before dawn and no boat had crossed the inlet.".to_owned());
+    for i in 1..43 {
+        let body = if i % 7 == 0 {
+            format!("Bell {i}. The sound stopped short.")
+        } else if i % 3 == 0 {
+            format!("Along reach {i}, the ferry nosed through rain while Mara counted the lamps on the far bank, losing one whenever the reeds bent across her view.")
+        } else {
+            format!("Reach {i} kept its own weather. The passengers spoke quietly of ropes, salt, and the road beyond the landing, while the old engine worried at the current without gaining ground.")
+        };
+        paragraphs.push(body);
+    }
+    paragraphs.insert(22, "At the manuscript's middle, the brass compass began pointing inland.".to_owned());
+    paragraphs.push("FINAL LANTERN: when the last passenger stepped ashore, Mara left the blue oar across the empty bench and watched the ferry answer the turning tide alone.".to_owned());
+    paragraphs.join("\n\n")
+}
+
 impl Editor {
     fn past_cards_at(&self, at_ms: i64) -> Vec<PastMarginCard> {
         let Some(bake) = self.strip.bake.as_ref() else { return Vec::new() };
@@ -11750,6 +11768,33 @@ impl Editor {
                     .map(Vec::len).sum::<usize>(),
                 "diamonds": b.threads.iter().filter(|thread| thread.uncertain_start).count(),
                 "past_cards": if self.strip.parked { self.strip.past_margin().len() } else { 0 },
+                "station_hits": self.strip_station_hits.borrow().len(),
+                "blue_oar_ms": b.stations.iter().find(|s| s.label == "Blue oar")
+                    .map(|s| s.at_ms),
+                "labels": b.stations.iter().filter(|s| s.show)
+                    .map(|s| s.label.clone()).collect::<Vec<_>>(),
+                "well_durations": b.well_data.iter()
+                    .map(|w| w.label.clone()).collect::<Vec<_>>(),
+                "saved_scroll": self.strip.saved_scroll,
+                "live_scroll": f32::from(self.scroll_top),
+                "max_scroll": self.last_frame.as_ref().map(|f| f32::from(f.max_scroll())),
+                "focused_past_card": self.past_card_focus.map(|(id, _)| id),
+                "past_card_y": self.strip.parked.then(|| {
+                    let frame = self.last_frame.as_ref()?;
+                    let preview = self.history_preview.as_ref()?;
+                    let card = self.past_cards_at(self.strip.pos_ms).into_iter()
+                        .find(|c| c.anchor.is_some())?;
+                    let rope = ropey::Rope::from_str(&preview.text);
+                    let byte = rope.char_to_byte(card.anchor?.start.min(rope.len_chars()));
+                    frame.position_of(byte, false)
+                        .map(|p| f32::from(p.y - frame.scroll_top))
+                }).flatten(),
+                "compare_a_offset": -f32::from(self.compare_scroll_a.offset().y),
+                "compare_b_offset": -f32::from(self.compare_scroll_b.offset().y),
+                "compare_a_max": f32::from(self.compare_scroll_a.max_offset().y),
+                "compare_b_max": f32::from(self.compare_scroll_b.max_offset().y),
+                "gutter_regions": self.compare_alignment.borrow().as_ref()
+                    .map_or(0, |(_, _, marks)| marks.len()),
                 "words_at": self.strip.words_at,
                 "bakes": self.strip.bakes,
                 // Axis width in working px — non-zero even for a LEGACY era
@@ -12553,6 +12598,121 @@ impl Editor {
         cx.notify();
     }
 
+    /// Rig hook (`seed:novel`): the round-two fixture law in one deterministic
+    /// long record. All timestamps are offsets from one captured `now`.
+    pub fn debug_seed_novel(&mut self, cx: &mut Context<Self>) {
+        use strop_core::document::{Annotation, NoteKind, NoteStatus};
+        use strop_core::journal::{EditRun, Journal, JournalEvent};
+        use strop_core::store::CheckpointState;
+
+        let now = strop_core::journal::now_ms();
+        let day = 86_400_000i64;
+        let hour = 3_600_000i64;
+        let start = now - 57 * day;
+        let final_text = novel_prose();
+        let mut runs = Vec::new();
+        // Single-occurrence swaps: the replay's day-43/44 edits restore ONE
+        // site each, so base-vs-final differs at exactly the intended five
+        // places (a global swap made every repeating paragraph a diff region
+        // — 91 gutter marks where the law wants a countable few).
+        let base = final_text.replacen("blue oar", "red sail", 1)
+            .replacen("brass compass", "tin compass", 1)
+            .replace("\n\nFINAL LANTERN:", "\n\nA paragraph later removed from the distant shore.\n\nFINAL LANTERN:")
+            .replace(" and watched the ferry answer the turning tide alone.", "");
+        runs.push(EditRun { t0: start, t1: start + 8 * 60_000, pos: 0,
+            del_chars: 0, del_words: None, ins: base.clone() });
+        let replace_at = base.find("red sail").unwrap();
+        runs.push(EditRun { t0: start + 43 * day, t1: start + 43 * day + 20_000,
+            pos: base[..replace_at].chars().count(), del_chars: 8, del_words: None,
+            ins: "blue oar".into() });
+        let after_replace = base.replacen("red sail", "blue oar", 1);
+        let compass_at = after_replace.find("tin compass").unwrap();
+        runs.push(EditRun { t0: start + 44 * day, t1: start + 44 * day + 20_000,
+            pos: after_replace[..compass_at].chars().count(), del_chars: 11,
+            del_words: None, ins: "brass compass".into() });
+        let after_compass = after_replace.replacen("tin compass", "brass compass", 1);
+        let rework_pos = after_compass.chars().count() / 3;
+        let rework_char = after_compass.chars().nth(rework_pos).unwrap().to_string();
+        runs.push(EditRun { t0: start + 45 * day, t1: start + 45 * day + 20_000,
+            pos: rework_pos, del_chars: 1, del_words: None, ins: rework_char });
+        let deleted = "A paragraph later removed from the distant shore.\n\n";
+        let delete_at = after_compass.find(deleted).unwrap();
+        runs.push(EditRun { t0: start + 50 * day, t1: start + 50 * day + 20_000,
+            pos: after_compass[..delete_at].chars().count(),
+            del_chars: deleted.chars().count(), del_words: None, ins: String::new() });
+        let append = " and watched the ferry answer the turning tide alone.";
+        runs.push(EditRun { t0: now - hour, t1: now - hour + 20_000,
+            pos: final_text.chars().count() - append.chars().count(), del_chars: 0,
+            del_words: None, ins: append.into() });
+
+        let mk = |range, body: &str, kind, created_ms| Annotation {
+            id: 0, range, body: body.into(), status: NoteStatus::Open,
+            created_unix: created_ms / 1000, kind, title: "Crossing".into(),
+            level: "line".into(), orphaned: false, pass_id: 77, unverified: false,
+        };
+        let len = final_text.chars().count();
+        let previous = self.doc.notes().notes().iter().map(|n| n.id).max().unwrap_or(0);
+        self.doc.restore_state(&final_text, SpanSet::default(),
+            BlockMap::new(final_text.lines().count().max(1)));
+        self.doc.add_diagnoses(vec![
+            mk(len / 4..len / 4 + 8, "Does the crossing turn soon enough?",
+                NoteKind::Diagnosis, start + 43 * day),
+            mk(len / 2..len / 2 + 8, "Remember the sound of the bell.",
+                NoteKind::Note, start + 44 * day),
+            mk(3 * len / 4..3 * len / 4 + 1, "Is the last image earned?",
+                NoteKind::Diagnosis, now - hour),
+        ]);
+        let mut ids: Vec<_> = self.doc.notes().notes().iter().filter(|n| n.id > previous)
+            .map(|n| n.id).collect();
+        ids.sort_unstable();
+        let [card, note, _legacy] = ids.as_slice() else { panic!("novel card ids") };
+        let events = vec![
+            JournalEvent::CardRaised { t: start + 43 * day, id: *card,
+                card_kind: NoteKind::Diagnosis, range: len / 4..len / 4 + 8,
+                body: "Does the crossing turn soon enough?".into(), title: "Crossing".into(),
+                level: "line".into(), pass_id: 77, status: NoteStatus::Open,
+                orphaned: false, unverified: false },
+            JournalEvent::CardRaised { t: start + 44 * day, id: *note,
+                card_kind: NoteKind::Note, range: len / 2..len / 2 + 8,
+                body: "Remember the sound of the bell.".into(), title: String::new(),
+                level: String::new(), pass_id: 0, status: NoteStatus::Open,
+                orphaned: false, unverified: false },
+            JournalEvent::CardEdited { t: start + 45 * day, id: *card,
+                body: "Does the revised crossing turn soon enough?".into(),
+                title: "Crossing".into(), level: "line".into(), pass_id: 77,
+                status: NoteStatus::Open, orphaned: false, unverified: false },
+            JournalEvent::CardClosed { t: start + 51 * day, id: *card, resolved: true },
+            JournalEvent::Export { t: start + 45 * day + hour },
+            JournalEvent::Restore { t: start + 51 * day + hour,
+                from_unix: (start + 44 * day) / 1000, len_chars: len },
+        ];
+        // v0.2 simulation: `legacy` remains annotated but deliberately has no
+        // CardRaised event. Today's suffix proves its reverse-walk skeleton.
+        self.doc.set_journal(Journal::from_parts(runs, events));
+
+        if let Some(store) = &self.store {
+            let state = |text: String| {
+                let lines = text.lines().count().max(1);
+                CheckpointState { text, spans: SpanSet::default(), blocks: BlockMap::new(lines) }
+            };
+            for (days, seconds, name, manual) in [
+                (56, 0, "Opening tide", true), (36, 0, "Blue oar", true),
+                (35, 0, "Compass", true), (35, 3, "Compass polish", true),
+                (7, 0, "Far shore", true), (6, 0, "Exported", true),
+                (1, 0, "Restored", true), (0, 0, "Started", false),
+            ] {
+                let text = if days >= 56 { base.clone() }
+                    else if days >= 36 { after_replace.clone() }
+                    else if days >= 7 { after_compass.clone() }
+                    else { final_text.clone() };
+                store.debug_push_checkpoint(name, (now - days * day) / 1000 + seconds,
+                    manual, state(text));
+            }
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
     /// Rig hook (`seed:legacy`): the legacy litmus shape (Bug A) — a store with
     /// six materialized checkpoints spread across two weeks (growing word
     /// counts, one mid-arc cut) and an EMPTY journal. Before Bug A this
@@ -12803,6 +12963,51 @@ impl Editor {
             .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
         if let Some(pos) = pos {
             self.strip_toggle_pin(pos, cx);
+        }
+    }
+
+    /// Rig hook: exercise a painted station's exact timestamp target.
+    pub fn debug_strip_station(&mut self, label: &str, cx: &mut Context<Self>) {
+        let pos = self.strip.bake.as_ref().and_then(|b| b.stations.iter()
+            .find(|station| station.label == label).map(|station| station.at_ms));
+        if let Some(pos) = pos {
+            if !self.strip.parked {
+                self.strip.saved_sel = Some(self.selected_range.clone());
+                self.selected_range = self.selected_range.end..self.selected_range.end;
+            }
+            self.strip.parked = true;
+            self.strip_scrub_to(pos, true, cx);
+        }
+    }
+
+    /// Rig hook: pin the PARKED moment as Compare's A through the real verb
+    /// path — interactive parity for `compare:begin` (see smoke.rs on why the
+    /// fraction-mapped pin token is unfit for edge positions).
+    pub fn debug_compare_begin(&mut self, cx: &mut Context<Self>) {
+        self.strip_begin_compare(cx);
+    }
+
+    /// Rig hook: one page on a named compare side, through the same helper as
+    /// PageDown after selecting that side.
+    pub fn debug_compare_page(&mut self, side_b: bool, cx: &mut Context<Self>) {
+        self.compare_active_b = side_b;
+        self.compare_page_by(1., cx);
+    }
+
+    /// Rig hook: deterministic document/preview scroll fraction.
+    pub fn debug_scroll_fraction(&mut self, frac: f32, cx: &mut Context<Self>) {
+        if let Some(frame) = self.last_frame.as_ref() {
+            self.scroll_top = frame.max_scroll() * frac.clamp(0., 1.);
+            self.autoscroll_request = false;
+            cx.notify();
+        }
+    }
+
+    /// Rig hook: click the middle of the first painted thread target.
+    pub fn debug_strip_thread(&mut self, cx: &mut Context<Self>) {
+        let point = self.strip_thread_hits.borrow().first().map(|hit| hit.bounds.center());
+        if let Some(point) = point {
+            self.strip_park_at_x(f32::from(point.x), f32::from(point.y), false, cx);
         }
     }
 
@@ -21979,14 +22184,39 @@ fn strip_sheet_tail(rail_x0: f32, rail_x1: f32, total_work: f32, view: f32) -> f
 
 /// Prefer the playhead's right side, flip left when that is the side that
 /// fits, and finally clamp. Pure geometry keeps narrow-width behavior stable.
-fn strip_dock_left(playhead_x: f32, width: f32, left: f32, right: f32) -> f32 {
+/// `now_zone` is the Now label's reserved span: the dock may stand on either
+/// side of it, never across it — on a young sheet the whole interval between
+/// the readout and the selvage can be narrower than the dock, and the dock
+/// then takes the desk to Now's right (the callout-from-the-sheet reading),
+/// leaving the terminal label legible.
+fn strip_dock_left(
+    playhead_x: f32,
+    width: f32,
+    left: f32,
+    right: f32,
+    now_zone: (f32, f32),
+) -> f32 {
     let gap = 10.;
     let candidate = if playhead_x + gap + width <= right {
         playhead_x + gap
     } else {
         playhead_x - gap - width
     };
-    candidate.clamp(left, (right - width).max(left))
+    let mut x = candidate.clamp(left, (right - width).max(left));
+    if x < now_zone.1 && x + width > now_zone.0 {
+        let after = (now_zone.1 + gap).min((right - width).max(left));
+        let before = (now_zone.0 - gap - width).max(left);
+        // Prefer the side that actually clears the zone; right wins ties
+        // (the desk is empty there by definition).
+        x = if after + width <= right && after >= now_zone.1 + gap - 0.5 {
+            after
+        } else if before + width <= now_zone.0 {
+            before
+        } else {
+            after
+        };
+    }
+    x
 }
 
 /// An rgb constant with an explicit alpha — the strip's translucent fabric
@@ -24679,7 +24909,11 @@ impl Editor {
         // the readout's reserved width (two blocks while comparing), not the
         // rail edge — the young-sheet case parks the playhead AT the origin.
         let dock_floor = rail_x0 + if comparing { 470. } else { 230. };
-        let dock_left = strip_dock_left(playhead_x, dock_w, dock_floor, rail_x1);
+        // Now's reserved span: the label sits 6px right of the selvage,
+        // clamped to the near edge when the selvage is off-view (§3e).
+        let now_x = (selvage_x + 6.).min(rail_x1 - 30.);
+        let dock_left = strip_dock_left(
+            playhead_x, dock_w, dock_floor, rail_x1, (now_x - 8., now_x + 38.));
         let readout = if parked {
             strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms)
         } else {
@@ -25745,9 +25979,27 @@ mod tests {
 
     #[test]
     fn strip_dock_flips_and_clamps_at_the_frame_edges() {
-        assert_eq!(strip_dock_left(100., 120., 28., 428.), 110.);
-        assert_eq!(strip_dock_left(390., 120., 28., 428.), 260.);
-        assert_eq!(strip_dock_left(30., 500., 28., 428.), 28.);
+        // A far-away Now zone leaves the classic flip/clamp behavior alone.
+        let far = (1000., 1040.);
+        assert_eq!(strip_dock_left(100., 120., 28., 428., far), 110.);
+        assert_eq!(strip_dock_left(390., 120., 28., 428., far), 260.);
+        assert_eq!(strip_dock_left(30., 500., 28., 428., far), 28.);
+    }
+
+    #[test]
+    fn strip_dock_never_stands_across_the_now_label() {
+        // Young sheet: readout floor at 230, selvage/Now right there — the
+        // interval left of Now cannot hold a 300px dock, so it takes the
+        // desk to Now's right (the callout-from-the-sheet reading).
+        let x = strip_dock_left(240., 300., 230., 1590., (238., 284.));
+        assert!(x >= 294., "dock {x} must clear Now's right edge");
+        // Wide sheet, parked mid-fabric: Now at the far selvage stays clear
+        // and the dock still prefers the playhead's right.
+        assert_eq!(strip_dock_left(800., 300., 230., 1590., (1520., 1566.)), 810.);
+        // Parked NEAR the selvage: the dock flips left of the zone when the
+        // right side cannot fit.
+        let x = strip_dock_left(1500., 300., 230., 1590., (1508., 1554.));
+        assert!(x + 300. <= 1508., "dock {x}+300 must clear Now's left edge");
     }
 
     #[test]

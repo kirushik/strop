@@ -314,6 +314,56 @@ expect "Now clears the past-card projection" 0 "$(field "$S3" past_cards)"
 expect "card scrubbing does NOT re-bake" 1 "$(field "$S3" bakes)"
 rm -f "$DOCS2" "$DOCS2.strop"
 
+echo "rig-check: seed:novel makes the round-two laws visible"
+DOCN=$(mktemp --suffix=.md); cp "$DOC" "$DOCN"
+# The compare pair brackets ALL the fixture's scattered edits through the
+# interactive-parity route: park at the "Restored" station (the late text),
+# pin it as A via the real Compare verb, then park B at "Opening tide" (the
+# completed base) — four separated diff regions by design, and both sides
+# anchor on materialized station states rather than fraction arithmetic.
+OUT=$(WRUN_TAIL=120 scripts/wrun.sh "$DOCN" "seed:novel scroll:0.42 strip:open dump:ui scroll:1 dump:ui strip:station:Restored compare:begin strip:station:Opening_tide dump:ui compare:page:a dump:ui strip:station:Blue_oar dump:ui strip:scrub:0.233 dump:ui strip:thread:first dump:ui strip:now wait:240 dump:ui" 2>/dev/null | grep 'UI-DUMP')
+N1=$(echo "$OUT" | sed -n 1p); N2=$(echo "$OUT" | sed -n 2p)
+N3=$(echo "$OUT" | sed -n 3p); N4=$(echo "$OUT" | sed -n 4p)
+N5=$(echo "$OUT" | sed -n 5p); N6=$(echo "$OUT" | sed -n 6p)
+N7=$(echo "$OUT" | sed -n 7p); N8=$(echo "$OUT" | sed -n 8p)
+NS1=$(echo "$N1" | grep -oE '"strip":\{[^}]*\}')
+NS2=$(echo "$N2" | grep -oE '"strip":\{[^}]*\}')
+NS3=$(echo "$N3" | grep -oE '"strip":\{[^}]*\}')
+NS4=$(echo "$N4" | grep -oE '"strip":\{[^}]*\}')
+NS5=$(echo "$N5" | grep -oE '"strip":\{[^}]*\}')
+NS6=$(echo "$N6" | grep -oE '"strip":\{[^}]*\}')
+NS7=$(echo "$N7" | grep -oE '"strip":\{[^}]*\}')
+[ -n "$NS1" ] || { echo "  FAIL no novel strip dump"; exit 1; }
+expect "novel opens with one immutable bake" 1 "$(field "$NS1" bakes)"
+if [ "$(field "$NS1" station_hits)" -ge 6 ] 2>/dev/null; then echo "  ok   named station targets were painted"; else
+  echo "  FAIL too few station targets"; fail=1; fi
+if echo "$NS1" | grep -q 'Started'; then echo "  FAIL automatic Started leaked into labels"; fail=1; else
+  echo "  ok   automatic Started is absent from baked labels"; fi
+if echo "$NS1" | grep -qE '2 wk|3 wk|mo'; then echo "  ok   a wide well carries duration data"; else
+  echo "  FAIL wide well has no duration datum"; fail=1; fi
+# The overnight seam is deliberately absent from well_durations; only the
+# multi-day folds above are eligible for words.
+if echo "$NS1" | grep -q '17 h'; then echo "  FAIL overnight well was labelled"; fail=1; else
+  echo "  ok   the overnight well stays mute"; fi
+expect "max scroll reaches the strip-open floor" "$(field "$NS2" max_scroll)" "$(field "$NS2" live_scroll)"
+if [ "$(field "$NS3" compare_a_max)" != "0.0" ] && [ "$(field "$NS3" compare_b_max)" != "0.0" ]; then
+  echo "  ok   both compare columns have reading extents"; else echo "  FAIL compare extent collapsed"; fail=1; fi
+if [ "$(field "$NS4" compare_a_offset)" != "$(field "$NS4" compare_b_offset)" ]; then
+  echo "  ok   compare sides scroll independently"; else echo "  FAIL compare offsets did not diverge"; fail=1; fi
+if [ "$(field "$NS4" gutter_regions)" -ge 4 ] 2>/dev/null; then echo "  ok   change gutter has regions"; else
+  echo "  FAIL gutter regions=$(field "$NS4" gutter_regions)"; fail=1; fi
+expect "station target parks at its exact timestamp" "$(field "$NS5" blue_oar_ms)" "$(field "$NS5" pos_ms)"
+if [ "$(field "$NS6" pos_ms)" != "$(field "$NS5" pos_ms)" ]; then echo "  ok   fabric remains continuous between stations"; else
+  echo "  FAIL fabric scrub snapped to station"; fail=1; fi
+if [ "$(field "$NS7" focused_past_card)" != "null" ]; then echo "  ok   thread click focuses its past card"; else
+  echo "  FAIL thread click did not focus a card"; fail=1; fi
+for S in "$NS2" "$NS3" "$NS4" "$NS5" "$NS6" "$NS7"; do
+  expect "novel interaction does not rebake" 1 "$(field "$S" bakes)"
+done
+expect "exit restores the captured scroll exactly" "$(field "$NS1" saved_scroll)" "$(field "$N8" scroll_y)"
+expect "novel frame returns to live paragraphs" "$(field "$N1" frame_paras)" "$(field "$N8" frame_paras)"
+rm -f "$DOCN" "$DOCN.strop"
+
 echo "rig-check: legacy history renders a real axis + a visible parked banner (Bug A/B)"
 # A legacy file — six materialized checkpoints across two weeks, EMPTY journal.
 # Before the fix the axis read only the journal, so every tick landed at x=0 and
@@ -1033,6 +1083,19 @@ rm -f "$DIS" "$DIS.strop"
 for s in image-wash image-page image-drop-gap; do
   if [ -s "$SHOTS/$s.png" ]; then echo "  ok   still $SHOTS/$s.png"; else
     echo "  FAIL still $s.png did not render"; fail=1; fi
+done
+echo "rig-check: history round-two stills for the eyes"
+for spec in \
+  "novel-floor|seed:novel strip:open scroll:1 strip:scrub:0.30 scroll:1" \
+  "novel-compare|seed:novel strip:open strip:station:Restored compare:begin strip:station:Opening_tide compare:page:a" \
+  "novel-labels|seed:novel strip:open strip:station:Compass" \
+  "novel-well|seed:novel strip:open" \
+  "novel-legacy|seed:novel strip:open strip:scrub:0.30"; do
+  name=${spec%%|*}; keys=${spec#*|}; DIS=$(mktemp --suffix=.md)
+  scripts/wshot.sh "$SHOTS/$name.png" 1 "$DIS" "$keys" >/dev/null 2>&1
+  rm -f "$DIS" "$DIS.strop"
+  if [ -s "$SHOTS/$name.png" ]; then echo "  ok   still $SHOTS/$name.png"; else
+    echo "  FAIL still $name.png did not render"; fail=1; fi
 done
 rm -f "$IMG_A" "$IMG_B"
 
