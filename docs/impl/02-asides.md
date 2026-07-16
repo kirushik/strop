@@ -144,6 +144,16 @@ suppression guard), and undo/redo/restore never file; undo of a cut
 also removes its entry — and peels the replacement, when one landed
 (the inverse in the same grammar, P13).
 
+- **Exile widens over blank separators** (divergence resolved): Exile
+  and Set aside now share the widening — a whole-block exile from
+  blank-separated prose consumes the blank-line separator too, so
+  "AAA\n\nBBB\n\nCCC" minus BBB reads "AAA\n\nCCC", never stacked
+  blanks with the caret stranded on one. The entry records the blank
+  (`blank_sep`) and Put back synthesizes it back, byte-identical. The
+  seam's blank line and a textless furniture line are never read as
+  separators. The two verbs still differ by destination and record:
+  Exile files a graveyard entry; Set aside moves living text to the
+  compost.
 - **Put back** inserts `text` at the re-anchored `origin_pos` (or at
   the nearest paragraph boundary), removes the entry, flashes the
   paragraph — one verb, both the entry button and the post-cut footer

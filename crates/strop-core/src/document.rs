@@ -1602,6 +1602,13 @@ pub struct GraveEntry {
     /// false keeps every pre-papercuts entry loading as a plain fragment.
     #[serde(default)]
     pub whole_blocks: bool,
+    /// Whether the exile consumed a BLANK-LINE separator (the widening it
+    /// shares with Set aside: the prose closes up beneath the departing
+    /// block). Put back synthesizes the same blank line, so the round trip
+    /// is byte-identical. Only meaningful with `whole_blocks`; `serde`
+    /// default false keeps older entries returning with a plain join.
+    #[serde(default)]
+    pub blank_sep: bool,
 }
 
 /// The graveyard record: a side structure mirroring `Annotations` in every way
@@ -1665,7 +1672,9 @@ impl Graveyard {
     /// `region` records which side of the seam the text left (Put back
     /// returns through the same door — graveyard-interplay 1/2).
     /// `whole_blocks` records whether the exile verb read the cut as complete
-    /// paragraph block(s), so Put back rebuilds a paragraph, not a splice.
+    /// paragraph block(s), so Put back rebuilds a paragraph, not a splice;
+    /// `blank_sep` whether the consumed separator was a blank line, so Put
+    /// back rebuilds that too.
     #[allow(clippy::too_many_arguments)]
     pub fn file(
         &mut self,
@@ -1677,6 +1686,7 @@ impl Graveyard {
         kinds: Vec<BlockKind>,
         region: GraveRegion,
         whole_blocks: bool,
+        blank_sep: bool,
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
@@ -1692,6 +1702,7 @@ impl Graveyard {
             kinds,
             region,
             whole_blocks,
+            blank_sep,
         });
         id
     }
@@ -2285,6 +2296,7 @@ impl Document {
                     kinds,
                     region,
                     whole,
+                    false,
                 );
             }
             if collapse_emptied && self.scraps_textless() {
@@ -2313,6 +2325,7 @@ impl Document {
             kinds,
             region,
             whole,
+            false,
         );
         if collapse_emptied && self.scraps_textless() {
             self.evaporate_scraps_in_tx();
@@ -2385,8 +2398,11 @@ impl Document {
     /// from a block's text start to a block's text end over one or more
     /// complete blocks — takes its bounding separator along, so the prose is
     /// left with exactly the separator that joined the neighbours and NO empty
-    /// grave; the entry records `whole_blocks: true` so Put back rebuilds a
-    /// paragraph (§B2). Anything else (a partial or mixed selection) falls
+    /// grave; a BLANK-LINE separator is consumed whole (the widening Set
+    /// aside performs, adjudicated shared — the two verbs still differ by
+    /// destination and record), and the entry records it (`blank_sep`) so
+    /// Put back restores the separator situation byte-identically. The entry
+    /// records `whole_blocks: true` so Put back rebuilds a paragraph (§B2). Anything else (a partial or mixed selection) falls
     /// through to `cut_to_graveyard`'s exact-byte semantics — two verbs, two
     /// contracts (plain delete stays exact-bytes; only exile interprets
     /// intent). Cut and its consumed separator are ONE transaction, so plain
@@ -2461,21 +2477,46 @@ impl Document {
             .collect();
         let spans = self.spans.slice(s..e);
         // A same-region block follows iff the char at `e` is a separator whose
-        // next line stays in this region.
-        let trailing_break = break_len_at(rope, e);
-        let trailing_sep = trailing_break > 0
-            && region_of_char(rope, &self.blocks, e + trailing_break)
-                == region_of_char(rope, &self.blocks, s);
-        let (del_start, del_end, origin) = if trailing_sep {
-            (s, e + trailing_break, s)
-        } else if break_len_before(rope, s) > 0 {
+        // next line stays in this region. The separator may be a BLANK LINE
+        // (Set aside's widening, adjudicated shared: exiling BBB from
+        // "AAA\n\nBBB\n\nCCC" must leave "AAA\n\nCCC" — the prose closes up
+        // beneath the departing block, never stacked blanks with the caret
+        // stranded on one). Every widened position must stay in this region:
+        // the seam's own blank line is a boundary, not a separator, and the
+        // widening never chews it. Nor is a TEXTLESS FURNITURE line one —
+        // an empty-caption image is a standing block (inline-images §5),
+        // and a neighbour's exile must not destroy the picture.
+        let my_region = region_of_char(rope, &self.blocks, s);
+        let region_of = |ch: usize| region_of_char(rope, &self.blocks, ch);
+        let tb1 = break_len_at(rope, e);
+        let tb2 = if tb1 > 0 { break_len_at(rope, e + tb1) } else { 0 };
+        let trailing_blank = tb2 > 0
+            && !self.blocks.kind(last_line + 1).is_furniture()
+            && region_of(e + tb1) == my_region
+            && region_of(e + tb1 + tb2) == my_region;
+        let trailing_sep = tb1 > 0 && region_of(e + tb1) == my_region;
+        let lb1 = break_len_before(rope, s);
+        let lb2 = if lb1 > 0 { break_len_before(rope, s - lb1) } else { 0 };
+        let leading_blank = lb2 > 0
+            && !self.blocks.kind(first_line - 1).is_furniture()
+            && region_of(s - lb1) == my_region
+            && region_of(s - lb1 - lb2) == my_region;
+        let (del_start, del_end, origin) = if trailing_blank {
+            (s, e + tb1 + tb2, s) // block + its trailing blank-line separator
+        } else if trailing_sep {
+            (s, e + tb1, s)
+        } else if leading_blank {
+            // The last block(s) of blank-separated prose: eat the blank line
+            // joining us to the block above.
+            (s - lb1 - lb2, e, s - lb1 - lb2)
+        } else if lb1 > 0 {
             // Leading separator: eat the newline joining us to the block above.
-            let leading_break = break_len_before(rope, s);
-            (s - leading_break, e, s - leading_break)
+            (s - lb1, e, s - lb1)
         } else {
             // A lone block that is the entire region: no separator to take.
             (s, e, s)
         };
+        let blank_sep = trailing_blank || leading_blank;
         let del_byte = self.char_to_byte(del_start)..self.char_to_byte(del_end);
         self.delete_bytes_whole_block(del_byte, first_line);
         // A lone block that is the entire document leaves its LINE standing
@@ -2497,6 +2538,7 @@ impl Document {
             kinds,
             region,
             true,
+            blank_sep,
         );
         if collapse_emptied && self.scraps_textless() {
             self.evaporate_scraps_in_tx();
@@ -2579,6 +2621,7 @@ impl Document {
                 above_kinds,
                 GraveRegion::Manuscript,
                 false,
+                false,
             );
         }
         if capture && b_e - b_s >= capture_threshold && !below_text.is_empty() {
@@ -2593,6 +2636,7 @@ impl Document {
                 below_spans,
                 below_kinds,
                 GraveRegion::Scraps,
+                false,
                 false,
             );
         }
@@ -2670,17 +2714,26 @@ impl Document {
             // all into an empty document (no phantom blank block) — or into a
             // trailing EMPTY block (the grave a plain delete leaves standing):
             // the return fills that block rather than opening a second blank.
-            // Synthesized LF can mix with CRLF; Ropey and BlockMap stay aligned.
+            // An entry whose exile widened over a BLANK-LINE separator
+            // (`blank_sep`) synthesizes the blank line back, so the round
+            // trip is byte-identical — at the tail, only the breaks the
+            // document is missing are prepended. Synthesized LF can mix
+            // with CRLF; Ropey and BlockMap stay aligned.
+            let sep = if entry.blank_sep { "\n\n" } else { "\n" };
             let (payload, text_offset) = if rope.len_chars() == 0 || empty_line {
                 (entry.text.clone(), 0)
             } else if at_end {
-                if break_len_before(rope, rope.len_chars()) > 0 {
-                    (entry.text.clone(), 0)
+                let b1 = break_len_before(rope, rope.len_chars());
+                let b2 = if b1 > 0 {
+                    break_len_before(rope, rope.len_chars() - b1)
                 } else {
-                    (format!("\n{}", entry.text), 1)
-                }
+                    0
+                };
+                let standing = (b1 > 0) as usize + (b2 > 0) as usize;
+                let missing = sep.len().saturating_sub(standing);
+                (format!("{}{}", &sep[..missing], entry.text), missing)
             } else {
-                (format!("{}\n", entry.text), 0)
+                (format!("{}{}", entry.text, sep), 0)
             };
             let at_byte = rope.char_to_byte(boundary);
             self.edit_bytes_verbatim(at_byte..at_byte, &payload);
@@ -4950,7 +5003,7 @@ mod tests {
     #[test]
     fn graveyard_apply_op_shifts_and_clamps_origin() {
         let mut g = Graveyard::default();
-        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
+        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false, false);
         assert_eq!(g.get(id).unwrap().words, 1);
         // Insert before the origin → shifts right (10 → 12).
         g.apply_op(&op(0, 0, "xx"));
@@ -5011,7 +5064,7 @@ mod tests {
         let base = doc.manuscript_base_char();
         assert!(base > 0);
         let mut g = Graveyard::default();
-        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false); // origin drifted into the pile
+        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false, false); // origin drifted into the pile
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
         assert!(doc.text().starts_with("cc\n\n"), "compost untouched: {}", doc.text());
@@ -5085,8 +5138,10 @@ mod tests {
         assert!(e.spans.spans().is_empty());
         assert!(e.kinds.is_empty());
         // A pre-papercuts entry has no `whole_blocks` key: serde-default false,
-        // so it loads and puts back as a plain fragment (§B1).
+        // so it loads and puts back as a plain fragment (§B1). Same for the
+        // widening's `blank_sep` — an older entry returns with a plain join.
         assert!(!e.whole_blocks);
+        assert!(!e.blank_sep);
         // The whole record round-trips too.
         let g: Graveyard = serde_json::from_str(
             r#"{"entries":[{"id":1,"text":"x","origin_quote":"","origin_pos":0,"cut_unix":0,"words":1}],"next_id":1}"#,
@@ -5277,6 +5332,111 @@ mod tests {
         assert_eq!(doc.text(), "AAA\nBBB\nCCC");
         assert_eq!(doc.blocks().len(), 3);
         assert_eq!(caret, 8, "caret at CCC's start");
+    }
+
+    // ---- exile widens over blank separators (adjudicated: shared with
+    // ---- Set aside — the verbs still differ by destination and record) ----
+
+    #[test]
+    fn exile_widens_over_the_blank_separator_and_round_trips_byte_identical() {
+        // Exiling BBB from blank-separated prose leaves "AAA\n\nCCC" — never
+        // "AAA\n\n\nCCC" with the caret stranded on a stacked blank — and
+        // Put back restores the paragraph AND its blank separator.
+        let mut doc =
+            Document::new("AAA\n\nBBB\n\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(5..8, String::new(), 0, false); // "BBB"
+        assert_eq!(doc.text(), "AAA\n\nCCC", "the prose closes up");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.whole_blocks);
+        assert!(e.blank_sep, "the entry records the blank separator");
+        assert_eq!(e.text, "BBB");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\n\nBBB\n\nCCC", "byte-identical round trip");
+        assert_eq!(caret, 5, "caret at the returned block's start");
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn blank_separator_exile_stays_a_single_history_atom() {
+        let mut doc =
+            Document::new("AAA\n\nBBB\n\nCCC", SpanSet::default(), BlockMap::default());
+        doc.exile_to_graveyard(5..8, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\n\nCCC");
+        // ONE undo restores the paragraph AND its blank separator, entry gone.
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\n\nBBB\n\nCCC");
+        assert_eq!(doc.blocks().len(), 5);
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn blank_separator_exile_covers_the_document_edges() {
+        // First block: the trailing blank goes with it.
+        let mut doc = Document::new("BBB\n\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(0..3, String::new(), 0, false);
+        assert_eq!(doc.text(), "CCC");
+        assert!(doc.graveyard().get(id).unwrap().blank_sep);
+        doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "BBB\n\nCCC", "first block round trip");
+
+        // Last block: the LEADING blank goes — no stacked blanks strand at
+        // the tail — and put back synthesizes the missing breaks back.
+        let mut doc = Document::new("AAA\n\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(5..8, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA");
+        assert!(doc.graveyard().get(id).unwrap().blank_sep);
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\n\nCCC", "last block round trip");
+        assert_eq!(caret, 5, "caret at CCC's start");
+
+        // A lone block has no separator to widen over.
+        let mut doc = Document::new("only", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(0..4, String::new(), 0, false);
+        assert_eq!(doc.text(), "");
+        assert!(!doc.graveyard().get(id).unwrap().blank_sep);
+        doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "only");
+    }
+
+    #[test]
+    fn exile_widening_never_reads_a_textless_furniture_line_as_a_blank() {
+        // [P, Image{empty caption}, P]: the image's empty line is a STANDING
+        // block (inline-images §5), not a blank separator — exiling AAA takes
+        // one join as before, never the picture's line with it.
+        let mut doc = Document::new(
+            "AAA\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                BlockKind::Image { src: "asset:pic".into(), alt: String::new() },
+                BlockKind::Paragraph,
+            ]),
+        );
+        let id = doc.exile_to_graveyard(0..3, String::new(), 0, false);
+        assert_eq!(doc.text(), "\nBBB", "the image's line still stands");
+        assert!(!doc.graveyard().get(id).unwrap().blank_sep);
+    }
+
+    #[test]
+    fn exile_widening_never_chews_the_seam_blank_line() {
+        // The manuscript's last block with a pile below: the blank after BBB
+        // is the seam's join, not a separator — the widening stops at the
+        // region edge and takes the LEADING blank instead, leaving the seam
+        // and the pile exactly as they stood.
+        let mut doc = Document::new("x", SpanSet::default(), BlockMap::default());
+        let mut b = BlockMap::new(5);
+        b.set_scrap_line(Some(3));
+        doc.restore_state("AAA\n\nBBB\n\npile", SpanSet::default(), b);
+        let id = doc.exile_to_graveyard(5..8, String::new(), 0, false); // "BBB"
+        assert_eq!(doc.text(), "AAA\n\npile");
+        assert_eq!(doc.manuscript_slice().0, "AAA", "manuscript closed up");
+        assert!(doc.text().ends_with("pile"), "the pile untouched");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.blank_sep);
+        assert_eq!(e.region, GraveRegion::Manuscript);
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\n\nBBB\n\npile", "one undo restores it all");
+        assert!(doc.graveyard().is_empty());
     }
 
     // ---- papercuts follow-up (2026-07-11 owner round): reports 3 & 4 ----
@@ -6498,6 +6658,7 @@ mod tests {
             Vec::new(),
             GraveRegion::Manuscript,
             false,
+            false,
         );
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
@@ -6541,7 +6702,7 @@ mod tests {
         let pile_note = doc.add_note(4..7, "pile note".into(), 0); // "one"
         let manu_note = doc.add_note(22..27, "manu note".into(), 0); // "piece"
         let mut g = Graveyard::default();
-        let gid = g.file("corpse".into(), String::new(), 22, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
+        let gid = g.file("corpse".into(), String::new(), 22, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false, false);
         doc.set_graveyard(g);
         // Give it an undo stack that could reach back across the flip.
         doc.edit_bytes(0..0, "Z");
