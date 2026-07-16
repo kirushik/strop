@@ -116,6 +116,55 @@ impl<T> LatestSave<T> {
     }
 }
 
+/// A std-only async doorbell between the strop-save worker thread and the
+/// GPUI foreground: the worker rings it after posting each completion
+/// (`SaveWorker::with_notify`), and a foreground task parked on `wait`
+/// wakes to drain — so a finished final write closes the quit-guarded
+/// window in milliseconds instead of idling until the next 1s heartbeat
+/// tick. The flag latches, so a ring before anyone listens is never lost.
+#[derive(Default)]
+struct SaveWake {
+    rung: std::sync::atomic::AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl SaveWake {
+    fn ring(&self) {
+        self.rung.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+
+    fn wait(self: &Arc<Self>) -> SaveWakeWait {
+        SaveWakeWait(self.clone())
+    }
+}
+
+struct SaveWakeWait(Arc<SaveWake>);
+
+impl std::future::Future for SaveWakeWait {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        use std::sync::atomic::Ordering;
+        if self.0.rung.swap(false, Ordering::SeqCst) {
+            return std::task::Poll::Ready(());
+        }
+        *self.0.waker.lock().unwrap() = Some(cx.waker().clone());
+        // Re-check AFTER parking the waker: a ring that raced the store
+        // above sees no waker to wake, and would otherwise sleep forever.
+        if self.0.rung.swap(false, Ordering::SeqCst) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
 fn safe_asset_extension(id: &str) -> &str {
     id.rsplit_once('.')
         .map(|(_, ext)| ext)
@@ -268,6 +317,11 @@ const CARD_MOVE: Duration = Duration::from_millis(200);
 /// Capped (`MOVE_STAGGER_CAP`) so a long train never turns into a slow wave.
 const MOVE_STAGGER: Duration = Duration::from_millis(40);
 const MOVE_STAGGER_CAP: u32 = 4;
+/// Quit guard c: how long the final save may run before the "Saving before
+/// closing" veil earns its pixels. A local write lands in single-digit
+/// milliseconds, so most closes never show a frame of it; the threshold is
+/// generous enough that only a genuinely slow disk raises the chrome.
+const QUIT_VEIL_DELAY: Duration = Duration::from_millis(200);
 
 /// One card's re-pack move in flight (see `Editor::moving` and
 /// `update_lane_motion`). Offsets are CONTENT-SPACE (viewport top + scroll):
@@ -1391,6 +1445,11 @@ pub struct Editor {
     /// A close request is a small state machine, not an irrevocable event:
     /// the window remains alive until the newest generation reaches disk.
     quit_guard: QuitGuard,
+    /// The "Saving before closing" veil earns its pixels only when the
+    /// final save is still pending after `QUIT_VEIL_DELAY` — most closes
+    /// finish first and never flash a frame of chrome. Armed by a timer,
+    /// never by `request_quit` itself.
+    quit_veil: bool,
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
@@ -2311,6 +2370,7 @@ impl Editor {
             save_retry_delay: Duration::from_secs(1),
             save_error: None,
             quit_guard: QuitGuard::Idle,
+            quit_veil: false,
             history_view: None,
             history_preview: None,
             compare_preview: None,
@@ -2424,7 +2484,35 @@ impl Editor {
     pub fn attach_store(&mut self, store: Store, cx: &mut Context<Self>) {
         let legacy = !store.checkpoints_materialized();
         self.store = Some(store);
-        self.save_worker = Some(SaveWorker::new());
+        // Completions drain the moment they arrive (quit guard b): the
+        // worker thread rings the doorbell, the task below wakes on the
+        // foreground and drains — a fast final write closes a quit-guarded
+        // window in milliseconds. The 1s heartbeat keeps draining too, as
+        // the belt under this suspender.
+        let wake = Arc::new(SaveWake::default());
+        let bell = wake.clone();
+        self.save_worker = Some(SaveWorker::with_notify(move || bell.ring()));
+        cx.spawn(async move |this, cx| {
+            loop {
+                wake.wait().await;
+                let alive = this.update(cx, |editor: &mut Editor, cx| {
+                    let error_before = editor.save_error.clone();
+                    editor.drain_save_completions();
+                    editor.finish_quit_if_ready(cx);
+                    // Repaint only when the drain changed something the
+                    // writer can see; routine autosaves stay invisible.
+                    if editor.save_error != error_before
+                        || !matches!(editor.quit_guard, QuitGuard::Idle)
+                    {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Heal a legacy file without waiting for the writer to open history:
         // materialize its checkpoint states in the background now, so the
         // sidebar is instant whenever it IS opened — and the next open of
@@ -2581,6 +2669,13 @@ impl Editor {
     /// mid-sentence. The only thing quit records now — the intent question
     /// (and its End Session verb) is gone (impl 04 §1).
     pub fn record_exit_state(&self) {
+        if cfg!(test) {
+            // The quit tests drive real close paths; the caret memory
+            // writes to the REAL state dir (files.rs isolates env-dependent
+            // behavior in its own single sequential test) and must not
+            // collect junk temp-path entries from every test run.
+            return;
+        }
         let Some(store) = &self.store else { return };
         crate::files::record_caret(store.path(), self.cursor_offset());
     }
@@ -7214,8 +7309,33 @@ impl Editor {
         }
     }
 
+    /// The clean-close predicate (quit guard a): true when a close can skip
+    /// the final save because every byte is already durable. The editor's
+    /// own flags cover marked mutations and in-flight/failed saves; the
+    /// store's frontier baseline (`Store::needs_save`) covers doc mutations
+    /// that never route through the dirty chokepoint — open-time session
+    /// seals, idle-gap checkpoints — and the journal's unpersisted tail.
+    fn quit_close_clean(&mut self) -> bool {
+        // Fold any just-committed transient-field ops in first — they are
+        // exactly the bytes LAW 2 exists to protect.
+        self.sync_mutations();
+        if self.store_dirty || self.latest_save.is_some() || self.save_error.is_some() {
+            return false;
+        }
+        match &self.store {
+            Some(store) => !store.needs_save(self.doc.journal()),
+            None => true,
+        }
+    }
+
     /// Queue the newest snapshot and wait only at a shutdown/rename boundary.
     pub fn flush_saves(&mut self) -> std::io::Result<()> {
+        // Clean close writes nothing: when the flags AND the store's own
+        // frontier baseline agree that disk already matches, the last-ditch
+        // flush must not rewrite (or, under lazy birth, CREATE) the file.
+        if self.quit_close_clean() {
+            return Ok(());
+        }
         // Use the generation produced by THIS attempt. Consulting editor
         // state here could accidentally select an older queued snapshot after
         // preparation of the newest revision failed.
@@ -7246,6 +7366,7 @@ impl Editor {
         }
         self.sync_active_note_draft(cx);
         self.quit_guard = QuitGuard::Saving;
+        self.quit_veil = false;
         window.focus(&self.quit_focus, cx);
         // LAW 2: quit's resolution boundary is broader than any gesture's — the
         // composer AND every single-line field (link, cold-read reaction) must
@@ -7258,11 +7379,61 @@ impl Editor {
         self.commit_composer_no_focus(cx);
         self.commit_transient_fields_on_quit(cx);
         cx.defer_in(window, |editor, _, cx| {
-            let _ = editor.save_now();
-            editor.finish_quit_if_ready(cx);
-            cx.notify();
+            editor.settle_quit(cx);
         });
         cx.notify();
+    }
+
+    /// The deferred half of `request_quit`, after every transient field has
+    /// resolved into the document. Clean close (quit guard a): nothing to
+    /// flush means the window closes NOW — no save, no veil, no frame of
+    /// chrome. Otherwise the final save is queued and the veil is armed on
+    /// a delay (quit guard c); the completion doorbell (`SaveWake`) usually
+    /// closes the window long before that timer fires.
+    fn settle_quit(&mut self, cx: &mut Context<Self>) {
+        if self.quit_close_clean() {
+            self.record_exit_state();
+            self.quit_guard = QuitGuard::Bypass;
+            cx.quit();
+            return;
+        }
+        let _ = self.save_now();
+        self.finish_quit_if_ready(cx);
+        self.arm_quit_veil(cx);
+        cx.notify();
+    }
+
+    /// Quit guard c: the veil renders only if the final save is still
+    /// pending after this long. A local disk finishes in single-digit
+    /// milliseconds; only a genuinely slow write (network mount, spun-down
+    /// drive) earns the "Saving before closing" chrome.
+    fn arm_quit_veil(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.quit_guard, QuitGuard::Saving) {
+            return; // already closed — or Failed, which renders regardless
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(QUIT_VEIL_DELAY).await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.reveal_quit_veil() {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The timer's half of quit guard c, separated so the transition is a
+    /// testable fact: the veil shows only while a save is still holding the
+    /// window open. Returns whether anything changed.
+    fn reveal_quit_veil(&mut self) -> bool {
+        let saving = matches!(self.quit_guard, QuitGuard::Saving | QuitGuard::SavingCopy);
+        if saving && !self.quit_veil {
+            self.quit_veil = true;
+            true
+        } else {
+            false
+        }
     }
 
     fn finish_quit_if_ready(&mut self, cx: &mut Context<Self>) {
@@ -7291,6 +7462,7 @@ impl Editor {
     fn cancel_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.quit_guard, QuitGuard::Failed(_)) {
             self.quit_guard = QuitGuard::Idle;
+            self.quit_veil = false;
             window.focus(&self.focus_handle, cx);
             cx.notify();
         }
@@ -7312,6 +7484,9 @@ impl Editor {
             store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
         );
         self.quit_guard = QuitGuard::SavingCopy;
+        // The copy flow holds a path dialog open — deliberate, slow, and
+        // exactly what today's veil narrates. No 200ms grace here.
+        self.quit_veil = true;
         let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
         cx.spawn(async move |this, cx| {
             let path = match rx.await {
@@ -21952,6 +22127,10 @@ impl Editor {
     fn render_quit_guard(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (title, detail, working) = match &self.quit_guard {
             QuitGuard::Idle | QuitGuard::Bypass => return None,
+            // Quit guard c: within QUIT_VEIL_DELAY of the close the save is
+            // almost always already done — no chrome for a fast goodbye.
+            // Failed below renders regardless: errors never hide.
+            QuitGuard::Saving if !self.quit_veil => return None,
             QuitGuard::Saving => ("Saving before closing", "The window will close as soon as the newest changes are safely on disk.".into(), true),
             QuitGuard::SavingCopy => ("Saving a recovery copy", "The original file is unchanged. The window will close when the copy is safe.".into(), true),
             QuitGuard::Failed(message) => ("Your changes could not be saved", message.clone(), false),
@@ -28564,5 +28743,175 @@ mod tests {
         assert_eq!(space_mark_hit(&marks, 12.), Some(0), "midpoint tie is stable");
         assert_eq!(space_mark_hit(&marks, 12.1), Some(1));
         assert_eq!(space_mark_hit(&marks, 20.), None, "padding never magnetizes track");
+    }
+
+    // ---- Quit guard (see request_quit / settle_quit) ----
+
+    fn quit_test_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("strop-quit-test-{}-{tag}.strop", std::process::id()))
+    }
+
+    /// An editor over an attached store, the way main.rs assembles one.
+    fn editor_with_store(
+        cx: &mut gpui::TestAppContext,
+        text: &str,
+        store: Store,
+    ) -> gpui::Entity<Editor> {
+        let text = text.to_owned();
+        cx.new(|cx| {
+            let mut editor = Editor::new(cx, &text, SpanSet::default(), BlockMap::default());
+            editor.attach_store(store, cx);
+            editor
+        })
+    }
+
+    #[gpui::test]
+    fn clean_close_bypasses_instantly_and_writes_nothing(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("clean-close");
+        let _ = std::fs::remove_file(&path);
+        {
+            // A settled file from an earlier "session".
+            let (store, _) = Store::open(&path).unwrap();
+            store.seed("settled prose");
+            store.add_checkpoint("Started", false);
+            store.save().unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let (store, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        let editor = editor_with_store(cx, &loaded.text, store);
+        cx.update_entity(&editor, |editor, cx| {
+            editor.quit_guard = QuitGuard::Saving; // as request_quit sets before deferring
+            editor.settle_quit(cx);
+            assert!(
+                matches!(editor.quit_guard, QuitGuard::Bypass),
+                "a clean close bypasses immediately — no save, no wait"
+            );
+            assert!(!editor.quit_veil, "no frame of veil for a fast goodbye");
+            assert!(editor.latest_save.is_none(), "a clean close queues nothing");
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a clean close rewrote the file");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn dirty_close_flushes_before_the_window_closes(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("dirty-close");
+        let _ = std::fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        let editor = editor_with_store(cx, "", store);
+        cx.update_entity(&editor, |editor, cx| {
+            editor.doc.edit_bytes(0..0, "dirty bytes");
+            editor.quit_guard = QuitGuard::Saving;
+            editor.settle_quit(cx);
+            // LAW 2 (papercuts): dirty bytes in flight — no bypass yet.
+            assert!(matches!(editor.quit_guard, QuitGuard::Saving));
+            assert!(editor.latest_save.is_some(), "the final save is in flight");
+        });
+        // Drain the way the doorbell/heartbeat would, until the worker lands.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let closed = cx.update_entity(&editor, |editor, cx| {
+                editor.drain_save_completions();
+                editor.finish_quit_if_ready(cx);
+                matches!(editor.quit_guard, QuitGuard::Bypass)
+            });
+            if closed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the dirty close never became durable");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (_, loaded) = Store::open(&path).unwrap();
+        assert_eq!(loaded.unwrap().text, "dirty bytes", "the flush landed before the close");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn quit_never_bypasses_a_pending_dirty_save(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("law-two");
+        let _ = std::fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        let editor = editor_with_store(cx, "", store);
+        cx.update_entity(&editor, |editor, cx| {
+            editor.doc.edit_bytes(0..0, "unflushed");
+            editor.sync_mutations();
+            let _ = editor.save_now();
+            editor.quit_guard = QuitGuard::Saving;
+            // The completion has not been drained: the guard must hold.
+            editor.finish_quit_if_ready(cx);
+            assert!(
+                matches!(editor.quit_guard, QuitGuard::Saving),
+                "a generation in flight can never be bypassed"
+            );
+            // Dirty bytes with a FAILED save must surface, never exit.
+            let _ = editor.latest_save.take();
+            editor.store_dirty = true;
+            editor.save_error = Some("simulated: disk full".into());
+            editor.finish_quit_if_ready(cx);
+            assert!(
+                matches!(editor.quit_guard, QuitGuard::Failed(_)),
+                "dirty + failed must reach the recovery dialog"
+            );
+            // And the clean-close shortcut may not call this clean either.
+            assert!(!editor.quit_close_clean(), "dirty bytes are never 'clean'");
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn the_veil_shows_only_while_a_close_is_still_saving(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "text", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, _| {
+            assert!(!editor.quit_veil, "the veil starts down");
+            editor.quit_guard = QuitGuard::Saving;
+            assert!(
+                editor.reveal_quit_veil(),
+                "still saving at the threshold: the veil earns its pixels"
+            );
+            assert!(editor.quit_veil);
+            editor.quit_veil = false;
+            editor.quit_guard = QuitGuard::Bypass;
+            assert!(!editor.reveal_quit_veil(), "already closing: nothing to show");
+            editor.quit_guard = QuitGuard::Idle;
+            assert!(!editor.reveal_quit_veil(), "not quitting: nothing to show");
+        });
+    }
+
+    #[gpui::test]
+    fn a_failed_final_write_reaches_the_failed_dialog(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("failed-close");
+        let _ = std::fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        // Occupy the destination with a DIRECTORY: the atomic replace
+        // cannot land, so the final write genuinely fails.
+        std::fs::create_dir_all(&path).unwrap();
+        let editor = editor_with_store(cx, "", store);
+        cx.update_entity(&editor, |editor, cx| {
+            editor.doc.edit_bytes(0..0, "doomed");
+            editor.quit_guard = QuitGuard::Saving;
+            editor.settle_quit(cx);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let failed = cx.update_entity(&editor, |editor, cx| {
+                editor.drain_save_completions();
+                editor.finish_quit_if_ready(cx);
+                assert!(
+                    !matches!(editor.quit_guard, QuitGuard::Bypass),
+                    "a failed write must never let the process exit"
+                );
+                matches!(editor.quit_guard, QuitGuard::Failed(_))
+            });
+            if failed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the failed write never surfaced");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(path.with_extension("strop.tmp"));
     }
 }
