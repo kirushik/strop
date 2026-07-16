@@ -66,7 +66,7 @@ proptest! {
     #[test]
     fn typograph_process_never_panics(s in ".*", ru in any::<bool>()) {
         let lang = if ru { Lang::Ru } else { Lang::En };
-        let _ = process(&s, lang);
+        let _ = process(&s, None, lang);
     }
 
     #[test]

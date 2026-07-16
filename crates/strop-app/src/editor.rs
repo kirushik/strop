@@ -13654,7 +13654,10 @@ impl Editor {
                 Language::En => typograph::Lang::En,
                 Language::Auto => typograph::detect_lang(self.doc.rope().chars()),
             };
-            if let Some(sub) = typograph::process(&prefix, lang) {
+            let next = self.doc.rope().byte_to_char(cursor);
+            let next = (next < self.doc.rope().len_chars())
+                .then(|| self.doc.rope().char(next));
+            if let Some(sub) = typograph::process(&prefix, next, lang) {
                 // The substitution is its own transaction: one undo reverts
                 // it alone, restoring the literally-typed characters — and
                 // since rules fire only on the typed char, the restored text
@@ -15324,6 +15327,10 @@ impl Element for EditorElement {
             top += height
                 + if in_pile {
                     px((f32::from(paragraph_gap) * 0.5 / 2.).round() * 2.)
+                } else if matches!(kind, BlockKind::ListItem { .. })
+                    && matches!(kinds.get(block_ix + 1), Some(BlockKind::ListItem { .. }))
+                {
+                    paragraph_gap * 0.25
                 } else if is_image && par_text.is_empty() {
                     // The empty caption slot's borrowed margin (§3): must
                     // hold one caption caret — a no-op at the default
@@ -22893,9 +22900,10 @@ impl CrGeom {
                 CR_AVG_EN * ratio,
                 CR_AVG_RU * ratio,
             ),
-            // The approved mock's inter-paragraph air (1em — scene 1 CSS);
-            // a named §3.2-register entry at Gate 2.
-            para_gap: self.body.round(),
+            // Book paragraphs sit on the bare line grid; first-line indents
+            // carry their separation (impl 16 §1).
+            para_gap: 0.0,
+            language: None,
         }
     }
 }
@@ -23034,11 +23042,13 @@ fn cr_layout(
     spans: &SpanSet,
     blocks: &BlockMap,
     geom: &CrGeom,
+    language: typograph::Lang,
     sizes: &HashMap<String, (f32, f32)>,
     widths: &mut HashMap<CrWidthKey, f32>,
     ts: &std::sync::Arc<gpui::WindowTextSystem>,
 ) -> crate::bookpage::BookLayout {
-    let metrics = geom.metrics();
+    let mut metrics = geom.metrics();
+    metrics.language = Some(language);
     let mut m = CrMeasure { ts: ts.clone(), widths, sizes, body: geom.body };
     if metrics.justify {
         crate::bookpage::paginate(text, spans, blocks, &metrics, &mut m, &mut crate::hyphen::DictHyphenator)
@@ -23093,6 +23103,9 @@ struct ColdRead {
     text: String,
     spans: SpanSet,
     blocks: BlockMap,
+    /// Config override first, automatic detection otherwise — the same
+    /// document-language oracle used by the typing typograph.
+    language: typograph::Lang,
     /// A Past read keeps the checkpoint's FULL state for its Restore chip
     /// (the slice above is only what the book paints).
     restore_state: Option<(String, SpanSet, BlockMap)>,
@@ -23673,7 +23686,14 @@ impl Editor {
         let geom = if small { cr_geom(desk_w, desk_h, scale, true, live) } else { normal };
         let ts = window.text_system().clone();
         let mut widths = HashMap::new();
-        let book = cr_layout(&text, &spans, &blocks, &geom, &image_sizes, &mut widths, &ts);
+        let language = match self.config.language {
+            Language::Ru => typograph::Lang::Ru,
+            Language::En => typograph::Lang::En,
+            Language::Auto => typograph::detect_lang(text.chars()),
+        };
+        let book = cr_layout(
+            &text, &spans, &blocks, &geom, language, &image_sizes, &mut widths, &ts,
+        );
         let page = entry_char.map_or(0, |c| book.page_of_char(c));
         let paper = crate::paths::asset_file("paper-noise-256.png").and_then(|p| {
             std::fs::read(&p)
@@ -23685,6 +23705,7 @@ impl Editor {
             text,
             spans,
             blocks,
+            language,
             restore_state,
             book,
             geom,
@@ -24366,7 +24387,9 @@ impl Editor {
         let ts = cr.ts.clone();
         let (text, spans, blocks) = (cr.text.clone(), cr.spans.clone(), cr.blocks.clone());
         let sizes = cr.image_sizes.clone();
-        let book = cr_layout(&text, &spans, &blocks, &geom, &sizes, &mut cr.widths, &ts);
+        let book = cr_layout(
+            &text, &spans, &blocks, &geom, cr.language, &sizes, &mut cr.widths, &ts,
+        );
         cr.page = book.page_of_char(top_char);
         cr.book = book;
         cr.geom = geom;
@@ -24416,7 +24439,8 @@ impl Editor {
                             (cr.text.clone(), cr.spans.clone(), cr.blocks.clone());
                         let sizes = cr.image_sizes.clone();
                         let book = cr_layout(
-                            &text, &spans, &blocks, &geom, &sizes, &mut cr.widths, &ts,
+                            &text, &spans, &blocks, &geom, cr.language, &sizes,
+                            &mut cr.widths, &ts,
                         );
                         cr.page = book.page_of_char(top_char);
                         cr.book = book;
@@ -27659,7 +27683,7 @@ mod tests {
         assert_eq!(text_h % g.line_h, 0., "whole lines");
         assert!(g.lane, "Live reserves the lane from entry (S2)");
         assert!(g.metrics().justify);
-        assert_eq!(g.metrics().para_gap, 17., "1em air, rounded");
+        assert_eq!(g.metrics().para_gap, 0., "book body sits on the line grid");
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use strop_core::document::{BlockKind, BlockMap, InlineAttr, SpanSet};
+use strop_core::typograph::{self, Lang};
 
 // ---- Parameters (research-linebreak §4, the spec table) -------------------
 
@@ -77,6 +78,13 @@ pub const QUOTE_INDENT_EM: f32 = 1.0;
 pub const LIST_INDENT_EM: f32 = 1.5;
 /// Gap between a list marker's right edge and its item text, in em.
 pub const MARKER_GAP_EM: f32 = 0.5;
+/// First-line paragraph indent in the book door (impl 16 §1).
+pub const PARA_INDENT_EM: f32 = 1.5;
+/// Protect the paragraph signal when the final line is exceptionally short
+/// or almost fills the measure (impl 16 §1).
+pub const LAST_LINE_PENALTY: f32 = 2_000.0;
+/// Heading air is independent of the body paragraph grid (impl 16 §1).
+pub const HEAD_AIR_BELOW: f32 = 8.0;
 /// The deterministic box for an image whose dimensions are unknown — the
 /// editor's own decoding/missing placeholder height (editor.rs); regions 12
 /// wants the same input to paginate identically every time.
@@ -331,6 +339,9 @@ pub struct BookMetrics {
     /// Air between two consecutive text blocks (the approved mock's
     /// `margin: 0 0 1em` — ux-lab scene 1); 0 = the bare line grid.
     pub para_gap: f32,
+    /// Document-language oracle; tests and non-editor callers may leave it
+    /// automatic, while the cold-read surface supplies the config override.
+    pub language: Option<Lang>,
 }
 
 /// S7: is `measure` too narrow to justify? Below ~45 EN / ~40 RU characters
@@ -406,7 +417,12 @@ pub fn paginate(
     let body_h = metrics.line_height.round().max(1.0);
     let head_h = metrics.heading_line_height.round().max(1.0);
     let rope = ropey::Rope::from_str(text);
+    let lang = metrics.language.unwrap_or_else(|| typograph::detect_lang(rope.chars()));
     let em = metrics.em;
+    let raw: Vec<String> = (0..rope.len_lines())
+        .map(|i| rope.line(i).chars().take_while(|&c| !is_line_break(c)).collect())
+        .collect();
+    let shaped_lists = shaped_list_paragraphs(&raw, blocks);
     let mut flows: Vec<Flow> = Vec::new();
     let mut counters: Vec<usize> = Vec::new(); // ordered-list numbering per depth
     for i in 0..rope.len_lines() {
@@ -482,11 +498,13 @@ pub fn paginate(
                 flows.push(Flow::Para {
                     lines: vec![blank_line(Role::Divider, body_h, i, cstart)],
                     heading: false,
+                    list: false,
                 });
                 continue;
             }
             _ => {}
         }
+        let shaped_list = shaped_lists[i];
         let (role, indent, rindent, mode0, line_h) = match &kind {
             // Headings set ragged: a justified two-word heading is a hole.
             BlockKind::Heading(l) => (Role::Heading(*l), 0.0, 0.0, Mode::Ragged, head_h),
@@ -514,6 +532,7 @@ pub fn paginate(
             flows.push(Flow::Para {
                 lines: vec![blank_line(role, line_h, i, cstart)],
                 heading: false,
+                list: false,
             });
             continue;
         }
@@ -561,11 +580,28 @@ pub fn paginate(
         let ctx = ParaCtx { chars, styles, start: cstart };
         let frags = tokenize(&ctx, m, role);
         let avail = (metrics.measure - indent - rindent).max(1.0);
-        let broken = break_para(&ctx, frags, avail, mode, role, m, h);
+        let previous = i.checked_sub(1).map(|p| blocks.kind(p));
+        let first_indent = if matches!(kind, BlockKind::Paragraph)
+            && !shaped_list
+            && (lang == Lang::Ru
+                || (i > 0
+                    && !matches!(previous, Some(BlockKind::Heading(_) | BlockKind::Divider))
+                    && raw[i - 1].chars().any(|c| !c.is_whitespace())))
+        {
+            em * PARA_INDENT_EM
+        } else {
+            0.0
+        };
+        let first_avail = (avail - first_indent).max(1.0);
+        let broken = break_para(
+            &ctx, frags, avail, first_avail, first_indent, mode, role, m, h,
+        );
         let n = broken.len();
         let params = LineParams {
             avail,
+            first_avail,
             indent,
+            first_indent,
             mode,
             role,
             height: line_h,
@@ -575,7 +611,7 @@ pub fn paginate(
         let mut lines: Vec<Line> = broken
             .into_iter()
             .enumerate()
-            .map(|(k, bl)| finish_line(bl, k + 1 == n, &params))
+            .map(|(k, bl)| finish_line(bl, k == 0, k + 1 == n, &params))
             .collect();
         if let Some(mk) = marker
             && let Some(first) = lines.first_mut()
@@ -585,9 +621,43 @@ pub fn paginate(
         flows.push(Flow::Para {
             lines,
             heading: matches!(kind, BlockKind::Heading(_)),
+            list: matches!(kind, BlockKind::ListItem { .. }) || shaped_list,
         });
     }
     assemble(flows, metrics, body_h)
+}
+
+fn list_number(text: &str) -> Option<u8> {
+    let (digits, rest) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    if digits.is_empty() || digits.len() > 2 || !(rest.starts_with(". ") || rest.starts_with(") ")) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn shaped_list_paragraphs(texts: &[String], blocks: &BlockMap) -> Vec<bool> {
+    let mut shaped = vec![false; texts.len()];
+    for i in 0..texts.len() {
+        if !matches!(blocks.kind(i), BlockKind::Paragraph) {
+            continue;
+        }
+        if matches!(texts[i].as_bytes(), [b'-' | b'*', b' ', ..]) || texts[i].starts_with("• ") {
+            let adjacent = [i.checked_sub(1), (i + 1 < texts.len()).then_some(i + 1)]
+                .into_iter().flatten().any(|j| {
+                    matches!(blocks.kind(j), BlockKind::Paragraph)
+                        && (matches!(texts[j].as_bytes(), [b'-' | b'*', b' ', ..])
+                            || texts[j].starts_with("• "))
+                });
+            shaped[i] = adjacent;
+        } else if let Some(n) = list_number(&texts[i]) {
+            shaped[i] = [i.checked_sub(1), (i + 1 < texts.len()).then_some(i + 1)]
+                .into_iter().flatten().any(|j| {
+                    matches!(blocks.kind(j), BlockKind::Paragraph)
+                        && list_number(&texts[j]).is_some_and(|m| m.abs_diff(n) == 1)
+                });
+        }
+    }
+    shaped
 }
 
 // ---- Tokenizer -----------------------------------------------------------------
@@ -882,6 +952,8 @@ fn break_para(
     ctx: &ParaCtx,
     frags: Vec<Frag>,
     avail: f32,
+    first_avail: f32,
+    para_indent: f32,
     mode: Mode,
     role: Role,
     m: &mut dyn Measure,
@@ -912,10 +984,11 @@ fn break_para(
     let mut streak = 0usize;
 
     while let Some(unit) = units.pop_front() {
+        let line_avail = if lines.is_empty() { first_avail } else { avail };
         let unit_w: f32 = unit.iter().map(|f| f.width).sum();
         let unit_g: f32 = unit.iter().take(unit.len() - 1).map(|f| f.space_after).sum();
         let join = if cur.is_empty() { 0.0 } else { cur.last().unwrap().space_after };
-        if cur_w + unit_w + (cur_g + join + unit_g) * min_factor <= avail + EPS {
+        if cur_w + unit_w + (cur_g + join + unit_g) * min_factor <= line_avail + EPS {
             cur_w += unit_w;
             cur_g += join + unit_g;
             cur.extend(unit);
@@ -930,7 +1003,15 @@ fn break_para(
             let eh = cur.last().unwrap().class == BreakClass::AtHyphen;
             let kind = if eh { EndpointKind::ExistingHyphen } else { EndpointKind::Clean };
             if let Some(extra) = endpoint_cost(kind, streak, false) {
-                best_cost = badness(cur_w, cur_g, avail) + extra;
+                let last_cost = if units.is_empty() && para_indent > 0.0
+                    && (unit_w < 2.0 * para_indent
+                        || unit_w > avail - para_indent)
+                {
+                    LAST_LINE_PENALTY
+                } else {
+                    0.0
+                };
+                best_cost = badness(cur_w, cur_g, line_avail) + extra + last_cost;
                 best = Some(None);
             }
         }
@@ -944,7 +1025,7 @@ fn break_para(
                 };
                 let w = cur_w + prefix.width;
                 let g = cur_g + join;
-                if w + g * min_factor > avail + EPS {
+                if w + g * min_factor > line_avail + EPS {
                     continue; // even at minimum spacing the prefix misses
                 }
                 let Some(extra) = endpoint_cost(
@@ -954,7 +1035,7 @@ fn break_para(
                 ) else {
                     continue;
                 };
-                let cost = badness(w, g, avail) + extra;
+                let cost = badness(w, g, line_avail) + extra;
                 if cost < best_cost {
                     best_cost = cost;
                     best = Some(Some((prefix, rest)));
@@ -1020,7 +1101,9 @@ fn break_para(
 
 struct LineParams {
     avail: f32,
+    first_avail: f32,
     indent: f32,
+    first_indent: f32,
     mode: Mode,
     role: Role,
     height: f32,
@@ -1031,7 +1114,7 @@ struct LineParams {
 /// Distribute slack across word gaps only — exact f32 arithmetic, spaces
 /// never painted; the last line sets natural, never justified (the one
 /// non-negotiable of justified setting — research §4).
-fn finish_line(bl: BrokenLine, is_last: bool, p: &LineParams) -> Line {
+fn finish_line(bl: BrokenLine, is_first: bool, is_last: bool, p: &LineParams) -> Line {
     let mut frags = bl.frags;
     let n = frags.len();
     let mut gaps: Vec<f32> = frags
@@ -1043,7 +1126,7 @@ fn finish_line(bl: BrokenLine, is_last: bool, p: &LineParams) -> Line {
     let mut loose = false;
     let justified = p.mode == Mode::Justified && !is_last && !bl.overfull && !gaps.is_empty();
     if justified {
-        let slack = p.avail - natural;
+        let slack = (if is_first { p.first_avail } else { p.avail }) - natural;
         let per: Vec<f32> = gaps
             .iter()
             .map(|g| g * if slack >= 0.0 { STRETCH_PER_GAP } else { SHRINK_PER_GAP })
@@ -1062,9 +1145,10 @@ fn finish_line(bl: BrokenLine, is_last: bool, p: &LineParams) -> Line {
             }
         }
     }
-    let x = p.indent
+    let avail = if is_first { p.first_avail } else { p.avail };
+    let x = p.indent + if is_first { p.first_indent } else { 0.0 }
         + if p.mode == Mode::RaggedLeft {
-            (p.avail - natural).max(0.0)
+            (avail - natural).max(0.0)
         } else {
             0.0
         };
@@ -1124,7 +1208,7 @@ struct ImageFlow {
 }
 
 enum Flow {
-    Para { lines: Vec<Line>, heading: bool },
+    Para { lines: Vec<Line>, heading: bool, list: bool },
     Image(ImageFlow),
 }
 
@@ -1326,6 +1410,7 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
     };
     let mut q: VecDeque<Flow> = flows.into();
     let mut prev_text = false;
+    let mut prev_list = false;
     while let Some(flow) = q.pop_front() {
         // Inter-paragraph air (`para_gap`, the lab mock's `margin: 0 0 1em`
         // — scene 1 CSS): between two consecutive TEXT blocks only; a
@@ -1335,12 +1420,20 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
             Flow::Para { lines, .. } => lines.iter().any(|l| !l.frags.is_empty()),
             Flow::Image(_) => true,
         };
+        let is_list = matches!(&flow, Flow::Para { list: true, .. });
+        if prev_list != is_list && asm.y > 0.0 {
+            asm.y += body_h / 2.0;
+        }
+        if matches!(&flow, Flow::Para { heading: true, .. }) && asm.y > 0.0 {
+            asm.y += body_h;
+        }
         if prev_text && is_text && asm.y > 0.0 {
             asm.y += metrics.para_gap;
         }
         prev_text = is_text;
+        prev_list = is_list;
         match flow {
-            Flow::Para { lines, heading } => {
+            Flow::Para { lines, heading, .. } => {
                 if heading {
                     // The keep must look PAST invisible flows: a writer's
                     // blank line after a chapter heading would otherwise
@@ -1363,15 +1456,21 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
                             // Text directly after the heading takes the
                             // gap; an intervening blank suppresses it (the
                             // loop's own prev_text rule above).
-                            lead = metrics.para_gap;
+                            lead = HEAD_AIR_BELOW;
                         }
                         asm.reserve_heading(&lines, next, lead);
                     }
                 }
                 asm.place_para(lines);
+                if heading {
+                    asm.y += HEAD_AIR_BELOW;
+                }
             }
             Flow::Image(img) => asm.place_image(img),
         }
+    }
+    if prev_list && asm.y > 0.0 {
+        asm.y += body_h / 2.0;
     }
     asm.close();
     if asm.pages.is_empty() {
@@ -1435,6 +1534,7 @@ mod tests {
             // The pagination tests reason in whole lines; the surface's
             // inter-paragraph air is exercised by its own test below.
             para_gap: 0.0,
+            language: None,
         }
     }
 
@@ -1637,7 +1737,9 @@ mod tests {
         assert_eq!(a.token, 0..8, "both halves carry the whole token (F9)");
         assert_eq!(b.token, 0..8);
         // Narrow: the break lands at the existing hyphen, nothing added.
-        let book = lay("хх какой-то", BlockMap::new(1), 90.0, 30);
+        // The RU first-line indent consumes 24px; 114 preserves the old
+        // fixture's 90px effective first-line measure.
+        let book = lay("хх какой-то", BlockMap::new(1), 114.0, 30);
         let ls = lines(&book);
         assert!(ls[0].ends_hyphen, "the compound break is a hyphen end");
         assert_eq!(words(ls[0]).last(), Some(&"какой-"));
@@ -1785,15 +1887,17 @@ mod tests {
     /// Widows/orphans ≥ 2 lines each side of a page break (research §4).
     #[test]
     fn widow_orphan_floors_hold() {
-        // capacity 10; para2 = 3 lines: a 2-line foot chunk would leave a
+        // capacity 10; para2 = 3 lines under its first-line indent: a
+        // 2-line foot chunk would leave a
         // 1-line widow, a 1-line foot chunk is an orphan — it moves whole.
-        let text = format!("{}\n{}", prose(8), prose(3));
+        let text = format!("{}\n{}", prose(8), prose(2));
         let book = lay(&text, BlockMap::new(2), 170.0, 10);
         assert_eq!(page_line_counts(&book), vec![8, 3], "para2 moved whole");
-        // para2 = 4 lines: 2 + 2 satisfies both floors -> it splits.
+        // The larger para2 is 5 lines with its indent: 2 + 3 satisfies both
+        // floors, so it splits.
         let text = format!("{}\n{}", prose(8), prose(4));
         let book = lay(&text, BlockMap::new(2), 170.0, 10);
-        assert_eq!(page_line_counts(&book), vec![10, 2]);
+        assert_eq!(page_line_counts(&book), vec![10, 3]);
     }
 
     /// A heading is never the last block on a page: it keeps ≥ 2 lines of
@@ -1897,7 +2001,7 @@ mod tests {
     #[test]
     fn slice_final_heading_sets_on_the_last_page() {
         // Fits the first page: sets as its (vacuously legal) last line.
-        let text = format!("{}\nThe End", prose(8));
+        let text = format!("{}\nThe End", prose(7));
         let blocks =
             BlockMap::from_kinds(vec![BlockKind::Paragraph, BlockKind::Heading(1)]);
         let book = lay(&text, blocks.clone(), 170.0, 10);
@@ -1905,9 +2009,9 @@ mod tests {
         let PageItem::Line(l) = book.pages[0].items.last().unwrap() else { panic!() };
         assert!(matches!(l.role, Role::Heading(_)));
         // No room left: it opens (and closes) the last page alone.
-        let text = format!("{}\nThe End", prose(9));
+        let text = format!("{}\nThe End", prose(8));
         let book = lay(&text, blocks, 170.0, 10);
-        assert_eq!(page_line_counts(&book), vec![9, 1]);
+        assert_eq!(page_line_counts(&book), vec![8, 1]);
     }
 
     /// S8 step 1: the page-final-hyphen avoidance holds at book capacity
@@ -2232,6 +2336,7 @@ mod tests {
             em: 16.5,
             justify: true,
             para_gap: 17.0,
+            language: None,
         };
         let spans = SpanSet::default();
         let t0 = std::time::Instant::now();
@@ -2248,24 +2353,13 @@ mod tests {
         );
     }
 
-    /// The surface's inter-paragraph air (the approved mock's 1em margin):
-    /// applied between two consecutive TEXT blocks only — a writer's own
-    /// blank line already separates, and a page never opens with a gap.
+    /// Body paragraphs use the bare grid; a writer's own blank remains one
+    /// honest line rather than acquiring synthetic air on either side.
     #[test]
-    fn para_gap_airs_consecutive_text_blocks_only() {
+    fn paragraph_indent_replaces_gap_without_disturbing_blank_lines() {
         let text = "one two\nthree four\n\nfive six";
         let blocks = BlockMap::new(4);
-        let mut m = metrics(200.0, 20);
-        m.para_gap = 5.0;
-        let book = paginate(text, &SpanSet::default(), &blocks, &m, &mut FakeM, &mut FakeH);
-        let ls = lines(&book);
-        assert_eq!(ls.len(), 4);
-        assert_eq!(ls[0].y, 0.0, "the first block never gaps");
-        assert_eq!(ls[1].y, 30.0, "text→text gets the air");
-        assert_eq!(ls[2].y, 55.0, "a blank line is already separation");
-        assert_eq!(ls[3].y, 80.0, "…on both of its sides");
-        // With the gap at 0 the grid is bare (the Wave A default).
-        let plain = paginate(
+        let book = paginate(
             text,
             &SpanSet::default(),
             &blocks,
@@ -2273,10 +2367,58 @@ mod tests {
             &mut FakeM,
             &mut FakeH,
         );
-        let pl = lines(&plain);
+        let ls = lines(&book);
+        assert_eq!(ls.len(), 4);
         assert_eq!(
-            pl.iter().map(|l| l.y).collect::<Vec<_>>(),
+            ls.iter().map(|l| l.y).collect::<Vec<_>>(),
             vec![0.0, 25.0, 50.0, 75.0]
         );
+        assert_eq!(ls[0].x, 0.0, "EN starts flush");
+        assert_eq!(ls[1].x, 24.0, "body→body uses an indent");
+        assert_eq!(ls[3].x, 0.0, "EN resumes flush after a writer's blank");
+    }
+
+    #[test]
+    fn book_indent_is_language_conditional_and_grid_is_solid() {
+        let en = lay("Plain words\nMore words", BlockMap::new(2), 200.0, 20);
+        let ls = lines(&en);
+        assert_eq!(ls[0].x, 0.0, "EN opens flush");
+        assert_eq!(ls[1].x, 24.0, "following EN body indents 1.5em");
+        assert_eq!(ls[1].y, ls[0].y + 25.0, "body blocks keep the grid");
+
+        let ru = lay("Русский текст\nЕщё текст", BlockMap::new(2), 200.0, 20);
+        let ls = lines(&ru);
+        assert_eq!(ls[0].x, 24.0, "RU indents from document start");
+        assert_eq!(ls[1].x, 24.0, "RU keeps a uniform paragraph indent");
+        assert_eq!(ls[1].y, ls[0].y + 25.0, "RU keeps the same grid");
+
+        let mut forced = metrics(200.0, 20);
+        forced.language = Some(Lang::En);
+        let book = paginate(
+            "Русский текст",
+            &SpanSet::default(),
+            &BlockMap::new(1),
+            &forced,
+            &mut FakeM,
+            &mut FakeH,
+        );
+        assert_eq!(lines(&book)[0].x, 0.0, "configured EN overrides detection");
+    }
+
+    #[test]
+    fn shaped_lists_exclude_dates_and_dialogue() {
+        let positive = lay("1. One\n2. Two", BlockMap::new(2), 200.0, 20);
+        assert!(lines(&positive).iter().all(|l| l.x == 0.0));
+
+        let date = lay("1917. Всё началось…\nОбычный абзац", BlockMap::new(2), 300.0, 20);
+        assert_eq!(lines(&date)[1].x, 24.0, "a year is not an ordered list");
+
+        let dialogue = lay(
+            "— Реплика первая\n— Реплика вторая\n— Реплика третья",
+            BlockMap::new(3),
+            300.0,
+            20,
+        );
+        assert!(lines(&dialogue).iter().all(|l| l.x == 24.0));
     }
 }

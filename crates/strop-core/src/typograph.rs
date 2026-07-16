@@ -53,14 +53,15 @@ impl Substitution {
 }
 
 /// `prefix` is the paragraph text up to the cursor, the just-typed character
-/// last. Returns a substitution of a suffix of `prefix`, or None.
-pub fn process(prefix: &str, lang: Lang) -> Option<Substitution> {
+/// last; `next` is the character after the cursor, when any. Returns a
+/// substitution of a suffix of `prefix`, or None.
+pub fn process(prefix: &str, next: Option<char>, lang: Lang) -> Option<Substitution> {
     let typed = prefix.chars().next_back()?;
     match typed {
         '.' => ellipsis(prefix),
         '-' => double_hyphen(prefix),
-        '"' => double_quote(prefix, lang),
-        '\'' => single_quote(prefix, lang),
+        '"' => double_quote(prefix, next, lang),
+        '\'' => single_quote(prefix, next, lang),
         ' ' => space_rules(prefix, lang),
         _ => None,
     }
@@ -96,8 +97,22 @@ fn double_hyphen(prefix: &str) -> Option<Substitution> {
     }
 }
 
-fn double_quote(prefix: &str, lang: Lang) -> Option<Substitution> {
+fn closes_empty_pair(next: Option<char>) -> bool {
+    next.is_none_or(|c| {
+        c.is_whitespace()
+            || matches!(c, ')' | ']' | '}' | '»' | '”' | '’' | ',' | '.' | ':' | ';' | '!' | '?')
+    })
+}
+
+fn double_quote(prefix: &str, next: Option<char>, lang: Lang) -> Option<Substitution> {
     let before = &prefix[..prefix.len() - 1];
+    if closes_empty_pair(next) {
+        match (lang, before.chars().next_back()) {
+            (Lang::En, Some('“')) => return Substitution::new(1, "”"),
+            (Lang::Ru, Some('„')) => return Substitution::new(1, "“"),
+            _ => {}
+        }
+    }
     let opening = opens_after(before.chars().next_back());
     let quote = match lang {
         Lang::En => {
@@ -135,11 +150,14 @@ fn depth(text: &str, open: char, close: char) -> usize {
     depth
 }
 
-fn single_quote(prefix: &str, lang: Lang) -> Option<Substitution> {
+fn single_quote(prefix: &str, next: Option<char>, lang: Lang) -> Option<Substitution> {
     let before = &prefix[..prefix.len() - 1];
     let prev = before.chars().next_back();
     // Apostrophe between letters (don’t, д’Артаньян) in both languages.
     if prev.is_some_and(char::is_alphabetic) {
+        return Substitution::new(1, "’");
+    }
+    if lang == Lang::En && prev == Some('‘') && closes_empty_pair(next) {
         return Substitution::new(1, "’");
     }
     match lang {
@@ -209,7 +227,11 @@ mod tests {
     use super::*;
 
     fn sub(prefix: &str, lang: Lang) -> Option<(usize, String)> {
-        process(prefix, lang).map(|s| (s.span, s.text))
+        process(prefix, None, lang).map(|s| (s.span, s.text))
+    }
+
+    fn sub_before(prefix: &str, next: char, lang: Lang) -> Option<(usize, String)> {
+        process(prefix, Some(next), lang).map(|s| (s.span, s.text))
     }
 
     #[test]
@@ -245,6 +267,8 @@ mod tests {
         assert_eq!(sub("He said \"", Lang::En), Some((1, "“".into())));
         assert_eq!(sub("He said “hi\"", Lang::En), Some((1, "”".into())));
         assert_eq!(sub("(\"", Lang::En), Some((1, "“".into())));
+        assert_eq!(sub("“\"", Lang::En), Some((1, "”".into())));
+        assert_eq!(sub_before("“\"", 'x', Lang::En), Some((1, "“".into())));
     }
 
     #[test]
@@ -253,6 +277,8 @@ mod tests {
         assert_eq!(sub("«Фильм \"", Lang::Ru), Some((1, "„".into())));
         assert_eq!(sub("«Фильм „Ирония\"", Lang::Ru), Some((1, "“".into())));
         assert_eq!(sub("«Фильм „Ирония“ хорош\"", Lang::Ru), Some((1, "»".into())));
+        assert_eq!(sub("«\"", Lang::Ru), Some((1, "„".into())));
+        assert_eq!(sub("«„\"", Lang::Ru), Some((1, "“".into())));
     }
 
     #[test]
@@ -261,6 +287,8 @@ mod tests {
         assert_eq!(sub("д'", Lang::Ru), Some((1, "’".into())));
         assert_eq!(sub("'", Lang::En), Some((1, "‘".into())));
         assert_eq!(sub("said ‘hi'", Lang::En), Some((1, "’".into())));
+        assert_eq!(sub("‘'", Lang::En), Some((1, "’".into())));
+        assert_eq!(sub_before("‘'", 'x', Lang::En), Some((1, "‘".into())));
         assert_eq!(sub("сказал '", Lang::Ru), None);
     }
 
