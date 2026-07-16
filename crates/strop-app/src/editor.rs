@@ -415,6 +415,20 @@ enum StripCenterMode {
     Comparing,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripDeparture {
+    StayOpen,
+    Close,
+    Panel,
+}
+
+const STRIP_DEPARTURE_MS: u64 = 180;
+
+/// The document viewport ends at the strip's top border while it is open.
+fn document_viewport_height(height: Pixels, strip_open: bool) -> Pixels {
+    (height - if strip_open { px(strip::STRIP_H) } else { px(0.) }).max(px(1.))
+}
+
 fn strip_center_mode(parked: bool, pinned: bool) -> StripCenterMode {
     match (parked, pinned) {
         (true, true) => StripCenterMode::Comparing,
@@ -1603,6 +1617,8 @@ pub struct Editor {
     /// fade-out). The read-only mode is visible and its refusal is legible
     /// (P2/P4). `None` at rest; the fade alpha is a pure function of elapsed.
     strip_pulse: Option<Instant>,
+    /// Continuation waiting behind the exit law's real-present-frame beat.
+    strip_departure: Option<(StripDeparture, Instant, i64)>,
     /// One-shot blink of a manuscript paragraph (the `originflash` idiom): the
     /// block containing this char offset tints briefly. Set by "show origin"
     /// (reveal where a cut came from) and by Put back (the passage returned).
@@ -1679,6 +1695,8 @@ struct TextFrame {
     bounds: Bounds<Pixels>,
     line_height: Pixels,
     scroll_top: Pixels,
+    /// Height of document glass; excludes the open history strip.
+    viewport_height: Pixels,
     content_height: Pixels,
     paragraphs: Vec<ParagraphLayout>,
     /// The graveyard tail section's pre-shaped rows (Bug B): painted after the
@@ -1887,7 +1905,8 @@ impl TextFrame {
 
     /// Maximum scroll offset: one blank line of breathing room past the end.
     fn max_scroll(&self) -> Pixels {
-        (self.content_height + self.line_height - self.bounds.size.height).max(px(0.))
+        // Normal breathing room plus the floor law's 24 px clearance.
+        (self.content_height + self.line_height + px(24.) - self.viewport_height).max(px(0.))
     }
 
     /// Window point -> document-space point.
@@ -2219,6 +2238,7 @@ impl Editor {
             arrival_flash: None,
             grave_flash: None,
             strip_pulse: None,
+            strip_departure: None,
             para_flash: None,
             session_had_edits: false,
             session_goal: None,
@@ -2654,7 +2674,11 @@ impl Editor {
     fn enter_history(&mut self, cx: &mut Context<Self>) {
         // The strip and the panel never open together (spec §0).
         if self.strip.open {
-            self.close_strip(cx);
+            if self.strip.parked || self.strip.pin_ms.is_some() {
+                self.begin_strip_departure(StripDeparture::Panel, cx);
+                return;
+            }
+            self.close_strip_now(cx);
         }
         let Some(store) = &self.store else {
             return;
@@ -3132,6 +3156,7 @@ impl Editor {
         // The text changed for real — a selection saved at any preview's
         // entrance is void, and must not be re-applied by the exits below.
         self.strip.saved_sel = None;
+        self.strip.saved_scroll = None;
         // Drops any preview (panel `history_view` OR the strip's
         // `history_preview`) so the live restored document is what shows.
         self.exit_history(cx);
@@ -3229,6 +3254,7 @@ impl Editor {
         }
         let now = strop_core::journal::now_ms();
         self.strip.open = true;
+        self.strip.saved_scroll = Some(f32::from(self.scroll_top));
         self.strip.parked = false;
         self.strip.pin_ms = None;
         self.compare_preview = None;
@@ -3245,7 +3271,16 @@ impl Editor {
     }
 
     fn close_strip(&mut self, cx: &mut Context<Self>) {
+        if self.strip.parked || self.strip.pin_ms.is_some() {
+            self.begin_strip_departure(StripDeparture::Close, cx);
+        } else {
+            self.close_strip_now(cx);
+        }
+    }
+
+    fn close_strip_now(&mut self, cx: &mut Context<Self>) {
         self.strip_name_input = None;
+        self.strip_departure = None;
         self.strip.open = false;
         self.strip.parked = false;
         self.strip.scrubbing = false;
@@ -3257,13 +3292,28 @@ impl Editor {
         self.strip.bake = None;
         self.strip_pulse = None;
         // Closing from a park is a return too: the live selection comes back.
-        if let Some(s) = self.strip.saved_sel.take() {
+        let returning_locus = if let Some(s) = self.strip.saved_sel.take() {
             self.selected_range = s;
+            true
+        } else {
+            false
+        };
+        if returning_locus {
+            self.restore_strip_scroll();
+        } else {
+            self.strip.saved_scroll = None;
         }
         // Drop any preview so the live document returns.
         self.history_preview = None;
         *self.strip_rail.borrow_mut() = None;
         cx.notify();
+    }
+
+    fn restore_strip_scroll(&mut self) {
+        let Some(saved) = self.strip.saved_scroll.take() else { return };
+        let max = self.last_frame.as_ref().map_or(px(saved), TextFrame::max_scroll);
+        self.scroll_top = px(saved).clamp(px(0.), max);
+        self.autoscroll_request = false;
     }
 
     /// Build the immutable bake from `(journal, checkpoints, cards)` and bump
@@ -3519,6 +3569,10 @@ impl Editor {
     /// just clicked stays under the cursor, and the thumb alone shows the
     /// global position until the next rail interaction re-binds them.
     fn strip_scrub_to(&mut self, pos_ms: i64, lock: bool, cx: &mut Context<Self>) {
+        // Re-entering the past cancels a pending departure beat: the writer
+        // changed her mind mid-return, and a stale StayOpen must not answer
+        // for (or swallow) the next close — the rig's park-during-beat race.
+        self.strip_departure = None;
         self.strip.pos_ms = pos_ms;
         self.strip_reconstruct(pos_ms);
         if lock {
@@ -3666,6 +3720,28 @@ impl Editor {
     /// strip open (spec §2). Also clears any Compare pin (review: every state
     /// needs an exit).
     fn strip_return_to_now(&mut self, cx: &mut Context<Self>) {
+        self.begin_strip_departure(StripDeparture::StayOpen, cx);
+    }
+
+    /// All non-Restore doors out of a parked/comparing frame share this
+    /// return-through-now. A repeated command completes the pending door.
+    fn begin_strip_departure(
+        &mut self,
+        continuation: StripDeparture,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, started, from)) = self.strip_departure.take() {
+            // A second departure command during the beat completes the
+            // pending departure immediately — with the NEW continuation,
+            // never the stale one (Esc-then-close must close, not re-run
+            // "stay open").
+            self.strip_departure = Some((continuation, started, from));
+            self.finish_strip_departure(cx);
+            return;
+        }
+        self.resolve_composer_draft(cx);
+        self.strip_name_input = None;
+        let from_ms = self.strip.pos_ms;
         let now = self
             .strip
             .bake
@@ -3687,8 +3763,38 @@ impl Editor {
         if let Some(s) = self.strip.saved_sel.take() {
             self.selected_range = s;
         }
+        self.restore_strip_scroll();
         self.history_preview = None;
+        self.strip_departure = Some((continuation, Instant::now(), from_ms));
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            for _ in 0..6 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(STRIP_DEPARTURE_MS / 6))
+                    .await;
+                let done = this.update(cx, |editor, cx| {
+                    if editor.strip_departure.is_none() {
+                        return true;
+                    }
+                    cx.notify();
+                    false
+                });
+                if !matches!(done, Ok(false)) { return }
+            }
+            this.update(cx, |editor, cx| editor.finish_strip_departure(cx)).ok();
+        }).detach();
+    }
+
+    fn finish_strip_departure(&mut self, cx: &mut Context<Self>) {
+        let Some((continuation, _, _)) = self.strip_departure.take() else { return };
+        match continuation {
+            StripDeparture::StayOpen => cx.notify(),
+            StripDeparture::Close => self.close_strip_now(cx),
+            StripDeparture::Panel => {
+                self.close_strip_now(cx);
+                self.enter_history(cx);
+            }
+        }
     }
 
     /// An edit gesture arrived while parked in the past (Bug B): the past is
@@ -3985,7 +4091,7 @@ impl Editor {
             return (Vec::new(), 0);
         };
         let top = frame.scroll_top;
-        let bottom = top + frame.bounds.size.height;
+        let bottom = top + frame.viewport_height;
         let mut lo = usize::MAX;
         let mut hi = 0usize;
         for par in &frame.paragraphs {
@@ -4074,7 +4180,7 @@ impl Editor {
         let total = out.len();
         if total > 3 {
             // Keep the 3 nearest the viewport center; reading order stays.
-            let center = f32::from(top + frame.bounds.size.height / 2.);
+            let center = f32::from(top + frame.viewport_height / 2.);
             let mut by_dist: Vec<usize> = (0..total).collect();
             by_dist.sort_by(|&a, &b| {
                 let d = |i: usize| {
@@ -7470,7 +7576,7 @@ impl Editor {
             return;
         };
         let x = self.goal_x.unwrap_or(x);
-        let page = (frame.bounds.size.height - frame.line_height).max(frame.line_height);
+        let page = (frame.viewport_height - frame.line_height).max(frame.line_height);
         let par = &frame.paragraphs[par_ix];
         let y = par.top + par.text_top + par.line_height * (line_ix as f32) + par.line_height / 2.;
         let target = point(x, y + page * (direction as f32));
@@ -7576,7 +7682,7 @@ impl Editor {
         // which knows nothing of the pixels above the caption line.
         if let Some(frame) = self.last_frame.as_ref() {
             if let Some(par) = frame.paragraphs.get(block) {
-                let viewport = frame.bounds.size.height;
+                let viewport = frame.viewport_height;
                 let mut scroll = self.scroll_top;
                 if par.top + par.height > scroll + viewport {
                     scroll = par.top + par.height - viewport;
@@ -8466,7 +8572,7 @@ impl Editor {
     fn grave_tail_on_screen(&self) -> bool {
         self.last_frame.as_ref().is_some_and(|f| {
             f.grave_section_top
-                .is_some_and(|top| top - f.scroll_top < f.bounds.size.height)
+                .is_some_and(|top| top - f.scroll_top < f.viewport_height)
         })
     }
 
@@ -10676,7 +10782,7 @@ impl Editor {
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
-        let vp_h = f32::from(frame.bounds.size.height);
+        let vp_h = f32::from(frame.viewport_height);
         let max_scroll = f32::from(frame.max_scroll());
         let layout = self.margin_cards(true);
         let refs = if below { layout.below } else { layout.above };
@@ -13859,7 +13965,7 @@ impl Element for EditorElement {
         let line_height = window.line_height();
         let paragraph_gap = line_height; // vertical rhythm: one full line
         let wrap_width = bounds.size.width;
-        let viewport = bounds.size.height;
+        let viewport = document_viewport_height(bounds.size.height, editor.strip.open);
 
         let preview = editor.history_preview.clone();
         let in_history = preview.is_some();
@@ -13951,7 +14057,8 @@ impl Element for EditorElement {
                         f.content_height,
                     )
                 });
-            let max_scroll = (content_height + line_height - viewport).max(px(0.));
+            let max_scroll =
+                (content_height + line_height + px(24.) - viewport).max(px(0.));
             scroll_top = scroll_top.clamp(px(0.), max_scroll);
             let cursor_pos = paragraphs
                 .iter()
@@ -14541,7 +14648,8 @@ impl Element for EditorElement {
                 shape_grave_section(window, &grave_render, wrap_width, section_top);
             (lines, Some(section_top), bottom)
         };
-        let max_scroll = (content_height + line_height - viewport).max(px(0.));
+        let max_scroll =
+            (content_height + line_height + px(24.) - viewport).max(px(0.));
         scroll_top = scroll_top.clamp(px(0.), max_scroll);
 
         // Cursor position in document space (needed for autoscroll + quad).
@@ -14642,7 +14750,10 @@ impl Element for EditorElement {
 
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
-        let viewport = bounds.size.height;
+        let viewport = document_viewport_height(
+            bounds.size.height,
+            self.editor.read(cx).strip.open,
+        );
         for (par_ix, par) in prepaint.paragraphs.iter().enumerate() {
             let y = par.top - scroll_top;
             // The wash tile bleeds one paragraph gap above its block (tiles
@@ -14967,6 +15078,7 @@ impl Element for EditorElement {
                 bounds,
                 line_height,
                 scroll_top,
+                viewport_height: viewport,
                 content_height,
                 paragraphs,
                 grave_lines,
@@ -16473,7 +16585,7 @@ impl Editor {
         self.last_frame.as_ref().is_some_and(|f| {
             f.seam_top.is_some_and(|top| {
                 let end = f.grave_section_top.unwrap_or(f.content_height);
-                top - f.scroll_top < f.bounds.size.height && end - f.scroll_top > px(0.)
+                top - f.scroll_top < f.viewport_height && end - f.scroll_top > px(0.)
             })
         })
     }
@@ -16723,7 +16835,7 @@ impl Editor {
     /// (curly-quoted) when the playhead sits on a tick, else the bare date/
     /// time; it flashes seltint on a REFUSED edit (`pulse_strip`), fading over
     /// ~900ms — the read-only mode made visible, its refusal legible.
-    fn render_strip_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_strip_banner(&self, _cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.strip.is_parked() {
             return None;
         }
@@ -16748,39 +16860,12 @@ impl Editor {
         });
         let moment = at_station.unwrap_or_else(|| strip::format_moment(self.strip.pos_ms, now_ms));
         let words = format!("{} words", format_thousands(self.strip.words_at));
-        // The quiet `Read` text-verb (Regions 1): rendered ONLY when the
-        // playhead resolves to a checkpoint WITH a materialized state within
-        // the banner's 5-working-px window — identity by tick (index/at_ms),
-        // regardless of label rank; never `state_at`.
-        let read_cp = self.strip_read_target();
         // The refusal pulse: seltint (0xC8A951 @ .33) decaying to 0 across the
         // pulse window — a pure function of the stored Instant.
         let pulse_a = self.strip_pulse.map_or(0., |t| {
             let e = t.elapsed().as_millis() as f32 / STRIP_PULSE_MS as f32;
             (0.33 * (1. - e)).clamp(0., 0.33)
         });
-
-        let restore_chip = div()
-            .id("strip-banner-restore")
-            .occlude()
-            .px(px(12.))
-            .py(px(2.))
-            .rounded(px(11.))
-            .bg(rgb(TEXT_COLOR))
-            .text_color(rgb(BG_COLOR))
-            .font_family("PT Sans")
-            .text_size(px(11.5))
-            .cursor(CursorStyle::PointingHand)
-            .hover(|d| d.bg(rgb(0x33322D)))
-            .child("Restore")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    editor.cancel_strip_name(window, cx);
-                    editor.strip_restore(cx);
-                }),
-            );
 
         Some(
             div()
@@ -16812,27 +16897,6 @@ impl Editor {
                         .child(moment),
                 )
                 .child(div().child(format!("\u{b7} {words}")))
-                .when_some(read_cp, |d, ix| {
-                    d.child(
-                        div()
-                            .id("strip-banner-read")
-                            .occlude()
-                            .px(px(4.))
-                            .text_color(rgb(TEXT_COLOR))
-                            .cursor(CursorStyle::PointingHand)
-                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                            .child("Read")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    editor.enter_cold_read_past(ix, window, cx);
-                                }),
-                            ),
-                    )
-                })
-                .child(restore_chip)
-                .child(div().text_color(rgb(0xB8B4A8)).child("\u{b7}"))
                 .child(div().child("Esc returns")),
         )
     }
@@ -18719,7 +18783,7 @@ impl Editor {
             // bug) and attribute to nothing visible. The active card is exempt:
             // you're working it, so it stays even if its anchor scrolled away.
             let vp_top = f32::from(frame.bounds.origin.y);
-            let vp_bot = vp_top + f32::from(frame.bounds.size.height);
+            let vp_bot = vp_top + f32::from(frame.viewport_height);
             if cull
                 && !active
                 && (desired < vp_top - CARD_OVERSCAN || desired > vp_bot + CARD_OVERSCAN)
@@ -18852,7 +18916,7 @@ impl Editor {
         // them, the selected card is kept fully in view, and no two overlap.
         // `top` currently holds each card's anchor target.
         let floor = self.margin_card_floor();
-        let viewport_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
+        let viewport_bottom = f32::from(frame.bounds.origin.y + frame.viewport_height);
         let items: Vec<PlaceItem> = cards
             .iter()
             .map(|c| PlaceItem {
@@ -18878,7 +18942,7 @@ impl Editor {
         // rest as off-screen refs (anchor_culled = false → reveal by selecting,
         // since their anchor is on-screen and scrolling won't help).
         let vp_top = f32::from(frame.bounds.origin.y);
-        let vp_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
+        let vp_bottom = f32::from(frame.bounds.origin.y + frame.viewport_height);
         let mut visible = Vec::with_capacity(cards.len());
         for card in cards {
             let packed_off = OffscreenRef {
@@ -18923,7 +18987,7 @@ impl Editor {
         self.lane_scroll = scroll;
         let viewport = (
             f32::from(frame.bounds.size.width),
-            f32::from(frame.bounds.size.height),
+            f32::from(frame.viewport_height),
         );
         let resized = (viewport.0 - self.lane_viewport.0).abs() > 0.5
             || (viewport.1 - self.lane_viewport.1).abs() > 0.5;
@@ -19953,7 +20017,10 @@ impl Editor {
         if cards.is_empty() { return None; }
         let col_right = self.column_right(window);
         let lane_left = col_right + 20.;
-        let lane_h = f32::from(window.viewport_size().height) - 96.;
+        let lane_h = f32::from(document_viewport_height(
+            window.viewport_size().height,
+            self.strip.open,
+        )) - 96.;
         let doc_len = self.strip.scratch.as_ref()
             .map(|s| s.replay.rope.len_chars()).unwrap_or(1).max(1);
         let mut orphan_top = lane_h - 8.;
@@ -21688,6 +21755,18 @@ fn strip_travel(rail_w: f32, total_work: f32) -> f32 {
 /// Window x of the sheet's cream tail edge for the current fixed-scale view.
 fn strip_sheet_tail(rail_x0: f32, rail_x1: f32, total_work: f32, view: f32) -> f32 {
     (rail_x0 + total_work - view).clamp(rail_x0, rail_x1)
+}
+
+/// Prefer the playhead's right side, flip left when that is the side that
+/// fits, and finally clamp. Pure geometry keeps narrow-width behavior stable.
+fn strip_dock_left(playhead_x: f32, width: f32, left: f32, right: f32) -> f32 {
+    let gap = 10.;
+    let candidate = if playhead_x + gap + width <= right {
+        playhead_x + gap
+    } else {
+        playhead_x - gap - width
+    };
+    candidate.clamp(left, (right - width).max(left))
 }
 
 /// An rgb constant with an explicit alpha — the strip's translucent fabric
@@ -24270,13 +24349,25 @@ impl Editor {
         }
         let parked = self.strip.parked;
         let desk_w = f32::from(window.viewport_size().width);
-        // The fixed groups reserve their actual laid-out widths: the readout
-        // has a 220 px floor, Restore adds its measured-label allowance, and
-        // Now + dismiss occupy the fixed right cluster. The center may use
-        // only the interval left between those group bounds.
-        let left_edge = strip::SIDE_PAD - 8. + 220. + if parked { 76. } else { 0. };
-        let right_edge = desk_w - 92.;
-        let free_interval = (right_edge - left_edge - 32.).max(0.);
+        let rail_x0 = strip::SIDE_PAD;
+        let rail_x1 = desk_w - strip::SIDE_PAD;
+        let view = self.strip.bake.as_ref().map_or(0., |b| {
+            self.strip.view_offset.clamp(
+                0.,
+                (b.timeline.total_work - (rail_x1 - rail_x0)).max(0.),
+            )
+        });
+        let (playhead_x, selvage_x) = self.strip.bake.as_ref().map_or(
+            (rail_x0, rail_x0),
+            |b| (
+                (rail_x0 + b.timeline.work_at(self.strip.pos_ms) - view)
+                    .clamp(rail_x0, rail_x1),
+                strip_sheet_tail(rail_x0, rail_x1, b.timeline.total_work, view),
+            ),
+        );
+        let dock_w = if desk_w >= 720. { 300. } else if desk_w >= 560. { 250. } else { 154. };
+        let dock_left = strip_dock_left(playhead_x, dock_w, rail_x0, rail_x1);
+        let free_interval = dock_w - if parked { 70. } else { 0. };
         let now_ms = self
             .strip
             .bake
@@ -24290,13 +24381,11 @@ impl Editor {
             strip::format_readout(now_ms, self.word_count, now_ms)
         };
 
-        // A chip button in the machine-room family.
+        // Recessed data. It has no border, hover, or pointer semantics.
         let chip = |label: SharedString, bright: bool| {
             div()
-                .px(px(8.))
+                .px(px(4.))
                 .py(px(3.))
-                .rounded(px(4.))
-                .bg(rgb(strip::READOUT_CHIP))
                 .font_family("PT Sans")
                 .text_size(px(11.))
                 .text_color(if bright { rgb(0xE7E1D0) } else { rgb(0x8F8A7C) })
@@ -24379,11 +24468,14 @@ impl Editor {
         // themselves as the pair they are — design §3, review H4: the two
         // exits from the past light up in the same beat). Click / Esc return.
         let now_chip = chip("Now".into(), parked)
-            .when(parked, |d| d.bg(rgb(0xEAE6D8)).text_color(rgb(0x23221F)))
             .id("strip-now")
             .occlude()
-            .cursor(CursorStyle::PointingHand)
-            .hover(|d| d.bg(rgb(0x2E2C22)))
+            .when(parked, |d| {
+                d.cursor(CursorStyle::PointingHand)
+                    .border_b_1()
+                    .border_dashed()
+                    .border_color(rgb(0xE7E1D0))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|editor, _: &MouseDownEvent, window, cx| {
@@ -24417,29 +24509,22 @@ impl Editor {
                 }),
             );
 
-        let quiet_action = |label: &'static str| {
-            div()
+        let strip_action = |id: &'static str, label: &'static str| {
+            inline_action(id, label)
                 .px(px(6.))
                 .py(px(3.))
-                .border_b_1()
-                .border_color(rgba(0x00000000))
-                .cursor(CursorStyle::PointingHand)
                 .font_family("PT Sans")
                 .text_size(px(11.))
-                .text_color(rgb(0x8F8A7C))
-                .hover(|d| {
-                    d.text_color(rgb(0xE7E1D0))
-                        .border_color(rgb(0xE7E1D0))
-                })
-                .child(label)
         };
         let center = if comparing {
-            quiet_action("Done comparing").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    editor.strip_done_comparing(cx);
-                }),
+            div().child(
+                strip_action("strip-done-comparing", "Done comparing").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.strip_done_comparing(cx);
+                    }),
+                ),
             )
         } else if let Some(input) = self.strip_name_input.clone() {
             let empty = input.read(cx).content.is_empty();
@@ -24467,7 +24552,7 @@ impl Editor {
             } else {
                 "Name version"
             };
-            let naming = quiet_action(label).on_mouse_down(
+            let naming = strip_action("strip-name-version", label).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
@@ -24476,7 +24561,7 @@ impl Editor {
             );
             div().flex().items_center().gap(px(12.)).child(naming)
                 .when(center_mode == StripCenterMode::Parked, |d| d.child(
-                    quiet_action("Compare").on_mouse_down(
+                    strip_action("strip-compare", "Compare").on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
@@ -24485,12 +24570,14 @@ impl Editor {
                     )
                 ))
         } else {
-            quiet_action("…").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    editor.open_strip_name(window, cx);
-                }),
+            div().child(
+                strip_action("strip-more", "…").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        editor.open_strip_name(window, cx);
+                    }),
+                ),
             )
         };
 
@@ -24569,41 +24656,38 @@ impl Editor {
                     editor.strip_pan(d, cx);
                 }))
                 .child(StripElement { editor: cx.entity() })
-                // Left group: the readout, with Restore beside it when parked.
+                // The sheet origin owns the readout.
                 .child(
                     div()
                         .absolute()
-                        .left(px(strip::SIDE_PAD - 8.))
+                        .left(px(strip::SIDE_PAD))
                         .top(px(4.))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(readout_chip)
-                        .when(parked, |d| d.child(restore_btn)),
+                        .child(readout_chip),
                 )
+                // The parked playhead owns the moment dock.
                 .child(
                     div()
                         .absolute()
-                        .left(px(left_edge + 16.))
-                        .right(px(desk_w - right_edge + 16.))
+                        .left(px(dock_left))
                         .top(px(4.))
+                        .w(px(dock_w))
                         .h(px(22.))
                         .flex()
                         .items_center()
-                        .justify_center()
+                        .gap(px(6.))
+                        .when(parked, |d| d.child(restore_btn))
                         .child(center),
                 )
-                // Now + close, fixed at the far right.
+                // The selvage owns Now; only the frame owns close.
                 .child(
                     div()
                         .absolute()
-                        .right(px(8.))
+                        .left(px((selvage_x - 14.).clamp(rail_x0, rail_x1 - 36.)))
                         .top(px(4.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(now_chip)
-                        .child(close_x),
+                        .child(now_chip),
+                )
+                .child(
+                    div().absolute().right(px(8.)).top(px(4.)).child(close_x),
                 ),
         )
     }
@@ -24862,7 +24946,18 @@ impl Element for StripElement {
         };
         let view = prepaint.view;
         let total = bake.timeline.total_work;
-        let pos = editor.strip.pos_ms;
+        let pos = editor.strip_departure.map_or(editor.strip.pos_ms, |(_, start, from)| {
+            if editor.config.reduce_motion {
+                editor.strip.pos_ms
+            } else {
+                let a = (start.elapsed().as_secs_f32()
+                    / (STRIP_DEPARTURE_MS as f32 / 1000.))
+                    .clamp(0., 1.);
+                let from_work = bake.timeline.work_at(from);
+                let now_work = bake.timeline.work_at(editor.strip.pos_ms);
+                bake.timeline.wall_at(from_work + (now_work - from_work) * a)
+            }
+        });
         let fab_x = |work: f32| rail_x0 + work - view;
         let fab_top = rail_y; // the page hangs from the rail
         let fab_bot = fab_top + strip::FABRIC_H;
@@ -25197,6 +25292,22 @@ mod tests {
         assert_eq!(strip_sheet_tail(28., 428., 400., 0.), 428.);
         assert_eq!(strip_travel(400., 900.), 400.);
         assert_eq!(strip_sheet_tail(28., 428., 900., 500.), 428.);
+    }
+
+    #[test]
+    fn strip_dock_flips_and_clamps_at_the_frame_edges() {
+        assert_eq!(strip_dock_left(100., 120., 28., 428.), 110.);
+        assert_eq!(strip_dock_left(390., 120., 28., 428.), 260.);
+        assert_eq!(strip_dock_left(30., 500., 28., 428.), 28.);
+    }
+
+    #[test]
+    fn open_strip_shortens_only_the_visible_document_height() {
+        assert_eq!(document_viewport_height(px(700.), false), px(700.));
+        assert_eq!(
+            document_viewport_height(px(700.), true),
+            px(700. - strip::STRIP_H),
+        );
     }
 
     #[test]

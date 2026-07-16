@@ -94,7 +94,6 @@ pub const FLECK_CAP: usize = 70;
 pub const GROUND: u32 = 0x26251F;
 /// The desk beyond the manuscript's recorded extent (spec v3 §1a).
 pub const DESK: u32 = 0x211F1A;
-pub const READOUT_CHIP: u32 = 0x111009;
 /// The cream page-fill under the envelope and the envelope stroke itself
 /// (design §1 — the corridor fix filled the rail→envelope band faint so it
 /// reads as a page, not a floating line).
@@ -1415,6 +1414,9 @@ pub struct Strip {
     /// return the identical frame). A Restore drops it instead — the text
     /// changed for real.
     pub saved_sel: Option<std::ops::Range<usize>>,
+    /// The live document scroll captured with `saved_sel`. Preview scrolling
+    /// is an excursion; every non-Restore exit returns this locus.
+    pub saved_scroll: Option<f32>,
 }
 
 impl Default for Strip {
@@ -1434,6 +1436,7 @@ impl Default for Strip {
             words_at: 0,
             pin_words: 0,
             saved_sel: None,
+            saved_scroll: None,
         }
     }
 }
