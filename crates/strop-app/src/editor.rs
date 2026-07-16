@@ -11520,6 +11520,13 @@ impl Editor {
                 "banner": self.strip.parked,
                 "pulse": self.strip_pulse.is_some(),
             })),
+            // What is ON GLASS, not what the document holds: the painted
+            // frame's paragraph count. The stale-preview regression
+            // (2026-07-16, field report) had a closed strip keep painting
+            // the past — the reuse cache lacked preview identity, so the
+            // preview frame answered for the live key. The rig asserts the
+            // count round-trips across park → close.
+            "frame_paras": self.last_frame.as_ref().map(|f| f.paragraphs.len()),
             // Presentation gate: the margin lane + rail render only when no
             // history surface is previewing (review H36) and the reading
             // room is down — the model above is ungated, so the rig asserts
@@ -13095,6 +13102,13 @@ struct LayoutKey {
     /// size and invalidates layout exactly once; thereafter an image document
     /// can use the same scroll/blink/caret fast path as plain prose.
     image_sizes: Vec<(String, Option<(i32, i32)>)>,
+    /// A history preview lays out PREVIEW text, which `revision` knows
+    /// nothing about — a preview frame stored under the live key would be
+    /// reused as the live document after the strip closes (the stale-page
+    /// bug: the past kept rendering, editable, until the first edit bumped
+    /// the revision). Keying the frame on it makes a stored preview frame
+    /// unmatchable by any live-document key.
+    preview: bool,
 }
 
 struct PrepaintState {
@@ -13909,6 +13923,7 @@ impl Element for EditorElement {
             scrap_words: editor.scraps_word_count(),
             grave_fingerprint: editor.grave_layout_fingerprint(),
             image_sizes,
+            preview: in_history,
         };
         let can_reuse = !in_history
             && editor.last_frame.as_ref().is_some_and(|f| {

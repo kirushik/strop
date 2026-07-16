@@ -285,10 +285,21 @@ echo "rig-check: card-history threads bend, project, and mark legacy uncertainty
 DOCS2=$(mktemp --suffix=.md); cp "$DOC" "$DOCS2"
 # Six equal ~100-minute sittings put the fifth sitting around 4/6..5/6 of
 # working time; 0.75 is after Card B's +5m raise and before Card A's end close.
-OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCS2" "seed:cards strip:open dump:ui strip:scrub:0.75 dump:ui strip:now dump:ui" 2>/dev/null | grep 'UI-DUMP')
-D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p)
+OUT=$(WRUN_TAIL=80 scripts/wrun.sh "$DOCS2" "seed:cards strip:open dump:ui strip:scrub:0.75 dump:ui strip:now dump:ui strip:scrub:0.6 ctrl-alt-h dump:ui" 2>/dev/null | grep 'UI-DUMP')
+D1=$(echo "$OUT" | sed -n 1p); D2=$(echo "$OUT" | sed -n 2p); D3=$(echo "$OUT" | sed -n 3p); D4=$(echo "$OUT" | sed -n 4p)
 S1=$(echo "$D1" | grep -oE '"strip":\{[^}]*\}'); S2=$(echo "$D2" | grep -oE '"strip":\{[^}]*\}'); S3=$(echo "$D3" | grep -oE '"strip":\{[^}]*\}')
 [ -n "$S1" ] || { echo "  FAIL no card-history strip dump"; exit 1; }
+# The stale-preview regression (2026-07-16 field report): what is ON GLASS
+# must be the live document again after every preview exit. The parked frame
+# paints the reconstructed past (a different paragraph count than the live
+# doc); return-to-now and close must both repaint the present — before the
+# LayoutKey carried preview identity, both kept painting the past.
+FP1=$(field "$D1" frame_paras); FP2=$(field "$D2" frame_paras)
+FP3=$(field "$D3" frame_paras); FP4=$(field "$D4" frame_paras)
+if [ -n "$FP1" ] && [ "$FP2" != "$FP1" ] 2>/dev/null; then echo "  ok   the parked frame paints the past ($FP2 vs $FP1 paras)"; else
+  echo "  FAIL parked frame_paras=$FP2 does not differ from live=$FP1 (fixture too tame?)"; fail=1; fi
+expect "Now repaints the present on glass"   "$FP1" "$FP3"
+expect "close repaints the present on glass" "$FP1" "$FP4"
 PC=$(field "$S2" past_cards)
 if [ "${PC:-0}" -ge 2 ] 2>/dev/null; then echo "  ok   parked margin projects both live cards ($PC)"; else
   echo "  FAIL past_cards=$PC (expected at least 2)"; fail=1; fi
