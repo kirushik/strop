@@ -455,7 +455,18 @@ forensics, and B often needs the moment just beside a mark. **The
 fine lane**: alt-arrows move the parked playhead by exactly one
 work-px of the fixed quant per press — the precise instrument for
 the moments between marks; plain arrows keep walking the stations
-and big-cut shoulders.
+and big-cut shoulders. **One discrete pointer park = one reveal**
+(corridor round three): a click — fabric, rail, station, date, or
+thread — scrolls the preview to where the WRITING was at that
+moment (the run under t, or its anchor for a thread), landing it a
+third down the viewport; a DRAG never reveals, because the writer
+parked her eyes on a passage to watch it change under the scrub;
+keyboard steps don't either — the hand that points gets taken
+there, the keys that nudge keep the eye still. The reveal waits for
+the parked moment's own layout (computing it against the previous
+frame's geometry was the bug that sent thread clicks somewhere
+else), and the clicked thread's card is the margin packer's active
+card — guaranteed a place in the lane beside its revealed anchor.
 **Scrub stability law:** while the
 thumb moves, the only things that change are the thumb's x, the
 readout numerals, the document above, the past margin's projection

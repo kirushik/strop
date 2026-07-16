@@ -1696,6 +1696,14 @@ pub struct Editor {
     strip_thread_hits: std::rc::Rc<std::cell::RefCell<Vec<StripThreadHit>>>,
     strip_hover_thread: Option<u64>,
     past_card_focus: Option<(u64, Instant)>,
+    /// One-shot: reveal this PREVIEW byte once the parked layout exists.
+    /// Computing a y against `last_frame` at click time reads the PREVIOUS
+    /// moment's geometry — the reveal must wait for its own frame.
+    strip_reveal_byte: Option<usize>,
+    /// Did the current lane gesture actually DRAG? A click reveals the
+    /// moment's edit site (§3a); a drag never yanks the eye — the writer
+    /// parked it on a passage to watch it change.
+    strip_drag_moved: bool,
     /// The cold read (impl 05 Wave B): the writer-invoked, read-only, paged
     /// takeover — the reading room. `Some` while the room is up; beside
     /// `history_preview` per the state-on-Editor + render-switch precedent.
@@ -2330,6 +2338,8 @@ impl Editor {
             strip_thread_hits: std::rc::Rc::default(),
             strip_hover_thread: None,
             past_card_focus: None,
+            strip_reveal_byte: None,
+            strip_drag_moved: false,
             cold_read: None,
             cr_page_bounds: std::rc::Rc::default(),
         }
@@ -3648,6 +3658,7 @@ impl Editor {
                 self.strip.scrubbing = false;
                 self.strip.scrub_fabric = false;
                 self.strip_scrub_to(pos, true, cx);
+                self.strip_reveal_edit_at(pos);
             }
             return;
         }
@@ -3672,15 +3683,15 @@ impl Editor {
             };
             let anchor = hit.anchor0 as f32
                 + (hit.anchor1 as f32 - hit.anchor0 as f32) * f;
-            if let Some(frame) = self.last_frame.as_ref()
-                && let Some(preview) = self.history_preview.as_ref()
-            {
+            // Deferred: mapping this byte through `last_frame` here would
+            // read the PREVIOUS moment's layout (the scrub above just
+            // changed the preview) — the reveal waits for its own frame,
+            // where the packed card lands beside it.
+            if let Some(preview) = self.history_preview.as_ref() {
                 let rope = ropey::Rope::from_str(&preview.text);
-                let byte = rope.char_to_byte((anchor.round().max(0.) as usize)
-                    .min(rope.len_chars()));
-                if let Some(y) = frame.position_of(byte, false).map(|p| p.y) {
-                    self.scroll_top = y.clamp(px(0.), frame.max_scroll());
-                }
+                self.strip_reveal_byte = Some(rope.char_to_byte(
+                    (anchor.round().max(0.) as usize).min(rope.len_chars()),
+                ));
             }
             self.past_card_focus = Some((hit.card_id, Instant::now()));
             cx.notify();
@@ -3714,6 +3725,7 @@ impl Editor {
                 self.strip.scrubbing = false;
                 self.strip.scrub_fabric = false;
                 self.strip_scrub_to(pos, true, cx);
+                self.strip_reveal_edit_at(pos);
             }
             return;
         }
@@ -3751,6 +3763,7 @@ impl Editor {
         self.strip.parked = true;
         self.strip.scrubbing = true;
         self.strip.scrub_fabric = fabric;
+        self.strip_drag_moved = false;
         self.strip_scrub_to(pos, !fabric, cx);
     }
 
@@ -3778,6 +3791,39 @@ impl Editor {
             .filter(|(_, d)| *d <= SNAP_PX)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map_or(pos_ms, |(ms, _)| ms)
+    }
+
+    /// One discrete pointer park = one reveal (§3a, corridor round three):
+    /// scroll the preview to where the WRITING was at the parked moment —
+    /// the run under t, its chars interpolated through the interior, or the
+    /// latest run before it. A drag never reveals (the writer parked her
+    /// eyes on a passage to watch it change under the scrub); keyboard
+    /// steps don't either — the hand that points gets taken there, the keys
+    /// that nudge keep the eye still. Deferred to the parked layout's own
+    /// frame via `strip_reveal_byte`.
+    fn strip_reveal_edit_at(&mut self, pos_ms: i64) {
+        let ch = self
+            .doc
+            .journal()
+            .runs
+            .iter()
+            .take_while(|r| r.t0 <= pos_ms)
+            .last()
+            .map(|r| {
+                let ins = r.ins.chars().count();
+                if pos_ms >= r.t1 {
+                    r.pos + ins
+                } else {
+                    let span = (r.t1 - r.t0).max(1) as f32;
+                    let f = ((pos_ms - r.t0) as f32 / span).clamp(0., 1.);
+                    r.pos + (ins as f32 * f) as usize
+                }
+            });
+        let (Some(ch), Some(preview)) = (ch, self.history_preview.as_ref()) else {
+            return;
+        };
+        let rope = ropey::Rope::from_str(&preview.text);
+        self.strip_reveal_byte = Some(rope.char_to_byte(ch.min(rope.len_chars())));
     }
 
     /// Map a rail x (window coords) → fraction of the WHOLE history → wall ms.
@@ -15174,11 +15220,26 @@ impl Element for EditorElement {
             }
         }
 
+        // A strip navigation's one-shot reveal (§3a): now that the PARKED
+        // moment's own paragraphs exist, land the requested byte a third
+        // down the viewport — computing this at click time read the previous
+        // moment's geometry.
+        let reveal = self.editor.read(cx).strip_reveal_byte;
+        if let Some(byte) = reveal
+            && let Some(par) = paragraphs.iter().find(|p| byte <= p.range.end)
+        {
+            let (line, _) = par.position(byte.saturating_sub(par.range.start), false);
+            let y = par.top + par.text_top + par.line_height * (line as f32);
+            scroll_top = (y - viewport / 3.)
+                .clamp(px(0.), (content_height + line_height - viewport).max(px(0.)));
+        }
+
         // Write the clamped/adjusted scroll back; no notify needed, we're
         // mid-frame and painting with this exact value.
         self.editor.update_in_draw(cx, |editor| {
             editor.scroll_top = scroll_top;
             editor.autoscroll_request = false;
+            editor.strip_reveal_byte = None;
         });
 
         let cursor = cursor_pos.and_then(|(pos, cursor_lh)| {
@@ -20541,12 +20602,16 @@ impl Editor {
             }
         }
         projected.sort_by(|a, b| a.1.unwrap().total_cmp(&b.1.unwrap()));
-        let items: Vec<PlaceItem> = projected.iter().map(|(_, anchor, height)| PlaceItem {
+        // The thread-click focus is the packer's active card (Pass 3): the
+        // clicked card is guaranteed a place in the lane instead of being
+        // culled at the edge the reveal landed on.
+        let focus = self.past_card_focus.map(|(id, _)| id);
+        let items: Vec<PlaceItem> = projected.iter().map(|(card, anchor, height)| PlaceItem {
             anchor: f32::from(frame.bounds.origin.y) + anchor.unwrap()
                 - f32::from(frame.scroll_top),
             height: *height,
             pin: true,
-            active: false,
+            active: focus == Some(card.id),
         }).collect();
         let tops = place_margin_cards(&items, floor, viewport_bottom, MARGIN_GAP);
         let mut orphan_top = viewport_bottom;
@@ -25365,6 +25430,7 @@ impl Editor {
                         }
                     }
                     if editor.strip.scrubbing && ev.pressed_button == Some(MouseButton::Left) {
+                        editor.strip_drag_moved = true;
                         let fabric = editor.strip.scrub_fabric;
                         let pos = if fabric {
                             editor.strip_pos_at_fabric_x(f32::from(ev.position.x))
@@ -25385,6 +25451,9 @@ impl Editor {
                             if settled != editor.strip.pos_ms {
                                 editor.strip_scrub_to(settled, false, cx);
                             }
+                            if !editor.strip_drag_moved {
+                                editor.strip_reveal_edit_at(editor.strip.pos_ms);
+                            }
                         }
                         cx.notify();
                     }),
@@ -25397,6 +25466,9 @@ impl Editor {
                             let settled = editor.strip_settle_ms(editor.strip.pos_ms);
                             if settled != editor.strip.pos_ms {
                                 editor.strip_scrub_to(settled, false, cx);
+                            }
+                            if !editor.strip_drag_moved {
+                                editor.strip_reveal_edit_at(editor.strip.pos_ms);
                             }
                         }
                         cx.notify();
