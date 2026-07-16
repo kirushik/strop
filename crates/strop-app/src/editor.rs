@@ -707,6 +707,7 @@ actions!(
         ScrapsTravel, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
         MoveToManuscript, PutBackScrap, ToggleGraveyard, ReadItCold, CrRefuse, CrNoop,
         CrCopy, CrEscape, CrNextPage, CrPrevPage, CrFirstPage, CrLastPage,
+        StripFineLeft, StripFineRight,
     ]
 );
 
@@ -762,6 +763,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-down", SelectParagraphDown, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
+        // Parked in the past, plain arrows step stations; alt-arrows are the
+        // fine lane — one work-px per press (§3a). At now they do nothing,
+        // so no prose gesture is stolen.
+        KeyBinding::new("alt-left", StripFineLeft, ctx),
+        KeyBinding::new("alt-right", StripFineRight, ctx),
         KeyBinding::new("shift-up", SelectUp, ctx),
         KeyBinding::new("shift-down", SelectDown, ctx),
         KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
@@ -1338,6 +1344,9 @@ pub struct Editor {
     compare_active_b: bool,
     compare_scroll_a: ScrollHandle,
     compare_scroll_b: ScrollHandle,
+    /// (A's pin ms, B's scrub ms, baked marks) — a cache slot the draw
+    /// pass shares, not an API type worth an alias.
+    #[allow(clippy::type_complexity)]
     compare_alignment: std::rc::Rc<std::cell::RefCell<Option<(
         i64, i64, Vec<strop_core::diff::ParagraphMark>)>>>,
     compare_hover_mark: Option<usize>,
@@ -1450,6 +1459,10 @@ pub struct Editor {
     palette_input: Option<Entity<TextField>>,
     /// The strip's inline "Name this version" composer (§3c).
     strip_name_input: Option<Entity<TextField>>,
+    /// `Some(timestamp)` while the composer RENAMES the writer-named version
+    /// parked under the playhead (§3c): commit renames, an emptied commit
+    /// demotes. `None` = the create mode.
+    strip_name_target: Option<i64>,
     palette_selected: usize,
     /// The omni-list's scroll state (`render_omni`'s "omni-list" div),
     /// persisted across frames so it survives the per-frame rebuild. Mouse
@@ -2261,6 +2274,7 @@ impl Editor {
             last_pass: PassKind::Diagnostic("line".to_owned()),
             palette_input: None,
             strip_name_input: None,
+            strip_name_target: None,
             palette_selected: 0,
             omni_scroll: ScrollHandle::new(),
             palette_query: String::new(),
@@ -2611,7 +2625,20 @@ impl Editor {
         if self.strip.saved_sel.is_none() {
             self.strip.saved_sel = Some(self.selected_range.clone());
         }
-        let input = cx.new(|cx| TextField::single(cx, String::new()));
+        // Parked ON a writer-named version, the verb is Rename (§3c): the
+        // composer opens holding the current name, selected — the
+        // prefilled-datum idiom: typing replaces it, erasing it erases the
+        // datum (an emptied commit demotes).
+        let seed = self
+            .strip
+            .parked
+            .then(|| self.strip_named_station_at(self.strip.pos_ms))
+            .flatten();
+        self.strip_name_target = seed.as_ref().map(|_| self.strip.pos_ms);
+        let input = cx.new(|cx| match &seed {
+            Some(name) => TextField::single_selected(cx, name.clone()),
+            None => TextField::single(cx, String::new()),
+        });
         cx.subscribe_in(
             &input,
             window,
@@ -2632,6 +2659,7 @@ impl Editor {
         if self.strip_name_input.take().is_none() {
             return;
         }
+        self.strip_name_target = None;
         if !self.strip.parked && let Some(selection) = self.strip.saved_sel.take() {
             self.selected_range = selection;
         }
@@ -2650,7 +2678,10 @@ impl Editor {
             return;
         };
         let draft = input.read(cx).content.clone();
-        if draft.trim().is_empty() {
+        // Create mode: an empty draft dismisses quietly. Rename mode: an
+        // emptied field IS the demotion — the writer deleted the datum,
+        // and blur commits what the field holds (§3c).
+        if draft.trim().is_empty() && self.strip_name_target.is_none() {
             self.cancel_strip_name(window, cx);
         } else {
             self.commit_strip_name(&draft, window, cx);
@@ -2681,15 +2712,45 @@ impl Editor {
             return;
         };
         let draft = input.read(cx).content.clone();
-        if !draft.trim().is_empty() {
+        if !draft.trim().is_empty() || self.strip_name_target.is_some() {
             self.commit_strip_name_core(&draft, cx);
         }
+        self.strip_name_target = None;
+    }
+
+    /// Look up the writer-named station standing exactly at `pos_ms` in the
+    /// current bake — the rename verb's precondition (§3c).
+    fn strip_named_station_at(&self, pos_ms: i64) -> Option<String> {
+        self.strip.bake.as_ref()?.stations.iter()
+            .find(|s| s.at_ms == pos_ms && s.writer_named())
+            .map(|s| s.label.clone())
     }
 
     /// Store + re-bake for a named version; true when it was actually
     /// stored. Window-free so the departure/close paths can share it.
     fn commit_strip_name_core(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
         let name = name.trim();
+        // Rename mode (§3c): the composer opened over an existing named
+        // version. A non-empty commit renames it; an emptied one demotes it
+        // to an unnamed station — the naming verb's inverse (P13). The
+        // recorded state is never removed.
+        if let Some(ts) = self.strip_name_target.take() {
+            let Some(store) = &self.store else { return false };
+            let Some(ix) = store
+                .checkpoints()
+                .iter()
+                .rposition(|cp| cp.manual && cp.timestamp_ms() == ts)
+            else {
+                return false;
+            };
+            store.rename_checkpoint(ix, name);
+            let now = self.strip.bake.as_ref().map_or(ts, |b| b.now_ms);
+            self.strip_bake(now);
+            self.strip_name_input = None;
+            self.mark_dirty();
+            cx.notify();
+            return true;
+        }
         if name.is_empty() {
             return false;
         }
@@ -3701,6 +3762,12 @@ impl Editor {
     /// cloth contract holds while deliberate moments win the landing.
     fn strip_settle_ms(&self, pos_ms: i64) -> i64 {
         const SNAP_PX: f32 = 4.;
+        // Comparing is fine forensics — B often needs the moment just
+        // beside a mark, so the detent stands down while a pin is set
+        // (corridor round two). The rescue visit keeps it.
+        if self.strip.pin_ms.is_some() {
+            return pos_ms;
+        }
         let Some(bake) = self.strip.bake.as_ref() else {
             return pos_ms;
         };
@@ -3814,6 +3881,26 @@ impl Editor {
         if let Some(t) = next {
             self.strip.parked = true;
             self.strip_scrub_to(t, true, cx);
+        }
+    }
+
+    /// alt-arrows: the fine lane (§3a, corridor round two). Plain arrows walk
+    /// the deliberate marks; a press here moves exactly one work-px of the
+    /// fixed quant — the precise instrument for the moment BETWEEN marks that
+    /// the release detent would otherwise make hard to reach by hand.
+    fn strip_fine_step(&mut self, dir: f32, cx: &mut Context<Self>) {
+        if !self.strip.is_parked() {
+            return;
+        }
+        let Some(bake) = self.strip.bake.as_ref() else {
+            return;
+        };
+        let work = bake.timeline.work_at(self.strip.pos_ms) + dir;
+        let pos = bake
+            .timeline
+            .wall_at(work.clamp(0., bake.timeline.total_work));
+        if pos != self.strip.pos_ms {
+            self.strip_scrub_to(pos, true, cx);
         }
     }
 
@@ -20464,7 +20551,7 @@ impl Editor {
         let tops = place_margin_cards(&items, floor, viewport_bottom, MARGIN_GAP);
         let mut orphan_top = viewport_bottom;
         detached.reverse();
-        let placed = projected.into_iter().zip(tops).map(|(item, top)| (item, top))
+        let placed = projected.into_iter().zip(tops)
             .chain(detached.into_iter().map(|item| {
                 orphan_top -= item.2 + MARGIN_GAP;
                 (item, orphan_top)
@@ -21449,6 +21536,12 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::delete_word_right))
                     .on_action(cx.listener(Self::left))
                     .on_action(cx.listener(Self::right))
+                    .on_action(cx.listener(|editor, _: &StripFineLeft, _, cx| {
+                        editor.strip_fine_step(-1., cx);
+                    }))
+                    .on_action(cx.listener(|editor, _: &StripFineRight, _, cx| {
+                        editor.strip_fine_step(1., cx);
+                    }))
                     .on_action(cx.listener(Self::up))
                     .on_action(cx.listener(Self::down))
                     .on_action(cx.listener(Self::word_left))
@@ -25155,7 +25248,7 @@ impl Editor {
             let empty = input.read(cx).content.is_empty();
             div()
                 .relative()
-                .w(px(free_interval.min(280.).max(160.)))
+                .w(px(free_interval.clamp(160., 280.)))
                 .h(px(22.))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .when(empty, |d| {
@@ -25172,10 +25265,16 @@ impl Editor {
                 })
                 .child(input)
         } else if free_interval >= 104. {
-            let label = if free_interval >= 132. {
-                "Name this version"
-            } else {
-                "Name version"
+            // Parked ON a writer-named version (the detent's common landing),
+            // the verb inverts to Rename (§3c): the composer opens holding
+            // the current name; clearing it demotes.
+            let renaming = parked
+                && self.strip_named_station_at(self.strip.pos_ms).is_some();
+            let label = match (renaming, free_interval >= 132.) {
+                (true, true) => "Rename this version",
+                (true, false) => "Rename version",
+                (false, true) => "Name this version",
+                (false, false) => "Name version",
             };
             let naming = strip_action("strip-name-version", label).on_mouse_down(
                 MouseButton::Left,
@@ -25835,8 +25934,7 @@ impl Element for StripElement {
                 }
             }
             let first = t.segments.first().and_then(|s| s.first()).copied();
-            if t.origin_proven && first.is_some() {
-                let p = first.unwrap();
+            if t.origin_proven && let Some(p) = first {
                 let x0 = fab_x(p.x);
                 let y = band_top + p.y;
                 if x0 >= rail_x0 && x0 <= rail_x1 {
@@ -26043,7 +26141,7 @@ mod tests {
     ) {
         let editor = cx.new(|cx| Editor::new(
             cx, "now", SpanSet::default(), BlockMap::default()));
-        editor.update(cx, |editor, cx| {
+        cx.update_entity(&editor, |editor, cx| {
             editor.strip.open = true;
             editor.strip.parked = true;
             editor.strip.pos_ms = 20;

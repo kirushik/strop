@@ -449,8 +449,13 @@ the earlier no-snap ruling): the DRAG stays continuous — the live
 preview keeps its exactness under the hand — but a park that ENDS
 within ~4 work-px of a station settles onto the station's own
 timestamp. A deliberate mark beats the half-sentence thirty seconds
-after it; the cloth contract holds while the finger is down, and
-arrow stepping still reaches every in-between moment.
+after it; the cloth contract holds while the finger is down. The
+detent stands down while a Compare pin is set — comparing is fine
+forensics, and B often needs the moment just beside a mark. **The
+fine lane**: alt-arrows move the parked playhead by exactly one
+work-px of the fixed quant per press — the precise instrument for
+the moments between marks; plain arrows keep walking the stations
+and big-cut shoulders.
 **Scrub stability law:** while the
 thumb moves, the only things that change are the thumb's x, the
 readout numerals, the document above, the past margin's projection
@@ -539,11 +544,17 @@ parked, living in the moment dock (§3e):
   confirmation, no congratulation (P2). If persistence fails the
   interactive composer stays — never a station that wasn't stored.
   The reversal is safe because naming now has its inverse (P13):
-  **demotion** — in the history panel, clearing a version's name
-  un-names it. The recorded state stays forever (nothing is lost);
-  only the label, which was writer data, comes off, and the station
-  leaves the strip's label lane. Removing a version outright does
-  not exist: recorded moments are the file's history, not chrome.
+  **demotion**. Parked ON a writer-named version — the detent's
+  common landing — the dock verb inverts to **`Rename this
+  version`**: the composer opens holding the current name, selected
+  (the prefilled-datum idiom: typing replaces it, erasing it erases
+  the datum). A non-empty commit renames; an EMPTIED commit demotes
+  the version to an unnamed station. The recorded state stays
+  forever (nothing is lost); only the label, which was writer data,
+  comes off, and the station leaves the strip's label lane. The
+  history panel's double-click rename obeys the same grammar (clear
+  to un-name). Removing a version outright does not exist: recorded
+  moments are the file's history, not chrome.
 
 Names are the writer's words: never generated, never uniquified,
 never truncated by the system (P3, P8). Renaming and everything else

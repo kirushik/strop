@@ -643,6 +643,14 @@ pub struct Station {
     pub at_ms: i64,
 }
 
+impl Station {
+    /// A writer's own named version — the only stations the strip's rename
+    /// verb (§3c) may touch; the honest automatics stay system-owned.
+    pub fn writer_named(&self) -> bool {
+        self.rank == RANK_WRITER
+    }
+}
+
 /// A stepwise envelope vertex (document length over time): x = a run's right
 /// edge, y hangs from the fabric top and steps down as the story grows.
 #[derive(Clone, Copy, Debug)]
@@ -1078,6 +1086,10 @@ const RANK_REFLEX: u8 = 6;
 
 /// The automatic checkpoint names Strop writes — everything else that is
 /// `manual` is a writer's own title (the highest-ranked label).
+// "Checkpoint N" shares the reflex rank by design; it keeps its own rung
+// so the name ladder stays legible. Clippy sees identical arms, we see
+// the enumeration of every name Strop writes.
+#[allow(clippy::if_same_then_else)]
 fn station_rank(name: &str, manual: bool) -> u8 {
     if manual && name != "Fresh tutorial" {
         RANK_WRITER
