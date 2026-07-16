@@ -310,11 +310,11 @@ fn compact_on_open(doc: LoroDoc, original: &[u8], path: &Path) -> LoroDoc {
     {
         return doc;
     }
-    let bak = path.with_extension("strop.pre-compact.bak");
+    let bak = sidecar_path(path, ".pre-compact.bak");
     if !bak.exists() && fs::write(&bak, original).is_err() {
         return doc;
     }
-    let tmp = path.with_extension("strop.tmp");
+    let tmp = sidecar_path(path, ".tmp");
     if fs::write(&tmp, &shallow).is_err() || fs::rename(&tmp, path).is_err() {
         let _ = fs::remove_file(&tmp);
         return doc;
@@ -672,10 +672,7 @@ impl Default for SaveWorker {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("strop.tmp");
+    let tmp = sidecar_path(path, ".tmp");
     let mut file = fs::File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -686,6 +683,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 #[cfg(not(windows))]
@@ -1519,8 +1522,39 @@ mod tests {
         fs::write(&path, b"old").unwrap();
         atomic_write(&path, b"new snapshot").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new snapshot");
-        assert!(!path.with_extension("strop.tmp").exists());
+        assert!(!sidecar_path(&path, ".tmp").exists());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sidecars_append_to_extensionless_dotted_names() {
+        let path = Path::new("my-notes v0.2");
+        assert_eq!(
+            sidecar_path(path, ".tmp"),
+            PathBuf::from("my-notes v0.2.tmp")
+        );
+        assert_eq!(
+            sidecar_path(path, ".pre-compact.bak"),
+            PathBuf::from("my-notes v0.2.pre-compact.bak")
+        );
+        assert_eq!(
+            sidecar_path(Path::new("doc.strop"), ".tmp"),
+            PathBuf::from("doc.strop.tmp")
+        );
+    }
+
+    #[test]
+    fn atomic_save_does_not_recreate_a_vanished_parent() {
+        let dir = temp_path("vanished-parent");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("document.strop");
+        fs::remove_dir(&dir).unwrap();
+
+        assert!(atomic_write(&path, b"snapshot").is_err());
+        assert!(!dir.exists());
+        assert!(!path.exists());
+        assert!(!sidecar_path(&path, ".tmp").exists());
     }
 
     #[test]
@@ -1920,7 +1954,7 @@ manuscript opens here");
     #[test]
     fn bloated_file_compacts_at_open_without_losing_state() {
         let path = temp_path("compact");
-        let bak = path.with_extension("strop.pre-compact.bak");
+        let bak = sidecar_path(&path, ".pre-compact.bak");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&bak);
 

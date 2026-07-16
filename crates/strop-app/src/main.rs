@@ -122,7 +122,10 @@ fn data_file() -> (PathBuf, bool) {
     if let Some(migrated) = files::migrate_scratch() {
         return (migrated, false);
     }
-    if let Some(recent) = files::recents().into_iter().next() {
+    if let Some(recent) = files::recents()
+        .into_iter()
+        .find(|path| path.exists())
+    {
         return (recent, false);
     }
     (files::welcome_path(), true)
@@ -208,6 +211,22 @@ fn main() {
                 } else {
                     p.clone()
                 };
+                let require_existing = std::env::var_os("STROP_REQUIRE_EXISTING").is_some();
+                if !require_existing
+                    && !store_path.exists()
+                    && let Some(parent) = store_path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    startup_error::show(
+                        startup_error::OpenFailure::from_io(
+                            startup_error::OpenOperation::Open,
+                            store_path,
+                            &e,
+                        ),
+                        cx,
+                    );
+                    return;
+                }
                 // One writer per document: if a live instance already holds
                 // this file, ask it to surface and exit BEFORE we open (and
                 // mutate) the Loro store — two writers on one store is the
@@ -232,6 +251,19 @@ fn main() {
                     }
                 }
                 match Store::open(&store_path) {
+                    Ok((_, None)) if require_existing => {
+                        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+                        drop(instance_guard.take());
+                        startup_error::show(
+                            startup_error::OpenFailure::from_io(
+                                startup_error::OpenOperation::Open,
+                                store_path,
+                                &e,
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
                     Ok(opened) => {
                         if !smoke {
                             files::push_recent(opened.0.path());

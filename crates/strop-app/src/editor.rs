@@ -1498,6 +1498,8 @@ pub struct Editor {
     palette_freq: HashMap<String, u32>,
     /// In-titlebar document rename (PLAN.md E2).
     doc_rename_input: Option<Entity<TextField>>,
+    /// A refused rename stays witnessed beside the still-open field.
+    doc_rename_error: Option<&'static str>,
     /// The keyboard-map overlay (PLAN.md E4, ctrl-?).
     shortcuts_open: bool,
     /// The AI settings panel (DESIGN §2-ai, F4): form + async test +
@@ -2307,6 +2309,7 @@ impl Editor {
             omni_return: None,
             palette_freq: HashMap::new(),
             doc_rename_input: None,
+            doc_rename_error: None,
             shortcuts_open: false,
             ai_settings: None,
             ai_settings_generation: 0,
@@ -6279,6 +6282,7 @@ impl Editor {
                 TextFieldEvent::Commit(title) => editor.finish_rename(title.clone(), window, cx),
                 TextFieldEvent::Cancel => {
                     editor.doc_rename_input = None;
+                    editor.doc_rename_error = None;
                     window.focus(&editor.focus_handle, cx);
                     cx.notify();
                 }
@@ -6300,9 +6304,10 @@ impl Editor {
     }
 
     fn finish_rename(&mut self, title: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.doc_rename_input = None;
-        window.focus(&self.focus_handle, cx);
+        self.doc_rename_error = None;
         let Some(stem) = crate::files::stem_from_title(&title) else {
+            self.doc_rename_input = None;
+            window.focus(&self.focus_handle, cx);
             cx.notify();
             return;
         };
@@ -6310,6 +6315,8 @@ impl Editor {
         // a delayed write cannot recreate the old path after the rename.
         if let Err(e) = self.flush_saves() {
             eprintln!("strop: save before rename: {e}");
+            self.doc_rename_input = None;
+            window.focus(&self.focus_handle, cx);
             cx.notify();
             return;
         }
@@ -6323,8 +6330,21 @@ impl Editor {
                 Ok(()) => {
                     crate::files::replace_recent(&old, store.path());
                     window.set_window_title(&format!("{stem} — Strop"));
+                    self.doc_rename_input = None;
+                    window.focus(&self.focus_handle, cx);
                 }
-                Err(e) => eprintln!("strop: rename: {e}"),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    self.doc_rename_error = Some("another file has this name");
+                    if let Some(input) = &self.doc_rename_input {
+                        let focus = input.read(cx).focus_handle.clone();
+                        window.focus(&focus, cx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("strop: rename: {e}");
+                    self.doc_rename_input = None;
+                    window.focus(&self.focus_handle, cx);
+                }
             }
         }
         cx.notify();
@@ -6546,6 +6566,7 @@ impl Editor {
             .pb(px(6.));
         let mut last_section = "";
         for (ix, row) in rows.iter().enumerate() {
+            let missing = matches!(row, OmniRow::Recent(path) if !path.exists());
             if grouped {
                 let section = omni_row_section(row);
                 if section != last_section {
@@ -6568,7 +6589,10 @@ impl Editor {
                     (cmd.label.to_owned(), cmd.keys.map(|k| k.to_owned()), None)
                 }
                 OmniRow::Recent(p) => {
-                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_owned();
+                    let mut stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_owned();
+                    if missing {
+                        stem.push_str(" · missing");
+                    }
                     let dir = p
                         .parent()
                         .map(|d| d.display().to_string().replace(&home, "~"))
@@ -6604,6 +6628,7 @@ impl Editor {
                     .items_center()
                     .gap(px(10.))
                     .cursor(CursorStyle::PointingHand)
+                    .when(missing, |d| d.bg(rgb(STALE_BG)))
                     .when(ix == selected, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                     .on_mouse_down(
@@ -6634,7 +6659,7 @@ impl Editor {
                             .min_w(px(0.))
                             .truncate()
                             .text_size(px(13.))
-                            .text_color(rgb(TEXT_COLOR))
+                            .text_color(rgb(if missing { MUTED_COLOR } else { TEXT_COLOR }))
                             .child(label),
                     )
                     .when_some(right, |d, right| {
@@ -16686,8 +16711,13 @@ impl Editor {
                     (Some(input), _) => div()
                         .occlude()
                         .ml(px(8.))
-                        .w(px(220.))
-                        .child(input.clone())
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().w(px(220.)).child(input.clone()))
+                        .when_some(self.doc_rename_error, |row, error| {
+                            row.child(div().text_color(rgb(ERROR)).child(error))
+                        })
                         .into_any_element(),
                     (None, Some(store)) => {
                         let stem = store

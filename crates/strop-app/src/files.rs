@@ -57,13 +57,25 @@ fn recents_file() -> PathBuf {
     crate::paths::state_dir().join("recents.json")
 }
 
-/// Most-recent-first, existing files only.
+/// Most-recent-first. Missing files stay visible as stale evidence.
 pub fn recents() -> Vec<PathBuf> {
     let Ok(json) = std::fs::read_to_string(recents_file()) else {
         return Vec::new();
     };
     let list: Vec<PathBuf> = serde_json::from_str(&json).unwrap_or_default();
-    list.into_iter().filter(|p| p.exists()).collect()
+    list
+}
+
+fn cap_recents(list: &mut Vec<PathBuf>) {
+    let mut live = 0;
+    list.retain(|path| {
+        if path.exists() {
+            live += 1;
+            live <= 20
+        } else {
+            true
+        }
+    });
 }
 
 pub fn push_recent(path: &Path) {
@@ -79,7 +91,7 @@ pub fn push_recent(path: &Path) {
     let mut list = recents();
     list.retain(|p| p != &path);
     list.insert(0, path);
-    list.truncate(20);
+    cap_recents(&mut list);
     let file = recents_file();
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -308,7 +320,10 @@ pub fn reveal(path: &Path) {
 /// the same CRDT file unless the user opens the same path twice).
 pub fn open_in_new_window(path: &Path) {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).arg(path).spawn();
+        let _ = std::process::Command::new(exe)
+            .env("STROP_REQUIRE_EXISTING", "1")
+            .arg(path)
+            .spawn();
     }
 }
 
@@ -340,18 +355,48 @@ pub fn open_welcome_window() {
     }
 }
 
-/// Sanitize a typed title into a file stem (keeps Unicode letters, trims
-/// path separators and leading dots).
+/// Sanitize a typed title into a portable file stem. Legal punctuation such
+/// as hyphens and interior dots is preserved because titles rely on it.
 pub fn stem_from_title(title: &str) -> Option<String> {
-    let cleaned: String = title
+    let mut cleaned: String = title
         .trim()
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == '\0' { ' ' } else { c })
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect::<String>()
         .trim()
         .trim_start_matches('.')
+        .trim_end_matches(['.', ' '])
         .to_string();
-    (!cleaned.is_empty()).then_some(cleaned)
+    if cleaned.is_empty() {
+        return None;
+    }
+    let device = cleaned
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let numbered_device = |prefix| {
+        device
+            .strip_prefix(prefix)
+            .is_some_and(|n| {
+                matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+    };
+    let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || numbered_device("COM")
+        || numbered_device("LPT");
+    if reserved {
+        cleaned.push('_');
+    }
+    Some(cleaned)
 }
 
 #[cfg(test)]
@@ -497,5 +542,36 @@ mod tests {
         assert_eq!(stem_from_title("..hidden"), Some("hidden".into()));
         assert_eq!(stem_from_title("   "), None);
         assert_eq!(stem_from_title("///"), None);
+        assert_eq!(stem_from_title("draft.old"), Some("draft.old".into()));
+        assert_eq!(
+            stem_from_title("my-notes v0.2"),
+            Some("my-notes v0.2".into())
+        );
+        assert_eq!(stem_from_title("CON"), Some("CON_".into()));
+        assert_eq!(stem_from_title("con.txt"), Some("con.txt_".into()));
+        assert_eq!(stem_from_title("notes."), Some("notes".into()));
+        assert_eq!(stem_from_title("a:b"), Some("a b".into()));
+    }
+
+    #[test]
+    fn missing_recents_do_not_consume_the_live_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "strop-recents-cap-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = root.join("missing.strop");
+        let mut list = vec![missing.clone()];
+        for ix in 0..21 {
+            let path = root.join(format!("live-{ix}.strop"));
+            std::fs::write(&path, b"x").unwrap();
+            list.push(path);
+        }
+
+        cap_recents(&mut list);
+        assert_eq!(list.iter().filter(|path| path.exists()).count(), 20);
+        assert!(list.contains(&missing));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
