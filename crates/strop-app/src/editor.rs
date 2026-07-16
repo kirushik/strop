@@ -2639,17 +2639,61 @@ impl Editor {
         cx.notify();
     }
 
+    /// The universal blur law reaches the naming composer (corridor report,
+    /// 2026-07-16: it was the ONE field in Strop that dropped its draft on
+    /// focus loss). A click-away commits a non-empty draft and quietly
+    /// dismisses an empty one; Esc remains the deliberate cancel. Safe to
+    /// commit because naming now has its inverse — a version's name can be
+    /// removed in the history panel (P13).
+    fn resolve_strip_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.strip_name_input.as_ref() else {
+            return;
+        };
+        let draft = input.read(cx).content.clone();
+        if draft.trim().is_empty() {
+            self.cancel_strip_name(window, cx);
+        } else {
+            self.commit_strip_name(&draft, window, cx);
+        }
+    }
+
     fn commit_strip_name(
         &mut self,
         name: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.commit_strip_name_core(name, cx) {
+            if !self.strip.parked && let Some(selection) = self.strip.saved_sel.take() {
+                self.selected_range = selection;
+            }
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// The windowless half of the blur law: a close or departure cannot
+    /// reach `window.focus`, but a typed name still commits on the way out —
+    /// leaving must not shred the draft. (Focus and selection are the
+    /// leaving path's own business.)
+    fn resolve_strip_name_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.strip_name_input.take() else {
+            return;
+        };
+        let draft = input.read(cx).content.clone();
+        if !draft.trim().is_empty() {
+            self.commit_strip_name_core(&draft, cx);
+        }
+    }
+
+    /// Store + re-bake for a named version; true when it was actually
+    /// stored. Window-free so the departure/close paths can share it.
+    fn commit_strip_name_core(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
         let name = name.trim();
         if name.is_empty() {
-            return;
+            return false;
         }
-        let Some(store) = &self.store else { return };
+        let Some(store) = &self.store else { return false };
         let before = store.checkpoints().len();
         let timestamp_ms = if self.strip.parked {
             self.strip.pos_ms
@@ -2657,7 +2701,7 @@ impl Editor {
             strop_core::journal::now_ms()
         };
         let state = if self.strip.parked {
-            let Some(scratch) = self.strip.scratch.as_ref() else { return };
+            let Some(scratch) = self.strip.scratch.as_ref() else { return false };
             strop_core::store::CheckpointState {
                 text: scratch.replay.text(),
                 spans: scratch.replay.spans.clone(),
@@ -2672,18 +2716,15 @@ impl Editor {
         };
         store.add_checkpoint_at(name, timestamp_ms, state);
         if store.checkpoints().len() == before {
-            return;
+            return false;
         }
         let now = self.strip.bake.as_ref().map_or(timestamp_ms, |b| b.now_ms);
         self.strip_bake(now);
         self.strip_name_input = None;
         self.dirty_since_checkpoint = false;
         self.mark_dirty();
-        if !self.strip.parked && let Some(selection) = self.strip.saved_sel.take() {
-            self.selected_range = selection;
-        }
-        window.focus(&self.focus_handle, cx);
         cx.notify();
+        true
     }
 
     /// Build the rewind list from the checkpoints' MATERIALIZED states —
@@ -3111,18 +3152,29 @@ impl Editor {
             &input,
             window,
             move |editor, _, event: &TextFieldEvent, window, cx| {
-                if let TextFieldEvent::Commit(name) = event
-                    && !name.trim().is_empty()
-                {
-                    if let Some(store) = &editor.store {
-                        store.rename_checkpoint(ix, name.trim());
-                        editor.mark_dirty();
-                    }
-                    if let Some(hv) = &mut editor.history_view
-                        && let Some(e) = hv.entries.get_mut(ix)
-                    {
-                        e.name = name.trim().to_owned();
-                        e.manual = true;
+                // A non-empty commit renames (and promotes an automatic
+                // entry); an EMPTIED commit is the inverse verb — demotion
+                // to an unnamed version (P13: naming has an inverse; the
+                // recorded state itself is never removed). Emptying an
+                // already-unnamed row is a no-op, so autos can't be
+                // "demoted" into churn by an idle blur.
+                if let TextFieldEvent::Commit(name) = event {
+                    let name = name.trim();
+                    let demoting = name.is_empty()
+                        && editor.history_view.as_ref().is_some_and(|hv| {
+                            hv.entries.get(ix).is_some_and(|e| e.manual)
+                        });
+                    if !name.is_empty() || demoting {
+                        if let Some(store) = &editor.store {
+                            store.rename_checkpoint(ix, name);
+                            editor.mark_dirty();
+                        }
+                        if let Some(hv) = &mut editor.history_view
+                            && let Some(e) = hv.entries.get_mut(ix)
+                        {
+                            e.name = name.to_owned();
+                            e.manual = !name.is_empty();
+                        }
                     }
                 }
                 editor.rename_input = None;
@@ -3345,7 +3397,7 @@ impl Editor {
     }
 
     fn close_strip_now(&mut self, cx: &mut Context<Self>) {
-        self.strip_name_input = None;
+        self.resolve_strip_name_draft(cx);
         self.strip_departure = None;
         self.strip.open = false;
         self.strip.parked = false;
@@ -3641,6 +3693,26 @@ impl Editor {
         self.strip_scrub_to(pos, !fabric, cx);
     }
 
+    /// The release detent (corridor fix 2026-07-16, amending §3a): a park
+    /// that ENDS within a few work-px of a deliberate mark settles onto the
+    /// mark's exact timestamp — a named version beats the half-sentence
+    /// thirty seconds after it. The DRAG stays continuous (the live preview
+    /// keeps its exactness under the hand); only the release settles, so the
+    /// cloth contract holds while deliberate moments win the landing.
+    fn strip_settle_ms(&self, pos_ms: i64) -> i64 {
+        const SNAP_PX: f32 = 4.;
+        let Some(bake) = self.strip.bake.as_ref() else {
+            return pos_ms;
+        };
+        let w = bake.timeline.work_at(pos_ms);
+        bake.stations
+            .iter()
+            .map(|s| (s.at_ms, (bake.timeline.work_at(s.at_ms) - w).abs()))
+            .filter(|(_, d)| *d <= SNAP_PX)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or(pos_ms, |(ms, _)| ms)
+    }
+
     /// Map a rail x (window coords) → fraction of the WHOLE history → wall ms.
     /// The thumb travels `min(total_work, rail_width)` (design §1): when the
     /// history fits, the rail and the fixed-scale fabric coincide 1:1; when it
@@ -3870,7 +3942,7 @@ impl Editor {
             return;
         }
         self.resolve_composer_draft(cx);
-        self.strip_name_input = None;
+        self.resolve_strip_name_draft(cx);
         let from_ms = self.strip.pos_ms;
         let now = self
             .strip
@@ -11152,7 +11224,7 @@ impl Editor {
     /// genuinely-outside clicks arrive here.
     fn light_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.strip_name_input.is_some() {
-            self.cancel_strip_name(window, cx);
+            self.resolve_strip_name(window, cx);
         }
         // LAW 2 / C4 — no dead zones ANYWHERE: the margin lane, the titlebar
         // blank and the gutters all live OUTSIDE the editor column's hitbox,
@@ -17566,8 +17638,9 @@ impl Editor {
                     .text_color(rgb(MUTED_COLOR))
                     .child(
                         "Click a version to preview it in the document; Up/Down steps through \
-                         them. Double-click a name to rename. Restore brings a version back — \
-                         undoable, like everything here. Nothing is ever lost.",
+                         them. Double-click a name to rename; clear it to un-name. Restore \
+                         brings a version back — undoable, like everything here. Nothing is \
+                         ever lost.",
                     ),
             )
             // A legacy file's first history open: versions are being read out
@@ -25019,7 +25092,7 @@ impl Editor {
                 MouseButton::Left,
                 cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    editor.cancel_strip_name(window, cx);
+                    editor.resolve_strip_name(window, cx);
                     editor.strip_return_to_now(cx);
                 }),
             );
@@ -25049,11 +25122,24 @@ impl Editor {
             );
 
         let strip_action = |id: &'static str, label: &'static str| {
-            inline_action(id, label)
+            // The product's dashed actionable mark in CHROME ink:
+            // `inline_action` hovers toward page ink, which on the dark desk
+            // reads as a blackout (corridor report, 2026-07-16). A chrome
+            // action brightens toward the desk's bright ink instead — hover
+            // makes it MORE visible, same dashes, same grammar.
+            div()
+                .id(id)
+                .cursor(CursorStyle::PointingHand)
+                .text_color(rgb(0x8F8A7C))
+                .border_b_1()
+                .border_dashed()
+                .border_color(rgb(0x8F8A7C))
+                .hover(|d| d.text_color(rgb(0xE7E1D0)).border_color(rgb(0xE7E1D0)))
                 .px(px(6.))
                 .py(px(3.))
                 .font_family("PT Sans")
                 .text_size(px(11.))
+                .child(label)
         };
         let center = if comparing {
             div().child(
@@ -25140,7 +25226,7 @@ impl Editor {
                     MouseButton::Left,
                     cx.listener(|editor, ev: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        editor.cancel_strip_name(window, cx);
+                        editor.resolve_strip_name(window, cx);
                         editor.strip_park_at_x(
                             f32::from(ev.position.x),
                             f32::from(ev.position.y),
@@ -25194,14 +25280,26 @@ impl Editor {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|editor, _: &MouseUpEvent, _, cx| {
-                        editor.strip.scrubbing = false;
+                        if editor.strip.scrubbing {
+                            editor.strip.scrubbing = false;
+                            let settled = editor.strip_settle_ms(editor.strip.pos_ms);
+                            if settled != editor.strip.pos_ms {
+                                editor.strip_scrub_to(settled, false, cx);
+                            }
+                        }
                         cx.notify();
                     }),
                 )
                 .on_mouse_up_out(
                     MouseButton::Left,
                     cx.listener(|editor, _: &MouseUpEvent, _, cx| {
-                        editor.strip.scrubbing = false;
+                        if editor.strip.scrubbing {
+                            editor.strip.scrubbing = false;
+                            let settled = editor.strip_settle_ms(editor.strip.pos_ms);
+                            if settled != editor.strip.pos_ms {
+                                editor.strip_scrub_to(settled, false, cx);
+                            }
+                        }
                         cx.notify();
                     }),
                 )

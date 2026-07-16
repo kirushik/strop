@@ -397,7 +397,11 @@ Exactly four kinds of text exist:
      stay dashes) = a reversible text action. `Name this version`,
      `Compare`, `Done comparing`, clickable station labels,
      clickable dates, and `Now` while away from now all wear it.
-     Dashed = actionable, never emphasis.
+     Dashed = actionable, never emphasis. On the desk, hover
+     brightens toward the CHROME's bright ink (`#E7E1D0`) — never
+     toward page ink, which on the dark ground reads as a blackout
+     (corridor fix, 2026-07-16): hover makes a control MORE visible,
+     everywhere, by definition.
    - **dark fill** = commits a document-changing act. Exactly one
      control may wear it: `Restore`. Fill is not importance, not
      selection, not location.
@@ -440,6 +444,13 @@ hit: **named objects act exactly** — station labels and ticks (§2.1),
 dates (§1b), thread segments (§1e), and Compare's gutter marks (§3d)
 resolve before the lanes; everything unmarked keeps the lane grammar
 untouched, and no target may steal a drag that began in a lane.
+**The release detent** (corridor amendment, 2026-07-16, narrowing
+the earlier no-snap ruling): the DRAG stays continuous — the live
+preview keeps its exactness under the hand — but a park that ENDS
+within ~4 work-px of a station settles onto the station's own
+timestamp. A deliberate mark beats the half-sentence thirty seconds
+after it; the cloth contract holds while the finger is down, and
+arrow stepping still reaches every in-between moment.
 **Scrub stability law:** while the
 thumb moves, the only things that change are the thumb's x, the
 readout numerals, the document above, the past margin's projection
@@ -518,10 +529,21 @@ parked, living in the moment dock (§3e):
   label appear in the same frame the composer leaves (P6: no frame
   shows neither); the playhead, preview, and viewport do not move.
   Ranked label collision applies with writer-named at highest rank.
-- **Esc**, clicking outside, or closing the strip cancels; empty
-  Enter does nothing; no error text, no confirmation, no
-  congratulation (P2). If persistence fails the composer stays —
-  never a station that wasn't stored.
+- **Esc** cancels — the deliberate abort. **Clicking outside or
+  closing the strip commits a non-empty draft** (corridor REVERSAL,
+  2026-07-16, of v3.0's cancel-on-click-out: the composer was the
+  one field in Strop that dropped its draft on focus loss, and the
+  universal blur law wins — a writer with any Strop habituation
+  expects her typed name to survive a stray click). An empty draft
+  dismisses quietly; empty Enter does nothing; no error text, no
+  confirmation, no congratulation (P2). If persistence fails the
+  interactive composer stays — never a station that wasn't stored.
+  The reversal is safe because naming now has its inverse (P13):
+  **demotion** — in the history panel, clearing a version's name
+  un-names it. The recorded state stays forever (nothing is lost);
+  only the label, which was writer data, comes off, and the station
+  leaves the strip's label lane. Removing a version outright does
+  not exist: recorded moments are the file's history, not chrome.
 
 Names are the writer's words: never generated, never uniquified,
 never truncated by the system (P3, P8). Renaming and everything else

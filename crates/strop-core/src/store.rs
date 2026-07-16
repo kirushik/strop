@@ -1034,7 +1034,9 @@ impl Store {
     }
 
     /// Rename a checkpoint; renaming an automatic entry makes it named
-    /// (manual), per the rewind research.
+    /// (manual), per the rewind research. An EMPTY name is the inverse verb
+    /// — demotion: the version keeps its recorded state (nothing is lost)
+    /// and returns to an unnamed station, off the strip's label lane.
     pub fn rename_checkpoint(&self, ix: usize, name: &str) {
         let list = self.doc.get_list(CHECKPOINTS_CONTAINER);
         let Some(v) = list.get(ix) else { return };
@@ -1045,7 +1047,7 @@ impl Store {
             return;
         };
         cp.name = name.to_owned();
-        cp.manual = true;
+        cp.manual = !name.is_empty();
         match serde_json::to_string(&cp) {
             Ok(json) => {
                 // Insert-before-delete (see `set_checkpoint_state`): a failed
