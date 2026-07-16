@@ -1679,6 +1679,10 @@ pub struct Editor {
     strip_station_hits: std::rc::Rc<std::cell::RefCell<Vec<StripStationHit>>>,
     /// Plain wide-well datum hover bounds (never click targets).
     strip_well_hits: std::rc::Rc<std::cell::RefCell<Vec<StripWellHit>>>,
+    /// Painted thread-segment targets (§1e: threads answer the hand).
+    strip_thread_hits: std::rc::Rc<std::cell::RefCell<Vec<StripThreadHit>>>,
+    strip_hover_thread: Option<u64>,
+    past_card_focus: Option<(u64, Instant)>,
     /// The cold read (impl 05 Wave B): the writer-invoked, read-only, paged
     /// takeover — the reading room. `Some` while the room is up; beside
     /// `history_preview` per the state-on-Editor + render-switch precedent.
@@ -2134,6 +2138,36 @@ fn seed_prose(words: usize) -> String {
 }
 
 impl Editor {
+    fn past_cards_at(&self, at_ms: i64) -> Vec<PastMarginCard> {
+        let Some(bake) = self.strip.bake.as_ref() else { return Vec::new() };
+        let mut cards: Vec<PastMarginCard> = self.strip.past_margin_at(at_ms).into_iter()
+            .map(|card| PastMarginCard {
+                id: card.id, kind: card.kind, title: card.body.title.clone(),
+                body: card.body.body.clone(), anchor: card.anchor.cloned(),
+                orphaned: card.body.orphaned, unverified: card.body.unverified,
+                skeleton: false,
+            }).collect();
+        let work = bake.timeline.work_at(at_ms);
+        for thread in bake.threads.iter().filter(|thread| !thread.origin_proven) {
+            let relation = strip::legacy_card_at(thread, work);
+            if relation == strip::LegacyCardAt::Absent { continue; }
+            let Some(note) = self.doc.notes().notes().iter()
+                .find(|note| note.id == thread.card_id) else { continue };
+            cards.push(PastMarginCard {
+                id: note.id, kind: note.kind, title: note.title.clone(),
+                body: note.body.clone(),
+                anchor: match relation {
+                    strip::LegacyCardAt::ProvenAnchor(at) => Some(at..at),
+                    strip::LegacyCardAt::Detached => None,
+                    strip::LegacyCardAt::Absent => unreachable!(),
+                },
+                orphaned: relation == strip::LegacyCardAt::Detached,
+                unverified: true, skeleton: true,
+            });
+        }
+        cards
+    }
+
     pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
@@ -2261,6 +2295,9 @@ impl Editor {
             strip_date_hits: std::rc::Rc::default(),
             strip_station_hits: std::rc::Rc::default(),
             strip_well_hits: std::rc::Rc::default(),
+            strip_thread_hits: std::rc::Rc::default(),
+            strip_hover_thread: None,
+            past_card_focus: None,
             cold_read: None,
             cr_page_bounds: std::rc::Rc::default(),
         }
@@ -3464,6 +3501,9 @@ impl Editor {
     }
 
     fn strip_park_at_x(&mut self, x: f32, y: f32, pin: bool, cx: &mut Context<Self>) {
+        // §3a arbitration: named objects act exactly, most specific first —
+        // stations (a deliberate mark), then threads (a card's path), then
+        // dates, then the two lanes.
         let station_pos = station_hit_at(
             &self.strip_station_hits.borrow(), point(px(x), px(y)));
         if let Some(pos) = station_pos {
@@ -3478,6 +3518,52 @@ impl Editor {
                 self.strip.scrub_fabric = false;
                 self.strip_scrub_to(pos, true, cx);
             }
+            return;
+        }
+        let thread_hit = self.strip_thread_hits.borrow().iter()
+            .find(|hit| hit.bounds.contains(&point(px(x), px(y)))).cloned();
+        if let Some(hit) = thread_hit {
+            let Some(pos) = self.strip_pos_at_fabric_x(x) else { return };
+            if !self.strip.parked {
+                self.strip.saved_sel = Some(self.selected_range.clone());
+                let c = self.selected_range.end;
+                self.selected_range = c..c;
+            }
+            self.strip.parked = true;
+            self.strip.scrubbing = false;
+            self.strip.scrub_fabric = false;
+            self.strip_scrub_to(pos, false, cx);
+            let work = self.strip.bake.as_ref().map(|b| b.timeline.work_at(pos))
+                .unwrap_or(hit.work0);
+            let span = hit.work1 - hit.work0;
+            let f = if span.abs() < f32::EPSILON { 0. } else {
+                ((work - hit.work0) / span).clamp(0., 1.)
+            };
+            let anchor = hit.anchor0 as f32
+                + (hit.anchor1 as f32 - hit.anchor0 as f32) * f;
+            if let Some(frame) = self.last_frame.as_ref()
+                && let Some(preview) = self.history_preview.as_ref()
+            {
+                let rope = ropey::Rope::from_str(&preview.text);
+                let byte = rope.char_to_byte((anchor.round().max(0.) as usize)
+                    .min(rope.len_chars()));
+                if let Some(y) = frame.position_of(byte, false).map(|p| p.y) {
+                    self.scroll_top = y.clamp(px(0.), frame.max_scroll());
+                }
+            }
+            self.past_card_focus = Some((hit.card_id, Instant::now()));
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(700)).await;
+                let _ = this.update(cx, |editor, cx| {
+                    if editor.past_card_focus.is_some_and(|(id, at)| {
+                        id == hit.card_id && at.elapsed() >= Duration::from_millis(650)
+                    }) {
+                        editor.past_card_focus = None;
+                        cx.notify();
+                    }
+                });
+            }).detach();
             return;
         }
         let date_pos = self
@@ -18174,6 +18260,31 @@ struct MarginLayout {
     below: Vec<OffscreenRef>,
 }
 
+/// Project a byte anchor through the paragraph geometry which painted the
+/// preview. Keeping this pure makes the past lane incapable of falling back
+/// to a document fraction when an anchor cannot be proved.
+fn preview_anchor_y(
+    paragraphs: &[(Range<usize>, f32)],
+    anchor: usize,
+) -> Option<f32> {
+    let ix = paragraphs.partition_point(|(range, _)| range.end < anchor);
+    paragraphs.get(ix).and_then(|(range, top)| {
+        (anchor >= range.start && anchor <= range.end).then_some(*top)
+    })
+}
+
+#[derive(Clone)]
+struct PastMarginCard {
+    id: u64,
+    kind: NoteKind,
+    title: String,
+    body: String,
+    anchor: Option<Range<usize>>,
+    orphaned: bool,
+    unverified: bool,
+    skeleton: bool,
+}
+
 /// An open card hidden past a viewport edge — enough to NAVIGATE to it, not just
 /// tally it. `anchor_y` is the anchor's content-space y. `anchor_culled`
 /// distinguishes the two ways a card hides, which need different reveals:
@@ -20027,50 +20138,105 @@ impl Editor {
     /// Frozen §3b projection. It deliberately has no ids, listeners, hover
     /// styling, composer, or verbs: the past is readable evidence, not a
     /// second live margin.
-    fn render_past_margin(&self, window: &Window) -> Option<gpui::AnyElement> {
+    fn render_past_margin(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         if !self.margin_fits(window) || !self.strip.is_parked() {
             return None;
         }
-        self.strip.bake.as_ref()?.card_history.as_ref()?;
-        let cards = self.strip.past_margin();
+        let cards = self.past_cards_at(self.strip.pos_ms);
         if cards.is_empty() { return None; }
+        let frame = self.last_frame.as_ref()?;
         let col_right = self.column_right(window);
         let lane_left = col_right + 20.;
-        let lane_h = f32::from(document_viewport_height(
-            window.viewport_size().height,
-            self.strip.open,
-        )) - 96.;
-        let doc_len = self.strip.scratch.as_ref()
-            .map(|s| s.replay.rope.len_chars()).unwrap_or(1).max(1);
-        let mut orphan_top = lane_h - 8.;
-        let children = cards.into_iter().map(|card| {
-            let detached = card.anchor.is_none() || card.body.orphaned;
-            let top = if let Some(range) = card.anchor {
-                48. + (range.start.min(doc_len) as f32 / doc_len as f32) * (lane_h - 140.)
-            } else {
-                orphan_top -= 76.;
-                orphan_top
-            };
+        let geometry: Vec<(Range<usize>, f32)> = frame.paragraphs.iter()
+            .map(|p| (p.range.clone(), f32::from(p.top))).collect();
+        let preview = self.history_preview.as_ref()?;
+        let rope = ropey::Rope::from_str(&preview.text);
+        let floor = self.margin_card_floor();
+        let viewport_bottom = f32::from(frame.bounds.origin.y + frame.viewport_height);
+        let mut projected = Vec::new();
+        let mut detached = Vec::new();
+        for card in cards {
+            let anchor = card.anchor.as_ref().and_then(|range| {
+                let byte = rope.char_to_byte(range.start.min(rope.len_chars()));
+                preview_anchor_y(&geometry, byte)
+            });
             let machine = card.kind == NoteKind::Diagnosis;
-            div().absolute().top(px(top.max(8.))).left(px(8.))
+            let title = if machine { card.title.as_str() } else { "" };
+            let height = Self::measure_card_height(window, title, &card.body,
+                if machine { 0. } else { 1. });
+            let item = (card, anchor, height);
+            if anchor.is_some() && !item.0.orphaned {
+                projected.push(item);
+            } else {
+                detached.push(item);
+            }
+        }
+        projected.sort_by(|a, b| a.1.unwrap().total_cmp(&b.1.unwrap()));
+        let items: Vec<PlaceItem> = projected.iter().map(|(_, anchor, height)| PlaceItem {
+            anchor: f32::from(frame.bounds.origin.y) + anchor.unwrap()
+                - f32::from(frame.scroll_top),
+            height: *height,
+            pin: true,
+            active: false,
+        }).collect();
+        let tops = place_margin_cards(&items, floor, viewport_bottom, MARGIN_GAP);
+        let mut orphan_top = viewport_bottom;
+        detached.reverse();
+        let placed = projected.into_iter().zip(tops).map(|(item, top)| (item, top))
+            .chain(detached.into_iter().map(|item| {
+                orphan_top -= item.2 + MARGIN_GAP;
+                (item, orphan_top)
+            }));
+        let children = placed.filter_map(|((card, anchor_y, height), top)| {
+            if top + height < floor || top > viewport_bottom { return None; }
+            let detached = anchor_y.is_none() || card.orphaned;
+            let machine = card.kind == NoteKind::Diagnosis;
+            let id = card.id;
+            let target = anchor_y;
+            Some(div().id(("past-card", id)).absolute().top(px(top)).left(px(8.))
                 .w(px(MARGIN_WIDTH - 8.)).p(px(8.))
                 .rounded(px(if machine { 3. } else { 9. }))
-                .bg(rgb(if card.body.unverified { STALE_BG } else if machine {
+                .bg(rgb(if card.unverified { STALE_BG } else if machine {
                     DIAGNOSIS_CARD_BG
                 } else { NOTE_CARD_BG }))
-                .border_1().border_color(rgb(RULE_COLOR))
+                .border_1().border_color(rgb(if self.strip_hover_thread == Some(id)
+                    || self.past_card_focus.is_some_and(|(focus, _)| focus == id)
+                { 0x7C8791 } else { RULE_COLOR }))
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(MouseButton::Left,
+                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(y) = target
+                            && let Some(frame) = editor.last_frame.as_ref()
+                        {
+                            editor.scroll_top = px(y).clamp(px(0.), frame.max_scroll());
+                            cx.notify();
+                        }
+                    }))
                 .font_family("PT Serif").text_size(px(13.))
-                .text_color(rgb(if card.body.unverified { MUTED_COLOR } else { TEXT_COLOR }))
-                .when(machine && !card.body.title.is_empty(), |d| {
-                    d.child(div().font_weight(FontWeight::BOLD).child(card.body.title.clone()))
+                .text_color(rgb(if card.unverified { MUTED_COLOR } else { TEXT_COLOR }))
+                .when(card.skeleton, |d| d.child(
+                    div().mb(px(3.)).font_family("PT Sans").text_size(px(10.))
+                        .text_color(rgb(MUTED_COLOR)).child("Now")
+                ))
+                .when(machine && !card.title.is_empty(), |d| {
+                    d.child(div().font_weight(FontWeight::BOLD).child(card.title.clone()))
                 })
-                .child(if card.body.body.is_empty() && !machine {
+                .child(if card.body.is_empty() && !machine {
                     "(empty note)".to_string()
-                } else { card.body.body.clone() })
+                } else { card.body.clone() })
+                .when(card.skeleton, |d| d.child(
+                    div().mt(px(4.)).text_size(px(10.)).text_color(rgb(MUTED_COLOR))
+                        .child("◇")
+                ))
                 .when(detached, |d| d.child(
                     div().mt(px(4.)).text_size(px(10.)).text_color(rgb(MUTED_COLOR))
                         .child("◇ detached")
-                )).into_any_element()
+                )).into_any_element())
         }).collect::<Vec<_>>();
         Some(div().absolute().left(px(lane_left)).top_0().bottom_0()
             .w(px(MARGIN_WIDTH)).children(children).into_any_element())
@@ -21174,7 +21340,7 @@ impl Render for Editor {
                 // to exit by construction) — and the lane/margin
                 // mutual-exclusion switch (N6).
                 if self.strip.is_parked() {
-                    return match self.render_past_margin(window) {
+                    return match self.render_past_margin(window, cx) {
                         Some(margin) => d.child(margin),
                         None => d,
                     };
@@ -21762,6 +21928,16 @@ pub struct StripGeom {
 struct StripDateHit {
     bounds: Bounds<Pixels>,
     at_ms: i64,
+}
+
+#[derive(Clone)]
+struct StripThreadHit {
+    bounds: Bounds<Pixels>,
+    card_id: u64,
+    work0: f32,
+    work1: f32,
+    anchor0: usize,
+    anchor1: usize,
 }
 
 #[derive(Clone)]
@@ -22394,6 +22570,31 @@ impl Editor {
                 marks
             }
         };
+        let side_cards = |text: &str, at_ms: i64| {
+            let mut starts = Vec::new();
+            let mut char_at = 0;
+            for line in text.split('\n') {
+                starts.push((char_at, char_at + line.chars().count()));
+                char_at += line.chars().count() + 1;
+            }
+            let mut by_par = vec![Vec::new(); starts.len().max(1)];
+            let mut foot = Vec::new();
+            for card in self.past_cards_at(at_ms) {
+                if let Some(anchor) = card.anchor.as_ref()
+                    && let Some(ix) = starts.iter().position(|(start, end)| {
+                        anchor.start >= *start && anchor.start <= *end
+                    })
+                {
+                    by_par[ix].push(card);
+                } else {
+                    foot.push(card);
+                }
+            }
+            if let Some(last) = by_par.last_mut() { last.extend(foot); }
+            by_par
+        };
+        let cards_a = side_cards(&a.text, pin);
+        let cards_b = side_cards(&b.text, self.strip.pos_ms);
         let column = |letter, is_b, text: String, scroll: ScrollHandle| {
             let text_len = text.len();
             let (ms, words) = if is_b {
@@ -22403,6 +22604,7 @@ impl Editor {
             };
             let active = self.compare_active_b == is_b;
             let side_marks = marks.clone();
+            let margin_cards = if is_b { cards_b.clone() } else { cards_a.clone() };
             let scroll_a = self.compare_scroll_a.clone();
             let scroll_b = self.compare_scroll_b.clone();
             div().id(if is_b { "compare-column-b" } else { "compare-column-a" })
@@ -22474,10 +22676,38 @@ impl Editor {
                                         mark_scroll_b.scroll_to_top_of_item(target_b + 1);
                                     }))
                         }));
+                    let past = div().w(px(150.)).flex_none().flex().flex_col().gap(px(6.))
+                        .children(margin_cards.get(par_ix).into_iter().flatten().map(|card| {
+                            let machine = card.kind == NoteKind::Diagnosis;
+                            div().p(px(7.)).rounded(px(if machine { 3. } else { 9. }))
+                                .border_1().border_color(rgb(RULE_COLOR))
+                                .bg(rgb(if card.unverified { STALE_BG } else if machine {
+                                    DIAGNOSIS_CARD_BG
+                                } else { NOTE_CARD_BG }))
+                                .font_family("PT Serif").text_size(px(12.))
+                                .text_color(rgb(if card.unverified { MUTED_COLOR } else {
+                                    TEXT_COLOR
+                                }))
+                                .when(card.skeleton, |d| d.child(
+                                    div().font_family("PT Sans").text_size(px(10.)).child("Now")
+                                ))
+                                .when(machine && !card.title.is_empty(), |d| d.child(
+                                    div().font_weight(FontWeight::BOLD).child(card.title.clone())
+                                ))
+                                .child(card.body.clone())
+                                .when(card.skeleton, |d| d.child(
+                                    div().text_size(px(10.)).child("◇")
+                                ))
+                                .when(card.orphaned || card.anchor.is_none(), |d| d.child(
+                                    div().text_size(px(10.)).child("◇ detached")
+                                ))
+                        }));
                     if is_b {
-                        div().w_full().flex_none().flex().items_start().child(prose).child(gutter)
+                        div().w_full().flex_none().flex().items_start()
+                            .child(prose).child(gutter).child(past)
                     } else {
-                        div().w_full().flex_none().flex().items_start().child(gutter).child(prose)
+                        div().w_full().flex_none().flex().items_start()
+                            .child(past).child(gutter).child(prose)
                     }
                 }))
         };
@@ -24685,6 +24915,13 @@ impl Editor {
                     if !editor.strip.scrubbing {
                         let station = station_hit_at(
                             &editor.strip_station_hits.borrow(), ev.position);
+                        let thread = editor.strip_thread_hits.borrow().iter()
+                            .find(|hit| hit.bounds.contains(&ev.position))
+                            .map(|hit| hit.card_id);
+                        if thread != editor.strip_hover_thread {
+                            editor.strip_hover_thread = thread;
+                            cx.notify();
+                        }
                         let hover = editor
                             .strip_date_hits
                             .borrow()
@@ -24805,6 +25042,7 @@ struct StripPrepaint {
     wells: Vec<StripText>,
     station_hitboxes: Vec<Hitbox>,
     date_hitboxes: Vec<Hitbox>,
+    thread_hitboxes: Vec<Hitbox>,
 }
 
 impl Element for StripElement {
@@ -24864,6 +25102,44 @@ impl Element for StripElement {
             .clamp(0., (bake.timeline.total_work - (rail_x1 - rail_x0)).max(0.));
         let fab_x = |work: f32| rail_x0 + work - view;
         let tail_x = strip_sheet_tail(rail_x0, rail_x1, bake.timeline.total_work, view);
+        let mut thread_hits = Vec::new();
+        let mut thread_hitboxes = Vec::new();
+        for thread in &bake.threads {
+            for segment in &thread.segments {
+                for pair in segment.windows(2) {
+                    let x0 = fab_x(pair[0].x);
+                    let x1 = fab_x(pair[1].x);
+                    if x1 < rail_x0 || x0 > tail_x { continue; }
+                    let y0 = band_top + pair[0].y;
+                    let y1 = band_top + pair[1].y;
+                    let steps = (x1 - x0).abs().max((y1 - y0).abs()).ceil().max(1.) as usize;
+                    for i in 0..steps {
+                        let f0 = i as f32 / steps as f32;
+                        let f1 = (i + 1) as f32 / steps as f32;
+                        let x = x0 + (x1 - x0) * f0;
+                        let y = y0 + (y1 - y0) * f0;
+                        let bounds = Bounds::new(
+                            point(px(x - 2.), px(y - 2.)), size(px(5.), px(5.)),
+                        );
+                        thread_hitboxes.push(window.insert_hitbox(
+                            bounds, HitboxBehavior::Normal));
+                        thread_hits.push(StripThreadHit {
+                            bounds,
+                            card_id: thread.card_id,
+                            work0: pair[0].x + (pair[1].x - pair[0].x) * f0,
+                            work1: pair[0].x + (pair[1].x - pair[0].x) * f1,
+                            anchor0: (pair[0].anchor as f32
+                                + (pair[1].anchor as f32 - pair[0].anchor as f32) * f0)
+                                .round().max(0.) as usize,
+                            anchor1: (pair[0].anchor as f32
+                                + (pair[1].anchor as f32 - pair[0].anchor as f32) * f1)
+                                .round().max(0.) as usize,
+                        });
+                    }
+                }
+            }
+        }
+        *editor.strip_thread_hits.borrow_mut() = thread_hits;
         let shape = |text: &str, size: f32, color: u32, w: &mut Window| {
             let run = TextRun {
                 len: text.len(),
@@ -25037,6 +25313,7 @@ impl Element for StripElement {
             wells,
             station_hitboxes,
             date_hitboxes,
+            thread_hitboxes,
         }
     }
 
@@ -25056,6 +25333,9 @@ impl Element for StripElement {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
         for hitbox in &prepaint.station_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        for hitbox in &prepaint.thread_hitboxes {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
         let rail_x0 = prepaint.rail_x0;
@@ -25188,7 +25468,8 @@ impl Element for StripElement {
         // terminal where it closed. Open threads run quieter than closed
         // ones ended: eight open questions must not grid the cloth.
         for t in &bake.threads {
-            let alpha = if t.open { 0.28 } else { 0.42 };
+            let hovered = editor.strip_hover_thread == Some(t.card_id);
+            let alpha = if hovered { 0.72 } else if t.open { 0.28 } else { 0.42 };
             for (segment_ix, segment) in t.segments.iter().enumerate() {
                 for (pair_ix, pair) in segment.windows(2).enumerate() {
                     let mut a = pair[0];
@@ -25716,6 +25997,14 @@ mod tests {
     const PACK_FLOOR: f32 = 44.;
     const PACK_VP_BOTTOM: f32 = 800.;
     const PACK_GAP: f32 = 16.;
+
+    #[test]
+    fn parked_anchor_projects_through_synthetic_paragraph_layout() {
+        let paragraphs = vec![(0..12, 24.), (13..40, 82.), (41..55, 166.)];
+        assert_eq!(preview_anchor_y(&paragraphs, 20), Some(82.));
+        assert_eq!(preview_anchor_y(&paragraphs, 41), Some(166.));
+        assert_eq!(preview_anchor_y(&paragraphs, 90), None);
+    }
 
     proptest! {
         // INV1 (no overlap, EVER — the never-overlap rule, no active-card excuse)

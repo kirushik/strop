@@ -380,15 +380,53 @@ pub struct Veil {
 pub struct ThreadPoint {
     pub x: f32,
     pub y: f32,
+    pub anchor: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct Thread {
+    pub card_id: u64,
     pub segments: Vec<Vec<ThreadPoint>>,
     pub resolved: bool,
     pub open: bool,
     pub origin_proven: bool,
     pub uncertain_start: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyCardAt {
+    ProvenAnchor(usize),
+    Detached,
+    Absent,
+}
+
+pub fn legacy_card_at(thread: &Thread, work: f32) -> LegacyCardAt {
+    let Some(first) = thread.segments.first().and_then(|s| s.first()) else {
+        return LegacyCardAt::Absent;
+    };
+    let Some(last) = thread.segments.last().and_then(|s| s.last()) else {
+        return LegacyCardAt::Absent;
+    };
+    if work < first.x || work > last.x {
+        return LegacyCardAt::Absent;
+    }
+    for segment in &thread.segments {
+        for pair in segment.windows(2) {
+            if work >= pair[0].x && work <= pair[1].x {
+                let span = pair[1].x - pair[0].x;
+                let f = if span.abs() < f32::EPSILON { 0. } else {
+                    (work - pair[0].x) / span
+                };
+                let anchor = pair[0].anchor as f32
+                    + (pair[1].anchor as f32 - pair[0].anchor as f32) * f;
+                return LegacyCardAt::ProvenAnchor(anchor.round().max(0.) as usize);
+            }
+        }
+        if segment.len() == 1 && (segment[0].x - work).abs() < 0.5 {
+            return LegacyCardAt::ProvenAnchor(segment[0].anchor);
+        }
+    }
+    LegacyCardAt::Detached
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -832,6 +870,7 @@ impl StripBake {
         let point = |at_ms: i64, anchor: usize| ThreadPoint {
             x: timeline.work_at(at_ms),
             y: depth_y(anchor as i64).clamp(FAB_Y0 + 2., FAB_Y0 + FABRIC_H),
+            anchor,
         };
         let mut threads = Vec::new();
         if let Some(index) = &card_history {
@@ -854,14 +893,15 @@ impl StripBake {
                 if !current.is_empty() { segments.push(current); }
                 let end_ms = card.closed_ms.unwrap_or(now_ms);
                 if let Some(last) = segments.last_mut().and_then(|s| s.last().copied()) {
-                    let terminal = ThreadPoint { x: timeline.work_at(end_ms).max(last.x), y: last.y };
+                    let terminal = ThreadPoint { x: timeline.work_at(end_ms).max(last.x),
+                        y: last.y, anchor: last.anchor };
                     if terminal.x > last.x { segments.last_mut().unwrap().push(terminal); }
                 }
                 let resolved = journal.events.iter().find_map(|e| match e {
                     JournalEvent::CardClosed { id, resolved, .. } if *id == card.id => Some(*resolved),
                     _ => None,
                 }).unwrap_or(false);
-                threads.push(Thread { segments, resolved, open: card.closed_ms.is_none(),
+                threads.push(Thread { card_id: card.id, segments, resolved, open: card.closed_ms.is_none(),
                     origin_proven: true, uncertain_start: false });
             }
         }
@@ -876,7 +916,7 @@ impl StripBake {
             ).into_iter().map(|(at, anchor)| point(at, anchor)).collect();
             let uncertain_start = rev.len() > 1;
             let segments = if uncertain_start { vec![rev] } else { vec![vec![point(now_ms, card.anchor)]] };
-            threads.push(Thread { segments, resolved: card.resolved, open: true,
+            threads.push(Thread { card_id: card.id, segments, resolved: card.resolved, open: true,
                 origin_proven: false, uncertain_start });
         }
 
@@ -1614,11 +1654,31 @@ mod tests {
     #[test]
     fn thread_points_coalesce_subpixel_and_collinear_runs() {
         let mut points = Vec::new();
-        push_thread_point(&mut points, ThreadPoint { x: 0., y: 10. });
-        push_thread_point(&mut points, ThreadPoint { x: 1., y: 10.1 });
-        push_thread_point(&mut points, ThreadPoint { x: 2., y: 10.2 });
-        push_thread_point(&mut points, ThreadPoint { x: 2.2, y: 10.3 });
+        push_thread_point(&mut points, ThreadPoint { x: 0., y: 10., anchor: 10 });
+        push_thread_point(&mut points, ThreadPoint { x: 1., y: 10.1, anchor: 11 });
+        push_thread_point(&mut points, ThreadPoint { x: 2., y: 10.2, anchor: 12 });
+        push_thread_point(&mut points, ThreadPoint { x: 2.2, y: 10.3, anchor: 13 });
         assert_eq!(points.len(), 2, "straight and sub-pixel drafting collapses to endpoints");
+    }
+
+    #[test]
+    fn skeleton_eligibility_distinguishes_anchor_gap_and_absence() {
+        let thread = Thread {
+            card_id: 7,
+            segments: vec![
+                vec![ThreadPoint { x: 10., y: 20., anchor: 4 },
+                    ThreadPoint { x: 20., y: 22., anchor: 8 }],
+                vec![ThreadPoint { x: 30., y: 24., anchor: 12 },
+                    ThreadPoint { x: 40., y: 26., anchor: 16 }],
+            ],
+            resolved: false,
+            open: true,
+            origin_proven: false,
+            uncertain_start: true,
+        };
+        assert_eq!(legacy_card_at(&thread, 15.), LegacyCardAt::ProvenAnchor(6));
+        assert_eq!(legacy_card_at(&thread, 25.), LegacyCardAt::Detached);
+        assert_eq!(legacy_card_at(&thread, 5.), LegacyCardAt::Absent);
     }
 
     #[test]
