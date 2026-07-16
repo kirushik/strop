@@ -1149,7 +1149,7 @@ for spec in \
   "door-open|seed:diag" \
   "door-ready|x seed:deliver ebtn:door" \
   "door-drained|seed:diag notes:drain ebtn:door" \
-  "door-glance|seed:diag ebtn:door click:800,100" \
+  "door-glance|seed:diag ebtn:door notes:glance" \
   "titlebar-order|seed:diag"; do
   name=${spec%%|*}; keys=${spec#*|}; DIS=$(mktemp --suffix=.md)
   cp "$DOC" "$DIS"

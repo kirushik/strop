@@ -530,6 +530,16 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE ebtn:door: door toggled");
                 continue;
             }
+            if key == "notes:glance" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_glance_first(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE notes:glance: first diagnosis lifted");
+                continue;
+            }
             if key == "notes:drain" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_drain_diagnoses(cx))

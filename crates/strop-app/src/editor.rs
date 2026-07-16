@@ -13168,6 +13168,21 @@ impl Editor {
         self.toggle_door(cx);
     }
 
+    /// Rig hook (`notes:glance`): select the first open diagnosis the way a
+    /// squiggle click would — while the fan rests, the selected card paints
+    /// as the glance overlay. Coordinates-free, so the still can't miss.
+    pub fn debug_glance_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self
+            .doc
+            .notes()
+            .open()
+            .find(|n| n.kind == NoteKind::Diagnosis)
+            .map(|n| n.id);
+        if let Some(id) = id {
+            self.select_card(id, window, cx);
+        }
+    }
+
     /// Rig hook (`notes:drain`): mark every open diagnosis unverified so the
     /// chip's all-stale treatment can be captured without synthesizing edits.
     pub fn debug_drain_diagnoses(&mut self, cx: &mut Context<Self>) {
@@ -21406,7 +21421,9 @@ impl Editor {
                 .justify_center()
                 .rounded_full()
                 .border_1()
-                .border_color(rgb(if ready { ACTIVE_BORDER } else { RULE_COLOR }))
+                // A waiting read is the machine's state — the ready ring is
+                // cool (color-language: warm never marks machinery).
+                .border_color(rgb(if ready { AI_ACCENT } else { RULE_COLOR }))
                 .bg(rgb(DIAGNOSIS_CARD_BG))
                 .font_family("PT Sans")
                 .text_size(px(10.5))
