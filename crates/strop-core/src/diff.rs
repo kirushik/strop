@@ -81,6 +81,51 @@ pub struct BlockDiff {
     pub segs: Vec<DiffSeg>,
 }
 
+/// One paragraph correspondence for Compare's change gutter. Paired blocks
+/// are replacements; a missing side is honest arrival/departure evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParagraphChange {
+    Changed,
+    Arrival,
+    Departure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParagraphMark {
+    pub old_par: Option<usize>,
+    pub new_par: Option<usize>,
+    pub old_boundary: usize,
+    pub new_boundary: usize,
+    pub change: ParagraphChange,
+}
+
+/// Changed paragraph correspondences only. Equal blocks are deliberately
+/// absent: an unchanged stretch must leave the reading-room gutter quiet.
+pub fn paragraph_marks(old: &str, new: &str) -> Vec<ParagraphMark> {
+    let mut old_boundary = 0;
+    let mut new_boundary = 0;
+    prose_diff_blocks(old, new).into_iter().filter_map(|block| {
+        let change = match (block.old_par, block.new_par) {
+            (Some(_), Some(_)) if block.segs.iter().any(|s| s.op != DiffOp::Same) => {
+                Some(ParagraphChange::Changed)
+            }
+            (None, Some(_)) => Some(ParagraphChange::Arrival),
+            (Some(_), None) => Some(ParagraphChange::Departure),
+            _ => None,
+        };
+        let mark = change.map(|change| ParagraphMark {
+            old_par: block.old_par,
+            new_par: block.new_par,
+            old_boundary,
+            new_boundary,
+            change,
+        });
+        old_boundary += usize::from(block.old_par.is_some());
+        new_boundary += usize::from(block.new_par.is_some());
+        mark
+    }).collect()
+}
+
 fn block(old_par: Option<usize>, new_par: Option<usize>, segs: Vec<DiffSeg>) -> BlockDiff {
     BlockDiff {
         old_par,
@@ -271,5 +316,28 @@ mod tests {
                 assert_eq!(from_new, new_pars[p]);
             }
         }
+    }
+
+    #[test]
+    fn paragraph_marks_keep_scattered_changes_separate() {
+        let old = "opening old\ncalm one\ncalm two\ncalm three\ndelete me\nlong quiet one\nlong quiet two\nending";
+        let new = "opening new\ncalm one\ninserted middle\ncalm two\ncalm three\nlong quiet one\nlong quiet two\nending\nfinal append";
+        let marks = paragraph_marks(old, new);
+        assert!(marks.iter().any(|m| m.change == ParagraphChange::Changed
+            && m.old_par == Some(0) && m.new_par == Some(0)));
+        assert!(marks.iter().any(|m| m.change == ParagraphChange::Arrival
+            && m.new_par == Some(2)));
+        assert!(marks.iter().any(|m| m.change == ParagraphChange::Departure
+            && m.old_par == Some(4)));
+        assert!(marks.iter().any(|m| m.change == ParagraphChange::Arrival
+            && m.new_par == Some(8)));
+        assert!(!marks.iter().any(|m| m.old_par == Some(5) || m.old_par == Some(6)));
+    }
+
+    #[test]
+    fn moved_paragraph_is_departure_and_arrival() {
+        let marks = paragraph_marks("alpha\nmoved\nomega", "moved\nalpha\nomega");
+        assert_eq!(marks.iter().filter(|m| m.change == ParagraphChange::Departure).count(), 1);
+        assert_eq!(marks.iter().filter(|m| m.change == ParagraphChange::Arrival).count(), 1);
     }
 }
