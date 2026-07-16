@@ -469,6 +469,11 @@ const AUTO_CUT_MIN_CHARS: usize = 80;
 /// The Scraps chip's arrival ring: two expanding beats (the mockup's
 /// `chippulse`, 1.4s ease-out × 2) — an event, never a standing light.
 const CHIP_PULSE_MS: u64 = 2800;
+
+/// The editor button's cooking-dot breathing cycle (item: the pulse). Slow —
+/// attention-motion's calm band (~2.5–3.5 s) — so the periphery reads "still
+/// at work", never a blink. One full opacity breath per cycle.
+const BTN_PULSE_MS: u64 = 3000;
 /// The provenance one-liner's id namespace in the margin lane (a packer
 /// citizen beside real note cards — the flag keeps record ids and note ids
 /// from ever colliding in the motion/appearing maps).
@@ -17163,7 +17168,34 @@ impl Editor {
                             }),
                         )
                         .when_some(dot, |d, color| {
-                            d.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(rgb(color)))
+                            // The comment-promised pulse, finally real: a slow
+                            // breathing opacity cycle on the cooking dot —
+                            // ongoing work as a standing state, not an event.
+                            // Sine-eased full→dim→full (seamless across the
+                            // loop, never brighter than the static dot) and
+                            // quieter than the scraps chip's arrival ring.
+                            // Error keeps a static red dot; reduce_motion
+                            // keeps today's static dot for cooking too.
+                            let breathing = face == EditorFace::Cooking
+                                && !self.config.reduce_motion;
+                            d.child({
+                                let dot = div().flex_shrink_0().size(px(6.)).rounded_full();
+                                if breathing {
+                                    dot.with_animation(
+                                        "editor-btn-pulse",
+                                        Animation::new(Duration::from_millis(BTN_PULSE_MS))
+                                            .repeat(),
+                                        move |el, t| {
+                                            let breath =
+                                                0.5 + 0.5 * (t * std::f32::consts::TAU).cos();
+                                            el.bg(tint(color, 0.45 + 0.55 * breath))
+                                        },
+                                    )
+                                    .into_any_element()
+                                } else {
+                                    dot.bg(rgb(color)).into_any_element()
+                                }
+                            })
                         })
                         .child(div().min_w(px(0.)).truncate().child(label))
                         // The dropdown wedge — the pictorial family's one
