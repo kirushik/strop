@@ -38,6 +38,14 @@ Report every command actually run with its real exit status.
 "not_run" and "failed" are legitimate outcomes; never report an
 unrun or interrupted test as passed.
 
+Known environment quirk: the `single_instance` tests bind unix
+sockets and fail with ReadOnlyFilesystem under the default sandbox
+runtime dir. Run the workspace suite as
+`mkdir -p /tmp/strop-runtime && XDG_RUNTIME_DIR=/tmp/strop-runtime
+cargo test --workspace` (pinned toolchain as above). Those three
+tests failing under the default runtime dir is environmental, not
+a regression — but say so explicitly rather than reporting green.
+
 ## Scope
 
 - Make the smallest change that fixes the stated behavior; no
