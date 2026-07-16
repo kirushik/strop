@@ -619,6 +619,18 @@ pub struct EnvPoint {
 pub struct Seam {
     pub x: f32,
     pub w: f32,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// Plain data carried by a wide well. It is baked with the fold so neither
+/// its words nor its exact hover bounds can change during a scrub.
+#[derive(Clone, Debug)]
+pub struct WellDatum {
+    pub x: f32,
+    pub label: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
 }
 
 /// A quiet date in the bottom lane ("Today" / "Tue 1 Jul").
@@ -646,6 +658,7 @@ pub struct StripBake {
     pub stations: Vec<Station>,
     pub envelope: Vec<EnvPoint>,
     pub seams: Vec<Seam>,
+    pub well_data: Vec<WellDatum>,
     pub dates: Vec<DateTick>,
     /// Materialized-checkpoint anchor times (ms), sorted — the reconstruction
     /// anchor is the latest ≤ pos_ms (the editor holds the states themselves).
@@ -799,6 +812,18 @@ impl StripBake {
             .map(|s| Seam {
                 x: s.work0,
                 w: s.work1 - s.work0,
+                start_ms: s.wall0,
+                end_ms: s.wall1,
+            })
+            .collect();
+        let well_data = seams
+            .iter()
+            .filter(|s| s.w == SEAM_WIDE_PX)
+            .map(|s| WellDatum {
+                x: s.x + s.w / 2.,
+                label: format_well_duration(s.end_ms - s.start_ms),
+                start_ms: s.start_ms,
+                end_ms: s.end_ms,
             })
             .collect();
 
@@ -856,26 +881,11 @@ impl StripBake {
         }
 
         // --- Stations (checkpoints) + Restore/Export ticks -------------------
-        // Sitting seals remain durable replay anchors and arrow-step targets,
-        // but are not marks: neither their tick nor their internal name may
-        // reach the strip (v3 §1b). The birth station alone reads "Started"
-        // once the record has distinguishable extent (v3 §1a).
-        let first_ms = stations.iter().map(|s| s.created_ms).min();
+        // Every checkpoint remains a replay/arrow anchor. Only writer names
+        // and the two sanctioned automatic labels reach the label lane.
         let mut baked: Vec<Station> = Vec::new();
         for st in stations {
-            let session = st.name == "Session start" || st.name == "Session";
-            let birth = Some(st.created_ms) == first_ms
-                && (st.name == "Session start"
-                    || st.name == "Started"
-                    || st.name == "Fresh tutorial");
-            if (session && !birth) || (birth && timeline.total_work <= 0.) {
-                continue;
-            }
-            let label = if birth {
-                "Started".into()
-            } else {
-                station_display(&st.name)
-            };
+            let label = station_display(&st.name, st.manual);
             baked.push(Station {
                 x: timeline.work_at(st.created_ms),
                 label,
@@ -968,6 +978,7 @@ impl StripBake {
             stations: baked,
             envelope,
             seams,
+            well_data,
             dates,
             anchor_ms,
             snap_ms,
@@ -1028,7 +1039,9 @@ const RANK_REFLEX: u8 = 6;
 /// The automatic checkpoint names Strop writes — everything else that is
 /// `manual` is a writer's own title (the highest-ranked label).
 fn station_rank(name: &str, manual: bool) -> u8 {
-    if name == "Before restore" || name.starts_with("Before restoring") {
+    if manual && name != "Fresh tutorial" {
+        RANK_WRITER
+    } else if name == "Before restore" || name.starts_with("Before restoring") {
         RANK_BEFORE_RESTORE
     } else if name == "Restored" {
         RANK_RESTORE
@@ -1044,8 +1057,6 @@ fn station_rank(name: &str, manual: bool) -> u8 {
         RANK_SESSION
     } else if name.starts_with("Checkpoint ") {
         RANK_REFLEX
-    } else if manual {
-        RANK_WRITER
     } else {
         RANK_REFLEX
     }
@@ -1055,11 +1066,16 @@ fn station_rank(name: &str, manual: bool) -> u8 {
 /// lowest rank — design §2), and so are session starts: the date lane already
 /// says when a sitting began, and a lane full of "Session start" echoes was
 /// the doubled-print smear. Everything else shows its own name.
-fn station_display(name: &str) -> String {
-    if name.starts_with("Checkpoint ") || name == "Session start" || name == "Session" {
+fn station_display(name: &str, manual: bool) -> String {
+    // Files created before history round two persisted the tutorial's chrome
+    // name as manual. This exact compatibility carve-out sacrifices only the
+    // strip label of a writer-typed duplicate; its arrow target still lives.
+    if name == "Fresh tutorial" {
         String::new()
-    } else {
+    } else if manual || name == "Restored" || name == "Exported" {
         name.to_owned()
+    } else {
+        String::new()
     }
 }
 
@@ -1197,6 +1213,29 @@ pub fn format_moment(wall_ms: i64, now_ms: i64) -> String {
     } else {
         format!("{} {d} {mon} {y}, {hh:02}:{mm:02}", WEEKDAYS[wd])
     }
+}
+
+/// Compact whole-unit face for a wide folded interval (§1b). The caller only
+/// creates these at two days or more; sub-day wording is deliberately absent.
+pub fn format_well_duration(elapsed_ms: i64) -> String {
+    let days = elapsed_ms.max(0) / 86_400_000;
+    if days < 14 {
+        format!("{days} days")
+    } else if days <= 8 * 7 + 6 {
+        let weeks = days / 7;
+        let rest = days % 7;
+        if rest == 0 { format!("{weeks} wk") } else { format!("{weeks} wk {rest} d") }
+    } else {
+        let weeks = days / 7;
+        let months = weeks / 4;
+        let rest = weeks % 4;
+        if rest == 0 { format!("{months} mo") } else { format!("{months} mo {rest} wk") }
+    }
+}
+
+pub fn well_span_label(datum: &WellDatum, now_ms: i64) -> String {
+    format!("{}–{}", format_moment(datum.start_ms, now_ms),
+        format_moment(datum.end_ms, now_ms))
 }
 
 /// The readout chip's text (spec §2): `{date} · {n} words`, tabular, NEVER a
@@ -1394,6 +1433,10 @@ pub struct Strip {
     pub scrub_fabric: bool,
     /// Sitting whose already-visible date is under the pointer.
     pub hover_date_ms: Option<i64>,
+    /// Wide well whose plain datum is expanded under the pointer.
+    pub hover_well_start_ms: Option<i64>,
+    /// Exact station target under the pointer; label and tick share it.
+    pub hover_station_ms: Option<i64>,
     /// Fabric horizontal pan (px) — auto-scroll keeps the playhead in view at
     /// novel scale; wheel pans it. NOT part of the bake (review B7).
     pub view_offset: f32,
@@ -1429,6 +1472,8 @@ impl Default for Strip {
             scrubbing: false,
             scrub_fabric: false,
             hover_date_ms: None,
+            hover_well_start_ms: None,
+            hover_station_ms: None,
             view_offset: 0.,
             bakes: 0,
             bake: None,
@@ -1843,18 +1888,14 @@ mod tests {
         let day = 86_400_000i64;
         let base = 1_700_000_000_000i64;
         let stations = vec![
-            station(base, "Session start", 10, 60),
-            station(base + day, "Session start", 200, 1200),
-            station(base + 2 * day, "Session start", 400, 2400),
+            automatic_station(base, "Session start", 10, 60),
+            automatic_station(base + day, "Session start", 200, 1200),
+            automatic_station(base + 2 * day, "Session start", 400, 2400),
         ];
         let j = Journal::default();
         let bake = StripBake::build(&j, &stations, &[], 0, base + 3 * day);
-        assert_eq!(
-            bake.stations.len(),
-            1,
-            "only the distinguishable birth remains"
-        );
-        assert_eq!(bake.stations[0].label, "Started", "the birth keeps a name");
+        assert_eq!(bake.stations.len(), 3, "automatic stations remain exact ticks");
+        assert!(bake.stations.iter().all(|st| st.label.is_empty()));
         assert!(
             stations.iter().all(|st| bake.snap_ms.contains(&st.created_ms)),
             "invisible sitting boundaries remain arrow steps"
@@ -1868,11 +1909,11 @@ mod tests {
     fn idle_session_name_never_reaches_the_bake() {
         let base = 1_700_000_000_000i64;
         let stations = vec![
-            station(base, "Started", 10, 60),
-            station(base + 20_000, "Session", 20, 120),
+            automatic_station(base, "Started", 10, 60),
+            automatic_station(base + 20_000, "Session", 20, 120),
         ];
         let bake = StripBake::build(&Journal::default(), &stations, &[], 0, base + 30_000);
-        assert!(bake.stations.iter().all(|st| st.at_ms != base + 20_000));
+        assert!(bake.stations.iter().any(|st| st.at_ms == base + 20_000));
         assert!(
             bake.stations.iter().all(|st| !st.label.to_lowercase().contains("session"))
         );
@@ -1972,9 +2013,10 @@ mod tests {
     #[test]
     fn zero_extent_birth_station_lays_no_mark() {
         let now = 1_700_000_000_000;
-        let birth = vec![station(now, "Session start", 0, 0)];
+        let birth = vec![automatic_station(now, "Session start", 0, 0)];
         let bake = StripBake::build(&Journal::default(), &birth, &[], 0, now);
-        assert!(bake.stations.is_empty());
+        assert_eq!(bake.stations.len(), 1, "the replay anchor remains");
+        assert!(bake.stations[0].label.is_empty());
     }
 
     #[test]
@@ -2008,6 +2050,43 @@ mod tests {
             words,
             chars,
         }
+    }
+
+    fn automatic_station(
+        created_ms: i64,
+        name: &str,
+        words: usize,
+        chars: usize,
+    ) -> StationSnap {
+        StationSnap { manual: false, ..station(created_ms, name, words, chars) }
+    }
+
+    #[test]
+    fn only_writer_and_sanctioned_automatic_names_label_stations() {
+        let base = 1_700_000_000_000i64;
+        let stations = vec![
+            automatic_station(base, "Session start", 1, 5),
+            automatic_station(base + 1, "Started", 2, 10),
+            automatic_station(base + 2, "Fresh tutorial", 3, 15),
+            automatic_station(base + 3, "Restored", 4, 20),
+            automatic_station(base + 4, "Exported", 5, 25),
+            station(base + 5, "Started", 6, 30),
+            station(base + 6, "Fresh tutorial", 7, 35),
+        ];
+        let bake = StripBake::build(&Journal::default(), &stations, &[], 0, base + 10);
+        let labels: Vec<_> = bake.stations.iter().map(|st| st.label.as_str()).collect();
+        assert_eq!(labels, ["", "", "", "Restored", "Exported", "Started", ""]);
+    }
+
+    #[test]
+    fn wide_well_duration_boundaries_use_compact_whole_units() {
+        let day = 86_400_000i64;
+        assert_eq!(format_well_duration(2 * day), "2 days");
+        assert_eq!(format_well_duration(13 * day), "13 days");
+        assert_eq!(format_well_duration(14 * day), "2 wk");
+        assert_eq!(format_well_duration(45 * day), "6 wk 3 d");
+        assert_eq!(format_well_duration(63 * day), "2 mo 1 wk");
+        assert_eq!(format_well_duration(98 * day), "3 mo 2 wk");
     }
 
     #[test]

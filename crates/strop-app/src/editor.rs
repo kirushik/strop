@@ -1675,6 +1675,10 @@ pub struct Editor {
     strip_rail: std::rc::Rc<std::cell::RefCell<Option<StripGeom>>>,
     /// Painted date-control bounds and sitting targets, from strip prepaint.
     strip_date_hits: std::rc::Rc<std::cell::RefCell<Vec<StripDateHit>>>,
+    /// Painted station label/tick targets, resolved before dates and lanes.
+    strip_station_hits: std::rc::Rc<std::cell::RefCell<Vec<StripStationHit>>>,
+    /// Plain wide-well datum hover bounds (never click targets).
+    strip_well_hits: std::rc::Rc<std::cell::RefCell<Vec<StripWellHit>>>,
     /// The cold read (impl 05 Wave B): the writer-invoked, read-only, paged
     /// takeover — the reading room. `Some` while the room is up; beside
     /// `history_preview` per the state-on-Editor + render-switch precedent.
@@ -2255,6 +2259,8 @@ impl Editor {
             strip: Strip::default(),
             strip_rail: std::rc::Rc::default(),
             strip_date_hits: std::rc::Rc::default(),
+            strip_station_hits: std::rc::Rc::default(),
+            strip_well_hits: std::rc::Rc::default(),
             cold_read: None,
             cr_page_bounds: std::rc::Rc::default(),
         }
@@ -3458,6 +3464,22 @@ impl Editor {
     }
 
     fn strip_park_at_x(&mut self, x: f32, y: f32, pin: bool, cx: &mut Context<Self>) {
+        let station_pos = station_hit_at(
+            &self.strip_station_hits.borrow(), point(px(x), px(y)));
+        if let Some(pos) = station_pos {
+            if self.strip_has_past() {
+                if !self.strip.parked {
+                    self.strip.saved_sel = Some(self.selected_range.clone());
+                    let c = self.selected_range.end;
+                    self.selected_range = c..c;
+                }
+                self.strip.parked = true;
+                self.strip.scrubbing = false;
+                self.strip.scrub_fabric = false;
+                self.strip_scrub_to(pos, true, cx);
+            }
+            return;
+        }
         let date_pos = self
             .strip_date_hits
             .borrow()
@@ -21742,6 +21764,31 @@ struct StripDateHit {
     at_ms: i64,
 }
 
+#[derive(Clone)]
+struct StripStationHit {
+    bounds: Bounds<Pixels>,
+    tick_x: f32,
+    at_ms: i64,
+    rank: u8,
+}
+
+#[derive(Clone)]
+struct StripWellHit {
+    bounds: Bounds<Pixels>,
+    start_ms: i64,
+}
+
+fn station_hit_at(hits: &[StripStationHit], p: Point<Pixels>) -> Option<i64> {
+    hits.iter()
+        .filter(|hit| hit.bounds.contains(&p))
+        .min_by(|a, b| {
+            (f32::from(p.x) - a.tick_x).abs()
+                .total_cmp(&(f32::from(p.x) - b.tick_x).abs())
+                .then(a.rank.cmp(&b.rank))
+        })
+        .map(|hit| hit.at_ms)
+}
+
 /// The thumb's travel: `min(total_work, rail_width)` (design §1). When the
 /// history fits, the rail and the fixed-scale fabric coincide 1:1; when it
 /// overflows, the thumb compresses the whole duration into the rail.
@@ -24636,14 +24683,24 @@ impl Editor {
                 )
                 .on_mouse_move(cx.listener(|editor, ev: &MouseMoveEvent, _, cx| {
                     if !editor.strip.scrubbing {
+                        let station = station_hit_at(
+                            &editor.strip_station_hits.borrow(), ev.position);
                         let hover = editor
                             .strip_date_hits
                             .borrow()
                             .iter()
                             .find(|hit| hit.bounds.contains(&ev.position))
                             .map(|hit| hit.at_ms);
-                        if hover != editor.strip.hover_date_ms {
+                        let well = editor.strip_well_hits.borrow().iter()
+                            .find(|hit| hit.bounds.contains(&ev.position))
+                            .map(|hit| hit.start_ms);
+                        if station != editor.strip.hover_station_ms
+                            || hover != editor.strip.hover_date_ms
+                            || well != editor.strip.hover_well_start_ms
+                        {
+                            editor.strip.hover_station_ms = station;
                             editor.strip.hover_date_ms = hover;
+                            editor.strip.hover_well_start_ms = well;
                             cx.notify();
                         }
                     }
@@ -24745,6 +24802,8 @@ struct StripPrepaint {
     view: f32,
     labels: Vec<StripText>,
     dates: Vec<StripText>,
+    wells: Vec<StripText>,
+    station_hitboxes: Vec<Hitbox>,
     date_hitboxes: Vec<Hitbox>,
 }
 
@@ -24832,7 +24891,8 @@ impl Element for StripElement {
             if wx < rail_x0 - 60. || wx > rail_x1 + 60. {
                 continue;
             }
-            let near = (st.at_ms - pos).abs() < 45_000;
+            let near = editor.strip.hover_station_ms == Some(st.at_ms)
+                || (st.at_ms - pos).abs() < 45_000;
             let line = shape(&st.label, 11., if near { 0xEAE4D2 } else { 0xC1BBA9 }, window);
             let lx = if st.flip_left {
                 wx - f32::from(line.width) - 3.
@@ -24843,9 +24903,45 @@ impl Element for StripElement {
             labels.push(StripText {
                 origin: point(px(lx), px(ly)),
                 line,
-                at_ms: None,
+                at_ms: Some(st.at_ms),
             });
         }
+        // One target owns each station's painted tick and, when present, its
+        // label. Midpoints clip transparent padding so neighbours never
+        // overlap; omitted labels retain a 12×24 target.
+        let mut station_order: Vec<_> = bake.stations.iter().enumerate()
+            .map(|(i, st)| (i, fab_x(st.x))).collect();
+        station_order.sort_by(|a, b| a.1.total_cmp(&b.1)
+            .then(bake.stations[a.0].rank.cmp(&bake.stations[b.0].rank)));
+        let mut station_hits = Vec::new();
+        let mut station_hitboxes = Vec::new();
+        for (order, &(i, tick_x)) in station_order.iter().enumerate() {
+            if tick_x < rail_x0 - 8. || tick_x > rail_x1 + 8. { continue; }
+            let st = &bake.stations[i];
+            let label = labels.iter().find(|l| l.at_ms == Some(st.at_ms));
+            let mut left = tick_x - 6.;
+            let mut right = tick_x + 6.;
+            if let Some(label) = label {
+                left = left.min(f32::from(label.origin.x) - 3.);
+                right = right.max(f32::from(label.origin.x + label.line.width) + 3.);
+            }
+            if order > 0 {
+                left = left.max((station_order[order - 1].1 + tick_x) / 2.);
+            }
+            if order + 1 < station_order.len() {
+                right = right.min((tick_x + station_order[order + 1].1) / 2.);
+            }
+            if right <= left { continue; }
+            let bounds = Bounds::new(
+                point(px(left), px(band_top + strip::TOP_ROW_H)),
+                size(px(right - left), px(strip::LABEL_LANE_H.max(24.))),
+            );
+            station_hitboxes.push(window.insert_hitbox(bounds, HitboxBehavior::Normal));
+            station_hits.push(StripStationHit {
+                bounds, tick_x, at_ms: st.at_ms, rank: st.rank,
+            });
+        }
+        *editor.strip_station_hits.borrow_mut() = station_hits;
         // Date lane — thinned by real shaped width: a checkpoint-dense era
         // packs several day-firsts into a few px, and overprinted labels read
         // as one smear ("Tue 23 JulToday"). The LAST date always survives a
@@ -24905,6 +25001,32 @@ impl Element for StripElement {
             });
         }
         *editor.strip_date_hits.borrow_mut() = date_hits;
+        let mut wells = Vec::new();
+        let mut well_hits = Vec::new();
+        for datum in &bake.well_data {
+            let wx = fab_x(datum.x);
+            let expanded = editor.strip.hover_well_start_ms == Some(datum.start_ms);
+            let text = if expanded {
+                strip::well_span_label(datum, bake.now_ms)
+            } else {
+                datum.label.clone()
+            };
+            let line = shape(&text, 8.5, 0x8E8878, window);
+            let lx = (wx - f32::from(line.width) / 2.)
+                .clamp(rail_x0, (tail_x - f32::from(line.width)).max(rail_x0));
+            let origin = point(px(lx), px(band_top + strip::STRIP_H - strip::DATE_LANE_H));
+            let bounds = Bounds::new(origin, size(line.width, px(strip::DATE_LANE_H)));
+            // Bounding dates speak first. If the compact datum cannot coexist,
+            // the immutable well remains and its words are simply omitted.
+            if !expanded && dates.iter().any(|d| {
+                let dl = f32::from(d.origin.x);
+                let dr = dl + f32::from(d.line.width);
+                lx < dr + 4. && dl < lx + f32::from(line.width) + 4.
+            }) { continue; }
+            wells.push(StripText { origin, line, at_ms: None });
+            well_hits.push(StripWellHit { bounds, start_ms: datum.start_ms });
+        }
+        *editor.strip_well_hits.borrow_mut() = well_hits;
         StripPrepaint {
             rail_x0,
             rail_x1,
@@ -24912,6 +25034,8 @@ impl Element for StripElement {
             view,
             labels,
             dates,
+            wells,
+            station_hitboxes,
             date_hitboxes,
         }
     }
@@ -24929,6 +25053,9 @@ impl Element for StripElement {
         let _guard = DrawGuard::enter();
         let editor = self.editor.read(cx);
         for hitbox in &prepaint.date_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        for hitbox in &prepaint.station_hitboxes {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
         let rail_x0 = prepaint.rail_x0;
@@ -25132,7 +25259,8 @@ impl Element for StripElement {
             let x = fab_x(st.x);
             // Brighten by TIME distance to the playhead (association by light,
             // design §2) — stable under the fabric's pan, unlike pixel distance.
-            let near = (st.at_ms - pos).abs() < 45_000;
+            let near = editor.strip.hover_station_ms == Some(st.at_ms)
+                || (st.at_ms - pos).abs() < 45_000;
             let base = if st.restore { strip::SAGE } else { strip::GREY };
             let a = if near { 0.95 } else { 0.3 };
             rect(window, x, band_top + strip::TOP_ROW_H, 1., strip::LABEL_LANE_H + strip::FABRIC_H, tint(base, a));
@@ -25224,10 +25352,20 @@ impl Element for StripElement {
 
         // --- Shaped text: station labels + the date lane ---------------------
         for t in prepaint.labels.drain(..) {
+            let y = f32::from(t.origin.y) + 12.;
+            let mut x = f32::from(t.origin.x);
+            let end = x + f32::from(t.line.width);
+            while x < end {
+                rect(window, x, y, 3., 1., tint(strip::GREY, 0.72));
+                x += 6.;
+            }
             t.line.paint(t.origin, px(13.), TextAlign::Left, None, window, cx).ok();
         }
         for t in prepaint.dates.drain(..) {
             t.line.paint(t.origin, px(12.), TextAlign::Left, None, window, cx).ok();
+        }
+        for t in prepaint.wells.drain(..) {
+            t.line.paint(t.origin, px(10.), TextAlign::Left, None, window, cx).ok();
         }
     }
 }
@@ -25236,6 +25374,18 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn station_hit_arbitrates_by_tick_then_rank() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(30.), px(24.)));
+        let hits = vec![
+            StripStationHit { bounds, tick_x: 8., at_ms: 10, rank: 6 },
+            StripStationHit { bounds, tick_x: 22., at_ms: 20, rank: 0 },
+        ];
+        assert_eq!(station_hit_at(&hits, point(px(9.), px(12.))), Some(10));
+        assert_eq!(station_hit_at(&hits, point(px(15.), px(12.))), Some(20));
+        assert_eq!(station_hit_at(&hits, point(px(31.), px(12.))), None);
+    }
 
     fn plain_preview(text: &str) -> PreviewDoc {
         PreviewDoc {
