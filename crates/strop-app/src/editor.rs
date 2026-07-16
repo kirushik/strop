@@ -21,7 +21,7 @@ use gpui::{
     Hitbox, HitboxBehavior, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad,
+    PaintQuad, PathBuilder,
     Pixels, Point, ResizeEdge, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
     Style, TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
     WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
@@ -1996,6 +1996,53 @@ struct ParagraphLayout {
     /// to decide whether the shaped line can be reused verbatim (per-block
     /// layout reuse) instead of re-shaping — a few `TextRun`s per block.
     runs: Vec<TextRun>,
+    /// Paragraph-local bytes of the one promoted diagnosis anchor. Its tint
+    /// is custom-painted below run backgrounds; history frames carry none.
+    active_diagnosis: Option<Range<usize>>,
+}
+
+// GPUI's wavy-underline shader (`fs_underline`) uses these exact ratios for
+// a 1px underline: a 3px-high primitive, 0.8px amplitude, and two pi over
+// 9px. Keeping the analytic edge here beside its path consumer makes the
+// promoted band's boundary the same mark rather than a second approximation.
+const DIAGNOSIS_WAVE_AMPLITUDE: f32 = 0.8;
+const DIAGNOSIS_WAVE_LENGTH: f32 = 9.;
+
+fn diagnosis_wave_y(x_from_segment: f32, underline_y: f32) -> f32 {
+    underline_y
+        + (x_from_segment * std::f32::consts::TAU / DIAGNOSIS_WAVE_LENGTH).sin()
+            * DIAGNOSIS_WAVE_AMPLITUDE
+}
+
+fn paint_diagnosis_band(
+    origin: Point<Pixels>,
+    top: Pixels,
+    underline_y: Pixels,
+    left: Pixels,
+    right: Pixels,
+    window: &mut Window,
+) {
+    if right <= left {
+        return;
+    }
+    let mut path = PathBuilder::fill();
+    path.move_to(origin + point(left, top));
+    path.line_to(origin + point(right, top));
+    // Half-pixel sampling is comfortably below the shader's one-pixel
+    // antialias fringe while retaining its segment-anchored phase.
+    let width = f32::from(right - left);
+    let mut dx = width;
+    while dx > 0. {
+        path.line_to(origin + point(
+            left + px(dx),
+            px(diagnosis_wave_y(dx, f32::from(underline_y))),
+        ));
+        dx = (dx - 0.5).max(0.);
+    }
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, rgba(DIAGNOSIS_TINT_ACTIVE));
+    }
 }
 
 impl ParagraphLayout {
@@ -14754,9 +14801,12 @@ fn runs_for_paragraph(
                             wavy: true,
                         });
                     }
-                    let tint = if *is_diagnosis {
-                        rgba(DIAGNOSIS_TINT_ACTIVE)
-                    } else if *active {
+                    if *is_diagnosis {
+                        // The active diagnosis tint is a shaped element-paint
+                        // path. Its run keeps only the existing squiggle.
+                        continue;
+                    }
+                    let tint = if *active {
                         rgba(NOTE_TINT_ACTIVE)
                     } else {
                         rgba(NOTE_TINT)
@@ -15812,6 +15862,16 @@ impl Element for EditorElement {
                 text_top,
                 centered: bstyle.centered,
                 runs,
+                active_diagnosis: note_ranges.iter().find_map(|(note, active, diagnosis)| {
+                    if !*active || !*diagnosis {
+                        return None;
+                    }
+                    let start = note.start.max(range.start);
+                    let end = note.end.min(range.end);
+                    // then (not then_some): the subtraction must stay lazy —
+                    // a note wholly before this paragraph underflows it.
+                    (start < end).then(|| start - range.start..end - range.start)
+                }),
             });
             // The pile keeps a tighter vertical rhythm (the mockup's
             // ~0.95em item spacing): its blank separator lines are honest
@@ -16127,6 +16187,27 @@ impl Element for EditorElement {
             // translators mirror (`center_shift`), so glyphs, wash and
             // caret agree to the pixel.
             let align = if par.centered { TextAlign::Center } else { TextAlign::Left };
+            if let Some(active) = &par.active_diagnosis {
+                let layout = &par.line.unwrapped_layout;
+                let padding_top =
+                    (par.line_height - layout.ascent - layout.descent) / 2.;
+                let underline_in_line = padding_top + layout.ascent + layout.descent * 0.618;
+                let first = par.line_of(active.start, true);
+                let last = par.line_of(active.end, false);
+                for line in first..=last {
+                    let start = active.start.max(par.line_start(line));
+                    let end = active.end.min(par.line_end(line));
+                    paint_diagnosis_band(
+                        bounds.origin,
+                        y + par.text_top + par.line_height * (line as f32),
+                        y + par.text_top + par.line_height * (line as f32)
+                            + underline_in_line,
+                        par.x_for(start, line),
+                        par.x_for(end, line),
+                        window,
+                    );
+                }
+            }
             par.line
                 .paint_background(origin, par.line_height, align, None, window, cx)
                 .expect("paint_background failed");
@@ -29269,3 +29350,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+    #[test]
+    fn diagnosis_band_edge_is_the_gpui_underline_wave() {
+        let underline_y = 17.;
+        for x in [0., 1., 2.25, 4.5, 6.75, 9., 18.] {
+            let shader_y = underline_y
+                + (x * std::f32::consts::TAU / 9.).sin() * 0.8;
+            assert!((diagnosis_wave_y(x, underline_y) - shader_y).abs() < 0.0001);
+            assert!((diagnosis_wave_y(x, underline_y) - underline_y).abs()
+                <= DIAGNOSIS_WAVE_AMPLITUDE + f32::EPSILON);
+        }
+        assert!((diagnosis_wave_y(2.25, underline_y)
+            - (underline_y + DIAGNOSIS_WAVE_AMPLITUDE)).abs() < 0.0001);
+        assert!((diagnosis_wave_y(6.75, underline_y)
+            - (underline_y - DIAGNOSIS_WAVE_AMPLITUDE)).abs() < 0.0001);
+    }
