@@ -607,7 +607,11 @@ fn markdown_fence(text: &str) -> Option<&str> {
 }
 
 /// Locate a quote in the text as a char range, searching from `after_char`
-/// (sequential anchoring handles repeated quotes).
+/// (sequential anchoring handles repeated quotes). Exact match first; when
+/// that fails, a lenient pass under one shared normalization — models
+/// straighten curly apostrophes, collapse whitespace runs and turn U+2028
+/// into \n when quoting, none of which is evidence the text changed. The
+/// returned OFFSETS always index the TRUE text.
 pub fn anchor(text: &str, quote: &str, after_char: usize) -> Option<Range<usize>> {
     if quote.is_empty() {
         return None;
@@ -617,13 +621,99 @@ pub fn anchor(text: &str, quote: &str, after_char: usize) -> Option<Range<usize>
         .nth(after_char)
         .map(|(b, _)| b)
         .unwrap_or(text.len());
-    let found = text[after_byte..]
+    if let Some(found) = text[after_byte..]
         .find(quote)
         .map(|b| b + after_byte)
-        .or_else(|| text.find(quote))?;
-    let start_char = text[..found].chars().count();
-    let end_char = start_char + quote.chars().count();
-    Some(start_char..end_char)
+        .or_else(|| text.find(quote))
+    {
+        let start_char = text[..found].chars().count();
+        let end_char = start_char + quote.chars().count();
+        return Some(start_char..end_char);
+    }
+    anchor_normalized(text, quote, after_char)
+}
+
+/// The lenient pass behind `anchor`: match under `normalize_quote`'s folding
+/// while mapping every normalized char back to the true text's char index,
+/// so anchoring offsets are never computed against the folded copy.
+fn anchor_normalized(text: &str, quote: &str, after_char: usize) -> Option<Range<usize>> {
+    let needle = normalize_quote(quote);
+    if needle.is_empty() {
+        return None;
+    }
+    // Per normalized char: the true-text char it starts at, and the true-
+    // text char just past it (a collapsed whitespace run spans several).
+    let (norm, starts, ends) = {
+        let mut norm = String::new();
+        let mut starts = Vec::new();
+        let mut ends = Vec::new();
+        let mut in_ws = false;
+        for (i, c) in text.chars().enumerate() {
+            if c.is_whitespace() {
+                if in_ws {
+                    *ends.last_mut().expect("a whitespace run emitted its space") = i + 1;
+                } else {
+                    norm.push(' ');
+                    starts.push(i);
+                    ends.push(i + 1);
+                    in_ws = true;
+                }
+            } else {
+                norm.push(fold_char(c));
+                starts.push(i);
+                ends.push(i + 1);
+                in_ws = false;
+            }
+        }
+        (norm, starts, ends)
+    };
+    // `after_char` (true domain) → the first normalized char at/after it.
+    let after_norm = starts
+        .iter()
+        .position(|&s| s >= after_char)
+        .unwrap_or(starts.len());
+    let after_byte = norm
+        .char_indices()
+        .nth(after_norm)
+        .map(|(b, _)| b)
+        .unwrap_or(norm.len());
+    let found = norm[after_byte..]
+        .find(&needle)
+        .map(|b| b + after_byte)
+        .or_else(|| norm.find(&needle))?;
+    let start_norm = norm[..found].chars().count();
+    let end_norm = start_norm + needle.chars().count();
+    Some(starts[start_norm]..ends[end_norm - 1])
+}
+
+/// One char of the grounding normalization: apostrophes agree across their
+/// curly/straight forms. Whitespace folding lives in the callers (it is a
+/// run operation, not a char map).
+fn fold_char(c: char) -> char {
+    match c {
+        '\u{2018}' | '\u{2019}' => '\'',
+        other => other,
+    }
+}
+
+/// A quote folded the same way `anchor_normalized` folds the text: curly
+/// apostrophes straighten, any whitespace run (U+2028 included — Rust's
+/// `char::is_whitespace` covers it) reads as one space.
+fn normalize_quote(quote: &str) -> String {
+    let mut out = String::new();
+    let mut in_ws = false;
+    for c in quote.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+            }
+            in_ws = true;
+        } else {
+            out.push(fold_char(c));
+            in_ws = false;
+        }
+    }
+    out
 }
 
 /// Diagnoses -> annotations, anchored sequentially, skipping anything the
@@ -689,6 +779,29 @@ mod tests {
         // Sequential anchoring finds the SECOND occurrence next.
         let second = anchor(text, "зарыта мысль", range.start + 1).unwrap();
         assert_eq!(second.start, 22);
+    }
+
+    #[test]
+    fn anchor_survives_model_normalization() {
+        // Curly apostrophes in the text, straight in the model's quote.
+        let text = "It’s the writer’s own line.";
+        assert_eq!(anchor(text, "It's the writer's", 0), Some(0..17));
+        // U+2028 quoted as \n, a double space collapsed — offsets still
+        // index the TRUE text, whitespace runs and all.
+        let text = "first\u{2028}second  third";
+        assert_eq!(
+            anchor(text, "first\nsecond third", 0),
+            Some(0..text.chars().count())
+        );
+        // A run-collapsing match ends past the run it swallowed.
+        assert_eq!(anchor("a  b’c", "a b'c", 0), Some(0..6));
+        // Sequential anchoring holds under the lenient pass too.
+        let text = "он’ и он’ again";
+        let first = anchor(text, "он'", 0).unwrap();
+        assert_eq!(first, 0..3);
+        assert_eq!(anchor(text, "он'", first.end), Some(6..9));
+        // Leniency is not fuzziness: a genuinely absent quote stays absent.
+        assert!(anchor("plain text", "absent", 0).is_none());
     }
 
     #[test]

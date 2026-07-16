@@ -337,6 +337,10 @@ struct DeferredPass {
     rejected: usize,
     scope: Option<strop_core::diagnose::PromptScope>,
     generation: u64,
+    /// The document revision the read was ASKED against (staleness honesty):
+    /// "the draft changed" may only ever be claimed when this differs from
+    /// the revision at integration.
+    base_revision: u64,
 }
 
 struct CompletedAiPass {
@@ -344,6 +348,8 @@ struct CompletedAiPass {
     rejected: usize,
     scope: strop_core::diagnose::PromptScope,
     log: crate::ai_log::PassLog,
+    /// See `DeferredPass::base_revision` — snapshotted in `run_pass`.
+    base_revision: u64,
 }
 
 #[derive(Clone)]
@@ -5185,6 +5191,10 @@ impl Editor {
         };
         let target_language = self.resolved_ai_language(&manuscript);
         let max_tokens = output_token_budget(&kind, &target_language.code);
+        // The staleness snapshot: the revision this read is asked against.
+        // Integration compares it to the revision THEN — a "draft changed"
+        // verdict without an actual change in between is a fabrication.
+        let base_revision = self.doc.revision();
         self.ai_generation += 1;
         let generation = self.ai_generation;
         self.ai_worker_active = true;
@@ -5283,6 +5293,7 @@ impl Editor {
                         rejected,
                         scope,
                         log,
+                        base_revision,
                     })
                 })
                 .await;
@@ -5303,6 +5314,7 @@ impl Editor {
                             completed.diagnoses,
                             completed.rejected,
                             Some(completed.scope),
+                            completed.base_revision,
                             generation,
                             cx,
                         )
@@ -5369,6 +5381,7 @@ impl Editor {
         diagnoses: Vec<strop_core::diagnose::Diagnosis>,
         rejected: usize,
         scope: Option<strop_core::diagnose::PromptScope>,
+        base_revision: u64,
         _generation: u64,
         cx: &mut Context<Self>,
     ) {
@@ -5377,12 +5390,17 @@ impl Editor {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let count = diagnoses.len();
+        // Read BEFORE this integration's own mutations: did the document
+        // actually change between the ask and the landing? Only an actual
+        // change may ever be blamed for ungroundable quotes.
+        let doc_changed = self.doc.revision() != base_revision;
         // Anchor against the text as it is NOW — quotes
         // that no longer match are dropped.
         self.diagnosis_pass += 1;
         let pass_id = self.diagnosis_pass;
         let grounded = ground_diagnoses(&self.doc, diagnoses, scope.as_ref(), now, pass_id);
         let groundable = grounded.groundable;
+        let context_grounded = grounded.context_grounded;
         let target_missing = grounded.target_missing;
         let annotations = grounded.annotations;
         let kept = annotations.len();
@@ -5419,7 +5437,15 @@ impl Editor {
             })
             .detach();
         }
-        match ai_landing(count, rejected, groundable, target_missing, kept) {
+        match ai_landing(
+            count,
+            rejected,
+            groundable,
+            target_missing,
+            kept,
+            doc_changed,
+            context_grounded,
+        ) {
             AiLanding::Cards => {
                 // The cards are the result. Malformed/stale sibling counts
                 // remain in diagnostics; backend maintenance is not writer work.
@@ -5441,6 +5467,17 @@ impl Editor {
                     title: "The draft changed before the read landed".into(),
                     detail: "The old quotes were not attached to different text.".into(),
                     recovery: AiRecovery::ReadAgain,
+                });
+            }
+            AiLanding::Unlanded => {
+                // Verdict honesty: the revision did NOT change (or the
+                // quotes only match context) — the failed grounding is the
+                // read's, never the draft's. Short and factual; no advice.
+                self.ai_empty_result = None;
+                self.ai_status = Some(AiStatus::Error {
+                    title: "The read did not land".into(),
+                    detail: "The reply quoted text that is not in the passage it read.".into(),
+                    recovery: AiRecovery::Retry,
                 });
             }
             AiLanding::Empty => {
@@ -5469,7 +5506,10 @@ impl Editor {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
-        self.deliver_pass_report(diagnoses, 0, None, generation, cx);
+        // The seed/demo path has no run_pass snapshot; "asked against the
+        // current revision" is the honest equivalent.
+        let base_revision = self.doc.revision();
+        self.deliver_pass_report(diagnoses, 0, None, base_revision, generation, cx);
     }
 
     fn deliver_pass_report(
@@ -5477,6 +5517,7 @@ impl Editor {
         diagnoses: Vec<strop_core::diagnose::Diagnosis>,
         rejected: usize,
         scope: Option<strop_core::diagnose::PromptScope>,
+        base_revision: u64,
         generation: u64,
         cx: &mut Context<Self>,
     ) {
@@ -5489,6 +5530,7 @@ impl Editor {
                 rejected,
                 scope,
                 generation,
+                base_revision,
             });
             // The provider call is complete. Ready outranks neither a real
             // worker nor an error, so clear Running before the button derives
@@ -5497,7 +5539,7 @@ impl Editor {
             self.ai_status = None;
             self.watch_for_lull(cx);
         } else {
-            self.integrate_pass(diagnoses, rejected, scope, generation, cx);
+            self.integrate_pass(diagnoses, rejected, scope, base_revision, generation, cx);
         }
     }
 
@@ -5511,7 +5553,7 @@ impl Editor {
         if d.generation != self.ai_generation {
             return; // cancelled or superseded while parked
         }
-        self.integrate_pass(d.diagnoses, d.rejected, d.scope, d.generation, cx);
+        self.integrate_pass(d.diagnoses, d.rejected, d.scope, d.base_revision, d.generation, cx);
     }
 
     /// Poll (4×/s) until the typing burst ends, then flush the parked pass.
@@ -18355,6 +18397,10 @@ struct AiEmptyResult {
 
 struct GroundedDiagnoses {
     groundable: usize,
+    /// Quotes that ground in the scope's CONTEXT but not the target: the
+    /// model quoted its surroundings. Ungroundable — no card can anchor —
+    /// but never staleness evidence: the text it quoted demonstrably exists.
+    context_grounded: usize,
     target_missing: bool,
     annotations: Vec<Annotation>,
 }
@@ -18382,10 +18428,27 @@ fn ground_diagnoses(
             (0, manuscript.clone())
         }
     });
+    // Lenient grounding, shared with the anchoring path (`anchor`'s
+    // normalized fallback): models normalize apostrophes, collapse
+    // whitespace runs and turn U+2028 into \n when quoting — none of which
+    // is evidence the draft changed.
+    let grounds = |haystack: &str, quote: &str| {
+        strop_core::diagnose::anchor(haystack, quote, 0).is_some()
+    };
     let groundable = diagnoses
         .iter()
-        .filter(|diagnosis| target_text.contains(&diagnosis.quote))
+        .filter(|diagnosis| grounds(&target_text, &diagnosis.quote))
         .count();
+    let context_grounded = scope.map_or(0, |scope| {
+        diagnoses
+            .iter()
+            .filter(|d| {
+                !grounds(&target_text, &d.quote)
+                    && (grounds(&scope.context_before, &d.quote)
+                        || grounds(&scope.context_after, &d.quote))
+            })
+            .count()
+    });
     let target_doc_start = base + target_start;
     let target_doc_end = target_doc_start + target_text.chars().count();
     let mut existing = Annotations::default();
@@ -18410,6 +18473,7 @@ fn ground_diagnoses(
     }
     GroundedDiagnoses {
         groundable,
+        context_grounded,
         target_missing,
         annotations,
     }
@@ -18420,6 +18484,10 @@ enum AiLanding {
     Cards,
     Empty,
     Stale,
+    /// Nothing grounded, but the draft is NOT to blame: the revision never
+    /// changed between ask and landing (or the quotes only match context).
+    /// The failure is the read's — a different card than Stale.
+    Unlanded,
     Invalid,
 }
 
@@ -18429,13 +18497,22 @@ fn ai_landing(
     groundable: usize,
     target_missing: bool,
     kept: usize,
+    doc_changed: bool,
+    context_grounded: usize,
 ) -> AiLanding {
     if kept > 0 {
         AiLanding::Cards
     } else if rejected > 0 {
         AiLanding::Invalid
     } else if accepted > 0 && (target_missing || groundable == 0) {
-        AiLanding::Stale
+        // "The draft changed" requires the draft to have CHANGED — and a
+        // quote that grounds in the context paragraphs proves the model
+        // read real text, so it never counts as staleness evidence either.
+        if doc_changed && context_grounded == 0 {
+            AiLanding::Stale
+        } else {
+            AiLanding::Unlanded
+        }
     } else {
         AiLanding::Empty
     }
@@ -26434,10 +26511,12 @@ mod tests {
                 level: "line".into(),
             };
 
+            let base_revision = editor.doc.revision();
             editor.integrate_pass(
                 vec![diagnosis("duplicate"), diagnosis("new issue")],
                 0,
                 Some(scope),
+                base_revision,
                 1,
                 cx,
             );
@@ -26467,7 +26546,8 @@ mod tests {
                 label: "line read · model".into(),
             });
 
-            editor.deliver_pass_report(Vec::new(), 0, None, editor.ai_generation, cx);
+            let base_revision = editor.doc.revision();
+            editor.deliver_pass_report(Vec::new(), 0, None, base_revision, editor.ai_generation, cx);
 
             assert!(editor.deferred_pass.is_some());
             assert!(!matches!(editor.ai_status, Some(AiStatus::Running { .. })));
@@ -27080,20 +27160,37 @@ mod tests {
     #[test]
     fn ai_landing_separates_empty_stale_and_invalid_results() {
         use AiLanding::*;
-        assert_eq!(ai_landing(0, 0, 0, false, 0), Empty);
+        assert_eq!(ai_landing(0, 0, 0, false, 0, false, 0), Empty);
         assert_eq!(
-            ai_landing(2, 0, 2, false, 0),
+            ai_landing(2, 0, 2, false, 0, true, 0),
             Empty,
             "grounded duplicates mean no new queries, not a failed read"
         );
-        assert_eq!(ai_landing(2, 0, 0, false, 0), Stale);
-        assert_eq!(ai_landing(2, 0, 2, true, 0), Stale);
-        assert_eq!(ai_landing(0, 1, 0, false, 0), Invalid);
+        assert_eq!(ai_landing(2, 0, 0, false, 0, true, 0), Stale);
+        assert_eq!(ai_landing(2, 0, 2, true, 0, true, 0), Stale);
+        assert_eq!(ai_landing(0, 1, 0, false, 0, false, 0), Invalid);
         assert_eq!(
-            ai_landing(2, 1, 1, false, 1),
+            ai_landing(2, 1, 1, false, 1, true, 0),
             Cards,
             "valid cards land despite malformed siblings"
         );
+    }
+
+    #[test]
+    fn staleness_requires_an_actual_edit_and_context_quotes_never_count() {
+        use AiLanding::*;
+        // Nothing grounded but the revision never changed: the read did not
+        // land — the draft may not be blamed for it.
+        assert_eq!(ai_landing(2, 0, 0, false, 0, false, 0), Unlanded);
+        assert_eq!(ai_landing(2, 0, 2, true, 0, false, 0), Unlanded);
+        // Quotes grounding only in the context paragraphs prove the model
+        // read real text — never staleness evidence, even after an edit.
+        assert_eq!(ai_landing(2, 0, 0, false, 0, true, 2), Unlanded);
+        // The genuine staleness case still names the draft.
+        assert_eq!(ai_landing(2, 0, 0, false, 0, true, 0), Stale);
+        // Cards and Invalid outrank the staleness question entirely.
+        assert_eq!(ai_landing(2, 1, 0, false, 1, false, 0), Cards);
+        assert_eq!(ai_landing(2, 1, 0, false, 0, false, 0), Invalid);
     }
 
     #[test]
