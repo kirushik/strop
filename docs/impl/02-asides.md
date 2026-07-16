@@ -129,14 +129,19 @@ pub struct GraveEntry {
 pub struct Graveyard { entries: Vec<GraveEntry>, next_id: u64 }
 ```
 
-**What counts as a cut (the trigger):** a single SELECTION-deletion
-op of ≥ 80 chars of prose lands in the graveyard automatically —
-deterministic, and the editor still holds the deleted text at that
-point (reviews H24 + H43: journal-run coalescing must not decide
-this, and a backspace machine-gun never auto-files). `Send to the
-graveyard` (selection menu) files any size. Deletions INSIDE compost,
-moves (aside/orphan migration — suppression guard), and
-undo/redo/restore never file; undo of a cut also removes its entry
+**What counts as a cut (the trigger):** a single selection-removal
+op of ≥ 80 chars, with or without replacement text — anything big
+that leaves in one stroke, survives. Typing or pasting over a big
+selection files the REMOVED text and lands the replacement in the
+same transaction; a plain deletion files as before. Deterministic,
+and the editor still holds the doomed text at that point (reviews
+H24 + H43: journal-run coalescing must not decide this, and a
+backspace machine-gun never auto-files). Typograph substitutions
+(tiny prefix replaces) and IME commits (which only replace their own
+preedit) never file. `Send to the graveyard` (selection menu) files
+any size. Deletions INSIDE compost, moves (aside/orphan migration —
+suppression guard), and undo/redo/restore never file; undo of a cut
+also removes its entry — and peels the replacement, when one landed
 (the inverse in the same grammar, P13).
 
 - **Put back** inserts `text` at the re-anchored `origin_pos` (or at

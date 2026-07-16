@@ -2027,14 +2027,17 @@ fn format_thousands(n: usize) -> String {
 }
 
 /// The auto-cut predicate (docs/impl/02-asides.md §4): a single
-/// SELECTION-deletion op — an EMPTY replacement over a non-empty selection —
-/// of at least `AUTO_CUT_MIN_CHARS` chars. The old manuscript-only gate is
-/// gone (adjudicated, graveyard-interplay 5: ONE capture law on both sides
+/// selection-removal op of at least `AUTO_CUT_MIN_CHARS` chars, with or
+/// without replacement text — "anything big that leaves in one stroke,
+/// survives" (adjudicated: the old emptiness gate let a type-over or a
+/// paste-over destroy 500 chars and file NOTHING). The old manuscript-only
+/// gate is gone too (graveyard-interplay 5: ONE capture law on both sides
 /// of the seam — rope text always qualifies; only the graveyard slab, which
 /// is not rope text, sits outside it). Pure, so both sides of the threshold
-/// and the move-vs-cut distinction are unit-tested.
-fn auto_cut_qualifies(new_text: &str, range_chars: usize) -> bool {
-    new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS
+/// are unit-tested; the IME and typograph exemptions live at the call site
+/// (`apply_replace`), where the op's provenance is known.
+fn auto_cut_qualifies(range_chars: usize) -> bool {
+    range_chars >= AUTO_CUT_MIN_CHARS
 }
 
 /// A tiny deterministic PNG for the rig (`seed:image`): 8-bit RGB, zlib
@@ -13459,10 +13462,12 @@ impl Editor {
         // A seam-spanning selection (legalized by seam-mechanics 2): ONE
         // transaction, TWO edits — above and below the separator, the seam
         // between the remnants, the replacement landing manuscript-side.
-        // A spanning DELETION files up to two region-honest graveyard
-        // entries, threshold per side (graveyard-interplay 6); a type-over
-        // files nothing. Only the tail era has live spanning input (top-era
-        // docs migrate at open; the past is preview-only).
+        // A spanning REMOVAL files up to two region-honest graveyard
+        // entries, threshold per side (graveyard-interplay 6) — type-over
+        // included (§4's amendment); only the IME commit, which replaces
+        // its own preedit and never manuscript, files nothing. Only the
+        // tail era has live spanning input (top-era docs migrate at open;
+        // the past is preview-only).
         if !range.is_empty()
             && matches!(
                 self.doc.boundary(),
@@ -13481,7 +13486,7 @@ impl Editor {
                 above,
                 below,
                 new_text,
-                new_text.is_empty(),
+                self.marked_range.is_none(),
                 AUTO_CUT_MIN_CHARS,
                 quote,
                 now_unix(),
@@ -13508,30 +13513,42 @@ impl Editor {
         }
 
         // The auto-cut trigger (docs/impl/02-asides.md §4): a SINGLE
-        // selection-deletion op ≥ AUTO_CUT_MIN_CHARS files itself in the
-        // graveyard — on either side of the seam (one capture law,
-        // graveyard-interplay 5). Only a real deletion of a real selection —
-        // a replace-by-typing keeps its text and never files; a backspace
-        // run is many one-char ops, none reaching the threshold (H24 + H43).
-        // See `auto_cut_qualifies` for the pure predicate.
-        if !range.is_empty() {
+        // selection-removal op ≥ AUTO_CUT_MIN_CHARS files itself in the
+        // graveyard — with or without replacement text ("anything big that
+        // leaves in one stroke, survives"), on either side of the seam (one
+        // capture law, graveyard-interplay 5). A backspace run is many
+        // one-char ops, none reaching the threshold (H24 + H43); an IME
+        // commit only replaces its own preedit, never manuscript, so a live
+        // marked range exempts the op; typograph substitutions are tiny
+        // direct edits that never pass through here. See
+        // `auto_cut_qualifies` for the pure predicate.
+        let auto_cut = !range.is_empty() && self.marked_range.is_none() && {
             let start_char = self.doc.rope().byte_to_char(range.start);
             let end_char = self.doc.rope().byte_to_char(range.end);
-            if auto_cut_qualifies(new_text, end_char - start_char) {
-                // The auto path never collapses the seam itself: the caret
-                // ends inside the emptied pile, and the retype-race guard
-                // (seam-mechanics 6) owns the evaporation moment. Plain delete
-                // stays exact-bytes — only the exile verb interprets blocks.
-                self.file_cut(range, false, false, cx);
-                return;
-            }
+            auto_cut_qualifies(end_char - start_char)
+        };
+        if auto_cut && new_text.is_empty() {
+            // The auto path never collapses the seam itself: the caret
+            // ends inside the emptied pile, and the retype-race guard
+            // (seam-mechanics 6) owns the evaporation moment. Plain delete
+            // stays exact-bytes — only the exile verb interprets blocks.
+            self.file_cut(range, false, false, cx);
+            return;
         }
 
         // A machine-performed insertion (paste) re-anchors spans verbatim: no
         // right-edge expansion dresses it in a neighbour's mark (papercuts §A3
         // machine-insertion law). The typing hand still extends via the
-        // coalescing path.
-        if machine {
+        // coalescing path. A qualifying type-over files the removed text and
+        // lands the replacement in ONE transaction (undo restores both and
+        // drops the entry — the cut law's parity).
+        if auto_cut {
+            let quote = self.origin_quote_before(range.start);
+            self.doc
+                .replace_to_graveyard(range.clone(), new_text, machine, quote, now_unix());
+            self.grave_flash = Some(Instant::now());
+            self.schedule_flash_clear(cx);
+        } else if machine {
             self.doc.edit_bytes_verbatim(range.clone(), new_text);
         } else {
             self.doc.edit_bytes_coalescing(range.clone(), new_text);
@@ -13605,6 +13622,11 @@ impl Editor {
 
         self.bump_activity();
         cx.notify();
+        // A filed type-over may have carried a margin note / diagnosis on the
+        // removed text — the same anchor tidy-up `file_cut` performs (Bug C).
+        if auto_cut {
+            self.reconcile_dead_anchors(cx);
+        }
     }
 }
 
@@ -26720,19 +26742,73 @@ mod tests {
     }
 
     #[test]
-    fn auto_cut_fires_only_on_a_big_selection_deletion() {
-        // At/over the threshold, a pure selection-deletion fires — on EITHER
-        // side of the seam (one capture law, graveyard-interplay 5; the old
-        // region gate is gone — capture is region-agnostic, the ENTRY is
-        // region-honest instead).
-        assert!(auto_cut_qualifies("", AUTO_CUT_MIN_CHARS));
-        assert!(auto_cut_qualifies("", 500));
-        // Just under the threshold does NOT.
-        assert!(!auto_cut_qualifies("", AUTO_CUT_MIN_CHARS - 1));
-        // A replace-by-typing never files, however large the deleted run.
-        assert!(!auto_cut_qualifies("x", 500));
+    fn auto_cut_fires_on_any_big_selection_removal() {
+        // At/over the threshold, a selection-removal fires — deletion and
+        // type-over alike ("anything big that leaves in one stroke,
+        // survives"), on EITHER side of the seam (one capture law,
+        // graveyard-interplay 5; capture is region-agnostic, the ENTRY is
+        // region-honest instead). The IME exemption lives at the call site,
+        // where the marked range is known.
+        assert!(auto_cut_qualifies(AUTO_CUT_MIN_CHARS));
+        assert!(auto_cut_qualifies(500));
+        // Just under the threshold does NOT — so a typograph substitution
+        // (a tiny prefix replace) could never qualify even if it routed
+        // through the trigger.
+        assert!(!auto_cut_qualifies(AUTO_CUT_MIN_CHARS - 1));
         // An empty selection never fires.
-        assert!(!auto_cut_qualifies("", 0));
+        assert!(!auto_cut_qualifies(0));
+    }
+
+    #[gpui::test]
+    fn select_all_and_paste_files_exactly_one_entry_with_the_old_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let long = "x".repeat(120);
+        let editor = cx.new(|cx| Editor::new(cx, &long, SpanSet::default(), BlockMap::default()));
+        cx.update_entity(&editor, |editor, cx| {
+            editor.selected_range = 0..editor.doc.len_bytes();
+            editor.apply_replace(None, "fresh start", false, true, cx);
+            assert_eq!(editor.doc.text(), "fresh start");
+            assert_eq!(editor.doc.graveyard().len(), 1, "exactly ONE entry");
+            assert_eq!(editor.doc.graveyard().entries()[0].text, long);
+            // One undo: old text back, replacement gone, entry dropped.
+            editor.doc.undo();
+            assert_eq!(editor.doc.text(), long);
+            assert!(editor.doc.graveyard().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn ime_commit_over_its_own_preedit_never_files(cx: &mut gpui::TestAppContext) {
+        // The commit replaces the marked preedit, never manuscript — however
+        // long the composition grew, nothing lands in the graveyard.
+        let preedit = "か".repeat(100);
+        let editor =
+            cx.new(|cx| Editor::new(cx, &preedit, SpanSet::default(), BlockMap::default()));
+        cx.update_entity(&editor, |editor, cx| {
+            editor.marked_range = Some(0..editor.doc.len_bytes());
+            editor.apply_replace(None, "漢字", false, false, cx);
+            assert_eq!(editor.doc.text(), "漢字");
+            assert!(editor.doc.graveyard().is_empty(), "IME commit paths never file");
+        });
+    }
+
+    #[gpui::test]
+    fn typograph_substitution_after_a_filing_type_over_files_nothing_extra(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Type "-" over a 100-char selection right after a literal "-": the
+        // type-over files ONE entry, and the em-dash substitution that fires
+        // on the result (a tiny prefix replace) files nothing.
+        let text = format!("-{}", "a".repeat(100));
+        let editor = cx.new(|cx| Editor::new(cx, &text, SpanSet::default(), BlockMap::default()));
+        cx.update_entity(&editor, |editor, cx| {
+            editor.selected_range = 1..101;
+            editor.apply_replace(None, "-", true, false, cx);
+            assert_eq!(editor.doc.text(), "—", "the substitution still fired");
+            assert_eq!(editor.doc.graveyard().len(), 1, "the selection filed, the typograph did not");
+            assert_eq!(editor.doc.graveyard().entries()[0].text, "a".repeat(100));
+        });
     }
 
     #[test]

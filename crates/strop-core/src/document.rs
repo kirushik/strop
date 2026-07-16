@@ -2180,7 +2180,9 @@ impl Document {
     /// Delete `byte_range` and file the removed prose in the graveyard as ONE
     /// undoable transaction. Both the auto-cut trigger and the explicit "Send
     /// to the graveyard" verb route here — on EITHER side of the seam (one
-    /// capture law, graveyard-interplay 5). Because `edit_bytes` snapshots
+    /// capture law, graveyard-interplay 5); a qualifying TYPE-OVER routes
+    /// through the sibling `replace_to_graveyard` (§4's amendment: with or
+    /// without replacement text). Because `edit_bytes` snapshots
     /// the PRE-cut side-state (graveyard included) before the filing, undoing
     /// the deletion restores a graveyard WITHOUT this entry — P13's inverse
     /// in the same grammar, no correlation table needed. `origin_pos` is the
@@ -2201,6 +2203,41 @@ impl Document {
         cut_unix: i64,
         collapse_emptied: bool,
     ) -> u64 {
+        self.file_removal(byte_range, "", false, origin_quote, cut_unix, collapse_emptied)
+    }
+
+    /// The type-over half of §4's capture law ("anything big that leaves in
+    /// one stroke, survives"): delete `byte_range`, file the REMOVED prose,
+    /// and land `replacement` where it stood — ONE undoable transaction, so
+    /// undo restores the old text, peels the replacement, and drops the
+    /// entry together (the same parity `cut_to_graveyard` documents).
+    /// `machine` picks the replacement's span anchoring: a paste re-anchors
+    /// verbatim (the A3 machine-insertion law), the typing hand extends.
+    /// The editor's auto-cut trigger is the only caller; the explicit verbs
+    /// never carry a replacement.
+    pub fn replace_to_graveyard(
+        &mut self,
+        byte_range: Range<usize>,
+        replacement: &str,
+        machine: bool,
+        origin_quote: String,
+        cut_unix: i64,
+    ) -> u64 {
+        self.file_removal(byte_range, replacement, machine, origin_quote, cut_unix, false)
+    }
+
+    /// Shared body of `cut_to_graveyard` / `replace_to_graveyard`: the one
+    /// removal-capture engine, `replacement` empty for the plain cut.
+    fn file_removal(
+        &mut self,
+        byte_range: Range<usize>,
+        replacement: &str,
+        machine: bool,
+        origin_quote: String,
+        cut_unix: i64,
+        collapse_emptied: bool,
+    ) -> u64 {
+        let repl_chars = replacement.chars().count();
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.crosses_furniture_wall(block, merged) {
             // §2 ("no text mechanic may move, clone, or absorb" furniture):
@@ -2219,13 +2256,20 @@ impl Document {
             for cut in &cuts {
                 let rope = self.buffer.rope();
                 let (s, e) = (rope.byte_to_char(cut.start), rope.byte_to_char(cut.end));
-                // Origins are POST-delete positions: each cut's start, less
+                // Origins are POST-edit positions: each cut's start, less
                 // the chars the earlier cuts take (the walls between them
-                // stand, so nothing else shifts).
-                pending.push((self.grave_capture(s, e), s - removed));
+                // stand, so nothing else shifts), plus the replacement —
+                // it lands at the range start's side, left of every cut.
+                pending.push((self.grave_capture(s, e), s - removed + repl_chars));
                 removed += e - s;
             }
-            self.edit_bytes(byte_range, ""); // re-plans identically; the clamped executor
+            // Re-plans identically; the clamped executor runs the cuts and
+            // lands the replacement in one transaction.
+            if machine {
+                self.edit_bytes_verbatim(byte_range, replacement);
+            } else {
+                self.edit_bytes(byte_range, replacement);
+            }
             self.revision += 1;
             // A separator-only range plans no cuts and files nothing; the
             // returned 0 is never a live entry id (`Graveyard::file` starts
@@ -2254,7 +2298,11 @@ impl Document {
         let (text, spans, kinds, region, whole) = self.grave_capture(start_char, end_char);
         // The non-coalescing edit always opens a fresh transaction, so the
         // pre-cut snapshot is always taken and the filing below rides it.
-        self.edit_bytes(byte_range, "");
+        if machine {
+            self.edit_bytes_verbatim(byte_range, replacement);
+        } else {
+            self.edit_bytes(byte_range, replacement);
+        }
         self.revision += 1;
         let id = self.graveyard.file(
             text,
@@ -2463,8 +2511,10 @@ impl Document {
     /// replacement lands MANUSCRIPT-side and the caret returns to the
     /// selection start. Each side that independently clears
     /// `capture_threshold` (chars) files its own region-honest graveyard
-    /// entry inside the same atom (graveyard-interplay 6) — `capture: false`
-    /// (a type-over, which keeps its text in spirit) files nothing. If the
+    /// entry inside the same atom (graveyard-interplay 6) — a type-over
+    /// files like a deletion (§4's amendment: anything big that leaves in
+    /// one stroke, survives); `capture: false` (the IME commit, which only
+    /// replaces its own preedit) files nothing. If the
     /// below edit empties the pile, evaporation rides the atom too (the
     /// caret ends manuscript-side, so the retype guard does not apply).
     /// Returns the caret char offset (the selection start).
@@ -5348,6 +5398,70 @@ mod tests {
         doc.put_back(id).unwrap();
         assert_eq!(doc.text(), "AAA\nBBB\nCCC", "a fragment splices back in place");
         assert_eq!(doc.blocks().len(), 3);
+    }
+
+    // ---- §4's type-over amendment: anything big that leaves in one
+    // ---- stroke, survives — with or without replacement text ----
+
+    #[test]
+    fn type_over_files_the_removed_text_and_undoes_in_one_step() {
+        let long = "x".repeat(100);
+        let original = format!("AAA\n{long}\nCCC");
+        let mut doc = Document::new(&original, SpanSet::default(), BlockMap::default());
+        let id = doc.replace_to_graveyard(4..104, "NEW", false, "AAA".into(), 7);
+        assert_eq!(doc.text(), "AAA\nNEW\nCCC");
+        let e = doc.graveyard().get(id).unwrap();
+        assert_eq!(e.text, long, "the entry holds the REMOVED text, not the replacement");
+        assert!(e.whole_blocks, "a complete-block type-over records block-ness");
+        // ONE undo restores the old text, peels the replacement, and drops
+        // the entry together (the cut law's parity).
+        doc.undo();
+        assert_eq!(doc.text(), original);
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn paste_over_everything_files_exactly_one_entry_with_the_old_text() {
+        // Select-all + paste: the machine-performed replacement (verbatim
+        // span anchoring) still files ONE entry carrying the whole old text.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let end = doc.len_bytes();
+        doc.replace_to_graveyard(0..end, "fresh start", true, String::new(), 0);
+        assert_eq!(doc.text(), "fresh start");
+        assert_eq!(doc.graveyard().len(), 1);
+        assert_eq!(doc.graveyard().entries()[0].text, "AAA\nBBB\nCCC");
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn type_over_across_a_furniture_wall_clamps_and_files_the_actual_cuts() {
+        // §2 wall law under the amendment: the walls and the picture stand,
+        // the replacement lands at the range start's side, and each ACTUAL
+        // sub-deletion files its own entry at post-edit origins — never the
+        // raw slice, which would grave bytes still standing.
+        let mut doc = Document::new("0123456789\ncap\nabcdefghij", SpanSet::default(), {
+            let mut b = BlockMap::new(3);
+            b.set_kind(
+                1,
+                BlockKind::Image { src: "asset:img".into(), alt: String::new() },
+            );
+            b
+        });
+        doc.replace_to_graveyard(2..13, "XX", false, String::new(), 0);
+        assert_eq!(doc.text(), "01XX\np\nabcdefghij");
+        assert!(doc.blocks().kind(1).is_furniture(), "the picture survives the type-over");
+        assert_eq!(doc.graveyard().len(), 2, "one entry per surviving sub-deletion");
+        let entries = doc.graveyard().entries();
+        assert_eq!(entries[0].text, "23456789");
+        assert_eq!(entries[0].origin_pos, 4, "post-edit: after the landed replacement");
+        assert_eq!(entries[1].text, "ca");
+        assert_eq!(entries[1].origin_pos, 5);
+        // One undo restores text, walls, and empties the graveyard.
+        doc.undo();
+        assert_eq!(doc.text(), "0123456789\ncap\nabcdefghij");
+        assert!(doc.graveyard().is_empty());
     }
 
     #[test]
