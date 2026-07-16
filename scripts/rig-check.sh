@@ -1143,6 +1143,21 @@ for s in image-wash image-page image-drop-gap; do
   if [ -s "$SHOTS/$s.png" ]; then echo "  ok   still $SHOTS/$s.png"; else
     echo "  FAIL still $s.png did not render"; fail=1; fi
 done
+echo "rig-check: door chip stills for the eyes"
+for spec in \
+  "door-resting|seed:diag ebtn:door" \
+  "door-open|seed:diag" \
+  "door-ready|x seed:deliver ebtn:door" \
+  "door-drained|seed:diag notes:drain ebtn:door" \
+  "door-glance|seed:diag ebtn:door click:800,100" \
+  "titlebar-order|seed:diag"; do
+  name=${spec%%|*}; keys=${spec#*|}; DIS=$(mktemp --suffix=.md)
+  cp "$DOC" "$DIS"
+  scripts/wshot.sh "$SHOTS/$name.png" 1 "$DIS" "$keys" >/dev/null 2>&1
+  rm -f "$DIS" "$DIS.strop"
+  if [ -s "$SHOTS/$name.png" ]; then echo "  ok   still $SHOTS/$name.png"; else
+    echo "  FAIL still $name.png did not render"; fail=1; fi
+done
 echo "rig-check: history round-two stills for the eyes"
 for spec in \
   "novel-floor|seed:novel strip:open scroll:1 strip:scrub:0.30 scroll:1" \

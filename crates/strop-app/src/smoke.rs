@@ -499,9 +499,7 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 continue;
             }
             // `ebtn:open` opens the editor button's dropdown; `ebtn:door`
-            // flips the door through the menu footer's presence verb. Together
-            // they let the rig assert the door law (cards rest while drafting
-            // even with the menu open) and the face's transitions.
+            // exercises the same transition as the fixed margin chip.
             if key == "ebtn:open" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_open_editor_menu(cx))
@@ -530,6 +528,16 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(80))
                     .await;
                 eprintln!("SMOKE ebtn:door: door toggled");
+                continue;
+            }
+            if key == "notes:drain" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_drain_diagnoses(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE notes:drain: diagnoses marked unverified");
                 continue;
             }
             if key == "ai:empty" {

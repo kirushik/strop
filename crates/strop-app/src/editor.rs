@@ -565,7 +565,6 @@ const CHIP_PULSE_MS: u64 = 2800;
 /// The editor button's cooking-dot breathing cycle (item: the pulse). Slow —
 /// attention-motion's calm band (~2.5–3.5 s) — so the periphery reads "still
 /// at work", never a blink. One full opacity breath per cycle.
-const BTN_PULSE_MS: u64 = 3000;
 /// The provenance one-liner's id namespace in the margin lane (a packer
 /// citizen beside real note cards — the flag keeps record ids and note ids
 /// from ever colliding in the motion/appearing maps).
@@ -1169,7 +1168,8 @@ fn output_token_budget(kind: &PassKind, language_code: &str) -> u32 {
 /// a PRIORITY over it, not four exclusive states: a cooking pass while the door
 /// is open must resolve to ONE face, and Error/NeedsSetup can't fall through to
 /// a bare idle button while `render_ai_status` shows the failure. The door word
-/// is the glossary's presence pair (`Reading`), never the internal "Reviewing".
+/// no longer contributes copy; this internal variant only selects the
+/// open-fan ink treatment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EditorFace {
     /// No provider configured — routes to setup (the card lives on render_ai_status).
@@ -1183,7 +1183,7 @@ enum EditorFace {
     /// A valid read completed with no new queries and has not yet been
     /// acknowledged through the attached menu.
     Empty,
-    /// The door is open — "Reading · {n} open".
+    /// The fan is out; the button still says only "Ask the editor".
     Reading,
     /// Drafting, nothing pending — the bare "Ask the editor ▾".
     Idle,
@@ -1233,6 +1233,35 @@ fn face_for(i: &FaceInputs) -> EditorFace {
         EditorFace::Reading
     } else {
         EditorFace::Idle
+    }
+}
+
+fn door_chip_semantics(unverified: impl Iterator<Item = bool>) -> Option<(usize, bool)> {
+    let mut total = 0;
+    let mut current = 0;
+    for stale in unverified {
+        total += 1;
+        if !stale {
+            current += 1;
+        }
+    }
+    (total > 0).then_some((current, current == 0))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DoorEscape {
+    Glance,
+    Fan,
+    None,
+}
+
+fn door_escape_step(fan_resting: bool, glanced: bool, has_diagnoses: bool) -> DoorEscape {
+    if fan_resting && glanced {
+        DoorEscape::Glance
+    } else if !fan_resting && has_diagnoses {
+        DoorEscape::Fan
+    } else {
+        DoorEscape::None
     }
 }
 
@@ -5081,8 +5110,10 @@ impl Editor {
         // it has no card to snapshot). The model itself commits immediately —
         // only the light lingers (departing), never the data.
         if matches!(status, NoteStatus::Done | NoteStatus::Dismissed)
-            && let Some(card) =
-                self.margin_cards(true).cards.into_iter().find(|c| c.id == id)
+            && let Some(card) = {
+                let layout = self.margin_cards(true);
+                layout.cards.into_iter().chain(layout.glance).find(|c| c.id == id)
+            }
         {
             self.departing.push((card, Instant::now()));
             self.schedule_departing_clear(cx);
@@ -5154,13 +5185,28 @@ impl Editor {
         self.toggle_door(cx);
     }
 
-    /// The door's flush-and-flip, shared by the ctrl-shift-r action, the editor
-    /// menu's presence verb (`Reading ⇄ Away`), and the rig hook. Touching the
-    /// door is an explicit attention shift — a parked pass lands right now,
-    /// mid-burst or not.
+    /// The chip/shortcut transition. Opening lands a parked pass; closing
+    /// commits transient card text and never flushes hidden work.
     fn toggle_door(&mut self, cx: &mut Context<Self>) {
-        self.flush_deferred_pass(cx);
+        let opening = self.drafting;
+        if !opening {
+            self.commit_composer_no_focus(cx);
+            let closing: Vec<MarginCard> = self
+                .margin_cards(true)
+                .cards
+                .into_iter()
+                .filter(|card| card.kind == NoteKind::Diagnosis)
+                .collect();
+            if !closing.is_empty() {
+                self.departing.extend(closing.into_iter().map(|card| (card, Instant::now())));
+                self.schedule_departing_clear(cx);
+            }
+            self.focus = CardFocus::Idle;
+        }
         self.drafting = !self.drafting;
+        if opening {
+            self.flush_deferred_pass(cx);
+        }
         cx.notify();
     }
 
@@ -5179,6 +5225,18 @@ impl Editor {
             .open()
             .filter(|n| n.kind == NoteKind::Diagnosis)
             .count()
+    }
+
+    /// The chip counts current editorial claims. An all-unverified set keeps
+    /// its referent but drains the count's ink.
+    fn door_chip_count(&self) -> Option<(usize, bool)> {
+        door_chip_semantics(
+            self.doc
+                .notes()
+                .open()
+                .filter(|n| n.kind == NoteKind::Diagnosis)
+                .map(|n| n.unverified),
+        )
     }
 
     /// Copy-level diagnoses suppressed while a developmental one is still
@@ -5238,20 +5296,6 @@ impl Editor {
     /// counts exactly these, regardless of the door.
     fn open_query_count(&self) -> usize {
         self.resting_diagnoses()
-    }
-
-    /// Queries the writer RESOLVED (marked Done) in this document — the footer's
-    /// "{resolved} resolved". Deliberately Done-ONLY: Dismissed cards are
-    /// permanent suppression tombstones (`is_suppressed` leans on them), not work
-    /// done, so counting them would inflate the tally with silenced nags (review
-    /// mid). Bounded by the document's real annotation set.
-    fn resolved_query_count(&self) -> usize {
-        self.doc
-            .notes()
-            .notes()
-            .iter()
-            .filter(|n| n.kind == NoteKind::Diagnosis && n.status == NoteStatus::Done)
-            .count()
     }
 
     /// The copy row's gate (impl 04 §0): while any developmental query is open,
@@ -5353,8 +5397,8 @@ impl Editor {
         // come back into view alongside them). Asking again is also the most
         // explicit attention shift there is: a still-parked earlier pass
         // lands now rather than racing the run it just triggered.
-        self.flush_deferred_pass(cx);
         self.drafting = false;
+        self.flush_deferred_pass(cx);
         // Scope is manuscript-relative even when the document has a compost
         // rail. A selected passage is the target; neighboring paragraphs are
         // context only. With no selection the whole piece is eligible up to
@@ -5553,6 +5597,10 @@ impl Editor {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
+        self.cancel_ai_run_inner(cx);
+    }
+
+    fn cancel_ai_run_inner(&mut self, cx: &mut Context<Self>) {
         // UI-level cancel: the response of the abandoned generation is
         // ignored when it lands (no need to abort the request itself).
         // A parked deferral dies with its generation too (flush checks it),
@@ -5725,7 +5773,7 @@ impl Editor {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
-        if self.typing_burst_live() || self.cold_read.is_some() {
+        if self.drafting || self.typing_burst_live() || self.cold_read.is_some() {
             // F7: the reveal clock holds in the reading room — a pass
             // completing mid-read parks; exit flushes it after the
             // suppressed surfaces restore.
@@ -5777,7 +5825,10 @@ impl Editor {
                     // F7: the room holds results parked like a live burst
                     // does — the lull watcher waits it out; the exit flush
                     // usually lands them first.
-                    if editor.typing_burst_live() || editor.cold_read.is_some() {
+                    if editor.drafting
+                        || editor.typing_burst_live()
+                        || editor.cold_read.is_some()
+                    {
                         return false;
                     }
                     editor.flush_deferred_pass(cx);
@@ -7896,6 +7947,14 @@ impl Editor {
         // Remember the manuscript caret so Esc from a pile caret returns
         // exactly here (review B3). A seamless doc is all manuscript.
         let ch = self.doc.rope().byte_to_char(offset.min(self.doc.len_bytes()));
+        if self.drafting && self.focus.active_id().is_some_and(|id| {
+            self.doc.notes().get(id).is_some_and(|note| {
+                note.kind == NoteKind::Diagnosis
+                    && (ch < note.range.start || ch > note.range.end)
+            })
+        }) {
+            self.focus = CardFocus::Idle;
+        }
         if self.doc.region_of_char(ch) == strop_core::document::Region::Manuscript {
             self.last_manuscript_caret = offset;
         }
@@ -9818,6 +9877,21 @@ impl Editor {
             self.exit_history(cx);
             return;
         }
+        let glanced = self.focus.active_id().is_some_and(|id| {
+            self.doc.notes().get(id).is_some_and(|n| n.kind == NoteKind::Diagnosis)
+        });
+        match door_escape_step(self.drafting, glanced, self.resting_diagnoses() > 0) {
+            DoorEscape::Glance => {
+                self.focus = CardFocus::Idle;
+                cx.notify();
+                return;
+            }
+            DoorEscape::Fan => {
+                self.toggle_door(cx);
+                return;
+            }
+            DoorEscape::None => {}
+        }
         // The flanks are NEVER their own Escape layer (LAW 1): with nothing
         // bigger to dismiss, Escape collapses a live selection to a caret, which
         // lowers the flanks as a consequence. Latch so a restore can't re-raise
@@ -11484,9 +11558,11 @@ impl Editor {
         if self.palette_input.is_some() || self.ai_settings.is_some() || self.shortcuts_open {
             return;
         }
-        // Scrolling is the writer looking around — a parked pass lands now
-        // (attention already moved; nothing can pop "under" it mid-thought).
-        self.flush_deferred_pass(cx);
+        // Scrolling may end the typing reveal clock only while the fan is
+        // already out. A closed fan continues to park until an explicit open.
+        if !self.drafting {
+            self.flush_deferred_pass(cx);
+        }
         // Exit-fade ghosts are viewport-frozen snapshots: once the text
         // moves under them they'd hang mid-air, so a scroll just drops them.
         self.departing.clear();
@@ -11546,6 +11622,30 @@ impl Editor {
             self.select_card(target.id, window, cx);
             cx.notify();
         }
+    }
+
+    /// Opening must visibly reveal a referent even when every diagnosis anchor
+    /// starts outside the viewport. Reuse the edge-pill reveal path so the
+    /// nearest anchor lands at the near edge.
+    fn reveal_after_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let layout = self.margin_cards(true);
+        if !layout.cards.is_empty() {
+            return;
+        }
+        let above = layout.above.last().copied();
+        let below = layout.below.first().copied();
+        let choose_below = match (above, below) {
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => {
+                let Some(frame) = self.last_frame.as_ref() else { return };
+                let top = f32::from(frame.scroll_top);
+                let bottom = top + f32::from(frame.viewport_height);
+                (b.anchor_y - bottom).abs() <= (top - a.anchor_y).abs()
+            }
+            (None, None) => return,
+        };
+        self.reveal_offscreen(choose_below, window, cx);
     }
 
     /// One tick of drag-edge autoscroll: while the pointer is held beyond
@@ -11930,14 +12030,9 @@ impl Editor {
                     .map(|n| (n.id, n.range.start, n.range.end))
                     .collect();
                 let hit_id = note_at_char(&ranges, c);
-                let hit = hit_id.and_then(|id| self.doc.notes().get(id));
-                // Reaching for a resting diagnosis opens the door (DESIGN
-                // §4.4), so the card it activates is actually on screen —
-                // and an attention shift this explicit lands a parked pass.
-                if self.drafting && hit.is_some_and(|n| n.kind == NoteKind::Diagnosis) {
-                    self.flush_deferred_pass(cx);
-                    self.drafting = false;
-                }
+                // Reaching for a diagnosis is a glance, not a stance change.
+                // The selected-card exemption paints it without opening the
+                // rest of the fan or landing a parked pass.
                 // Clicking the text selects the hit card (or clears selection);
                 // either way it commits and closes any composer first, so a
                 // click into the document never strands an open note editor.
@@ -13068,10 +13163,34 @@ impl Editor {
         cx.notify();
     }
 
-    /// Rig hook (`ebtn:door`): the menu footer's presence verb — flush a parked
-    /// pass and flip the door, exactly the path a click on it takes.
+    /// Rig hook (`ebtn:door`): exercise the chip/shortcut transition.
     pub fn debug_toggle_door(&mut self, cx: &mut Context<Self>) {
         self.toggle_door(cx);
+    }
+
+    /// Rig hook (`notes:drain`): mark every open diagnosis unverified so the
+    /// chip's all-stale treatment can be captured without synthesizing edits.
+    pub fn debug_drain_diagnoses(&mut self, cx: &mut Context<Self>) {
+        let mut edits: Vec<(Range<usize>, String)> = self
+            .doc
+            .notes()
+            .open()
+            .filter(|note| note.kind == NoteKind::Diagnosis)
+            .filter_map(|note| {
+                let start = self.doc.char_to_byte(note.range.start);
+                let end_char = (note.range.start + 1).min(note.range.end);
+                let end = self.doc.char_to_byte(end_char);
+                (end > start).then(|| {
+                    (start..end, self.doc.rope().byte_slice(start..end).to_string())
+                })
+            })
+            .collect();
+        edits.reverse();
+        for (range, same_text) in edits {
+            self.doc.edit_bytes(range, &same_text);
+        }
+        self.sync_mutations();
+        cx.notify();
     }
 
     /// Rig hook (`seed:journal`): install a deterministic synthetic fortnight —
@@ -16970,6 +17089,7 @@ impl Editor {
             // hit-test resolves to this control rather than HTCAPTION.
             .occlude()
             .flex_shrink_0()
+            .ml(px(8.))
             // 28, not the old 34: the cells were sized for glyph labels;
             // the matched 13px marks need less air, and the freed width is
             // what lets "Ask the editor" rest untruncated in an 800px-
@@ -17004,10 +17124,10 @@ impl Editor {
         // the doc name keeps its rename (both entrances pierce). The muted
         // mode label rides beside the name (L16).
         let in_cold = self.cold_read.is_some();
-        let cr_mode_label: Option<String> = self.cold_read.as_ref().map(|cr| match &cr.source {
-            ColdReadSource::Live => "\u{2014} reading".to_owned(),
+        let cr_mode_label: Option<String> = self.cold_read.as_ref().and_then(|cr| match &cr.source {
+            ColdReadSource::Live => None,
             ColdReadSource::Past { name, .. } => {
-                format!("\u{2014} viewing \u{201c}{name}\u{201d}")
+                Some(format!("\u{2014} viewing \u{201c}{name}\u{201d}"))
             }
         });
         // Dragging the bar moves the window — by two mechanisms, because the
@@ -17217,9 +17337,11 @@ impl Editor {
                     .id("palette-toggle")
                     .occlude()
                     .flex_shrink_0()
-                    .px(px(6.))
-                    .py(px(4.))
-                    .mr(px(6.))
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .mr(px(8.))
                     .rounded(px(5.))
                     .map(|d| {
                         if in_cold {
@@ -17368,6 +17490,43 @@ impl Editor {
                     )
                     .into_any_element(),
             })
+            // Navigation by name and navigation by time share the omnibar
+            // neighborhood. The clock sits on the field's right flank, away
+            // from the book/window-control cluster.
+            .child(
+                div()
+                    .id("history-toggle")
+                    .occlude()
+                    .flex_shrink_0()
+                    .size(px(28.))
+                    .ml(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .map(|d| {
+                        if in_cold {
+                            d.opacity(0.55).tooltip(tip("History", None))
+                        } else {
+                            d.cursor(CursorStyle::PointingHand)
+                                .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
+                                .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                                .tooltip(tip("History", Some("ctrl-alt-h")))
+                        }
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.toggle_strip(&ToggleStrip, window, cx);
+                        }),
+                    )
+                    .child(icon(
+                        icons::HISTORY,
+                        13.,
+                        if self.strip.open && !in_cold { TEXT_COLOR } else { MUTED_COLOR },
+                    )),
+            )
             // Right third — mirrors the left (equal claims keep the centre
             // still): history, the editor button, then the OS verbs behind
             // a drag-surface moat (no app verb adjacent to window controls).
@@ -17379,103 +17538,18 @@ impl Editor {
                     .flex()
                     .items_center()
                     .justify_end()
-                // History first in the cluster (2026-07-11 ordering round):
-                // the ↺-clock keeps the top-right residency where Docs and
-                // Time Machine taught it, but the editor button and the
-                // moat below now stand between it and the OS verbs — a
-                // misclick on its neighbour opens a menu (esc, free), never
-                // minimizes the window.
-                .child(
-                    div()
-                        .id("history-toggle")
-                        .occlude()
-                        .flex_shrink_0()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .mr(px(2.))
-                        .rounded(px(5.))
-                        .map(|d| {
-                            if in_cold {
-                                // Dimmed; the click pulses (Scopes 7).
-                                d.opacity(0.55).tooltip(tip("History", None))
-                            } else {
-                                d.cursor(CursorStyle::PointingHand)
-                                    .when(self.strip.open, |d| d.bg(rgba(0x1A1A1812u32)))
-                                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                                    .tooltip(tip("History", Some("ctrl-alt-h")))
-                            }
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            // The clock toggles the STRIP (the new first history
-                            // surface); the right-side panel lives on in the palette
-                            // ("History panel"). The two never open together.
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.toggle_strip(&ToggleStrip, window, cx);
-                            }),
-                        )
-                        .child(
-                            // History: the counter-clockwise clock — the one
-                            // "versions" form the corridor already knows
-                            // (docs/iconography.md).
-                            icon(
-                                icons::HISTORY,
-                                13.,
-                                if self.strip.open && !in_cold {
-                                    TEXT_COLOR
-                                } else {
-                                    MUTED_COLOR
-                                },
-                            ),
-                        ),
-                )
-                // The reading room's doorknob (spec D4): a resting place, not an
-                // advertisement (P2/P5). `ReadItCold` already toggles, so the
-                // control IS the indicator (P12) — muted at rest, lit inside the
-                // room, and a click leaves. It is the ONE right-cluster control
-                // that stays LIVE in the cold read (the word pill and editor
-                // button hide there), so every still of the room shows the lit
-                // mark that exits it (P6). An open book, the reader's mark —
-                // the pictorial family's newest member (docs/iconography.md).
-                .child(
-                    div()
-                        .id("cold-read-toggle")
-                        .occlude()
-                        .flex_shrink_0()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .mr(px(2.))
-                        .rounded(px(5.))
-                        .cursor(CursorStyle::PointingHand)
-                        .when(in_cold, |d| d.bg(rgba(0x1A1A1812u32)))
-                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("Read it cold", Some("ctrl-shift-l")))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.read_it_cold(&ReadItCold, window, cx);
-                            }),
-                        )
-                        .child(icon(
-                            icons::BOOK,
-                            13.,
-                            if in_cold { TEXT_COLOR } else { MUTED_COLOR },
-                        )),
-                )
                 // The editor button (impl 04 §0): the AI subsystem's single home,
                 // where its results live — just left of the margin side. The old
                 // drawn mini-card is gone; the control now WEARS its state (a
                 // priority face) and opens the dropdown that names the reads.
-                // Hidden in the reading room (L16) — which also keeps the two
-                // "Reading"s from ever co-occurring (O10).
-                .when(!in_cold, |bar| bar.child({
+                // The control keeps its place in the reading room, dimmed and
+                // inert, so its location never depends on the active view.
+                .child({
                     let face = self.editor_face();
                     let open = self.editor_menu_open;
                     let n = self.open_query_count();
-                    // The face's label. "Reading" is the glossary presence word,
-                    // never the internal "Reviewing" (review H31).
+                    // The face never exposes the internal fan state; the
+                    // artifact and its chip carry that state.
                     let label: String = match face {
                         EditorFace::NeedsSetup => "Ask the editor · needs setup".to_owned(),
                         EditorFace::Cooking | EditorFace::Error | EditorFace::Idle => {
@@ -17483,10 +17557,8 @@ impl Editor {
                         }
                         EditorFace::Ready => "Ask the editor · a read is ready".to_owned(),
                         EditorFace::Empty => "Ask the editor · 0 new".to_owned(),
-                        EditorFace::Reading if n > 0 => {
-                            format!("Reading · {n} open · Ask the editor")
-                        }
-                        EditorFace::Reading => "Reading · Ask the editor".to_owned(),
+                        EditorFace::Reading if n > 0 => "Ask the editor".to_owned(),
+                        EditorFace::Reading => "Ask the editor".to_owned(),
                     };
                     // A colour cue only where the words don't carry it: cool = the
                     // machine is at work, red = it failed (color-language.md axis).
@@ -17512,7 +17584,7 @@ impl Editor {
                         // The one elastic control in the cluster: when the bar
                         // tightens, THIS label truncates — the OS verbs and the
                         // toggles right of it are shrink-proof, so the wide
-                        // "Reading · …" face can never crush them into a
+                        // A long status face can never crush them into a
                         // clipped clump at the window edge.
                         .min_w(px(0.))
                         .ml(px(4.))
@@ -17524,7 +17596,8 @@ impl Editor {
                         .rounded(px(7.))
                         .border_1()
                         .border_color(rgb(RULE_COLOR))
-                        .cursor(CursorStyle::PointingHand)
+                        .when(in_cold, |d| d.opacity(0.55))
+                        .when(!in_cold, |d| d.cursor(CursorStyle::PointingHand))
                         .flex()
                         .items_center()
                         .gap(px(5.))
@@ -17540,38 +17613,18 @@ impl Editor {
                             MouseButton::Left,
                             cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
+                                if editor.cold_read.is_some() {
+                                    return;
+                                }
                                 editor.toggle_editor_menu(cx);
                             }),
                         )
                         .when_some(dot, |d, color| {
-                            // The comment-promised pulse, finally real: a slow
-                            // breathing opacity cycle on the cooking dot —
-                            // ongoing work as a standing state, not an event.
-                            // Sine-eased full→dim→full (seamless across the
-                            // loop, never brighter than the static dot) and
-                            // quieter than the scraps chip's arrival ring.
-                            // Error keeps a static red dot; reduce_motion
-                            // keeps today's static dot for cooking too.
-                            let breathing = face == EditorFace::Cooking
-                                && !self.config.reduce_motion;
-                            d.child({
-                                let dot = div().flex_shrink_0().size(px(6.)).rounded_full();
-                                if breathing {
-                                    dot.with_animation(
-                                        "editor-btn-pulse",
-                                        Animation::new(Duration::from_millis(BTN_PULSE_MS))
-                                            .repeat(),
-                                        move |el, t| {
-                                            let breath =
-                                                0.5 + 0.5 * (t * std::f32::consts::TAU).cos();
-                                            el.bg(tint(color, 0.45 + 0.55 * breath))
-                                        },
-                                    )
-                                    .into_any_element()
-                                } else {
-                                    dot.bg(rgb(color)).into_any_element()
-                                }
-                            })
+                            d.child(div()
+                                .flex_shrink_0()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(rgb(color)))
                         })
                         .child(div().min_w(px(0.)).truncate().child(label))
                         // The dropdown wedge — the pictorial family's one
@@ -17587,7 +17640,38 @@ impl Editor {
                                 MUTED_COLOR
                             },
                         ))
-                }))
+                })
+                // The book keeps the Ask control as its left moat and the
+                // drag surface as its right moat. Its latch is visible in the
+                // reading room; entering it closes history first.
+                .child(
+                    div()
+                        .id("cold-read-toggle")
+                        .occlude()
+                        .flex_shrink_0()
+                        .size(px(28.))
+                        .ml(px(8.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .cursor(CursorStyle::PointingHand)
+                        .when(in_cold, |d| d.bg(rgba(0x1A1A1812u32)))
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Read it cold", Some("ctrl-shift-l")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.read_it_cold(&ReadItCold, window, cx);
+                            }),
+                        )
+                        .child(icon(
+                            icons::BOOK,
+                            13.,
+                            if in_cold { TEXT_COLOR } else { MUTED_COLOR },
+                        )),
+                )
                 // Windows/Linux get our own drawn window controls. macOS keeps its
                 // native traffic lights (top-left) instead, so we omit these here —
                 // which also retires the macOS papercut that our "×" quit the whole
@@ -19292,6 +19376,9 @@ struct MarginLayout {
     /// Door-held cards are NOT here; the rail (render_margin_rail) owns those.
     above: Vec<OffscreenRef>,
     below: Vec<OffscreenRef>,
+    /// A closed-fan diagnosis selected through its prose mark. It is painted
+    /// by the live card renderer but never enters placement or edge counts.
+    glance: Option<MarginCard>,
 }
 
 /// Project a byte anchor through the paragraph geometry which painted the
@@ -19904,6 +19991,7 @@ impl Editor {
                 cards: Vec::new(),
                 above: Vec::new(),
                 below: Vec::new(),
+                glance: None,
             };
         };
         let rope = self.doc.rope();
@@ -19913,6 +20001,7 @@ impl Editor {
         // AND navigated by reveal_offscreen (one source of truth).
         let mut above: Vec<OffscreenRef> = Vec::new();
         let mut below: Vec<OffscreenRef> = Vec::new();
+        let mut glance = None;
         // The door (DESIGN §4.4): drafting hides the editor's cards (the
         // writer's own notes stay); reviewing shows them, but suppresses
         // copy-level cards while a developmental one is still open (the
@@ -19986,7 +20075,7 @@ impl Editor {
                     CARD_CHROME_H + (title_rows + body_rows) * CARD_LINE_H
                 })
             };
-            cards.push(MarginCard {
+            let card = MarginCard {
                 id: n.id,
                 top: desired,
                 anchor_y: f32::from(pos.y),
@@ -20002,7 +20091,12 @@ impl Editor {
                 collapsed: false,
                 provenance: None,
                 created_unix: n.created_unix,
-            });
+            };
+            if drafting && active && is_diag {
+                glance = Some(card);
+            } else {
+                cards.push(card);
+            }
         }
         // The caret-block's provenance one-liner (08 §2; surfaces-attention
         // 5): a packer citizen beside the real cards, shown only after the
@@ -20097,7 +20191,7 @@ impl Editor {
             card.top = top;
         }
         if !cull {
-            return MarginLayout { cards, above, below };
+            return MarginLayout { cards, above, below, glance };
         }
         // Packing can shove an on-screen-anchored card off an edge (the active
         // card wins the bottom slot and displaces the run above it up; or a run
@@ -20131,6 +20225,7 @@ impl Editor {
             cards: visible,
             above,
             below,
+            glance,
         }
     }
 
@@ -20305,12 +20400,7 @@ impl Editor {
     /// ones recede to one-line cards, still in the lane), so it owes the rail
     /// nothing. `None` means the rail stands down — a quiet margin.
     fn margin_rail_count(&self) -> Option<usize> {
-        let n = if self.drafting {
-            self.resting_diagnoses()
-        } else {
-            self.suppressed_copy()
-        };
-        (n > 0).then_some(n)
+        self.door_chip_count().map(|(n, _)| n)
     }
 
     /// Cheap emptiness predicate for `lane_has_content`: would ANY open note
@@ -20696,7 +20786,11 @@ impl Editor {
             mut cards,
             above,
             below,
+            glance,
         } = self.margin_cards(true);
+        if let Some(glance) = glance {
+            cards.push(glance);
+        }
         if cards.is_empty() && above.is_empty() && below.is_empty() && self.departing.is_empty() {
             return None;
         }
@@ -21284,13 +21378,8 @@ impl Editor {
             .w(px(MARGIN_WIDTH)).children(children).into_any_element())
     }
 
-    /// The door's visible state (DESIGN §4.4, principle 5 — no hidden modes):
-    /// a thin rail at the lane top that names what the closed door is holding
-    /// ("3 resting · open") and opens it on a click; in reviewing it instead
-    /// notes copy-level cards held back until the structural ones clear.
-    /// Returns None when nothing is held — a quiet margin with nothing to
-    /// gate looks exactly like an empty one, so the mode only shows when it
-    /// is actually doing something.
+    /// The document-global diagnosis chip: fixed at the lane top, wordless,
+    /// present in both fan states, and absent when it has no referent.
     fn render_margin_rail(
         &self,
         window: &Window,
@@ -21303,47 +21392,63 @@ impl Editor {
         let lane_left = col_right + MARGIN_GAP + 8.;
         let top = self.margin_floor();
         let drafting = self.drafting;
-        let n = self.margin_rail_count()?;
-        let label = if drafting {
-            format!("{n} resting · open")
-        } else {
-            format!("{n} copy-level · after structure")
-        };
+        let (n, drained) = self.door_chip_count()?;
+        let ready = self.deferred_pass.is_some();
+        let label = format!("⌇ {n}");
         let styled = |d: gpui::Div| {
             d.absolute()
                 .top(px(top))
-                .left(px(lane_left))
-                .w(px(MARGIN_WIDTH - 8.))
-                .px(px(8.))
-                .py(px(4.))
-                .rounded(px(6.))
+                .left(px(lane_left + MARGIN_WIDTH - 54.))
+                .w(px(46.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
                 .border_1()
-                .border_color(rgb(RULE_COLOR))
-                .bg(rgb(0xF7F5EF))
+                .border_color(rgb(if ready { ACTIVE_BORDER } else { RULE_COLOR }))
+                .bg(rgb(DIAGNOSIS_CARD_BG))
                 .font_family("PT Sans")
-                .text_size(px(11.))
+                .text_size(px(10.5))
                 .text_color(rgb(MUTED_COLOR))
+                .when(drained, |d| d.opacity(0.55))
                 .child(label.clone())
         };
-        Some(if drafting {
-            styled(div())
-                .id("margin-door-open")
+        let chip = styled(div())
+                .id("margin-door-chip")
                 .cursor(CursorStyle::PointingHand)
+                .when(!drafting, |d| d.bg(rgba(0x1A1A1812u32)))
                 .hover(|d| d.text_color(rgb(TEXT_COLOR)))
-                .tooltip(tip("Open the door — show the editor's notes", Some("ctrl-shift-r")))
+                .tooltip(tip(if drafting {
+                    "Show the editor's notes"
+                } else {
+                    "Put the editor's notes away"
+                }, Some("ctrl-shift-r")))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        editor.flush_deferred_pass(cx);
-                        editor.drafting = false;
-                        cx.notify();
+                        let opening = editor.drafting;
+                        editor.toggle_door(cx);
+                        if opening {
+                            editor.reveal_after_open(window, cx);
+                        }
                     }),
-                )
-                .into_any_element()
-        } else {
-            styled(div()).into_any_element()
-        })
+                );
+        let animate_ready = ready && !self.config.reduce_motion;
+        Some(chip.with_animation(
+            ("door-chip", n ^ if ready { self.ai_generation as usize } else { 0 }),
+            Animation::new(Duration::from_millis(550)),
+            move |el, t| {
+                let beat = if t < 0.28 { t / 0.28 } else { (1. - t) / 0.72 };
+                let count_fade = (t / (120. / 550.)).min(1.);
+                el.opacity(if animate_ready {
+                    0.82 + 0.18 * beat.max(0.)
+                } else {
+                    0.45 + 0.55 * count_fade
+                })
+            },
+        ).into_any_element())
     }
 
     /// How many lane items the narrow drawer should advertise: the visible
@@ -21532,9 +21637,8 @@ impl Editor {
         // believing read's qualifier beside its ctrl-shift-b chip). A window
         // too narrow for that cedes width, never the button's edge.
         let menu_w = 430f32.min(vw - menu_right - 8.);
-        let door_open = !self.drafting;
         let active_read = match &self.ai_status {
-            Some(AiStatus::Running { label }) => Some(
+            Some(AiStatus::Running { .. }) => Some(
                 div()
                     .px(px(12.))
                     .py(px(7.))
@@ -21542,16 +21646,9 @@ impl Editor {
                     .border_color(rgb(RULE_COLOR))
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .justify_end()
                     .gap(px(10.))
                     .text_size(px(11.))
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_color(rgb(MUTED_COLOR))
-                            .child(format!("Reading · {label}")),
-                    )
                     .child(
                         div()
                             .id("editor-menu-cancel")
@@ -21576,83 +21673,6 @@ impl Editor {
             ),
             _ => None,
         };
-        let last_result = self.ai_empty_result.as_ref().map(|result| {
-            div()
-                .px(px(12.))
-                .py(px(5.))
-                .border_b_1()
-                .border_color(rgb(RULE_COLOR))
-                .text_size(px(11.))
-                .text_color(rgb(MUTED_COLOR))
-                .child(format!("Last: {} · 0 new queries", result.kind.run_label()))
-                .into_any_element()
-        });
-        let footer = div()
-            .pt(px(7.))
-            .px(px(12.))
-            .pb(px(8.))
-            .border_t_1()
-            .border_color(rgb(RULE_COLOR))
-            .flex()
-            .items_center()
-            .justify_between()
-            .text_size(px(11.))
-            .child(div().text_color(rgb(MUTED_COLOR)).child(format!(
-                "{} queries open · {} resolved",
-                self.open_query_count(),
-                self.resolved_query_count(),
-            )))
-            .child(
-                // The presence pair (glossary): Reading (door open) / Away
-                // (drafting). A drawn toggle — the current pole wears the ink
-                // AND the weight (never color alone, WCAG 1.4.1), and the
-                // OTHER pole — the one a click flips to — wears the dashed
-                // underline, the product's "this text is clickable" mark
-                // (state in ink, action dashed). A click anywhere flips
-                // through toggle_door's flush semantics. No "⇄" glyph (not
-                // in the bundled PT fonts); a dot divides the poles.
-                div()
-                    .id("editor-menu-door")
-                    .cursor(CursorStyle::PointingHand)
-                    .flex()
-                    .items_center()
-                    .gap(px(5.))
-                    .px(px(4.))
-                    .py(px(1.))
-                    .rounded(px(4.))
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("The door", Some("ctrl-shift-r")))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            editor.toggle_door(cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR }))
-                            .when(door_open, |d| d.font_weight(FontWeight::BOLD))
-                            .when(!door_open, |d| {
-                                d.border_b_1()
-                                    .border_dashed()
-                                    .border_color(rgb(MUTED_COLOR))
-                            })
-                            .child("Reading"),
-                    )
-                    .child(div().size(px(3.)).rounded_full().bg(rgb(MUTED_COLOR)))
-                    .child(
-                        div()
-                            .text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR }))
-                            .when(!door_open, |d| d.font_weight(FontWeight::BOLD))
-                            .when(door_open, |d| {
-                                d.border_b_1()
-                                    .border_dashed()
-                                    .border_color(rgb(MUTED_COLOR))
-                            })
-                            .child("Away"),
-                    ),
-            );
         Some(
             div()
                 .id("editor-menu")
@@ -21685,7 +21705,6 @@ impl Editor {
                         .child("Ask the editor for…"),
                 )
                 .when_some(active_read, |d, active| d.child(active))
-                .when_some(last_result, |d, result| d.child(result))
                 .child(self.editor_menu_row(
                     "er-believing",
                     ("A believing read", "— what's alive here, what it's secretly about"),
@@ -21726,7 +21745,6 @@ impl Editor {
                     None,
                     cx,
                 ))
-                .child(footer)
                 .into_any_element(),
         )
     }
@@ -21848,7 +21866,7 @@ impl Editor {
                     .text_size(px(12.))
                     .text_color(rgb(MUTED_COLOR))
                     .hover(|d| d.text_color(rgb(TEXT_COLOR)))
-                    .tooltip(tip("Open the door — show the editor's notes", Some("ctrl-shift-r")))
+                    .tooltip(tip("Show the editor's notes", Some("ctrl-shift-r")))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
@@ -21858,7 +21876,7 @@ impl Editor {
                             cx.notify();
                         }),
                     )
-                    .child(format!("{n} resting — open the door")),
+                    .child(format!("⌇ {n}")),
             );
         } else {
             for card in &cards {
@@ -25179,7 +25197,7 @@ impl Editor {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         match &cr.source {
             ColdReadSource::Live => banner
-                .child(bold("Reading".into()))
+                .child(bold("Read it cold".into()))
                 .child(div().child(match &cr.station {
                     Some(s) => format!("\u{b7} \u{201c}{s}\u{201d} \u{b7} {words}"),
                     None => format!("\u{b7} {words}"),
@@ -27215,6 +27233,85 @@ mod tests {
     }
 
     #[gpui::test]
+    fn completed_read_parks_while_closed_and_open_lands_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "A bright sentence.", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            editor.config.ai.base_url = "http://rig.invalid/v1".into();
+            editor.config.ai.model = "model".into();
+            let diagnosis = strop_core::diagnose::Diagnosis {
+                quote: "bright sentence".into(),
+                problem: "The light is generic".into(),
+                query: "Which light is particular?".into(),
+                level: "line".into(),
+            };
+            editor.deliver_pass(vec![diagnosis], editor.ai_generation, cx);
+            assert!(editor.drafting);
+            assert!(editor.deferred_pass.is_some());
+            assert_eq!(editor.resting_diagnoses(), 0);
+            assert_eq!(editor.editor_face(), EditorFace::Ready);
+
+            // Closing again is impossible from this pole; only the explicit
+            // opening transition consumes the parked pass.
+            editor.toggle_door(cx);
+            assert!(!editor.drafting);
+            assert!(editor.deferred_pass.is_none());
+            assert_eq!(editor.resting_diagnoses(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn cancel_drops_running_and_parked_read_without_landing_a_card(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "A sentence.", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            editor.ai_status = Some(AiStatus::Running { label: "line read".into() });
+            editor.deliver_pass(vec![strop_core::diagnose::Diagnosis {
+                quote: "sentence".into(),
+                problem: "Problem".into(),
+                query: "Question?".into(),
+                level: "line".into(),
+            }], editor.ai_generation, cx);
+            let generation = editor.ai_generation;
+            assert!(editor.deferred_pass.is_some());
+            editor.cancel_ai_run_inner(cx);
+            assert_eq!(editor.ai_generation, generation + 1);
+            assert!(editor.deferred_pass.is_none());
+            assert!(editor.ai_status.is_none());
+            assert_eq!(editor.resting_diagnoses(), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn closing_never_flushes_a_typing_parked_read(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "A sentence.", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            editor.drafting = false;
+            editor.last_text_edit = Some(Instant::now());
+            editor.deliver_pass(vec![strop_core::diagnose::Diagnosis {
+                quote: "sentence".into(),
+                problem: "Problem".into(),
+                query: "Question?".into(),
+                level: "line".into(),
+            }], editor.ai_generation, cx);
+            assert!(editor.deferred_pass.is_some());
+
+            editor.toggle_door(cx);
+            assert!(editor.drafting);
+            assert!(editor.deferred_pass.is_some());
+            assert_eq!(editor.resting_diagnoses(), 0);
+        });
+    }
+
+    #[gpui::test]
     fn replacement_read_queues_behind_cancelled_blocking_worker(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -27785,6 +27882,24 @@ mod tests {
                 f.token()
             );
         }
+    }
+
+    #[test]
+    fn door_chip_count_excludes_stale_and_drains_when_all_stale() {
+        assert_eq!(door_chip_semantics([].into_iter()), None);
+        assert_eq!(door_chip_semantics([false, true, false].into_iter()), Some((2, false)));
+        assert_eq!(door_chip_semantics([true, true].into_iter()), Some((0, true)));
+        // Door state and glance focus are intentionally absent from the pure
+        // inputs: neither can change the document-global truth.
+        assert_eq!(door_chip_semantics([false, true].into_iter()), Some((1, false)));
+    }
+
+    #[test]
+    fn escape_recedes_a_glance_before_the_fan() {
+        assert_eq!(door_escape_step(true, true, true), DoorEscape::Glance);
+        assert_eq!(door_escape_step(false, false, true), DoorEscape::Fan);
+        assert_eq!(door_escape_step(true, false, true), DoorEscape::None);
+        assert_eq!(door_escape_step(false, false, false), DoorEscape::None);
     }
 
     #[test]
