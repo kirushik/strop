@@ -1192,6 +1192,40 @@ pub struct Annotations {
     next_id: u64,
 }
 
+/// Apply the annotation anchor law to one range. This is the shared pure
+/// primitive for live adjustment and historical replay: non-expanding at
+/// insertion boundaries, collapsing a fully consumed range to a point.
+pub fn transform_annotation_range(range: &Range<usize>, op: &TextOp) -> Range<usize> {
+    let del_end = op.pos + op.delete;
+    let ins = op.insert.chars().count();
+    let clamp = |x: usize| {
+        if x >= del_end {
+            x - op.delete
+        } else if x > op.pos {
+            op.pos
+        } else {
+            x
+        }
+    };
+    let mut transformed = range.clone();
+    if op.delete > 0 {
+        transformed.start = clamp(transformed.start);
+        transformed.end = clamp(transformed.end);
+    }
+    if ins > 0 {
+        if transformed.start >= op.pos {
+            transformed.start += ins;
+        }
+        if transformed.end > op.pos {
+            transformed.end += ins;
+        }
+        if transformed.end < transformed.start {
+            transformed.end = transformed.start;
+        }
+    }
+    transformed
+}
+
 impl Annotations {
     fn needs_normalization(&self, len_chars: usize) -> bool {
         self.notes.iter().any(|n| n.range.start > n.range.end || n.range.end > len_chars)
@@ -1316,15 +1350,6 @@ impl Annotations {
     pub fn apply_op(&mut self, op: &TextOp) {
         let del_end = op.pos + op.delete;
         let ins = op.insert.chars().count();
-        let clamp = |x: usize| {
-            if x >= del_end {
-                x - op.delete
-            } else if x > op.pos {
-                op.pos
-            } else {
-                x
-            }
-        };
         for n in &mut self.notes {
             // Staleness: a diagnosis whose flagged text is edited can no longer
             // be vouched for → mark it unverified (it greys; only the writer
@@ -1339,26 +1364,7 @@ impl Annotations {
                     n.unverified = true;
                 }
             }
-            if op.delete > 0 {
-                n.range.start = clamp(n.range.start);
-                n.range.end = clamp(n.range.end);
-            }
-            if ins > 0 {
-                // Non-expanding (ExpandType::None semantics).
-                if n.range.start >= op.pos {
-                    n.range.start += ins;
-                }
-                if n.range.end > op.pos {
-                    n.range.end += ins;
-                }
-                // A zero-width anchor sitting exactly at the insertion point
-                // would advance its start (>=) but not its end (>), inverting
-                // the range. Keep the boundaries ordered. (Caught by the
-                // notes property test.)
-                if n.range.end < n.range.start {
-                    n.range.end = n.range.start;
-                }
-            }
+            n.range = transform_annotation_range(&n.range, op);
         }
         self.notes.sort_by_key(|n| n.range.start);
     }
@@ -1895,7 +1901,7 @@ impl Document {
     fn absorb_buffer_ops_inner(&mut self, by_typing: bool) {
         let ops = self.buffer.take_ops();
         let now = crate::journal::now_ms();
-        for op in &ops {
+        for (op, deleted) in &ops {
             // The `affected_by` gate rides OUTSIDE the typing/verbatim split:
             // it is what keeps an untouched structure structurally shared, and
             // the predicate carries the typing law (right-edge expansion), so
@@ -1910,9 +1916,9 @@ impl Document {
             if self.notes.affected_by(op) { self.notes.apply_op(op); }
             if self.graveyard.affected_by(op) { self.graveyard.apply_op(op); }
             if self.provenance.affected_by(op) { self.provenance.apply_op(op); }
-            self.journal.record(op, now);
+            self.journal.record_deleted(op, now, deleted);
         }
-        self.pending_ops.extend(ops);
+        self.pending_ops.extend(ops.into_iter().map(|(op, _)| op));
     }
 
     /// Journal a boundary mutation (time-persistence 2): every seam
@@ -3175,7 +3181,9 @@ impl Document {
         self.buffer.push_empty_transaction();
         self.undo_states.push(snapshot);
         self.redo_states.clear();
-        self.notes.add(range, body, created_unix)
+        let id = self.notes.add(range, body, created_unix);
+        self.record_card_raised(id);
+        id
     }
 
     pub fn set_note_status(&mut self, id: u64, status: NoteStatus) {
@@ -3194,6 +3202,7 @@ impl Document {
         self.undo_states.push(snapshot);
         self.redo_states.clear();
         self.notes.set_body(id, body);
+        self.record_card_edited(id);
     }
 
     /// Mirror an in-progress composer draft onto the note without disturbing
@@ -3255,8 +3264,50 @@ impl Document {
         self.undo_states.push(snapshot);
         self.redo_states.clear();
         for d in diagnoses {
-            self.notes.push(d);
+            let id = self.notes.push(d);
+            self.record_card_raised(id);
         }
+    }
+
+    fn record_card_raised(&mut self, id: u64) {
+        let Some(n) = self.notes.get(id).cloned() else { return };
+        self.journal.record_event(crate::journal::JournalEvent::CardRaised {
+            t: crate::journal::now_ms(),
+            id: n.id,
+            card_kind: n.kind,
+            range: n.range,
+            body: n.body,
+            title: n.title,
+            level: n.level,
+            pass_id: n.pass_id,
+            status: n.status,
+            orphaned: n.orphaned,
+            unverified: n.unverified,
+        });
+    }
+
+    fn record_card_edited(&mut self, id: u64) {
+        let Some(n) = self.notes.get(id).cloned() else { return };
+        let latest_body = self.journal.events.iter().rev().find_map(|event| match event {
+            crate::journal::JournalEvent::CardRaised { id: event_id, body, .. }
+            | crate::journal::JournalEvent::CardEdited { id: event_id, body, .. }
+                if *event_id == id => Some(body.as_str()),
+            _ => None,
+        });
+        if latest_body == Some(n.body.as_str()) {
+            return;
+        }
+        self.journal.record_event(crate::journal::JournalEvent::CardEdited {
+            t: crate::journal::now_ms(),
+            id: n.id,
+            body: n.body,
+            title: n.title,
+            level: n.level,
+            pass_id: n.pass_id,
+            status: n.status,
+            orphaned: n.orphaned,
+            unverified: n.unverified,
+        });
     }
 
     /// The whole-block doors' own splice (the exile verb's delete): the §2
@@ -3643,10 +3694,10 @@ impl Document {
         // a just-born seam) records its Seam event like any other mutation.
         let ops = self.buffer.take_ops();
         let now = crate::journal::now_ms();
-        for op in &ops {
-            self.journal.record(op, now);
+        for (op, deleted) in &ops {
+            self.journal.record_deleted(op, now, deleted);
         }
-        self.pending_ops.extend(ops);
+        self.pending_ops.extend(ops.into_iter().map(|(op, _)| op));
         self.journal_seam(before_seam);
         Some(cursor)
     }
@@ -3671,10 +3722,10 @@ impl Document {
         }
         let ops = self.buffer.take_ops();
         let now = crate::journal::now_ms();
-        for op in &ops {
-            self.journal.record(op, now);
+        for (op, deleted) in &ops {
+            self.journal.record_deleted(op, now, deleted);
         }
-        self.pending_ops.extend(ops);
+        self.pending_ops.extend(ops.into_iter().map(|(op, _)| op));
         self.journal_seam(before_seam);
         Some(cursor)
     }
@@ -3905,6 +3956,79 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_annotation_transform_matches_the_original_interval_law() {
+        let old = |range: &Range<usize>, op: &TextOp| {
+            let del_end = op.pos + op.delete;
+            let ins = op.insert.chars().count();
+            let clamp = |x: usize| if x >= del_end { x - op.delete }
+                else if x > op.pos { op.pos } else { x };
+            let mut r = range.clone();
+            if op.delete > 0 { r.start = clamp(r.start); r.end = clamp(r.end); }
+            if ins > 0 {
+                if r.start >= op.pos { r.start += ins; }
+                if r.end > op.pos { r.end += ins; }
+                if r.end < r.start { r.end = r.start; }
+            }
+            r
+        };
+        for start in 0..8 {
+            for end in start..8 {
+                for pos in 0..8 {
+                    for delete in 0..=8 - pos {
+                        for insert in ["", "x", "xy"] {
+                            let op = TextOp { pos, delete, insert: insert.into() };
+                            let range = start..end;
+                            assert_eq!(transform_annotation_range(&range, &op), old(&range, &op));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn card_record_uses_creation_and_committed_body_grain() {
+        let mut doc = Document::new("alpha", SpanSet::default(), BlockMap::new(1));
+        let id = doc.add_note(0..5, String::new(), 10);
+        assert!(matches!(doc.journal().events.last(),
+            Some(crate::journal::JournalEvent::CardRaised { id: raised, body, .. })
+                if *raised == id && body.is_empty()));
+        doc.set_note_body_draft(id, "draft".into());
+        assert_eq!(doc.journal().events.len(), 1, "draft keystrokes are not events");
+        doc.set_note_body(id, "draft".into());
+        assert!(matches!(doc.journal().events.last(),
+            Some(crate::journal::JournalEvent::CardEdited { id: edited, body, .. })
+                if *edited == id && body == "draft"));
+        doc.set_note_body(id, "draft".into());
+        assert_eq!(doc.journal().events.len(), 2, "unchanged commits are suppressed");
+    }
+
+    #[test]
+    fn document_cut_records_words_from_the_actual_deleted_text() {
+        let mut doc = Document::new("one two-three", SpanSet::default(), BlockMap::new(1));
+        doc.edit_bytes(0..doc.len_bytes(), "");
+        assert_eq!(doc.journal().runs[0].del_words, Some(2));
+    }
+
+    #[test]
+    fn document_charwise_deletes_count_whole_runs() {
+        let mut backspace = Document::new("hello world", SpanSet::default(), BlockMap::new(1));
+        while backspace.len_bytes() > 0 {
+            let end = backspace.len_bytes();
+            backspace.edit_bytes(end - 1..end, "");
+        }
+        assert_eq!(backspace.journal().runs.len(), 1);
+        assert_eq!(backspace.journal().runs[0].del_words, Some(2));
+
+        let mut forward = Document::new("hello world", SpanSet::default(), BlockMap::new(1));
+        while forward.len_bytes() > 0 {
+            forward.edit_bytes(0..1, "");
+        }
+        assert_eq!(forward.journal().runs.len(), 1);
+        assert_eq!(forward.journal().runs[0].del_words, Some(2));
+    }
 
     #[test]
     fn byte_break_lengths_and_line_text_ends_cover_ropeys_full_set() {
@@ -6409,7 +6533,8 @@ mod tests {
     fn replay_applies_seam_events_by_timestamp() {
         use crate::journal::{EditRun, Journal, JournalEvent, ReplayDoc};
         let mut j = Journal::default();
-        j.runs.push(EditRun { t0: 1_000, t1: 1_000, pos: 4, del_chars: 0, ins: "\n\nscrap".into() });
+        j.runs.push(EditRun { t0: 1_000, t1: 1_000, pos: 4, del_chars: 0,
+            del_words: None, ins: "\n\nscrap".into() });
         j.events.push(JournalEvent::Seam { t: 1_000, at: Some(1) });
         j.events.push(JournalEvent::Seam { t: 5_000, at: None });
         let mut r = ReplayDoc::new("manu", SpanSet::default(), BlockMap::new(1), 0);

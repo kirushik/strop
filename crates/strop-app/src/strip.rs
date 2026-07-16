@@ -92,7 +92,8 @@ pub const FLECK_CAP: usize = 70;
 /// The machine-room dark ground and the readout chip (spec §0 — new inline
 /// values in that family; NOT theme tokens, chrome fills stay at use sites).
 pub const GROUND: u32 = 0x26251F;
-pub const READOUT_CHIP: u32 = 0x111009;
+/// The desk beyond the manuscript's recorded extent (spec v3 §1a).
+pub const DESK: u32 = 0x211F1A;
 /// The cream page-fill under the envelope and the envelope stroke itself
 /// (design §1 — the corridor fix filled the rail→envelope band faint so it
 /// reads as a page, not a floating line).
@@ -343,12 +344,14 @@ pub struct StationSnap {
 /// stayed open). Times in ms; `raised_ms` is the note's `created_unix × 1000`.
 #[derive(Clone, Copy, Debug)]
 pub struct CardSnap {
+    pub id: u64,
     pub raised_ms: i64,
     pub closed_ms: Option<i64>,
     /// The anchor's position in chars (today's text) — mapped through the
     /// envelope's own y-scale at bake, so the thread sits inside the page.
     pub anchor: usize,
     pub resolved: bool,
+    pub kind: strop_core::document::NoteKind,
 }
 
 // ---- Baked geometry --------------------------------------------------------
@@ -373,13 +376,282 @@ pub struct Veil {
 
 /// A card's open life as a 1-px cool thread; `sage` terminal when resolved,
 /// grey when dismissed, `open` runs to the right edge (still open).
-#[derive(Clone, Copy, Debug)]
-pub struct Thread {
-    pub x0: f32,
-    pub x1: f32,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThreadPoint {
+    pub x: f32,
     pub y: f32,
+    pub anchor: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct Thread {
+    pub card_id: u64,
+    pub segments: Vec<Vec<ThreadPoint>>,
     pub resolved: bool,
     pub open: bool,
+    pub origin_proven: bool,
+    pub uncertain_start: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyCardAt {
+    ProvenAnchor(usize),
+    Detached,
+    Absent,
+}
+
+pub fn legacy_card_at(thread: &Thread, work: f32) -> LegacyCardAt {
+    let Some(first) = thread.segments.first().and_then(|s| s.first()) else {
+        return LegacyCardAt::Absent;
+    };
+    let Some(last) = thread.segments.last().and_then(|s| s.last()) else {
+        return LegacyCardAt::Absent;
+    };
+    if work < first.x || work > last.x {
+        return LegacyCardAt::Absent;
+    }
+    for segment in &thread.segments {
+        for pair in segment.windows(2) {
+            if work >= pair[0].x && work <= pair[1].x {
+                let span = pair[1].x - pair[0].x;
+                let f = if span.abs() < f32::EPSILON { 0. } else {
+                    (work - pair[0].x) / span
+                };
+                let anchor = pair[0].anchor as f32
+                    + (pair[1].anchor as f32 - pair[0].anchor as f32) * f;
+                return LegacyCardAt::ProvenAnchor(anchor.round().max(0.) as usize);
+            }
+        }
+        if segment.len() == 1 && (segment[0].x - work).abs() < 0.5 {
+            return LegacyCardAt::ProvenAnchor(segment[0].anchor);
+        }
+    }
+    LegacyCardAt::Detached
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardBodySnapshot {
+    pub at_ms: i64,
+    pub body: String,
+    pub title: String,
+    pub level: String,
+    pub status: strop_core::document::NoteStatus,
+    pub orphaned: bool,
+    pub unverified: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardAnchorSnapshot {
+    pub at_ms: i64,
+    pub range: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardHistory {
+    pub id: u64,
+    pub kind: strop_core::document::NoteKind,
+    pub raised_ms: i64,
+    pub closed_ms: Option<i64>,
+    pub bodies: Vec<CardBodySnapshot>,
+    pub anchors: Vec<CardAnchorSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CardHistoryIndex {
+    pub cards: Vec<CardHistory>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PastCard<'a> {
+    pub id: u64,
+    pub kind: strop_core::document::NoteKind,
+    pub body: &'a CardBodySnapshot,
+    pub anchor: Option<&'a std::ops::Range<usize>>,
+}
+
+impl CardHistoryIndex {
+    pub fn past_margin(&self, at_ms: i64) -> Vec<PastCard<'_>> {
+        self.cards.iter().filter_map(|card| {
+            if at_ms < card.raised_ms || card.closed_ms.is_some_and(|t| at_ms >= t) {
+                return None;
+            }
+            let body = card.bodies.get(
+                card.bodies.partition_point(|b| b.at_ms <= at_ms).checked_sub(1)?
+            )?;
+            let anchor = card.anchors
+                .get(card.anchors.partition_point(|a| a.at_ms <= at_ms).checked_sub(1)?)
+                .and_then(|a| a.range.as_ref());
+            Some(PastCard { id: card.id, kind: card.kind, body, anchor })
+        }).collect()
+    }
+}
+
+fn push_thread_point(points: &mut Vec<ThreadPoint>, point: ThreadPoint) {
+    if let Some(last) = points.last()
+        && (last.x - point.x).abs() < 0.5
+        && (last.y - point.y).abs() < 0.5
+    {
+        return;
+    }
+    if points.len() >= 2 {
+        let a = points[points.len() - 2];
+        let b = points[points.len() - 1];
+        let cross = (b.x - a.x) * (point.y - b.y) - (b.y - a.y) * (point.x - b.x);
+        if cross.abs() < 0.25 {
+            points.pop();
+        }
+    }
+    points.push(point);
+}
+
+/// Recover only the legacy suffix whose inverse is unique. Reaching the
+/// beginning of the available run record is a proof boundary, not evidence
+/// that the card occupied its present y all the way back to its raise.
+///
+/// `end_ms` is the thread's TERMINAL — `now_ms` for a live card, its close for
+/// a closed one (the record already holds the `CardClosed` time; a closed
+/// card's path up to that moment is real history, not to be dropped). The note
+/// still tracks the text after it closes, so `today_anchor` is the present
+/// position: post-terminal runs are rolled back (no vertex) to recover the
+/// close-time anchor, and a post-terminal ambiguity/restore — where that
+/// position becomes unknowable — yields no thread at all.
+fn legacy_reverse_vertices(
+    journal: &Journal,
+    raised_ms: i64,
+    today_anchor: usize,
+    end_ms: i64,
+    now_ms: i64,
+) -> Vec<(i64, usize)> {
+    let restores: Vec<i64> = journal.events.iter().filter_map(|e| match e {
+        JournalEvent::Restore { t, .. } => Some(*t),
+        _ => None,
+    }).collect();
+    let ambiguous = |anchor: usize, run: &EditRun| -> bool {
+        let ins = run.ins.chars().count();
+        // A post-edit anchor inside replacement text, or at the collapse point
+        // of a deletion, has more than one possible pre-edit coordinate.
+        (anchor > run.pos && anchor < run.pos + ins)
+            || (run.del_chars > 0 && anchor == run.pos)
+    };
+    let invert = |anchor: usize, run: &EditRun| -> usize {
+        let ins = run.ins.chars().count();
+        if anchor >= run.pos + ins { anchor + run.del_chars - ins } else { anchor }
+    };
+    // A restore after the terminal severs the invertible chain from the present
+    // back to the close position — the close-time anchor is unrecoverable, so
+    // the thread is absent (for a live card `end_ms == now_ms`: vacuous).
+    if restores.iter().any(|t| *t > end_ms && *t <= now_ms) {
+        return Vec::new();
+    }
+    let mut anchor = today_anchor;
+    // Roll the present anchor back to its position at `end_ms`. Runs after the
+    // terminal moved the still-tracking note but lie outside its thread; an
+    // ambiguous one there leaves the close position unknowable.
+    for run in journal.runs.iter().rev().filter(|r| r.t0 > end_ms && r.t0 >= raised_ms) {
+        if ambiguous(anchor, run) {
+            return Vec::new();
+        }
+        anchor = invert(anchor, run);
+    }
+    // The thread proper: from the terminal back while the inverse stays unique.
+    let mut rev = vec![(end_ms, anchor)];
+    let mut ceiling = end_ms;
+    for run in journal.runs.iter().rev().filter(|r| r.t0 >= raised_ms && r.t0 <= end_ms) {
+        if restores.iter().any(|t| *t > run.t0 && *t <= ceiling) || ambiguous(anchor, run) {
+            break;
+        }
+        ceiling = run.t0;
+        anchor = invert(anchor, run);
+        rev.push((run.t0, anchor));
+    }
+    rev.reverse();
+    rev
+}
+
+fn card_history_index(journal: &Journal) -> Option<CardHistoryIndex> {
+    use strop_core::buffer::TextOp;
+    use strop_core::document::transform_annotation_range;
+
+    let mut cards = Vec::new();
+    for raised in &journal.events {
+        let JournalEvent::CardRaised { t, id, card_kind, range, body, title, level,
+            status, orphaned, unverified, .. } = raised else { continue };
+        let mut history = CardHistory {
+            id: *id,
+            kind: *card_kind,
+            raised_ms: *t,
+            closed_ms: None,
+            bodies: vec![CardBodySnapshot {
+                at_ms: *t,
+                body: body.clone(),
+                title: title.clone(),
+                level: level.clone(),
+                status: *status,
+                orphaned: *orphaned,
+                unverified: *unverified,
+            }],
+            anchors: vec![CardAnchorSnapshot { at_ms: *t, range: Some(range.clone()) }],
+        };
+        enum CardStep<'a> { Run(&'a EditRun), Event(&'a JournalEvent) }
+        // `t0 >= t` is exact, not approximate: record_event seals the open
+        // run and clamps a card event strictly past every written run, so a
+        // run sharing the raise's millisecond was recorded after it and a
+        // pre-raise run can never straddle it. (Legacy files recorded before
+        // that law keep the events-before-runs tie-break below: best effort.)
+        let mut steps: Vec<(i64, u8, CardStep<'_>)> = journal.runs.iter()
+            .filter(|r| r.t0 >= *t)
+            .map(|r| (r.t0, 1, CardStep::Run(r))).collect();
+        steps.extend(journal.events.iter().filter(|e| e.t() > *t)
+            .map(|e| (e.t(), 0, CardStep::Event(e))));
+        steps.sort_by_key(|s| (s.0, s.1));
+        let mut anchor = range.clone();
+        let mut proven = true;
+        for (at, _, step) in steps {
+            match step {
+                CardStep::Run(run) if proven => {
+                    let op = TextOp { pos: run.pos, delete: run.del_chars, insert: run.ins.clone() };
+                    let next = transform_annotation_range(&anchor, &op);
+                    if next.start != anchor.start {
+                        history.anchors.push(CardAnchorSnapshot { at_ms: at, range: Some(next.clone()) });
+                    }
+                    anchor = next;
+                }
+                CardStep::Event(JournalEvent::Restore { .. }) => {
+                    proven = false;
+                    history.anchors.push(CardAnchorSnapshot { at_ms: at, range: None });
+                }
+                CardStep::Event(JournalEvent::CardsRebased { entries, .. }) => {
+                    if let Some(entry) = entries.iter().find(|e| e.id == *id) {
+                        anchor = entry.range.clone();
+                        proven = entry.disposition != strop_core::journal::CardDisposition::Orphaned;
+                        history.anchors.push(CardAnchorSnapshot {
+                            at_ms: at, range: proven.then(|| anchor.clone())
+                        });
+                        if let Some(previous) = history.bodies.last() {
+                            history.bodies.push(CardBodySnapshot { at_ms: at,
+                                body: previous.body.clone(), title: entry.title.clone(),
+                                level: entry.level.clone(), status: entry.status,
+                                orphaned: entry.orphaned, unverified: entry.unverified });
+                        }
+                    }
+                }
+                CardStep::Event(JournalEvent::CardEdited { id: event_id, body, title,
+                    level, status, orphaned, unverified, .. }) if event_id == id => {
+                    history.bodies.push(CardBodySnapshot { at_ms: at, body: body.clone(),
+                        title: title.clone(), level: level.clone(), status: *status,
+                        orphaned: *orphaned, unverified: *unverified });
+                }
+                CardStep::Event(JournalEvent::CardClosed { id: event_id, .. })
+                    if event_id == id => {
+                    history.closed_ms = Some(at);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        cards.push(history);
+    }
+    (!cards.is_empty()).then_some(CardHistoryIndex { cards })
 }
 
 /// A checkpoint tick + its (possibly omitted) label. `restore` draws it sage
@@ -402,6 +674,14 @@ pub struct Station {
     pub at_ms: i64,
 }
 
+impl Station {
+    /// A writer's own named version — the only stations the strip's rename
+    /// verb (§3c) may touch; the honest automatics stay system-owned.
+    pub fn writer_named(&self) -> bool {
+        self.rank == RANK_WRITER
+    }
+}
+
 /// A stepwise envelope vertex (document length over time): x = a run's right
 /// edge, y hangs from the fabric top and steps down as the story grows.
 #[derive(Clone, Copy, Debug)]
@@ -416,6 +696,30 @@ pub struct EnvPoint {
 pub struct Seam {
     pub x: f32,
     pub w: f32,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+impl Seam {
+    /// The two-day tier (§1b): does this well carry a hover-duration datum?
+    /// Decided from the WALL-CLOCK gap the fold spans, never from the derived
+    /// pixel width `w`. `w` is `work1 - work0` after a long accumulation of f32
+    /// additions, so `w == SEAM_WIDE_PX` starts missing genuinely wide seams
+    /// once the axis grows (drift reaches a whole tier step past ~1M px). The
+    /// gap span is the integer the fold decision was made from — exact forever.
+    pub fn wide(&self) -> bool {
+        self.end_ms - self.start_ms >= SEAM_WIDE_MS
+    }
+}
+
+/// Plain data carried by a wide well. It is baked with the fold so neither
+/// its words nor its exact hover bounds can change during a scrub.
+#[derive(Clone, Debug)]
+pub struct WellDatum {
+    pub x: f32,
+    pub label: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
 }
 
 /// A quiet date in the bottom lane ("Today" / "Tue 1 Jul").
@@ -423,6 +727,11 @@ pub struct Seam {
 pub struct DateTick {
     pub x: f32,
     pub label: String,
+    /// The sitting's first recorded moment: the date control seeks here.
+    pub at_ms: i64,
+    /// First/last run time, used only by the visible hover expansion.
+    pub span_start_ms: i64,
+    pub span_end_ms: i64,
 }
 
 /// The immutable view model (spec §1). Built once per open/Restore from
@@ -434,9 +743,11 @@ pub struct StripBake {
     pub flecks: Vec<Fleck>,
     pub veils: Vec<Veil>,
     pub threads: Vec<Thread>,
+    pub card_history: Option<CardHistoryIndex>,
     pub stations: Vec<Station>,
     pub envelope: Vec<EnvPoint>,
     pub seams: Vec<Seam>,
+    pub well_data: Vec<WellDatum>,
     pub dates: Vec<DateTick>,
     /// Materialized-checkpoint anchor times (ms), sorted — the reconstruction
     /// anchor is the latest ≤ pos_ms (the editor holds the states themselves).
@@ -534,10 +845,7 @@ impl StripBake {
                     let y0 = depth_y(pos as i64).min(page_bot - FLECK);
                     let y1 = depth_y((pos + run.del_chars.max(ins_chars)) as i64).min(page_bot);
                     let ins = run.ins_words();
-                    // Deleted words are estimated from del_chars (the text
-                    // itself is not stored — forward replay never needs it):
-                    // ~5.5 chars/word.
-                    let del = (run.del_chars as f32 / 5.5).round() as usize;
+                    let (del, _exact) = run.deleted_words();
                     let n = (ins + del).min(FLECK_CAP);
                     for k in 0..n {
                         let (jx, jy) = jitter(*i as u64, k);
@@ -593,50 +901,97 @@ impl StripBake {
             .map(|s| Seam {
                 x: s.work0,
                 w: s.work1 - s.work0,
+                start_ms: s.wall0,
+                end_ms: s.wall1,
+            })
+            .collect();
+        let well_data = seams
+            .iter()
+            .filter(|s| s.wide())
+            .map(|s| WellDatum {
+                x: s.x + s.w / 2.,
+                label: format_well_duration(s.end_ms - s.start_ms),
+                start_ms: s.start_ms,
+                end_ms: s.end_ms,
             })
             .collect();
 
-        // --- Threads (card lifespans) ----------------------------------------
-        // Anchor depth on the chars axis (inside the page, like everything
-        // else). `anchor` is the note's position in TODAY'S text — the
-        // historical offset isn't recorded — an honest approximation that
-        // stays within the page because pos ≤ len ≤ max.
-        let threads: Vec<Thread> = cards
-            .iter()
-            .map(|c| {
-                let x0 = timeline.work_at(c.raised_ms);
-                let (x1, open) = match c.closed_ms {
-                    Some(t) => (timeline.work_at(t).max(x0 + 1.), false),
-                    None => (timeline.total_work, true),
-                };
-                Thread {
-                    x0,
-                    x1,
-                    y: depth_y(c.anchor as i64).clamp(FAB_Y0 + 2., FAB_Y0 + FABRIC_H),
-                    resolved: c.resolved,
-                    open,
+        // --- Threads + their immutable past-margin sibling ------------------
+        let card_history = card_history_index(journal);
+        let point = |at_ms: i64, anchor: usize| ThreadPoint {
+            x: timeline.work_at(at_ms),
+            y: depth_y(anchor as i64).clamp(FAB_Y0 + 2., FAB_Y0 + FABRIC_H),
+            anchor,
+        };
+        let mut threads = Vec::new();
+        if let Some(index) = &card_history {
+            for card in index.cards.iter().filter(|c| {
+                c.kind == strop_core::document::NoteKind::Diagnosis
+            }) {
+                let mut segments: Vec<Vec<ThreadPoint>> = Vec::new();
+                let mut current = Vec::new();
+                for anchor in &card.anchors {
+                    match &anchor.range {
+                        Some(range) => {
+                            let p = point(anchor.at_ms, range.start);
+                            push_thread_point(&mut current, p);
+                        }
+                        None => {
+                            if !current.is_empty() { segments.push(std::mem::take(&mut current)); }
+                        }
+                    }
                 }
-            })
-            .collect();
+                if !current.is_empty() { segments.push(current); }
+                let end_ms = card.closed_ms.unwrap_or(now_ms);
+                if let Some(last) = segments.last_mut().and_then(|s| s.last().copied()) {
+                    let terminal = ThreadPoint { x: timeline.work_at(end_ms).max(last.x),
+                        y: last.y, anchor: last.anchor };
+                    if terminal.x > last.x { segments.last_mut().unwrap().push(terminal); }
+                }
+                let resolved = journal.events.iter().find_map(|e| match e {
+                    JournalEvent::CardClosed { id, resolved, .. } if *id == card.id => Some(*resolved),
+                    _ => None,
+                }).unwrap_or(false);
+                threads.push(Thread { card_id: card.id, segments, resolved, open: card.closed_ms.is_none(),
+                    origin_proven: true, uncertain_start: false });
+            }
+        }
+        // Legacy cards have no raise snapshot. Walk backwards only while the
+        // inverse is unique; silence becomes absent geometry, never a guess.
+        for card in cards.iter().filter(|c| c.kind == strop_core::document::NoteKind::Diagnosis
+            && !journal.events.iter().any(|e| matches!(e,
+                JournalEvent::CardRaised { id, .. } if *id == c.id))) {
+            // A closed legacy card is not dropped: its path up to the close it
+            // already recorded is real history. The reverse walk terminates at
+            // that close (else at `now`), and the thread renders terminated.
+            let end_ms = card.closed_ms.unwrap_or(now_ms);
+            let rev: Vec<ThreadPoint> = legacy_reverse_vertices(
+                journal, card.raised_ms, card.anchor, end_ms, now_ms
+            ).into_iter().map(|(at, anchor)| point(at, anchor)).collect();
+            if rev.is_empty() { continue; }
+            let uncertain_start = rev.len() > 1;
+            let segments = vec![rev];
+            threads.push(Thread { card_id: card.id, segments, resolved: card.resolved,
+                open: card.closed_ms.is_none(), origin_proven: false, uncertain_start });
+        }
 
         // --- Stations (checkpoints) + Restore/Export ticks -------------------
-        // Session starts are bare ticks — the date lane carries the day, and
-        // the words "Session start" taught nothing while colliding with
-        // themselves on every sitting (spec §2: the honest automatics are
-        // Started/Restored/Exported). The one exception: the document's very
-        // first station keeps a name — its birth is data.
-        let first_ms = stations.iter().map(|s| s.created_ms).min();
+        // A tick means exactly one thing: a deliberate mark (§1b, §2) — a
+        // named version, a seal, an export, a restore. Session and reflex
+        // checkpoints stay replay anchors in the store, but bake NO station:
+        // no tick, no hit target, no arrow stop. The wells and the dates
+        // carry the sittings — a tick beside a well is duplicate grammar.
         let mut baked: Vec<Station> = Vec::new();
         for st in stations {
-            let label = if st.name == "Session start" && Some(st.created_ms) == first_ms {
-                "Started".into()
-            } else {
-                station_display(&st.name)
-            };
+            let rank = station_rank(&st.name, st.manual);
+            if rank >= RANK_SESSION {
+                continue;
+            }
+            let label = station_display(&st.name, st.manual);
             baked.push(Station {
                 x: timeline.work_at(st.created_ms),
                 label,
-                rank: station_rank(&st.name, st.manual),
+                rank,
                 restore: st.name == "Restored",
                 arc_to: None,
                 row: 0,
@@ -699,10 +1054,12 @@ impl StripBake {
             v
         };
 
-        // Step destinations: stations, the shoulders of every ≥150-word run
-        // (a big cut's corners), the two ends.
+        // Step destinations: baked stations (deliberate marks only — an
+        // invisible session seal must not attract an arrow or a detent),
+        // the shoulders of every ≥150-word run (a big cut's corners), the
+        // two ends.
         let snap_ms: Vec<i64> = {
-            let mut v: Vec<i64> = stations.iter().map(|s| s.created_ms).collect();
+            let mut v: Vec<i64> = baked.iter().map(|s| s.at_ms).collect();
             for run in &journal.runs {
                 if run.delta_chars().unsigned_abs() >= 800 {
                     v.push(run.t0);
@@ -721,9 +1078,11 @@ impl StripBake {
             flecks,
             veils,
             threads,
+            card_history,
             stations: baked,
             envelope,
             seams,
+            well_data,
             dates,
             anchor_ms,
             snap_ms,
@@ -732,48 +1091,40 @@ impl StripBake {
     }
 }
 
-/// Dates for the bottom lane, one label per calendar day, placed at that day's
-/// earliest anchor along the axis. Anchors are run session-starts (the first
-/// run, and each after a >15 min gap — a new sitting) AND every checkpoint: a
-/// LEGACY era carries no runs, so its checkpoints are the only time record the
-/// lane has to date (Bug A).
+/// Dates for the bottom lane, one control per sitting. Its position and target
+/// are the sitting's first run; its hover span is the first/last run.
 fn build_dates(
     runs: &[EditRun],
     stations: &[StationSnap],
     timeline: &Timeline,
     now_ms: i64,
 ) -> Vec<DateTick> {
-    let mut anchors: Vec<i64> = Vec::new();
+    let mut spans: Vec<(i64, i64)> = Vec::new();
     let mut prev_t1 = i64::MIN;
     for run in runs {
         if prev_t1 == i64::MIN || run.t0 - prev_t1 > GAP_FOLD_MS {
-            anchors.push(run.t0);
+            spans.push((run.t0, run.t1));
+        } else if let Some(span) = spans.last_mut() {
+            span.1 = run.t1.max(span.1);
         }
         prev_t1 = run.t1;
     }
-    anchors.extend(stations.iter().map(|s| s.created_ms));
-    anchors.sort_unstable();
-    let mut dates: Vec<DateTick> = Vec::new();
-    let mut last_day = i64::MIN;
-    for t in anchors {
-        let day = t.div_euclid(86_400_000);
-        if day != last_day {
-            dates.push(DateTick {
-                x: timeline.work_at(t),
-                label: date_label(t / 1000, now_ms / 1000),
-            });
-            last_day = day;
-        }
+    // A legacy checkpoint-only era has no runs from which to prove a sitting
+    // span. Its materialized moments remain usable date controls, without a
+    // fabricated duration.
+    if spans.is_empty() {
+        spans.extend(stations.iter().map(|s| (s.created_ms, s.created_ms)));
     }
-    // A document with nothing recorded yet still stands on today — the one
-    // honest word an empty strip can say (the axis does extend to now).
-    if dates.is_empty() {
-        dates.push(DateTick {
-            x: timeline.work_at(now_ms),
-            label: "Today".into(),
-        });
-    }
-    dates
+    spans
+        .into_iter()
+        .map(|(start, end)| DateTick {
+            x: timeline.work_at(start),
+            label: date_label(start / 1000, now_ms / 1000),
+            at_ms: start,
+            span_start_ms: start,
+            span_end_ms: end,
+        })
+        .collect()
 }
 
 // ---- Ranked omission -------------------------------------------------------
@@ -791,8 +1142,14 @@ const RANK_REFLEX: u8 = 6;
 
 /// The automatic checkpoint names Strop writes — everything else that is
 /// `manual` is a writer's own title (the highest-ranked label).
+// "Checkpoint N" shares the reflex rank by design; it keeps its own rung
+// so the name ladder stays legible. Clippy sees identical arms, we see
+// the enumeration of every name Strop writes.
+#[allow(clippy::if_same_then_else)]
 fn station_rank(name: &str, manual: bool) -> u8 {
-    if name == "Before restore" || name.starts_with("Before restoring") {
+    if manual && name != "Fresh tutorial" {
+        RANK_WRITER
+    } else if name == "Before restore" || name.starts_with("Before restoring") {
         RANK_BEFORE_RESTORE
     } else if name == "Restored" {
         RANK_RESTORE
@@ -800,12 +1157,14 @@ fn station_rank(name: &str, manual: bool) -> u8 {
         RANK_EXPORT
     } else if name.contains("seal") || name == "Draft complete" {
         RANK_SEAL
-    } else if name == "Session start" || name == "Started" || name == "Fresh tutorial" {
+    } else if name == "Session start"
+        || name == "Session"
+        || name == "Started"
+        || name == "Fresh tutorial"
+    {
         RANK_SESSION
     } else if name.starts_with("Checkpoint ") {
         RANK_REFLEX
-    } else if manual {
-        RANK_WRITER
     } else {
         RANK_REFLEX
     }
@@ -815,11 +1174,16 @@ fn station_rank(name: &str, manual: bool) -> u8 {
 /// lowest rank — design §2), and so are session starts: the date lane already
 /// says when a sitting began, and a lane full of "Session start" echoes was
 /// the doubled-print smear. Everything else shows its own name.
-fn station_display(name: &str) -> String {
-    if name.starts_with("Checkpoint ") || name == "Session start" {
+fn station_display(name: &str, manual: bool) -> String {
+    // Files created before history round two persisted the tutorial's chrome
+    // name as manual. This exact compatibility carve-out sacrifices only the
+    // strip label of a writer-typed duplicate; its arrow target still lives.
+    if name == "Fresh tutorial" {
         String::new()
-    } else {
+    } else if manual || name == "Restored" || name == "Exported" {
         name.to_owned()
+    } else {
+        String::new()
     }
 }
 
@@ -959,6 +1323,29 @@ pub fn format_moment(wall_ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// Compact whole-unit face for a wide folded interval (§1b). The caller only
+/// creates these at two days or more; sub-day wording is deliberately absent.
+pub fn format_well_duration(elapsed_ms: i64) -> String {
+    let days = elapsed_ms.max(0) / 86_400_000;
+    if days < 14 {
+        format!("{days} days")
+    } else if days <= 8 * 7 + 6 {
+        let weeks = days / 7;
+        let rest = days % 7;
+        if rest == 0 { format!("{weeks} wk") } else { format!("{weeks} wk {rest} d") }
+    } else {
+        let weeks = days / 7;
+        let months = weeks / 4;
+        let rest = weeks % 4;
+        if rest == 0 { format!("{months} mo") } else { format!("{months} mo {rest} wk") }
+    }
+}
+
+pub fn well_span_label(datum: &WellDatum, now_ms: i64) -> String {
+    format!("{}–{}", format_moment(datum.start_ms, now_ms),
+        format_moment(datum.end_ms, now_ms))
+}
+
 /// The readout chip's text (spec §2): `{date} · {n} words`, tabular, NEVER a
 /// sentence and NEVER a station name (P8's template ban).
 pub fn format_readout(wall_ms: i64, words: usize, now_ms: i64) -> String {
@@ -967,6 +1354,94 @@ pub fn format_readout(wall_ms: i64, words: usize, now_ms: i64) -> String {
         format_moment(wall_ms, now_ms),
         group_thousands(words)
     )
+}
+
+pub fn format_word_delta(a: usize, b: usize, include_words: bool) -> String {
+    let delta = b as i64 - a as i64;
+    if delta == 0 {
+        "no word-count change".to_owned()
+    } else if include_words {
+        format!("{delta:+} words")
+    } else {
+        format!("{delta:+}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompareChipTier {
+    Full,
+    SharedDate,
+    ShortDates,
+    ActiveOnly,
+}
+
+pub struct CompareReadouts {
+    pub full_a: String,
+    pub full_b: String,
+    pub shared_date: Option<(String, String, String)>,
+    pub short_a: String,
+    pub short_b: String,
+}
+
+pub fn compare_readouts(
+    a_ms: i64,
+    a_words: usize,
+    b_ms: i64,
+    b_words: usize,
+    now_ms: i64,
+) -> CompareReadouts {
+    let a = civil(a_ms / 1000);
+    let b = civil(b_ms / 1000);
+    let (now_y, ..) = civil(now_ms / 1000);
+    let delta_words = format_word_delta(a_words, b_words, true);
+    let delta_count = format_word_delta(a_words, b_words, false);
+    let short = |(y, m, d, hh, mm, _): (i64, u32, u32, u32, u32, usize), words| {
+        let date = if y == now_y {
+            format!("{d} {}", MONTHS[(m - 1) as usize])
+        } else {
+            format!("{d} {} {y}", MONTHS[(m - 1) as usize])
+        };
+        format!("{date}, {hh:02}:{mm:02} · {} words", group_thousands(words))
+    };
+    let shared_date = (a.0, a.1, a.2).eq(&(b.0, b.1, b.2)).then(|| {
+        let prefix = if a.0 == now_y {
+            format!("{} {}", a.2, MONTHS[(a.1 - 1) as usize])
+        } else {
+            format!("{} {} {}", a.2, MONTHS[(a.1 - 1) as usize], a.0)
+        };
+        (
+            prefix,
+            format!("A · {:02}:{:02} · {} words", a.3, a.4, group_thousands(a_words)),
+            format!("B · {:02}:{:02} · {} words · {delta_count}",
+                b.3, b.4, group_thousands(b_words)),
+        )
+    });
+    CompareReadouts {
+        full_a: format!("A · {}", format_readout(a_ms, a_words, now_ms)),
+        full_b: format!("B · {} · {delta_words}", format_readout(b_ms, b_words, now_ms)),
+        shared_date,
+        short_a: format!("A · {}", short(a, a_words)),
+        short_b: format!("B · {} · {delta_count}", short(b, b_words)),
+    }
+}
+
+/// Choose the first semantic compare readout that fits. Widths are shaped
+/// measurements supplied by the caller; no datum is ever clipped or elided.
+pub fn compare_chip_tier(
+    available: f32,
+    full: f32,
+    shared_date: Option<f32>,
+    short_dates: f32,
+) -> CompareChipTier {
+    if full <= available {
+        CompareChipTier::Full
+    } else if shared_date.is_some_and(|w| w <= available) {
+        CompareChipTier::SharedDate
+    } else if short_dates <= available {
+        CompareChipTier::ShortDates
+    } else {
+        CompareChipTier::ActiveOnly
+    }
 }
 
 /// A session-start date for the bottom lane (spec §1): "Today" / "Yesterday" /
@@ -988,6 +1463,14 @@ pub fn date_label(day_secs: i64, now_secs: i64) -> String {
     } else {
         format!("{} {d} {mon} {y}", WEEKDAYS[wd])
     }
+}
+
+/// The date control's hover face: expand the existing visible label, never
+/// add a second annotation (P9).
+pub fn date_span_label(date: &DateTick) -> String {
+    let (_, _, _, sh, sm, _) = civil(date.span_start_ms / 1000);
+    let (_, _, _, eh, em, _) = civil(date.span_end_ms / 1000);
+    format!("{}, {sh:02}:{sm:02}–{eh:02}:{em:02}", date.label)
 }
 
 /// 1234 → "1,234" (the titlebar's convention, mirrored so the readout at now
@@ -1056,6 +1539,12 @@ pub struct Strip {
     /// moment-under-cursor mapping, view never yanks) rather than on the rail
     /// (fraction-of-the-whole seek, view locked to the thumb).
     pub scrub_fabric: bool,
+    /// Sitting whose already-visible date is under the pointer.
+    pub hover_date_ms: Option<i64>,
+    /// Wide well whose plain datum is expanded under the pointer.
+    pub hover_well_start_ms: Option<i64>,
+    /// Exact station target under the pointer; label and tick share it.
+    pub hover_station_ms: Option<i64>,
     /// Fabric horizontal pan (px) — auto-scroll keeps the playhead in view at
     /// novel scale; wheel pans it. NOT part of the bake (review B7).
     pub view_offset: f32,
@@ -1076,6 +1565,9 @@ pub struct Strip {
     /// return the identical frame). A Restore drops it instead — the text
     /// changed for real.
     pub saved_sel: Option<std::ops::Range<usize>>,
+    /// The live document scroll captured with `saved_sel`. Preview scrolling
+    /// is an excursion; every non-Restore exit returns this locus.
+    pub saved_scroll: Option<f32>,
 }
 
 impl Default for Strip {
@@ -1087,6 +1579,9 @@ impl Default for Strip {
             parked: false,
             scrubbing: false,
             scrub_fabric: false,
+            hover_date_ms: None,
+            hover_well_start_ms: None,
+            hover_station_ms: None,
             view_offset: 0.,
             bakes: 0,
             bake: None,
@@ -1094,6 +1589,7 @@ impl Default for Strip {
             words_at: 0,
             pin_words: 0,
             saved_sel: None,
+            saved_scroll: None,
         }
     }
 }
@@ -1104,12 +1600,22 @@ impl Strip {
     pub fn is_parked(&self) -> bool {
         self.open && self.parked
     }
+
+    pub fn past_margin(&self) -> Vec<PastCard<'_>> {
+        self.past_margin_at(self.pos_ms)
+    }
+
+    pub fn past_margin_at(&self, at_ms: i64) -> Vec<PastCard<'_>> {
+        self.bake.as_ref().and_then(|b| b.card_history.as_ref())
+            .map_or_else(Vec::new, |index| index.past_margin(at_ms))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use strop_core::buffer::TextOp;
+    use strop_core::document::{NoteKind, NoteStatus};
     use strop_core::journal::Journal;
 
     fn ins(pos: usize, text: &str) -> TextOp {
@@ -1118,6 +1624,214 @@ mod tests {
             delete: 0,
             insert: text.into(),
         }
+    }
+
+    fn raised(t: i64, id: u64, range: std::ops::Range<usize>, body: &str) -> JournalEvent {
+        JournalEvent::CardRaised { t, id, card_kind: NoteKind::Diagnosis, range,
+            body: body.into(), title: "Question".into(), level: "line".into(),
+            pass_id: 1, status: NoteStatus::Open, orphaned: false, unverified: false }
+    }
+
+    #[test]
+    fn card_path_uses_the_live_range_transform() {
+        let mut j = Journal::default();
+        j.events.push(raised(10, 7, 10..14, "first"));
+        let ops = [
+            TextOp { pos: 2, delete: 0, insert: "abc".into() },
+            TextOp { pos: 20, delete: 0, insert: "z".into() },
+            TextOp { pos: 13, delete: 2, insert: String::new() },
+            TextOp { pos: 13, delete: 0, insert: "q".into() },
+            TextOp { pos: 10, delete: 20, insert: String::new() },
+        ];
+        let mut expected = 10..14;
+        for (i, op) in ops.iter().enumerate() {
+            j.record(op, 20 + i as i64 * 10);
+            j.settle();
+            expected = strop_core::document::transform_annotation_range(&expected, op);
+        }
+        let index = card_history_index(&j).unwrap();
+        assert_eq!(index.cards[0].anchors.last().unwrap().range, Some(expected));
+    }
+
+    #[test]
+    fn past_projection_obeys_lifespan_and_committed_body_boundaries() {
+        let mut j = Journal::default();
+        j.events.push(raised(10, 7, 4..8, "first"));
+        j.events.push(JournalEvent::CardEdited { t: 20, id: 7, body: "second".into(),
+            title: "Question".into(), level: "line".into(), pass_id: 1,
+            status: NoteStatus::Open, orphaned: false, unverified: false });
+        j.events.push(JournalEvent::CardClosed { t: 30, id: 7, resolved: true });
+        let index = card_history_index(&j).unwrap();
+        assert!(index.past_margin(9).is_empty());
+        assert_eq!(index.past_margin(10)[0].body.body, "first");
+        assert_eq!(index.past_margin(20)[0].body.body, "second");
+        assert!(index.past_margin(30).is_empty());
+    }
+
+    #[test]
+    fn compare_sides_project_independently_across_a_card_boundary() {
+        let mut j = Journal::default();
+        j.events.push(raised(10, 7, 4..8, "A-only card"));
+        j.events.push(JournalEvent::CardClosed { t: 30, id: 7, resolved: true });
+        let index = card_history_index(&j).unwrap();
+        let a = index.past_margin(20);
+        let b = index.past_margin(40);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].body.body, "A-only card");
+        assert!(b.is_empty(), "B must not inherit A's card across the close boundary");
+    }
+
+    #[test]
+    fn pre_card_record_history_has_no_past_margin_index() {
+        assert!(card_history_index(&Journal::default()).is_none());
+    }
+
+    #[test]
+    fn a_same_millisecond_keystroke_is_never_reapplied_to_a_fresh_card() {
+        let mut j = Journal::default();
+        // Five chars land at the head; the card is raised in the SAME
+        // millisecond, its recorded range already in post-edit coordinates —
+        // the recording law (record_event) orders the raise strictly past
+        // the keystroke, so replay must leave the anchor alone.
+        j.record(&ins(0, "abcde"), 100);
+        j.record_event(raised(100, 7, 10..14, "fresh"));
+        let index = card_history_index(&j).unwrap();
+        assert_eq!(index.cards[0].anchors.len(), 1,
+            "the pre-raise run must not transform the anchor it already shaped");
+        assert_eq!(index.cards[0].anchors[0].range, Some(10..14));
+        // A keystroke AFTER the raise still walks it forward.
+        j.record(&ins(0, "xy"), index.cards[0].raised_ms);
+        let index = card_history_index(&j).unwrap();
+        assert_eq!(index.cards[0].anchors.last().unwrap().range, Some(12..16));
+    }
+
+    fn run(t: i64, pos: usize, del: usize, insert: &str) -> EditRun {
+        EditRun { t0: t, t1: t + 1, pos, del_chars: del,
+            del_words: Some(0), ins: insert.into() }
+    }
+
+    #[test]
+    fn legacy_reverse_walk_stops_at_overlap_without_false_geometry() {
+        let mut j = Journal::default();
+        j.runs = vec![run(20, 6, 5, ""), run(30, 2, 0, "aa")];
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 40, 40);
+        assert_eq!(vertices, vec![(30, 6), (40, 8)]);
+        assert!(vertices.iter().all(|(t, _)| *t > 20), "no line crosses the ambiguous edit");
+    }
+
+    #[test]
+    fn legacy_reverse_walk_stops_at_restore_without_rebase() {
+        let mut j = Journal::default();
+        j.runs = vec![run(20, 1, 0, "a"), run(40, 1, 0, "b")];
+        j.events.push(JournalEvent::Restore { t: 30, from_unix: 0, len_chars: 4 });
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 50, 50);
+        assert_eq!(vertices, vec![(40, 7), (50, 8)]);
+        assert!(vertices.iter().all(|(t, _)| *t > 30), "restore gap has no invented y");
+    }
+
+    #[test]
+    fn legacy_reverse_walk_stops_at_the_journal_coverage_gap() {
+        let mut j = Journal::default();
+        j.runs = vec![run(50, 2, 0, "aa")];
+        let vertices = legacy_reverse_vertices(&j, 10, 8, 60, 60);
+        assert_eq!(vertices, vec![(50, 6), (60, 8)]);
+        assert_ne!(vertices[0].0, 10, "the unrecorded raise-to-journal span stays absent");
+    }
+
+    #[test]
+    fn legacy_reverse_walk_terminates_a_closed_card_at_its_close() {
+        // A closed legacy card: the note still tracks the text after it closes
+        // (`run(60)` postdates the close at 40), so the present anchor is rolled
+        // back through that run — no vertex — to recover the close-time
+        // position, and the thread ends at the close, not at `now`.
+        let mut j = Journal::default();
+        j.runs = vec![run(20, 0, 0, "aa"), run(60, 0, 0, "bb")];
+        let vertices = legacy_reverse_vertices(&j, 10, 12, 40, 100);
+        assert_eq!(vertices, vec![(20, 8), (40, 10)],
+            "the thread spans raise→close, terminating at 40 (not 100)");
+    }
+
+    #[test]
+    fn closed_legacy_card_keeps_a_terminated_thread_through_the_bake() {
+        // The whole bake path: a legacy diagnosis (no CardRaised record) closed
+        // mid-history keeps its thread — nothing is lost — and it renders
+        // terminated (open == false), ending at the close, not the playhead.
+        let mut j = Journal::default();
+        j.runs = vec![run(20, 0, 0, "aa"), run(60, 0, 0, "bb")];
+        let now = 100;
+        let closed = 40;
+        let card = CardSnap { id: 7, raised_ms: 10, closed_ms: Some(closed),
+            anchor: 12, resolved: true, kind: NoteKind::Diagnosis };
+        let bake = StripBake::build(&j, &[], &[card], 0, now);
+        let thread = bake.threads.iter().find(|t| t.card_id == 7)
+            .expect("the closed legacy card keeps its thread");
+        assert!(!thread.open, "a closed card's thread is terminated, not live");
+        let last = thread.segments.last().unwrap().last().unwrap();
+        let close_x = bake.timeline.work_at(closed);
+        assert!((last.x - close_x).abs() < 0.5,
+            "the thread ends at the close ({close_x}), not now: {}", last.x);
+        assert!(close_x < bake.timeline.work_at(now),
+            "a closed thread must not reach the playhead");
+    }
+
+    #[test]
+    fn thread_points_coalesce_subpixel_and_collinear_runs() {
+        let mut points = Vec::new();
+        push_thread_point(&mut points, ThreadPoint { x: 0., y: 10., anchor: 10 });
+        push_thread_point(&mut points, ThreadPoint { x: 1., y: 10.1, anchor: 11 });
+        push_thread_point(&mut points, ThreadPoint { x: 2., y: 10.2, anchor: 12 });
+        push_thread_point(&mut points, ThreadPoint { x: 2.2, y: 10.3, anchor: 13 });
+        assert_eq!(points.len(), 2, "straight and sub-pixel drafting collapses to endpoints");
+    }
+
+    #[test]
+    fn skeleton_eligibility_distinguishes_anchor_gap_and_absence() {
+        let thread = Thread {
+            card_id: 7,
+            segments: vec![
+                vec![ThreadPoint { x: 10., y: 20., anchor: 4 },
+                    ThreadPoint { x: 20., y: 22., anchor: 8 }],
+                vec![ThreadPoint { x: 30., y: 24., anchor: 12 },
+                    ThreadPoint { x: 40., y: 26., anchor: 16 }],
+            ],
+            resolved: false,
+            open: true,
+            origin_proven: false,
+            uncertain_start: true,
+        };
+        assert_eq!(legacy_card_at(&thread, 15.), LegacyCardAt::ProvenAnchor(6));
+        assert_eq!(legacy_card_at(&thread, 25.), LegacyCardAt::Detached);
+        assert_eq!(legacy_card_at(&thread, 5.), LegacyCardAt::Absent);
+    }
+
+    #[test]
+    fn writer_notes_lay_no_thread() {
+        let mut j = Journal::default();
+        let mut event = raised(10, 7, 4..8, "note");
+        if let JournalEvent::CardRaised { card_kind, .. } = &mut event {
+            *card_kind = NoteKind::Note;
+        }
+        j.events.push(event);
+        let bake = StripBake::build(&j, &[], &[], 0, 20);
+        assert!(bake.threads.is_empty());
+        assert_eq!(bake.card_history.unwrap().cards.len(), 1);
+    }
+
+    #[test]
+    fn past_projection_across_events_does_not_rebake() {
+        let mut j = Journal::default();
+        j.events.push(raised(10, 7, 4..8, "first"));
+        j.events.push(JournalEvent::CardEdited { t: 20, id: 7, body: "second".into(),
+            title: "Question".into(), level: "line".into(), pass_id: 1,
+            status: NoteStatus::Open, orphaned: false, unverified: false });
+        j.events.push(JournalEvent::CardClosed { t: 30, id: 7, resolved: true });
+        let mut strip = Strip { open: true, parked: true, bakes: 1,
+            bake: Some(StripBake::build(&j, &[], &[], 0, 40)), ..Strip::default() };
+        for at in [9, 10, 20, 30] {
+            strip.pos_ms = at;
+            let _ = strip.past_margin();
+        }
+        assert_eq!(strip.bakes, 1);
     }
 
     // A fortnight fixture: three sittings a day apart, each a burst of runs.
@@ -1241,6 +1955,37 @@ mod tests {
     }
 
     #[test]
+    fn compare_delta_has_all_three_exact_forms() {
+        assert_eq!(format_word_delta(2800, 3412, true), "+612 words");
+        assert_eq!(format_word_delta(3412, 2800, true), "-612 words");
+        assert_eq!(format_word_delta(3412, 3412, true), "no word-count change");
+        for delta in [
+            format_word_delta(2800, 3412, true),
+            format_word_delta(3412, 2800, true),
+            format_word_delta(3412, 3412, true),
+        ] {
+            assert!(!delta.contains("since"));
+        }
+    }
+
+    #[test]
+    fn compare_chip_tiers_follow_measured_widths() {
+        assert_eq!(compare_chip_tier(500., 480., Some(360.), 410.), CompareChipTier::Full);
+        assert_eq!(
+            compare_chip_tier(400., 480., Some(360.), 410.),
+            CompareChipTier::SharedDate
+        );
+        assert_eq!(
+            compare_chip_tier(420., 480., None, 410.),
+            CompareChipTier::ShortDates
+        );
+        assert_eq!(
+            compare_chip_tier(300., 480., Some(360.), 410.),
+            CompareChipTier::ActiveOnly
+        );
+    }
+
+    #[test]
     fn date_label_speaks_relative_then_absolute() {
         let now = 1_700_000_000i64; // secs
         assert_eq!(date_label(now, now), "Today");
@@ -1322,21 +2067,73 @@ mod tests {
     }
 
     #[test]
-    fn session_starts_are_bare_ticks_except_the_first() {
+    fn wide_well_tier_reads_the_wall_gap_not_the_derived_width() {
+        // `Seam::w` is `work1 - work0` after a long f32 accumulation, so a
+        // genuinely wide seam drifts off the 20.0 nominal (empirically a whole
+        // tier step past ~1M px). The tier is decided from the exact wall-clock
+        // gap, so the well keeps its duration datum however `w` rounded.
+        let day = 86_400_000i64;
+        let drifted = SEAM_WIDE_PX + f32::EPSILON * SEAM_WIDE_PX;
+        assert_ne!(drifted, SEAM_WIDE_PX, "the pixel width really has drifted");
+        let seam = Seam { x: 1_000., w: drifted, start_ms: 0, end_ms: 3 * day };
+        assert!(seam.wide(), "a 3-day gap is wide however `w` rounded");
+        // The retired `w == SEAM_WIDE_PX` predicate would have dropped this.
+        assert!(seam.w != SEAM_WIDE_PX);
+        let thin = Seam { x: 0., w: SEAM_WIDE_PX, start_ms: 0, end_ms: day };
+        assert!(!thin.wide(), "a one-day gap stays the thin tier");
+    }
+
+    #[test]
+    fn wide_gap_bakes_a_duration_datum() {
+        // The real bake path: a >2-day gap yields exactly one wide-well datum.
+        let day = 86_400_000i64;
+        let base = 1_700_000_000_000i64;
+        let mut j = Journal::default();
+        let mut pos = 0usize;
+        for t0 in [base, base + 5 * day] {
+            for k in 0..5i64 {
+                j.record(&ins(pos, "word "), t0 + k * 400);
+                pos += 5;
+            }
+            j.settle();
+        }
+        let bake = StripBake::build(&j, &[], &[], 0, base + 5 * day + 10_000);
+        assert_eq!(bake.well_data.len(), 1, "the >2-day gap carries one datum");
+        let datum = &bake.well_data[0];
+        assert_eq!(datum.label, format_well_duration(datum.end_ms - datum.start_ms));
+    }
+
+    #[test]
+    fn session_marks_die_entirely_the_dates_carry_the_sittings() {
+        // §1b, §2: a session checkpoint lays NO tick, NO hit target, NO
+        // arrow stop — not an unlabeled one. The date lane alone carries
+        // the sittings.
         let day = 86_400_000i64;
         let base = 1_700_000_000_000i64;
         let stations = vec![
-            station(base, "Session start", 10, 60),
-            station(base + day, "Session start", 200, 1200),
-            station(base + 2 * day, "Session start", 400, 2400),
+            automatic_station(base, "Session start", 10, 60),
+            automatic_station(base + day, "Session start", 200, 1200),
+            automatic_station(base + 2 * day, "Session start", 400, 2400),
         ];
         let j = Journal::default();
         let bake = StripBake::build(&j, &stations, &[], 0, base + 3 * day);
-        assert_eq!(bake.stations[0].label, "Started", "the birth keeps a name");
+        assert!(bake.stations.is_empty(), "session checkpoints bake no station at all");
         assert!(
-            bake.stations[1].label.is_empty() && bake.stations[2].label.is_empty(),
-            "later session starts are bare ticks — the date lane carries the day"
+            !bake.snap_ms.contains(&(base + day)) && !bake.snap_ms.contains(&(base + 2 * day)),
+            "an invisible seal must not attract an arrow or a detent"
         );
+        assert!(!bake.dates.is_empty(), "the sittings stay reachable through the date lane");
+    }
+
+    #[test]
+    fn idle_session_name_never_reaches_the_bake() {
+        let base = 1_700_000_000_000i64;
+        let stations = vec![
+            automatic_station(base, "Started", 10, 60),
+            automatic_station(base + 20_000, "Session", 20, 120),
+        ];
+        let bake = StripBake::build(&Journal::default(), &stations, &[], 0, base + 30_000);
+        assert!(bake.stations.is_empty(), "Started and Session are not deliberate marks");
     }
 
     #[test]
@@ -1427,6 +2224,37 @@ mod tests {
         assert!(bake.flecks.is_empty());
         assert!(bake.envelope.is_empty());
         assert_eq!(bake.timeline.total_work, 0.);
+        assert!(bake.dates.is_empty(), "minute one has an empty date lane");
+    }
+
+    #[test]
+    fn zero_extent_birth_station_lays_no_mark() {
+        let now = 1_700_000_000_000;
+        let birth = vec![automatic_station(now, "Session start", 0, 0)];
+        let bake = StripBake::build(&Journal::default(), &birth, &[], 0, now);
+        assert!(bake.stations.is_empty(), "a birth seal is not a deliberate mark");
+        assert_eq!(bake.anchor_ms, vec![now], "the replay anchor remains");
+    }
+
+    #[test]
+    fn date_control_targets_the_sittings_first_recorded_moment() {
+        let j = fixture();
+        let now = j.runs.last().unwrap().t1 + 1000;
+        let bake = StripBake::build(&j, &[], &[], 0, now);
+        assert_eq!(bake.dates.len(), 3, "the fixture has three sittings");
+        let starts: Vec<i64> = j
+            .runs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, run)| {
+                (i == 0 || run.t0 - j.runs[i - 1].t1 > GAP_FOLD_MS).then_some(run.t0)
+            })
+            .collect();
+        for (date, first) in bake.dates.iter().zip(starts) {
+            assert_eq!(date.at_ms, first);
+            assert!(date.span_end_ms >= date.span_start_ms);
+        }
+        assert!(date_span_label(&bake.dates[0]).contains('–'));
     }
 
     // A materialized checkpoint snapshot for the merged-axis tests (Bug A).
@@ -1439,6 +2267,46 @@ mod tests {
             words,
             chars,
         }
+    }
+
+    fn automatic_station(
+        created_ms: i64,
+        name: &str,
+        words: usize,
+        chars: usize,
+    ) -> StationSnap {
+        StationSnap { manual: false, ..station(created_ms, name, words, chars) }
+    }
+
+    #[test]
+    fn only_writer_and_sanctioned_automatic_names_label_stations() {
+        let base = 1_700_000_000_000i64;
+        let stations = vec![
+            automatic_station(base, "Session start", 1, 5),
+            automatic_station(base + 1, "Started", 2, 10),
+            automatic_station(base + 2, "Fresh tutorial", 3, 15),
+            automatic_station(base + 3, "Restored", 4, 20),
+            automatic_station(base + 4, "Exported", 5, 25),
+            station(base + 5, "Started", 6, 30),
+            station(base + 6, "Fresh tutorial", 7, 35),
+        ];
+        let bake = StripBake::build(&Journal::default(), &stations, &[], 0, base + 10);
+        let labels: Vec<_> = bake.stations.iter().map(|st| st.label.as_str()).collect();
+        // The three session-ranked automatics (and the manual legacy
+        // "Fresh tutorial" carve-out) bake no station at all now — only
+        // deliberate marks survive, each carrying its label.
+        assert_eq!(labels, ["Restored", "Exported", "Started"]);
+    }
+
+    #[test]
+    fn wide_well_duration_boundaries_use_compact_whole_units() {
+        let day = 86_400_000i64;
+        assert_eq!(format_well_duration(2 * day), "2 days");
+        assert_eq!(format_well_duration(13 * day), "13 days");
+        assert_eq!(format_well_duration(14 * day), "2 wk");
+        assert_eq!(format_well_duration(45 * day), "6 wk 3 d");
+        assert_eq!(format_well_duration(63 * day), "2 mo 1 wk");
+        assert_eq!(format_well_duration(98 * day), "3 mo 2 wk");
     }
 
     #[test]

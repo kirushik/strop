@@ -337,14 +337,14 @@ pub fn all() -> &'static [Command] {
             "History",
             None,
             ToggleHistory,
-            ["versions", "rewind", "sidebar", "checkpoints", "версии", "панель истории"]
+            ["versions", "rewind", "sidebar", "history", "версии", "панель истории"]
         ),
         cmd!(
-            "Name a Checkpoint",
+            "Name this version",
             "History",
             Some("ctrl-alt-s"),
             AddCheckpoint,
-            ["snapshot", "version", "чекпоинт"]
+            ["snapshot", "version", "name", "версия"]
         ),
         // The finish-your-story layer (DESIGN §4): per-session progress.
         // Scaffolds prompt at CLOSE, never at open (§4b tension 6) — pull-only.
@@ -502,6 +502,19 @@ mod tests {
         assert_eq!(labels("диагноз")[0], "Run Editorial Diagnosis");
         assert_eq!(labels("ai")[0], "Run Editorial Diagnosis");
         assert_eq!(labels("экспорт")[0], "Export as Markdown");
+    }
+
+    #[test]
+    fn naming_uses_the_version_vocabulary_and_existing_action_route() {
+        let command = all().iter().find(|c| c.label == "Name this version").unwrap();
+        assert_eq!(command.keys, Some("ctrl-alt-s"));
+        assert!(all().iter().all(|c| {
+            !c.label.to_ascii_lowercase().contains("checkpoint")
+                && !c.section.to_ascii_lowercase().contains("checkpoint")
+                && c.aliases
+                    .iter()
+                    .all(|a| !a.to_ascii_lowercase().contains("checkpoint"))
+        }));
     }
 
     #[test]

@@ -572,6 +572,24 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:journal: synthetic fortnight installed");
                 continue;
             }
+            if key == "seed:cards" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_cards(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE seed:cards: card-history fortnight installed");
+                continue;
+            }
+            if key == "seed:novel" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_novel(cx))
+                    .ok();
+                cx.background_executor().timer(Duration::from_millis(120)).await;
+                eprintln!("SMOKE seed:novel: round-two long fixture installed");
+                continue;
+            }
             // `seed:legacy` — the legacy litmus (Bug A): six materialized
             // checkpoints across two weeks, EMPTY journal. The strip's axis must
             // come from the checkpoint states, not the (absent) journal.
@@ -615,6 +633,44 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(80))
                     .await;
                 eprintln!("SMOKE strip:pin:{f}");
+                continue;
+            }
+            if let Some(label) = key.strip_prefix("strip:station:") {
+                let label = label.replace('_', " ");
+                window.update(cx, |editor, _, cx| editor.debug_strip_station(&label, cx)).ok();
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                eprintln!("SMOKE strip:station:{label}");
+                continue;
+            }
+            // `compare:begin` pins the PARKED moment as A through the real
+            // verb path (strip_begin_compare) — the interactive-parity route
+            // for the rig: fraction-mapped pins proved treacherous at the
+            // edges of a mixed checkpoint+journal axis, while a parked
+            // station's preview is always a materialized truth.
+            if key == "compare:begin" {
+                window.update(cx, |editor, _, cx| editor.debug_compare_begin(cx)).ok();
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                eprintln!("SMOKE compare:begin");
+                continue;
+            }
+            if key == "compare:page:a" || key == "compare:page:b" {
+                let side_b = key.ends_with(":b");
+                window.update(cx, |editor, _, cx| editor.debug_compare_page(side_b, cx)).ok();
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                eprintln!("SMOKE {key}");
+                continue;
+            }
+            if let Some(frac) = key.strip_prefix("scroll:") {
+                let f: f32 = frac.parse().expect("bad scroll fraction");
+                window.update(cx, |editor, _, cx| editor.debug_scroll_fraction(f, cx)).ok();
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                eprintln!("SMOKE scroll:{f}");
+                continue;
+            }
+            if key == "strip:thread:first" {
+                window.update(cx, |editor, _, cx| editor.debug_strip_thread(cx)).ok();
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                eprintln!("SMOKE strip:thread:first");
                 continue;
             }
             if key == "strip:restore" {

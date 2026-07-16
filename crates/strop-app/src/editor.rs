@@ -17,8 +17,8 @@ use std::sync::Arc;
 use gpui::{
     Animation, AnimationExt,
     AnyView, App, Bounds, BoxShadow, ClipboardEntry, ClipboardItem, Context, Corners, CursorStyle,
-    Decorations, DragMoveEvent, Element, ElementId, ElementInputHandler, ExternalPaths, Hsla,
-    RenderImage,
+    Decorations, DragMoveEvent, Element, ElementId, ElementInputHandler, ExternalPaths,
+    Hitbox, HitboxBehavior, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PaintQuad,
@@ -407,6 +407,39 @@ const STRIP_PULSE_FRAMES: u64 = 9;
 /// shift every overlay's window-origin coordinates); the top band doubling
 /// as a resize handle over the titlebar is the conventional CSD behavior.
 const RESIZE_INSET: f32 = 8.;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StripCenterMode {
+    Naming,
+    Parked,
+    Comparing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripDeparture {
+    StayOpen,
+    Close,
+    Panel,
+}
+
+const STRIP_DEPARTURE_MS: u64 = 180;
+
+/// The document viewport ends at the strip's top border while it is open.
+fn document_viewport_height(height: Pixels, strip_open: bool) -> Pixels {
+    (height - if strip_open { px(strip::STRIP_H) } else { px(0.) }).max(px(1.))
+}
+
+fn strip_center_mode(parked: bool, pinned: bool) -> StripCenterMode {
+    match (parked, pinned) {
+        (true, true) => StripCenterMode::Comparing,
+        (true, false) => StripCenterMode::Parked,
+        (false, _) => StripCenterMode::Naming,
+    }
+}
+
+fn compare_columns_fit(width: f32, cold_read_min: f32) -> bool {
+    (width - 72.) / 2. >= cold_read_min
+}
 /// Client-side decoration shadow gutter (docs/research/window-decorations-csd.md):
 /// on Wayland CSD the compositor draws no shadow, so the window blends into the
 /// desktop. We reserve a transparent margin on each untiled edge and paint our
@@ -674,6 +707,7 @@ actions!(
         ScrapsTravel, SetSessionGoal, ToggleReview, SetAside, SendToGraveyard,
         MoveToManuscript, PutBackScrap, ToggleGraveyard, ReadItCold, CrRefuse, CrNoop,
         CrCopy, CrEscape, CrNextPage, CrPrevPage, CrFirstPage, CrLastPage,
+        StripFineLeft, StripFineRight,
     ]
 );
 
@@ -729,6 +763,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-down", SelectParagraphDown, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
+        // Parked in the past, plain arrows step stations; alt-arrows are the
+        // fine lane — one work-px per press (§3a). At now they do nothing,
+        // so no prose gesture is stolen.
+        KeyBinding::new("alt-left", StripFineLeft, ctx),
+        KeyBinding::new("alt-right", StripFineRight, ctx),
         KeyBinding::new("shift-up", SelectUp, ctx),
         KeyBinding::new("shift-down", SelectDown, ctx),
         KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
@@ -1298,6 +1337,21 @@ pub struct Editor {
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
+    /// Compare's immutable A state. B remains `history_preview`, preserving
+    /// the established incremental scrub path and its frozen bake.
+    compare_preview: Option<PreviewDoc>,
+    compare_show_b: bool,
+    compare_active_b: bool,
+    compare_scroll_a: ScrollHandle,
+    compare_scroll_b: ScrollHandle,
+    /// (A's pin ms, B's scrub ms, baked marks) — a cache slot the draw
+    /// pass shares, not an API type worth an alias.
+    #[allow(clippy::type_complexity)]
+    compare_alignment: std::rc::Rc<std::cell::RefCell<Option<(
+        i64, i64, Vec<strop_core::diff::ParagraphMark>)>>>,
+    compare_hover_mark: Option<usize>,
+    /// Quotable-past selection in the reading room: side B?, byte range.
+    compare_selection: Option<(bool, Range<usize>)>,
     /// A legacy-checkpoint backfill is in flight (one at a time; the result
     /// persists, so it can never need to run twice for the same file).
     history_backfill_running: bool,
@@ -1403,6 +1457,12 @@ pub struct Editor {
     /// top-centre field that finds (plain), runs commands (`>`) or jumps to
     /// headings (`@`). `palette_*` is its backing state across all modes.
     palette_input: Option<Entity<TextField>>,
+    /// The strip's inline "Name this version" composer (§3c).
+    strip_name_input: Option<Entity<TextField>>,
+    /// `Some(timestamp)` while the composer RENAMES the writer-named version
+    /// parked under the playhead (§3c): commit renames, an emptied commit
+    /// demotes. `None` = the create mode.
+    strip_name_target: Option<i64>,
     palette_selected: usize,
     /// The omni-list's scroll state (`render_omni`'s "omni-list" div),
     /// persisted across frames so it survives the per-frame rebuild. Mouse
@@ -1574,6 +1634,8 @@ pub struct Editor {
     /// fade-out). The read-only mode is visible and its refusal is legible
     /// (P2/P4). `None` at rest; the fade alpha is a pure function of elapsed.
     strip_pulse: Option<Instant>,
+    /// Continuation waiting behind the exit law's real-present-frame beat.
+    strip_departure: Option<(StripDeparture, Instant, i64)>,
     /// One-shot blink of a manuscript paragraph (the `originflash` idiom): the
     /// block containing this char offset tints briefly. Set by "show origin"
     /// (reveal where a cut came from) and by Put back (the passage returned).
@@ -1624,6 +1686,28 @@ pub struct Editor {
     /// inside the draw pass (the 2026-06-12 corruption rule, like
     /// `zone_row_bounds`).
     strip_rail: std::rc::Rc<std::cell::RefCell<Option<StripGeom>>>,
+    /// Painted date-control bounds and sitting targets, from strip prepaint.
+    strip_date_hits: std::rc::Rc<std::cell::RefCell<Vec<StripDateHit>>>,
+    /// Painted station label/tick targets, resolved before dates and lanes.
+    strip_station_hits: std::rc::Rc<std::cell::RefCell<Vec<StripStationHit>>>,
+    /// Plain wide-well datum hover bounds (never click targets).
+    strip_well_hits: std::rc::Rc<std::cell::RefCell<Vec<StripWellHit>>>,
+    /// Painted thread-segment targets (§1e: threads answer the hand).
+    strip_thread_hits: std::rc::Rc<std::cell::RefCell<Vec<StripThreadHit>>>,
+    strip_hover_thread: Option<u64>,
+    past_card_focus: Option<(u64, Instant)>,
+    /// Rig witness: "Now" stamps the parked margin actually BUILT this
+    /// render — counted at the element, not recomputed from the model, so
+    /// deleting the stamp fails the gate while the skeleton flag survives.
+    past_stamps: std::cell::Cell<usize>,
+    /// One-shot: reveal this PREVIEW byte once the parked layout exists.
+    /// Computing a y against `last_frame` at click time reads the PREVIOUS
+    /// moment's geometry — the reveal must wait for its own frame.
+    strip_reveal_byte: Option<usize>,
+    /// Did the current lane gesture actually DRAG? A click reveals the
+    /// moment's edit site (§3a); a drag never yanks the eye — the writer
+    /// parked it on a passage to watch it change.
+    strip_drag_moved: bool,
     /// The cold read (impl 05 Wave B): the writer-invoked, read-only, paged
     /// takeover — the reading room. `Some` while the room is up; beside
     /// `history_preview` per the state-on-Editor + render-switch precedent.
@@ -1648,6 +1732,8 @@ struct TextFrame {
     bounds: Bounds<Pixels>,
     line_height: Pixels,
     scroll_top: Pixels,
+    /// Height of document glass; excludes the open history strip.
+    viewport_height: Pixels,
     content_height: Pixels,
     paragraphs: Vec<ParagraphLayout>,
     /// The graveyard tail section's pre-shaped rows (Bug B): painted after the
@@ -1856,7 +1942,8 @@ impl TextFrame {
 
     /// Maximum scroll offset: one blank line of breathing room past the end.
     fn max_scroll(&self) -> Pixels {
-        (self.content_height + self.line_height - self.bounds.size.height).max(px(0.))
+        // Normal breathing room plus the floor law's 24 px clearance.
+        (self.content_height + self.line_height + px(24.) - self.viewport_height).max(px(0.))
     }
 
     /// Window point -> document-space point.
@@ -2075,7 +2162,55 @@ fn seed_prose(words: usize) -> String {
     out
 }
 
+fn novel_prose() -> String {
+    let mut paragraphs = Vec::new();
+    paragraphs.push("At first light Mara found the blue oar standing upright in the mud, though the tide had gone out before dawn and no boat had crossed the inlet.".to_owned());
+    for i in 1..43 {
+        let body = if i % 7 == 0 {
+            format!("Bell {i}. The sound stopped short.")
+        } else if i % 3 == 0 {
+            format!("Along reach {i}, the ferry nosed through rain while Mara counted the lamps on the far bank, losing one whenever the reeds bent across her view.")
+        } else {
+            format!("Reach {i} kept its own weather. The passengers spoke quietly of ropes, salt, and the road beyond the landing, while the old engine worried at the current without gaining ground.")
+        };
+        paragraphs.push(body);
+    }
+    paragraphs.insert(22, "At the manuscript's middle, the brass compass began pointing inland.".to_owned());
+    paragraphs.push("FINAL LANTERN: when the last passenger stepped ashore, Mara left the blue oar across the empty bench and watched the ferry answer the turning tide alone.".to_owned());
+    paragraphs.join("\n\n")
+}
+
 impl Editor {
+    fn past_cards_at(&self, at_ms: i64) -> Vec<PastMarginCard> {
+        let Some(bake) = self.strip.bake.as_ref() else { return Vec::new() };
+        let mut cards: Vec<PastMarginCard> = self.strip.past_margin_at(at_ms).into_iter()
+            .map(|card| PastMarginCard {
+                id: card.id, kind: card.kind, title: card.body.title.clone(),
+                body: card.body.body.clone(), anchor: card.anchor.cloned(),
+                orphaned: card.body.orphaned, unverified: card.body.unverified,
+                skeleton: false,
+            }).collect();
+        let work = bake.timeline.work_at(at_ms);
+        for thread in bake.threads.iter().filter(|thread| !thread.origin_proven) {
+            let relation = strip::legacy_card_at(thread, work);
+            if relation == strip::LegacyCardAt::Absent { continue; }
+            let Some(note) = self.doc.notes().notes().iter()
+                .find(|note| note.id == thread.card_id) else { continue };
+            cards.push(PastMarginCard {
+                id: note.id, kind: note.kind, title: note.title.clone(),
+                body: note.body.clone(),
+                anchor: match relation {
+                    strip::LegacyCardAt::ProvenAnchor(at) => Some(at..at),
+                    strip::LegacyCardAt::Detached => None,
+                    strip::LegacyCardAt::Absent => unreachable!(),
+                },
+                orphaned: relation == strip::LegacyCardAt::Detached,
+                unverified: true, skeleton: true,
+            });
+        }
+        cards
+    }
+
     pub fn new(cx: &mut Context<Self>, text: &str, spans: SpanSet, blocks: BlockMap) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
@@ -2111,6 +2246,14 @@ impl Editor {
             quit_guard: QuitGuard::Idle,
             history_view: None,
             history_preview: None,
+            compare_preview: None,
+            compare_show_b: false,
+            compare_active_b: false,
+            compare_scroll_a: ScrollHandle::new(),
+            compare_scroll_b: ScrollHandle::new(),
+            compare_alignment: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            compare_hover_mark: None,
+            compare_selection: None,
             history_backfill_running: false,
             dirty_since_checkpoint: false,
             image_assets: HashMap::new(),
@@ -2142,6 +2285,8 @@ impl Editor {
             // a pass ran); a plain line diagnosis is the sensible default.
             last_pass: PassKind::Diagnostic("line".to_owned()),
             palette_input: None,
+            strip_name_input: None,
+            strip_name_target: None,
             palette_selected: 0,
             omni_scroll: ScrollHandle::new(),
             palette_query: String::new(),
@@ -2182,6 +2327,7 @@ impl Editor {
             arrival_flash: None,
             grave_flash: None,
             strip_pulse: None,
+            strip_departure: None,
             para_flash: None,
             session_had_edits: false,
             session_goal: None,
@@ -2190,6 +2336,15 @@ impl Editor {
             last_frame: None,
             strip: Strip::default(),
             strip_rail: std::rc::Rc::default(),
+            strip_date_hits: std::rc::Rc::default(),
+            strip_station_hits: std::rc::Rc::default(),
+            strip_well_hits: std::rc::Rc::default(),
+            strip_thread_hits: std::rc::Rc::default(),
+            strip_hover_thread: None,
+            past_card_focus: None,
+            past_stamps: std::cell::Cell::new(0),
+            strip_reveal_byte: None,
+            strip_drag_moved: false,
             cold_read: None,
             cr_page_bounds: std::rc::Rc::default(),
         }
@@ -2467,24 +2622,185 @@ impl Editor {
         self.mark_dirty();
     }
 
-    /// Record a named version snapshot in the document file.
-    fn add_checkpoint(&mut self, _: &AddCheckpoint, _: &mut Window, cx: &mut Context<Self>) {
+    /// Route the palette/shortcut verb into the strip's naming composer.
+    fn add_checkpoint(&mut self, _: &AddCheckpoint, window: &mut Window, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
-        // Save first: the checkpoint materializes its state from the store
-        // (Checkpoint::state), and the store's spans/blocks/annotations are
-        // only as fresh as the last save. Checkpointing implying durability
-        // is the right property anyway.
-        let _ = self.save_now();
-        if let Some(store) = &self.store {
-            let name = format!("Checkpoint {}", store.checkpoints().len() + 1);
-            store.add_checkpoint(&name, true);
-            self.dirty_since_checkpoint = false;
-            self.mark_dirty();
-            eprintln!("strop: recorded \"{name}\"");
+        if !self.strip.open {
+            self.open_strip(window, cx);
         }
+        self.open_strip_name(window, cx);
+    }
+
+    fn open_strip_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip_name_input.is_some() {
+            return;
+        }
+        if self.strip.saved_sel.is_none() {
+            self.strip.saved_sel = Some(self.selected_range.clone());
+        }
+        // Parked ON a writer-named version, the verb is Rename (§3c): the
+        // composer opens holding the current name, selected — the
+        // prefilled-datum idiom: typing replaces it, erasing it erases the
+        // datum (an emptied commit demotes).
+        let seed = self
+            .strip
+            .parked
+            .then(|| self.strip_named_station_at(self.strip.pos_ms))
+            .flatten();
+        self.strip_name_target = seed.as_ref().map(|_| self.strip.pos_ms);
+        let input = cx.new(|cx| match &seed {
+            Some(name) => TextField::single_selected(cx, name.clone()),
+            None => TextField::single(cx, String::new()),
+        });
+        cx.subscribe_in(
+            &input,
+            window,
+            |editor, _, event: &TextFieldEvent, window, cx| match event {
+                TextFieldEvent::Commit(name) => editor.commit_strip_name(name, window, cx),
+                TextFieldEvent::Cancel => editor.cancel_strip_name(window, cx),
+            },
+        )
+        .detach();
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        let focus = input.read(cx).focus_handle.clone();
+        window.focus(&focus, cx);
+        self.strip_name_input = Some(input);
         cx.notify();
+    }
+
+    fn cancel_strip_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip_name_input.take().is_none() {
+            return;
+        }
+        self.strip_name_target = None;
+        if !self.strip.parked && let Some(selection) = self.strip.saved_sel.take() {
+            self.selected_range = selection;
+        }
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// The universal blur law reaches the naming composer (corridor report,
+    /// 2026-07-16: it was the ONE field in Strop that dropped its draft on
+    /// focus loss). A click-away commits a non-empty draft and quietly
+    /// dismisses an empty one; Esc remains the deliberate cancel. Safe to
+    /// commit because naming now has its inverse — a version's name can be
+    /// removed in the history panel (P13).
+    fn resolve_strip_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.strip_name_input.as_ref() else {
+            return;
+        };
+        let draft = input.read(cx).content.clone();
+        // Create mode: an empty draft dismisses quietly. Rename mode: an
+        // emptied field IS the demotion — the writer deleted the datum,
+        // and blur commits what the field holds (§3c).
+        if draft.trim().is_empty() && self.strip_name_target.is_none() {
+            self.cancel_strip_name(window, cx);
+        } else {
+            self.commit_strip_name(&draft, window, cx);
+        }
+    }
+
+    fn commit_strip_name(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_strip_name_core(name, cx) {
+            if !self.strip.parked && let Some(selection) = self.strip.saved_sel.take() {
+                self.selected_range = selection;
+            }
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// The windowless half of the blur law: a close or departure cannot
+    /// reach `window.focus`, but a typed name still commits on the way out —
+    /// leaving must not shred the draft. (Focus and selection are the
+    /// leaving path's own business.)
+    fn resolve_strip_name_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.strip_name_input.take() else {
+            return;
+        };
+        let draft = input.read(cx).content.clone();
+        if !draft.trim().is_empty() || self.strip_name_target.is_some() {
+            self.commit_strip_name_core(&draft, cx);
+        }
+        self.strip_name_target = None;
+    }
+
+    /// Look up the writer-named station standing exactly at `pos_ms` in the
+    /// current bake — the rename verb's precondition (§3c).
+    fn strip_named_station_at(&self, pos_ms: i64) -> Option<String> {
+        self.strip.bake.as_ref()?.stations.iter()
+            .find(|s| s.at_ms == pos_ms && s.writer_named())
+            .map(|s| s.label.clone())
+    }
+
+    /// Store + re-bake for a named version; true when it was actually
+    /// stored. Window-free so the departure/close paths can share it.
+    fn commit_strip_name_core(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
+        let name = name.trim();
+        // Rename mode (§3c): the composer opened over an existing named
+        // version. A non-empty commit renames it; an emptied one demotes it
+        // to an unnamed station — the naming verb's inverse (P13). The
+        // recorded state is never removed.
+        if let Some(ts) = self.strip_name_target.take() {
+            let Some(store) = &self.store else { return false };
+            let Some(ix) = store
+                .checkpoints()
+                .iter()
+                .rposition(|cp| cp.manual && cp.timestamp_ms() == ts)
+            else {
+                return false;
+            };
+            store.rename_checkpoint(ix, name);
+            let now = self.strip.bake.as_ref().map_or(ts, |b| b.now_ms);
+            self.strip_bake(now);
+            self.strip_name_input = None;
+            self.mark_dirty();
+            cx.notify();
+            return true;
+        }
+        if name.is_empty() {
+            return false;
+        }
+        let Some(store) = &self.store else { return false };
+        let before = store.checkpoints().len();
+        let timestamp_ms = if self.strip.parked {
+            self.strip.pos_ms
+        } else {
+            strop_core::journal::now_ms()
+        };
+        let state = if self.strip.parked {
+            let Some(scratch) = self.strip.scratch.as_ref() else { return false };
+            strop_core::store::CheckpointState {
+                text: scratch.replay.text(),
+                spans: scratch.replay.spans.clone(),
+                blocks: scratch.replay.blocks.clone(),
+            }
+        } else {
+            strop_core::store::CheckpointState {
+                text: self.doc.text(),
+                spans: self.doc.spans().clone(),
+                blocks: self.doc.blocks().clone(),
+            }
+        };
+        store.add_checkpoint_at(name, timestamp_ms, state);
+        if store.checkpoints().len() == before {
+            return false;
+        }
+        let now = self.strip.bake.as_ref().map_or(timestamp_ms, |b| b.now_ms);
+        self.strip_bake(now);
+        self.strip_name_input = None;
+        self.dirty_since_checkpoint = false;
+        self.mark_dirty();
+        cx.notify();
+        true
     }
 
     /// Build the rewind list from the checkpoints' MATERIALIZED states —
@@ -2543,7 +2859,11 @@ impl Editor {
     fn enter_history(&mut self, cx: &mut Context<Self>) {
         // The strip and the panel never open together (spec §0).
         if self.strip.open {
-            self.close_strip(cx);
+            if self.strip.parked || self.strip.pin_ms.is_some() {
+                self.begin_strip_departure(StripDeparture::Panel, cx);
+                return;
+            }
+            self.close_strip_now(cx);
         }
         let Some(store) = &self.store else {
             return;
@@ -2908,18 +3228,29 @@ impl Editor {
             &input,
             window,
             move |editor, _, event: &TextFieldEvent, window, cx| {
-                if let TextFieldEvent::Commit(name) = event
-                    && !name.trim().is_empty()
-                {
-                    if let Some(store) = &editor.store {
-                        store.rename_checkpoint(ix, name.trim());
-                        editor.mark_dirty();
-                    }
-                    if let Some(hv) = &mut editor.history_view
-                        && let Some(e) = hv.entries.get_mut(ix)
-                    {
-                        e.name = name.trim().to_owned();
-                        e.manual = true;
+                // A non-empty commit renames (and promotes an automatic
+                // entry); an EMPTIED commit is the inverse verb — demotion
+                // to an unnamed version (P13: naming has an inverse; the
+                // recorded state itself is never removed). Emptying an
+                // already-unnamed row is a no-op, so autos can't be
+                // "demoted" into churn by an idle blur.
+                if let TextFieldEvent::Commit(name) = event {
+                    let name = name.trim();
+                    let demoting = name.is_empty()
+                        && editor.history_view.as_ref().is_some_and(|hv| {
+                            hv.entries.get(ix).is_some_and(|e| e.manual)
+                        });
+                    if !name.is_empty() || demoting {
+                        if let Some(store) = &editor.store {
+                            store.rename_checkpoint(ix, name);
+                            editor.mark_dirty();
+                        }
+                        if let Some(hv) = &mut editor.history_view
+                            && let Some(e) = hv.entries.get_mut(ix)
+                        {
+                            e.name = name.to_owned();
+                            e.manual = !name.is_empty();
+                        }
                     }
                 }
                 editor.rename_input = None;
@@ -3021,10 +3352,12 @@ impl Editor {
         // The text changed for real — a selection saved at any preview's
         // entrance is void, and must not be re-applied by the exits below.
         self.strip.saved_sel = None;
+        self.strip.saved_scroll = None;
         // Drops any preview (panel `history_view` OR the strip's
         // `history_preview`) so the live restored document is what shows.
         self.exit_history(cx);
         self.sync_mutations();
+        let rebased = self.doc.notes().notes().to_vec();
         // A restore can orphan writer notes (reanchor sets `orphaned` when a
         // passage vanished): migrate their text to the compost (spec §3).
         self.migrate_orphans_after_restore(cx);
@@ -3034,17 +3367,42 @@ impl Editor {
         // restored state as the reconstruction anchor (review B6: without
         // it, text_at(now) would rebuild the PRE-restore document).
         let len_chars = self.doc.rope().len_chars();
-        self.doc
-            .journal_mut()
-            .record_event(strop_core::journal::JournalEvent::Restore {
-                t: strop_core::journal::now_ms(),
+        let t = strop_core::journal::now_ms();
+        let entries = rebased.into_iter().map(|n| {
+            let disposition = if self.doc.notes().get(n.id).is_none() {
+                strop_core::journal::CardDisposition::Migrated
+            } else if n.orphaned {
+                strop_core::journal::CardDisposition::Orphaned
+            } else {
+                strop_core::journal::CardDisposition::Anchored
+            };
+            strop_core::journal::CardRebaseEntry {
+                id: n.id,
+                range: n.range,
+                status: n.status,
+                title: n.title,
+                level: n.level,
+                pass_id: n.pass_id,
+                orphaned: n.orphaned,
+                unverified: n.unverified,
+                disposition,
+            }
+        }).collect();
+        let journal = self.doc.journal_mut();
+        journal.record_event(strop_core::journal::JournalEvent::Restore {
+                t,
                 from_unix,
                 len_chars,
             });
-        let _ = self.save_now();
+        journal.record_event(strop_core::journal::JournalEvent::CardsRebased { t, entries });
+        // The anchor goes in BEFORE the save: one durable generation holds
+        // the restored text, both events, and the materialized post-restore
+        // checkpoint together — a crash between two saves must never leave
+        // the record with a restore it cannot replay past.
         if let Some(store) = &self.store {
             store.add_checkpoint("Restored", false);
         }
+        let _ = self.save_now();
         // F3, the strip epilogue (hoisted from `strip_restore` so EVERY
         // entrance — panel, strip, the book's Restore chip — leaves an open
         // strip unparked, snapped to now, and re-baked over the new data).
@@ -3053,10 +3411,13 @@ impl Editor {
             self.strip.parked = false;
             self.strip.scrubbing = false;
             self.strip.pin_ms = None;
+            self.compare_preview = None;
+            self.compare_selection = None;
             self.strip.pos_ms = now;
             self.strip.scratch = None;
             self.strip.view_offset = f32::MAX; // back to the tail with the new data
             self.history_preview = None;
+            self.strip_reveal_byte = None;
             self.strip_bake(now);
             cx.notify();
         }
@@ -3084,14 +3445,20 @@ impl Editor {
         if self.strip.open {
             return;
         }
+        // History freezes committed card bodies. Resolve an open composer
+        // before baking so the record and its projection share one boundary.
+        self.resolve_composer_draft(cx);
         // Strip and panel never coexist (spec §0): the panel yields.
         if self.history_view.is_some() {
             self.exit_history(cx);
         }
         let now = strop_core::journal::now_ms();
         self.strip.open = true;
+        self.strip.saved_scroll = Some(f32::from(self.scroll_top));
         self.strip.parked = false;
         self.strip.pin_ms = None;
+        self.compare_preview = None;
+        self.compare_selection = None;
         self.strip.pos_ms = now;
         // Pin the view to the TAIL: the strip opens where the writer just was
         // (v1 opened on the oldest screenful, playhead off-screen right). The
@@ -3103,21 +3470,50 @@ impl Editor {
     }
 
     fn close_strip(&mut self, cx: &mut Context<Self>) {
+        if self.strip.parked || self.strip.pin_ms.is_some() {
+            self.begin_strip_departure(StripDeparture::Close, cx);
+        } else {
+            self.close_strip_now(cx);
+        }
+    }
+
+    fn close_strip_now(&mut self, cx: &mut Context<Self>) {
+        self.resolve_strip_name_draft(cx);
+        self.strip_departure = None;
         self.strip.open = false;
         self.strip.parked = false;
         self.strip.scrubbing = false;
         self.strip.pin_ms = None;
+        self.compare_preview = None;
+        self.compare_selection = None;
         self.strip.scratch = None;
         self.strip.bake = None;
         self.strip_pulse = None;
         // Closing from a park is a return too: the live selection comes back.
-        if let Some(s) = self.strip.saved_sel.take() {
+        let returning_locus = if let Some(s) = self.strip.saved_sel.take() {
             self.selected_range = s;
+            true
+        } else {
+            false
+        };
+        if returning_locus {
+            self.restore_strip_scroll();
+        } else {
+            self.strip.saved_scroll = None;
         }
-        // Drop any preview so the live document returns.
+        // Drop any preview so the live document returns; a reveal the
+        // preview never painted dies with it.
         self.history_preview = None;
+        self.strip_reveal_byte = None;
         *self.strip_rail.borrow_mut() = None;
         cx.notify();
+    }
+
+    fn restore_strip_scroll(&mut self) {
+        let Some(saved) = self.strip.saved_scroll.take() else { return };
+        let max = self.last_frame.as_ref().map_or(px(saved), TextFrame::max_scroll);
+        self.scroll_top = px(saved).clamp(px(0.), max);
+        self.autoscroll_request = false;
     }
 
     /// Build the immutable bake from `(journal, checkpoints, cards)` and bump
@@ -3192,10 +3588,12 @@ impl Editor {
             .map(|n| {
                 let closed = closes.get(&n.id);
                 strip::CardSnap {
+                    id: n.id,
                     raised_ms: n.created_unix * 1000,
                     closed_ms: closed.map(|(t, _)| *t),
                     anchor: n.range.start,
                     resolved: closed.map_or(n.status == NoteStatus::Done, |(_, r)| *r),
+                    kind: n.kind,
                 }
             })
             .collect()
@@ -3256,6 +3654,81 @@ impl Editor {
     }
 
     fn strip_park_at_x(&mut self, x: f32, y: f32, pin: bool, cx: &mut Context<Self>) {
+        // §3a arbitration: named objects act exactly, most specific first —
+        // stations (a deliberate mark), then threads (a card's path), then
+        // dates, then the two lanes.
+        let station_pos = station_hit_at(
+            &self.strip_station_hits.borrow(), point(px(x), px(y)));
+        if let Some(pos) = station_pos {
+            if self.strip_has_past() {
+                self.strip_save_live_locus();
+                self.strip.parked = true;
+                self.strip.scrubbing = false;
+                self.strip.scrub_fabric = false;
+                self.strip_scrub_to(pos, true, cx);
+                self.strip_reveal_edit_at(pos);
+            }
+            return;
+        }
+        let thread_hit = self.strip_thread_hits.borrow().iter()
+            .find(|hit| hit.bounds.contains(&point(px(x), px(y)))).cloned();
+        if let Some(hit) = thread_hit {
+            let Some(pos) = self.strip_pos_at_fabric_x(x) else { return };
+            self.strip_save_live_locus();
+            self.strip.parked = true;
+            self.strip.scrubbing = false;
+            self.strip.scrub_fabric = false;
+            self.strip_scrub_to(pos, false, cx);
+            let work = self.strip.bake.as_ref().map(|b| b.timeline.work_at(pos))
+                .unwrap_or(hit.work0);
+            let span = hit.work1 - hit.work0;
+            let f = if span.abs() < f32::EPSILON { 0. } else {
+                ((work - hit.work0) / span).clamp(0., 1.)
+            };
+            let anchor = hit.anchor0 as f32
+                + (hit.anchor1 as f32 - hit.anchor0 as f32) * f;
+            // Deferred: mapping this byte through `last_frame` here would
+            // read the PREVIOUS moment's layout (the scrub above just
+            // changed the preview) — the reveal waits for its own frame,
+            // where the packed card lands beside it.
+            if let Some(preview) = self.history_preview.as_ref() {
+                let rope = ropey::Rope::from_str(&preview.text);
+                self.strip_reveal_byte = Some(rope.char_to_byte(
+                    (anchor.round().max(0.) as usize).min(rope.len_chars()),
+                ));
+            }
+            self.past_card_focus = Some((hit.card_id, Instant::now()));
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(700)).await;
+                let _ = this.update(cx, |editor, cx| {
+                    if editor.past_card_focus.is_some_and(|(id, at)| {
+                        id == hit.card_id && at.elapsed() >= Duration::from_millis(650)
+                    }) {
+                        editor.past_card_focus = None;
+                        cx.notify();
+                    }
+                });
+            }).detach();
+            return;
+        }
+        let date_pos = self
+            .strip_date_hits
+            .borrow()
+            .iter()
+            .find(|hit| hit.bounds.contains(&point(px(x), px(y))))
+            .map(|hit| hit.at_ms);
+        if let Some(pos) = date_pos {
+            if self.strip_has_past() {
+                self.strip_save_live_locus();
+                self.strip.parked = true;
+                self.strip.scrubbing = false;
+                self.strip.scrub_fabric = false;
+                self.strip_scrub_to(pos, true, cx);
+                self.strip_reveal_edit_at(pos);
+            }
+            return;
+        }
         // Two hit lanes, matching what each looks like (P7): the rail row and
         // everything above it is the seek bar — a click maps a FRACTION of the
         // whole history; the fabric below is the cloth itself — a click lands
@@ -3279,18 +3752,71 @@ impl Editor {
             self.strip_toggle_pin(pos, cx);
             return;
         }
-        // A live-doc selection's offsets mean nothing against the preview
-        // text — save it for the return and collapse, rather than wash the
-        // wrong words (P6).
-        if !self.strip.parked {
-            self.strip.saved_sel = Some(self.selected_range.clone());
-            let c = self.selected_range.end;
-            self.selected_range = c..c;
-        }
+        self.strip_save_live_locus();
         self.strip.parked = true;
         self.strip.scrubbing = true;
         self.strip.scrub_fabric = fabric;
+        self.strip_drag_moved = false;
         self.strip_scrub_to(pos, !fabric, cx);
+    }
+
+    /// The release detent (corridor fix 2026-07-16, amending §3a): a park
+    /// that ENDS within a few work-px of a deliberate mark settles onto the
+    /// mark's exact timestamp — a named version beats the half-sentence
+    /// thirty seconds after it. The DRAG stays continuous (the live preview
+    /// keeps its exactness under the hand); only the release settles, so the
+    /// cloth contract holds while deliberate moments win the landing.
+    fn strip_settle_ms(&self, pos_ms: i64) -> i64 {
+        const SNAP_PX: f32 = 4.;
+        // Comparing is fine forensics — B often needs the moment just
+        // beside a mark, so the detent stands down while a pin is set
+        // (corridor round two). The rescue visit keeps it.
+        if self.strip.pin_ms.is_some() {
+            return pos_ms;
+        }
+        let Some(bake) = self.strip.bake.as_ref() else {
+            return pos_ms;
+        };
+        let w = bake.timeline.work_at(pos_ms);
+        bake.stations
+            .iter()
+            .map(|s| (s.at_ms, (bake.timeline.work_at(s.at_ms) - w).abs()))
+            .filter(|(_, d)| *d <= SNAP_PX)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or(pos_ms, |(ms, _)| ms)
+    }
+
+    /// One discrete pointer park = one reveal (§3a, corridor round three):
+    /// scroll the preview to where the WRITING was at the parked moment —
+    /// the run under t, its chars interpolated through the interior, or the
+    /// latest run before it. A drag never reveals (the writer parked her
+    /// eyes on a passage to watch it change under the scrub); keyboard
+    /// steps don't either — the hand that points gets taken there, the keys
+    /// that nudge keep the eye still. Deferred to the parked layout's own
+    /// frame via `strip_reveal_byte`.
+    fn strip_reveal_edit_at(&mut self, pos_ms: i64) {
+        let ch = self
+            .doc
+            .journal()
+            .runs
+            .iter()
+            .take_while(|r| r.t0 <= pos_ms)
+            .last()
+            .map(|r| {
+                let ins = r.ins.chars().count();
+                if pos_ms >= r.t1 {
+                    r.pos + ins
+                } else {
+                    let span = (r.t1 - r.t0).max(1) as f32;
+                    let f = ((pos_ms - r.t0) as f32 / span).clamp(0., 1.);
+                    r.pos + (ins as f32 * f) as usize
+                }
+            });
+        let (Some(ch), Some(preview)) = (ch, self.history_preview.as_ref()) else {
+            return;
+        };
+        let rope = ropey::Rope::from_str(&preview.text);
+        self.strip_reveal_byte = Some(rope.char_to_byte(ch.min(rope.len_chars())));
     }
 
     /// Map a rail x (window coords) → fraction of the WHOLE history → wall ms.
@@ -3303,6 +3829,12 @@ impl Editor {
         let geom = (*self.strip_rail.borrow())?;
         let bake = self.strip.bake.as_ref()?;
         let travel = strip_travel(geom.rail_x1 - geom.rail_x0, bake.timeline.total_work);
+        if travel <= 0. {
+            return Some(bake.now_ms);
+        }
+        if x < geom.rail_x0 || x > geom.rail_x0 + travel {
+            return None;
+        }
         let frac = ((x - geom.rail_x0) / travel).clamp(0., 1.);
         Some(bake.timeline.wall_at(frac * bake.timeline.total_work))
     }
@@ -3327,8 +3859,28 @@ impl Editor {
     fn strip_pos_at_fabric_x(&self, x: f32) -> Option<i64> {
         let geom = (*self.strip_rail.borrow())?;
         let bake = self.strip.bake.as_ref()?;
-        let work = (x - geom.rail_x0 + self.strip_view()).clamp(0., bake.timeline.total_work);
+        let work = x - geom.rail_x0 + self.strip_view();
+        if work < 0. || work > bake.timeline.total_work {
+            return None;
+        }
         Some(bake.timeline.wall_at(work))
+    }
+
+    /// The one live→parked seam: save the writer's live locus — the selection
+    /// (P6: its offsets mean nothing against preview text, so it collapses)
+    /// and the scroll — so EVERY departure hands the present back exactly as
+    /// she left it. A no-op while already parked: the locus of record is the
+    /// last live moment, not the last click; re-arming here is what lets a
+    /// second dwell in one open-strip session return home too (the first
+    /// departure consumed the values open_strip armed).
+    fn strip_save_live_locus(&mut self) {
+        if self.strip.parked {
+            return;
+        }
+        self.strip.saved_sel = Some(self.selected_range.clone());
+        let c = self.selected_range.end;
+        self.selected_range = c..c;
+        self.strip.saved_scroll = Some(f32::from(self.scroll_top));
     }
 
     /// One scrub step: move the playhead and reconstruct the past (the mutable
@@ -3342,6 +3894,15 @@ impl Editor {
     /// just clicked stays under the cursor, and the thumb alone shows the
     /// global position until the next rail interaction re-binds them.
     fn strip_scrub_to(&mut self, pos_ms: i64, lock: bool, cx: &mut Context<Self>) {
+        // Re-entering the past cancels a pending departure beat: the writer
+        // changed her mind mid-return, and a stale StayOpen must not answer
+        // for (or swallow) the next close — the rig's park-during-beat race.
+        self.strip_departure = None;
+        // Every scrub voids an unconsumed reveal — it was computed for the
+        // moment a CLICK parked, and must not land on whatever frame a later
+        // drag or keystroke happens to paint. The discrete paths that want a
+        // reveal re-arm it right after this call (§3a: one park, one reveal).
+        self.strip_reveal_byte = None;
         self.strip.pos_ms = pos_ms;
         self.strip_reconstruct(pos_ms);
         if lock {
@@ -3379,8 +3940,29 @@ impl Editor {
             bake.snap_ms.iter().find(|&&t| t > pos).copied()
         };
         if let Some(t) = next {
+            self.strip_save_live_locus();
             self.strip.parked = true;
             self.strip_scrub_to(t, true, cx);
+        }
+    }
+
+    /// alt-arrows: the fine lane (§3a, corridor round two). Plain arrows walk
+    /// the deliberate marks; a press here moves exactly one work-px of the
+    /// fixed quant — the precise instrument for the moment BETWEEN marks that
+    /// the release detent would otherwise make hard to reach by hand.
+    fn strip_fine_step(&mut self, dir: f32, cx: &mut Context<Self>) {
+        if !self.strip.is_parked() {
+            return;
+        }
+        let Some(bake) = self.strip.bake.as_ref() else {
+            return;
+        };
+        let work = bake.timeline.work_at(self.strip.pos_ms) + dir;
+        let pos = bake
+            .timeline
+            .wall_at(work.clamp(0., bake.timeline.total_work));
+        if pos != self.strip.pos_ms {
+            self.strip_scrub_to(pos, true, cx);
         }
     }
 
@@ -3489,6 +4071,28 @@ impl Editor {
     /// strip open (spec §2). Also clears any Compare pin (review: every state
     /// needs an exit).
     fn strip_return_to_now(&mut self, cx: &mut Context<Self>) {
+        self.begin_strip_departure(StripDeparture::StayOpen, cx);
+    }
+
+    /// All non-Restore doors out of a parked/comparing frame share this
+    /// return-through-now. A repeated command completes the pending door.
+    fn begin_strip_departure(
+        &mut self,
+        continuation: StripDeparture,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, started, from)) = self.strip_departure.take() {
+            // A second departure command during the beat completes the
+            // pending departure immediately — with the NEW continuation,
+            // never the stale one (Esc-then-close must close, not re-run
+            // "stay open").
+            self.strip_departure = Some((continuation, started, from));
+            self.finish_strip_departure(cx);
+            return;
+        }
+        self.resolve_composer_draft(cx);
+        self.resolve_strip_name_draft(cx);
+        let from_ms = self.strip.pos_ms;
         let now = self
             .strip
             .bake
@@ -3497,6 +4101,8 @@ impl Editor {
         self.strip.parked = false;
         self.strip.scrubbing = false;
         self.strip.pin_ms = None;
+        self.compare_preview = None;
+        self.compare_selection = None;
         self.strip.pos_ms = now;
         self.strip.scratch = None;
         // Re-pin the view to the tail — returning to now also returns the eye.
@@ -3507,8 +4113,42 @@ impl Editor {
         if let Some(s) = self.strip.saved_sel.take() {
             self.selected_range = s;
         }
+        self.restore_strip_scroll();
         self.history_preview = None;
+        // An unpainted reveal dies with the preview it aimed at — left alive,
+        // the next LIVE frame would consume the past byte and drag the just-
+        // restored scroll to wherever that moment's edit happened to be.
+        self.strip_reveal_byte = None;
+        self.strip_departure = Some((continuation, Instant::now(), from_ms));
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            for _ in 0..6 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(STRIP_DEPARTURE_MS / 6))
+                    .await;
+                let done = this.update(cx, |editor, cx| {
+                    if editor.strip_departure.is_none() {
+                        return true;
+                    }
+                    cx.notify();
+                    false
+                });
+                if !matches!(done, Ok(false)) { return }
+            }
+            this.update(cx, |editor, cx| editor.finish_strip_departure(cx)).ok();
+        }).detach();
+    }
+
+    fn finish_strip_departure(&mut self, cx: &mut Context<Self>) {
+        let Some((continuation, _, _)) = self.strip_departure.take() else { return };
+        match continuation {
+            StripDeparture::StayOpen => cx.notify(),
+            StripDeparture::Close => self.close_strip_now(cx),
+            StripDeparture::Panel => {
+                self.close_strip_now(cx);
+                self.enter_history(cx);
+            }
+        }
     }
 
     /// An edit gesture arrived while parked in the past (Bug B): the past is
@@ -3556,11 +4196,77 @@ impl Editor {
         });
         if clear {
             self.strip.pin_ms = None;
+            self.compare_preview = None;
+            self.compare_selection = None;
         } else {
             self.strip.pin_ms = Some(pos_ms);
             self.strip.pin_words = self.strip_word_count_at(pos_ms);
+            // Shift-click remains an expert entrance. If it targets the
+            // parked frame, cache exactly the already reconstructed state.
+            // An arbitrary A is materialized once by the same replay helper.
+            self.compare_preview = if pos_ms == self.strip.pos_ms {
+                self.history_preview.clone()
+            } else {
+                self.strip_preview_at(pos_ms)
+            };
+            self.compare_show_b = false;
+            self.compare_active_b = false;
+            self.compare_scroll_a = ScrollHandle::new();
+            self.compare_scroll_b = ScrollHandle::new();
+            self.compare_selection = None;
         }
         cx.notify();
+    }
+
+    fn strip_begin_compare(&mut self, cx: &mut Context<Self>) {
+        if !self.strip.is_parked() {
+            return;
+        }
+        self.strip.pin_ms = Some(self.strip.pos_ms);
+        self.strip.pin_words = self.strip.words_at;
+        self.compare_preview = self.history_preview.clone();
+        self.compare_show_b = false;
+        self.compare_active_b = false;
+        self.compare_scroll_a = ScrollHandle::new();
+        self.compare_scroll_b = ScrollHandle::new();
+        self.compare_selection = None;
+        cx.notify();
+    }
+
+    fn strip_done_comparing(&mut self, cx: &mut Context<Self>) {
+        self.strip.pin_ms = None;
+        self.compare_preview = None;
+        self.compare_selection = None;
+        cx.notify();
+    }
+
+    fn strip_preview_at(&self, pos_ms: i64) -> Option<PreviewDoc> {
+        let bake = self.strip.bake.as_ref()?;
+        let anchor_ms = strip::anchor_index(&bake.anchor_ms, pos_ms).map(|i| bake.anchor_ms[i]);
+        let (text, spans, blocks) = match anchor_ms {
+            Some(a) => self.checkpoint_state_at_ms(a)
+                .unwrap_or_else(|| (String::new(), SpanSet::default(), BlockMap::default())),
+            None => (String::new(), SpanSet::default(), BlockMap::default()),
+        };
+        let applied = anchor_ms.map_or(0, |a| self.doc.journal().runs_until(a));
+        let mut replay = strop_core::journal::ReplayDoc::new(&text, spans, blocks, applied);
+        replay.seams_applied = anchor_ms.map_or(0, |a| self.doc.journal().seams_until(a));
+        replay.advance(self.doc.journal(), pos_ms);
+        let text = replay.text();
+        let mut idx: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+        idx.push(text.len());
+        let byte = |ci: usize| idx.get(ci).copied().unwrap_or(text.len());
+        let spans_bytes = replay.spans.spans().iter()
+            .map(|s| (byte(s.range.start)..byte(s.range.end), s.attr.clone()))
+            .collect();
+        Some(PreviewDoc {
+            text,
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+            spans_bytes,
+            kinds: replay.blocks.kinds().to_vec(),
+            boundary: replay.blocks.boundary(),
+        })
     }
 
     /// Word count of the reconstruction at `pos_ms`, computed on a THROWAWAY
@@ -3741,7 +4447,7 @@ impl Editor {
             return (Vec::new(), 0);
         };
         let top = frame.scroll_top;
-        let bottom = top + frame.bounds.size.height;
+        let bottom = top + frame.viewport_height;
         let mut lo = usize::MAX;
         let mut hi = 0usize;
         for par in &frame.paragraphs {
@@ -3830,7 +4536,7 @@ impl Editor {
         let total = out.len();
         if total > 3 {
             // Keep the 3 nearest the viewport center; reading order stays.
-            let center = f32::from(top + frame.bounds.size.height / 2.);
+            let center = f32::from(top + frame.viewport_height / 2.);
             let mut by_dist: Vec<usize> = (0..total).collect();
             by_dist.sort_by(|&a, &b| {
                 let d = |i: usize| {
@@ -7226,7 +7932,7 @@ impl Editor {
             return;
         };
         let x = self.goal_x.unwrap_or(x);
-        let page = (frame.bounds.size.height - frame.line_height).max(frame.line_height);
+        let page = (frame.viewport_height - frame.line_height).max(frame.line_height);
         let par = &frame.paragraphs[par_ix];
         let y = par.top + par.text_top + par.line_height * (line_ix as f32) + par.line_height / 2.;
         let target = point(x, y + page * (direction as f32));
@@ -7332,7 +8038,7 @@ impl Editor {
         // which knows nothing of the pixels above the caption line.
         if let Some(frame) = self.last_frame.as_ref() {
             if let Some(par) = frame.paragraphs.get(block) {
-                let viewport = frame.bounds.size.height;
+                let viewport = frame.viewport_height;
                 let mut scroll = self.scroll_top;
                 if par.top + par.height > scroll + viewport {
                     scroll = par.top + par.height - viewport;
@@ -8222,7 +8928,7 @@ impl Editor {
     fn grave_tail_on_screen(&self) -> bool {
         self.last_frame.as_ref().is_some_and(|f| {
             f.grave_section_top
-                .is_some_and(|top| top - f.scroll_top < f.bounds.size.height)
+                .is_some_and(|top| top - f.scroll_top < f.viewport_height)
         })
     }
 
@@ -8735,7 +9441,11 @@ impl Editor {
         // close it (spec §2 / review mid — restores the app-wide Esc-closes rule).
         if self.strip.open {
             if self.strip.parked {
-                self.strip_return_to_now(cx);
+                if self.strip.pin_ms.is_some() {
+                    self.strip_done_comparing(cx);
+                } else {
+                    self.strip_return_to_now(cx);
+                }
             } else {
                 self.close_strip(cx);
             }
@@ -9414,11 +10124,32 @@ impl Editor {
     }
 
     fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.compare_preview.is_some() {
+            self.compare_page_by(-1., cx);
+            return;
+        }
         self.page_by(-1, false, cx);
     }
 
     fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.compare_preview.is_some() {
+            self.compare_page_by(1., cx);
+            return;
+        }
         self.page_by(1, false, cx);
+    }
+
+    fn compare_page_by(&mut self, direction: f32, cx: &mut Context<Self>) {
+        let handle = if self.compare_active_b {
+            &self.compare_scroll_b
+        } else {
+            &self.compare_scroll_a
+        };
+        let page = (handle.bounds().size.height - px(30.)).max(px(30.));
+        let max = handle.max_offset().y;
+        let y = (handle.offset().y - page * direction).clamp(-max, px(0.));
+        handle.set_offset(point(px(0.), y));
+        cx.notify();
     }
 
     fn select_page_up(&mut self, _: &SelectPageUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -9673,6 +10404,14 @@ impl Editor {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((side_b, range)) = self.compare_selection.clone() {
+            let (Some(a), Some(b)) = (
+                self.compare_preview.as_ref(), self.history_preview.as_ref()) else { return };
+            let text = compare_selected_text(a, b, side_b, range);
+            crate::smoke::mirror_clipboard(&text);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
         if self.selected_range.is_empty() {
             // §9: the selected picture travels as TWO entries — the
             // Markdown line (caption + alt, the honest text form) and the
@@ -10420,7 +11159,7 @@ impl Editor {
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
-        let vp_h = f32::from(frame.bounds.size.height);
+        let vp_h = f32::from(frame.viewport_height);
         let max_scroll = f32::from(frame.max_scroll());
         let layout = self.margin_cards(true);
         let refs = if below { layout.below } else { layout.above };
@@ -10637,6 +11376,9 @@ impl Editor {
     /// the window root — the layers themselves stop propagation, so only
     /// genuinely-outside clicks arrive here.
     fn light_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.strip_name_input.is_some() {
+            self.resolve_strip_name(window, cx);
+        }
         // LAW 2 / C4 — no dead zones ANYWHERE: the margin lane, the titlebar
         // blank and the gutters all live OUTSIDE the editor column's hitbox,
         // so the column's own `on_mouse_down` (which resolves fields for
@@ -11246,6 +11988,47 @@ impl Editor {
                 "runs": self.doc.journal().runs.len(),
                 "events": self.doc.journal().events.len(),
                 "stations": b.stations.len(),
+                "threads": b.threads.len(),
+                "thread_pts": b.threads.iter().flat_map(|thread| &thread.segments)
+                    .map(Vec::len).sum::<usize>(),
+                "diamonds": b.threads.iter().filter(|thread| thread.uncertain_start).count(),
+                "past_cards": if self.strip.parked { self.strip.past_margin().len() } else { 0 },
+                "station_hits": self.strip_station_hits.borrow().len(),
+                "blue_oar_ms": b.stations.iter().find(|s| s.label == "Blue oar")
+                    .map(|s| s.at_ms),
+                "labels": b.stations.iter().filter(|s| s.show)
+                    .map(|s| s.label.clone()).collect::<Vec<_>>(),
+                "well_durations": b.well_data.iter()
+                    .map(|w| w.label.clone()).collect::<Vec<_>>(),
+                "saved_scroll": self.strip.saved_scroll,
+                "live_scroll": f32::from(self.scroll_top),
+                "max_scroll": self.last_frame.as_ref().map(|f| f32::from(f.max_scroll())),
+                "focused_past_card": self.past_card_focus.map(|(id, _)| id),
+                "past_card_y": self.strip.parked.then(|| {
+                    let frame = self.last_frame.as_ref()?;
+                    let preview = self.history_preview.as_ref()?;
+                    let card = self.past_cards_at(self.strip.pos_ms).into_iter()
+                        .find(|c| c.anchor.is_some())?;
+                    let rope = ropey::Rope::from_str(&preview.text);
+                    let byte = rope.char_to_byte(card.anchor?.start.min(rope.len_chars()));
+                    frame.position_of(byte, false)
+                        .map(|p| f32::from(p.y - frame.scroll_top))
+                }).flatten(),
+                "compare_a_offset": -f32::from(self.compare_scroll_a.offset().y),
+                "compare_b_offset": -f32::from(self.compare_scroll_b.offset().y),
+                "compare_a_max": f32::from(self.compare_scroll_a.max_offset().y),
+                "compare_b_max": f32::from(self.compare_scroll_b.max_offset().y),
+                "gutter_regions": self.compare_alignment.borrow().as_ref()
+                    .map_or(0, |(_, _, marks)| marks.len()),
+                // Coverage witnesses: marks must single out paragraphs, not
+                // wash the column — the rig asserts marked_b < b_paras (a
+                // quiet middle survives the diff).
+                "gutter_marked_b": self.compare_alignment.borrow().as_ref()
+                    .map_or(0, |(_, _, marks)| marks.iter()
+                        .filter(|m| m.new_par.is_some()).count()),
+                "gutter_b_paras": self.history_preview.as_ref()
+                    .map(|p| p.text.split('\n').count()),
+                "past_stamps": self.past_stamps.get(),
                 "words_at": self.strip.words_at,
                 "bakes": self.strip.bakes,
                 // Axis width in working px — non-zero even for a LEGACY era
@@ -11256,6 +12039,20 @@ impl Editor {
                 "banner": self.strip.parked,
                 "pulse": self.strip_pulse.is_some(),
             })),
+            // What is ON GLASS, not what the document holds: the painted
+            // frame's paragraph count. The stale-preview regression
+            // (2026-07-16, field report) had a closed strip keep painting
+            // the past — the reuse cache lacked preview identity, so the
+            // preview frame answered for the live key. The rig asserts the
+            // count round-trips across park → close.
+            "frame_paras": self.last_frame.as_ref().map(|f| f.paragraphs.len()),
+            // Floor-law witnesses: at max scroll the clearance below the
+            // painted content is line_h (breathing) + 24 (the floor's own
+            // clearance); the rig asserts floor_gap - line_h >= 24, which
+            // dies with the `+ px(24.)` in TextFrame::max_scroll.
+            "floor_gap": self.last_frame.as_ref().map(|f|
+                f32::from(f.viewport_height - f.content_height + f.scroll_top)),
+            "line_h": self.last_frame.as_ref().map(|f| f32::from(f.line_height)),
             // Presentation gate: the margin lane + rail render only when no
             // history surface is previewing (review H36) and the reading
             // room is down — the model above is ungated, so the rig asserts
@@ -11899,6 +12696,7 @@ impl Editor {
                         t1: t0 + 9_000,
                         pos: (len / 3).min(len),
                         del_chars: del.min(len),
+                        del_words: None,
                         ins: String::new(),
                     });
                     len = len.saturating_sub(del).max(200);
@@ -11917,6 +12715,7 @@ impl Editor {
                         t1: t0 + 12_000,
                         pos: len.saturating_sub(k as usize % 40),
                         del_chars: 0,
+                        del_words: None,
                         ins: ins.clone(),
                     });
                     len += ins.chars().count();
@@ -11937,6 +12736,220 @@ impl Editor {
             }
         }
         self.doc.set_journal(Journal::from_parts(runs, events));
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Rig hook (`seed:cards`): the synthetic fortnight plus three card-history
+    /// shapes — exact closed/open paths and one deliberately legacy suffix.
+    pub fn debug_seed_cards(&mut self, cx: &mut Context<Self>) {
+        use strop_core::document::{Annotation, NoteKind, NoteStatus,
+            transform_annotation_range};
+        use strop_core::journal::{EditRun, JournalEvent};
+        use strop_core::buffer::TextOp;
+
+        self.debug_seed_journal(cx);
+        let now = strop_core::journal::now_ms();
+        let day = 86_400_000i64;
+        let sitting = |days_ago: i64| now - days_ago * day - 4 * 3_600_000;
+        self.doc.journal_mut().runs.push(EditRun {
+            t0: sitting(0) + 10_000, t1: sitting(0) + 19_000,
+            pos: 100, del_chars: 12, del_words: None, ins: String::new(),
+        });
+        self.doc.journal_mut().runs.sort_by_key(|run| run.t0);
+        let len_at = |at: i64| self.doc.journal().runs.iter()
+            .filter(|run| run.t0 <= at)
+            .fold(0usize, |len, run| {
+                len.saturating_sub(run.del_chars.min(len)) + run.ins.chars().count()
+            });
+        let third_end = sitting(8) + 149 * 40_000 + 12_000;
+        let fifth_start = sitting(2);
+        let a_range = {
+            let start = len_at(third_end).saturating_sub(900);
+            start..start + 80
+        };
+        let b_range = {
+            let start = len_at(fifth_start).saturating_sub(500);
+            start..start + 70
+        };
+
+        // Pick the legacy card's present anchor by carrying the first today's
+        // rework collapse forward. Reverse replay therefore stops exactly at
+        // that ambiguous cut, after proving a non-empty suffix.
+        let today_runs: Vec<_> = self.doc.journal().runs.iter()
+            .filter(|run| run.t0 >= sitting(0)).collect();
+        let doc_len = self.doc.text().chars().count();
+        let mut legacy_range = today_runs.iter().enumerate().filter(|(_, run)| run.del_chars > 0)
+            .find_map(|(cut_ix, cut)| {
+                let mut range = cut.pos..cut.pos;
+                for run in &today_runs[cut_ix + 1..] {
+                    range = transform_annotation_range(&range, &TextOp {
+                        pos: run.pos, delete: run.del_chars, insert: run.ins.clone(),
+                    });
+                }
+                (range.start < doc_len).then_some(range)
+            }).expect("card fixture needs a legacy anchor inside today's document");
+        legacy_range.end = (legacy_range.start + 1).min(doc_len);
+        let live_range = |numerator: usize| {
+            let start = doc_len.saturating_mul(numerator) / 4;
+            start..(start + 1).min(doc_len)
+        };
+
+        let make = |range, body: &str, title: &str, level: &str, created_ms| Annotation {
+            id: 0, range, body: body.into(), status: NoteStatus::Open,
+            created_unix: created_ms / 1000, kind: NoteKind::Diagnosis,
+            title: title.into(), level: level.into(), orphaned: false,
+            pass_id: 41, unverified: false,
+        };
+        let previous_id = self.doc.notes().notes().iter().map(|note| note.id).max().unwrap_or(0);
+        self.doc.add_diagnoses(vec![
+            make(live_range(1), "Does this turn arrive too late?", "Late turn", "line", third_end),
+            make(live_range(2), "What does this choice cost her?", "Missing cost", "developmental", fifth_start + 300_000),
+            make(legacy_range, "Is this image carrying the scene?", "Image weight", "line", sitting(0)),
+        ]);
+        let mut ids: Vec<u64> = self.doc.notes().notes().iter()
+            .filter(|note| note.id > previous_id).map(|note| note.id).collect();
+        ids.sort_unstable();
+        let [a, b, c] = ids.as_slice() else { panic!("card fixture ids") };
+        self.doc.journal_mut().events.retain(|event| !matches!(event,
+            JournalEvent::CardRaised { id, .. } | JournalEvent::CardClosed { id, .. }
+                if id == a || id == b || id == c));
+        self.doc.journal_mut().events.extend([
+            JournalEvent::CardRaised { t: third_end, id: *a, card_kind: NoteKind::Diagnosis,
+                range: a_range, body: "Does this turn arrive too late?".into(),
+                title: "Late turn".into(), level: "line".into(), pass_id: 41,
+                status: NoteStatus::Open, orphaned: false, unverified: false },
+            JournalEvent::CardRaised { t: fifth_start + 300_000, id: *b,
+                card_kind: NoteKind::Diagnosis, range: b_range,
+                body: "What does this choice cost her?".into(), title: "Missing cost".into(),
+                level: "developmental".into(), pass_id: 42, status: NoteStatus::Open,
+                orphaned: false, unverified: false },
+            JournalEvent::CardEdited { t: fifth_start + 600_000, id: *a,
+                body: "Does the revised turn still arrive too late?".into(),
+                title: "Late turn".into(), level: "line".into(), pass_id: 41,
+                status: NoteStatus::Open, orphaned: false, unverified: false },
+            JournalEvent::CardClosed { t: fifth_start + 150 * 40_000 + 300_000,
+                id: *a, resolved: true },
+        ]);
+        // fixture-level simulation of a v0.2 file
+        self.doc.journal_mut().events.retain(|event| !matches!(event,
+            JournalEvent::CardRaised { id, .. } if id == c));
+        self.doc.journal_mut().events.sort_by_key(JournalEvent::t);
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Rig hook (`seed:novel`): the round-two fixture law in one deterministic
+    /// long record. All timestamps are offsets from one captured `now`.
+    pub fn debug_seed_novel(&mut self, cx: &mut Context<Self>) {
+        use strop_core::document::{Annotation, NoteKind, NoteStatus};
+        use strop_core::journal::{EditRun, Journal, JournalEvent};
+        use strop_core::store::CheckpointState;
+
+        let now = strop_core::journal::now_ms();
+        let day = 86_400_000i64;
+        let hour = 3_600_000i64;
+        let start = now - 57 * day;
+        let final_text = novel_prose();
+        let mut runs = Vec::new();
+        // Single-occurrence swaps: the replay's day-43/44 edits restore ONE
+        // site each, so base-vs-final differs at exactly the intended five
+        // places (a global swap made every repeating paragraph a diff region
+        // — 91 gutter marks where the law wants a countable few).
+        let base = final_text.replacen("blue oar", "red sail", 1)
+            .replacen("brass compass", "tin compass", 1)
+            .replace("\n\nFINAL LANTERN:", "\n\nA paragraph later removed from the distant shore.\n\nFINAL LANTERN:")
+            .replace(" and watched the ferry answer the turning tide alone.", "");
+        runs.push(EditRun { t0: start, t1: start + 8 * 60_000, pos: 0,
+            del_chars: 0, del_words: None, ins: base.clone() });
+        let replace_at = base.find("red sail").unwrap();
+        runs.push(EditRun { t0: start + 43 * day, t1: start + 43 * day + 20_000,
+            pos: base[..replace_at].chars().count(), del_chars: 8, del_words: None,
+            ins: "blue oar".into() });
+        let after_replace = base.replacen("red sail", "blue oar", 1);
+        let compass_at = after_replace.find("tin compass").unwrap();
+        runs.push(EditRun { t0: start + 44 * day, t1: start + 44 * day + 20_000,
+            pos: after_replace[..compass_at].chars().count(), del_chars: 11,
+            del_words: None, ins: "brass compass".into() });
+        let after_compass = after_replace.replacen("tin compass", "brass compass", 1);
+        let rework_pos = after_compass.chars().count() / 3;
+        let rework_char = after_compass.chars().nth(rework_pos).unwrap().to_string();
+        runs.push(EditRun { t0: start + 45 * day, t1: start + 45 * day + 20_000,
+            pos: rework_pos, del_chars: 1, del_words: None, ins: rework_char });
+        let deleted = "A paragraph later removed from the distant shore.\n\n";
+        let delete_at = after_compass.find(deleted).unwrap();
+        runs.push(EditRun { t0: start + 50 * day, t1: start + 50 * day + 20_000,
+            pos: after_compass[..delete_at].chars().count(),
+            del_chars: deleted.chars().count(), del_words: None, ins: String::new() });
+        let append = " and watched the ferry answer the turning tide alone.";
+        runs.push(EditRun { t0: now - hour, t1: now - hour + 20_000,
+            pos: final_text.chars().count() - append.chars().count(), del_chars: 0,
+            del_words: None, ins: append.into() });
+
+        let mk = |range, body: &str, kind, created_ms| Annotation {
+            id: 0, range, body: body.into(), status: NoteStatus::Open,
+            created_unix: created_ms / 1000, kind, title: "Crossing".into(),
+            level: "line".into(), orphaned: false, pass_id: 77, unverified: false,
+        };
+        let len = final_text.chars().count();
+        let previous = self.doc.notes().notes().iter().map(|n| n.id).max().unwrap_or(0);
+        self.doc.restore_state(&final_text, SpanSet::default(),
+            BlockMap::new(final_text.lines().count().max(1)));
+        self.doc.add_diagnoses(vec![
+            mk(len / 4..len / 4 + 8, "Does the crossing turn soon enough?",
+                NoteKind::Diagnosis, start + 43 * day),
+            mk(len / 2..len / 2 + 8, "Remember the sound of the bell.",
+                NoteKind::Note, start + 44 * day),
+            mk(3 * len / 4..3 * len / 4 + 1, "Is the last image earned?",
+                NoteKind::Diagnosis, now - hour),
+        ]);
+        let mut ids: Vec<_> = self.doc.notes().notes().iter().filter(|n| n.id > previous)
+            .map(|n| n.id).collect();
+        ids.sort_unstable();
+        let [card, note, _legacy] = ids.as_slice() else { panic!("novel card ids") };
+        let events = vec![
+            JournalEvent::CardRaised { t: start + 43 * day, id: *card,
+                card_kind: NoteKind::Diagnosis, range: len / 4..len / 4 + 8,
+                body: "Does the crossing turn soon enough?".into(), title: "Crossing".into(),
+                level: "line".into(), pass_id: 77, status: NoteStatus::Open,
+                orphaned: false, unverified: false },
+            JournalEvent::CardRaised { t: start + 44 * day, id: *note,
+                card_kind: NoteKind::Note, range: len / 2..len / 2 + 8,
+                body: "Remember the sound of the bell.".into(), title: String::new(),
+                level: String::new(), pass_id: 0, status: NoteStatus::Open,
+                orphaned: false, unverified: false },
+            JournalEvent::CardEdited { t: start + 45 * day, id: *card,
+                body: "Does the revised crossing turn soon enough?".into(),
+                title: "Crossing".into(), level: "line".into(), pass_id: 77,
+                status: NoteStatus::Open, orphaned: false, unverified: false },
+            JournalEvent::CardClosed { t: start + 51 * day, id: *card, resolved: true },
+            JournalEvent::Export { t: start + 45 * day + hour },
+            JournalEvent::Restore { t: start + 51 * day + hour,
+                from_unix: (start + 44 * day) / 1000, len_chars: len },
+        ];
+        // v0.2 simulation: `legacy` remains annotated but deliberately has no
+        // CardRaised event. Today's suffix proves its reverse-walk skeleton.
+        self.doc.set_journal(Journal::from_parts(runs, events));
+
+        if let Some(store) = &self.store {
+            let state = |text: String| {
+                let lines = text.lines().count().max(1);
+                CheckpointState { text, spans: SpanSet::default(), blocks: BlockMap::new(lines) }
+            };
+            for (days, seconds, name, manual) in [
+                (56, 0, "Opening tide", true), (36, 0, "Blue oar", true),
+                (35, 0, "Compass", true), (35, 3, "Compass polish", true),
+                (7, 0, "Far shore", true), (6, 0, "Exported", true),
+                (1, 0, "Restored", true), (0, 0, "Started", false),
+            ] {
+                let text = if days >= 56 { base.clone() }
+                    else if days >= 36 { after_replace.clone() }
+                    else if days >= 7 { after_compass.clone() }
+                    else { final_text.clone() };
+                store.debug_push_checkpoint(name, (now - days * day) / 1000 + seconds,
+                    manual, state(text));
+            }
+        }
         self.mark_dirty();
         cx.notify();
     }
@@ -12168,14 +13181,9 @@ impl Editor {
             .as_ref()
             .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
         if let Some(pos) = pos {
-            // The same park entrance the click path takes: the live selection
-            // is saved+collapsed, so the rig exercises the real invariants
-            // (review: five-lens pass, interaction).
-            if !self.strip.parked {
-                self.strip.saved_sel = Some(self.selected_range.clone());
-                let c = self.selected_range.end;
-                self.selected_range = c..c;
-            }
+            // The same park entrance the click path takes, so the rig
+            // exercises the real invariants (review: five-lens pass).
+            self.strip_save_live_locus();
             self.strip.parked = true;
             self.strip.scrubbing = false;
             self.strip_scrub_to(pos, true, cx);
@@ -12191,6 +13199,48 @@ impl Editor {
             .map(|b| b.timeline.wall_at(frac.clamp(0., 1.) * b.timeline.total_work));
         if let Some(pos) = pos {
             self.strip_toggle_pin(pos, cx);
+        }
+    }
+
+    /// Rig hook: exercise a painted station's exact timestamp target.
+    pub fn debug_strip_station(&mut self, label: &str, cx: &mut Context<Self>) {
+        let pos = self.strip.bake.as_ref().and_then(|b| b.stations.iter()
+            .find(|station| station.label == label).map(|station| station.at_ms));
+        if let Some(pos) = pos {
+            self.strip_save_live_locus();
+            self.strip.parked = true;
+            self.strip_scrub_to(pos, true, cx);
+        }
+    }
+
+    /// Rig hook: pin the PARKED moment as Compare's A through the real verb
+    /// path — interactive parity for `compare:begin` (see smoke.rs on why the
+    /// fraction-mapped pin token is unfit for edge positions).
+    pub fn debug_compare_begin(&mut self, cx: &mut Context<Self>) {
+        self.strip_begin_compare(cx);
+    }
+
+    /// Rig hook: one page on a named compare side, through the same helper as
+    /// PageDown after selecting that side.
+    pub fn debug_compare_page(&mut self, side_b: bool, cx: &mut Context<Self>) {
+        self.compare_active_b = side_b;
+        self.compare_page_by(1., cx);
+    }
+
+    /// Rig hook: deterministic document/preview scroll fraction.
+    pub fn debug_scroll_fraction(&mut self, frac: f32, cx: &mut Context<Self>) {
+        if let Some(frame) = self.last_frame.as_ref() {
+            self.scroll_top = frame.max_scroll() * frac.clamp(0., 1.);
+            self.autoscroll_request = false;
+            cx.notify();
+        }
+    }
+
+    /// Rig hook: click the middle of the first painted thread target.
+    pub fn debug_strip_thread(&mut self, cx: &mut Context<Self>) {
+        let point = self.strip_thread_hits.borrow().first().map(|hit| hit.bounds.center());
+        if let Some(point) = point {
+            self.strip_park_at_x(f32::from(point.x), f32::from(point.y), false, cx);
         }
     }
 
@@ -12730,6 +13780,13 @@ struct LayoutKey {
     /// size and invalidates layout exactly once; thereafter an image document
     /// can use the same scroll/blink/caret fast path as plain prose.
     image_sizes: Vec<(String, Option<(i32, i32)>)>,
+    /// A history preview lays out PREVIEW text, which `revision` knows
+    /// nothing about — a preview frame stored under the live key would be
+    /// reused as the live document after the strip closes (the stale-page
+    /// bug: the past kept rendering, editable, until the first edit bumped
+    /// the revision). Keying the frame on it makes a stored preview frame
+    /// unmatchable by any live-document key.
+    preview: bool,
 }
 
 struct PrepaintState {
@@ -13480,7 +14537,7 @@ impl Element for EditorElement {
         let line_height = window.line_height();
         let paragraph_gap = line_height; // vertical rhythm: one full line
         let wrap_width = bounds.size.width;
-        let viewport = bounds.size.height;
+        let viewport = document_viewport_height(bounds.size.height, editor.strip.open);
 
         let preview = editor.history_preview.clone();
         let in_history = preview.is_some();
@@ -13544,6 +14601,7 @@ impl Element for EditorElement {
             scrap_words: editor.scraps_word_count(),
             grave_fingerprint: editor.grave_layout_fingerprint(),
             image_sizes,
+            preview: in_history,
         };
         let can_reuse = !in_history
             && editor.last_frame.as_ref().is_some_and(|f| {
@@ -13571,7 +14629,8 @@ impl Element for EditorElement {
                         f.content_height,
                     )
                 });
-            let max_scroll = (content_height + line_height - viewport).max(px(0.));
+            let max_scroll =
+                (content_height + line_height + px(24.) - viewport).max(px(0.));
             scroll_top = scroll_top.clamp(px(0.), max_scroll);
             let cursor_pos = paragraphs
                 .iter()
@@ -14161,7 +15220,8 @@ impl Element for EditorElement {
                 shape_grave_section(window, &grave_render, wrap_width, section_top);
             (lines, Some(section_top), bottom)
         };
-        let max_scroll = (content_height + line_height - viewport).max(px(0.));
+        let max_scroll =
+            (content_height + line_height + px(24.) - viewport).max(px(0.));
         scroll_top = scroll_top.clamp(px(0.), max_scroll);
 
         // Cursor position in document space (needed for autoscroll + quad).
@@ -14188,11 +15248,31 @@ impl Element for EditorElement {
             }
         }
 
+        // A strip navigation's one-shot reveal (§3a): now that the PARKED
+        // moment's own paragraphs exist, land the requested byte a third
+        // down the viewport — computing this at click time read the previous
+        // moment's geometry.
+        // Gated on the preview: a reveal is meaningless against the live
+        // page (every exit clears it; this keeps the worst case impossible).
+        let reveal = {
+            let editor = self.editor.read(cx);
+            editor.history_preview.is_some().then_some(editor.strip_reveal_byte).flatten()
+        };
+        if let Some(byte) = reveal
+            && let Some(par) = paragraphs.iter().find(|p| byte <= p.range.end)
+        {
+            let (line, _) = par.position(byte.saturating_sub(par.range.start), false);
+            let y = par.top + par.text_top + par.line_height * (line as f32);
+            scroll_top = (y - viewport / 3.)
+                .clamp(px(0.), (content_height + line_height - viewport).max(px(0.)));
+        }
+
         // Write the clamped/adjusted scroll back; no notify needed, we're
         // mid-frame and painting with this exact value.
         self.editor.update_in_draw(cx, |editor| {
             editor.scroll_top = scroll_top;
             editor.autoscroll_request = false;
+            editor.strip_reveal_byte = None;
         });
 
         let cursor = cursor_pos.and_then(|(pos, cursor_lh)| {
@@ -14262,7 +15342,10 @@ impl Element for EditorElement {
 
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
-        let viewport = bounds.size.height;
+        let viewport = document_viewport_height(
+            bounds.size.height,
+            self.editor.read(cx).strip.open,
+        );
         for (par_ix, par) in prepaint.paragraphs.iter().enumerate() {
             let y = par.top - scroll_top;
             // The wash tile bleeds one paragraph gap above its block (tiles
@@ -14587,6 +15670,7 @@ impl Element for EditorElement {
                 bounds,
                 line_height,
                 scroll_top,
+                viewport_height: viewport,
                 content_height,
                 paragraphs,
                 grave_lines,
@@ -16093,7 +17177,7 @@ impl Editor {
         self.last_frame.as_ref().is_some_and(|f| {
             f.seam_top.is_some_and(|top| {
                 let end = f.grave_section_top.unwrap_or(f.content_height);
-                top - f.scroll_top < f.bounds.size.height && end - f.scroll_top > px(0.)
+                top - f.scroll_top < f.viewport_height && end - f.scroll_top > px(0.)
             })
         })
     }
@@ -16343,7 +17427,7 @@ impl Editor {
     /// (curly-quoted) when the playhead sits on a tick, else the bare date/
     /// time; it flashes seltint on a REFUSED edit (`pulse_strip`), fading over
     /// ~900ms — the read-only mode made visible, its refusal legible.
-    fn render_strip_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_strip_banner(&self, _cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.strip.is_parked() {
             return None;
         }
@@ -16368,38 +17452,12 @@ impl Editor {
         });
         let moment = at_station.unwrap_or_else(|| strip::format_moment(self.strip.pos_ms, now_ms));
         let words = format!("{} words", format_thousands(self.strip.words_at));
-        // The quiet `Read` text-verb (Regions 1): rendered ONLY when the
-        // playhead resolves to a checkpoint WITH a materialized state within
-        // the banner's 5-working-px window — identity by tick (index/at_ms),
-        // regardless of label rank; never `state_at`.
-        let read_cp = self.strip_read_target();
         // The refusal pulse: seltint (0xC8A951 @ .33) decaying to 0 across the
         // pulse window — a pure function of the stored Instant.
         let pulse_a = self.strip_pulse.map_or(0., |t| {
             let e = t.elapsed().as_millis() as f32 / STRIP_PULSE_MS as f32;
             (0.33 * (1. - e)).clamp(0., 0.33)
         });
-
-        let restore_chip = div()
-            .id("strip-banner-restore")
-            .occlude()
-            .px(px(12.))
-            .py(px(2.))
-            .rounded(px(11.))
-            .bg(rgb(TEXT_COLOR))
-            .text_color(rgb(BG_COLOR))
-            .font_family("PT Sans")
-            .text_size(px(11.5))
-            .cursor(CursorStyle::PointingHand)
-            .hover(|d| d.bg(rgb(0x33322D)))
-            .child("Restore")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    editor.strip_restore(cx);
-                }),
-            );
 
         Some(
             div()
@@ -16431,27 +17489,6 @@ impl Editor {
                         .child(moment),
                 )
                 .child(div().child(format!("\u{b7} {words}")))
-                .when_some(read_cp, |d, ix| {
-                    d.child(
-                        div()
-                            .id("strip-banner-read")
-                            .occlude()
-                            .px(px(4.))
-                            .text_color(rgb(TEXT_COLOR))
-                            .cursor(CursorStyle::PointingHand)
-                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                            .child("Read")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    editor.enter_cold_read_past(ix, window, cx);
-                                }),
-                            ),
-                    )
-                })
-                .child(restore_chip)
-                .child(div().text_color(rgb(0xB8B4A8)).child("\u{b7}"))
                 .child(div().child("Esc returns")),
         )
     }
@@ -16677,7 +17714,7 @@ impl Editor {
                             .truncate()
                             .text_color(rgb(MUTED_COLOR))
                             .child(format!(
-                                "{n} auto-checkpoint{}",
+                                "{n} automatic version{}",
                                 if n == 1 { "" } else { "s" }
                             )),
                     )
@@ -16746,7 +17783,7 @@ impl Editor {
                                 rgb(MUTED_COLOR)
                             })
                             .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                            .tooltip(tip("Show only named checkpoints", None))
+                            .tooltip(tip("Show only named versions", None))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|editor, _: &MouseDownEvent, _, cx| {
@@ -16782,8 +17819,9 @@ impl Editor {
                     .text_color(rgb(MUTED_COLOR))
                     .child(
                         "Click a version to preview it in the document; Up/Down steps through \
-                         them. Double-click a name to rename. Restore brings a version back — \
-                         undoable, like everything here. Nothing is ever lost.",
+                         them. Double-click a name to rename; clear it to un-name. Restore \
+                         brings a version back — undoable, like everything here. Nothing is \
+                         ever lost.",
                     ),
             )
             // A legacy file's first history open: versions are being read out
@@ -17657,6 +18695,17 @@ struct PreviewDoc {
     boundary: Option<(strop_core::document::BoundaryEra, usize)>,
 }
 
+fn compare_selected_text(
+    a: &PreviewDoc,
+    b: &PreviewDoc,
+    side_b: bool,
+    range: Range<usize>,
+) -> String {
+    let source = if side_b { b } else { a };
+    let range = range.start.min(source.text.len())..range.end.min(source.text.len());
+    source.text.get(range).unwrap_or("").to_owned()
+}
+
 struct MarginLayout {
     /// Cards to render — packed and at least partly in view.
     cards: Vec<MarginCard>,
@@ -17668,6 +18717,31 @@ struct MarginLayout {
     /// Door-held cards are NOT here; the rail (render_margin_rail) owns those.
     above: Vec<OffscreenRef>,
     below: Vec<OffscreenRef>,
+}
+
+/// Project a byte anchor through the paragraph geometry which painted the
+/// preview. Keeping this pure makes the past lane incapable of falling back
+/// to a document fraction when an anchor cannot be proved.
+fn preview_anchor_y(
+    paragraphs: &[(Range<usize>, f32)],
+    anchor: usize,
+) -> Option<f32> {
+    let ix = paragraphs.partition_point(|(range, _)| range.end < anchor);
+    paragraphs.get(ix).and_then(|(range, top)| {
+        (anchor >= range.start && anchor <= range.end).then_some(*top)
+    })
+}
+
+#[derive(Clone)]
+struct PastMarginCard {
+    id: u64,
+    kind: NoteKind,
+    title: String,
+    body: String,
+    anchor: Option<Range<usize>>,
+    orphaned: bool,
+    unverified: bool,
+    skeleton: bool,
 }
 
 /// An open card hidden past a viewport edge — enough to NAVIGATE to it, not just
@@ -18298,7 +19372,7 @@ impl Editor {
             // bug) and attribute to nothing visible. The active card is exempt:
             // you're working it, so it stays even if its anchor scrolled away.
             let vp_top = f32::from(frame.bounds.origin.y);
-            let vp_bot = vp_top + f32::from(frame.bounds.size.height);
+            let vp_bot = vp_top + f32::from(frame.viewport_height);
             if cull
                 && !active
                 && (desired < vp_top - CARD_OVERSCAN || desired > vp_bot + CARD_OVERSCAN)
@@ -18431,7 +19505,7 @@ impl Editor {
         // them, the selected card is kept fully in view, and no two overlap.
         // `top` currently holds each card's anchor target.
         let floor = self.margin_card_floor();
-        let viewport_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
+        let viewport_bottom = f32::from(frame.bounds.origin.y + frame.viewport_height);
         let items: Vec<PlaceItem> = cards
             .iter()
             .map(|c| PlaceItem {
@@ -18457,7 +19531,7 @@ impl Editor {
         // rest as off-screen refs (anchor_culled = false → reveal by selecting,
         // since their anchor is on-screen and scrolling won't help).
         let vp_top = f32::from(frame.bounds.origin.y);
-        let vp_bottom = f32::from(frame.bounds.origin.y + frame.bounds.size.height);
+        let vp_bottom = f32::from(frame.bounds.origin.y + frame.viewport_height);
         let mut visible = Vec::with_capacity(cards.len());
         for card in cards {
             let packed_off = OffscreenRef {
@@ -18502,7 +19576,7 @@ impl Editor {
         self.lane_scroll = scroll;
         let viewport = (
             f32::from(frame.bounds.size.width),
-            f32::from(frame.bounds.size.height),
+            f32::from(frame.viewport_height),
         );
         let resized = (viewport.0 - self.lane_viewport.0).abs() > 0.5
             || (viewport.1 - self.lane_viewport.1).abs() > 0.5;
@@ -19520,6 +20594,121 @@ impl Editor {
         )
     }
 
+    /// Frozen §3b projection. It deliberately has no ids, listeners, hover
+    /// styling, composer, or verbs: the past is readable evidence, not a
+    /// second live margin.
+    fn render_past_margin(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        self.past_stamps.set(0);
+        if !self.margin_fits(window) || !self.strip.is_parked() {
+            return None;
+        }
+        let cards = self.past_cards_at(self.strip.pos_ms);
+        if cards.is_empty() { return None; }
+        let frame = self.last_frame.as_ref()?;
+        let col_right = self.column_right(window);
+        let lane_left = col_right + 20.;
+        let geometry: Vec<(Range<usize>, f32)> = frame.paragraphs.iter()
+            .map(|p| (p.range.clone(), f32::from(p.top))).collect();
+        let preview = self.history_preview.as_ref()?;
+        let rope = ropey::Rope::from_str(&preview.text);
+        let floor = self.margin_card_floor();
+        let viewport_bottom = f32::from(frame.bounds.origin.y + frame.viewport_height);
+        let mut projected = Vec::new();
+        let mut detached = Vec::new();
+        for card in cards {
+            let anchor = card.anchor.as_ref().and_then(|range| {
+                let byte = rope.char_to_byte(range.start.min(rope.len_chars()));
+                preview_anchor_y(&geometry, byte)
+            });
+            let machine = card.kind == NoteKind::Diagnosis;
+            let title = if machine { card.title.as_str() } else { "" };
+            let height = Self::measure_card_height(window, title, &card.body,
+                if machine { 0. } else { 1. });
+            let item = (card, anchor, height);
+            if anchor.is_some() && !item.0.orphaned {
+                projected.push(item);
+            } else {
+                detached.push(item);
+            }
+        }
+        projected.sort_by(|a, b| a.1.unwrap().total_cmp(&b.1.unwrap()));
+        // The thread-click focus is the packer's active card (Pass 3): the
+        // clicked card is guaranteed a place in the lane instead of being
+        // culled at the edge the reveal landed on.
+        let focus = self.past_card_focus.map(|(id, _)| id);
+        let items: Vec<PlaceItem> = projected.iter().map(|(card, anchor, height)| PlaceItem {
+            anchor: f32::from(frame.bounds.origin.y) + anchor.unwrap()
+                - f32::from(frame.scroll_top),
+            height: *height,
+            pin: true,
+            active: focus == Some(card.id),
+        }).collect();
+        let tops = place_margin_cards(&items, floor, viewport_bottom, MARGIN_GAP);
+        let mut orphan_top = viewport_bottom;
+        detached.reverse();
+        let placed = projected.into_iter().zip(tops)
+            .chain(detached.into_iter().map(|item| {
+                orphan_top -= item.2 + MARGIN_GAP;
+                (item, orphan_top)
+            }));
+        let children = placed.filter_map(|((card, anchor_y, height), top)| {
+            if top + height < floor || top > viewport_bottom { return None; }
+            let detached = anchor_y.is_none() || card.orphaned;
+            let machine = card.kind == NoteKind::Diagnosis;
+            let id = card.id;
+            let target = anchor_y;
+            Some(div().id(("past-card", id)).absolute().top(px(top)).left(px(8.))
+                .w(px(MARGIN_WIDTH - 8.)).p(px(8.))
+                .rounded(px(if machine { 3. } else { 9. }))
+                .bg(rgb(if card.unverified { STALE_BG } else if machine {
+                    DIAGNOSIS_CARD_BG
+                } else { NOTE_CARD_BG }))
+                .border_1().border_color(rgb(if self.strip_hover_thread == Some(id)
+                    || self.past_card_focus.is_some_and(|(focus, _)| focus == id)
+                { 0x7C8791 } else { RULE_COLOR }))
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(MouseButton::Left,
+                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(y) = target
+                            && let Some(frame) = editor.last_frame.as_ref()
+                        {
+                            editor.scroll_top = px(y).clamp(px(0.), frame.max_scroll());
+                            cx.notify();
+                        }
+                    }))
+                .font_family("PT Serif").text_size(px(13.))
+                .text_color(rgb(if card.unverified { MUTED_COLOR } else { TEXT_COLOR }))
+                .when(card.skeleton, |d| {
+                    self.past_stamps.set(self.past_stamps.get() + 1);
+                    d.child(
+                        div().mb(px(3.)).font_family("PT Sans").text_size(px(10.))
+                            .text_color(rgb(MUTED_COLOR)).child("Now")
+                    )
+                })
+                .when(machine && !card.title.is_empty(), |d| {
+                    d.child(div().font_weight(FontWeight::BOLD).child(card.title.clone()))
+                })
+                .child(if card.body.is_empty() && !machine {
+                    "(empty note)".to_string()
+                } else { card.body.clone() })
+                .when(card.skeleton, |d| d.child(
+                    div().mt(px(4.)).text_size(px(10.)).text_color(rgb(MUTED_COLOR))
+                        .child("◇")
+                ))
+                .when(detached, |d| d.child(
+                    div().mt(px(4.)).text_size(px(10.)).text_color(rgb(MUTED_COLOR))
+                        .child("◇ detached")
+                )).into_any_element())
+        }).collect::<Vec<_>>();
+        Some(div().absolute().left(px(lane_left)).top_0().bottom_0()
+            .w(px(MARGIN_WIDTH)).children(children).into_any_element())
+    }
+
     /// The door's visible state (DESIGN §4.4, principle 5 — no hidden modes):
     /// a thin rail at the lane top that names what the closed door is holding
     /// ("3 resting · open") and opens it on a click; in reviewing it instead
@@ -20449,6 +21638,12 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::delete_word_right))
                     .on_action(cx.listener(Self::left))
                     .on_action(cx.listener(Self::right))
+                    .on_action(cx.listener(|editor, _: &StripFineLeft, _, cx| {
+                        editor.strip_fine_step(-1., cx);
+                    }))
+                    .on_action(cx.listener(|editor, _: &StripFineRight, _, cx| {
+                        editor.strip_fine_step(1., cx);
+                    }))
                     .on_action(cx.listener(Self::up))
                     .on_action(cx.listener(Self::down))
                     .on_action(cx.listener(Self::word_left))
@@ -20617,8 +21812,13 @@ impl Render for Editor {
                 // (S10; F7: machine states sleep, Error/NeedsSetup survive
                 // to exit by construction) — and the lane/margin
                 // mutual-exclusion switch (N6).
-                if self.history_view.is_some() || self.strip.is_parked() || self.cold_read.is_some()
-                {
+                if self.strip.is_parked() {
+                    return match self.render_past_margin(window, cx) {
+                        Some(margin) => d.child(margin),
+                        None => d,
+                    };
+                }
+                if self.history_view.is_some() || self.cold_read.is_some() {
                     return d;
                 }
                 let d = match self.render_margin(window, cx) {
@@ -20658,6 +21858,10 @@ impl Render for Editor {
             // over the past preview — the text area's mode indicator.
             .map(|d| match self.render_strip_banner(cx) {
                 Some(banner) => d.child(banner),
+                None => d,
+            })
+            .map(|d| match self.render_compare_room(window, cx) {
+                Some(room) => d.child(room),
                 None => d,
             })
             // The cold read (impl 05 Wave B): the reading-room takeover —
@@ -21193,11 +22397,94 @@ pub struct StripGeom {
     band_top: f32,
 }
 
+#[derive(Clone)]
+struct StripDateHit {
+    bounds: Bounds<Pixels>,
+    at_ms: i64,
+}
+
+#[derive(Clone)]
+struct StripThreadHit {
+    bounds: Bounds<Pixels>,
+    card_id: u64,
+    work0: f32,
+    work1: f32,
+    anchor0: usize,
+    anchor1: usize,
+}
+
+#[derive(Clone)]
+struct StripStationHit {
+    bounds: Bounds<Pixels>,
+    tick_x: f32,
+    at_ms: i64,
+    rank: u8,
+}
+
+#[derive(Clone)]
+struct StripWellHit {
+    bounds: Bounds<Pixels>,
+    start_ms: i64,
+}
+
+fn station_hit_at(hits: &[StripStationHit], p: Point<Pixels>) -> Option<i64> {
+    hits.iter()
+        .filter(|hit| hit.bounds.contains(&p))
+        .min_by(|a, b| {
+            (f32::from(p.x) - a.tick_x).abs()
+                .total_cmp(&(f32::from(p.x) - b.tick_x).abs())
+                .then(a.rank.cmp(&b.rank))
+        })
+        .map(|hit| hit.at_ms)
+}
+
 /// The thumb's travel: `min(total_work, rail_width)` (design §1). When the
 /// history fits, the rail and the fixed-scale fabric coincide 1:1; when it
 /// overflows, the thumb compresses the whole duration into the rail.
 fn strip_travel(rail_w: f32, total_work: f32) -> f32 {
-    total_work.min(rail_w).max(1.)
+    total_work.min(rail_w).max(0.)
+}
+
+/// Window x of the sheet's cream tail edge for the current fixed-scale view.
+fn strip_sheet_tail(rail_x0: f32, rail_x1: f32, total_work: f32, view: f32) -> f32 {
+    (rail_x0 + total_work - view).clamp(rail_x0, rail_x1)
+}
+
+/// Prefer the playhead's right side, flip left when that is the side that
+/// fits, and finally clamp. Pure geometry keeps narrow-width behavior stable.
+/// `now_zone` is the Now label's reserved span: the dock may stand on either
+/// side of it, never across it — on a young sheet the whole interval between
+/// the readout and the selvage can be narrower than the dock, and the dock
+/// then takes the desk to Now's right (the callout-from-the-sheet reading),
+/// leaving the terminal label legible.
+fn strip_dock_left(
+    playhead_x: f32,
+    width: f32,
+    left: f32,
+    right: f32,
+    now_zone: (f32, f32),
+) -> f32 {
+    let gap = 10.;
+    let candidate = if playhead_x + gap + width <= right {
+        playhead_x + gap
+    } else {
+        playhead_x - gap - width
+    };
+    let mut x = candidate.clamp(left, (right - width).max(left));
+    if x < now_zone.1 && x + width > now_zone.0 {
+        let after = (now_zone.1 + gap).min((right - width).max(left));
+        let before = (now_zone.0 - gap - width).max(left);
+        // Prefer the side that actually clears the zone; right wins ties
+        // (the desk is empty there by definition).
+        x = if after + width <= right && after >= now_zone.1 + gap - 0.5 {
+            after
+        } else if before + width <= now_zone.0 {
+            before
+        } else {
+            after
+        };
+    }
+    x
 }
 
 /// An rgb constant with an explicit alpha — the strip's translucent fabric
@@ -21749,6 +23036,207 @@ fn cr_quote(text: &str) -> String {
 }
 
 impl Editor {
+    fn render_compare_room(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let a = self.compare_preview.as_ref()?;
+        let b = self.history_preview.as_ref()?;
+        let pin = self.strip.pin_ms?;
+        let now = self.strip.bake.as_ref()?.now_ms;
+        let wide = compare_columns_fit(
+            f32::from(window.viewport_size().width), DOC_MIN_WIDTH);
+        let header = |letter: &'static str, ms, words, active| {
+            div().flex_none().pb(px(8.)).mb(px(12.)).border_b_1()
+                .when(active, |d| d.border_b_2())
+                .border_color(rgb(if active { TEXT_COLOR } else { RULE_COLOR }))
+                .font_family("PT Sans").text_size(px(11.)).text_color(rgb(MUTED_COLOR))
+                .child(format!("{letter} · {}", strip::format_readout(ms, words, now)))
+        };
+        let marks = {
+            let cached = self.compare_alignment.borrow();
+            if cached.as_ref().is_some_and(|(a_ms, b_ms, _)| {
+                *a_ms == pin && *b_ms == self.strip.pos_ms
+            }) {
+                cached.as_ref().unwrap().2.clone()
+            } else {
+                drop(cached);
+                let marks = strop_core::diff::paragraph_marks(&a.text, &b.text);
+                *self.compare_alignment.borrow_mut() =
+                    Some((pin, self.strip.pos_ms, marks.clone()));
+                marks
+            }
+        };
+        let side_cards = |text: &str, at_ms: i64| {
+            let mut starts = Vec::new();
+            let mut char_at = 0;
+            for line in text.split('\n') {
+                starts.push((char_at, char_at + line.chars().count()));
+                char_at += line.chars().count() + 1;
+            }
+            let mut by_par = vec![Vec::new(); starts.len().max(1)];
+            let mut foot = Vec::new();
+            for card in self.past_cards_at(at_ms) {
+                if let Some(anchor) = card.anchor.as_ref()
+                    && let Some(ix) = starts.iter().position(|(start, end)| {
+                        anchor.start >= *start && anchor.start <= *end
+                    })
+                {
+                    by_par[ix].push(card);
+                } else {
+                    foot.push(card);
+                }
+            }
+            if let Some(last) = by_par.last_mut() { last.extend(foot); }
+            by_par
+        };
+        let cards_a = side_cards(&a.text, pin);
+        let cards_b = side_cards(&b.text, self.strip.pos_ms);
+        let column = |letter, is_b, text: String, scroll: ScrollHandle| {
+            let text_len = text.len();
+            let (ms, words) = if is_b {
+                (self.strip.pos_ms, self.strip.words_at)
+            } else {
+                (pin, self.strip.pin_words)
+            };
+            let active = self.compare_active_b == is_b;
+            let side_marks = marks.clone();
+            let margin_cards = if is_b { cards_b.clone() } else { cards_a.clone() };
+            let scroll_a = self.compare_scroll_a.clone();
+            let scroll_b = self.compare_scroll_b.clone();
+            div().id(if is_b { "compare-column-b" } else { "compare-column-a" })
+                .flex_1().h_full().min_w(px(DOC_MIN_WIDTH)).max_w(px(COL_MAX_WIDTH))
+                .px(px(16.)).py(px(24.)).flex().flex_col()
+                .track_scroll(&scroll).overflow_y_scroll()
+                .child(header(letter, ms, words, active))
+                // The reading room is read-only but quotable. A press selects
+                // this column's source as one continuous passage; Copy then
+                // slices that side, never the live document or the other side.
+                .on_mouse_down(MouseButton::Left,
+                    cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                        editor.compare_selection = Some((is_b, 0..text_len));
+                        editor.compare_active_b = is_b;
+                        cx.notify();
+                    }))
+                .on_scroll_wheel(cx.listener(move |editor, _: &ScrollWheelEvent, _, cx| {
+                    editor.compare_active_b = is_b;
+                    cx.notify();
+                }))
+                .children(text.split('\n').enumerate().map(|(par_ix, line)| {
+                    let relevant: Vec<(usize, strop_core::diff::ParagraphMark)> = side_marks
+                        .iter().copied().enumerate().filter(|(_, mark)| {
+                            if is_b {
+                                mark.new_par == Some(par_ix)
+                                    || (mark.new_par.is_none() && mark.new_boundary == par_ix)
+                            } else {
+                                mark.old_par == Some(par_ix)
+                                    || (mark.old_par.is_none() && mark.old_boundary == par_ix)
+                            }
+                        }).collect();
+                    let par_scroll_a = scroll_a.clone();
+                    let par_scroll_b = scroll_b.clone();
+                    // min-width 0 lets the text shrink below its intrinsic
+                    // line width and WRAP inside the column (the flex default
+                    // of min-width:auto sized every row to its unwrapped line
+                    // and the room clipped at one line per paragraph).
+                    let prose = div().flex_1().min_w(px(0.))
+                        .font_family("PT Serif").text_size(px(18.))
+                        .line_height(px(30.)).text_color(rgb(TEXT_COLOR))
+                        .child(line.to_owned());
+                    let gutter = div().w(px(12.)).flex_none().relative()
+                        .children(relevant.into_iter().map(|(mark_ix, mark)| {
+                            let mark_scroll_a = par_scroll_a.clone();
+                            let mark_scroll_b = par_scroll_b.clone();
+                            let absent = if is_b { mark.new_par.is_none() } else {
+                                mark.old_par.is_none()
+                            };
+                            let hovered = self.compare_hover_mark == Some(mark_ix);
+                            let target_a = mark.old_par.unwrap_or(mark.old_boundary);
+                            let target_b = mark.new_par.unwrap_or(mark.new_boundary);
+                            div().id((if is_b { "compare-mark-b" } else {
+                                    "compare-mark-a" }, mark_ix))
+                                .absolute().top(px(if absent { 0. } else { 3. }))
+                                .when(is_b, |d| d.right_0())
+                                .when(!is_b, |d| d.left_0())
+                                .w(px(if absent { 7. } else { 2. }))
+                                .h(px(if absent { 2. } else { 24. }))
+                                .bg(rgb(if hovered { 0xA87824 } else { 0xB89554 }))
+                                .cursor(CursorStyle::PointingHand)
+                                .on_hover(cx.listener(move |editor, hover: &bool, _, cx| {
+                                    editor.compare_hover_mark = hover.then_some(mark_ix);
+                                    cx.notify();
+                                }))
+                                .on_mouse_down(MouseButton::Left,
+                                    cx.listener(move |_, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        mark_scroll_a.scroll_to_top_of_item(target_a + 1);
+                                        mark_scroll_b.scroll_to_top_of_item(target_b + 1);
+                                    }))
+                        }));
+                    let past = div().w(px(150.)).flex_none().flex().flex_col().gap(px(6.))
+                        .children(margin_cards.get(par_ix).into_iter().flatten().map(|card| {
+                            let machine = card.kind == NoteKind::Diagnosis;
+                            div().p(px(7.)).rounded(px(if machine { 3. } else { 9. }))
+                                .border_1().border_color(rgb(RULE_COLOR))
+                                .bg(rgb(if card.unverified { STALE_BG } else if machine {
+                                    DIAGNOSIS_CARD_BG
+                                } else { NOTE_CARD_BG }))
+                                .font_family("PT Serif").text_size(px(12.))
+                                .text_color(rgb(if card.unverified { MUTED_COLOR } else {
+                                    TEXT_COLOR
+                                }))
+                                .when(card.skeleton, |d| d.child(
+                                    div().font_family("PT Sans").text_size(px(10.)).child("Now")
+                                ))
+                                .when(machine && !card.title.is_empty(), |d| d.child(
+                                    div().font_weight(FontWeight::BOLD).child(card.title.clone())
+                                ))
+                                .child(card.body.clone())
+                                .when(card.skeleton, |d| d.child(
+                                    div().text_size(px(10.)).child("◇")
+                                ))
+                                .when(card.orphaned || card.anchor.is_none(), |d| d.child(
+                                    div().text_size(px(10.)).child("◇ detached")
+                                ))
+                        }));
+                    if is_b {
+                        div().w_full().flex_none().flex().items_start()
+                            .child(prose).child(gutter).child(past)
+                    } else {
+                        div().w_full().flex_none().flex().items_start()
+                            .child(past).child(gutter).child(prose)
+                    }
+                }))
+        };
+        let controls = div().absolute().top(px(BAR_HEIGHT + 8.)).right(px(20.))
+            .flex().items_center().gap(px(8.))
+            .when(!wide, |d| d
+                .child(div().id("compare-a").cursor(CursorStyle::PointingHand).child("A")
+                    .on_mouse_down(MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            editor.compare_show_b = false;
+                            editor.compare_active_b = false; cx.notify();
+                        })))
+                .child(div().id("compare-b").cursor(CursorStyle::PointingHand).child("B")
+                    .on_mouse_down(MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            editor.compare_show_b = true;
+                            editor.compare_active_b = true; cx.notify();
+                        }))));
+        Some(div().id("compare-room").absolute().top(px(BAR_HEIGHT)).bottom(px(strip::STRIP_H))
+            .left_0().right_0().occlude().bg(rgb(0xF7F5EF)).overflow_hidden()
+            .flex().justify_center().gap(px(24.))
+            .when(wide, |d| d.child(column("A", false, a.text.clone(),
+                    self.compare_scroll_a.clone()))
+                .child(column("B", true, b.text.clone(), self.compare_scroll_b.clone())))
+            .when(!wide && !self.compare_show_b,
+                |d| d.child(column("A", false, a.text.clone(), self.compare_scroll_a.clone())))
+            .when(!wide && self.compare_show_b,
+                |d| d.child(column("B", true, b.text.clone(), self.compare_scroll_b.clone())))
+            .child(controls).into_any_element())
+    }
+
     /// `Read it cold` (ctrl-shift-l): enter the reading room; inside it, the
     /// same chord is the toggle-exit (Time 9 — the strip/palette precedent).
     pub(crate) fn read_it_cold(
@@ -23647,7 +25135,7 @@ impl Editor {
     /// drag pattern) and pans the fabric on wheel.
     fn render_strip(
         &self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         if !self.strip.open {
@@ -23659,47 +25147,108 @@ impl Editor {
             return None;
         }
         let parked = self.strip.parked;
+        let desk_w = f32::from(window.viewport_size().width);
+        let rail_x0 = strip::SIDE_PAD;
+        let rail_x1 = desk_w - strip::SIDE_PAD;
+        let view = self.strip.bake.as_ref().map_or(0., |b| {
+            self.strip.view_offset.clamp(
+                0.,
+                (b.timeline.total_work - (rail_x1 - rail_x0)).max(0.),
+            )
+        });
+        let (playhead_x, selvage_x) = self.strip.bake.as_ref().map_or(
+            (rail_x0, rail_x0),
+            |b| (
+                (rail_x0 + b.timeline.work_at(self.strip.pos_ms) - view)
+                    .clamp(rail_x0, rail_x1),
+                strip_sheet_tail(rail_x0, rail_x1, b.timeline.total_work, view),
+            ),
+        );
+        let dock_w = if desk_w >= 720. { 300. } else if desk_w >= 560. { 250. } else { 154. };
+        let free_interval = dock_w - if parked { 70. } else { 0. };
         let now_ms = self
             .strip
             .bake
             .as_ref()
             .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
-        // The readout: at now → the live count; parked → the reconstructed
-        // moment, plus any Compare delta folded into the SAME single line.
+        let center_mode = strip_center_mode(parked, self.strip.pin_ms.is_some());
+        let comparing = center_mode == StripCenterMode::Comparing;
+        // The dock never overprints the origin's readout: its clamp floor is
+        // the readout's reserved width (two blocks while comparing), not the
+        // rail edge — the young-sheet case parks the playhead AT the origin.
+        let dock_floor = rail_x0 + if comparing { 470. } else { 230. };
+        // Now's reserved span: the label sits 6px right of the selvage,
+        // clamped to the near edge when the selvage is off-view (§3e).
+        let now_x = (selvage_x + 6.).min(rail_x1 - 30.);
+        let dock_left = strip_dock_left(
+            playhead_x, dock_w, dock_floor, rail_x1, (now_x - 8., now_x + 38.));
         let readout = if parked {
-            let mut s = strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms);
-            if let Some(pin) = self.strip.pin_ms {
-                let delta = self.strip.words_at as i64 - self.strip.pin_words as i64;
-                let when = strip::date_label(pin / 1000, now_ms / 1000);
-                s = format!("{s} · {delta:+} since {when}");
-            }
-            s
+            strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms)
         } else {
             strip::format_readout(now_ms, self.word_count, now_ms)
         };
 
-        // A chip button in the machine-room family.
+        // Recessed data. It has no border, hover, or pointer semantics.
         let chip = |label: SharedString, bright: bool| {
             div()
-                .px(px(8.))
+                .px(px(4.))
                 .py(px(3.))
-                .rounded(px(4.))
-                .bg(rgb(strip::READOUT_CHIP))
                 .font_family("PT Sans")
                 .text_size(px(11.))
                 .text_color(if bright { rgb(0xE7E1D0) } else { rgb(0x8F8A7C) })
                 .child(label)
         };
 
-        let readout_chip = chip(readout.into(), true)
-            .id("strip-readout")
-            .occlude()
-            .text_size(px(12.))
-            // Reserved width: scrubbing may only change the numerals, never
-            // re-flow the chip's neighbours (the stability law, §3).
-            .min_w(px(220.))
-            // The readout is fixed at the left end and NEVER parks (design §3).
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let readout_chip = if let Some(pin) = self.strip.pin_ms.filter(|_| parked) {
+            let forms = strip::compare_readouts(
+                pin, self.strip.pin_words, self.strip.pos_ms,
+                self.strip.words_at, now_ms);
+            let measure = |s: &str| {
+                let run = TextRun {
+                    len: s.len(),
+                    font: window.text_style().font(),
+                    color: rgb(0xE7E1D0).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                f32::from(window.text_system()
+                    .shape_line(s.into(), px(12.), &[run], None).width()) + 16.
+            };
+            let available = (desk_w - 190.).max(120.);
+            let full_w = measure(&forms.full_a) + measure(&forms.full_b) + 6.;
+            let shared_w = forms.shared_date.as_ref().map(|(date, a, b)| {
+                measure(date) + measure(a) + measure(b) + 12.
+            });
+            let short_w = measure(&forms.short_a) + measure(&forms.short_b) + 6.;
+            let tier = strip::compare_chip_tier(
+                available, full_w, shared_w, short_w);
+            let (a, b, date) = match tier {
+                strip::CompareChipTier::Full =>
+                    (Some(forms.full_a), forms.full_b, None),
+                strip::CompareChipTier::SharedDate => {
+                    let (date, a, b) = forms.shared_date
+                        .expect("the shared-date tier requires a shared date");
+                    (Some(a), b, Some(date))
+                }
+                strip::CompareChipTier::ShortDates =>
+                    (Some(forms.short_a), forms.short_b, None),
+                strip::CompareChipTier::ActiveOnly =>
+                    (None, forms.full_b, None),
+            };
+            let b_chip = chip(b.into(), true).text_size(px(12.));
+            div().id("strip-readout").occlude().flex().items_center().gap(px(6.))
+                .when_some(date, |d, date| d.child(
+                    chip(date.into(), false).text_size(px(12.))))
+                .when_some(a, |d, a| d.child(
+                    chip(a.into(), false).text_size(px(12.))))
+                .child(b_chip)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        } else {
+            div().id("strip-readout").occlude()
+                .child(chip(readout.into(), true).text_size(px(12.)).min_w(px(220.)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
 
         let restore_btn = div()
             .id("strip-restore")
@@ -23726,15 +25275,19 @@ impl Editor {
         // themselves as the pair they are — design §3, review H4: the two
         // exits from the past light up in the same beat). Click / Esc return.
         let now_chip = chip("Now".into(), parked)
-            .when(parked, |d| d.bg(rgb(0xEAE6D8)).text_color(rgb(0x23221F)))
             .id("strip-now")
             .occlude()
-            .cursor(CursorStyle::PointingHand)
-            .hover(|d| d.bg(rgb(0x2E2C22)))
+            .when(parked, |d| {
+                d.cursor(CursorStyle::PointingHand)
+                    .border_b_1()
+                    .border_dashed()
+                    .border_color(rgb(0xE7E1D0))
+            })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
+                    editor.resolve_strip_name(window, cx);
                     editor.strip_return_to_now(cx);
                 }),
             );
@@ -23763,6 +25316,97 @@ impl Editor {
                 }),
             );
 
+        let strip_action = |id: &'static str, label: &'static str| {
+            // The product's dashed actionable mark in CHROME ink:
+            // `inline_action` hovers toward page ink, which on the dark desk
+            // reads as a blackout (corridor report, 2026-07-16). A chrome
+            // action brightens toward the desk's bright ink instead — hover
+            // makes it MORE visible, same dashes, same grammar.
+            div()
+                .id(id)
+                .cursor(CursorStyle::PointingHand)
+                .text_color(rgb(0x8F8A7C))
+                .border_b_1()
+                .border_dashed()
+                .border_color(rgb(0x8F8A7C))
+                .hover(|d| d.text_color(rgb(0xE7E1D0)).border_color(rgb(0xE7E1D0)))
+                .px(px(6.))
+                .py(px(3.))
+                .font_family("PT Sans")
+                .text_size(px(11.))
+                .child(label)
+        };
+        let center = if comparing {
+            div().child(
+                strip_action("strip-done-comparing", "Done comparing").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        editor.strip_done_comparing(cx);
+                    }),
+                ),
+            )
+        } else if let Some(input) = self.strip_name_input.clone() {
+            let empty = input.read(cx).content.is_empty();
+            div()
+                .relative()
+                .w(px(free_interval.clamp(160., 280.)))
+                .h(px(22.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .when(empty, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left(px(7.))
+                            .top(px(3.))
+                            .font_family("PT Sans")
+                            .text_size(px(13.))
+                            .text_color(rgb(0x8F8A7C))
+                            .child("Version name"),
+                    )
+                })
+                .child(input)
+        } else if free_interval >= 104. {
+            // Parked ON a writer-named version (the detent's common landing),
+            // the verb inverts to Rename (§3c): the composer opens holding
+            // the current name; clearing it demotes.
+            let renaming = parked
+                && self.strip_named_station_at(self.strip.pos_ms).is_some();
+            let label = match (renaming, free_interval >= 132.) {
+                (true, true) => "Rename this version",
+                (true, false) => "Rename version",
+                (false, true) => "Name this version",
+                (false, false) => "Name version",
+            };
+            let naming = strip_action("strip-name-version", label).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    editor.open_strip_name(window, cx);
+                }),
+            );
+            div().flex().items_center().gap(px(12.)).child(naming)
+                .when(center_mode == StripCenterMode::Parked, |d| d.child(
+                    strip_action("strip-compare", "Compare").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            editor.strip_begin_compare(cx);
+                        }),
+                    )
+                ))
+        } else {
+            div().child(
+                strip_action("strip-more", "…").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        editor.open_strip_name(window, cx);
+                    }),
+                ),
+            )
+        };
+
         Some(
             div()
                 .absolute()
@@ -23770,7 +25414,7 @@ impl Editor {
                 .left_0()
                 .right_0()
                 .h(px(strip::STRIP_H))
-                .bg(rgb(strip::GROUND))
+                .bg(rgb(strip::DESK))
                 .border_t_1()
                 .border_color(rgb(0x3A382E))
                 .occlude()
@@ -23781,8 +25425,9 @@ impl Editor {
                 // it started in.
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|editor, ev: &MouseDownEvent, _, cx| {
+                    cx.listener(|editor, ev: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
+                        editor.resolve_strip_name(window, cx);
                         editor.strip_park_at_x(
                             f32::from(ev.position.x),
                             f32::from(ev.position.y),
@@ -23792,7 +25437,37 @@ impl Editor {
                     }),
                 )
                 .on_mouse_move(cx.listener(|editor, ev: &MouseMoveEvent, _, cx| {
+                    if !editor.strip.scrubbing {
+                        let station = station_hit_at(
+                            &editor.strip_station_hits.borrow(), ev.position);
+                        let thread = editor.strip_thread_hits.borrow().iter()
+                            .find(|hit| hit.bounds.contains(&ev.position))
+                            .map(|hit| hit.card_id);
+                        if thread != editor.strip_hover_thread {
+                            editor.strip_hover_thread = thread;
+                            cx.notify();
+                        }
+                        let hover = editor
+                            .strip_date_hits
+                            .borrow()
+                            .iter()
+                            .find(|hit| hit.bounds.contains(&ev.position))
+                            .map(|hit| hit.at_ms);
+                        let well = editor.strip_well_hits.borrow().iter()
+                            .find(|hit| hit.bounds.contains(&ev.position))
+                            .map(|hit| hit.start_ms);
+                        if station != editor.strip.hover_station_ms
+                            || hover != editor.strip.hover_date_ms
+                            || well != editor.strip.hover_well_start_ms
+                        {
+                            editor.strip.hover_station_ms = station;
+                            editor.strip.hover_date_ms = hover;
+                            editor.strip.hover_well_start_ms = well;
+                            cx.notify();
+                        }
+                    }
                     if editor.strip.scrubbing && ev.pressed_button == Some(MouseButton::Left) {
+                        editor.strip_drag_moved = true;
                         let fabric = editor.strip.scrub_fabric;
                         let pos = if fabric {
                             editor.strip_pos_at_fabric_x(f32::from(ev.position.x))
@@ -23807,14 +25482,32 @@ impl Editor {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|editor, _: &MouseUpEvent, _, cx| {
-                        editor.strip.scrubbing = false;
+                        if editor.strip.scrubbing {
+                            editor.strip.scrubbing = false;
+                            let settled = editor.strip_settle_ms(editor.strip.pos_ms);
+                            if settled != editor.strip.pos_ms {
+                                editor.strip_scrub_to(settled, false, cx);
+                            }
+                            if !editor.strip_drag_moved {
+                                editor.strip_reveal_edit_at(editor.strip.pos_ms);
+                            }
+                        }
                         cx.notify();
                     }),
                 )
                 .on_mouse_up_out(
                     MouseButton::Left,
                     cx.listener(|editor, _: &MouseUpEvent, _, cx| {
-                        editor.strip.scrubbing = false;
+                        if editor.strip.scrubbing {
+                            editor.strip.scrubbing = false;
+                            let settled = editor.strip_settle_ms(editor.strip.pos_ms);
+                            if settled != editor.strip.pos_ms {
+                                editor.strip_scrub_to(settled, false, cx);
+                            }
+                            if !editor.strip_drag_moved {
+                                editor.strip_reveal_edit_at(editor.strip.pos_ms);
+                            }
+                        }
                         cx.notify();
                     }),
                 )
@@ -23825,29 +25518,38 @@ impl Editor {
                     editor.strip_pan(d, cx);
                 }))
                 .child(StripElement { editor: cx.entity() })
-                // Left group: the readout, with Restore beside it when parked.
+                // The sheet origin owns the readout.
                 .child(
                     div()
                         .absolute()
-                        .left(px(strip::SIDE_PAD - 8.))
+                        .left(px(strip::SIDE_PAD))
                         .top(px(4.))
+                        .child(readout_chip),
+                )
+                // The parked playhead owns the moment dock.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(dock_left))
+                        .top(px(4.))
+                        .w(px(dock_w))
+                        .h(px(22.))
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .child(readout_chip)
-                        .when(parked, |d| d.child(restore_btn)),
+                        .when(parked, |d| d.child(restore_btn))
+                        .child(center),
                 )
-                // Now + close, fixed at the far right.
+                // The selvage owns Now; only the frame owns close.
                 .child(
                     div()
                         .absolute()
-                        .right(px(8.))
+                        .left(px((selvage_x - 14.).clamp(rail_x0, rail_x1 - 36.)))
                         .top(px(4.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(now_chip)
-                        .child(close_x),
+                        .child(now_chip),
+                )
+                .child(
+                    div().absolute().right(px(8.)).top(px(4.)).child(close_x),
                 ),
         )
     }
@@ -23870,6 +25572,7 @@ impl IntoElement for StripElement {
 struct StripText {
     origin: Point<Pixels>,
     line: gpui::ShapedLine,
+    at_ms: Option<i64>,
 }
 
 #[derive(Default)]
@@ -23880,6 +25583,10 @@ struct StripPrepaint {
     view: f32,
     labels: Vec<StripText>,
     dates: Vec<StripText>,
+    wells: Vec<StripText>,
+    station_hitboxes: Vec<Hitbox>,
+    date_hitboxes: Vec<Hitbox>,
+    thread_hitboxes: Vec<Hitbox>,
 }
 
 impl Element for StripElement {
@@ -23938,6 +25645,45 @@ impl Element for StripElement {
             .view_offset
             .clamp(0., (bake.timeline.total_work - (rail_x1 - rail_x0)).max(0.));
         let fab_x = |work: f32| rail_x0 + work - view;
+        let tail_x = strip_sheet_tail(rail_x0, rail_x1, bake.timeline.total_work, view);
+        let mut thread_hits = Vec::new();
+        let mut thread_hitboxes = Vec::new();
+        for thread in &bake.threads {
+            for segment in &thread.segments {
+                for pair in segment.windows(2) {
+                    let x0 = fab_x(pair[0].x);
+                    let x1 = fab_x(pair[1].x);
+                    if x1 < rail_x0 || x0 > tail_x { continue; }
+                    let y0 = band_top + pair[0].y;
+                    let y1 = band_top + pair[1].y;
+                    let steps = (x1 - x0).abs().max((y1 - y0).abs()).ceil().max(1.) as usize;
+                    for i in 0..steps {
+                        let f0 = i as f32 / steps as f32;
+                        let f1 = (i + 1) as f32 / steps as f32;
+                        let x = x0 + (x1 - x0) * f0;
+                        let y = y0 + (y1 - y0) * f0;
+                        let bounds = Bounds::new(
+                            point(px(x - 2.), px(y - 2.)), size(px(5.), px(5.)),
+                        );
+                        thread_hitboxes.push(window.insert_hitbox(
+                            bounds, HitboxBehavior::Normal));
+                        thread_hits.push(StripThreadHit {
+                            bounds,
+                            card_id: thread.card_id,
+                            work0: pair[0].x + (pair[1].x - pair[0].x) * f0,
+                            work1: pair[0].x + (pair[1].x - pair[0].x) * f1,
+                            anchor0: (pair[0].anchor as f32
+                                + (pair[1].anchor as f32 - pair[0].anchor as f32) * f0)
+                                .round().max(0.) as usize,
+                            anchor1: (pair[0].anchor as f32
+                                + (pair[1].anchor as f32 - pair[0].anchor as f32) * f1)
+                                .round().max(0.) as usize,
+                        });
+                    }
+                }
+            }
+        }
+        *editor.strip_thread_hits.borrow_mut() = thread_hits;
         let shape = |text: &str, size: f32, color: u32, w: &mut Window| {
             let run = TextRun {
                 len: text.len(),
@@ -23965,7 +25711,8 @@ impl Element for StripElement {
             if wx < rail_x0 - 60. || wx > rail_x1 + 60. {
                 continue;
             }
-            let near = (st.at_ms - pos).abs() < 45_000;
+            let near = editor.strip.hover_station_ms == Some(st.at_ms)
+                || (st.at_ms - pos).abs() < 45_000;
             let line = shape(&st.label, 11., if near { 0xEAE4D2 } else { 0xC1BBA9 }, window);
             let lx = if st.flip_left {
                 wx - f32::from(line.width) - 3.
@@ -23976,8 +25723,45 @@ impl Element for StripElement {
             labels.push(StripText {
                 origin: point(px(lx), px(ly)),
                 line,
+                at_ms: Some(st.at_ms),
             });
         }
+        // One target owns each station's painted tick and, when present, its
+        // label. Midpoints clip transparent padding so neighbours never
+        // overlap; omitted labels retain a 12×24 target.
+        let mut station_order: Vec<_> = bake.stations.iter().enumerate()
+            .map(|(i, st)| (i, fab_x(st.x))).collect();
+        station_order.sort_by(|a, b| a.1.total_cmp(&b.1)
+            .then(bake.stations[a.0].rank.cmp(&bake.stations[b.0].rank)));
+        let mut station_hits = Vec::new();
+        let mut station_hitboxes = Vec::new();
+        for (order, &(i, tick_x)) in station_order.iter().enumerate() {
+            if tick_x < rail_x0 - 8. || tick_x > rail_x1 + 8. { continue; }
+            let st = &bake.stations[i];
+            let label = labels.iter().find(|l| l.at_ms == Some(st.at_ms));
+            let mut left = tick_x - 6.;
+            let mut right = tick_x + 6.;
+            if let Some(label) = label {
+                left = left.min(f32::from(label.origin.x) - 3.);
+                right = right.max(f32::from(label.origin.x + label.line.width) + 3.);
+            }
+            if order > 0 {
+                left = left.max((station_order[order - 1].1 + tick_x) / 2.);
+            }
+            if order + 1 < station_order.len() {
+                right = right.min((tick_x + station_order[order + 1].1) / 2.);
+            }
+            if right <= left { continue; }
+            let bounds = Bounds::new(
+                point(px(left), px(band_top + strip::TOP_ROW_H)),
+                size(px(right - left), px(strip::LABEL_LANE_H.max(24.))),
+            );
+            station_hitboxes.push(window.insert_hitbox(bounds, HitboxBehavior::Normal));
+            station_hits.push(StripStationHit {
+                bounds, tick_x, at_ms: st.at_ms, rank: st.rank,
+            });
+        }
+        *editor.strip_station_hits.borrow_mut() = station_hits;
         // Date lane — thinned by real shaped width: a checkpoint-dense era
         // packs several day-firsts into a few px, and overprinted labels read
         // as one smear ("Tue 23 JulToday"). The LAST date always survives a
@@ -23990,7 +25774,16 @@ impl Element for StripElement {
             if wx < rail_x0 - 40. || wx > rail_x1 + 40. {
                 continue;
             }
-            let line = shape(&dt.label, 10.5, 0x9C9684, window);
+            let text = if editor.strip.hover_date_ms == Some(dt.at_ms) {
+                strip::date_span_label(dt)
+            } else {
+                dt.label.clone()
+            };
+            let line = shape(&text, 10.5, 0x9C9684, window);
+            let expanded = editor.strip.hover_date_ms == Some(dt.at_ms);
+            if !expanded && wx + 2. + f32::from(line.width) > tail_x {
+                continue;
+            }
             if wx < last_right + 14. {
                 if i + 1 != bake.dates.len() {
                     continue;
@@ -24002,11 +25795,58 @@ impl Element for StripElement {
                 }
             }
             last_right = wx + f32::from(line.width);
+            let lx = if expanded && wx + 2. + f32::from(line.width) > tail_x {
+                (tail_x - f32::from(line.width)).max(rail_x0)
+            } else {
+                wx + 2.
+            };
             dates.push(StripText {
-                origin: point(px(wx + 2.), px(band_top + strip::STRIP_H - strip::DATE_LANE_H)),
+                origin: point(px(lx), px(band_top + strip::STRIP_H - strip::DATE_LANE_H)),
                 line,
+                at_ms: Some(dt.at_ms),
             });
         }
+        let mut date_hits = Vec::new();
+        let mut date_hitboxes = Vec::new();
+        for date in &dates {
+            let bounds = Bounds::new(
+                date.origin,
+                size(date.line.width + px(4.), px(strip::DATE_LANE_H)),
+            );
+            let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+            date_hitboxes.push(hitbox);
+            date_hits.push(StripDateHit {
+                bounds,
+                at_ms: date.at_ms.expect("date text carries a sitting target"),
+            });
+        }
+        *editor.strip_date_hits.borrow_mut() = date_hits;
+        let mut wells = Vec::new();
+        let mut well_hits = Vec::new();
+        for datum in &bake.well_data {
+            let wx = fab_x(datum.x);
+            let expanded = editor.strip.hover_well_start_ms == Some(datum.start_ms);
+            let text = if expanded {
+                strip::well_span_label(datum, bake.now_ms)
+            } else {
+                datum.label.clone()
+            };
+            let line = shape(&text, 8.5, 0x8E8878, window);
+            let lx = (wx - f32::from(line.width) / 2.)
+                .clamp(rail_x0, (tail_x - f32::from(line.width)).max(rail_x0));
+            let origin = point(px(lx), px(band_top + strip::STRIP_H - strip::DATE_LANE_H));
+            let bounds = Bounds::new(origin, size(line.width, px(strip::DATE_LANE_H)));
+            // Bounding dates speak first. If the compact datum cannot coexist,
+            // the immutable well remains and its words are simply omitted.
+            if !expanded && dates.iter().any(|d| {
+                let dl = f32::from(d.origin.x);
+                let dr = dl + f32::from(d.line.width);
+                lx < dr + 4. && dl < lx + f32::from(line.width) + 4.
+            }) { continue; }
+            wells.push(StripText { origin, line, at_ms: None });
+            well_hits.push(StripWellHit { bounds, start_ms: datum.start_ms });
+        }
+        *editor.strip_well_hits.borrow_mut() = well_hits;
         StripPrepaint {
             rail_x0,
             rail_x1,
@@ -24014,6 +25854,10 @@ impl Element for StripElement {
             view,
             labels,
             dates,
+            wells,
+            station_hitboxes,
+            date_hitboxes,
+            thread_hitboxes,
         }
     }
 
@@ -24029,6 +25873,15 @@ impl Element for StripElement {
     ) {
         let _guard = DrawGuard::enter();
         let editor = self.editor.read(cx);
+        for hitbox in &prepaint.date_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        for hitbox in &prepaint.station_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        for hitbox in &prepaint.thread_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
         let rail_x0 = prepaint.rail_x0;
         let rail_x1 = prepaint.rail_x1;
         let band_top = prepaint.band_top;
@@ -24045,9 +25898,15 @@ impl Element for StripElement {
         // A thin quad, clipped to the rail's x-window. `window` is a parameter
         // (not captured), so the direct paint_quad calls below — thumb, flecks,
         // playhead — never fight this helper for the mutable window borrow.
-        let rect = |window: &mut Window, x: f32, y: f32, w: f32, h: f32, color: gpui::Rgba| {
+        let rect_to = |window: &mut Window,
+                       clip_x1: f32,
+                       x: f32,
+                       y: f32,
+                       w: f32,
+                       h: f32,
+                       color: gpui::Rgba| {
             let xa = x.max(rail_x0);
-            let xb = (x + w).min(rail_x1);
+            let xb = (x + w).min(clip_x1);
             if xb <= xa || h <= 0. {
                 return;
             }
@@ -24058,16 +25917,39 @@ impl Element for StripElement {
         };
 
         let Some(bake) = editor.strip.bake.as_ref() else {
-            // Degraded (no bake yet): just the rail line, so the floor exists.
-            rect(window, rail_x0, rail_y, rail_w, 2., tint(strip::GREY, 0.6));
             return;
         };
         let view = prepaint.view;
         let total = bake.timeline.total_work;
-        let pos = editor.strip.pos_ms;
+        let pos = editor.strip_departure.map_or(editor.strip.pos_ms, |(_, start, from)| {
+            if editor.config.reduce_motion {
+                editor.strip.pos_ms
+            } else {
+                let a = (start.elapsed().as_secs_f32()
+                    / (STRIP_DEPARTURE_MS as f32 / 1000.))
+                    .clamp(0., 1.);
+                let from_work = bake.timeline.work_at(from);
+                let now_work = bake.timeline.work_at(editor.strip.pos_ms);
+                bake.timeline.wall_at(from_work + (now_work - from_work) * a)
+            }
+        });
         let fab_x = |work: f32| rail_x0 + work - view;
         let fab_top = rail_y; // the page hangs from the rail
         let fab_bot = fab_top + strip::FABRIC_H;
+        let tail_x = strip_sheet_tail(rail_x0, rail_x1, total, view);
+        let rect = |window: &mut Window, x: f32, y: f32, w: f32, h: f32, color: gpui::Rgba| {
+            rect_to(window, tail_x, x, y, w, h, color);
+        };
+
+        // The recorded sheet overlays the darker desk only as far as now.
+        rect(
+            window,
+            rail_x0,
+            band_top + strip::TOP_ROW_H,
+            tail_x - rail_x0,
+            strip::STRIP_H - strip::TOP_ROW_H,
+            rgb(strip::GROUND),
+        );
 
         // --- Wells first: a folded gap is a recessed full-height column ------
         for s in &bake.seams {
@@ -24122,10 +26004,7 @@ impl Element for StripElement {
             } else {
                 tint(strip::FLECK_INS, strip::FLECK_INS_ALPHA)
             };
-            window.paint_quad(fill(
-                Bounds::new(point(px(x), px(band_top + f.y)), size(px(strip::FLECK), px(strip::FLECK))),
-                color,
-            ));
+            rect(window, x, band_top + f.y, strip::FLECK, strip::FLECK, color);
         }
 
         // --- Threads: a card's open life — a cool hairline at anchor depth
@@ -24133,11 +26012,41 @@ impl Element for StripElement {
         // terminal where it closed. Open threads run quieter than closed
         // ones ended: eight open questions must not grid the cloth.
         for t in &bake.threads {
-            let x0 = fab_x(t.x0);
-            let x1 = fab_x(t.x1);
-            let y = band_top + t.y;
-            rect(window, x0, y, x1 - x0, 1., tint(strip::THREAD, if t.open { 0.28 } else { 0.42 }));
-            if x0 >= rail_x0 && x0 <= rail_x1 {
+            let hovered = editor.strip_hover_thread == Some(t.card_id);
+            let alpha = if hovered { 0.72 } else if t.open { 0.28 } else { 0.42 };
+            for (segment_ix, segment) in t.segments.iter().enumerate() {
+                for (pair_ix, pair) in segment.windows(2).enumerate() {
+                    let mut a = pair[0];
+                    let mut b = pair[1];
+                    if segment_ix > 0 && pair_ix == 0 { a.x += 3.; }
+                    if segment_ix + 1 < t.segments.len() && pair_ix + 2 == segment.len() {
+                        b.x -= 3.;
+                    }
+                    let dx = b.x - a.x;
+                    let dy = b.y - a.y;
+                    let steps = dx.abs().max(dy.abs()).ceil().max(1.) as usize;
+                    for i in 0..steps {
+                        let f = i as f32 / steps as f32;
+                        rect(window, fab_x(a.x + dx * f), band_top + a.y + dy * f,
+                            1., 1., tint(strip::THREAD, alpha));
+                    }
+                }
+                if segment_ix + 1 < t.segments.len() {
+                    if let Some(end) = segment.last() {
+                        let x = fab_x(end.x - 3.);
+                        rect(window, x, band_top + end.y - 3., 1., 3., tint(strip::THREAD, 0.58));
+                    }
+                    if let Some(start) = t.segments[segment_ix + 1].first() {
+                        let x = fab_x(start.x + 3.);
+                        rect(window, x, band_top + start.y, 1., 3., tint(strip::THREAD, 0.58));
+                    }
+                }
+            }
+            let first = t.segments.first().and_then(|s| s.first()).copied();
+            if t.origin_proven && let Some(p) = first {
+                let x0 = fab_x(p.x);
+                let y = band_top + p.y;
+                if x0 >= rail_x0 && x0 <= rail_x1 {
                 let mut ring = fill(
                     Bounds::new(point(px(x0 - 2.), px(y - 2.)), size(px(4.), px(4.))),
                     tint(strip::THREAD, 0.),
@@ -24146,8 +26055,23 @@ impl Element for StripElement {
                 ring.border_widths = gpui::Edges::all(px(1.));
                 ring.border_color = tint(strip::THREAD, 0.7).into();
                 window.paint_quad(ring);
+                }
             }
-            if !t.open {
+            if t.uncertain_start && let Some(p) = first {
+                let x = fab_x(p.x);
+                let y = band_top + p.y;
+                rect(window, x, y - 2., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x - 1., y - 1., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x + 1., y - 1., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x - 2., y, 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x + 2., y, 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x - 1., y + 1., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x + 1., y + 1., 1., 1., tint(strip::THREAD, 0.78));
+                rect(window, x, y + 2., 1., 1., tint(strip::THREAD, 0.78));
+            }
+            if !t.open && let Some(p) = t.segments.last().and_then(|s| s.last()) {
+                let x1 = fab_x(p.x);
+                let y = band_top + p.y;
                 let dot = if t.resolved { strip::SAGE } else { strip::GREY };
                 rect(window, x1 - 1.5, y - 1.5, 3., 3., tint(dot, 0.9));
             }
@@ -24159,7 +26083,8 @@ impl Element for StripElement {
             let x = fab_x(st.x);
             // Brighten by TIME distance to the playhead (association by light,
             // design §2) — stable under the fabric's pan, unlike pixel distance.
-            let near = (st.at_ms - pos).abs() < 45_000;
+            let near = editor.strip.hover_station_ms == Some(st.at_ms)
+                || (st.at_ms - pos).abs() < 45_000;
             let base = if st.restore { strip::SAGE } else { strip::GREY };
             let a = if near { 0.95 } else { 0.3 };
             rect(window, x, band_top + strip::TOP_ROW_H, 1., strip::LABEL_LANE_H + strip::FABRIC_H, tint(base, a));
@@ -24182,6 +26107,16 @@ impl Element for StripElement {
         // end read as unreachable future).
         let travel = strip_travel(rail_w, total);
         rect(window, rail_x0, rail_y - 1., travel, 2., tint(strip::GREY, 0.55));
+
+        // The manuscript's now: always visible when the tail is in view,
+        // including minute one where it stands without a fabricated rail.
+        window.paint_quad(fill(
+            Bounds::new(
+                point(px(tail_x - 0.5), px(fab_top)),
+                size(px(1.), px(strip::FABRIC_H + strip::DATE_LANE_H)),
+            ),
+            rgb(strip::CREAM),
+        ));
 
         // --- The not-yet: everything right of a parked playhead dims one
         // alpha step — a STATIC encoding of position, so any paused frame
@@ -24241,10 +26176,20 @@ impl Element for StripElement {
 
         // --- Shaped text: station labels + the date lane ---------------------
         for t in prepaint.labels.drain(..) {
+            let y = f32::from(t.origin.y) + 12.;
+            let mut x = f32::from(t.origin.x);
+            let end = x + f32::from(t.line.width);
+            while x < end {
+                rect(window, x, y, 3., 1., tint(strip::GREY, 0.72));
+                x += 6.;
+            }
             t.line.paint(t.origin, px(13.), TextAlign::Left, None, window, cx).ok();
         }
         for t in prepaint.dates.drain(..) {
             t.line.paint(t.origin, px(12.), TextAlign::Left, None, window, cx).ok();
+        }
+        for t in prepaint.wells.drain(..) {
+            t.line.paint(t.origin, px(10.), TextAlign::Left, None, window, cx).ok();
         }
     }
 }
@@ -24253,6 +26198,123 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn station_hit_arbitrates_by_tick_then_rank() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(30.), px(24.)));
+        let hits = vec![
+            StripStationHit { bounds, tick_x: 8., at_ms: 10, rank: 6 },
+            StripStationHit { bounds, tick_x: 22., at_ms: 20, rank: 0 },
+        ];
+        assert_eq!(station_hit_at(&hits, point(px(9.), px(12.))), Some(10));
+        assert_eq!(station_hit_at(&hits, point(px(15.), px(12.))), Some(20));
+        assert_eq!(station_hit_at(&hits, point(px(31.), px(12.))), None);
+    }
+
+    fn plain_preview(text: &str) -> PreviewDoc {
+        PreviewDoc {
+            text: text.to_owned(),
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+            spans_bytes: Vec::new(),
+            kinds: vec![BlockKind::default()],
+            boundary: None,
+        }
+    }
+
+    #[test]
+    fn compare_copy_slices_the_selected_side_only() {
+        let a = plain_preview("alpha passage");
+        let b = plain_preview("bravo passage");
+        assert_eq!(compare_selected_text(&a, &b, false, 0..5), "alpha");
+        assert_eq!(compare_selected_text(&a, &b, true, 0..5), "bravo");
+    }
+
+    #[test]
+    fn compare_verb_exists_only_on_the_parked_center_group() {
+        assert_eq!(strip_center_mode(false, false), StripCenterMode::Naming);
+        assert_eq!(strip_center_mode(false, true), StripCenterMode::Naming);
+        assert_eq!(strip_center_mode(true, false), StripCenterMode::Parked);
+        assert_eq!(strip_center_mode(true, true), StripCenterMode::Comparing);
+    }
+
+    #[test]
+    fn compare_falls_back_when_either_column_misses_cold_read_measure() {
+        assert!(compare_columns_fit(872., 400.));
+        assert!(!compare_columns_fit(871., 400.));
+    }
+
+    #[gpui::test]
+    fn parked_compare_caches_a_and_done_returns_to_the_same_park(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|cx| Editor::new(
+            cx, "now", SpanSet::default(), BlockMap::default()));
+        cx.update_entity(&editor, |editor, cx| {
+            editor.strip.open = true;
+            editor.strip.parked = true;
+            editor.strip.pos_ms = 20;
+            editor.strip.words_at = 3;
+            editor.history_preview = Some(plain_preview("A stays put"));
+            editor.strip_begin_compare(cx);
+            assert_eq!(editor.strip.pin_ms, Some(20));
+            editor.history_preview = Some(plain_preview("B keeps scrubbing"));
+            assert_eq!(editor.compare_preview.as_ref().unwrap().text, "A stays put");
+            editor.strip_done_comparing(cx);
+            assert!(editor.strip.parked);
+            assert!(editor.strip.pin_ms.is_none());
+            assert_eq!(editor.history_preview.as_ref().unwrap().text, "B keeps scrubbing");
+            editor.strip_return_to_now(cx);
+            assert!(!editor.strip.parked);
+            assert!(editor.history_preview.is_none());
+        });
+    }
+
+    #[test]
+    fn sheet_tail_and_rail_obey_young_fit_overflow_and_minute_one() {
+        assert_eq!(strip_travel(400., 0.), 0., "minute one fabricates no rail");
+        assert_eq!(strip_sheet_tail(28., 428., 0., 0.), 28.);
+        assert_eq!(strip_travel(400., 75.), 75.);
+        assert_eq!(strip_sheet_tail(28., 428., 75., 0.), 103.);
+        assert_eq!(strip_travel(400., 400.), 400.);
+        assert_eq!(strip_sheet_tail(28., 428., 400., 0.), 428.);
+        assert_eq!(strip_travel(400., 900.), 400.);
+        assert_eq!(strip_sheet_tail(28., 428., 900., 500.), 428.);
+    }
+
+    #[test]
+    fn strip_dock_flips_and_clamps_at_the_frame_edges() {
+        // A far-away Now zone leaves the classic flip/clamp behavior alone.
+        let far = (1000., 1040.);
+        assert_eq!(strip_dock_left(100., 120., 28., 428., far), 110.);
+        assert_eq!(strip_dock_left(390., 120., 28., 428., far), 260.);
+        assert_eq!(strip_dock_left(30., 500., 28., 428., far), 28.);
+    }
+
+    #[test]
+    fn strip_dock_never_stands_across_the_now_label() {
+        // Young sheet: readout floor at 230, selvage/Now right there — the
+        // interval left of Now cannot hold a 300px dock, so it takes the
+        // desk to Now's right (the callout-from-the-sheet reading).
+        let x = strip_dock_left(240., 300., 230., 1590., (238., 284.));
+        assert!(x >= 294., "dock {x} must clear Now's right edge");
+        // Wide sheet, parked mid-fabric: Now at the far selvage stays clear
+        // and the dock still prefers the playhead's right.
+        assert_eq!(strip_dock_left(800., 300., 230., 1590., (1520., 1566.)), 810.);
+        // Parked NEAR the selvage: the dock flips left of the zone when the
+        // right side cannot fit.
+        let x = strip_dock_left(1500., 300., 230., 1590., (1508., 1554.));
+        assert!(x + 300. <= 1508., "dock {x}+300 must clear Now's left edge");
+    }
+
+    #[test]
+    fn open_strip_shortens_only_the_visible_document_height() {
+        assert_eq!(document_viewport_height(px(700.), false), px(700.));
+        assert_eq!(
+            document_viewport_height(px(700.), true),
+            px(700. - strip::STRIP_H),
+        );
+    }
 
     #[test]
     fn failed_preparation_supersedes_an_older_pending_save() {
@@ -24496,6 +26558,14 @@ mod tests {
     const PACK_FLOOR: f32 = 44.;
     const PACK_VP_BOTTOM: f32 = 800.;
     const PACK_GAP: f32 = 16.;
+
+    #[test]
+    fn parked_anchor_projects_through_synthetic_paragraph_layout() {
+        let paragraphs = vec![(0..12, 24.), (13..40, 82.), (41..55, 166.)];
+        assert_eq!(preview_anchor_y(&paragraphs, 20), Some(82.));
+        assert_eq!(preview_anchor_y(&paragraphs, 41), Some(166.));
+        assert_eq!(preview_anchor_y(&paragraphs, 90), None);
+    }
 
     proptest! {
         // INV1 (no overlap, EVER — the never-overlap rule, no active-card excuse)

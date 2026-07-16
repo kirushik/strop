@@ -324,7 +324,7 @@ fn main() {
                         // tutorial document, margin demo cards included.
                         let (text, spans, blocks, notes) = tutorial::document();
                         store.seed(&text);
-                        store.add_checkpoint("Fresh tutorial", true);
+                        store.add_checkpoint("Fresh tutorial", false);
                         tutorial_notes = Some(notes);
                         (text, spans, blocks, None)
                     }
