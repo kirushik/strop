@@ -24667,7 +24667,6 @@ impl Editor {
             ),
         );
         let dock_w = if desk_w >= 720. { 300. } else if desk_w >= 560. { 250. } else { 154. };
-        let dock_left = strip_dock_left(playhead_x, dock_w, rail_x0, rail_x1);
         let free_interval = dock_w - if parked { 70. } else { 0. };
         let now_ms = self
             .strip
@@ -24676,6 +24675,11 @@ impl Editor {
             .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
         let center_mode = strip_center_mode(parked, self.strip.pin_ms.is_some());
         let comparing = center_mode == StripCenterMode::Comparing;
+        // The dock never overprints the origin's readout: its clamp floor is
+        // the readout's reserved width (two blocks while comparing), not the
+        // rail edge — the young-sheet case parks the playhead AT the origin.
+        let dock_floor = rail_x0 + if comparing { 470. } else { 230. };
+        let dock_left = strip_dock_left(playhead_x, dock_w, dock_floor, rail_x1);
         let readout = if parked {
             strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms)
         } else {
