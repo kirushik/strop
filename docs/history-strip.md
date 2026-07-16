@@ -25,6 +25,21 @@ Panel texts: `docs/research/history-strip-panel-2026-07.md`.)*
 | "Where are my comments when I rewind?" | §3b — the past margin |
 | *(bug)* threads drawn as horizontal lines | §1e, §6 — true paths |
 
+Round two (the built v3 met its first fortnight of real use; a
+three-voice design pass — CTO RFC, a Raskin lens on modes and exits,
+a Birman lens on composition — re-solved the controls as one system):
+
+| Round-two report | Answer |
+|---|---|
+| "I can't read Compare past the first page" | §3d — the room scrolls |
+| "…at least show me what changed" | §3d — the change gutter |
+| the strip hides the last paragraph | §1a — the floor law |
+| "no way to inspect those cards in history" | §3b — placement + skeletons |
+| controls "dissipated", Now in a corner | §2, §3e — geometry owns them |
+| labels not clickable, "Started" mid-sheet | §2 — labels act; Started dies |
+| "is my 6-week rest mostly emptiness?" | §1b — the well says its span |
+| *(bug)* the past stayed on glass after close | §3e — fixed + rig-gated |
+
 ## 0.5 The visits — what the strip is FOR
 
 The same writer arrives in opposite emotional states, sometimes in the
@@ -126,6 +141,21 @@ rule). No text explains the emptiness; the selvage says "the page
 begins here" without asserting elapsed work (P4, P6). The first run
 lays the first flecks and the sheet grows rightward from there.
 
+**The floor law** (round two; the strip hid the last paragraph). The
+strip is a physical object on the floor of the window, not weather
+over the prose: while it is open, the visible document viewport ends
+at the strip's top border. Column width and wrapping never change —
+opening history must not reflow the manuscript — but the scroll range
+extends so the final baseline rests fully above the border with the
+document's normal bottom breathing room, and text is clipped at the
+border rather than sliding beneath the desk. One shared helper names
+the visible bottom, and every companion obeys it: live margin cards,
+the past margin, sidenotes, selection popovers, caret-reveal, and
+page stepping. Cards anchored near the bottom pack upward inside the
+visible lane; nothing ever descends behind the strip. Opening the
+strip does not move the scroll (the no-jump invariant); it only
+shortens what is visible until the writer scrolls.
+
 ### 1b. The quant, time, and the sittings
 
 **The quant: one fleck = one word.** A ~2 px grain of amber. Words the
@@ -164,6 +194,25 @@ containing "session" reaches the chrome, ever. Ticks in the label
 lane now mean exactly one thing: a deliberate mark — a named version,
 an export, a restore.
 
+**A wide well says what it holds** (round two; "is my six-week rest
+mostly emptiness?" — no: the fold already reduced it to one 20-px
+well; the geometry was right and mute). The wide tier gains a
+compact duration datum centered on the well in the date lane, 8–9 px
+tabular: `6 days`, `6 wk`, `3 mo 2 wk` — whole days from 2 to 13,
+weeks to 8, months plus weeks beyond. It reports the elapsed wall
+time between the last recorded event before the fold and the first
+after it — a fact about the record's interval, never a claim the
+file stayed closed. Hover may expand it to the exact bounding
+timestamps (the date-hover grammar, P9). It is data, not a control:
+no underline, no pointer, no click. On collision it yields to
+writer-named labels and the two bounding dates, and outranks reflex
+labels; the well itself survives even where its datum cannot. The
+overnight tier stays mute — the recess between two dates already
+says everything a night says. Widths stay the two fixed tiers,
+permanently: a six-week absence earns a different VALUE, not more x
+— the axis spends x on work, and a proportional hole would make
+absence the principal material of the sheet.
+
 ### 1c. No zoom — the adjudication, held against real users
 
 Users asked for zoom the way music and video editors have it. The
@@ -199,8 +248,8 @@ re-scaled fabric.
 
 ### 1d. The rail, the page, the envelope — unchanged law
 
-**The rail IS the page's top edge**: chips live in their own row
-above; the envelope hangs from the rail; the thumb rides along the
+**The rail IS the page's top edge**: the controls live in their own
+row above; the envelope hangs from the rail; the thumb rides along the
 top of the manuscript; the rail is exactly as long as the history.
 At fitting scale it ends at the selvage (§1a). When the history
 outgrows the viewport, the rail compresses the whole of it into full
@@ -271,54 +320,103 @@ thread: two solid segments separated by a 6-px blank with opposing
 3-px cap ticks — *a break in a thread is a restore the record could
 not carry the card across.*
 
+**Threads answer the hand** (round two; the lines promised cards the
+surface couldn't deliver). Every painted thread segment is a hit
+target over its own geometry — the painted path never changes for
+the sake of the hit. Clicking a thread parks at the exact moment
+under the click, scrolls the parked preview so the card's proven
+anchor is visible where it can be, and gives the matching past-margin
+card (§3b) a brief focus outline. Hover strengthens the already
+visible thread and its card together — association by light — and
+never parks or opens anything (P9). No hit exists where no geometry
+is drawn: an unprovable stretch of a card's past cannot be clicked
+because it is not there.
+
 ## 2. Words on the strip
 
 Exactly four kinds of text exist:
 
 1. **Station names** — the writer's own words ("Draft complete"),
-   plus the honest automatics ("Started", "Restored", "Exported") —
-   never "Saved", never "Session", never "Checkpoint N". Session
-   starts lay no ticks and no labels at all (§1b); the document's
-   very first station keeps its name ("Started") once it has
-   distinguishable extent. Ranked omission on collision (writer-named
-   > before-restore > export > reflex); a label that doesn't fit is
+   plus the honest automatics ("Restored", "Exported") — never
+   "Saved", never "Session", never "Checkpoint N", and since round
+   two never an automatic "Started": the label bound itself to the
+   earliest *surviving* version and appeared mid-sheet on any file
+   whose journal predates its store — a birth the record didn't
+   prove, red line 3 caught in the field. The sheet's own left edge
+   is the beginning of the available record; it needs no caption. (A
+   version the writer herself names "Started" is her data and shows
+   normally.) Session starts lay no ticks and no labels at all
+   (§1b). Ranked omission on collision (writer-named >
+   before-restore > export > reflex); a label that doesn't fit is
    omitted whole, its tick stays; a same-named twin at the same x is
    omitted rather than stacked — which is also why duplicate names
    are *allowed*: names are writer-owned data (P3), never rewritten,
    never suffixed; time and position disambiguate. Hover expands,
-   never reveals (P9).
+   never reveals (P9). **Labels and ticks act** (round two): every
+   painted station label and tick carries one shared exact-seek
+   target — click parks at that station's own timestamp, precisely,
+   no arithmetic asked of the hand. Labels wear the product's one
+   clickable-text mark (below); hover brightens label and tick
+   together. Hit padding is modest and never overlaps a neighbor;
+   competing padded targets resolve to the closest painted tick,
+   ties to the higher rank. A click outside any target keeps the
+   two-lane law (§3a) — the cloth stays continuous; there is no
+   magnetic snapping of ordinary fabric clicks. An omitted label's
+   tick still carries the target; arrow stepping reaches every
+   station regardless.
 2. **Dates** — real ones. "Today", "Tue 1 Jul". Never "day 12". The
    year appears whenever it isn't the current one. New in v3: dates
-   are seek targets (§1b).
-3. **The readout** — one chip, fixed position at the left end, fixed
-   width, tabular numerals: `Tue 12 Jul, 21:40 · 3,412 words`. Width
-   reserved per locale. The readout never forms a sentence and never
-   embeds a station name (P8's template ban). Near a station, that
-   station's tick and label *brighten* — association by light, not by
-   grammar. **While comparing (§3d), the readout becomes two parallel
-   chips**: the pinned moment's chip dim, the active playhead's chip
-   bright, the word delta on the bright chip (`· +612 words` /
-   `· no word-count change`) — the delta belongs to B because it is
-   B − A, and "since" is banned: it composes a narrative relation
-   (P8). Degradation is semantic, never ellipsis: same-date moments
-   share one date token; then the locale's shortest unambiguous
-   date+time form; at the narrowest, only the active chip and the
-   delta remain on the strip while the pinned moment's full readout
-   stands in its own column header (§3d). Dates and counts are data;
-   data is never clipped.
-4. **The action words** (new) — a quiet center group between the
-   readout and Now: plain muted small text (resting ink `#8F8A7C`,
-   no fill, no box; hover brightens and underlines), never a toolbar.
-   At now: `Name this version`. Parked: `Name this version` ·
-   `Compare`. Comparing: `Done comparing`. These rest (P2) — nothing
-   pulses, nothing appears on a timer, and the contrast order of the
-   strip is untouched: thumb and rail first, bright Now when parked
-   as the obvious exit, Restore as the only filled action verb, the
-   center words last (P11). When width starves the center group,
-   naming survives first (`Name version` is its only sanctioned
-   compact form; Compare keeps its shift-click shortcut); below that
-   the verbs fold into an ellipsis control beside Now. Restore, Now,
-   and close never disappear.
+   are seek targets (§1b). Wide wells carry their duration datum
+   (§1b) — data, not a control.
+3. **The readout** — recessed data at the sheet's origin, not a
+   chip: fixed position aligned to the strip's left content edge,
+   fixed width, tabular numerals: `Tue 12 Jul, 21:40 · 3,412 words`.
+   Width reserved per locale. A low-contrast backing is allowed only
+   where the fabric would fight legibility; it takes no border, no
+   hover, no pointer — a box around unclickable data falsely
+   promises a button (round two; the chip face dies). The readout
+   never forms a sentence and never embeds a station name (P8's
+   template ban). Near a station, that station's tick and label
+   *brighten* — association by light, not by grammar. **While
+   comparing (§3d), the readout becomes two parallel data blocks**:
+   the pinned moment's dim, the active playhead's bright, the word
+   delta on the bright one (`· +612 words` / `· no word-count
+   change`) — the delta belongs to B because it is B − A, and
+   "since" is banned: it composes a narrative relation (P8).
+   Degradation is semantic, never ellipsis: same-date moments share
+   one date token; then the locale's shortest unambiguous date+time
+   form; at the narrowest, only the active block and the delta
+   remain on the strip while the pinned moment's full readout stands
+   in its own column header (§3d). Dates and counts are data; data
+   is never clipped.
+4. **The action words** — and the one grammar that rules them (round
+   two; four idioms shared one bar and none could be learned). Form
+   means exactly this, strip-wide and product-consistent:
+   - **dashed underline** (the `inline_action` mark: muted ink and a
+     1-px dashed rule at rest; ink brightens on hover, the dashes
+     stay dashes) = a reversible text action. `Name this version`,
+     `Compare`, `Done comparing`, clickable station labels,
+     clickable dates, and `Now` while away from now all wear it.
+     Dashed = actionable, never emphasis.
+   - **dark fill** = commits a document-changing act. Exactly one
+     control may wear it: `Restore`. Fill is not importance, not
+     selection, not location.
+   - **plain text** = data or inactive state: the readout, well
+     durations, `Now` at now. No underline, no hover, no pointer.
+   - **the drawn mark** = a surface operation: the dismiss saltire,
+     top-right of the strip's frame, the only control that belongs
+     to the container instead of the timeline.
+   The cream fill the parked Now once wore dies: cream belongs to
+   the selvage, and repeating it in a button invented a second
+   "now". Where the verbs live is geometry's decision, not the
+   screen's — §3e. These rest (P2) — nothing pulses, nothing appears
+   on a timer, and the contrast order of the strip is untouched:
+   thumb and rail first, Restore as the only filled verb, the quiet
+   words last (P11). When width starves the moment dock, naming
+   survives first (`Name version` is its only sanctioned compact
+   form; Compare keeps its shift-click shortcut); below that the
+   dashed verbs fold into an ellipsis control — itself dashed —
+   while Restore, Now, and close never disappear.
 
 The vocabulary is glossary law (`ux-glossary.md`): "checkpoint" and
 "station" are internal register; the writer-facing category noun is
@@ -337,11 +435,17 @@ the thumb; the fabric below is the *cloth* — a click lands on the
 moment UNDER the cursor at the current pan, and the view never yanks.
 The document live-renders at frame rate either way. Wheel/trackpad
 pan the fabric only. While parked, arrow keys step to the previous/
-next station or big-cut shoulder. **Scrub stability law:** while the
+next station or big-cut shoulder. Round two adds the third class of
+hit: **named objects act exactly** — station labels and ticks (§2.1),
+dates (§1b), thread segments (§1e), and Compare's gutter marks (§3d)
+resolve before the lanes; everything unmarked keeps the lane grammar
+untouched, and no target may steal a drag that began in a lane.
+**Scrub stability law:** while the
 thumb moves, the only things that change are the thumb's x, the
 readout numerals, the document above, the past margin's projection
-(§3b), the dimmed not-yet region, and label brightening. No label
-re-ranks, re-flows, or changes length mid-drag.
+(§3b), the dimmed not-yet region, label brightening, and the moment
+dock's recede/settle (§3e). No label re-ranks, re-flows, or changes
+length mid-drag.
 
 ### 3b. The past margin — "where are my comments when I rewind?"
 
@@ -355,16 +459,40 @@ raised after t do not yet exist. Every paused frame is a true page
 from that day (P6). Scrubbing across a card's raise or close pops it
 in or out with no animation — the past doesn't perform.
 
+**Placement is the preview's own layout** (round two; v3.0 scattered
+cards at anchor-fraction-of-document heights, beside nothing). A past
+card stands beside its anchor's real on-screen paragraph: the
+historical anchor maps through the same text layout that renders the
+parked page, rides the preview's scroll, and feeds the same margin
+packing the live lane uses — measured heights, culling, the
+established off-screen treatment — in a read-only mode. No composer,
+no resolution verbs; past cards are evidence. Clicking a past card
+scrolls the preview to its anchor (navigation, never mutation).
+
 Where a card's anchor at t cannot be proven (legacy record, an
 unbridged restore), the card is not pinned to a guessed paragraph: it
 sits in a small stack at the margin's foot, each card carrying a
 broken-anchor mark — the same mark the margin already uses for
 orphaned notes at now, and the stack has no heading: the cards are
-the data, and a heading would be explanation (P4). For v0.2-era
-history, where bodies-as-of-t were never recorded, the past margin
-stays absent rather than half-true — a card whose today-body wore
-yesterday's date would be a quiet forgery. Truth outranks
-completeness (red line 3).
+the data, and a heading would be explanation (P4).
+
+**The legacy skeleton** (round two — a recorded REVERSAL of v3.0's
+"stays absent" ruling). v3.0 left the past margin empty for v0.2-era
+records, and the field answered: the threads still draw there, so
+the strip implies cards it refuses to show — a promise the surface
+doesn't keep. The reversal keeps red line 3 by changing the claim,
+not the honesty: where the parked t intersects a legacy card's
+proven anchor suffix (§1e), the margin shows a **skeleton** — the
+card's *current* body in its normal form, header stamped with the
+plain datum `Now`, wearing the drained/unverified treatment and the
+hollow-origin mark. The stamp is a fact about the body's source, not
+an estimate of its historical content: nothing asserts this wording
+existed at t, and no historical date ever touches the body. Where
+the anchor at t is unproven, the skeleton joins the detached foot
+stack; where even the card's relation to that time is unproven,
+nothing shows — truthful absence still outranks invented history. A
+card whose today-body wore yesterday's date would remain a quiet
+forgery; a today-body wearing today's name is testimony.
 
 The past is otherwise quotable, as before: selection works and
 RENDERS in a parked preview, Copy lifts the words out, and the live
@@ -376,9 +504,9 @@ Yes — at the scrub point, which is where the research said the commit
 verb belongs (Etherpad's lesson: co-locate the naming act with the
 timeline it marks; named checkpoints are what writers keep over
 continuous history). The quiet verb (§2d) is present at now AND while
-parked:
+parked, living in the moment dock (§3e):
 
-- **Activation** replaces the center group with one compact text
+- **Activation** replaces the dock's verbs with one compact text
   field (placeholder `Version name` — field-purpose text, not
   solicitation). Focus enters it; the prose caret and selection are
   saved aside.
@@ -413,37 +541,117 @@ shortcut it always was.
 
 - **Compare** pins the parked moment as the *pinned moment* (A). Its
   playhead stays as a faint dashed line; the live playhead (B)
-  continues to scrub normally. The readout becomes the two-chip form
+  continues to scrub normally. The readout becomes the two-block form
   (§2). The verb becomes `Done comparing`; Esc exits compare first,
   then the past — every step of the way out is the inverse of a step
   in (P13).
 - **The document area becomes a reading room, not a diff.** Two
-  read-only columns, A and B, synchronized, each headed by its
-  moment's full readout string; in narrow windows, a segmented A/B
-  switch over one column. Prose comparison answers "which reads
-  better?" first — writers compare voice and flow, not opcodes. A
-  quiet **Changes** toggle offers the forensic view second: added
-  passages in the warm insertion treatment; removed passages in a
-  gutter beside the prose, **never struck through inline** — the
-  writer's words are not raw material for the interface's diff
-  costume (P1). (Google Drive's colored inline diff was considered
-  and rejected on exactly this ground.)
+  read-only columns, A and B, each a continuous page headed by its
+  moment's full readout string (`A · …` / `B · …`); in narrow
+  windows, a segmented A/B switch over one column that preserves
+  each side's reading position. Prose comparison answers "which
+  reads better?" first — writers compare voice and flow, not
+  opcodes; that priority is why the columns stay whole: no spacer
+  holes punched through the prose to force alignment. **Each column
+  scrolls** (round two — v3.0's room clipped at one page), and the
+  columns scroll independently: any forced y-to-y coupling between
+  two arbitrary moments asserts a correspondence the record doesn't
+  prove. Wheel drives the column under the pointer; the narrow
+  switch keeps each side's own offset. The active side is named by a
+  stronger header rule, never a background wash.
+- **The change gutter answers "where do I look"** (round two; the
+  Changes toggle and its prefix/suffix single-region wash die). A
+  paragraph-level alignment of the two moments — the established
+  prose-diff grain: paragraph pass, never character confetti — lays
+  permanent, quiet marks in each column's outer gutter: a warm bar
+  beside changed paragraph runs on both sides, an arrival bar in B
+  with a short departure notch at the corresponding boundary in A
+  for prose only one side holds, the inverse for the other. The
+  prose itself is never decorated: no inline strikeout, no insertion
+  wash (P1 — held from v3.0). Unchanged stretches carry nothing.
+  **The marks are ticks, and ticks act** (§2): clicking a gutter
+  mark scrolls BOTH columns to stand that corresponding pair
+  abreast — alignment on demand, at the writer's own click, instead
+  of a standing claim; hover brightens the mark and its twin
+  together and moves nothing (P9). Authorship is never inferred: the
+  gutter asserts textual difference only.
 - **Each column carries its own past margin** (§3b): the cards as of
-  A beside A, as of B beside B. Uncertain cards obey §3b's rules per
-  side; nothing cross-associates.
+  A beside A, as of B beside B — placed by each column's own layout
+  and scroll, per §3b's placement law, never flattened into quotes
+  under the prose. Uncertain cards obey §3b's rules per side;
+  nothing cross-associates.
 - Restore, while comparing, applies to the active moment; Now exits
   the whole past state, dropping the pin, as it always did.
 
-### 3e. Now and Restore — unchanged law
+### 3e. Where the controls live, and how the past is left
 
-**Now** — the rightmost control, always. Click: back to the present;
-Esc the same. At now the chip rests dim; when parked it brightens in
-the same beat Restore appears — the two exits from the past announce
-themselves as the pair they are, from their fixed ends. **Restore**
-appears beside the readout only when parked. One word; the common
+**Geometry owns the controls** (round two; v3.0 pinned three groups
+to two screen edges and the desk's center, and the first user read
+it as furniture pushed against walls). The strip's own coordinates
+are the layout grid, three ownerships:
+
+- **The sheet's origin owns the readout** (§2.3): recessed data at
+  the left content edge, stable while the hand works the fabric.
+- **The playhead owns the moment dock**: `Restore` (the one filled
+  verb) with `Name this version` and `Compare` (dashed) beside it,
+  the dock anchored to the parked playhead in the top control row,
+  flipping to whichever side keeps it on the sheet/viewport and
+  clamping at the edges. It does not chase the hand: while a drag
+  scrubs, the dock recedes; it settles beside the playhead on
+  release or keyboard step. Position is the documentation — these
+  verbs concern the moment under this line.
+- **The selvage owns Now**: the word stands at the selvage as the
+  timeline's implicit terminal label — no tick, because the selvage
+  IS the geometry; visually distinct from station names so nobody
+  reads a freshly named version there. At now it is plain dim data;
+  while parked or comparing it wears the dashed mark and full ink —
+  the same word becomes the control, which is P12 exactly. When the
+  selvage stands beyond the viewport, Now clamps to the near edge —
+  still truthfully pointing the way home. Click: back to the
+  present; Esc the same.
+- **The frame owns close**: the dismiss saltire, top-right of the
+  strip container — the only control that acts on the surface
+  rather than on time.
+
+The parked banner over the document keeps announcing the past — the
+moment, the read-only condition, `Esc returns` — and keeps the
+refusal pulse; since round two it carries **no verbs**. One
+operation, one door: v3.0 showed two Restores at once (banner and
+bar), and neither could be habituated. The dock owns the verb;
+**Restore** appears there only when parked. One word; the common
 word; our restore appends, destroys nothing, and is itself one
 Restore away from undone (P13). No confirmation dialog exists
 anywhere in the strip.
+
+**The exit law** (round two; the scare that started this round). A
+writer who left the past believed she hadn't: the exit was silent,
+the scroll stayed where the past put it, and on an append-heavy
+draft the present is pixel-identical to the past at that offset.
+(The scare was also half real — a layout-cache bug kept the past
+literally on glass after close; fixed, rig-gated on `frame_paras`,
+and the law below is what makes the state legible even with the bug
+dead.) Every departure from a parked or comparing state that is not
+Restore now passes through one visible **return to now**:
+
+1. any open composer resolves or cancels;
+2. the pin drops, the live document returns to the glass;
+3. the caret, selection, AND scroll captured at open are restored —
+   the eye lands where the writer left, which no past frame can
+   imitate;
+4. the playhead travels to the selvage and the banner falls;
+5. the frame holds one short beat (~180 ms) — a real present frame,
+   not an animation for its own sake (under `reduce_motion`, a
+   cross-fade with no positional flight);
+6. then the initiating command completes: Esc-from-park and the Now
+   label leave the strip open at now; the saltire, the history
+   toggle, and a panel swap finish closing or swapping.
+
+Esc keeps its ladder (comparing → parked → now → closed: every step
+out inverts a step in, P13); the close controls stay single actions
+that CLOSE — a close that refuses to close would trade one mode
+error for another. Restore is the one exception to locus restore:
+the document deliberately changed, so the eye stays where the
+restored text is, and the strip re-bakes open at now.
 
 ## 4. The notches (P5 — depth that never taxes the floor)
 
@@ -502,6 +710,38 @@ sentences; any re-layout during scrub.
   (§6).
 - **Per-keystroke card-body recording** — quadratic in body length;
   the committed-edit grain is the truthful unit (§6).
+
+**In round two** (the controls re-solved as one system):
+
+- **The three screen-edge control groups** — position said "the
+  monitor ends here" about verbs that concern moments; geometry owns
+  them now (§3e).
+- **The banner's Restore** — two doors to one operation; the dock
+  owns the verb, the banner indicates (§3e).
+- **The cream parked-Now chip** — cream belongs to the selvage;
+  repeating it in a button invented a second now (§2.4).
+- **The strip's private hover-underline idiom** (`quiet_action`) —
+  the product already had one clickable-text mark; a second idiom
+  taxed every control with a second lesson (§2.4).
+- **The automatic "Started" label** — bound to the earliest
+  surviving version, it testified to births the record doesn't
+  prove, mid-sheet on real files (red line 3, found in the field;
+  §2.1).
+- **The Changes toggle and its prefix/suffix wash** — one contiguous
+  "changed region" balloons on any real session; the permanent
+  paragraph change gutter replaces it (§3d).
+- **The readout's and Now's chip faces** — boxes around data
+  falsely promise buttons; data is plain, fill means mutation
+  (§2.3–2.4).
+- **Anchor-fraction card placement in the past margin** — a
+  proportional guess at geometry; red line 3 extends to y. Cards
+  stand beside their real paragraphs now (§3b).
+- **Card quotes stacked under Compare columns** — cards are margin
+  objects with anchors, not footnotes (§3d).
+- **The empty legacy past margin** — REVERSED, the one v3.0 ruling
+  round two overturned: threads promised what the margin refused.
+  The skeleton stamped `Now` keeps the honesty and keeps the promise
+  (§3b).
 
 ## 6. The card record — what v3 must write down
 
