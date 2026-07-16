@@ -1129,6 +1129,18 @@ for spec in \
   if [ -s "$SHOTS/$name.png" ]; then echo "  ok   still $SHOTS/$name.png"; else
     echo "  FAIL still $name.png did not render"; fail=1; fi
 done
+echo "rig-check: space rail stills for the eyes"
+for spec in \
+  "scrollbar-long|seed:scrollbar-long scroll:0.38" \
+  "scrollbar-markless|seed:scrollbar-markless scroll:0.38" \
+  "scrollbar-short|seed:scrollbar-short" \
+  "scrollbar-readout|seed:scrollbar-long rail:drag:0.46"; do
+  name=${spec%%|*}; keys=${spec#*|}; DIS=$(mktemp --suffix=.md)
+  scripts/wshot.sh "$SHOTS/$name.png" 1 "$DIS" "$keys" >/dev/null 2>&1
+  rm -f "$DIS" "$DIS.strop"
+  if [ -s "$SHOTS/$name.png" ]; then echo "  ok   still $SHOTS/$name.png"; else
+    echo "  FAIL still $name.png did not render"; fail=1; fi
+done
 rm -f "$IMG_A" "$IMG_B"
 
 [ "$fail" = 0 ] && echo "rig-check: PASS" || echo "rig-check: FAIL"

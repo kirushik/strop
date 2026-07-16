@@ -590,6 +590,23 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE seed:novel: round-two long fixture installed");
                 continue;
             }
+            if let Some(mode) = key.strip_prefix("seed:scrollbar-") {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_scrollbar(mode, cx))
+                    .ok();
+                cx.background_executor().timer(Duration::from_millis(120)).await;
+                eprintln!("SMOKE seed:scrollbar-{mode}: rail fixture installed");
+                continue;
+            }
+            if let Some(fraction) = key.strip_prefix("rail:drag:") {
+                let fraction: f32 = fraction.parse().expect("rail:drag fraction");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_space_drag(fraction, cx))
+                    .ok();
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                eprintln!("SMOKE rail:drag:{fraction}: readout held live");
+                continue;
+            }
             // `seed:legacy` — the legacy litmus (Bug A): six materialized
             // checkpoints across two weeks, EMPTY journal. The strip's axis must
             // come from the checkpoint states, not the (absent) journal.

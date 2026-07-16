@@ -387,7 +387,7 @@ const COL_MAX_WIDTH: f32 = 660.;
 /// the lane itself, and the card's 8px inset. The lane is reserved on the
 /// right at all times (see `column_frame`) so a note appearing never moves the
 /// column; the margin renders inline while this much space exists past it.
-const NOTE_LANE_TOTAL: f32 = MARGIN_GAP + MARGIN_WIDTH + 8.;
+const NOTE_LANE_TOTAL: f32 = MARGIN_GAP + MARGIN_WIDTH + 16.;
 /// The column is CENTRED at rest (it rhymes with the centred omnibox), and
 /// stays centred as long as the right margin can still host the note lane.
 /// Only when narrowing past that does it shift left — continuously, no
@@ -433,6 +433,44 @@ const STRIP_DEPARTURE_MS: u64 = 180;
 /// The document viewport ends at the strip's top border while it is open.
 fn document_viewport_height(height: Pixels, strip_open: bool) -> Pixels {
     (height - if strip_open { px(strip::STRIP_H) } else { px(0.) }).max(px(1.))
+}
+
+const SPACE_RAIL_W: f32 = 14.;
+const SPACE_THUMB_W: f32 = 6.;
+const SPACE_THUMB_MIN_H: f32 = 32.;
+
+fn space_thumb(track: f32, viewport: f32, extent: f32, scroll: f32) -> (f32, f32) {
+    let height = (track * viewport / extent.max(viewport))
+        .clamp(SPACE_THUMB_MIN_H.min(track), track);
+    let travel = (track - height).max(0.);
+    let max_scroll = (extent - viewport).max(0.);
+    let top = if max_scroll == 0. { 0. } else { travel * scroll.clamp(0., max_scroll) / max_scroll };
+    (top, height)
+}
+
+fn space_mark_y(doc_y: f32, max_scroll: f32, track: f32, thumb_h: f32) -> f32 {
+    if max_scroll <= 0. { 0. } else { doc_y.clamp(0., max_scroll) / max_scroll * (track - thumb_h).max(0.) }
+}
+
+fn space_scroll_at(pointer_y: f32, track: f32, thumb_h: f32, max_scroll: f32) -> f32 {
+    let travel = (track - thumb_h).max(0.);
+    if travel == 0. { 0. } else { ((pointer_y - thumb_h / 2.) / travel).clamp(0., 1.) * max_scroll }
+}
+
+fn space_fleck_on_thumb(fleck_y: f32, thumb_y: f32, thumb_h: f32) -> bool {
+    fleck_y >= thumb_y && fleck_y <= thumb_y + thumb_h
+}
+
+fn space_mark_hit(ys: &[f32], pointer: f32) -> Option<usize> {
+    ys.iter().enumerate().filter_map(|(ix, y)| {
+        let distance = (pointer - *y).abs();
+        (distance <= 4.).then_some((ix, distance))
+    }).min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        .map(|(ix, _)| ix)
+}
+
+fn alpha_ink(color: u32, alpha: u8) -> u32 {
+    color << 8 | u32::from(alpha)
 }
 
 fn strip_center_mode(parked: bool, pinned: bool) -> StripCenterMode {
@@ -1325,6 +1363,14 @@ pub struct Editor {
     /// Last pointer position during a drag, for edge autoscrolling.
     drag_point: Option<Point<Pixels>>,
     autoscroll_active: bool,
+    /// Pointer-owned space-rail state. The offset keeps a thumb press under
+    /// the hand; a track press uses half the thumb and therefore warps and
+    /// grabs in the same synchronous gesture.
+    space_drag_offset: Option<f32>,
+    space_hover: bool,
+    space_hover_mark: Option<usize>,
+    space_readout_fade: Option<u64>,
+    space_readout_seq: u64,
     cursor_visible: bool,
     last_input: Instant,
     /// Durable layer; edits mirror into it, a background task saves when idle.
@@ -2249,6 +2295,11 @@ impl Editor {
             autoscroll_request: false,
             drag_point: None,
             autoscroll_active: false,
+            space_drag_offset: None,
+            space_hover: false,
+            space_hover_mark: None,
+            space_readout_fade: None,
+            space_readout_seq: 0,
             cursor_visible: true,
             last_input: Instant::now(),
             store: None,
@@ -12315,6 +12366,49 @@ impl Editor {
         cx.notify();
     }
 
+    /// Rig fixtures for the space rail: a long structured document with a
+    /// real Scraps seam, a long markless document, or a short markless page.
+    pub fn debug_seed_scrollbar(&mut self, mode: &str, cx: &mut Context<Self>) {
+        let count = if mode == "short" { 3 } else { 90 };
+        let mut lines = Vec::with_capacity(count);
+        let mut kinds = vec![BlockKind::Paragraph; count];
+        for ix in 0..count {
+            lines.push(format!("Rail fixture paragraph {ix}: rendered lines make position honest."));
+        }
+        if mode == "long" {
+            for (ix, kind, label) in [
+                (0, BlockKind::Heading(1), "The first crossing"),
+                (12, BlockKind::Heading(2), "Soundings"),
+                (25, BlockKind::Divider, "⁂"),
+                (42, BlockKind::Heading(1), "The far bank"),
+                (55, BlockKind::Heading(2), "Night water"),
+                (72, BlockKind::Heading(2), "Unplaced ending"),
+                (80, BlockKind::Divider, "⁂"),
+            ] {
+                kinds[ix] = kind;
+                lines[ix] = label.into();
+            }
+        }
+        let text = lines.join("\n");
+        self.doc.restore_state(&text, SpanSet::default(), BlockMap::from_kinds(kinds));
+        if mode == "long" {
+            self.doc.set_scrap_line(Some(68));
+        }
+        self.selected_range = 0..0;
+        self.scroll_top = px(0.);
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        cx.notify();
+    }
+
+    pub fn debug_space_drag(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else { return };
+        self.scroll_top = frame.max_scroll() * fraction.clamp(0., 1.);
+        self.space_readout_fade = None;
+        self.space_drag_offset = Some(SPACE_THUMB_MIN_H / 2.);
+        cx.notify();
+    }
+
     /// Rig hook (`seed:topera`): rebuild the LIVE doc in the SHIPPED
     /// compost-at-top shape and save — so the NEXT launch of this same file
     /// exercises the one-time migration against a real store. The direct
@@ -21677,6 +21771,184 @@ impl Editor {
 }
 
 impl Editor {
+    fn finish_space_drag(&mut self, cx: &mut Context<Self>) {
+        self.space_drag_offset = None;
+        if self.config.reduce_motion {
+            self.space_readout_fade = None;
+            cx.notify();
+            return;
+        }
+        self.space_readout_seq = self.space_readout_seq.wrapping_add(1);
+        let seq = self.space_readout_seq;
+        self.space_readout_fade = Some(seq);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            this.update(cx, |editor, cx| {
+                if editor.space_readout_fade == Some(seq) {
+                    editor.space_readout_fade = None;
+                    cx.notify();
+                }
+            }).ok();
+        }).detach();
+    }
+
+    fn render_space_rail(
+        &self,
+        col_x: f32,
+        col_w: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if self.cold_read.is_some() {
+            return None;
+        }
+        let frame = self.last_frame.as_ref()?;
+        let max_scroll = f32::from(frame.max_scroll());
+        if max_scroll <= 0. {
+            return None;
+        }
+        let track_h = (f32::from(window.viewport_size().height) - BAR_HEIGHT
+            - if self.strip.open { strip::STRIP_H } else { 0. }).max(1.);
+        let extent = f32::from(frame.content_height + frame.line_height + px(24.));
+        let (thumb_y, thumb_h) = space_thumb(
+            track_h,
+            f32::from(frame.viewport_height),
+            extent,
+            f32::from(self.scroll_top),
+        );
+        let kinds: &[BlockKind] = self.history_preview.as_ref()
+            .map_or(self.doc.blocks().kinds(), |p| p.kinds.as_slice());
+        let source = self.history_preview.as_ref().map_or_else(|| self.doc.text(), |p| p.text.clone());
+        let lines: Vec<&str> = source.split('\n').collect();
+        let mut marks = Vec::new();
+        let mut governing = None;
+        for (ix, par) in frame.paragraphs.iter().enumerate() {
+            let kind = kinds.get(ix).unwrap_or(&BlockKind::Paragraph);
+            if matches!(kind, BlockKind::Heading(1) | BlockKind::Heading(2))
+                && f32::from(par.top) <= f32::from(self.scroll_top)
+            {
+                governing = lines.get(ix).copied();
+            }
+            let w = match kind {
+                BlockKind::Heading(1) => Some(10.),
+                BlockKind::Heading(2) => Some(6.),
+                BlockKind::Divider => Some(2.),
+                _ => None,
+            };
+            if let Some(w) = w {
+                marks.push((ix, space_mark_y(f32::from(par.top), max_scroll, track_h, thumb_h), w,
+                    matches!(kind, BlockKind::Divider)));
+            }
+        }
+        let mark_hits: Vec<(f32, f32)> = marks.iter().map(|(ix, y, _, _)| {
+            (*y, f32::from(frame.paragraphs[*ix].top).clamp(0., max_scroll))
+        }).collect();
+        let mark_hits_down = mark_hits.clone();
+        let mark_ys_down: Vec<f32> = mark_hits_down.iter().map(|(y, _)| *y).collect();
+        let mark_ys: Vec<f32> = mark_hits.iter().map(|(y, _)| *y).collect();
+        let rail_left = col_x + col_w - SPACE_RAIL_W;
+        let bright = self.space_hover || self.space_drag_offset.is_some();
+        let mut rail = div().id("space-rail").absolute().left(px(rail_left)).top(px(BAR_HEIGHT))
+            .w(px(SPACE_RAIL_W)).h(px(track_h)).cursor(CursorStyle::PointingHand)
+            .on_hover(cx.listener(|editor, hover: &bool, _, cx| {
+                editor.space_hover = *hover;
+                if !*hover {
+                    editor.space_hover_mark = None;
+                }
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |editor, ev: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                editor.space_readout_fade = None;
+                let local = f32::from(ev.position.y) - BAR_HEIGHT;
+                if let Some(ix) = space_mark_hit(&mark_ys_down, local) {
+                    let target = mark_hits_down[ix].1;
+                    editor.scroll_top = px(target);
+                    editor.space_drag_offset = Some(thumb_h / 2.);
+                    cx.notify();
+                    return;
+                }
+                let offset = if local >= thumb_y && local <= thumb_y + thumb_h {
+                    local - thumb_y
+                } else {
+                    thumb_h / 2.
+                };
+                editor.space_drag_offset = Some(offset);
+                editor.scroll_top = px(space_scroll_at(local - offset + thumb_h / 2., track_h,
+                    thumb_h, max_scroll));
+                cx.notify();
+            }))
+            .on_mouse_move(cx.listener(move |editor, ev: &MouseMoveEvent, _, cx| {
+                let local = f32::from(ev.position.y) - BAR_HEIGHT;
+                if editor.space_drag_offset.is_none() {
+                    editor.space_hover_mark = space_mark_hit(&mark_ys, local);
+                    cx.notify();
+                    return;
+                }
+                let offset = editor.space_drag_offset.expect("checked above");
+                editor.scroll_top = px(((local - offset) / (track_h - thumb_h).max(1.))
+                    .clamp(0., 1.) * max_scroll);
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|editor, _: &MouseUpEvent, _, cx| {
+                editor.finish_space_drag(cx);
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|editor, _: &MouseUpEvent, _, cx| {
+                editor.finish_space_drag(cx);
+            }));
+        for (mark_ix, (_, y, w, dot)) in marks.into_iter().enumerate() {
+            let hovered = self.space_hover_mark == Some(mark_ix);
+            rail = rail.child(div().absolute().top(px(y - if dot { 1. } else { 0.5 }))
+                .right(px(0.)).w(px(w)).h(px(if dot { 2. } else { 1. }))
+                .bg(rgba(alpha_ink(MUTED_COLOR, if hovered { 0xBF } else { 0x8C }))));
+        }
+        if let Some(seam) = frame.seam_top {
+            let y = space_mark_y(f32::from(seam), max_scroll, track_h, thumb_h);
+            rail = rail.child(div().absolute().top(px(y)).left_0().w_full().h(px(1.))
+                .bg(rgba(alpha_ink(MUTED_COLOR, 0x8C))));
+        }
+        let caret_y = frame.paragraphs.iter().find(|p| {
+            p.range.start <= self.cursor_offset() && self.cursor_offset() <= p.range.end
+        }).map(|p| space_mark_y(f32::from(p.top), max_scroll, track_h, thumb_h));
+        rail = rail.child(div().absolute().top(px(thumb_y)).left(px(4.))
+            .w(px(SPACE_THUMB_W)).h(px(thumb_h)).rounded(px(3.))
+            .bg(rgba(alpha_ink(MUTED_COLOR, if bright { 0xBF } else { 0x73 }))));
+        if let Some(y) = caret_y {
+            let paint_y = if space_fleck_on_thumb(y, thumb_y, thumb_h) {
+                y.clamp(thumb_y + 1., thumb_y + thumb_h - 1.)
+            } else { y };
+            rail = rail.child(div().absolute().top(px(paint_y - 1.)).left(px(6.))
+                .w(px(2.)).h(px(2.)).rounded(px(1.)).bg(rgb(ACTIVE_BORDER))
+                .on_mouse_down(MouseButton::Left, cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.autoscroll_request = true;
+                    editor.space_drag_offset = None;
+                    cx.notify();
+                })));
+        }
+        let mut out = div().absolute().inset_0().child(rail);
+        if (self.space_drag_offset.is_some() || self.space_readout_fade.is_some())
+            && let Some(label) = governing.filter(|s| !s.is_empty())
+        {
+            let readout = div().absolute().top(px(self.margin_floor())).right(px(
+                f32::from(window.viewport_size().width) - rail_left + 8.))
+                .max_w(px(248.)).overflow_hidden().whitespace_nowrap()
+                .font_family("PT Serif").text_size(px(13.))
+                .text_color(rgba(alpha_ink(TEXT_COLOR, 0xBF))).child(label.to_owned());
+            out = out.child(if let Some(seq) = self.space_readout_fade {
+                readout.with_animation(
+                    ("space-readout-exit", seq as usize),
+                    Animation::new(Duration::from_millis(120)),
+                    |el, t| el.opacity(1. - t),
+                ).into_any_element()
+            } else {
+                readout.into_any_element()
+            });
+        }
+        Some(out.into_any_element())
+    }
+
     fn render_quit_guard(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (title, detail, working) = match &self.quit_guard {
             QuitGuard::Idle | QuitGuard::Bypass => return None,
@@ -22069,6 +22341,12 @@ impl Render for Editor {
                     Some(status) => d.child(status),
                     None => d,
                 }
+            })
+            // The standing space rail owns its reserved column and paints
+            // after the opaque footnote zone and margin furniture.
+            .map(|d| match self.render_space_rail(col_x, col_w, window, cx) {
+                Some(rail) => d.child(rail),
+                None => d,
             })
             .map(|d| {
                 if !self.margin_fits(window) && self.cold_read.is_none() {
@@ -28263,5 +28541,28 @@ mod tests {
         assert_eq!(image_format_for_src("asset:ab.jpg"), gpui::ImageFormat::Jpeg);
         assert_eq!(image_format_for_src("asset:ab.webp"), gpui::ImageFormat::Webp);
         assert_eq!(image_format_for_src("asset:legacy"), gpui::ImageFormat::Png);
+    }
+
+    #[test]
+    fn space_rail_mapping_uses_one_clamped_rendered_axis() {
+        let (top, height) = space_thumb(500., 500., 2000., 750.);
+        assert_eq!(height, 125.);
+        assert_eq!(top, 187.5);
+        assert_eq!(space_mark_y(750., 1500., 500., height), top);
+        assert_eq!(space_scroll_at(top + height / 2., 500., height, 1500.), 750.);
+        assert!(space_fleck_on_thumb(top, top, height));
+        assert!(!space_fleck_on_thumb(top - 0.1, top, height));
+
+        let (clamped_top, clamped_height) = space_thumb(100., 100., 10000., 9900.);
+        assert_eq!(clamped_height, 32.);
+        assert_eq!(clamped_top, 68.);
+        // The seam is merely another rendered document y on this axis.
+        assert_eq!(space_mark_y(4950., 9900., 100., clamped_height), 34.);
+
+        let marks = [10., 14., 30.];
+        assert_eq!(space_mark_hit(&marks, 11.9), Some(0));
+        assert_eq!(space_mark_hit(&marks, 12.), Some(0), "midpoint tie is stable");
+        assert_eq!(space_mark_hit(&marks, 12.1), Some(1));
+        assert_eq!(space_mark_hit(&marks, 20.), None, "padding never magnetizes track");
     }
 }
