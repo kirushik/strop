@@ -14042,6 +14042,7 @@ fn blend_over(top: gpui::Rgba, bottom: gpui::Rgba) -> gpui::Rgba {
 #[allow(clippy::too_many_arguments)]
 fn runs_for_paragraph(
     par_range: &Range<usize>,
+    text: &str,
     selection: &Range<usize>,
     marked: Option<&Range<usize>>,
     spans: &[(Range<usize>, InlineAttr)],
@@ -14050,22 +14051,36 @@ fn runs_for_paragraph(
     dels: &[Range<usize>],
     base: &TextRun,
 ) -> Vec<TextRun> {
+    // Defense in depth: every cut source SHOULD arrive char-aligned (the
+    // history gate keeps live-domain carets out of preview layout), but one
+    // stale offset against re-laid-out text silently corrupts glyph shaping
+    // for the whole block — so every cut snaps back to a char boundary of
+    // THIS text before windowing. `text` is the paragraph's slice; cuts are
+    // absolute. The strop-bug tripwire downstream stays armed: it now flags
+    // a broken snap, never a routine scrub frame.
+    let snap = |b: usize| {
+        let mut b = b.clamp(par_range.start, par_range.end);
+        while b > par_range.start && !text.is_char_boundary(b - par_range.start) {
+            b -= 1;
+        }
+        b
+    };
     let mut cuts = vec![par_range.start, par_range.end];
     for r in [Some(selection), marked].into_iter().flatten() {
-        cuts.push(r.start.clamp(par_range.start, par_range.end));
-        cuts.push(r.end.clamp(par_range.start, par_range.end));
+        cuts.push(snap(r.start));
+        cuts.push(snap(r.end));
     }
     for (r, _) in spans {
-        cuts.push(r.start.clamp(par_range.start, par_range.end));
-        cuts.push(r.end.clamp(par_range.start, par_range.end));
+        cuts.push(snap(r.start));
+        cuts.push(snap(r.end));
     }
     for (r, _, _) in notes {
-        cuts.push(r.start.clamp(par_range.start, par_range.end));
-        cuts.push(r.end.clamp(par_range.start, par_range.end));
+        cuts.push(snap(r.start));
+        cuts.push(snap(r.end));
     }
     for r in matches.iter().chain(dels.iter()) {
-        cuts.push(r.start.clamp(par_range.start, par_range.end));
-        cuts.push(r.end.clamp(par_range.start, par_range.end));
+        cuts.push(snap(r.start));
+        cuts.push(snap(r.end));
     }
     cuts.sort_unstable();
     cuts.dedup();
@@ -14711,10 +14726,21 @@ impl Element for EditorElement {
             Some(p) => (p.text, p.inserts, p.deletes, Some(p.spans_bytes), Some(p.kinds)),
             None => (editor.doc.text(), Vec::new(), Vec::new(), None, None),
         };
-        // The selection survives into history frames (offsets index the
-        // laid-out text, which IS the preview while previewing — the same
-        // source `copy` slices; see that comment).
-        let selection = editor.selected_range.clone();
+        // A selection MADE in the preview survives into history frames —
+        // it's the surgical rescue (history-strip §3b: selection works and
+        // RENDERS in a parked preview; `copy` slices the same source). A
+        // collapsed caret is different: parking saves the LIVE caret byte
+        // (`strip_save_live_locus`), and that offset means nothing against
+        // reconstructed text — injected as a run cut it lands mid-multibyte-
+        // char and trips the run-misalignment tripwire on every scrub frame.
+        // So in history an empty selection contributes nothing to layout
+        // (0..0), the same gate `marked` already wears; non-empty is
+        // preview-domain by construction (park always collapses first).
+        let selection = if in_history && editor.selected_range.is_empty() {
+            0..0
+        } else {
+            editor.selected_range.clone()
+        };
         let marked = if in_history {
             None
         } else {
@@ -15069,6 +15095,7 @@ impl Element for EditorElement {
             });
             let runs = runs_for_paragraph(
                 &range,
+                par_text,
                 &selection,
                 marked.as_ref(),
                 &par_spans,
@@ -27168,7 +27195,8 @@ mod tests {
             (2..5, InlineAttr::Strong),
             (5..8, InlineAttr::Highlight),
         ];
-        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &[], &[], &base());
+        let runs =
+            runs_for_paragraph(&par, "0123456789", &(0..0), None, &spans, &[], &[], &[], &base());
         // Segments: [0,2) plain, [2,5) bold, [5,8) highlight, [8,10) plain.
         assert_eq!(runs.len(), 4);
         assert_eq!(runs[1].font.weight, FontWeight::BOLD);
@@ -27185,7 +27213,8 @@ mod tests {
         // partial overlap splits into its own runs.
         let par = 0..6;
         let spans = vec![(0..6, InlineAttr::Highlight)];
-        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &[], &[], &[], &base());
+        let runs =
+            runs_for_paragraph(&par, "abcdef", &(2..4), None, &spans, &[], &[], &[], &base());
         let blended = blend_over(rgba(SELECTION_COLOR), rgba(HIGHLIGHT_COLOR));
         assert_eq!(runs[1].background_color, Some(blended.into()));
         assert_ne!(
@@ -27199,7 +27228,8 @@ mod tests {
         // Outside the selection the pure highlight shows.
         assert_eq!(runs[0].background_color, Some(rgba(HIGHLIGHT_COLOR).into()));
         // Selection over plain text stays the plain selection color.
-        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &[], &[], &[], &base());
+        let plain =
+            runs_for_paragraph(&par, "abcdef", &(2..4), None, &[], &[], &[], &[], &base());
         assert_eq!(
             plain[1].background_color,
             Some(rgba(SELECTION_COLOR).into())
@@ -27252,7 +27282,8 @@ mod tests {
         // superior figure is painted over it in the paint phase.
         let par = 0..5;
         let spans = vec![(2..3, InlineAttr::FootnoteRef("1".into()))];
-        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &[], &[], &base());
+        let runs =
+            runs_for_paragraph(&par, "abcde", &(0..0), None, &spans, &[], &[], &[], &base());
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[1].color.a, 0.);
         assert!(runs[1].background_color.is_none());
@@ -27264,9 +27295,44 @@ mod tests {
     fn code_run_switches_family_and_marked_text_underlines() {
         let par = 0..8;
         let spans = vec![(0..4, InlineAttr::Code)];
-        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &[], &[], &[], &base());
+        let runs = runs_for_paragraph(
+            &par,
+            "abcdefgh",
+            &(0..0),
+            Some(&(4..8)),
+            &spans,
+            &[],
+            &[],
+            &[],
+            &base(),
+        );
         assert_eq!(runs[0].font.family.as_ref(), CODE_FONT);
         assert!(runs[1].underline.is_some());
+    }
+
+    #[test]
+    fn stale_cuts_snap_to_char_boundaries() {
+        // The history-preview hazard: an offset from ANOTHER text (the live
+        // caret, a stale selection) injected as a run cut into multibyte
+        // text. Every cut must snap back to a char boundary of THIS text —
+        // the runs partition the paragraph and shaping never sees a torn
+        // char. "привет" is 6 chars × 2 bytes; 3 and 7 are mid-char.
+        let text = "привет";
+        let par = 0..text.len();
+        let check = |runs: &[TextRun]| {
+            let mut at = 0usize;
+            for run in runs {
+                assert!(text.is_char_boundary(at), "run cut mid-char at {at}");
+                at += run.len;
+            }
+            assert_eq!(at, text.len(), "runs must cover the paragraph");
+        };
+        // A collapsed caret off-boundary (the parked live caret's shape).
+        check(&runs_for_paragraph(&par, text, &(3..3), None, &[], &[], &[], &[], &base()));
+        // A non-empty stale selection, both ends mid-char.
+        check(&runs_for_paragraph(&par, text, &(3..7), None, &[], &[], &[], &[], &base()));
+        // Beyond the paragraph entirely.
+        check(&runs_for_paragraph(&par, text, &(15..40), None, &[], &[], &[], &[], &base()));
     }
 
     #[test]
