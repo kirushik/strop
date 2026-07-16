@@ -20963,30 +20963,34 @@ impl Editor {
             })
             .collect();
         let (above_n, below_n) = (above.len(), below.len());
-        let floor = self.margin_card_floor();
-        // A quiet pill at a lane edge when cards are hidden past it — the honest
-        // "there's more here, it didn't vanish" cue (DESIGN principle 2).
+        // The margin-chrome law (2026-07-17 arrangement round): ONE pill
+        // family in TWO fixed rows. Every piece of lane chrome shares the
+        // door chip's geometry (18px, full radius, PT Sans 10.5) and
+        // right-aligns to the cards' edge. Top row: [N above][door chip],
+        // in the top padding band — never overlapping a card. Bottom row:
+        // [N below] alone. Warm fill on the count pills (they count the
+        // writer's notes too), cool on the chip — provenance in one row.
+        let chrome_row = self.margin_floor();
         let edge_chip = move |label: String, at_bottom: bool| {
             let chip = div()
                 .absolute()
-                .left(px((MARGIN_WIDTH - 88.) / 2.))
-                .w(px(88.))
+                .h(px(18.))
                 .flex()
-                .justify_center()
+                .items_center()
                 .px(px(8.))
-                .py(px(2.))
-                .rounded(px(10.))
+                .rounded_full()
                 .bg(rgb(CARD_BG))
                 .border_1()
                 .border_color(rgb(RULE_COLOR))
-                .text_size(px(10.))
+                .text_size(px(10.5))
                 .text_color(rgb(MUTED_COLOR))
-                .font_family("PT Serif")
+                .font_family("PT Sans")
                 .child(label);
             if at_bottom {
-                chip.bottom(px(6.))
+                chip.right(px(8.)).bottom(px(6.))
             } else {
-                chip.top(px(floor))
+                // Left of the door chip's slot (46px + 8px gap + 8px inset).
+                chip.right(px(62.)).top(px(chrome_row))
             }
         };
         // Paint the active card LAST so it sits ON TOP of any neighbour it
@@ -22228,7 +22232,24 @@ impl Editor {
         if max_scroll <= 0. {
             return None;
         }
-        let track_h = (f32::from(window.viewport_size().height) - BAR_HEIGHT
+        // The rail is a child of the content surface, which is ALREADY
+        // inset by the CSD shadow gutter on each untiled edge — and clips
+        // (overflow_hidden). Placement is therefore content-LOCAL:
+        // content_width() is the visible width, y starts below the top
+        // gutter. Painting at raw viewport width pushed the rail past the
+        // clipped edge — present maximized (gutter 0), gone floating
+        // (content_width's own lesson, inherited late). Only the mouse
+        // handlers see window-ABSOLUTE positions, which do include the
+        // gutter — track_top carries it for them alone.
+        let (gutter_top, gutter_bottom) = match window.window_decorations() {
+            Decorations::Client { tiling } => (
+                if tiling.top { 0. } else { CSD_GUTTER },
+                if tiling.bottom { 0. } else { CSD_GUTTER },
+            ),
+            Decorations::Server => (0., 0.),
+        };
+        let track_top = gutter_top + BAR_HEIGHT;
+        let track_h = (f32::from(window.viewport_size().height) - track_top - gutter_bottom
             - if self.strip.open { strip::STRIP_H } else { 0. }).max(1.);
         let extent = f32::from(frame.content_height + frame.line_height + px(24.));
         let (thumb_y, thumb_h) = space_thumb(
@@ -22275,13 +22296,17 @@ impl Editor {
         // it would partition the sheet into page-and-not-page
         // (product-owner adjudication over the frame-edge draft; Word's
         // bar is at the window, not the page).
-        let vw = f32::from(window.viewport_size().width);
-        let rail_left = vw - SPACE_RAIL_W;
+        let content_w = self.content_width(window);
+        let rail_left = content_w - SPACE_RAIL_W;
         let dragging = self.space_drag_offset.is_some();
         // A held drag follows the hand anywhere (P7): the hit surface grows
-        // to the whole viewport for the drag's lifetime. At rest the column
-        // already touches the screen edge — throw-right lands by geometry.
-        let (hit_left, hit_w) = if dragging { (0., vw) } else { (rail_left, SPACE_RAIL_W) };
+        // to the whole content surface for the drag's lifetime. Maximized,
+        // the column touches the screen edge — throw-right lands by geometry.
+        let (hit_left, hit_w) = if dragging {
+            (0., content_w)
+        } else {
+            (rail_left, SPACE_RAIL_W)
+        };
         let bright = self.space_hover || dragging;
         let rail = div().id("space-rail").absolute().left(px(hit_left)).top(px(BAR_HEIGHT))
             .w(px(hit_w)).h(px(track_h)).cursor(CursorStyle::PointingHand)
@@ -22298,7 +22323,7 @@ impl Editor {
                 // A rail jump moves the text under any exit-fade ghosts,
                 // exactly like a wheel scroll — drop them (fleet finding).
                 editor.departing.clear();
-                let local = f32::from(ev.position.y) - BAR_HEIGHT;
+                let local = f32::from(ev.position.y) - track_top;
                 if let Some(ix) = space_mark_hit(&mark_ys_down, local) {
                     let target = mark_hits_down[ix].1;
                     editor.scroll_top = px(target);
@@ -22317,7 +22342,7 @@ impl Editor {
                 cx.notify();
             }))
             .on_mouse_move(cx.listener(move |editor, ev: &MouseMoveEvent, _, cx| {
-                let local = f32::from(ev.position.y) - BAR_HEIGHT;
+                let local = f32::from(ev.position.y) - track_top;
                 if editor.space_drag_offset.is_none() {
                     editor.space_hover_mark = space_mark_hit(&mark_ys, local);
                     cx.notify();
