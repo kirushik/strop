@@ -14216,6 +14216,19 @@ fn runs_for_paragraph(
                     // pointing here), a writer note warm amber. A resting note
                     // keeps its faint amber tint; a resting diagnosis took the
                     // squiggle branch above and never reaches here.
+                    if *is_diagnosis {
+                        // The band keeps the squiggle as its lower border —
+                        // same wave, same ink, same thickness as the resting
+                        // mark, so promotion reads as the SAME mark lit up,
+                        // not a different object (one mark family). The
+                        // writer's own straight underline still outranks it
+                        // (get_or_insert).
+                        underline.get_or_insert(UnderlineStyle {
+                            color: Some(rgb(AI_ACCENT).into()),
+                            thickness: px(1.),
+                            wavy: true,
+                        });
+                    }
                     let tint = if *is_diagnosis {
                         rgba(DIAGNOSIS_TINT_ACTIVE)
                     } else if *active {
