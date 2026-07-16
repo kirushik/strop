@@ -202,11 +202,17 @@ deliberately; small deletions are history-only, everywhere.
 **Chips — two, rhymed** (07 B3/N5 stands; the blind design's one-chip
 merge was its worst sentence — exile feedback must name the dead
 destination, and the shipped graveyard chip's contract is not for
-subverting, P7). Scraps chip warm with its count, pulsing on arrivals;
+subverting, P7). Scraps chip warm, pulsing on arrivals;
 graveyard chip drained with its mark; each hides while its own section
 is on screen; neither exists before its section does. The
 "descending chip" (one chip, two stops) is named-rejected for the same
 feedback-lies reason.
+
+*Resolution (2026-07-16): the chip carries no count.* asides.md §5's
+refusal — "a counter that gamifies compost size" — outranks this
+paragraph's original "with its count"; the chip reads just "Scraps".
+The seam row's live word count and the caret-scoped count control are
+untouched — they are scope arithmetic, not a score.
 
 **Adoption & migration, two paths.** (1) A writer with her own divider
 pile selects it and presses ctrl-shift-a once — the tool has learned

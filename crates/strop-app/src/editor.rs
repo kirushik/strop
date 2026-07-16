@@ -17323,10 +17323,12 @@ impl Editor {
     /// the gradient's descent. Each hides while its own section is on screen;
     /// neither exists before its section does.
     ///
-    /// The warm Scraps chip carries the region's word count and pulses on
-    /// arrivals (an expanding ring — the mockup's chippulse; reduce_motion
-    /// swaps it for the 420ms ARRIVAL_FLASH blink: luminance, not travel);
-    /// click = the travel verb (latch + seam / pile_end).
+    /// The warm Scraps chip is presence-only — just the word "Scraps"
+    /// (asides.md §5's refusal: no counter that gamifies compost size; the
+    /// SEAM row and the caret-scoped count keep the scope arithmetic) — and
+    /// pulses on arrivals (an expanding ring — the mockup's chippulse;
+    /// reduce_motion swaps it for the 420ms ARRIVAL_FLASH blink: luminance,
+    /// not travel); click = the travel verb (latch + seam / pile_end).
     ///
     /// The drained Graveyard chip keeps the band's FULL shipped contract
     /// (surfaces-attention 2): "Graveyard · N" + mark, the 420ms exile blink,
@@ -17342,12 +17344,10 @@ impl Editor {
         let scraps_chip = matches!(
             self.doc.boundary(),
             Some((strop_core::document::BoundaryEra::Tail, _))
-        )
-        .then(|| self.scraps_word_count())
-        .filter(|_| !self.scraps_region_on_screen());
+        ) && !self.scraps_region_on_screen();
         let n = self.doc.graveyard().len();
         let grave_chip = (n > 0 && !self.grave_tail_on_screen()).then_some(n);
-        if scraps_chip.is_none() && grave_chip.is_none() {
+        if !scraps_chip && grave_chip.is_none() {
             return None;
         }
         let reduce_motion = self.config.reduce_motion;
@@ -17369,7 +17369,7 @@ impl Editor {
                 .gap(px(10.))
                 .font_family("PT Sans")
                 .text_size(px(11.5))
-                .when_some(scraps_chip, |d, words| {
+                .when(scraps_chip, |d| {
                     let blink = reduce_motion && self.arrival_flash.is_some();
                     let pulsing = !reduce_motion && self.chip_pulse.is_some();
                     d.child(
@@ -17421,10 +17421,10 @@ impl Editor {
                                             editor.scraps_travel(&ScrapsTravel, window, cx);
                                         }),
                                     )
-                                    .child(format!(
-                                        "Scraps · {}",
-                                        format_thousands(words)
-                                    )),
+                                    // Presence-only: no count (asides.md §5 —
+                                    // a counter would gamify compost size; the
+                                    // seam row owns the live arithmetic).
+                                    .child("Scraps"),
                             ),
                     )
                 })
