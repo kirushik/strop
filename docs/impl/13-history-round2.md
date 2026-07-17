@@ -219,3 +219,17 @@ dashes when parked, returns via the existing Esc/Now path with the
 remains the sole geometric present — no vertical fill, no line from
 the Now chip into the fabric. EN "Now", RU «Сейчас» (provisional,
 corridor-tested), horizontal only.
+
+### Coda (2026-07-17 night): the frame is the CONTENT frame
+
+The four-slot law shipped with a coordinate-domain defect: slots were
+allocated in viewport width but positioned inside the CSD-inset
+content surface, so a floating window clipped Now at the edge and
+pushed close outside it entirely (operator screenshot). The law
+gains its missing sentence: slot arithmetic runs in
+`content_width()`, the same domain the strip's own edges live in —
+any strip control positioned from `viewport_size` is wrong by one
+gutter per floating side. Plus two care rules: 12px minimum air
+between Now and close (opposite verbs never touch), and all four
+slots share one 22px centered band (one row, one optical baseline;
+Now right-aligns as the axis end cap).
