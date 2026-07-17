@@ -95,6 +95,10 @@ pub const IMAGE_PLACEHOLDER_HEIGHT: f32 = 56.0;
 /// clamp and the paint's font size share this one number, so the width
 /// the clamp reasons about IS the width the ink takes.
 pub const CAPTION_SCALE: f32 = 0.8;
+/// Footnotes use the conventional smaller face and proportionate leading.
+pub const FOOTNOTE_SCALE: f32 = 0.85;
+/// Air above the separator and between it and the first note line.
+pub const FOOTNOTE_AIR: f32 = 12.0;
 
 const EPS: f32 = 0.01;
 
@@ -122,6 +126,7 @@ pub struct Style {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
     Body,
+    Footnote,
     Heading(u8),
     Code,
     /// A Divider block: an empty decorated line; Wave B paints the rule.
@@ -254,6 +259,8 @@ pub struct Line {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PageItem {
     Line(Line),
+    /// The short rule opening a page's bottom-set footnote area.
+    FootnoteRule { y: f32 },
     /// A deterministic image box (regions 12): the caller paints the asset
     /// or the missing-image degradation at exactly these bounds; the
     /// caption (one line, no source range — N10) sits under it.
@@ -274,6 +281,7 @@ impl PageItem {
     pub fn anchor(&self) -> usize {
         match self {
             PageItem::Line(l) => l.anchor,
+            PageItem::FootnoteRule { .. } => 0,
             PageItem::Image { anchor, .. } => *anchor,
         }
     }
@@ -423,6 +431,26 @@ pub fn paginate(
         .map(|i| rope.line(i).chars().take_while(|&c| !is_line_break(c)).collect())
         .collect();
     let shaped_lists = shaped_list_paragraphs(&raw, blocks.kinds(), false);
+    let mut refs: Vec<(Range<usize>, String)> = spans
+        .spans()
+        .iter()
+        .filter_map(|s| match &s.attr {
+            InlineAttr::FootnoteRef(id) => Some((s.range.clone(), id.clone())),
+            _ => None,
+        })
+        .collect();
+    refs.sort_by_key(|(r, _)| r.start);
+    let mut note_numbers = std::collections::HashMap::new();
+    for (_, id) in &refs {
+        let next = note_numbers.len() + 1;
+        note_numbers.entry(id.clone()).or_insert(next);
+    }
+    for kind in blocks.kinds() {
+        if let BlockKind::FootnoteDef { id } = kind {
+            let next = note_numbers.len() + 1;
+            note_numbers.entry(id.clone()).or_insert(next);
+        }
+    }
     let mut flows: Vec<Flow> = Vec::new();
     let mut counters: Vec<usize> = Vec::new(); // ordered-list numbering per depth
     for i in 0..rope.len_lines() {
@@ -440,9 +468,6 @@ pub fn paginate(
             counters.clear();
         }
         match &kind {
-            // Definitions stay off-page (v1 law; regions 11): the paginator
-            // skips the block entirely — refs superscript at paint.
-            BlockKind::FootnoteDef { .. } => continue,
             BlockKind::Image { src, .. } => {
                 // Deterministic box: natural size when the measurer knows
                 // it, the editor's decoding placeholder otherwise
@@ -524,6 +549,13 @@ pub fn paginate(
                 Mode::Justified,
                 body_h,
             ),
+            BlockKind::FootnoteDef { .. } => (
+                Role::Footnote,
+                em * 1.5,
+                0.0,
+                Mode::Justified,
+                (body_h * FOOTNOTE_SCALE).round().max(1.0),
+            ),
             _ => (Role::Body, 0.0, 0.0, Mode::Justified, body_h),
         };
         let chars: Vec<char> = ptext.chars().collect();
@@ -559,6 +591,11 @@ pub fn paginate(
             mode0
         };
         let marker = match &kind {
+            BlockKind::FootnoteDef { id } => {
+                let text = note_numbers.get(id).copied().unwrap_or(0).to_string();
+                let width = m.width(&text, Role::Footnote, &[(text.len(), Style::default())]);
+                Some(Marker { text, x: 0.0, width })
+            }
             BlockKind::ListItem { ordered, depth } => {
                 let d = usize::from(*depth);
                 if counters.len() <= d {
@@ -617,13 +654,17 @@ pub fn paginate(
         {
             first.marker = Some(mk);
         }
-        flows.push(Flow::Para {
-            lines,
-            heading: matches!(kind, BlockKind::Heading(_)),
-            list: matches!(kind, BlockKind::ListItem { .. }) || shaped_list,
-        });
+        if let BlockKind::FootnoteDef { id } = kind {
+            flows.push(Flow::Note { id, lines });
+        } else {
+            flows.push(Flow::Para {
+                lines,
+                heading: matches!(kind, BlockKind::Heading(_)),
+                list: matches!(kind, BlockKind::ListItem { .. }) || shaped_list,
+            });
+        }
     }
-    assemble(flows, metrics, body_h)
+    assemble(flows, refs, metrics, body_h)
 }
 
 fn list_number(text: &str) -> Option<u8> {
@@ -1236,6 +1277,7 @@ fn blank_line(role: Role, height: f32, block: usize, anchor: usize) -> Line {
 
 // ---- The paginator (spec 05 §2.7; S8) -------------------------------------------
 
+#[derive(Clone)]
 struct ImageFlow {
     src: String,
     caption: String,
@@ -1246,9 +1288,11 @@ struct ImageFlow {
     anchor: usize,
 }
 
+#[derive(Clone)]
 enum Flow {
     Para { lines: Vec<Line>, heading: bool, list: bool },
     Image(ImageFlow),
+    Note { id: String, lines: Vec<Line> },
 }
 
 /// S8 relaxation levels: 0 full rules · 1 hyphen-avoidance dropped ·
@@ -1276,6 +1320,7 @@ fn head_height(next: &Flow, keep: usize) -> f32 {
             .sum(),
         // Images keep whole: the kept piece is the whole box.
         Flow::Image(img) => img.h + img.caption_h,
+        Flow::Note { .. } => 0.0,
     }
 }
 
@@ -1286,13 +1331,28 @@ struct Asm {
     page_h: f32,
     measure: f32,
     base: usize,
+    page_ix: usize,
+    reserves: Vec<f32>,
+    forced_refs: Vec<(Range<usize>, usize)>,
 }
 
 impl Asm {
+    fn limit(&self) -> f32 {
+        self.page_h - self.reserves.get(self.page_ix).copied().unwrap_or(0.0)
+    }
+
+    fn forced_page(&self, line: &Line) -> usize {
+        self.forced_refs.iter().filter_map(|(range, page)| {
+            line.frags.iter().any(|frag| frag.slice.start < range.end
+                && range.start < frag.slice.end).then_some(*page)
+        }).max().unwrap_or(0)
+    }
+
     fn close(&mut self) {
         if !self.cur.is_empty() {
             self.pages.push(Page { items: std::mem::take(&mut self.cur) });
             self.y = 0.0;
+            self.page_ix += 1;
         }
     }
 
@@ -1311,7 +1371,7 @@ impl Asm {
                 return; // S8: keep-with-next dropped last
             }
             let needed = own + lead + head_height(next, keep);
-            if self.y + needed <= self.page_h + EPS {
+            if self.y + needed <= self.limit() + EPS {
                 return;
             }
             if !self.cur.is_empty() {
@@ -1332,10 +1392,13 @@ impl Asm {
         while !rest.is_empty() {
             let mut level = self.base;
             let k = loop {
-                let room = self.page_h - self.y;
+                let room = self.limit() - self.y;
                 let mut fit = 0usize;
                 let mut h = 0.0f32;
                 for l in &rest {
+                    if self.forced_page(l) > self.page_ix {
+                        break;
+                    }
                     if h + l.height > room + EPS {
                         break;
                     }
@@ -1415,12 +1478,12 @@ impl Asm {
     /// taller than the room left → move to the next page (spec 05 §2.7).
     fn place_image(&mut self, img: ImageFlow) {
         let (mut w, mut h) = (img.w, img.h);
-        if h + img.caption_h > self.page_h {
-            let s = (self.page_h - img.caption_h).max(1.0) / h;
+        if h + img.caption_h > self.limit() {
+            let s = (self.limit() - img.caption_h).max(1.0) / h;
             h *= s;
             w *= s;
         }
-        if self.y + h + img.caption_h > self.page_h + EPS {
+        if self.y + h + img.caption_h > self.limit() + EPS {
             self.close();
         }
         self.cur.push(PageItem::Image {
@@ -1437,7 +1500,13 @@ impl Asm {
     }
 }
 
-fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout {
+fn assemble_once(
+    flows: Vec<Flow>,
+    metrics: &BookMetrics,
+    body_h: f32,
+    reserves: Vec<f32>,
+    forced_refs: Vec<(Range<usize>, usize)>,
+) -> BookLayout {
     let capacity = (metrics.page_height / body_h).floor() as usize;
     let mut asm = Asm {
         pages: vec![],
@@ -1446,6 +1515,9 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
         page_h: metrics.page_height,
         measure: metrics.measure,
         base: usize::from(capacity < RELAX_CAPACITY),
+        page_ix: 0,
+        reserves,
+        forced_refs,
     };
     let mut q: VecDeque<Flow> = flows.into();
     let mut prev_text = false;
@@ -1458,6 +1530,7 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
         let is_text = match &flow {
             Flow::Para { lines, .. } => lines.iter().any(|l| !l.frags.is_empty()),
             Flow::Image(_) => true,
+            Flow::Note { .. } => false,
         };
         let is_list = matches!(&flow, Flow::Para { list: true, .. });
         if prev_list != is_list && asm.y > 0.0 {
@@ -1506,6 +1579,7 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
                 }
             }
             Flow::Image(img) => asm.place_image(img),
+            Flow::Note { .. } => unreachable!("notes are separated before body assembly"),
         }
     }
     if prev_list && asm.y > 0.0 {
@@ -1517,6 +1591,104 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
         asm.pages.push(Page { items: vec![] });
     }
     BookLayout { pages: asm.pages }
+}
+
+fn assemble(
+    flows: Vec<Flow>,
+    refs: Vec<(Range<usize>, String)>,
+    metrics: &BookMetrics,
+    body_h: f32,
+) -> BookLayout {
+    let mut body = Vec::new();
+    let mut notes = Vec::new();
+    for flow in flows {
+        match flow {
+            Flow::Note { id, lines } => notes.push((id, lines)),
+            other => body.push(other),
+        }
+    }
+    if notes.is_empty() {
+        return assemble_once(body, metrics, body_h, vec![], vec![]);
+    }
+
+    let mut reserves = Vec::new();
+    let mut assignments: Vec<Vec<usize>> = Vec::new();
+    let mut forced_refs = Vec::new();
+    let mut book = assemble_once(body.clone(), metrics, body_h, reserves.clone(), forced_refs.clone());
+    for _ in 0..32 {
+        let mut next = vec![Vec::new(); book.pages.len().max(1)];
+        let mut seen = std::collections::HashSet::new();
+        for (range, id) in &refs {
+            let Some(note_ix) = notes.iter().position(|(note_id, _)| note_id == id) else {
+                continue;
+            };
+            if !seen.insert(note_ix) {
+                continue;
+            }
+            let page_ix = book.pages.iter().position(|page| page.items.iter().any(|item| {
+                matches!(item, PageItem::Line(line) if line.frags.iter().any(|frag|
+                    frag.slice.start < range.end && range.start < frag.slice.end))
+            })).unwrap_or(book.pages.len().saturating_sub(1));
+            next[page_ix].push(note_ix);
+        }
+        let final_ix = next.len() - 1;
+        for note_ix in 0..notes.len() {
+            if seen.insert(note_ix) {
+                next[final_ix].push(note_ix);
+            }
+        }
+        let next_reserves: Vec<f32> = next.iter().map(|on_page| {
+            if on_page.is_empty() {
+                0.0
+            } else {
+                FOOTNOTE_AIR + on_page.iter().flat_map(|&i| &notes[i].1).map(|l| l.height).sum::<f32>()
+            }
+        }).collect();
+        if next == assignments && next_reserves == reserves {
+            assignments = next;
+            reserves = next_reserves;
+            break;
+        }
+        assignments = next;
+        reserves = next_reserves;
+        for (range, id) in &refs {
+            if let Some(note_ix) = notes.iter().position(|(note_id, _)| note_id == id)
+                && let Some(page_ix) = assignments.iter().position(|notes| notes.contains(&note_ix))
+            {
+                if let Some((_, floor)) = forced_refs.iter_mut().find(|(r, _)| r == range) {
+                    *floor = (*floor).max(page_ix);
+                } else {
+                    forced_refs.push((range.clone(), page_ix));
+                }
+            }
+        }
+        book = assemble_once(
+            body.clone(), metrics, body_h, reserves.clone(), forced_refs.clone(),
+        );
+    }
+
+    // One final pass uses the converged reservation. Whole notes move with
+    // their reference line in v1; definitions are not split across pages.
+    book = assemble_once(body, metrics, body_h, reserves.clone(), forced_refs);
+    for (page_ix, on_page) in assignments.into_iter().enumerate() {
+        if on_page.is_empty() {
+            continue;
+        }
+        let Some(page) = book.pages.get_mut(page_ix) else { continue };
+        let reserve = reserves[page_ix];
+        let mut y = metrics.page_height - reserve;
+        page.items.push(PageItem::FootnoteRule { y: y + FOOTNOTE_AIR / 2.0 });
+        y += FOOTNOTE_AIR;
+        for note_ix in on_page {
+            for line in &notes[note_ix].1 {
+                let mut line = line.clone();
+                line.y = y;
+                y += line.height;
+                page.items.push(PageItem::Line(line));
+            }
+        }
+    }
+    book
 }
 
 #[cfg(test)]
@@ -2174,7 +2346,7 @@ mod tests {
         );
     }
 
-    /// Per-BlockKind rules: footnote defs skipped, quotes indented 1 em,
+    /// Per-BlockKind rules: footnote defs bottom-set, quotes indented 1 em,
     /// code ragged, list markers as unanchored decoration, blank lines kept.
     #[test]
     fn block_kinds_render_by_their_rules() {
@@ -2209,7 +2381,9 @@ mod tests {
         assert_eq!(i2.marker.as_ref().unwrap().text, "2.");
         assert!(i1.marker.as_ref().unwrap().x < i1.x, "the marker hangs left of the text");
         assert_eq!(i1.x, 24.0, "list text indents 1.5 em");
-        assert!(by_block(7).is_none(), "FootnoteDef blocks are skipped entirely");
+        let note = by_block(7).expect("FootnoteDef is bottom-set");
+        assert!(matches!(note.role, Role::Footnote));
+        assert_eq!(note.marker.as_ref().unwrap().text, "1");
         let img = book.pages.iter().flat_map(|p| &p.items).find_map(|i| match i {
             PageItem::Image { block: 8, width, height, x, caption, .. } =>
                 Some((*width, *height, *x, caption.clone())),
@@ -2219,6 +2393,67 @@ mod tests {
         assert_eq!((w, h), (300.0, 150.0), "natural size fits the measure");
         assert_eq!(x, 150.0, "centered");
         assert_eq!(caption, "image-line", "the caption is the block's own line");
+    }
+
+    fn footnoted(text: &str, kinds: Vec<BlockKind>, refs: &[(Range<usize>, &str)],
+        page_lines: usize) -> BookLayout
+    {
+        let mut spans = SpanSet::default();
+        for (range, id) in refs {
+            spans.add(range.clone(), InlineAttr::FootnoteRef((*id).into()));
+        }
+        paginate(text, &spans, &BlockMap::from_kinds(kinds),
+            &metrics(600.0, page_lines), &mut FakeM, &mut FakeH)
+    }
+
+    #[test]
+    fn footnote_reservation_moves_ref_line_and_note_together() {
+        let text = "one\ntwo\nthree\nfour x\nfive\nnote words";
+        let kinds = vec![
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "a".into() },
+        ];
+        let x = text.find('x').unwrap();
+        let book = footnoted(text, kinds, &[(x..x + 1, "a")], 5);
+        let ref_page = book.pages.iter().position(|page| page.items.iter().any(|item| {
+            matches!(item, PageItem::Line(line) if line.frags.iter().any(|f| f.slice.contains(&x)))
+        })).unwrap();
+        let note_page = book.pages.iter().position(|page| page.items.iter().any(|item| {
+            matches!(item, PageItem::Line(line) if matches!(line.role, Role::Footnote))
+        })).unwrap();
+        assert_eq!(ref_page, note_page, "a ref never outruns its bottom-set note");
+        assert_eq!(ref_page, 1, "the reference line moves when its note reserve will not fit");
+        let rule_y = book.pages[ref_page].items.iter().find_map(|item| match item {
+            PageItem::FootnoteRule { y } => Some(*y),
+            _ => None,
+        }).unwrap();
+        assert!(rule_y < metrics(600.0, 5).page_height);
+    }
+
+    #[test]
+    fn footnotes_number_by_ref_order_and_orphans_finish_last() {
+        let text = "z b then a\ndef a\ndef b\norphan";
+        let b = text.find('b').unwrap();
+        let a = text.rfind('a').unwrap_or(0).min(text.find(" a").unwrap() + 1);
+        let book = footnoted(text, vec![
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "a".into() },
+            BlockKind::FootnoteDef { id: "b".into() },
+            BlockKind::FootnoteDef { id: "orphan".into() },
+        ], &[(b..b + 1, "b"), (a..a + 1, "a")], 8);
+        let notes: Vec<&Line> = book.pages.iter().flat_map(|p| &p.items).filter_map(|item| match item {
+            PageItem::Line(line) if matches!(line.role, Role::Footnote) => Some(line),
+            _ => None,
+        }).collect();
+        assert_eq!(notes.iter().map(|l| l.marker.as_ref().unwrap().text.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2", "3"]);
+        assert_eq!(notes.last().unwrap().block, 3, "the orphan is last on the final page");
+        assert_eq!(notes.last().unwrap().y + notes.last().unwrap().height,
+            metrics(600.0, 8).page_height, "the notes block is bottom-set");
     }
 
     /// Images keep whole: move to the next page when the room is short,

@@ -23752,6 +23752,7 @@ fn cr_frag_size(
     match role {
         // Headings set in Demi at ~1.15× body (spec §2.7).
         crate::bookpage::Role::Heading(_) => (body * 1.15).round(),
+        crate::bookpage::Role::Footnote => body * crate::bookpage::FOOTNOTE_SCALE,
         crate::bookpage::Role::Code => body * CR_CODE_SIZE,
         _ if !runs.is_empty() && runs.iter().all(|(_, st)| st.code) => body * CR_CODE_SIZE,
         _ => body,
@@ -23901,7 +23902,7 @@ enum CrOp {
     Wash { x: f32, y: f32, w: f32, h: f32 },
     Underline { x: f32, y: f32, w: f32 },
     Strike { x: f32, y: f32, w: f32 },
-    Rule { x: f32, y: f32, w: f32 },
+    Rule { x: f32, y: f32, w: f32, alpha: f32 },
     Image { x: f32, y: f32, w: f32, h: f32, src: String },
 }
 
@@ -26071,10 +26072,10 @@ impl Element for BookElement {
                             },
                         );
                     }
-                    CrOp::Rule { x, y, w } => {
+                    CrOp::Rule { x, y, w, alpha } => {
                         window.paint_quad(fill(
                             Bounds::new(origin + point(px(*x), px(*y)), size(px(*w), px(1.))),
-                            rgb(RULE_COLOR),
+                            tint(TEXT_COLOR, *alpha),
                         ));
                     }
                     CrOp::Image { x, y, w, h, src } => {
@@ -26139,20 +26140,25 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                         x: g.side + g.measure * 0.25,
                         y: ly + line.height / 2.,
                         w: g.measure * 0.5,
+                        alpha: 1.0,
                     });
                     continue;
                 }
                 if let Some(mk) = &line.marker {
                     let run = TextRun {
                         len: mk.text.len(),
-                        font: cr_font(Role::Body, crate::bookpage::Style::default()),
+                        font: cr_font(line.role, crate::bookpage::Style::default()),
                         color: rgb(TEXT_COLOR).into(),
                         background_color: None,
                         underline: None,
                         strikethrough: None,
                     };
-                    let shaped =
-                        ts.shape_line(SharedString::from(mk.text.clone()), px(g.body), &[run], None);
+                    let shaped = ts.shape_line(
+                        SharedString::from(mk.text.clone()),
+                        px(cr_frag_size(line.role, &[(mk.text.len(), Default::default())], g.body)),
+                        &[run],
+                        None,
+                    );
                     ops.push(CrOp::Ink { x: g.side + mk.x, y: ly, line_h: line.height, shaped: Box::new(shaped) });
                 }
                 for (frag_ix, frag) in line.frags.iter().enumerate() {
@@ -26254,6 +26260,12 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                     ops.push(CrOp::Ink { x: g.side + frag.x, y: ly, line_h: line.height, shaped: Box::new(shaped) });
                 }
             }
+            PageItem::FootnoteRule { y } => ops.push(CrOp::Rule {
+                x: g.side,
+                y: g.top + y,
+                w: g.measure / 3.0,
+                alpha: 0.45,
+            }),
             PageItem::Image { x, y, width, height, src, caption, .. } => {
                 ops.push(CrOp::Image {
                     x: g.side + x,
