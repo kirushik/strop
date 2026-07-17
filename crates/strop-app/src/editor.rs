@@ -23785,6 +23785,20 @@ fn cr_text_run(len: usize, role: crate::bookpage::Role, st: crate::bookpage::Sty
     }
 }
 
+/// Marks which cross an inter-fragment word space. Fragments deliberately
+/// exclude spaces so justification can set their advance independently;
+/// the paint joins equal marks at the two neighboring edges.
+fn cr_gap_marks(
+    left: crate::bookpage::Style,
+    right: crate::bookpage::Style,
+) -> (bool, bool, bool) {
+    (
+        left.highlight && right.highlight,
+        (left.underline || left.link) && (right.underline || right.link),
+        left.strike && right.strike,
+    )
+}
+
 /// The engine's width oracle over the real shaper (spec §2.6): gpui's
 /// LineLayoutCache is frame-scoped, so the view keeps its own immortal
 /// `(string, style) → width` cache for pagination.
@@ -23884,6 +23898,9 @@ struct CrDrag {
 #[derive(Clone)]
 enum CrOp {
     Ink { x: f32, y: f32, line_h: f32, shaped: Box<gpui::ShapedLine> },
+    Wash { x: f32, y: f32, w: f32, h: f32 },
+    Underline { x: f32, y: f32, w: f32 },
+    Strike { x: f32, y: f32, w: f32 },
     Rule { x: f32, y: f32, w: f32 },
     Image { x: f32, y: f32, w: f32, h: f32, src: String },
 }
@@ -25976,6 +25993,34 @@ impl Element for BookElement {
                     ),
                 ));
             }
+            // Run washes and their justified-space bridges sit beneath all
+            // glyphs and beneath the reader's transient selection (S14).
+            for op in &p.ops {
+                match op {
+                    CrOp::Ink { x, y, line_h, shaped } => {
+                        shaped
+                            .paint_background(
+                                origin + point(px(*x), px(*y)),
+                                px(*line_h),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
+                    }
+                    CrOp::Wash { x, y, w, h } => {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                origin + point(px(*x), px(*y)),
+                                size(px(*w), px(*h)),
+                            ),
+                            rgba(HIGHLIGHT_COLOR),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             // Selection tint and the anchor flash: painted before ink (S14).
             for &(x, y, w, h) in &p.tints {
                 window.paint_quad(fill(
@@ -26003,6 +26048,28 @@ impl Element for BookElement {
                                 cx,
                             )
                             .ok();
+                    }
+                    CrOp::Wash { .. } => {}
+                    CrOp::Underline { x, y, w } => {
+                        window.paint_underline(
+                            origin + point(px(*x), px(*y)),
+                            px(*w),
+                            &UnderlineStyle {
+                                thickness: px(1.),
+                                color: Some(rgb(TEXT_COLOR).into()),
+                                wavy: false,
+                            },
+                        );
+                    }
+                    CrOp::Strike { x, y, w } => {
+                        window.paint_strikethrough(
+                            origin + point(px(*x), px(*y)),
+                            px(*w),
+                            &StrikethroughStyle {
+                                thickness: px(1.),
+                                color: Some(rgb(TEXT_COLOR).into()),
+                            },
+                        );
                     }
                     CrOp::Rule { x, y, w } => {
                         window.paint_quad(fill(
@@ -26088,7 +26155,7 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                         ts.shape_line(SharedString::from(mk.text.clone()), px(g.body), &[run], None);
                     ops.push(CrOp::Ink { x: g.side + mk.x, y: ly, line_h: line.height, shaped: Box::new(shaped) });
                 }
-                for frag in &line.frags {
+                for (frag_ix, frag) in line.frags.iter().enumerate() {
                     let runs: Vec<TextRun> = frag
                         .runs
                         .iter()
@@ -26100,6 +26167,42 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                         &runs,
                         None,
                     );
+                    if let Some(next) = line.frags.get(frag_ix + 1) {
+                        let left = frag.runs.last().map(|r| r.1).unwrap_or_default();
+                        let right = next.runs.first().map(|r| r.1).unwrap_or_default();
+                        let (wash, underline, strike) = cr_gap_marks(left, right);
+                        let gap_x = g.side + frag.x + f32::from(shaped.width());
+                        let gap_w = (g.side + next.x - gap_x).max(0.);
+                        let padding =
+                            (line.height - f32::from(shaped.ascent) - f32::from(shaped.descent))
+                                / 2.;
+                        if wash && gap_w > 0. {
+                            ops.push(CrOp::Wash {
+                                x: gap_x,
+                                y: ly,
+                                w: gap_w,
+                                h: line.height,
+                            });
+                        }
+                        if underline && gap_w > 0. {
+                            ops.push(CrOp::Underline {
+                                x: gap_x,
+                                y: ly + padding + f32::from(shaped.ascent)
+                                    + f32::from(shaped.descent) * 0.618,
+                                w: gap_w,
+                            });
+                        }
+                        if strike && gap_w > 0. {
+                            ops.push(CrOp::Strike {
+                                x: gap_x,
+                                y: ly + ((f32::from(shaped.ascent) * 0.5
+                                    + padding
+                                    + f32::from(shaped.ascent))
+                                    * 0.5),
+                                w: gap_w,
+                            });
+                        }
+                    }
                     // Footnote refs paint as superior figures over their
                     // invisible carriers, numbered by slice order
                     // (regions 11; the fn_marks machinery's grammar).
@@ -26121,7 +26224,7 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                             let sup_run = TextRun {
                                 len: label.len(),
                                 font: cr_font(line.role, crate::bookpage::Style::default()),
-                                color: rgb(LINK_COLOR).into(),
+                                color: rgb(TEXT_COLOR).into(),
                                 background_color: None,
                                 underline: None,
                                 strikethrough: None,
@@ -28369,6 +28472,24 @@ mod tests {
         assert_eq!(runs[2].font.weight, FontWeight::default());
         assert!(runs[2].background_color.is_some());
         assert!(runs[0].background_color.is_none());
+    }
+
+    #[test]
+    fn cold_read_marks_join_only_matching_frag_edges() {
+        let marked = crate::bookpage::Style {
+            highlight: true,
+            underline: true,
+            strike: true,
+            ..Default::default()
+        };
+        assert_eq!(cr_gap_marks(marked, marked), (true, true, true));
+
+        let link = crate::bookpage::Style { link: true, ..Default::default() };
+        assert_eq!(cr_gap_marks(marked, link), (false, true, false));
+        assert_eq!(
+            cr_gap_marks(marked, crate::bookpage::Style::default()),
+            (false, false, false)
+        );
     }
 
     #[test]
