@@ -37,7 +37,10 @@ rm -f /tmp/strop-wshot.log
 RUNDIR=$(mktemp -d); chmod 700 "$RUNDIR"
 LOG="$RUNDIR/strop.log"
 APP=; SWAY=
-trap 'kill $APP $SWAY 2>/dev/null; cp -f "$LOG" /tmp/strop-wshot.log 2>/dev/null; rm -rf "$CFG" "$RUNDIR"' EXIT
+# Every trap command tolerates failure (Copilot, PR #28): under
+# `set -e` a failing kill (empty PID after an early exit) would
+# abort the trap mid-way, leaking $RUNDIR and skipping the log copy.
+trap 'kill $APP $SWAY 2>/dev/null || true; cp -f "$LOG" /tmp/strop-wshot.log 2>/dev/null || true; rm -rf "$CFG" "$RUNDIR"' EXIT
 WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
   XDG_RUNTIME_DIR="$RUNDIR" sway -c "$CFG" > "$RUNDIR/sway.log" 2>&1 &
 SWAY=$!

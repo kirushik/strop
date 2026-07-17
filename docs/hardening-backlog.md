@@ -60,3 +60,14 @@ plus trailing prose; (b) a cold-read page showing a reference and
 its bottom-set note together; (c) a styled cold-read page combining
 highlight, underline, strike, and the diagnosis band. Smoke dumps
 assert the geometry; the stills stay for eyes.
+
+## 6. Wayland raise via activation tokens (fork patch)
+
+True raise-on-command for a second window on Wayland requires
+xdg-activation done right: the FOCUSED surface (the editor) mints a
+token from its live input serial and activates the TARGET surface
+(the keymap). gpui only self-activates from stored state, which
+Mutter rejects. Fork patch ~40-80 lines in wayland/{window,client}
+(a `PlatformWindow::activate_from(&other)` or equivalent), no-op on
+other backends; then ctrl-?'s toggle could grow the raise state
+back where it genuinely works. Blocked on the next fork-pin bump.

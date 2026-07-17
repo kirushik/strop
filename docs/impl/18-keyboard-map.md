@@ -68,3 +68,37 @@ windows until resolved, quit closes both, reference close never
 saves/quits, independent bounds. Rig: stills at default/narrow/
 short; two-surface capture support. Manual per-OS close/activation
 checks remain listed risks.
+
+## Amendment (2026-07-17 night): the card you can grab
+
+Live use + a fork-source research pass (Wayland ground truth)
+rewrote three clauses:
+
+- **Chrome**: `WindowDecorations::Client` everywhere, self-drawn —
+  the Server request gave GNOME a bare undecorated rectangle and
+  sway/macOS an OS titlebar: one object, two costumes. Titlebar-less
+  on every platform; the header band (title + close saltire) is
+  visible anatomy, and the editor's CSD kit (gutter, rounding,
+  resize strips, client inset) is the one decoration language.
+- **The whole surface drags.** window_control_area(Drag) +
+  start_window_move from pointer-down on the ROOT — lawful here
+  precisely because the sheet is pure reference: no selectable
+  text, no clickable rows. Close and the resize strips opt out
+  (occlude + stop_propagation). Revisit if any row ever becomes
+  interactive.
+- **ctrl-? is a strict two-state toggle**: absent → open, present →
+  close, from either window's focus. The former raise clause is
+  RETIRED: on Wayland, raise is protocol-impossible without an
+  xdg-activation token minted by the focused surface, which gpui
+  does not plumb (fork patch filed in docs/hardening-backlog.md);
+  a three-state grammar that silently no-ops on the primary
+  platform fails the every-press-visibly-acts test.
+- **Placement honesty**: beside-the-editor placement and bounds
+  restore happen only where the platform accepts coordinates
+  (X11/macOS/Windows). Wayland gets compositor placement, no
+  pretense — the requested origin is zeroed at map (fork source,
+  wayland/window.rs:685) and no set-position exists.
+- **app_id**: every Strop window sets a stable app_id ("strop") —
+  desktop-file matching, icon grouping, and the prerequisite for
+  the future activation patch. Its absence made activate_window a
+  silent no-op.

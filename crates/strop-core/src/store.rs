@@ -1519,7 +1519,11 @@ impl Store {
         })
     }
 
-    /// Has anything moved past what the last save wrote (or the open read)?
+    /// Has anything moved past the last PREPARED save (or the open read)?
+    /// The frontiers baseline advances in `prepare_save`, before the bytes
+    /// land — deliberately optimistic: a failed write raises `save_error`,
+    /// and every quit path consults that alongside this predicate, so a
+    /// lost write can never look clean (see `prepare_save`'s comment).
     /// Doc ops via the frontiers baseline; the journal's unpersisted tail by
     /// count (its items live editor-side until a save pushes them). The
     /// quit guard's clean predicate: false means a close may skip the final
