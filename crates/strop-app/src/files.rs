@@ -60,11 +60,37 @@ pub fn resolve_portal_path(path: impl Into<PathBuf>) -> PathBuf {
 /// Still under the portal mount — i.e. `resolve_portal_path` couldn't
 /// escape it (dead doc id, portal absent). Such a path names plumbing,
 /// not a place a writer knows.
+///
+/// Field forensics 2026-07-17: a dev build launched through the snap
+/// rustup's `cargo run` lives in a `snap.rustup.cargo-*.scope` cgroup, so
+/// xdg-desktop-portal classifies it as a CONFINED snap app — the file
+/// chooser then hands out doc-portal paths, and GetHostPaths refuses that
+/// same caller, so resolution fails 100% in-app while succeeding from any
+/// unconfined shell. Identical binary, different cgroup, opposite result.
 fn is_portal_path(path: &Path) -> bool {
     let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
         return false;
     };
     portal_path_parts(path, Path::new(&runtime_dir)).is_some()
+}
+
+/// The host directory a sibling of `path` should be minted in — rename
+/// targets, "save a copy" seeds, recovery copies. A resolvable path
+/// answers with its own parent. An UNRESOLVABLE portal path must never
+/// mint one: a foreign filename written into a single-file doc mount
+/// lands on the host as a hidden `.xdp-*` temp that no finalize ever
+/// renames — the writer's file goes invisible (observed live,
+/// 2026-07-17). The fallback is the one place Strop promises files
+/// live: the documents folder.
+pub fn host_parent_or_documents(path: &Path) -> PathBuf {
+    let resolved = resolve_portal_path(path.to_path_buf());
+    if is_portal_path(&resolved) {
+        return crate::paths::documents_dir();
+    }
+    resolved
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::paths::documents_dir)
 }
 
 /// First free "Untitled.strop" / "Untitled 2.strop" / … in the Strop folder.
@@ -533,6 +559,7 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", tmp.join("state"));
             std::env::set_var("XDG_DATA_HOME", tmp.join("data"));
             std::env::set_var("XDG_CONFIG_HOME", tmp.join("config"));
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.join("runtime"));
         }
 
         // Recents: round-trip, dedupe, most-recent-first.
@@ -553,6 +580,15 @@ mod tests {
         assert!(u1.parent().unwrap().is_dir(), "folder exists from birth");
         std::fs::write(&u1, b"x").unwrap();
         assert!(untitled_path().to_string_lossy().contains("Untitled 2"));
+
+        // Sibling minting: a host path mints next to itself; an
+        // unresolvable portal path must NEVER mint inside the doc mount
+        // (the invisible `.xdp-*` temp trap) — it falls back to the
+        // documents folder. The fake doc id can't resolve whether or not
+        // a session bus is reachable, so this holds hermetically.
+        assert_eq!(host_parent_or_documents(&a), tmp);
+        let trapped = tmp.join("runtime/doc/deadbeef/Chapter.strop");
+        assert_eq!(host_parent_or_documents(&trapped), untitled_path().parent().unwrap());
 
         // Legacy hidden scratch migrates into the visible folder.
         let scratch = tmp.join("data/strop/scratch.strop");

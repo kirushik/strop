@@ -759,6 +759,15 @@ impl Store {
         match fs::rename(&self.path, &new_path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // Escaping a portal mount crosses filesystems (FUSE → host);
+            // rename can't, copy-then-remove can. If the remove fails,
+            // keep both files — two copies beat zero.
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                fs::copy(&self.path, &new_path)?;
+                if let Err(e) = fs::remove_file(&self.path) {
+                    eprintln!("strop: rename left the old file behind: {e}");
+                }
+            }
             Err(e) => return Err(e),
         }
         self.path = new_path;
@@ -1573,6 +1582,30 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"new snapshot");
         assert!(!sidecar_path(&path, ".tmp").exists());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rename_survives_a_filesystem_boundary() {
+        // temp_dir is usually tmpfs while target/ sits on the repo's disk —
+        // when they differ this exercises the CrossesDevices copy fallback
+        // (the portal-mount escape); when they don't, plain rename covers
+        // the same contract. Either way: content moves, old path empties.
+        let old = temp_path("rename-across");
+        let _ = fs::remove_file(&old);
+        let (mut store, loaded) = Store::open(&old).unwrap();
+        assert!(loaded.is_none());
+        fs::write(&old, b"the manuscript").unwrap();
+        let far_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/strop-test-rename");
+        fs::create_dir_all(&far_dir).unwrap();
+        let new = far_dir.join(format!("moved-{}.strop", std::process::id()));
+        let _ = fs::remove_file(&new);
+
+        store.rename_file(&new).unwrap();
+        assert_eq!(store.path(), new);
+        assert_eq!(fs::read(&new).unwrap(), b"the manuscript");
+        assert!(!old.exists());
+        let _ = fs::remove_file(&new);
     }
 
     #[test]

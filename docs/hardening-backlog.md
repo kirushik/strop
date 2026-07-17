@@ -100,3 +100,20 @@ LineWrapper (suppress the candidate before `—`/`–` when preceded
 by NBSP or word char + space), or acceptance that the editor
 surface tolerates it. Decide once the punctuation patch has field
 time.
+
+## 9. Footnotes across the clipboard (paste semantics)
+
+Field report 2026-07-17: pasting a selection that carries a footnote
+turns the footnote index into a regular line item. Two mechanisms
+stack: (a) `FootnoteRef` spans are deliberately excluded from the
+stage-1 envelope (a ref's id is document-scoped), so the carrier
+digits paste as bare prose; (b) a `FootnoteDef` block pasted
+mid-document keeps its kind but no longer sits in the trailing
+definition run (H4), so it renders as an ordinary line, not in the
+footnote zone. The fix is design-first, not code-first: a pasted def
+should re-home to the trailing run and renumber against the
+destination's ids (insert_footnote already owns the numbering law),
+and a pasted ref should either re-bind to its traveling def (when
+the selection carried both) or degrade to plain digits (when it
+did not). Wants the exact field repro pinned as a document test
+before any implementation.

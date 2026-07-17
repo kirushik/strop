@@ -4935,11 +4935,10 @@ impl Editor {
             eprintln!("strop: no document to copy");
             return;
         };
-        let dir = store
-            .path()
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // Seed the dialog with the HOST directory: seeding a portal FUSE
+        // dir invites the picker to mint a foreign name inside the doc
+        // mount — the invisible-temp trap (files.rs law).
+        let dir = crate::files::host_parent_or_documents(store.path());
         let suggested = format!(
             "{} copy.strop",
             store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
@@ -6673,9 +6672,10 @@ impl Editor {
         }
         if let Some(store) = &mut self.store {
             let old = store.path().to_owned();
-            let new_path = old
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
+            // Mint the new name in the HOST directory, never inside the
+            // portal mount — a foreign filename in a doc mount becomes an
+            // invisible `.xdp-*` temp on the host (files.rs law).
+            let new_path = crate::files::host_parent_or_documents(&old)
                 .join(format!("{stem}.strop"));
             match store.rename_file(new_path) {
                 Ok(()) => {
@@ -7713,8 +7713,9 @@ impl Editor {
         let QuitGuard::Failed(previous_error) = &self.quit_guard else { return };
         let previous_error = previous_error.clone();
         let Some(store) = &self.store else { return };
-        let dir = store.path().parent().map(ToOwned::to_owned)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // Same host-directory law as save_copy_as: never seed the picker
+        // with a portal FUSE dir (files.rs, the invisible-temp trap).
+        let dir = crate::files::host_parent_or_documents(store.path());
         let suggested = format!(
             "{} recovery.strop",
             store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
