@@ -68,10 +68,19 @@ shipping table.*
 - **The empty-pair rule, split by tradition:**
   - EN doubles: after “ with nothing following → ” ("" becomes “”).
   - EN singles: after ‘ → ’ (same opens_after bug).
-  - RU: **after „ → “ only; NEVER after «** — «„ is *correct*
-    nesting («„Ирония судьбы“ вышла…», typed as two `"`), and
-    Russian has no third level so `"` after „ can never open deeper
-    (today it mints «„„, garbage).
+  - RU: **after „ → “; after « → »** (2026-07-17 REVERSAL of the
+    original never-after-« ruling, product-owner adjudication on
+    live use). The original panel read «„ as correct linear nesting
+    («„Ирония судьбы“ вышла…»); in practice the dominant keystroke
+    is the fill-in habit (`""` then arrow-left), and the «„ it
+    minted has no in-flow recovery. The reversal keeps nesting
+    reachable both ways: `"` typed *inside* the fresh «» sees » as
+    its suffix (exempted from the empty-pair rule) and nests „; and
+    with content already after the caret the suffix guard never
+    fires, so the linear-nester-into-existing-text also keeps „.
+    The one case that pays: typing «"Ирония… linearly at the end of
+    the document now needs the extra arrow-left — judged the rarer
+    habit by far.
   - The rule runs BEFORE open/close classification, and requires a
     **suffix guard**: fires only when the next char is
     end-of-paragraph, whitespace, or closing punctuation — the

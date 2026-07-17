@@ -2007,9 +2007,15 @@ struct ParagraphLayout {
 // promoted band's boundary the same mark rather than a second approximation.
 const DIAGNOSIS_WAVE_AMPLITUDE: f32 = 0.8;
 const DIAGNOSIS_WAVE_LENGTH: f32 = 9.;
+// The shader draws the wavy stroke inside a 3px-high box whose TOP is the
+// underline y (`paint_underline`: height = thickness * 3) — the stroke's
+// centerline rides mid-box, 1.5 stroke-widths down. Tracing the band's
+// edge at the raw underline y left a hairline of daylight above every
+// coincident resting squiggle (operator screenshot, 2026-07-17).
+const DIAGNOSIS_WAVE_CENTER: f32 = 1.5;
 
 fn diagnosis_wave_y(x_from_segment: f32, underline_y: f32) -> f32 {
-    underline_y
+    underline_y + DIAGNOSIS_WAVE_CENTER
         + (x_from_segment * std::f32::consts::TAU / DIAGNOSIS_WAVE_LENGTH).sin()
             * DIAGNOSIS_WAVE_AMPLITUDE
 }
@@ -2025,6 +2031,11 @@ fn paint_diagnosis_band(
     if right <= left {
         return;
     }
+    // A breath of air at the top: the line above's squiggle bottoms out
+    // ~2.8px past its underline y, which can graze this band's top edge
+    // (same operator screenshot). Well under padding_top, so no glyph's
+    // ascender is ever uncovered.
+    let top = top + px(1.5);
     let mut path = PathBuilder::fill();
     path.move_to(origin + point(left, top));
     path.line_to(origin + point(right, top));
@@ -20963,17 +20974,18 @@ impl Editor {
             })
             .collect();
         let (above_n, below_n) = (above.len(), below.len());
-        // The margin-chrome law (2026-07-17 arrangement round): ONE pill
-        // family in TWO fixed rows. Every piece of lane chrome shares the
-        // door chip's geometry (18px, full radius, PT Sans 10.5) and
-        // right-aligns to the cards' edge. Top row: [N above][door chip],
-        // in the top padding band — never overlapping a card. Bottom row:
-        // [N below] alone. Warm fill on the count pills (they count the
-        // writer's notes too), cool on the chip — provenance in one row.
+        // The margin-chrome law (2026-07-17 arrangement round, amended same
+        // day): ONE pill family in TWO fixed rows, sharing the door chip's
+        // geometry (18px, full radius, PT Sans 10.5). The above/below count
+        // pills CENTER on the cards' column — the pair reads as one
+        // vertical axis, top and bottom rhyming (operator adjudication over
+        // the right-align draft; the door chip alone holds the corner).
+        // Top row rides the padding band — never overlapping a card.
+        // Warm fill on the count pills (they count the writer's notes
+        // too), cool on the chip — provenance in one glance.
         let chrome_row = self.margin_floor();
         let edge_chip = move |label: String, at_bottom: bool| {
-            let chip = div()
-                .absolute()
+            let pill = div()
                 .h(px(18.))
                 .flex()
                 .items_center()
@@ -20986,11 +20998,17 @@ impl Editor {
                 .text_color(rgb(MUTED_COLOR))
                 .font_family("PT Sans")
                 .child(label);
+            let row = div()
+                .absolute()
+                .left_0()
+                .w(px(MARGIN_WIDTH - 8.))
+                .flex()
+                .justify_center()
+                .child(pill);
             if at_bottom {
-                chip.right(px(8.)).bottom(px(6.))
+                row.bottom(px(6.))
             } else {
-                // Left of the door chip's slot (46px + 8px gap + 8px inset).
-                chip.right(px(62.)).top(px(chrome_row))
+                row.top(px(chrome_row))
             }
         };
         // Paint the active card LAST so it sits ON TOP of any neighbour it
@@ -29378,15 +29396,18 @@ mod tests {
     #[test]
     fn diagnosis_band_edge_is_the_gpui_underline_wave() {
         let underline_y = 17.;
+        // The band's edge rides the shader's stroke CENTERLINE: mid-box,
+        // 1.5 stroke-widths below the underline y the primitive is given.
+        let center = underline_y + DIAGNOSIS_WAVE_CENTER;
         for x in [0., 1., 2.25, 4.5, 6.75, 9., 18.] {
-            let shader_y = underline_y
+            let shader_y = center
                 + (x * std::f32::consts::TAU / 9.).sin() * 0.8;
             assert!((diagnosis_wave_y(x, underline_y) - shader_y).abs() < 0.0001);
-            assert!((diagnosis_wave_y(x, underline_y) - underline_y).abs()
+            assert!((diagnosis_wave_y(x, underline_y) - center).abs()
                 <= DIAGNOSIS_WAVE_AMPLITUDE + f32::EPSILON);
         }
         assert!((diagnosis_wave_y(2.25, underline_y)
-            - (underline_y + DIAGNOSIS_WAVE_AMPLITUDE)).abs() < 0.0001);
+            - (center + DIAGNOSIS_WAVE_AMPLITUDE)).abs() < 0.0001);
         assert!((diagnosis_wave_y(6.75, underline_y)
-            - (underline_y - DIAGNOSIS_WAVE_AMPLITUDE)).abs() < 0.0001);
+            - (center - DIAGNOSIS_WAVE_AMPLITUDE)).abs() < 0.0001);
     }

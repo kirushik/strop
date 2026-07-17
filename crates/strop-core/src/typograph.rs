@@ -110,6 +110,16 @@ fn double_quote(prefix: &str, next: Option<char>, lang: Lang) -> Option<Substitu
         match (lang, before.chars().next_back()) {
             (Lang::En, Some('“')) => return Substitution::new(1, "”"),
             (Lang::Ru, Some('„')) => return Substitution::new(1, "“"),
+            // The fill-in habit wins at the outer level too (2026-07-17
+            // reversal of the never-after-« ruling): `""` then arrow-left
+            // is how the operator actually types an empty pair, and the
+            // «„ it minted has no in-flow recovery. The linear nester
+            // still gets „ two ways: content after the caret (the suffix
+            // guard doesn't fire), or typing `"` INSIDE the fresh «» —
+            // next is » there, exempted below, and classification nests.
+            (Lang::Ru, Some('«')) if next != Some('»') => {
+                return Substitution::new(1, "»")
+            }
             _ => {}
         }
     }
@@ -277,7 +287,15 @@ mod tests {
         assert_eq!(sub("«Фильм \"", Lang::Ru), Some((1, "„".into())));
         assert_eq!(sub("«Фильм „Ирония\"", Lang::Ru), Some((1, "“".into())));
         assert_eq!(sub("«Фильм „Ирония“ хорош\"", Lang::Ru), Some((1, "»".into())));
-        assert_eq!(sub("«\"", Lang::Ru), Some((1, "„".into())));
+        // The empty OUTER pair closes itself (the fill-in habit, 2026-07-17
+        // reversal): `""` at rest mints «», not «„.
+        assert_eq!(sub("«\"", Lang::Ru), Some((1, "»".into())));
+        // …but `"` typed INSIDE that fresh «» nests, so «„…“» stays
+        // reachable one keystroke later.
+        assert_eq!(sub_before("«\"", '»', Lang::Ru), Some((1, "„".into())));
+        // …and with content already waiting after the caret, the suffix
+        // guard holds its fire — the linear nester keeps „.
+        assert_eq!(sub_before("«\"", 'И', Lang::Ru), Some((1, "„".into())));
         assert_eq!(sub("«„\"", Lang::Ru), Some((1, "“".into())));
     }
 

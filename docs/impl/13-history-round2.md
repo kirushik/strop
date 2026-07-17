@@ -192,3 +192,30 @@ Wave order: A ∥ B, merge; then C ∥ D, merge; then E. Workers never
 commit; never run cargo fmt; target dirs on the real disk only
 (NEVER /tmp); XDG_RUNTIME_DIR=/tmp/strop-runtime for socket tests
 and the rig.
+
+## Amendment (2026-07-17): the dock comes home
+
+Supersedes item 4's control geometry ONLY (readout de-chipping, mark
+grammar, banner rules, saltire, ellipsis fold all stand). Trigger: on
+a young document the selvage-owned Now clamps onto the readout's
+x=28 origin and the two garble (operator screenshot); and the
+playhead-anchored dock's travel/flip is itself a defect, not a
+feature — controls need addresses (five-persona RFC, run
+sol-now-ribbon, 2026-07-17; the full-height right ribbon proposal
+was evaluated and REJECTED — a second geometric "present" competing
+with the honest selvage, and it dominates exactly the young
+histories that have the least data).
+
+The law now: the top row is FOUR frame-owned, disjoint, fixed slots,
+computed together before render — readout at x=28 (existing width +
+Compare degradation), a fixed action slot after it (Restore first,
+then Name/Rename, then Compare; overflow folds behind the dashed
+ellipsis, contents may change but the slot's x never moves), a
+locale-measured Now slot immediately left of close, and close at the
+frame edge. `playhead_x`/`selvage_x` drive NO control positions.
+Now stays visible at present (muted, pointer-inert), brightens +
+dashes when parked, returns via the existing Esc/Now path with the
+180 ms beat (cross-fade under reduce_motion). The cream selvage
+remains the sole geometric present — no vertical fill, no line from
+the Now chip into the fabric. EN "Now", RU «Сейчас» (provisional,
+corridor-tested), horizontal only.
