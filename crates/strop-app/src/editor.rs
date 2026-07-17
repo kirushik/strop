@@ -1842,6 +1842,10 @@ pub struct Editor {
     /// inside the draw pass (the 2026-06-12 corruption rule, like
     /// `zone_row_bounds`).
     strip_rail: std::rc::Rc<std::cell::RefCell<Option<StripGeom>>>,
+    /// The Now chip's shaped label width — a constant per session, so it
+    /// is measured once instead of on every open-strip render (review
+    /// finding). Whoever localizes the label owns invalidating this.
+    strip_now_w: std::cell::Cell<Option<f32>>,
     /// Painted date-control bounds and sitting targets, from strip prepaint.
     strip_date_hits: std::rc::Rc<std::cell::RefCell<Vec<StripDateHit>>>,
     /// Painted station label/tick targets, resolved before dates and lanes.
@@ -2561,6 +2565,7 @@ impl Editor {
             last_frame: None,
             strip: Strip::default(),
             strip_rail: std::rc::Rc::default(),
+            strip_now_w: std::cell::Cell::new(None),
             strip_date_hits: std::rc::Rc::default(),
             strip_station_hits: std::rc::Rc::default(),
             strip_well_hits: std::rc::Rc::default(),
@@ -26239,16 +26244,23 @@ impl Editor {
         let center_mode = strip_center_mode(parked, self.strip.pin_ms.is_some());
         let comparing = center_mode == StripCenterMode::Comparing;
         let now_label = "Now";
-        let now_run = TextRun {
-            len: now_label.len(),
-            font: window.text_style().font(),
-            color: rgb(0xE7E1D0).into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
+        let now_label_w = match self.strip_now_w.get() {
+            Some(w) => w,
+            None => {
+                let now_run = TextRun {
+                    len: now_label.len(),
+                    font: window.text_style().font(),
+                    color: rgb(0xE7E1D0).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let w = f32::from(window.text_system()
+                    .shape_line(now_label.into(), px(11.), &[now_run], None).width());
+                self.strip_now_w.set(Some(w));
+                w
+            }
         };
-        let now_label_w = f32::from(window.text_system()
-            .shape_line(now_label.into(), px(11.), &[now_run], None).width());
         let slots = strip_top_slots(
             desk_w, if comparing { 470. } else { 220. }, now_label_w);
         let free_interval = (slots.action.1 - if parked { 70. } else { 0. }).max(0.);

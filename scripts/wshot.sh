@@ -61,10 +61,19 @@ else
     "$BIN" 2>"$LOG" &
 fi
 APP=$!
+# Readiness is a GATE, not advice (review finding): a crashed or hung
+# app must fail the run, never yield a blank "successful" frame.
+READY=
 for _ in $(seq 1 60); do
-  grep -q "SMOKE HOLD" "$LOG" 2>/dev/null && break
+  grep -q "SMOKE HOLD" "$LOG" 2>/dev/null && { READY=1; break; }
+  kill -0 "$APP" 2>/dev/null || break
   sleep 0.5
 done
+if [ -z "$READY" ]; then
+  echo "wshot: app never reached SMOKE HOLD — no shot taken; log tail:" >&2
+  tail -20 "$LOG" >&2 2>/dev/null
+  exit 3
+fi
 sleep 1.5
 env -u DISPLAY XDG_RUNTIME_DIR="$RUNDIR" WAYLAND_DISPLAY="$WD" grim -o HEADLESS-1 "$OUT"
 echo "wshot: $OUT"

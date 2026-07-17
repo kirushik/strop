@@ -108,6 +108,16 @@ read before anything could be done.
 tooltips that define; any string whose audience is "a user who hasn't
 understood yet."
 
+*Narrow exception (2026-07-17, the keyboard map's "Physical keys"):*
+a REFERENCE TABLE'S column headers are table anatomy — they name
+what the column's cells ARE (data about data), not how to use an
+affordance. The exception covers exactly that: a header naming its
+column's content type in a reference surface whose entire purpose
+is lookup. It does not license legends on working surfaces; the
+test stands — delete the header and the reference table genuinely
+stops answering its question ("are these my layout's characters or
+physical keys?").
+
 *Budget:* the carrier sentence (a menu row that teaches a term by
 carrying it — "Ask the editor for a **line read**") is the one
 sanctioned channel for craft vocabulary, and it is capped: carried

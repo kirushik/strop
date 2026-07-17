@@ -558,10 +558,11 @@ enter/leave dump bits *(acceptance.md §§1–3)*.
 - **I9. Passes & altitude.** The cold read is P2's instrument; its
   notes seed the descent (Day 9 → Days 9–12); the altitude order and
   D4's menu-order defaults are untouched by this build.
-- **I10. Footnotes.** v1: refs render on the page (the
-  painted-superscript machinery the recon cites), definitions stay
-  off-page (05 §1); the bottom-zone footnote surface stays an editor
-  concern.
+- **I10. Footnotes.** *Amended 2026-07-17 with 05 §2.7:* refs render
+  as superscripts AND definitions set at the bottom of the ref's
+  page per print convention (rule, 0.85× face, ref-order hanging
+  numbers, reserved by pagination, ref-moves-with-note; orphans on
+  the final page). The off-page v1 law is retired.
 - **I11. Localization.** "Cold read" ships behind function-first
   localization («свежим взглядом»); every carried term in this
   surface needs its glossary row before a new UI string lands
