@@ -71,3 +71,32 @@ Mutter rejects. Fork patch ~40-80 lines in wayland/{window,client}
 (a `PlatformWindow::activate_from(&other)` or equivalent), no-op on
 other backends; then ctrl-?'s toggle could grow the raise state
 back where it genuinely works. Blocked on the next fork-pin bump.
+
+## 7. Cross-process rich clipboard (fork patch)
+
+Stage 1 (2026-07-17) carries the rich payload (spans + block kinds +
+boundary flags + image ids) in the gpui ClipboardString metadata,
+which round-trips only while the offer's `pid/<pid>` self-MIME
+matches — i.e. within ONE Strop process. One document per window
+means per-process, so cut→paste between two open essays degrades to
+plain text exactly where a writer moves paragraphs between drafts.
+Fork patch: advertise and serve a real `application/x-strop+json`
+MIME (Wayland `wayland/clipboard.rs` + the X11 twin) carrying the
+same envelope, and read it back from foreign offers before the
+plain-text fallback. The payload is already versioned (`v:1`) and
+self-contained for exactly this promotion. A `text/markdown` offer
+can ride the same patch nearly free. Blocked on the next fork-pin
+bump.
+
+## 8. Editor em-dash line-start guard
+
+The book engine binds «слово —» so тире never starts a line
+(bookpage `Bound` units); the EDITOR's wrapper cannot express the
+same rule — `is_word_char` glue is lookahead-only, so a break
+before `—` survives even after the 2026-07-17 punctuation patch
+(and an NBSP before the dash does not help: non-word chars always
+plant a candidate). Needs a lookback rule in the fork's
+LineWrapper (suppress the candidate before `—`/`–` when preceded
+by NBSP or word char + space), or acceptance that the editor
+surface tolerates it. Decide once the punctuation patch has field
+time.
