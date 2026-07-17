@@ -23489,41 +23489,32 @@ fn strip_sheet_tail(rail_x0: f32, rail_x1: f32, total_work: f32, view: f32) -> f
     (rail_x0 + total_work - view).clamp(rail_x0, rail_x1)
 }
 
-/// Prefer the playhead's right side, flip left when that is the side that
-/// fits, and finally clamp. Pure geometry keeps narrow-width behavior stable.
-/// `now_zone` is the Now label's reserved span: the dock may stand on either
-/// side of it, never across it — on a young sheet the whole interval between
-/// the readout and the selvage can be narrower than the dock, and the dock
-/// then takes the desk to Now's right (the callout-from-the-sheet reading),
-/// leaving the terminal label legible.
-fn strip_dock_left(
-    playhead_x: f32,
-    width: f32,
-    left: f32,
-    right: f32,
-    now_zone: (f32, f32),
-) -> f32 {
-    let gap = 10.;
-    let candidate = if playhead_x + gap + width <= right {
-        playhead_x + gap
-    } else {
-        playhead_x - gap - width
-    };
-    let mut x = candidate.clamp(left, (right - width).max(left));
-    if x < now_zone.1 && x + width > now_zone.0 {
-        let after = (now_zone.1 + gap).min((right - width).max(left));
-        let before = (now_zone.0 - gap - width).max(left);
-        // Prefer the side that actually clears the zone; right wins ties
-        // (the desk is empty there by definition).
-        x = if after + width <= right && after >= now_zone.1 + gap - 0.5 {
-            after
-        } else if before + width <= now_zone.0 {
-            before
-        } else {
-            after
-        };
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StripTopSlots {
+    readout: (f32, f32),
+    action: (f32, f32),
+    now: (f32, f32),
+    close: (f32, f32),
+}
+
+/// Allocate the strip's four frame-owned addresses together. The readout may
+/// yield width on a very narrow frame, but no slot can cross another one.
+fn strip_top_slots(frame_w: f32, readout_w: f32, now_label_w: f32) -> StripTopSlots {
+    let close_w = 19.;
+    let close_x = (frame_w - 8. - close_w).max(0.);
+    let now_w = (now_label_w + 16.).max(48.);
+    let now_x = (close_x - now_w).max(0.);
+    let readout_x = strip::SIDE_PAD;
+    let readout_limit = (now_x - 24. - readout_x).max(0.);
+    let readout_w = readout_w.min(readout_limit);
+    let action_x = readout_x + readout_w + 12.;
+    let action_w = (now_x - 12. - action_x).max(0.);
+    StripTopSlots {
+        readout: (readout_x, readout_w),
+        action: (action_x, action_w),
+        now: (now_x, now_w),
+        close: (close_x, close_w),
     }
-    x
 }
 
 /// An rgb constant with an explicit alpha — the strip's translucent fabric
@@ -26218,24 +26209,6 @@ impl Editor {
         }
         let parked = self.strip.parked;
         let desk_w = f32::from(window.viewport_size().width);
-        let rail_x0 = strip::SIDE_PAD;
-        let rail_x1 = desk_w - strip::SIDE_PAD;
-        let view = self.strip.bake.as_ref().map_or(0., |b| {
-            self.strip.view_offset.clamp(
-                0.,
-                (b.timeline.total_work - (rail_x1 - rail_x0)).max(0.),
-            )
-        });
-        let (playhead_x, selvage_x) = self.strip.bake.as_ref().map_or(
-            (rail_x0, rail_x0),
-            |b| (
-                (rail_x0 + b.timeline.work_at(self.strip.pos_ms) - view)
-                    .clamp(rail_x0, rail_x1),
-                strip_sheet_tail(rail_x0, rail_x1, b.timeline.total_work, view),
-            ),
-        );
-        let dock_w = if desk_w >= 720. { 300. } else if desk_w >= 560. { 250. } else { 154. };
-        let free_interval = dock_w - if parked { 70. } else { 0. };
         let now_ms = self
             .strip
             .bake
@@ -26243,15 +26216,20 @@ impl Editor {
             .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
         let center_mode = strip_center_mode(parked, self.strip.pin_ms.is_some());
         let comparing = center_mode == StripCenterMode::Comparing;
-        // The dock never overprints the origin's readout: its clamp floor is
-        // the readout's reserved width (two blocks while comparing), not the
-        // rail edge — the young-sheet case parks the playhead AT the origin.
-        let dock_floor = rail_x0 + if comparing { 470. } else { 230. };
-        // Now's reserved span: the label sits 6px right of the selvage,
-        // clamped to the near edge when the selvage is off-view (§3e).
-        let now_x = (selvage_x + 6.).min(rail_x1 - 30.);
-        let dock_left = strip_dock_left(
-            playhead_x, dock_w, dock_floor, rail_x1, (now_x - 8., now_x + 38.));
+        let now_label = "Now";
+        let now_run = TextRun {
+            len: now_label.len(),
+            font: window.text_style().font(),
+            color: rgb(0xE7E1D0).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let now_label_w = f32::from(window.text_system()
+            .shape_line(now_label.into(), px(11.), &[now_run], None).width());
+        let slots = strip_top_slots(
+            desk_w, if comparing { 470. } else { 220. }, now_label_w);
+        let free_interval = (slots.action.1 - if parked { 70. } else { 0. }).max(0.);
         let readout = if parked {
             strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms)
         } else {
@@ -26285,7 +26263,7 @@ impl Editor {
                 f32::from(window.text_system()
                     .shape_line(s.into(), px(12.), &[run], None).width()) + 16.
             };
-            let available = (desk_w - 190.).max(120.);
+            let available = slots.readout.1.max(120.);
             let full_w = measure(&forms.full_a) + measure(&forms.full_b) + 6.;
             let shared_w = forms.shared_date.as_ref().map(|(date, a, b)| {
                 measure(date) + measure(a) + measure(b) + 12.
@@ -26344,7 +26322,7 @@ impl Editor {
         // Now: dim at the present, bright when parked (it and Restore announce
         // themselves as the pair they are — design §3, review H4: the two
         // exits from the past light up in the same beat). Click / Esc return.
-        let now_chip = chip("Now".into(), parked)
+        let now_chip = chip(now_label.into(), parked)
             .id("strip-now")
             .occlude()
             .when(parked, |d| {
@@ -26353,14 +26331,14 @@ impl Editor {
                     .border_dashed()
                     .border_color(rgb(0xE7E1D0))
             })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    editor.resolve_strip_name(window, cx);
-                    editor.strip_return_to_now(cx);
-                }),
-            );
+            .when(parked, |d| d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        editor.resolve_strip_name(window, cx);
+                        editor.strip_return_to_now(cx);
+                    }),
+                ));
 
         // Close affordance (Bug C): the pictorial dismiss saltire in the
         // strip's top-right (muted → bright on hover, pointing hand) — the
@@ -26456,7 +26434,8 @@ impl Editor {
                 }),
             );
             div().flex().items_center().gap(px(12.)).child(naming)
-                .when(center_mode == StripCenterMode::Parked, |d| d.child(
+                .when(center_mode == StripCenterMode::Parked
+                    && free_interval >= 230., |d| d.child(
                     strip_action("strip-compare", "Compare").on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
@@ -26592,34 +26571,39 @@ impl Editor {
                 .child(
                     div()
                         .absolute()
-                        .left(px(strip::SIDE_PAD))
+                        .left(px(slots.readout.0))
                         .top(px(4.))
+                        .w(px(slots.readout.1))
+                        .overflow_hidden()
                         .child(readout_chip),
                 )
-                // The parked playhead owns the moment dock.
+                // Actions have a frame-owned address; state changes contents.
                 .child(
                     div()
                         .absolute()
-                        .left(px(dock_left))
+                        .left(px(slots.action.0))
                         .top(px(4.))
-                        .w(px(dock_w))
+                        .w(px(slots.action.1))
                         .h(px(22.))
                         .flex()
                         .items_center()
                         .gap(px(6.))
                         .when(parked, |d| d.child(restore_btn))
-                        .child(center),
+                        .when(parked, |d| d.child(center)),
                 )
-                // The selvage owns Now; only the frame owns close.
+                // Now and close are the two terminal frame-owned slots.
                 .child(
                     div()
                         .absolute()
-                        .left(px((selvage_x - 14.).clamp(rail_x0, rail_x1 - 36.)))
+                        .left(px(slots.now.0))
+                        .w(px(slots.now.1))
                         .top(px(4.))
+                        .flex()
+                        .justify_center()
                         .child(now_chip),
                 )
                 .child(
-                    div().absolute().right(px(8.)).top(px(4.)).child(close_x),
+                    div().absolute().left(px(slots.close.0)).top(px(4.)).child(close_x),
                 ),
         )
     }
@@ -27379,28 +27363,45 @@ mod tests {
     }
 
     #[test]
-    fn strip_dock_flips_and_clamps_at_the_frame_edges() {
-        // A far-away Now zone leaves the classic flip/clamp behavior alone.
-        let far = (1000., 1040.);
-        assert_eq!(strip_dock_left(100., 120., 28., 428., far), 110.);
-        assert_eq!(strip_dock_left(390., 120., 28., 428., far), 260.);
-        assert_eq!(strip_dock_left(30., 500., 28., 428., far), 28.);
+    fn strip_top_slots_are_disjoint_at_representative_widths() {
+        for width in [480., 600., 800., 1600.] {
+            let slots = strip_top_slots(width, 220., 24.);
+            assert!(slots.readout.0 + slots.readout.1 <= slots.action.0);
+            assert!(slots.action.0 + slots.action.1 <= slots.now.0);
+            assert!(slots.now.0 + slots.now.1 <= slots.close.0);
+            assert!(slots.close.0 + slots.close.1 <= width);
+        }
     }
 
     #[test]
-    fn strip_dock_never_stands_across_the_now_label() {
-        // Young sheet: readout floor at 230, selvage/Now right there — the
-        // interval left of Now cannot hold a 300px dock, so it takes the
-        // desk to Now's right (the callout-from-the-sheet reading).
-        let x = strip_dock_left(240., 300., 230., 1590., (238., 284.));
-        assert!(x >= 294., "dock {x} must clear Now's right edge");
-        // Wide sheet, parked mid-fabric: Now at the far selvage stays clear
-        // and the dock still prefers the playhead's right.
-        assert_eq!(strip_dock_left(800., 300., 230., 1590., (1520., 1566.)), 810.);
-        // Parked NEAR the selvage: the dock flips left of the zone when the
-        // right side cannot fit.
-        let x = strip_dock_left(1500., 300., 230., 1590., (1508., 1554.));
-        assert!(x + 300. <= 1508., "dock {x}+300 must clear Now's left edge");
+    fn strip_top_slots_make_the_young_tail_irrelevant() {
+        let slots = strip_top_slots(600., 220., 24.);
+        let young_selvage_x = strip::SIDE_PAD;
+        assert_eq!(young_selvage_x, slots.readout.0);
+        assert!(slots.readout.0 + slots.readout.1 <= slots.action.0);
+        assert!(slots.readout.0 + slots.readout.1 <= slots.now.0);
+    }
+
+    #[test]
+    fn strip_top_slot_addresses_ignore_timeline_state() {
+        let expected = strip_top_slots(800., 220., 24.);
+        for (_playhead, _pos_ms, _view, _total_work) in [
+            (28., 0, 0., 0.),
+            (400., 60_000, 120., 900.),
+            (772., 3_600_000, 800., 2_000.),
+        ] {
+            assert_eq!(strip_top_slots(800., 220., 24.), expected);
+        }
+    }
+
+    #[test]
+    fn strip_top_slots_degrade_compare_space_before_name_space() {
+        let wide = strip_top_slots(800., 220., 24.).action.1 - 70.;
+        let middle = strip_top_slots(600., 220., 24.).action.1 - 70.;
+        let narrow = strip_top_slots(480., 220., 24.).action.1 - 70.;
+        assert!(wide >= 230., "wide action slot admits Compare");
+        assert!((104.0..230.0).contains(&middle), "middle keeps Name only");
+        assert!(narrow < 104., "narrow folds actions behind ellipsis");
     }
 
     #[test]
