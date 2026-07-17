@@ -2,14 +2,16 @@
 //! the authority; this module owns only its presentation model and window.
 
 use gpui::{
-    AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels,
-    Render, Window, WindowBounds, WindowDecorations, WindowHandle, WindowOptions, div, px, rgb,
-    size,
+    AnyWindowHandle, App, Bounds, BoxShadow, Context, CursorStyle, Decorations, Entity,
+    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, Pixels, Render,
+    ResizeEdge, Tiling, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowDecorations, WindowHandle, WindowOptions, div, px, rgb, rgba, size,
 };
 use gpui::prelude::*;
 
 use crate::editor::{Editor, EscapeMode, ShowShortcuts};
 use crate::draw_guard::EntityUpdateExt as _;
+use crate::icons::{self, icon};
 
 pub const DEFAULT_WIDTH: f32 = 900.;
 pub const DEFAULT_HEIGHT: f32 = 560.;
@@ -17,6 +19,13 @@ const HEADER_HEIGHT: f32 = 68.;
 const SECTION_HEADING_HEIGHT: f32 = 24.;
 const ROW_PITCH: f32 = 16.;
 const GRID_BOTTOM: f32 = 20.;
+const CSD_GUTTER: f32 = 22.;
+const CSD_ROUNDING: f32 = 10.;
+const RESIZE_INSET: f32 = 8.;
+
+fn default_window_size() -> (f32, f32) {
+    (DEFAULT_WIDTH + 2. * CSD_GUTTER, DEFAULT_HEIGHT + 2. * CSD_GUTTER)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToggleDecision {
@@ -146,6 +155,74 @@ pub fn clamp_bounds(
     (x, y, w, h)
 }
 
+/// The editor chooses the monitor: remembered keymap coordinates must not pull
+/// the reference back to a different display. A display contains the editor
+/// only when it contains the editor's whole window rectangle.
+pub fn containing_display(
+    editor: (f32, f32, f32, f32),
+    displays: &[(f32, f32, f32, f32)],
+) -> Option<usize> {
+    let (ex, ey, ew, eh) = editor;
+    displays.iter().position(|&(x, y, w, h)| {
+        ex >= x && ey >= y && ex + ew <= x + w && ey + eh <= y + h
+    })
+}
+
+fn resize_strip(
+    id: &'static str,
+    edge: ResizeEdge,
+    cursor: CursorStyle,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .absolute()
+        .cursor(cursor)
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            window.start_window_resize(edge);
+        })
+}
+
+fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
+    let out = px(CSD_GUTTER - RESIZE_INSET);
+    let thick = px(2. * RESIZE_INSET);
+    let thin = px(RESIZE_INSET);
+    let mut handles = Vec::new();
+    if !tiling.top {
+        handles.push(resize_strip("keymap-rz-top", ResizeEdge::Top, CursorStyle::ResizeUpDown)
+            .top(out).left(out).right(out).h(thin).into_any_element());
+    }
+    if !tiling.bottom {
+        handles.push(resize_strip("keymap-rz-bottom", ResizeEdge::Bottom, CursorStyle::ResizeUpDown)
+            .bottom(out).left(out).right(out).h(thick).into_any_element());
+    }
+    if !tiling.left {
+        handles.push(resize_strip("keymap-rz-left", ResizeEdge::Left, CursorStyle::ResizeLeftRight)
+            .left(out).top(out).bottom(out).w(thick).into_any_element());
+    }
+    if !tiling.right {
+        handles.push(resize_strip("keymap-rz-right", ResizeEdge::Right, CursorStyle::ResizeLeftRight)
+            .right(out).top(out).bottom(out).w(thick).into_any_element());
+    }
+    if !tiling.top && !tiling.left {
+        handles.push(resize_strip("keymap-rz-tl", ResizeEdge::TopLeft, CursorStyle::ResizeUpLeftDownRight)
+            .top(out).left(out).size(thick).into_any_element());
+    }
+    if !tiling.top && !tiling.right {
+        handles.push(resize_strip("keymap-rz-tr", ResizeEdge::TopRight, CursorStyle::ResizeUpRightDownLeft)
+            .top(out).right(out).size(thick).into_any_element());
+    }
+    if !tiling.bottom && !tiling.left {
+        handles.push(resize_strip("keymap-rz-bl", ResizeEdge::BottomLeft, CursorStyle::ResizeUpRightDownLeft)
+            .bottom(out).left(out).size(thick).into_any_element());
+    }
+    if !tiling.bottom && !tiling.right {
+        handles.push(resize_strip("keymap-rz-br", ResizeEdge::BottomRight, CursorStyle::ResizeUpLeftDownRight)
+            .bottom(out).right(out).size(thick).into_any_element());
+    }
+    handles
+}
+
 pub struct KeymapWindow {
     focus_handle: FocusHandle,
     editor: Entity<Editor>,
@@ -172,21 +249,51 @@ impl KeymapWindow {
             window.focus(&editor.focus_handle(cx), cx);
         });
     }
+
+
+    fn request_quit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor.clone();
+        let _ = self.editor_window.update(cx, move |_, editor_window, cx| {
+            editor_window.activate_window();
+            editor.update_checked(cx, |editor, cx| {
+                editor.request_quit(&crate::Quit, editor_window, cx);
+            });
+        });
+    }
 }
 
 impl Render for KeymapWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds = window.bounds();
+        let decorations = window.window_decorations();
+        let tiling = match decorations {
+            Decorations::Client { tiling } => tiling,
+            Decorations::Server => Tiling::default(),
+        };
+        let client = matches!(decorations, Decorations::Client { .. });
+        window.set_client_inset(px(if client { CSD_GUTTER } else { 0. }));
+        let horizontal_inset = if client {
+            (if tiling.left { 0. } else { CSD_GUTTER })
+                + if tiling.right { 0. } else { CSD_GUTTER }
+        } else { 0. };
+        let vertical_inset = if client {
+            (if tiling.top { 0. } else { CSD_GUTTER })
+                + if tiling.bottom { 0. } else { CSD_GUTTER }
+        } else { 0. };
         let layout = allocate_layout(
-            f32::from(bounds.size.width),
-            f32::from(bounds.size.height),
+            f32::from(bounds.size.width) - horizontal_inset,
+            f32::from(bounds.size.height) - vertical_inset,
             &self.sections,
         );
-        div()
+        let drag = |_: &MouseDownEvent, window: &mut Window, _: &mut App| {
+            window.start_window_move();
+        };
+        let content = div()
             .key_context("Keymap")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &EscapeMode, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, window, cx| this.close(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)))
             .size_full()
             .bg(rgb(0xF6F4EF))
             .font_family("PT Sans")
@@ -194,6 +301,8 @@ impl Render for KeymapWindow {
             .child(
                 div()
                     .h(px(HEADER_HEIGHT))
+                    .window_control_area(WindowControlArea::Drag)
+                    .on_mouse_down(MouseButton::Left, drag)
                     .px(px(22.))
                     .flex()
                     .items_center()
@@ -202,16 +311,29 @@ impl Render for KeymapWindow {
                     .border_color(rgb(0xC9C4BA))
                     .child(div().text_size(px(18.)).child("Keyboard map"))
                     .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(0x716D66))
-                            .child("PHYSICAL KEYS"),
+                        div().flex().items_center().h_full().child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(0x716D66))
+                                .child("PHYSICAL KEYS"),
+                        ).when(client, |d| d.child(
+                            div().id("keymap-close").occlude().ml(px(14.)).w(px(28.)).h_full()
+                                .flex().items_center().justify_center().cursor(CursorStyle::PointingHand)
+                                .group("keymap-close").hover(|d| d.bg(rgba(0x1A1A180A)))
+                                .on_mouse_down(MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        this.close(window, cx);
+                                    }))
+                                .child(icon(icons::WIN_CLOSE, 13., 0x716D66)
+                                    .group_hover("keymap-close", |s| s.text_color(rgb(0x242321))))
+                        )),
                     ),
             )
             .child(
                 div()
                     .id("keymap-grid")
-                    .h(px((f32::from(bounds.size.height) - HEADER_HEIGHT).max(0.)))
+                    .h(px((f32::from(bounds.size.height) - vertical_inset - HEADER_HEIGHT).max(0.)))
                     .when(layout.scrolls, |grid| grid.overflow_y_scroll())
                     .px(px(22.))
                     .pt(px(14.))
@@ -247,7 +369,37 @@ impl Render for KeymapWindow {
                                 }))
                         }))
                     })),
-            )
+            );
+
+        let inset = |tiled: bool| px(if client && !tiled { CSD_GUTTER } else { 0. });
+        let floating = client && !tiling.top && !tiling.bottom && !tiling.left && !tiling.right;
+        let round = move |d: gpui::Div| {
+            d.when(!tiling.top && !tiling.left, |d| d.rounded_tl(px(CSD_ROUNDING)))
+                .when(!tiling.top && !tiling.right, |d| d.rounded_tr(px(CSD_ROUNDING)))
+                .when(!tiling.bottom && !tiling.left, |d| d.rounded_bl(px(CSD_ROUNDING)))
+                .when(!tiling.bottom && !tiling.right, |d| d.rounded_br(px(CSD_ROUNDING)))
+        };
+        div().size_full().relative().bg(rgba(0x00000000)).child(
+            div().absolute()
+                .top(inset(tiling.top)).bottom(inset(tiling.bottom))
+                .left(inset(tiling.left)).right(inset(tiling.right))
+                .overflow_hidden()
+                .when(client, |d| {
+                    let d = d.border_color(rgb(0xC9C4BA))
+                        .when(!tiling.top, |d| d.border_t_1())
+                        .when(!tiling.bottom, |d| d.border_b_1())
+                        .when(!tiling.left, |d| d.border_l_1())
+                        .when(!tiling.right, |d| d.border_r_1());
+                    round(d).when(floating, |d| {
+                        let shadow = |y: f32, blur: f32, a: f32| {
+                            BoxShadow::new(px(0.), px(y), Hsla { h: 0., s: 0., l: 0., a })
+                                .blur_radius(px(blur))
+                        };
+                        d.shadow(vec![shadow(1., 2., 0.14), shadow(3., 8., 0.10), shadow(6., 14., 0.07)])
+                    })
+                })
+                .child(round(content)),
+        ).when(client, |d| d.children(resize_handles(tiling)))
     }
 }
 
@@ -257,7 +409,18 @@ pub fn open(
     editor_bounds: Bounds<Pixels>,
     cx: &mut App,
 ) -> Option<WindowHandle<KeymapWindow>> {
-    let display = cx.primary_display();
+    let displays = cx.displays();
+    let editor_tuple = (
+        f32::from(editor_bounds.origin.x), f32::from(editor_bounds.origin.y),
+        f32::from(editor_bounds.size.width), f32::from(editor_bounds.size.height),
+    );
+    let display = containing_display(editor_tuple, &displays.iter().map(|display| {
+        let bounds = display.bounds();
+        (f32::from(bounds.origin.x), f32::from(bounds.origin.y),
+         f32::from(bounds.size.width), f32::from(bounds.size.height))
+    }).collect::<Vec<_>>())
+        .and_then(|ix| displays.get(ix).cloned())
+        .or_else(|| cx.primary_display());
     let work = display
         .as_ref()
         .map(|display| display.bounds())
@@ -268,20 +431,21 @@ pub fn open(
         f32::from(work.size.width),
         f32::from(work.size.height),
     );
+    let (default_width, default_height) = default_window_size();
     let editor_right = f32::from(editor_bounds.origin.x + editor_bounds.size.width);
     let editor_left = f32::from(editor_bounds.origin.x);
-    let beside_x = if editor_right + DEFAULT_WIDTH <= work_tuple.0 + work_tuple.2 {
+    let beside_x = if editor_right + default_width <= work_tuple.0 + work_tuple.2 {
         editor_right
-    } else if editor_left - DEFAULT_WIDTH >= work_tuple.0 {
-        editor_left - DEFAULT_WIDTH
+    } else if editor_left - default_width >= work_tuple.0 {
+        editor_left - default_width
     } else {
-        work_tuple.0 + (work_tuple.2 - DEFAULT_WIDTH) / 2.
+        work_tuple.0 + (work_tuple.2 - default_width) / 2.
     };
     let remembered = load_bounds().unwrap_or((
         beside_x,
         f32::from(editor_bounds.origin.y),
-        DEFAULT_WIDTH,
-        DEFAULT_HEIGHT,
+        default_width,
+        default_height,
     ));
     let (x, y, w, h) = clamp_bounds(remembered, work_tuple);
     cx.open_window(
@@ -294,7 +458,13 @@ pub fn open(
                 title: Some("Keyboard map".into()),
                 ..Default::default()
             }),
-            window_decorations: Some(WindowDecorations::Server),
+            window_decorations: Some(WindowDecorations::Client),
+            window_background: if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                WindowBackgroundAppearance::Transparent
+            } else {
+                WindowBackgroundAppearance::Opaque
+            },
+            display_id: display.as_ref().map(|display| display.id()),
             focus: true,
             ..Default::default()
         },
@@ -378,6 +548,14 @@ mod tests {
             !allocate_layout(900., 560., &sections).scrolls,
             "registry outgrew the default no-scroll density budget"
         );
+        assert!(
+            !allocate_layout(
+                default_window_size().0 - 2. * CSD_GUTTER,
+                default_window_size().1 - 2. * CSD_GUTTER,
+                &sections,
+            ).scrolls,
+            "client decoration inset broke the default no-scroll budget"
+        );
         assert!(allocate_layout(900., 300., &sections).scrolls);
     }
 
@@ -386,6 +564,21 @@ mod tests {
         assert_eq!(
             clamp_bounds((-200., 900., 900., 560.), (100., 50., 800., 500.)),
             (100., 50., 800., 500.)
+        );
+    }
+
+    #[test]
+    fn editor_display_selection_handles_a_two_display_matrix() {
+        let displays = [(0., 0., 1920., 1080.), (1920., -200., 2560., 1440.)];
+        assert_eq!(containing_display((100., 80., 900., 700.), &displays), Some(0));
+        assert_eq!(containing_display((2100., 0., 1200., 900.), &displays), Some(1));
+        assert_eq!(containing_display((1800., 0., 300., 700.), &displays), None);
+        assert_eq!(containing_display((5000., 0., 800., 600.), &displays), None);
+
+        assert_eq!(
+            clamp_bounds((100., 100., 900., 560.), displays[1]),
+            (1920., 100., 900., 560.),
+            "remembered primary-display bounds clamp onto the editor's display"
         );
     }
 
