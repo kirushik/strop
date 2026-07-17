@@ -1501,7 +1501,7 @@ impl Asm {
 }
 
 fn assemble_once(
-    flows: Vec<Flow>,
+    flows: &[Flow],
     metrics: &BookMetrics,
     body_h: f32,
     reserves: Vec<f32>,
@@ -1519,15 +1519,14 @@ fn assemble_once(
         reserves,
         forced_refs,
     };
-    let mut q: VecDeque<Flow> = flows.into();
     let mut prev_text = false;
     let mut prev_list = false;
-    while let Some(flow) = q.pop_front() {
+    for (flow_ix, flow) in flows.iter().enumerate() {
         // Inter-paragraph air (`para_gap`, the lab mock's `margin: 0 0 1em`
         // — scene 1 CSS): between two consecutive TEXT blocks only; a
         // writer's own blank line (or a divider's empty line) is already
         // separation, and a page never opens with a gap (close() resets y).
-        let is_text = match &flow {
+        let is_text = match flow {
             Flow::Para { lines, .. } => lines.iter().any(|l| !l.frags.is_empty()),
             Flow::Image(_) => true,
             Flow::Note { .. } => false,
@@ -1546,14 +1545,14 @@ fn assemble_once(
         prev_list = is_list;
         match flow {
             Flow::Para { lines, heading, .. } => {
-                if heading {
+                if *heading {
                     // The keep must look PAST invisible flows: a writer's
                     // blank line after a chapter heading would otherwise
                     // satisfy it with a line the reader can't see, and the
                     // page would visually end on the heading.
                     let mut lead = 0.0f32;
                     let mut next_vis = None;
-                    for f in &q {
+                    for f in &flows[flow_ix + 1..] {
                         if let Flow::Para { lines, .. } = f
                             && lines.iter().all(|l| l.frags.is_empty())
                         {
@@ -1570,15 +1569,15 @@ fn assemble_once(
                             // loop's own prev_text rule above).
                             lead = HEAD_AIR_BELOW;
                         }
-                        asm.reserve_heading(&lines, next, lead);
+                        asm.reserve_heading(lines, next, lead);
                     }
                 }
-                asm.place_para(lines);
-                if heading {
+                asm.place_para(lines.clone());
+                if *heading {
                     asm.y += HEAD_AIR_BELOW;
                 }
             }
-            Flow::Image(img) => asm.place_image(img),
+            Flow::Image(img) => asm.place_image(img.clone()),
             Flow::Note { .. } => unreachable!("notes are separated before body assembly"),
         }
     }
@@ -1608,52 +1607,115 @@ fn assemble(
         }
     }
     if notes.is_empty() {
-        return assemble_once(body, metrics, body_h, vec![], vec![]);
+        return assemble_once(&body, metrics, body_h, vec![], vec![]);
     }
 
+    #[derive(Clone, Copy, PartialEq)]
+    struct NoteSegment {
+        note: usize,
+        start: usize,
+        end: usize,
+    }
+
+    // A footnote reserve may consume everything except two derived body
+    // lines. This makes S8's unconditional progress path safe: even the
+    // terminal relaxation can never paint body through the bottom-set area.
+    let reserve_cap = (metrics.page_height - 2.0 * body_h).max(0.0);
+    let note_cap = (reserve_cap - FOOTNOTE_AIR).max(0.0);
+    assert!(notes.iter().flat_map(|(_, lines)| lines).all(|line|
+        line.height <= note_cap + EPS),
+        "page is too short for one footnote line while preserving two body lines");
     let mut reserves = Vec::new();
-    let mut assignments: Vec<Vec<usize>> = Vec::new();
+    let mut assignments: Vec<Vec<NoteSegment>> = Vec::new();
     let mut forced_refs = Vec::new();
-    let mut book = assemble_once(body.clone(), metrics, body_h, reserves.clone(), forced_refs.clone());
+    let mut book = assemble_once(&body, metrics, body_h, reserves.clone(), forced_refs.clone());
+    let mut converged = false;
     for _ in 0..32 {
-        let mut next = vec![Vec::new(); book.pages.len().max(1)];
+        let mut order = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for (range, id) in &refs {
+        for (_, id) in &refs {
             let Some(note_ix) = notes.iter().position(|(note_id, _)| note_id == id) else {
                 continue;
             };
-            if !seen.insert(note_ix) {
-                continue;
+            if seen.insert(note_ix) {
+                order.push(note_ix);
             }
-            let page_ix = book.pages.iter().position(|page| page.items.iter().any(|item| {
-                matches!(item, PageItem::Line(line) if line.frags.iter().any(|frag|
-                    frag.slice.start < range.end && range.start < frag.slice.end))
-            })).unwrap_or(book.pages.len().saturating_sub(1));
-            next[page_ix].push(note_ix);
         }
-        let final_ix = next.len() - 1;
         for note_ix in 0..notes.len() {
             if seen.insert(note_ix) {
-                next[final_ix].push(note_ix);
+                order.push(note_ix);
             }
         }
-        let next_reserves: Vec<f32> = next.iter().map(|on_page| {
-            if on_page.is_empty() {
-                0.0
-            } else {
-                FOOTNOTE_AIR + on_page.iter().flat_map(|&i| &notes[i].1).map(|l| l.height).sum::<f32>()
+
+        let mut next: Vec<Vec<NoteSegment>> = vec![Vec::new(); book.pages.len().max(1)];
+        let mut used = vec![0.0f32; next.len()];
+        let mut cursor = 0usize;
+        for note_ix in order {
+            let anchor = refs.iter().find(|(_, id)| id == &notes[note_ix].0)
+                .and_then(|(range, _)| book.pages.iter().position(|page| {
+                    page.items.iter().any(|item| matches!(item, PageItem::Line(line)
+                        if line.frags.iter().any(|frag| frag.slice.start < range.end
+                            && range.start < frag.slice.end)))
+                })).unwrap_or(book.pages.len().saturating_sub(1));
+            cursor = cursor.max(anchor);
+            let lines = &notes[note_ix].1;
+            let total = lines.iter().map(|line| line.height).sum::<f32>();
+            if total <= note_cap + EPS {
+                if cursor >= used.len() {
+                    used.resize(cursor + 1, 0.0);
+                    next.resize(cursor + 1, Vec::new());
+                }
+                if used[cursor] + total > note_cap + EPS {
+                    cursor += 1;
+                    used.resize(cursor + 1, 0.0);
+                    next.resize(cursor + 1, Vec::new());
+                }
+                next[cursor].push(NoteSegment { note: note_ix, start: 0, end: lines.len() });
+                used[cursor] += total;
+                continue;
             }
+
+            // Only an individually oversized note splits. Its already-shaped
+            // lines stream forward, and every iteration consumes a line.
+            let mut start = 0usize;
+            while start < lines.len() {
+                if cursor >= used.len() {
+                    used.resize(cursor + 1, 0.0);
+                    next.resize(cursor + 1, Vec::new());
+                }
+                let mut end = start;
+                while end < lines.len()
+                    && used[cursor] + lines[end].height <= note_cap + EPS
+                {
+                    used[cursor] += lines[end].height;
+                    end += 1;
+                }
+                if end == start {
+                    cursor += 1;
+                    continue;
+                }
+                next[cursor].push(NoteSegment { note: note_ix, start, end });
+                start = end;
+                if start < lines.len() {
+                    cursor += 1;
+                }
+            }
+        }
+        let next_reserves: Vec<f32> = used.iter().map(|height| {
+            if *height == 0.0 { 0.0 } else { FOOTNOTE_AIR + height }
         }).collect();
         if next == assignments && next_reserves == reserves {
             assignments = next;
             reserves = next_reserves;
+            converged = true;
             break;
         }
         assignments = next;
         reserves = next_reserves;
         for (range, id) in &refs {
             if let Some(note_ix) = notes.iter().position(|(note_id, _)| note_id == id)
-                && let Some(page_ix) = assignments.iter().position(|notes| notes.contains(&note_ix))
+                && let Some(page_ix) = assignments.iter().position(|segments|
+                    segments.iter().any(|segment| segment.note == note_ix && segment.start == 0))
             {
                 if let Some((_, floor)) = forced_refs.iter_mut().find(|(r, _)| r == range) {
                     *floor = (*floor).max(page_ix);
@@ -1662,14 +1724,15 @@ fn assemble(
                 }
             }
         }
-        book = assemble_once(
-            body.clone(), metrics, body_h, reserves.clone(), forced_refs.clone(),
-        );
+        book = assemble_once(&body, metrics, body_h, reserves.clone(), forced_refs.clone());
     }
+    assert!(converged, "footnote pagination did not converge within 32 passes");
 
-    // One final pass uses the converged reservation. Whole notes move with
-    // their reference line in v1; definitions are not split across pages.
-    book = assemble_once(body, metrics, body_h, reserves.clone(), forced_refs);
+    // One final pass uses the converged capped reservation.
+    book = assemble_once(&body, metrics, body_h, reserves.clone(), forced_refs);
+    while book.pages.len() < assignments.len() {
+        book.pages.push(Page { items: vec![] });
+    }
     for (page_ix, on_page) in assignments.into_iter().enumerate() {
         if on_page.is_empty() {
             continue;
@@ -1679,9 +1742,12 @@ fn assemble(
         let mut y = metrics.page_height - reserve;
         page.items.push(PageItem::FootnoteRule { y: y + FOOTNOTE_AIR / 2.0 });
         y += FOOTNOTE_AIR;
-        for note_ix in on_page {
-            for line in &notes[note_ix].1 {
+        for segment in on_page {
+            for (line_ix, line) in notes[segment.note].1[segment.start..segment.end].iter().enumerate() {
                 let mut line = line.clone();
+                if segment.start > 0 || line_ix > 0 {
+                    line.marker = None;
+                }
                 line.y = y;
                 y += line.height;
                 page.items.push(PageItem::Line(line));
@@ -2454,6 +2520,121 @@ mod tests {
         assert_eq!(notes.last().unwrap().block, 3, "the orphan is last on the final page");
         assert_eq!(notes.last().unwrap().y + notes.last().unwrap().height,
             metrics(600.0, 8).page_height, "the notes block is bottom-set");
+    }
+
+    fn assert_footnote_geometry(book: &BookLayout, page_lines: usize) {
+        let page_h = metrics(170.0, page_lines).page_height;
+        for page in &book.pages {
+            let rule = page.items.iter().find_map(|item| match item {
+                PageItem::FootnoteRule { y } => Some(*y),
+                _ => None,
+            });
+            let Some(rule_y) = rule else { continue };
+            let body_bottom = page.items.iter().filter_map(|item| match item {
+                PageItem::Line(line) if !matches!(line.role, Role::Footnote) =>
+                    Some(line.y + line.height),
+                PageItem::Image { y, height, .. } => Some(y + height),
+                _ => None,
+            }).fold(0.0f32, f32::max);
+            let note_bottom = page.items.iter().filter_map(|item| match item {
+                PageItem::Line(line) if matches!(line.role, Role::Footnote) =>
+                    Some(line.y + line.height),
+                _ => None,
+            }).fold(0.0f32, f32::max);
+            assert!(body_bottom <= rule_y + EPS, "body ink stays above the footnote rule");
+            assert!((note_bottom - page_h).abs() <= EPS, "notes end at the page bottom");
+            assert!(rule_y >= 2.0 * 25.0, "two derived body lines remain usable");
+        }
+    }
+
+    fn note_with_shaped_lines(wanted: usize) -> String {
+        for words in 1..200 {
+            let def = (0..words).map(|i| format!("n{i:07}"))
+                .collect::<Vec<_>>().join(" ");
+            let text = format!("x\n{def}");
+            let book = footnoted(&text, vec![
+                BlockKind::Paragraph,
+                BlockKind::FootnoteDef { id: "a".into() },
+            ], &[(0..1, "a")], 1000);
+            let count = lines(&book).iter()
+                .filter(|line| matches!(line.role, Role::Footnote)).count();
+            if count == wanted {
+                return def;
+            }
+        }
+        panic!("could not make a {wanted}-line fake footnote")
+    }
+
+    #[test]
+    fn footnote_reserve_capacity_exact_and_one_line_over() {
+        // Five body lines leave a three-footnote-line reserve after the
+        // rule air while protecting two body lines.
+        for (note_lines, expected_pages) in [(3, 1), (4, 2)] {
+            let text = format!("x\n{}", note_with_shaped_lines(note_lines));
+            let kinds = vec![
+                BlockKind::Paragraph,
+                BlockKind::FootnoteDef { id: "a".into() },
+            ];
+            let book = footnoted(&text, kinds.clone(), &[(0..1, "a")], 5);
+            let again = footnoted(&text, kinds, &[(0..1, "a")], 5);
+            assert_eq!(book, again, "capacity-boundary pagination is deterministic");
+            assert_eq!(book.pages.iter().filter(|page| page.items.iter().any(|item|
+                matches!(item, PageItem::Line(line) if matches!(line.role, Role::Footnote))))
+                .count(), expected_pages);
+            assert_footnote_geometry(&book, 5);
+        }
+    }
+
+    #[test]
+    fn oversized_note_splits_by_line_and_conserves_every_line() {
+        let def = note_with_shaped_lines(10);
+        let text = format!("x\n{def}");
+        let kinds = vec![
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "a".into() },
+        ];
+        let one_page = footnoted(&text, kinds.clone(), &[(0..1, "a")], 1000);
+        let split = footnoted(&text, kinds.clone(), &[(0..1, "a"), (0..1, "a")], 5);
+        let again = footnoted(&text, kinds, &[(0..1, "a"), (0..1, "a")], 5);
+        let note_lines = |book: &BookLayout| lines(book).iter()
+            .filter(|line| matches!(line.role, Role::Footnote)).count();
+        assert_eq!(note_lines(&split), note_lines(&one_page), "no shaped note line is lost");
+        assert_eq!(split, again, "continued-note pagination is deterministic");
+        assert_eq!(lines(&split).iter().filter(|line| matches!(line.role, Role::Footnote)
+            && line.marker.is_some()).count(), 1, "only the first segment paints the number");
+        let ref_page = split.pages.iter().position(|page| page.items.iter().any(|item|
+            matches!(item, PageItem::Line(line) if !matches!(line.role, Role::Footnote)
+                && line.frags.iter().any(|frag| frag.slice.contains(&0))))).unwrap();
+        assert!(split.pages[ref_page].items.iter().any(|item|
+            matches!(item, PageItem::Line(line) if matches!(line.role, Role::Footnote)
+                && line.marker.is_some())), "the ref page carries the note start");
+        assert_footnote_geometry(&split, 5);
+    }
+
+    #[test]
+    fn whole_note_carries_before_the_next_note_in_number_order() {
+        let def = note_with_shaped_lines(2);
+        let text = format!("x y\n{def}\n{def}");
+        let y = text.find('y').unwrap();
+        let book = footnoted(&text, vec![
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "a".into() },
+            BlockKind::FootnoteDef { id: "b".into() },
+        ], &[(0..1, "a"), (y..y + 1, "b")], 5);
+        let note_pages = |block| book.pages.iter().enumerate().filter_map(|(page_ix, page)|
+            page.items.iter().any(|item| matches!(item, PageItem::Line(line)
+                if matches!(line.role, Role::Footnote) && line.block == block))
+                .then_some(page_ix)).collect::<Vec<_>>();
+        assert_eq!(note_pages(1), vec![0], "the first whole note fits here");
+        assert_eq!(note_pages(2), vec![1], "the next whole note moves, never splits");
+        let markers: Vec<&str> = book.pages.iter().flat_map(|page| &page.items)
+            .filter_map(|item| match item {
+                PageItem::Line(line) if matches!(line.role, Role::Footnote) =>
+                    line.marker.as_ref().map(|marker| marker.text.as_str()),
+                _ => None,
+            }).collect();
+        assert_eq!(markers, vec!["1", "2"], "carried notes precede later anchored notes");
+        assert_footnote_geometry(&book, 5);
     }
 
     /// Images keep whole: move to the next page when the room is short,
