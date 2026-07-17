@@ -27,10 +27,11 @@ use gpui::{
     WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
-    Annotation, Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus,
-    SpanSet, line_text_end_bytes,
+    Annotation, Annotations, BlockKind, BlockMap, ClipboardBlock, Document, InlineAttr, NoteKind,
+    NoteStatus, RichPaste, Span, SpanSet, line_text_end_bytes,
 };
 use strop_core::{SaveCompletion, SaveGeneration, SaveWorker, Store, typograph};
+use serde::{Deserialize, Serialize};
 
 use crate::bookpage::shaped_list_paragraphs;
 use crate::config::{Config, Language};
@@ -55,6 +56,41 @@ struct ExportAsset {
     source_id: String,
     file_name: String,
     bytes: Vec<u8>,
+}
+
+const RICH_CLIPBOARD_VERSION: u8 = 1;
+
+/// Metadata on the clipboard's plain String entry. `text_len` is the guard
+/// against clipboard managers that rewrite the visible flavor but retain our
+/// private metadata. Asset ids map, in order, to sibling bitmap entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RichClipboardEnvelope {
+    v: u8,
+    text_len: usize,
+    rich: RichPaste,
+    image_asset_ids: Vec<String>,
+}
+
+/// Read the plain flavor and, unless explicitly bypassed, its still-matching
+/// private operation. Validate against the untouched clipboard bytes before
+/// normalizing CRLF for insertion: a clipboard manager rewrite must make the
+/// rich half ineligible, never accidentally repair its guard.
+fn clipboard_text_and_rich(
+    item: &ClipboardItem,
+    plain: bool,
+) -> Option<(String, Option<RichPaste>)> {
+    let text = item.entries.iter().find_map(|entry| match entry {
+        ClipboardEntry::String(text) => Some(text),
+        _ => None,
+    })?;
+    let rich = (!plain).then(|| {
+        text.metadata.as_deref().and_then(|metadata| {
+            serde_json::from_str::<RichClipboardEnvelope>(metadata).ok().filter(|payload| {
+                payload.v == RICH_CLIPBOARD_VERSION && payload.text_len == text.text().len()
+            }).map(|payload| payload.rich)
+        })
+    }).flatten();
+    Some((text.text().replace("\r\n", "\n"), rich))
 }
 
 impl ExportAsset {
@@ -798,7 +834,8 @@ actions!(
         WordRight, ParagraphUp, ParagraphDown, SelectLeft, SelectRight, SelectUp, SelectDown,
         SelectWordLeft, SelectWordRight, SelectParagraphUp, SelectParagraphDown, SelectAll, Home,
         End, SelectToHome, SelectToEnd, DocStart, DocEnd, SelectToDocStart, SelectToDocEnd,
-        PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, Undo, Redo,
+        PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, PastePlain,
+        Undo, Redo,
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
@@ -8262,22 +8299,95 @@ impl Editor {
         format!("{above}\n{below}")
     }
 
+    /// The two clipboard flavors are born together. For ordinary live prose
+    /// this records the exact source spans and block extents; seam rewriting
+    /// still receives a valid guarded envelope but deliberately has no rich
+    /// operation, because its visible text is not a contiguous document
+    /// slice. Whole image assets are sibling bitmap entries in id order.
+    fn clipboard_item(&self, range: &Range<usize>) -> ClipboardItem {
+        let text = self.clipboard_text(range);
+        let mut rich = RichPaste {
+            spans: Vec::new(),
+            blocks: Vec::new(),
+            starts_at_boundary: false,
+            ends_at_boundary: false,
+        };
+        let mut image_asset_ids = Vec::new();
+        if !self.selection_spans_seam(range) && text == self.doc.slice_bytes(range.clone()) {
+            let rope = self.doc.rope();
+            let first = rope.byte_to_line(range.start);
+            let last = rope.byte_to_line(range.end.min(self.doc.len_bytes()));
+            rich.starts_at_boundary = range.start == rope.line_to_byte(first);
+            rich.ends_at_boundary = range.end == rope.line_to_byte(last);
+            for block in first..=last.min(self.doc.blocks().len().saturating_sub(1)) {
+                let start = rope.line_to_byte(block);
+                let end = if block + 1 < rope.len_lines() {
+                    rope.line_to_byte(block + 1)
+                } else {
+                    self.doc.len_bytes()
+                };
+                let covered_start = start.max(range.start);
+                let covered_end = end.min(range.end);
+                if covered_start >= covered_end { continue; }
+                let kind = self.doc.blocks().kind(block).clone();
+                let complete = range.start <= start && end <= range.end;
+                if complete && let BlockKind::Image { src, .. } = &kind {
+                    image_asset_ids.push(src.clone());
+                }
+                rich.blocks.push(ClipboardBlock {
+                    range: covered_start - range.start..covered_end - range.start,
+                    kind,
+                    complete,
+                });
+            }
+            let char_start = rope.byte_to_char(range.start);
+            let char_end = rope.byte_to_char(range.end);
+            for source in self.doc.spans().spans() {
+                let start = source.range.start.max(char_start);
+                let end = source.range.end.min(char_end);
+                if start < end && !matches!(source.attr, InlineAttr::FootnoteRef(_)) {
+                    rich.spans.push(Span {
+                        range: start - char_start..end - char_start,
+                        attr: source.attr.clone(),
+                    });
+                }
+            }
+        }
+        let envelope = RichClipboardEnvelope {
+            v: RICH_CLIPBOARD_VERSION,
+            text_len: text.len(),
+            rich,
+            image_asset_ids: image_asset_ids.clone(),
+        };
+        let metadata = serde_json::to_string(&envelope).expect("clipboard payload serializes");
+        let mut item = ClipboardItem::new_string_with_metadata(text, metadata);
+        for id in image_asset_ids {
+            if let Some(bytes) = self.store.as_ref().and_then(|s| s.get_asset(&id)) {
+                item.entries.push(ClipboardEntry::Image(gpui::Image::from_bytes(
+                    image_format_for_src(&id),
+                    bytes,
+                )));
+            }
+        }
+        item
+    }
+
     /// Linux PRIMARY-selection contract: any selection (mouse or keyboard)
     /// is published; middle-click pastes it. With auto_copy_selection
     /// (config), the regular clipboard gets it too — Kirill's habit.
     fn publish_primary(&self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            let text = self.clipboard_text(&self.selected_range.clone());
+            let item = self.clipboard_item(&self.selected_range.clone());
             if self.config.auto_copy_selection {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                cx.write_to_clipboard(item.clone());
             }
             // The PRIMARY selection is an X11/Wayland concept; gpui exposes it
             // only on Linux/BSD. macOS and Windows have no PRIMARY — the
             // regular clipboard above is the only target there.
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            cx.write_to_primary(ClipboardItem::new_string(text));
+            cx.write_to_primary(item);
             #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-            let _ = text;
+            let _ = item;
         }
     }
 
@@ -10871,7 +10981,12 @@ impl Editor {
             // Live copy strips the seam from a spanning selection
             // (seam-mechanics 2 — the fragments join with one newline) and
             // carries whole-covered pictures in their Markdown form (§9).
-            None => self.clipboard_text(&self.selected_range.clone()),
+            None => {
+                let item = self.clipboard_item(&self.selected_range.clone());
+                crate::smoke::mirror_clipboard_item(&item);
+                cx.write_to_clipboard(item);
+                return;
+            }
         };
         crate::smoke::mirror_clipboard(&text);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -10905,13 +11020,21 @@ impl Editor {
         // spanning selection's fragments (pictures in Markdown form, §9);
         // the delete path below splits at the seam and leaves it between
         // the remnants.
-        let text = self.clipboard_text(&self.selected_range.clone());
-        crate::smoke::mirror_clipboard(&text);
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        let item = self.clipboard_item(&self.selected_range.clone());
+        crate::smoke::mirror_clipboard_item(&item);
+        cx.write_to_clipboard(item);
         self.replace_text_in_range(None, "", window, cx);
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste_from_clipboard(false, cx);
+    }
+
+    fn paste_plain(&mut self, _: &PastePlain, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste_from_clipboard(true, cx);
+    }
+
+    fn paste_from_clipboard(&mut self, plain: bool, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
@@ -10925,10 +11048,17 @@ impl Editor {
         else {
             return;
         };
+        if plain {
+            if let Some((text, _)) = clipboard_text_and_rich(&item, true) {
+                self.apply_replace(None, &text, false, true, cx);
+            }
+            return;
+        }
         // §9's gates, priced for prose: one reference pass over the
         // entries, and the image-line parse runs only when the text even
         // contains "![" — an ordinary paste pays two finds and a substring
         // scan, no allocation beyond what it always paid.
+        let rich = clipboard_text_and_rich(&item, false).and_then(|(_, rich)| rich);
         let mut entries = item.entries;
         let text_entry: Option<String> = entries.iter().find_map(|e| match e {
             ClipboardEntry::String(s) => Some(s.text().replace("\r\n", "\n")),
@@ -11046,23 +11176,85 @@ impl Editor {
                 return;
             }
         }
-        // The ordinary path, order-preserved from before §9: a foreign
-        // bitmap takes the bare §5b import; text pastes as text (never
-        // typographed — already authored).
-        for entry in entries {
+        if let (Some(text), Some(rich)) = (text_entry.as_deref(), rich.as_ref())
+            && !rich.blocks.is_empty()
+        {
+            let range = self.marked_range.clone().unwrap_or(self.selected_range.clone());
+            if !self.selection_spans_seam(&range) {
+                let line = self.doc.rope().byte_to_line(range.start);
+                let prefix = usize::from(rich.starts_at_boundary
+                    && range.start > self.doc.rope().line_to_byte(line));
+                let suffix = usize::from(rich.ends_at_boundary
+                    && range.start < line_text_end_bytes(self.doc.rope(), line)
+                    && !text.ends_with('\n'));
+                self.doc.paste_rich(range.clone(), text, rich);
+                let caret = (range.start + prefix + text.len() + suffix)
+                    .min(self.doc.len_bytes());
+                self.selected_range = caret..caret;
+                self.selection_reversed = false;
+                self.marked_range = None;
+                self.goal_x = None;
+                self.caret_attrs.clear();
+                self.mark_dirty();
+                self.sync_mutations();
+                self.bump_activity();
+                cx.notify();
+                self.reconcile_dead_anchors(cx);
+                return;
+            }
+        }
+        // The ordinary path (§9, amended with ExternalPaths import): the
+        // FIRST entry decides the paste's meaning — a foreign bitmap takes
+        // the bare §5b import, text pastes as text (never typographed —
+        // already authored), copied file paths go to the image importer.
+        // Every arm is terminal, so this is an `if`, not a loop.
+        if let Some(entry) = entries.into_iter().next() {
             match entry {
                 ClipboardEntry::Image(image) => {
                     self.import_image_bytes(image.bytes, cx);
-                    return;
                 }
                 ClipboardEntry::String(text) => {
                     let text = text.text().replace("\r\n", "\n");
                     self.apply_replace(None, &text, false, true, cx);
-                    return;
                 }
-                // New variant post-0.2.2; pasting file paths did nothing
-                // before, keep it that way (file *drops* import images).
-                ClipboardEntry::ExternalPaths(_) => {}
+                ClipboardEntry::ExternalPaths(paths) => {
+                    let mut files = Vec::new();
+                    let mut refused = false;
+                    for path in paths.paths() {
+                        // Copied file paths arrive through the same portal
+                        // door as drops — resolve before reading.
+                        let path = crate::files::resolve_portal_path(path);
+                        match std::fs::read(&path) {
+                            Ok(bytes) => files.push(bytes),
+                            Err(e) => {
+                                refused = true;
+                                eprintln!("strop: cannot read {}: {e}", path.display());
+                            }
+                        }
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let (imported, refused) = cx.background_executor().spawn(async move {
+                            let mut imported = Vec::new();
+                            let mut refused = refused;
+                            for bytes in files {
+                                match strop_core::images::import_image(bytes) {
+                                    Ok(image) => imported.push(image),
+                                    Err(e) => {
+                                        refused = true;
+                                        eprintln!("strop: {e}");
+                                    }
+                                }
+                            }
+                            (imported, refused)
+                        }).await;
+                        this.update(cx, |editor: &mut Editor, cx| {
+                            for image in imported {
+                                editor.insert_imported_image(image, "", "", cx);
+                            }
+                            if refused { editor.pulse_strip(cx); }
+                        }).ok();
+                    }).detach();
+                }
             }
         }
     }
@@ -22619,6 +22811,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::copy))
                     .on_action(cx.listener(Self::cut))
                     .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::paste_plain))
                     .on_action(cx.listener(Self::undo))
                     .on_action(cx.listener(Self::redo))
                     .on_action(cx.listener(Self::toggle_strong))
@@ -27299,6 +27492,59 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn structural_clipboard(text: &str) -> ClipboardItem {
+        let rich = RichPaste {
+            spans: Vec::new(),
+            blocks: vec![ClipboardBlock {
+                range: 0..text.len(),
+                kind: BlockKind::Blockquote,
+                complete: true,
+            }],
+            starts_at_boundary: true,
+            ends_at_boundary: true,
+        };
+        let metadata = serde_json::to_string(&RichClipboardEnvelope {
+            v: RICH_CLIPBOARD_VERSION,
+            text_len: text.len(),
+            rich,
+            image_asset_ids: Vec::new(),
+        }).unwrap();
+        ClipboardItem::new_string_with_metadata(text.into(), metadata)
+    }
+
+    #[test]
+    fn mismatched_clipboard_metadata_falls_back_to_plain_text_paste() {
+        let mut item = structural_clipboard("source\n");
+        let ClipboardEntry::String(text) = &mut item.entries[0] else { unreachable!() };
+        text.text.push('x'); // clipboard manager rewrote only the visible flavor
+        let (plain, rich) = clipboard_text_and_rich(&item, false).unwrap();
+        assert_eq!(plain, "source\nx");
+        assert!(rich.is_none(), "the stale structural operation is rejected");
+
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(1));
+        let mut doc = Document::new("heading", SpanSet::default(), blocks);
+        doc.edit_bytes(3..3, &plain);
+        assert!(doc.blocks().kinds().iter().all(|kind| kind == &BlockKind::Heading(1)),
+            "fallback follows the ordinary paste/type destination semantics");
+    }
+
+    #[test]
+    fn paste_as_plain_text_bypasses_an_applicable_rich_payload() {
+        let item = structural_clipboard("source\n");
+        assert!(clipboard_text_and_rich(&item, false).unwrap().1.is_some(),
+            "the control payload really would apply richly");
+        let (plain, rich) = clipboard_text_and_rich(&item, true).unwrap();
+        assert!(rich.is_none(), "Paste as Plain Text bypasses private metadata");
+
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(2));
+        let mut doc = Document::new("heading", SpanSet::default(), blocks);
+        doc.edit_bytes(3..3, &plain);
+        assert!(doc.blocks().kinds().iter().all(|kind| kind == &BlockKind::Heading(2)),
+            "source block kinds are not applied");
+    }
 
     #[test]
     fn shaped_list_layout_tightens_only_the_run_interior() {

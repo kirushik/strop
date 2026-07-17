@@ -887,6 +887,27 @@ pub struct SpanSet {
     spans: Vec<Span>,
 }
 
+/// One source block carried by Strop's private clipboard payload. Extents are
+/// bytes in the accompanying plain-text entry; `complete` is explicit because
+/// a trailing line break is not, by itself, evidence of selection intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardBlock {
+    pub range: Range<usize>,
+    pub kind: BlockKind,
+    pub complete: bool,
+}
+
+/// The structural portion of an internal paste. The app wraps this in the
+/// versioned, guarded clipboard envelope; keeping the application operation
+/// here makes text, blocks and spans one undo transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RichPaste {
+    pub spans: Vec<Span>,
+    pub blocks: Vec<ClipboardBlock>,
+    pub starts_at_boundary: bool,
+    pub ends_at_boundary: bool,
+}
+
 impl SpanSet {
     pub fn spans(&self) -> &[Span] {
         &self.spans
@@ -3556,6 +3577,46 @@ impl Document {
         let splits = count_line_breaks(text);
         if merged != 0 || splits != 0 { self.blocks.on_edit(block, merged, splits); }
         self.absorb_buffer_ops_verbatim();
+    }
+
+    /// Apply an internal clipboard slice as one machine insertion. Complete
+    /// source blocks retain their kinds; partial edge blocks deliberately do
+    /// not get stamped and therefore inherit the destination flank. Source
+    /// spans are rebased after the splice and never consult caret attributes.
+    pub fn paste_rich(
+        &mut self,
+        byte_range: Range<usize>,
+        text: &str,
+        rich: &RichPaste,
+    ) {
+        let at = byte_range.start;
+        let destination_line = self.rope().byte_to_line(at.min(self.len_bytes()));
+        let destination_start = self.rope().line_to_byte(destination_line);
+        let destination_end = line_text_end_bytes(self.rope(), destination_line);
+        let prefix = usize::from(rich.starts_at_boundary && at > destination_start);
+        let suffix = usize::from(rich.ends_at_boundary && at < destination_end);
+        let mut insertion = String::with_capacity(prefix + text.len() + suffix);
+        if prefix != 0 { insertion.push('\n'); }
+        insertion.push_str(text);
+        if suffix != 0 && !text.ends_with('\n') { insertion.push('\n'); }
+
+        self.edit_bytes_verbatim(byte_range, &insertion);
+        let char_base = self.rope().byte_to_char(at + prefix);
+        let text_chars = text.chars().count();
+        for span in &rich.spans {
+            if span.range.start < span.range.end && span.range.end <= text_chars {
+                self.spans.add(
+                    char_base + span.range.start..char_base + span.range.end,
+                    span.attr.clone(),
+                );
+            }
+        }
+        for source in rich.blocks.iter().filter(|b| b.complete) {
+            if source.range.start <= source.range.end && source.range.end <= text.len() {
+                let block = self.rope().byte_to_line(at + prefix + source.range.start);
+                self.blocks.set_kind(block, source.kind.clone());
+            }
+        }
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
@@ -6825,5 +6886,86 @@ mod tests {
         b.set_scrap_line(Some(3));
         let r = ReplayDoc::new("a\n\nb\n\nc", SpanSet::default(), b, 0);
         assert_eq!(r.blocks.scrap_line(), Some(3), "fallback keeps a fixable seam");
+    }
+
+    #[test]
+    fn rich_paste_rebases_every_inline_attribute_without_sticky_inheritance() {
+        let mut destination_spans = SpanSet::default();
+        destination_spans.add(0..4, InlineAttr::Strong);
+        let mut doc = Document::new("bold tail", destination_spans, BlockMap::new(1));
+        let attrs = [
+            InlineAttr::Strong,
+            InlineAttr::Emphasis,
+            InlineAttr::Strikethrough,
+            InlineAttr::Underline,
+            InlineAttr::Highlight,
+            InlineAttr::Code,
+            InlineAttr::Link("https://example.test".into()),
+        ];
+        let rich = RichPaste {
+            spans: attrs.iter().enumerate().map(|(i, attr)| Span {
+                range: i..i + 1,
+                attr: attr.clone(),
+            }).collect(),
+            blocks: vec![ClipboardBlock {
+                range: 0..7,
+                kind: BlockKind::Paragraph,
+                complete: false,
+            }],
+            starts_at_boundary: false,
+            ends_at_boundary: false,
+        };
+        doc.paste_rich(4..4, "1234567", &rich);
+        for (i, attr) in attrs.iter().enumerate() {
+            assert!(doc.spans().covers(4 + i..5 + i, attr), "{attr:?} round-trips");
+        }
+        assert!(!doc.spans().covers(4..11, &InlineAttr::Strong),
+            "machine paste does not inherit the destination's sticky strong span");
+    }
+
+    #[test]
+    fn rich_complete_blocks_split_destination_flanks_and_keep_kinds() {
+        let mut blocks = BlockMap::new(2);
+        blocks.set_kind(0, BlockKind::Heading(2));
+        blocks.set_kind(1, BlockKind::Paragraph);
+        let mut doc = Document::new("Heading\ndestination", SpanSet::default(), blocks);
+        let kinds = [
+            BlockKind::Heading(1),
+            BlockKind::Paragraph,
+            BlockKind::Blockquote,
+            BlockKind::ListItem { ordered: false, depth: 0 },
+            BlockKind::CodeBlock { info: "rs".into() },
+        ];
+        let text = "head\npara\nquote\nitem\ncode\n";
+        let mut start = 0;
+        let source = kinds.iter().map(|kind| {
+            let end = text[start..].find('\n').map(|n| start + n + 1).unwrap();
+            let block = ClipboardBlock { range: start..end, kind: kind.clone(), complete: true };
+            start = end;
+            block
+        }).collect();
+        let rich = RichPaste { spans: Vec::new(), blocks: source,
+            starts_at_boundary: true, ends_at_boundary: true };
+        let at = "Heading\nde".len();
+        doc.paste_rich(at..at, text, &rich);
+        assert_eq!(doc.text(), "Heading\nde\nhead\npara\nquote\nitem\ncode\nstination");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(2));
+        assert_eq!(&doc.blocks().kinds()[2..7], &kinds);
+        assert_eq!(doc.blocks().kind(7), &BlockKind::Paragraph);
+        doc.undo();
+        assert_eq!(doc.text(), "Heading\ndestination", "the entire rich paste undoes once");
+    }
+
+    #[test]
+    fn rich_fragment_adopts_destination_kind() {
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(1));
+        let mut doc = Document::new("heading", SpanSet::default(), blocks);
+        let rich = RichPaste { spans: Vec::new(), blocks: vec![ClipboardBlock {
+            range: 0..4, kind: BlockKind::Blockquote, complete: false,
+        }], starts_at_boundary: false, ends_at_boundary: false };
+        doc.paste_rich(3..3, "frag", &rich);
+        assert_eq!(doc.text(), "heafragding");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(1));
     }
 }
