@@ -137,11 +137,24 @@ fn data_file() -> (PathBuf, bool) {
 /// that sibling does not exist yet — once born, the .strop is the source
 /// of truth and wins every later open. The import itself is LAZY (see
 /// `Editor::stage_import_birth`): deciding `true` here creates nothing.
+/// An unborn sidecar is minted through the sibling-minting law (Copilot,
+/// PR #28): a .md that reached us as an UNRESOLVABLE portal path must not
+/// grow its .strop inside the doc mount, where a foreign name strands as
+/// an invisible `.xdp-*` temp — `files::host_parent_or_documents` sends
+/// it to the documents folder instead. For any ordinary path that law
+/// answers with the .md's own parent, so nothing moves.
 fn open_target(doc_path: &Path) -> (PathBuf, bool) {
     if doc_path.extension().is_some_and(|e| e == "md") {
-        let store_path = doc_path.with_extension("strop");
-        let import = !store_path.exists();
-        (store_path, import)
+        let sibling = doc_path.with_extension("strop");
+        if sibling.exists() {
+            return (sibling, false);
+        }
+        let name = sibling
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("Untitled.strop"));
+        let minted = files::host_parent_or_documents(doc_path).join(name);
+        let import = !minted.exists();
+        (minted, import)
     } else {
         (doc_path.to_owned(), false)
     }

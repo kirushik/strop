@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// The document ID and path below it for an XDG document-portal path.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn portal_path_parts(path: &Path, runtime_dir: &Path) -> Option<(String, PathBuf)> {
     let relative = path.strip_prefix(runtime_dir.join("doc")).ok()?;
     let mut components = relative.components();
@@ -19,10 +20,24 @@ fn portal_path_parts(path: &Path, runtime_dir: &Path) -> Option<(String, PathBuf
     Some((doc_id, components.collect()))
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> PathBuf {
     let Some((doc_id, tail)) = portal_path_parts(&path, runtime_dir) else {
         return path;
     };
+    // One honest attempt per document id per process (Copilot, PR #28):
+    // recents() sits on the palette's render path via omni_rows, so a doc
+    // id whose GetHostPaths already refused us must not cost a fresh
+    // blocking D-Bus round-trip on every keystroke. The verdict is sticky
+    // until relaunch — a portal that starts answering mid-session is far
+    // rarer than the render loop is hot, and the keep-rule below already
+    // tolerates an unresolved entry.
+    static DEAD_DOC_IDS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashSet<String>>,
+    > = std::sync::LazyLock::new(Default::default);
+    if DEAD_DOC_IDS.lock().unwrap().contains(&doc_id) {
+        return path;
+    }
     let result: Result<PathBuf, String> = async {
         let documents = ashpd::documents::Documents::new().await
             .map_err(|error| error.to_string())?;
@@ -39,17 +54,21 @@ async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> Path
         Ok(host_path) => host_path,
         Err(error) => {
             eprintln!("strop: could not resolve portal path {}: {error}", path.display());
+            DEAD_DOC_IDS.lock().unwrap().insert(doc_id);
             path
         }
     }
 }
 
-/// Resolve an XDG document-portal path, failing open when the portal is absent.
+/// Resolve an XDG document-portal path, failing open when the portal is
+/// absent. On OSes without an XDG portal (macOS, Windows) this is the
+/// identity — the portal stack compiles only where a portal can exist.
 pub async fn resolve_portal_path_async(path: PathBuf) -> PathBuf {
-    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
-        return path;
-    };
-    resolve_portal_path_async_at(path, Path::new(&runtime_dir)).await
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return resolve_portal_path_async_at(path, Path::new(&runtime_dir)).await;
+    }
+    path
 }
 
 /// Synchronous convenience for path boundaries outside GPUI tasks.
@@ -67,11 +86,16 @@ pub fn resolve_portal_path(path: impl Into<PathBuf>) -> PathBuf {
 /// chooser then hands out doc-portal paths, and GetHostPaths refuses that
 /// same caller, so resolution fails 100% in-app while succeeding from any
 /// unconfined shell. Identical binary, different cgroup, opposite result.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "freebsd")),
+    allow(unused_variables)
+)]
 fn is_portal_path(path: &Path) -> bool {
-    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
-        return false;
-    };
-    portal_path_parts(path, Path::new(&runtime_dir)).is_some()
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return portal_path_parts(path, Path::new(&runtime_dir)).is_some();
+    }
+    false
 }
 
 /// The host directory a sibling of `path` should be minted in — rename
@@ -509,6 +533,7 @@ pub fn stem_from_title(title: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn document_portal_path_exposes_id_and_filename() {
         let runtime = Path::new("/tmp/strop-test-runtime");
@@ -519,6 +544,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn ordinary_path_is_not_a_document_portal_path() {
         let runtime = Path::new("/tmp/strop-test-runtime");
@@ -530,6 +556,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn document_portal_path_keeps_nested_tail() {
         let runtime = Path::new("/tmp/strop-test-runtime");
