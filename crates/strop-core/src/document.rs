@@ -3595,6 +3595,10 @@ impl Document {
         let destination_end = line_text_end_bytes(self.rope(), destination_line);
         let prefix = usize::from(rich.starts_at_boundary && at > destination_start);
         let suffix = usize::from(rich.ends_at_boundary && at < destination_end);
+        // Measured on the PRE-edit rope: does destination text remain on the
+        // replaced range's last line, to the right of the paste?
+        let tail_line = self.rope().byte_to_line(byte_range.end.min(self.len_bytes()));
+        let tail_merges = byte_range.end < line_text_end_bytes(self.rope(), tail_line);
         let mut insertion = String::with_capacity(prefix + text.len() + suffix);
         if prefix != 0 { insertion.push('\n'); }
         insertion.push_str(text);
@@ -3611,8 +3615,30 @@ impl Document {
                 );
             }
         }
-        for source in rich.blocks.iter().filter(|b| b.complete) {
-            if source.range.start <= source.range.end && source.range.end <= text.len() {
+        // A source kind travels with every block that does not SHARE a line
+        // with destination text — sharing happens only at the two seams: the
+        // first block merging leftward (no prefix newline, mid-line caret)
+        // and the last block merging rightward (destination text follows on
+        // the same line). The earlier `complete`-only rule left a trailing
+        // fragment unstamped even when it landed alone on a fresh line, so
+        // on_edit's destination clone won: copy two paragraphs, paste after
+        // a heading, and the SECOND paragraph arrived as a heading (Kirill,
+        // 2026-07-17). A fragment alone on its line has no destination to
+        // adopt from; its own kind is the only honest one.
+        for (i, source) in rich.blocks.iter().enumerate() {
+            if source.range.start > source.range.end || source.range.end > text.len() {
+                continue;
+            }
+            let starts_own_line = if source.range.start == 0 {
+                prefix != 0 || at == destination_start
+            } else {
+                text.as_bytes()[source.range.start - 1] == b'\n'
+            };
+            let shares_right = i + 1 == rich.blocks.len()
+                && tail_merges
+                && suffix == 0
+                && !text[source.range.clone()].ends_with('\n');
+            if starts_own_line && !shares_right {
                 let block = self.rope().byte_to_line(at + prefix + source.range.start);
                 self.blocks.set_kind(block, source.kind.clone());
             }
@@ -6954,6 +6980,72 @@ mod tests {
         assert_eq!(doc.blocks().kind(7), &BlockKind::Paragraph);
         doc.undo();
         assert_eq!(doc.text(), "Heading\ndestination", "the entire rich paste undoes once");
+    }
+
+    #[test]
+    fn rich_trailing_fragment_alone_on_its_line_keeps_its_source_kind() {
+        // Kirill's 2026-07-17 repro: copy two paragraphs (selection stops
+        // before the second one's newline), paste at the end of an H1 —
+        // the FIRST arrived as a paragraph, the SECOND as a heading. A
+        // fragment alone on a fresh line has no destination to adopt from.
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(1));
+        let mut doc = Document::new("Title", SpanSet::default(), blocks);
+        let text = "first para\nsecond para";
+        let rich = RichPaste {
+            spans: Vec::new(),
+            blocks: vec![
+                ClipboardBlock {
+                    range: 0..11, kind: BlockKind::Paragraph, complete: true,
+                },
+                ClipboardBlock {
+                    range: 11..22, kind: BlockKind::Paragraph, complete: false,
+                },
+            ],
+            starts_at_boundary: true,
+            ends_at_boundary: false,
+        };
+        doc.paste_rich(5..5, text, &rich);
+        assert_eq!(doc.text(), "Title\nfirst para\nsecond para");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(1));
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        assert_eq!(
+            doc.blocks().kind(2),
+            &BlockKind::Paragraph,
+            "the trailing fragment lands alone on its line — its own kind wins"
+        );
+    }
+
+    #[test]
+    fn rich_trailing_fragment_merging_into_following_text_adopts_its_line() {
+        // The counter-case that keeps ruling 2 honest: pasted mid-heading,
+        // the trailing fragment SHARES the line with the heading's tail —
+        // that composite line stays the destination's.
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(1));
+        let mut doc = Document::new("Title tail", SpanSet::default(), blocks);
+        let text = "first para\nsecond";
+        let rich = RichPaste {
+            spans: Vec::new(),
+            blocks: vec![
+                ClipboardBlock {
+                    range: 0..11, kind: BlockKind::Paragraph, complete: true,
+                },
+                ClipboardBlock {
+                    range: 11..17, kind: BlockKind::Paragraph, complete: false,
+                },
+            ],
+            starts_at_boundary: true,
+            ends_at_boundary: false,
+        };
+        doc.paste_rich(5..5, text, &rich);
+        assert_eq!(doc.text(), "Title\nfirst para\nsecond tail");
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        assert_eq!(
+            doc.blocks().kind(2),
+            &BlockKind::Heading(1),
+            "a fragment merging into destination text adopts that line's kind"
+        );
     }
 
     #[test]

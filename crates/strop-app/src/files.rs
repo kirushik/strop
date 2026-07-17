@@ -117,10 +117,15 @@ fn recents_file() -> PathBuf {
 }
 
 /// Most-recent-first. Missing files stay visible as stale evidence.
-/// Portal paths persisted before the resolver existed heal ONCE: the
-/// resolved list is written back, so a stale entry cannot re-trigger a
-/// D-Bus round-trip (and its failure line) on every palette render —
-/// recents() sits on that render path via omni_rows.
+/// Portal paths persisted before the resolver existed heal at read: the
+/// resolved list is written back, so a healed entry never re-triggers a
+/// D-Bus round-trip on later reads — recents() sits on the palette's
+/// render path via omni_rows. An entry that FAILS to resolve is kept as
+/// long as its FUSE path still opens (the grant may outlive a failed
+/// GetHostPaths, and this entry can be the only pointer to the writer's
+/// last document — dropping it once cost a night of "why does Untitled
+/// open", 2026-07-17); only a dead mount — unresolvable AND gone — is
+/// dropped as plumbing.
 pub fn recents() -> Vec<PathBuf> {
     let Ok(json) = std::fs::read_to_string(recents_file()) else {
         return Vec::new();
@@ -130,7 +135,7 @@ pub fn recents() -> Vec<PathBuf> {
         .iter()
         .cloned()
         .map(resolve_portal_path)
-        .filter(|p| !is_portal_path(p))
+        .filter(|p| !is_portal_path(p) || p.exists())
         .collect();
     if resolved != list {
         let _ = std::fs::write(
