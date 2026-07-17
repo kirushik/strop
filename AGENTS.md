@@ -55,7 +55,12 @@ WAYLAND_DISPLAY lets a test-spawned binary open real windows on
 the operator's screen, which also lets stray keystrokes corrupt
 the run. The private dir additionally fixes the `single_instance`
 ReadOnlyFilesystem failures under sandboxes. Anything that truly
-needs a compositor goes through wrun.sh, which brings its own.
+needs a compositor goes through wrun.sh or wshot.sh, which bring
+their own — both are hermetic (private per-run XDG_RUNTIME_DIR,
+hard-fail with no fallback if headless sway doesn't come up; the
+2026-07-17 focus-steal was wshot globbing wayland-* in the shared
+runtime dir and racing onto the operator's live socket). Never
+launch sway or the binary against a compositor socket by hand.
 
 ## Scope
 
