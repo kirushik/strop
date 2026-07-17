@@ -30,15 +30,13 @@ fn default_window_size() -> (f32, f32) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToggleDecision {
     Open,
-    Raise,
     CloseAndRestore,
 }
 
-pub fn toggle_decision(present: bool, reference_focused: bool) -> ToggleDecision {
-    match (present, reference_focused) {
-        (false, _) => ToggleDecision::Open,
-        (true, false) => ToggleDecision::Raise,
-        (true, true) => ToggleDecision::CloseAndRestore,
+pub fn toggle_decision(present: bool) -> ToggleDecision {
+    match present {
+        false => ToggleDecision::Open,
+        true => ToggleDecision::CloseAndRestore,
     }
 }
 
@@ -175,6 +173,7 @@ fn resize_strip(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .occlude()
         .absolute()
         .cursor(cursor)
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -301,8 +300,6 @@ impl Render for KeymapWindow {
             .child(
                 div()
                     .h(px(HEADER_HEIGHT))
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down(MouseButton::Left, drag)
                     .px(px(22.))
                     .flex()
                     .items_center()
@@ -379,7 +376,10 @@ impl Render for KeymapWindow {
                 .when(!tiling.bottom && !tiling.left, |d| d.rounded_bl(px(CSD_ROUNDING)))
                 .when(!tiling.bottom && !tiling.right, |d| d.rounded_br(px(CSD_ROUNDING)))
         };
-        div().size_full().relative().bg(rgba(0x00000000)).child(
+        div().size_full().relative().bg(rgba(0x00000000))
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(MouseButton::Left, drag)
+            .child(
             div().absolute()
                 .top(inset(tiling.top)).bottom(inset(tiling.bottom))
                 .left(inset(tiling.left)).right(inset(tiling.right))
@@ -434,6 +434,8 @@ pub fn open(
     let (default_width, default_height) = default_window_size();
     let editor_right = f32::from(editor_bounds.origin.x + editor_bounds.size.width);
     let editor_left = f32::from(editor_bounds.origin.x);
+    // impl/18's 2026-07-17 amendment: Wayland ignores this requested origin
+    // and has no client position protocol; compositor placement is honest.
     let beside_x = if editor_right + default_width <= work_tuple.0 + work_tuple.2 {
         editor_right
     } else if editor_left - default_width >= work_tuple.0 {
@@ -450,6 +452,7 @@ pub fn open(
     let (x, y, w, h) = clamp_bounds(remembered, work_tuple);
     cx.open_window(
         WindowOptions {
+            app_id: Some("strop".to_owned()),
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: gpui::point(px(x), px(y)),
                 size: size(px(w), px(h)),
@@ -583,12 +586,8 @@ mod tests {
     }
 
     #[test]
-    fn controller_toggle_has_one_window_and_restores_on_the_focused_toggle() {
-        assert_eq!(toggle_decision(false, false), ToggleDecision::Open);
-        assert_eq!(toggle_decision(true, false), ToggleDecision::Raise);
-        assert_eq!(
-            toggle_decision(true, true),
-            ToggleDecision::CloseAndRestore
-        );
+    fn controller_toggle_is_a_strict_two_state_switch() {
+        assert_eq!(toggle_decision(false), ToggleDecision::Open);
+        assert_eq!(toggle_decision(true), ToggleDecision::CloseAndRestore);
     }
 }

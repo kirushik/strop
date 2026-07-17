@@ -10032,24 +10032,17 @@ impl Editor {
 
     fn show_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(reference) = self.keymap_window {
-            if let Ok(was_active) = reference.update(cx, |_, reference_window, _| {
-                let active = reference_window.is_window_active();
-                match crate::keymap_window::toggle_decision(true, active) {
+            if reference.update(cx, |_, reference_window, _| {
+                match crate::keymap_window::toggle_decision(true) {
                     crate::keymap_window::ToggleDecision::CloseAndRestore => {
                         reference_window.remove_window();
                     }
-                    crate::keymap_window::ToggleDecision::Raise => {
-                        reference_window.activate_window();
-                    }
                     crate::keymap_window::ToggleDecision::Open => unreachable!(),
                 }
-                active
-            }) {
-                if was_active {
-                    self.keymap_closed();
-                    window.activate_window();
-                    window.focus(&self.focus_handle, cx);
-                }
+            }).is_ok() {
+                self.keymap_closed();
+                window.activate_window();
+                window.focus(&self.focus_handle, cx);
                 return;
             }
             self.keymap_window = None;

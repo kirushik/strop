@@ -409,6 +409,7 @@ fn main() {
         };
         let window = cx.open_window(
             WindowOptions {
+                app_id: Some("strop".to_owned()),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.clone().into()),
