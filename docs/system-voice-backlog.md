@@ -101,3 +101,16 @@ The compost fresh-slate tournament (impl/08) worked: blind designers,
 adversarial panels, judges, an explicit shipping-nothing champion.
 This round has the same shape — and "shelve the upsell surface
 entirely, keep only the failure register" deserves its own champion.
+
+## Case file addition (2026-07-17): the refusal register
+
+The clipboard round exposed the missing register concretely: pasting
+a readable-but-not-an-image file now imports nothing and can only
+say so on stderr — the strip pulse exists but its banner renders
+only while PARKED, the cold-read pulse only in the reading room, the
+chip pulse means compost arrival. Every refusal surface we have is
+surface-LOCAL; the editing desk itself has no lawful way to decline.
+Whatever grammar this round designs must cover the quiet "no" (a
+paste, a drop, a command that cannot apply) before it covers any
+upsell speech. Until then: log-only is the accepted, recorded state
+of paste refusals — a deliberate gap, not an oversight.
