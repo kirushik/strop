@@ -235,8 +235,11 @@ slots share one 22px centered band (one row, one optical baseline;
 Now right-aligns as the axis end cap).
 
 The dock returns under P14's declared collision law: the verb tier is
-chosen from frame width alone (C5), then placement follows right, flip,
-clamp, and fixed fallback in order (C1–C4); the naming composer freezes
+chosen from frame width alone (C5), then placement is one continuous
+motion — the dock trails the playhead and parks gracefully at both
+rails; the side-swap flip was cut after a field session found the left
+clamp graceful and the right flip a jump (2026-07-18) — with the fixed
+fallback when nothing fits (C4); the naming composer freezes
 at fallback (C6), the dock occludes the fabric (C7), and follows the scrub
 on every frame (C8), with young-document convergence expected (C9). Now
 returns to the selvage at `tail + 14px` when the measured label plus 14px

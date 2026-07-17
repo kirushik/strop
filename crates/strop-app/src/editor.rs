@@ -23676,6 +23676,10 @@ struct StripDockGeometry {
 
 /// P14's complete placement law. Sizing has already happened from the frame's
 /// free interval; this function decides only where that immutable tier sits.
+/// One motion, no flip: the dock trails the playhead and parks gracefully at
+/// BOTH rails — the field verdict (2026-07-18) was that the left edge's clamp
+/// felt right and the right edge's side-swap jump did not, so the clamp is
+/// the whole law: position is continuous in playhead_x, |Δdock| ≤ |Δplayhead|.
 fn strip_dock_geometry(
     playhead_x: f32,
     dock_w: f32,
@@ -23688,20 +23692,8 @@ fn strip_dock_geometry(
     if naming || fallback + dock_w > right_limit {
         return StripDockGeometry { x: fallback, fallback, traveling: false };
     }
-    let right = playhead_x + GAP_DOCK;
-    if right + dock_w <= right_limit {
-        return StripDockGeometry {
-            x: right.max(fallback),
-            fallback,
-            traveling: right >= fallback,
-        };
-    }
-    let flipped = playhead_x - GAP_DOCK - dock_w;
-    StripDockGeometry {
-        x: flipped.min(right_limit - dock_w).max(fallback),
-        fallback,
-        traveling: true,
-    }
+    let x = (playhead_x + GAP_DOCK).min(right_limit - dock_w).max(fallback);
+    StripDockGeometry { x, fallback, traveling: x > fallback }
 }
 
 /// An rgb constant with an explicit alpha — the strip's translucent fabric
@@ -27912,7 +27904,22 @@ mod tests {
                 playhead, dock_w, readout_r, cap_left - 12., false);
             prop_assert!(capped.x + dock_w <= cap_left - 12. - GAP_DOCK + 0.001
                 || !capped.traveling);
+            // Graceful parking (field verdict 2026-07-18): the dock's motion
+            // is continuous — a 1px playhead step never moves it more than
+            // 1px, so neither rail can make it jump sides.
+            let stepped = strip_dock_geometry(
+                playhead + 1., dock_w, readout_r, slots.close.0, false);
+            prop_assert!((stepped.x - dock.x).abs() <= 1.001);
         }
+    }
+
+    #[test]
+    fn dock_parks_gracefully_at_the_right_rail() {
+        let slots = strip_top_slots(800., 220.);
+        let readout_r = slots.readout.0 + slots.readout.1;
+        let dock = strip_dock_geometry(772., 220., readout_r, slots.close.0, false);
+        assert_eq!(dock.x, slots.close.0 - GAP_DOCK - 220.);
+        assert!(dock.traveling);
     }
 
     #[test]
