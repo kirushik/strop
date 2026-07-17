@@ -233,3 +233,11 @@ gutter per floating side. Plus two care rules: 12px minimum air
 between Now and close (opposite verbs never touch), and all four
 slots share one 22px centered band (one row, one optical baseline;
 Now right-aligns as the axis end cap).
+
+The dock returns under P14's declared collision law: the verb tier is
+chosen from frame width alone (C5), then placement follows right, flip,
+clamp, and fixed fallback in order (C1–C4); the naming composer freezes
+at fallback (C6), the dock occludes the fabric (C7), and recedes during
+scrubbing (C8), with young-document convergence expected (C9). Now keeps
+its top-row address, widened leftward into a generous end-cap hit target,
+while the dead desk beyond the sheet tail becomes a return-to-now target.

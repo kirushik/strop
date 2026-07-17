@@ -257,6 +257,41 @@ warnings).
 product's strongest trust claim was folklore distributed across
 artifacts until this round wrote it down.
 
+### P14. Addresses for chrome; the locus for summoned verbs
+
+A control needs an **address** — a fixed, learnable position — exactly
+when the writer must **re-find** it: standing chrome (menus, toggles,
+the readout origin, close) and any reference worked *against*
+repeatedly, across sessions or within one, earns habit only by never
+moving. A verb that is **summoned at the point of action**, acts on
+the object already under the writer's eye, and is dismissed after one
+use earns nothing from an address — the hand is already there, search
+cost is zero, and proximity is what says it acts on *this* thing;
+such a verb may anchor to that locus. But attention-anchored placement
+is licensed **only with a declared collision law**: a written priority
+order and a deterministic fallback — recede, flip, clamp, or fold —
+for every case where the control would touch another, computed
+together before paint. Anchoring without that law is what reads as
+garble; the *missing law*, never the anchoring, is what earns removal.
+
+*Born from:* the traveling dock (Restore / Name this version /
+Compare, anchored to the parked playhead), removed 2026-07-17 under
+the then-unwritten maxim "controls need addresses" after Now clamped
+onto the readout's x=28 origin and the two garbled on young documents
+— while both external testers found the dock intuitively pleasant.
+The garble was a missing collision law, misdiagnosed as a flaw in
+attention-anchoring itself.
+
+*Forbids:* attention-anchored controls without a declared,
+pre-computed collision/fallback order; moving standing chrome or a
+re-found reference to follow attention (the readout does not travel;
+Now is a signpost and keeps its address).
+
+*Demands:* for any control positioned from a live coordinate, a
+written priority-plus-fallback beside it; and for every summoned
+verb, that it be reachable at the locus without the writer leaving
+the object.
+
 ## Applying the constitution
 
 Reviews cite principles by number. A mockup or feature that fails one
