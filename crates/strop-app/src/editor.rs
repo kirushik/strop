@@ -4195,18 +4195,6 @@ impl Editor {
         Some(bake.timeline.wall_at(frac * bake.timeline.total_work))
     }
 
-    fn strip_desk_at_rail_point(&self, x: f32, y: f32) -> bool {
-        let Some(geom) = *self.strip_rail.borrow() else { return false };
-        let Some(bake) = self.strip.bake.as_ref() else { return false };
-        let in_rail_band = y >= geom.band_top
-            && y - geom.band_top <= strip::RAIL_Y + 8.;
-        let tail = strip_sheet_tail(
-            geom.rail_x0, geom.rail_x1, bake.timeline.total_work,
-            self.strip_view());
-        in_rail_band && x <= geom.rail_x1
-            && strip_desk_release_returns_now(tail, x, self.strip_drag_moved)
-    }
-
     /// The effective fabric pan: the stored offset clamped to the current
     /// geometry. Open stores f32::MAX to pin the view to the tail — the clamp
     /// resolves the sentinel against a rail width the strip only learns at
@@ -23624,37 +23612,39 @@ fn strip_sheet_tail(rail_x0: f32, rail_x1: f32, total_work: f32, view: f32) -> f
     (rail_x0 + total_work - view).clamp(rail_x0, rail_x1)
 }
 
-fn strip_desk_release_returns_now(tail_x: f32, release_x: f32, dragged: bool) -> bool {
-    !dragged && release_x > tail_x
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StripTopSlots {
     readout: (f32, f32),
-    now: (f32, f32),
     close: (f32, f32),
 }
 
-/// Allocate the strip's three frame-owned addresses together. Now's painted
-/// label stays modest, but its end-cap hit address reaches left through the
-/// slack the fixed action slot vacated.
-fn strip_top_slots(frame_w: f32, readout_w: f32, now_label_w: f32) -> StripTopSlots {
+/// Allocate the strip's two standing frame-owned addresses together.
+fn strip_top_slots(frame_w: f32, readout_w: f32) -> StripTopSlots {
     let close_w = 19.;
     let close_x = (frame_w - 8. - close_w).max(0.);
-    let now_w = (now_label_w + 16.).max(110.);
-    // Air before the close saltire: Now (return to the present) and close
-    // (dismiss the strip) are unrelated verbs — adjacent hot targets with
-    // opposite meanings invite the misclick (2026-07-17 round).
-    let now_x = (close_x - 12. - now_w).max(0.);
     let readout_x = strip::SIDE_PAD;
     // The smallest dock (Restore + ellipsis) must retain one legal fallback
     // even when the readout degrades on a narrow frame.
-    let readout_limit = (now_x - 2. * GAP_DOCK - 80. - readout_x).max(0.);
+    let readout_limit = (close_x - 2. * GAP_DOCK - 80. - readout_x).max(0.);
     let readout_w = readout_w.min(readout_limit);
     StripTopSlots {
         readout: (readout_x, readout_w),
-        now: (now_x, now_w),
         close: (close_x, close_w),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NowHome {
+    Selvage(f32),
+    Cap,
+}
+
+fn strip_now_home(tail_x: f32, label_w: f32, rail_x1: f32) -> NowHome {
+    let x = tail_x + 14.;
+    if x + label_w + 14. <= rail_x1 {
+        NowHome::Selvage(x)
+    } else {
+        NowHome::Cap
     }
 }
 
@@ -23690,11 +23680,11 @@ fn strip_dock_geometry(
     playhead_x: f32,
     dock_w: f32,
     readout_r: f32,
-    now_cap_left: f32,
+    right_edge: f32,
     naming: bool,
 ) -> StripDockGeometry {
     let fallback = readout_r + GAP_DOCK;
-    let right_limit = now_cap_left - GAP_DOCK;
+    let right_limit = right_edge - GAP_DOCK;
     if naming || fallback + dock_w > right_limit {
         return StripDockGeometry { x: fallback, fallback, traveling: false };
     }
@@ -26575,9 +26565,32 @@ impl Editor {
         } else {
             measure_text(&readout, 12.) + 16.
         };
-        let slots = strip_top_slots(desk_w, readout_w, now_label_w);
+        let slots = strip_top_slots(desk_w, readout_w);
         let readout_r = slots.readout.0 + slots.readout.1;
-        let free_interval = (slots.now.0 - GAP_DOCK) - (readout_r + GAP_DOCK);
+        let rail_x0 = strip::SIDE_PAD;
+        let rail_x1 = desk_w - strip::SIDE_PAD;
+        let view = self.strip.bake.as_ref().map_or(0., |b| self.strip.view_offset.clamp(
+            0., (b.timeline.total_work - (rail_x1 - rail_x0)).max(0.)));
+        let playhead_x = self.strip.bake.as_ref().map_or(rail_x0, |b| {
+            (rail_x0 + b.timeline.work_at(self.strip.pos_ms) - view)
+                .clamp(rail_x0, rail_x1)
+        });
+        let tail_x = self.strip.bake.as_ref().map_or(rail_x0, |b| {
+            strip_sheet_tail(rail_x0, rail_x1, b.timeline.total_work, view)
+        });
+        let now_home = strip_now_home(tail_x, now_label_w, rail_x1);
+        let now_x = match now_home {
+            NowHome::Selvage(x) => x,
+            NowHome::Cap => slots.close.0 - 12. - now_label_w,
+        };
+        // P14: every collision is declared. At the Cap home the Now label
+        // shares the dock's row, so the label's padded box — not close —
+        // bounds the dock; C5 then sizes the tier from that same interval.
+        let dock_right_edge = match now_home {
+            NowHome::Selvage(_) => slots.close.0,
+            NowHome::Cap => now_x - 12.,
+        };
+        let free_interval = (dock_right_edge - GAP_DOCK) - (readout_r + GAP_DOCK);
         let restore_w = measure_text("Restore", 11.) + 16.;
         let verb_interval = (free_interval - if parked { restore_w + 6. } else { 0. }).max(0.);
         let dock_tier = strip_dock_tier(verb_interval);
@@ -26596,16 +26609,8 @@ impl Editor {
             }
         };
         let dock_w = center_w + if parked { restore_w + 6. } else { 0. };
-        let rail_x0 = strip::SIDE_PAD;
-        let rail_x1 = desk_w - strip::SIDE_PAD;
-        let view = self.strip.bake.as_ref().map_or(0., |b| self.strip.view_offset.clamp(
-            0., (b.timeline.total_work - (rail_x1 - rail_x0)).max(0.)));
-        let playhead_x = self.strip.bake.as_ref().map_or(rail_x0, |b| {
-            (rail_x0 + b.timeline.work_at(self.strip.pos_ms) - view)
-                .clamp(rail_x0, rail_x1)
-        });
         let dock = strip_dock_geometry(
-            playhead_x, dock_w, readout_r, slots.now.0,
+            playhead_x, dock_w, readout_r, dock_right_edge,
             self.strip_name_input.is_some());
 
         // Recessed data. It has no border, hover, or pointer semantics.
@@ -26694,23 +26699,18 @@ impl Editor {
         // Now: dim at the present, bright when parked (it and Restore announce
         // themselves as the pair they are — design §3, review H4: the two
         // exits from the past light up in the same beat). Click / Esc return.
-        let now_chip = chip(now_label.into(), parked)
+        let now_chip = div()
             .id("strip-now")
-            .occlude()
+            .font_family("PT Sans")
+            .text_size(px(11.))
+            .text_color(if parked { rgb(0xE7E1D0) } else { rgb(0x8F8A7C) })
+            .child(now_label)
             .when(parked, |d| {
                 d.cursor(CursorStyle::PointingHand)
                     .border_b_1()
                     .border_dashed()
                     .border_color(rgb(0xE7E1D0))
-            })
-            .when(parked, |d| d.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        editor.resolve_strip_name(window, cx);
-                        editor.strip_return_to_now(cx);
-                    }),
-                ));
+            });
 
         // Close affordance (Bug C): the pictorial dismiss saltire in the
         // strip's top-right (muted → bright on hover, pointing hand) — the
@@ -26908,12 +26908,7 @@ impl Editor {
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|editor, ev: &MouseUpEvent, _, cx| {
-                        if editor.strip_desk_at_rail_point(
-                            f32::from(ev.position.x), f32::from(ev.position.y))
-                        {
-                            editor.strip_return_to_now(cx);
-                        }
+                    cx.listener(|editor, _: &MouseUpEvent, _, cx| {
                         if editor.strip.scrubbing {
                             editor.strip.scrubbing = false;
                             let settled = editor.strip_settle_ms(editor.strip.pos_ms);
@@ -26980,9 +26975,9 @@ impl Editor {
                         .overflow_hidden()
                         .child(readout_chip),
                 )
-                // P14: the moment verbs travel with the parked playhead. The
-                // whole dock occludes fabric input; while scrubbing it recedes.
-                .when(parked && !self.strip.scrubbing, |strip| strip.child(
+                // P14: the moment verbs travel with the live playhead. Mouse
+                // move bubbles to the container, so the dock rides a scrub.
+                .when(parked || self.strip.scrubbing, |strip| strip.child(
                     div()
                         .absolute()
                         .left(px(dock.x))
@@ -26992,33 +26987,37 @@ impl Editor {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .occlude()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .when(!self.strip.scrubbing, |d| d.occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
                         .child(restore_btn)
                         .child(center),
                 ))
-                // Now and close are the two terminal frame-owned slots. Now
-                // right-aligns toward the rail's right terminus — the label
-                // reads as the axis's end cap, not a floating chip.
+                // Now belongs to the selvage when the desk has room. Its
+                // padded chrome target paints after the fabric's dimming; the
+                // top-row end cap is only the declared collision fallback.
                 .child(
                     div()
                         .absolute()
-                        .left(px(slots.now.0))
-                        .w(px(slots.now.1))
-                        .top(px(4.))
+                        .left(px(now_x - 12.))
+                        .w(px(now_label_w + 24.))
+                        .top(px(match now_home {
+                            NowHome::Selvage(_) => strip::TOP_ROW_H + 2.,
+                            NowHome::Cap => 4.,
+                        }))
                         .h(px(22.))
                         .flex()
                         .items_center()
-                        .justify_end()
+                        .justify_center()
                         .child(now_chip)
-                        .when(parked, |d| d.on_mouse_down(
+                        .occlude()
+                        .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
                                 editor.resolve_strip_name(window, cx);
                                 editor.strip_return_to_now(cx);
                             }),
-                        )),
+                        )
                 )
                 .child(
                     div().absolute().left(px(slots.close.0)).top(px(4.)).child(close_x),
@@ -27191,6 +27190,13 @@ impl Element for StripElement {
             } else {
                 wx + 3.
             };
+            if let Some(now_w) = editor.strip_now_w.get()
+                && let NowHome::Selvage(now_x) = strip_now_home(tail_x, now_w, rail_x1)
+                && lx < now_x + now_w
+                && now_x < lx + f32::from(line.width)
+            {
+                continue;
+            }
             let ly = band_top + strip::TOP_ROW_H + 2. + (st.row as f32) * 13.;
             labels.push(StripText {
                 origin: point(px(lx), px(ly)),
@@ -27835,47 +27841,44 @@ mod tests {
 
     #[test]
     fn strip_top_slots_are_disjoint_at_representative_widths() {
-        let ru_now_w = 46.; // shaped corridor measurement for «Сейчас»
         for width in [480., 600., 800., 1600.] {
-            let slots = strip_top_slots(width, 220., ru_now_w);
-            assert!(slots.readout.0 + slots.readout.1 <= slots.now.0);
-            assert!(slots.now.0 + slots.now.1 <= slots.close.0);
+            let slots = strip_top_slots(width, 220.);
+            assert!(slots.readout.0 + slots.readout.1 <= slots.close.0);
             assert!(slots.close.0 + slots.close.1 <= width);
-            assert!(slots.now.1 >= 110.);
-            assert_eq!(slots.close.0 - (slots.now.0 + slots.now.1), 12.);
+            assert_eq!(width - (slots.close.0 + slots.close.1), 8.);
         }
     }
 
     #[test]
-    fn strip_top_slots_make_the_young_tail_irrelevant() {
-        let slots = strip_top_slots(600., 220., 24.);
-        let young_selvage_x = strip::SIDE_PAD;
-        assert_eq!(young_selvage_x, slots.readout.0);
-        assert!(slots.readout.0 + slots.readout.1 <= slots.now.0);
+    fn strip_now_home_uses_the_young_selvage() {
+        assert_eq!(strip_now_home(strip::SIDE_PAD + 40., 24., 572.),
+            NowHome::Selvage(strip::SIDE_PAD + 54.));
     }
 
     #[test]
-    fn strip_top_slot_addresses_ignore_timeline_state() {
-        let expected = strip_top_slots(800., 220., 24.);
-        for (_playhead, _pos_ms, _view, _total_work) in [
-            (28., 0, 0., 0.),
-            (400., 60_000, 120., 900.),
-            (772., 3_600_000, 800., 2_000.),
-        ] {
-            assert_eq!(strip_top_slots(800., 220., 24.), expected);
-        }
+    fn strip_now_home_flips_to_cap_immediately_past_the_room_boundary() {
+        assert_eq!(strip_now_home(520., 24., 572.), NowHome::Selvage(534.));
+        assert_eq!(strip_now_home(520.001, 24., 572.), NowHome::Cap);
+        assert_eq!(strip_now_home(572., 24., 572.), NowHome::Cap);
+    }
+
+    #[test]
+    fn strip_now_home_uses_the_measured_russian_width() {
+        let ru_now_w = 46.; // shaped corridor measurement for «Сейчас»
+        assert_eq!(strip_now_home(498., ru_now_w, 572.), NowHome::Selvage(512.));
+        assert_eq!(strip_now_home(498.001, ru_now_w, 572.), NowHome::Cap);
     }
 
     #[test]
     fn strip_top_slots_degrade_compare_space_before_name_space() {
-        let free = |width| {
-            let slots = strip_top_slots(width, 220., 24.);
-            (slots.now.0 - GAP_DOCK)
+        let free = |width, readout_w| {
+            let slots = strip_top_slots(width, readout_w);
+            (slots.close.0 - GAP_DOCK)
                 - (slots.readout.0 + slots.readout.1 + GAP_DOCK)
         };
-        let wide = free(800.);
-        let middle = free(600.);
-        let narrow = free(480.);
+        let wide = free(800., 220.);
+        let middle = free(480., 220.);
+        let narrow = free(420., 520.);
         assert!(wide >= 230., "wide action slot admits Compare");
         assert!((104.0..230.0).contains(&middle), "middle keeps Name only");
         assert!(narrow < 104., "narrow folds actions behind ellipsis");
@@ -27887,9 +27890,9 @@ mod tests {
             content_width in 420f32..1600., readout_w in 180f32..520.,
             playhead_frac in 0f32..1.,
         ) {
-            let slots = strip_top_slots(content_width, readout_w, 46.);
+            let slots = strip_top_slots(content_width, readout_w);
             let readout_r = slots.readout.0 + slots.readout.1;
-            let free = (slots.now.0 - GAP_DOCK) - (readout_r + GAP_DOCK);
+            let free = (slots.close.0 - GAP_DOCK) - (readout_r + GAP_DOCK);
             let dock_w = match strip_dock_tier(free) {
                 StripDockTier::NameCompare => 220.,
                 StripDockTier::Name => 100.,
@@ -27899,17 +27902,23 @@ mod tests {
             let playhead = strip::SIDE_PAD
                 + (rail_x1 - strip::SIDE_PAD) * playhead_frac;
             let dock = strip_dock_geometry(
-                playhead, dock_w, readout_r, slots.now.0, false);
+                playhead, dock_w, readout_r, slots.close.0, false);
             prop_assert!(dock.x >= readout_r + GAP_DOCK);
-            prop_assert!(dock.x + dock_w <= slots.now.0 - GAP_DOCK + 0.001);
-            prop_assert!(dock.x + dock_w <= slots.close.0);
+            prop_assert!(dock.x + dock_w <= slots.close.0 - GAP_DOCK + 0.001);
+            // Cap home: the Now label shares the row, and its padded box —
+            // not close — bounds the dock (declared collision, P14).
+            let cap_left = slots.close.0 - 12. - 46.;
+            let capped = strip_dock_geometry(
+                playhead, dock_w, readout_r, cap_left - 12., false);
+            prop_assert!(capped.x + dock_w <= cap_left - 12. - GAP_DOCK + 0.001
+                || !capped.traveling);
         }
     }
 
     #[test]
     fn verb_tier_is_independent_of_playhead_at_fixed_frame_width() {
-        let slots = strip_top_slots(800., 220., 24.);
-        let free = (slots.now.0 - GAP_DOCK)
+        let slots = strip_top_slots(800., 220.);
+        let free = (slots.close.0 - GAP_DOCK)
             - (slots.readout.0 + slots.readout.1 + GAP_DOCK);
         let tiers = [strip::SIDE_PAD, 400., 772.].map(|_| strip_dock_tier(free));
         assert_eq!(tiers, [tiers[0]; 3]);
@@ -27917,19 +27926,12 @@ mod tests {
 
     #[test]
     fn young_doc_parked_early_dock_sits_at_the_fallback_address() {
-        let slots = strip_top_slots(600., 220., 24.);
+        let slots = strip_top_slots(600., 220.);
         let readout_r = slots.readout.0 + slots.readout.1;
         let dock = strip_dock_geometry(
-            strip::SIDE_PAD, 100., readout_r, slots.now.0, false);
+            strip::SIDE_PAD, 100., readout_r, slots.close.0, false);
         assert_eq!(dock.x, readout_r + GAP_DOCK);
         assert_eq!(dock.x, dock.fallback);
-    }
-
-    #[test]
-    fn desk_click_returns_to_now_but_drag_release_keeps_the_park() {
-        assert!(strip_desk_release_returns_now(240., 300., false));
-        assert!(!strip_desk_release_returns_now(240., 300., true));
-        assert!(!strip_desk_release_returns_now(240., 200., false));
     }
 
     #[test]

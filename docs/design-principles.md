@@ -285,7 +285,9 @@ attention-anchoring itself.
 *Forbids:* attention-anchored controls without a declared,
 pre-computed collision/fallback order; moving standing chrome or a
 re-found reference to follow attention (the readout does not travel;
-Now is a signpost and keeps its address).
+Now is a signpost bound to the geometry it names — its address is the
+selvage, wherever the selvage stands, with a declared fallback when the
+desk has no room).
 
 *Demands:* for any control positioned from a live coordinate, a
 written priority-plus-fallback beside it; and for every summoned

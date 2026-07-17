@@ -237,7 +237,10 @@ Now right-aligns as the axis end cap).
 The dock returns under P14's declared collision law: the verb tier is
 chosen from frame width alone (C5), then placement follows right, flip,
 clamp, and fixed fallback in order (C1–C4); the naming composer freezes
-at fallback (C6), the dock occludes the fabric (C7), and recedes during
-scrubbing (C8), with young-document convergence expected (C9). Now keeps
-its top-row address, widened leftward into a generous end-cap hit target,
-while the dead desk beyond the sheet tail becomes a return-to-now target.
+at fallback (C6), the dock occludes the fabric (C7), and follows the scrub
+on every frame (C8), with young-document convergence expected (C9). Now
+returns to the selvage at `tail + 14px` when the measured label plus 14px
+far air fits before the rail end, otherwise it uses its former top-row
+end-cap address; its padded target owns the lane collision. The desk-click
+experiment is retired after one field session found it undiscoverable and
+prone to accidental exits.

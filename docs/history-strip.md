@@ -640,9 +640,8 @@ are the layout grid, three ownerships:
   verb) with `Name this version` and `Compare` (dashed) beside it,
   the dock anchored to the parked playhead in the top control row,
   flipping to whichever side keeps it on the sheet/viewport and
-  clamping at the edges. It does not chase the hand: while a drag
-  scrubs, the dock recedes; it settles beside the playhead on
-  release or keyboard step. Position is the documentation — these
+  clamping at the edges. While a drag scrubs, the dock rides the
+  playhead on every frame. Position is the documentation — these
   verbs concern the moment under this line.
 - **The selvage owns Now**: the word stands at the selvage as the
   timeline's implicit terminal label — no tick, because the selvage
@@ -653,6 +652,10 @@ are the layout grid, three ownerships:
   selvage stands beyond the viewport, Now clamps to the near edge —
   still truthfully pointing the way home. Click: back to the
   present; Esc the same.
+
+  On 2026-07-17 Now returned to the selvage under a declared collision
+  law: it yields to a fixed end-cap fallback only when the desk has no
+  room for the word and its air.
 - **The frame owns close**: the dismiss saltire, top-right of the
   strip container — the only control that acts on the surface
   rather than on time.
