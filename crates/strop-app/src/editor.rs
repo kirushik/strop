@@ -905,6 +905,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-2", Heading2, ctx),
         KeyBinding::new("ctrl-alt-3", Heading3, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
+        KeyBinding::new("escape", EscapeMode, Some("Keymap")),
         KeyBinding::new("escape", EscapeMode, Some("QuitGuard")),
         // GNOME's menu key opens the palette — it IS the menu.
         KeyBinding::new("f10", TogglePalette, ctx),
@@ -1642,8 +1643,8 @@ pub struct Editor {
     doc_rename_input: Option<Entity<TextField>>,
     /// A refused rename stays witnessed beside the still-open field.
     doc_rename_error: Option<&'static str>,
-    /// The keyboard-map overlay (PLAN.md E4, ctrl-?).
-    shortcuts_open: bool,
+    /// The one modeless keyboard-reference window (impl/18, ctrl-?).
+    keymap_window: Option<gpui::WindowHandle<crate::keymap_window::KeymapWindow>>,
     /// The AI settings panel (DESIGN §2-ai, F4): form + async test +
     /// /models picker; saves write through toml_edit.
     ai_settings: Option<AiSettings>,
@@ -2517,7 +2518,7 @@ impl Editor {
             palette_freq: HashMap::new(),
             doc_rename_input: None,
             doc_rename_error: None,
-            shortcuts_open: false,
+            keymap_window: None,
             ai_settings: None,
             ai_settings_generation: 0,
             replace_input: None,
@@ -9879,12 +9880,6 @@ impl Editor {
             self.close_palette(window, cx);
             return;
         }
-        if self.shortcuts_open {
-            self.shortcuts_open = false;
-            window.focus(&self.focus_handle, cx);
-            cx.notify();
-            return;
-        }
         if self.editor_menu_open {
             self.editor_menu_open = false;
             cx.notify();
@@ -10030,12 +10025,43 @@ impl Editor {
         cx.notify();
     }
 
-    fn show_shortcuts(&mut self, _: &ShowShortcuts, _: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_guard(cx) {
-            return; // the reading room refuses with the pulse (F4 belt 2)
+    fn show_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reference) = self.keymap_window {
+            if let Ok(was_active) = reference.update(cx, |_, reference_window, _| {
+                let active = reference_window.is_window_active();
+                match crate::keymap_window::toggle_decision(true, active) {
+                    crate::keymap_window::ToggleDecision::CloseAndRestore => {
+                        reference_window.remove_window();
+                    }
+                    crate::keymap_window::ToggleDecision::Raise => {
+                        reference_window.activate_window();
+                    }
+                    crate::keymap_window::ToggleDecision::Open => unreachable!(),
+                }
+                active
+            }) {
+                if was_active {
+                    self.keymap_closed();
+                    window.activate_window();
+                    window.focus(&self.focus_handle, cx);
+                }
+                return;
+            }
+            self.keymap_window = None;
         }
-        self.shortcuts_open = !self.shortcuts_open;
-        cx.notify();
+        let editor = cx.entity();
+        if let Some(reference) = crate::keymap_window::open(
+            editor,
+            window.window_handle(),
+            window.bounds(),
+            cx,
+        ) {
+            self.keymap_window = Some(reference);
+        }
+    }
+
+    pub(crate) fn keymap_closed(&mut self) {
+        self.keymap_window = None;
     }
 
     fn open_welcome(&mut self, _: &OpenWelcome, _: &mut Window, cx: &mut Context<Self>) {
@@ -10043,116 +10069,6 @@ impl Editor {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
         crate::files::open_welcome_window();
-    }
-
-    /// The keyboard map (GNOME's ctrl-? convention): every command from
-    /// the registry plus the text-editing baseline, at a glance. The
-    /// palette is for doing; this is for learning.
-    fn render_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut sections: Vec<(&'static str, Vec<(String, String)>)> = Vec::new();
-        for cmd in crate::commands::all() {
-            let keys = cmd.keys.map_or_else(|| "palette".to_owned(), |k| k.to_owned());
-            match sections.iter_mut().find(|(s, _)| *s == cmd.section) {
-                Some((_, rows)) => rows.push((cmd.label.to_owned(), keys)),
-                None => sections.push((cmd.section, vec![(cmd.label.to_owned(), keys)])),
-            }
-        }
-        sections.push((
-            "Text editing",
-            [
-                ("Move by word / paragraph", "ctrl-arrows"),
-                ("Select by word / paragraph", "ctrl-shift-arrows"),
-                ("Document start / end", "ctrl-home / ctrl-end"),
-                ("Select all", "ctrl-a"),
-                ("Copy / Cut / Paste", "ctrl-c / x / v"),
-                ("Markdown headings", "# ## ### + space"),
-                ("Escape any mode", "escape"),
-            ]
-            .into_iter()
-            .map(|(a, b)| (a.to_owned(), b.to_owned()))
-            .collect(),
-        ));
-        div()
-            .absolute()
-            .inset_0()
-            .bg(rgba(0x1A1A1830u32))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    editor.shortcuts_open = false;
-                    // §0.6 law 4: closing a layer restores focus beneath it.
-                    window.focus(&editor.focus_handle, cx);
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .id("shortcuts-panel")
-                    .w(px(700.))
-                    .max_h(px(560.))
-                    .overflow_y_scroll()
-                    .bg(rgb(0xFCFAF4))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .rounded(px(8.))
-                    .shadow_lg()
-                    .p(px(18.))
-                    .font_family("PT Serif")
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .pb(px(10.))
-                            .flex()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(15.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(TEXT_COLOR))
-                                    .child("Keyboard map"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child("esc closes · ctrl-shift-p runs any of these by name"),
-                            ),
-                    )
-                    .child(div().flex().flex_wrap().gap(px(16.)).children(
-                        sections.into_iter().map(|(section, rows)| {
-                            div()
-                                .w(px(320.))
-                                .child(
-                                    div()
-                                        .pt(px(6.))
-                                        .pb(px(3.))
-                                        .text_size(px(10.))
-                                        .text_color(rgb(MUTED_COLOR))
-                                        .child(section.to_uppercase()),
-                                )
-                                .children(rows.into_iter().map(|(label, keys)| {
-                                    div()
-                                        .flex()
-                                        .justify_between()
-                                        .gap(px(10.))
-                                        .py(px(1.))
-                                        .text_size(px(12.))
-                                        .child(div().text_color(rgb(TEXT_COLOR)).child(label))
-                                        .child(
-                                            div()
-                                                .text_color(rgb(MUTED_COLOR))
-                                                .text_size(px(11.))
-                                                .child(keys),
-                                        )
-                                }))
-                        }),
-                    )),
-            )
     }
 
     /// The AI settings panel (DESIGN §2-ai, F4): centered in-surface
@@ -11633,7 +11549,7 @@ impl Editor {
         // §0.6 law 1, second line of defense: while a blocking overlay is
         // up, the document never scrolls — even if a wheel event slips
         // past the overlay's own stop_propagation.
-        if self.palette_input.is_some() || self.ai_settings.is_some() || self.shortcuts_open {
+        if self.palette_input.is_some() || self.ai_settings.is_some() {
             return;
         }
         // Scrolling may end the typing reveal clock only while the fan is
@@ -11938,11 +11854,6 @@ impl Editor {
         self.commit_transient_fields_on_gesture(cx);
         if self.palette_input.is_some() {
             self.close_palette(window, cx);
-        }
-        if self.shortcuts_open {
-            self.shortcuts_open = false;
-            window.focus(&self.focus_handle, cx);
-            cx.notify();
         }
         // A click outside the flank commits its open link argument-field before
         // the popover itself is dismissed, so the URL lands (spec §0.1).
@@ -12285,9 +12196,6 @@ impl Editor {
         }
         if self.palette_input.is_some() {
             overlays.push("palette");
-        }
-        if self.shortcuts_open {
-            overlays.push("shortcuts");
         }
         // Key on the RENDER gate, not the bare predicate (V9b): a settled
         // selection scrolled off-screen passes `flanks_visible` but paints
@@ -22960,12 +22868,11 @@ impl Render for Editor {
                 Some(menu) => d.child(menu),
                 None => d,
             })
-            // Last children = topmost: the omnibox, the keyboard map and
-            // the AI settings panel cover everything below.
+            // Last children = topmost: the omnibox and AI settings panel
+            // cover everything below. The keyboard map owns another window.
             .when(self.palette_input.is_some(), |d| {
                 d.child(self.render_omni(window, cx))
             })
-            .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
             .when(self.ai_settings.is_some(), |d| {
                 d.child(self.render_ai_settings(cx))
             })

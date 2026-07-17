@@ -23,6 +23,7 @@ mod draw_guard;
 mod editor;
 mod hyphen;
 mod icons;
+mod keymap_window;
 mod files;
 mod paths;
 mod single_instance;
