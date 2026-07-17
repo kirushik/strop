@@ -8,6 +8,65 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// The document ID and path below it for an XDG document-portal path.
+fn portal_path_parts(path: &Path, runtime_dir: &Path) -> Option<(String, PathBuf)> {
+    let relative = path.strip_prefix(runtime_dir.join("doc")).ok()?;
+    let mut components = relative.components();
+    let doc_id = components.next()?.as_os_str().to_str()?.to_owned();
+    if doc_id.is_empty() {
+        return None;
+    }
+    Some((doc_id, components.collect()))
+}
+
+async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> PathBuf {
+    let Some((doc_id, tail)) = portal_path_parts(&path, runtime_dir) else {
+        return path;
+    };
+    let result: Result<PathBuf, String> = async {
+        let documents = ashpd::documents::Documents::new().await
+            .map_err(|error| error.to_string())?;
+        let id = ashpd::documents::DocumentID::from(doc_id.as_str());
+        let paths = documents.host_paths(std::slice::from_ref(&id)).await
+            .map_err(|error| error.to_string())?;
+        let host_path = paths.get(&id)
+            .ok_or_else(|| "portal returned no document host path".to_owned())?;
+        let host_dir = host_path.as_ref().parent().unwrap_or(Path::new(""));
+        Ok(host_dir.join(tail))
+    }
+    .await;
+    match result {
+        Ok(host_path) => host_path,
+        Err(error) => {
+            eprintln!("strop: could not resolve portal path {}: {error}", path.display());
+            path
+        }
+    }
+}
+
+/// Resolve an XDG document-portal path, failing open when the portal is absent.
+pub async fn resolve_portal_path_async(path: PathBuf) -> PathBuf {
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return path;
+    };
+    resolve_portal_path_async_at(path, Path::new(&runtime_dir)).await
+}
+
+/// Synchronous convenience for path boundaries outside GPUI tasks.
+pub fn resolve_portal_path(path: impl Into<PathBuf>) -> PathBuf {
+    gpui::block_on(resolve_portal_path_async(path.into()))
+}
+
+/// Still under the portal mount — i.e. `resolve_portal_path` couldn't
+/// escape it (dead doc id, portal absent). Such a path names plumbing,
+/// not a place a writer knows.
+fn is_portal_path(path: &Path) -> bool {
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    portal_path_parts(path, Path::new(&runtime_dir)).is_some()
+}
+
 /// First free "Untitled.strop" / "Untitled 2.strop" / … in the Strop folder.
 pub fn untitled_path() -> PathBuf {
     let dir = crate::paths::documents_dir();
@@ -58,12 +117,28 @@ fn recents_file() -> PathBuf {
 }
 
 /// Most-recent-first. Missing files stay visible as stale evidence.
+/// Portal paths persisted before the resolver existed heal ONCE: the
+/// resolved list is written back, so a stale entry cannot re-trigger a
+/// D-Bus round-trip (and its failure line) on every palette render —
+/// recents() sits on that render path via omni_rows.
 pub fn recents() -> Vec<PathBuf> {
     let Ok(json) = std::fs::read_to_string(recents_file()) else {
         return Vec::new();
     };
     let list: Vec<PathBuf> = serde_json::from_str(&json).unwrap_or_default();
-    list
+    let resolved: Vec<PathBuf> = list
+        .iter()
+        .cloned()
+        .map(resolve_portal_path)
+        .filter(|p| !is_portal_path(p))
+        .collect();
+    if resolved != list {
+        let _ = std::fs::write(
+            recents_file(),
+            serde_json::to_string_pretty(&resolved).unwrap_or_default(),
+        );
+    }
+    resolved
 }
 
 fn cap_recents(list: &mut Vec<PathBuf>) {
@@ -402,6 +477,40 @@ pub fn stem_from_title(title: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_portal_path_exposes_id_and_filename() {
+        let runtime = Path::new("/tmp/strop-test-runtime");
+        let path = runtime.join("doc/7ad41c2e/Draft.strop");
+        assert_eq!(
+            portal_path_parts(&path, runtime),
+            Some(("7ad41c2e".to_owned(), PathBuf::from("Draft.strop")))
+        );
+    }
+
+    #[test]
+    fn ordinary_path_is_not_a_document_portal_path() {
+        let runtime = Path::new("/tmp/strop-test-runtime");
+        let path = Path::new("/home/writer/Documents/Draft.strop");
+        assert_eq!(portal_path_parts(path, runtime), None);
+        assert_eq!(
+            gpui::block_on(resolve_portal_path_async_at(path.to_owned(), runtime)),
+            path
+        );
+    }
+
+    #[test]
+    fn document_portal_path_keeps_nested_tail() {
+        let runtime = Path::new("/tmp/strop-test-runtime");
+        let path = runtime.join("doc/7ad41c2e/Project/images/cover.png");
+        assert_eq!(
+            portal_path_parts(&path, runtime),
+            Some((
+                "7ad41c2e".to_owned(),
+                PathBuf::from("Project/images/cover.png")
+            ))
+        );
+    }
 
     /// One sequential test for everything env-dependent (env is process
     /// global; parallel tests must not each repoint HOME). Linux/BSD only:

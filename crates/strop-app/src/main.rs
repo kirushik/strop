@@ -117,7 +117,7 @@ fn data_file() -> (PathBuf, bool) {
     match std::env::args().nth(1).as_deref() {
         Some("--new") => return (files::untitled_path(), false),
         Some("--welcome") => return (files::welcome_path(), true),
-        Some(arg) => return (arg.into(), false),
+        Some(arg) => return (files::resolve_portal_path(arg), false),
         None => {}
     }
     if let Some(migrated) = files::migrate_scratch() {

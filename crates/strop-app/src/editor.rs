@@ -4876,8 +4876,9 @@ impl Editor {
         cx.spawn(async move |_, _| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 let Some(path) = paths.first() else { return };
+                let path = crate::files::resolve_portal_path_async(path.clone()).await;
                 let Ok(exe) = std::env::current_exe() else { return };
-                if let Err(e) = std::process::Command::new(exe).arg(path).spawn() {
+                if let Err(e) = std::process::Command::new(exe).arg(&path).spawn() {
                     eprintln!("strop: open in new window: {e}");
                 }
             }
@@ -4910,6 +4911,7 @@ impl Editor {
         let markdown = MarkdownExport::prepare(&self.doc, store);
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
+                let path = crate::files::resolve_portal_path_async(path).await;
                 if path.extension().is_some_and(|e| e == "md") {
                     if let Err(e) = markdown.write_to(&path) {
                         eprintln!("strop: save copy: {e}");
@@ -7696,6 +7698,7 @@ impl Editor {
                     return;
                 }
             };
+            let path = crate::files::resolve_portal_path_async(path).await;
             let prepared = this.update(cx, |editor: &mut Editor, _| {
                 editor.store.as_ref()
                     .ok_or_else(|| std::io::Error::other("document store is no longer open"))?
@@ -11293,7 +11296,8 @@ impl Editor {
             && let Some(sel) = self.image_sel_live()
             && self.image_pixel_hit(position) == Some(sel.block)
         {
-            match std::fs::read(path) {
+            let path = crate::files::resolve_portal_path(path);
+            match std::fs::read(&path) {
                 Ok(bytes) => self.replace_selected_image_pixels(sel, bytes, cx),
                 Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
             }
@@ -11308,7 +11312,8 @@ impl Editor {
         };
         let mut files = Vec::new();
         for path in paths.paths() {
-            match std::fs::read(path) {
+            let path = crate::files::resolve_portal_path(path);
+            match std::fs::read(&path) {
                 Ok(bytes) => files.push(bytes),
                 Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
             }

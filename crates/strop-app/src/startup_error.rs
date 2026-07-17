@@ -78,7 +78,8 @@ impl OpenFailure {
             if let Ok(Ok(Some(paths))) = rx.await
                 && let Some(path) = paths.first()
             {
-                this.update(cx, |view, cx| view.launch(path, cx)).ok();
+                let path = crate::files::resolve_portal_path_async(path.clone()).await;
+                this.update(cx, |view, cx| view.launch(&path, cx)).ok();
             }
         })
         .detach();

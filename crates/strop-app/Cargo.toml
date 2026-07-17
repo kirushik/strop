@@ -14,6 +14,8 @@ strop-core = { workspace = true }
 ropey = { workspace = true }
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
+ashpd = { version = "0.13.11", default-features = false,
+    features = ["async-io", "documents"] }
 directories = "6"
 # Cold read (impl 05 §2.4): TeX-pattern hyphenation, runtime-loaded
 # dictionaries only — NO embed features, ever: hyph-ru is LPPL 1.2+

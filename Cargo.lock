@@ -5832,6 +5832,7 @@ dependencies = [
 name = "strop-app"
 version = "0.2.0"
 dependencies = [
+ "ashpd",
  "directories",
  "glob",
  "gpui",
