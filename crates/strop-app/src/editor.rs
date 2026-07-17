@@ -21,17 +21,19 @@ use gpui::{
     Hitbox, HitboxBehavior, Hsla, RenderImage,
     Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad,
+    PaintQuad, PathBuilder,
     Pixels, Point, ResizeEdge, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
     Style, TextAlign, TextRun, Tiling, UTF16Selection, UnderlineStyle, Window, WindowControlArea,
     WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use strop_core::document::{
-    Annotation, Annotations, BlockKind, BlockMap, Document, InlineAttr, NoteKind, NoteStatus,
-    SpanSet, line_text_end_bytes,
+    Annotation, Annotations, BlockKind, BlockMap, ClipboardBlock, Document, InlineAttr, NoteKind,
+    NoteStatus, RichPaste, Span, SpanSet, line_text_end_bytes,
 };
 use strop_core::{SaveCompletion, SaveGeneration, SaveWorker, Store, typograph};
+use serde::{Deserialize, Serialize};
 
+use crate::bookpage::shaped_list_paragraphs;
 use crate::config::{Config, Language};
 use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
 use crate::icons::{self, icon};
@@ -54,6 +56,41 @@ struct ExportAsset {
     source_id: String,
     file_name: String,
     bytes: Vec<u8>,
+}
+
+const RICH_CLIPBOARD_VERSION: u8 = 1;
+
+/// Metadata on the clipboard's plain String entry. `text_len` is the guard
+/// against clipboard managers that rewrite the visible flavor but retain our
+/// private metadata. Asset ids map, in order, to sibling bitmap entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RichClipboardEnvelope {
+    v: u8,
+    text_len: usize,
+    rich: RichPaste,
+    image_asset_ids: Vec<String>,
+}
+
+/// Read the plain flavor and, unless explicitly bypassed, its still-matching
+/// private operation. Validate against the untouched clipboard bytes before
+/// normalizing CRLF for insertion: a clipboard manager rewrite must make the
+/// rich half ineligible, never accidentally repair its guard.
+fn clipboard_text_and_rich(
+    item: &ClipboardItem,
+    plain: bool,
+) -> Option<(String, Option<RichPaste>)> {
+    let text = item.entries.iter().find_map(|entry| match entry {
+        ClipboardEntry::String(text) => Some(text),
+        _ => None,
+    })?;
+    let rich = (!plain).then(|| {
+        text.metadata.as_deref().and_then(|metadata| {
+            serde_json::from_str::<RichClipboardEnvelope>(metadata).ok().filter(|payload| {
+                payload.v == RICH_CLIPBOARD_VERSION && payload.text_len == text.text().len()
+            }).map(|payload| payload.rich)
+        })
+    }).flatten();
+    Some((text.text().replace("\r\n", "\n"), rich))
 }
 
 impl ExportAsset {
@@ -113,6 +150,55 @@ impl<T> LatestSave<T> {
 
     fn take(&mut self) -> Option<T> {
         self.pending.take()
+    }
+}
+
+/// A std-only async doorbell between the strop-save worker thread and the
+/// GPUI foreground: the worker rings it after posting each completion
+/// (`SaveWorker::with_notify`), and a foreground task parked on `wait`
+/// wakes to drain — so a finished final write closes the quit-guarded
+/// window in milliseconds instead of idling until the next 1s heartbeat
+/// tick. The flag latches, so a ring before anyone listens is never lost.
+#[derive(Default)]
+struct SaveWake {
+    rung: std::sync::atomic::AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl SaveWake {
+    fn ring(&self) {
+        self.rung.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+
+    fn wait(self: &Arc<Self>) -> SaveWakeWait {
+        SaveWakeWait(self.clone())
+    }
+}
+
+struct SaveWakeWait(Arc<SaveWake>);
+
+impl std::future::Future for SaveWakeWait {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        use std::sync::atomic::Ordering;
+        if self.0.rung.swap(false, Ordering::SeqCst) {
+            return std::task::Poll::Ready(());
+        }
+        *self.0.waker.lock().unwrap() = Some(cx.waker().clone());
+        // Re-check AFTER parking the waker: a ring that raced the store
+        // above sees no waker to wake, and would otherwise sleep forever.
+        if self.0.rung.swap(false, Ordering::SeqCst) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
     }
 }
 
@@ -268,6 +354,11 @@ const CARD_MOVE: Duration = Duration::from_millis(200);
 /// Capped (`MOVE_STAGGER_CAP`) so a long train never turns into a slow wave.
 const MOVE_STAGGER: Duration = Duration::from_millis(40);
 const MOVE_STAGGER_CAP: u32 = 4;
+/// Quit guard c: how long the final save may run before the "Saving before
+/// closing" veil earns its pixels. A local write lands in single-digit
+/// milliseconds, so most closes never show a frame of it; the threshold is
+/// generous enough that only a genuinely slow disk raises the chrome.
+const QUIT_VEIL_DELAY: Duration = Duration::from_millis(200);
 
 /// One card's re-pack move in flight (see `Editor::moving` and
 /// `update_lane_motion`). Offsets are CONTENT-SPACE (viewport top + scroll):
@@ -337,6 +428,10 @@ struct DeferredPass {
     rejected: usize,
     scope: Option<strop_core::diagnose::PromptScope>,
     generation: u64,
+    /// The document revision the read was ASKED against (staleness honesty):
+    /// "the draft changed" may only ever be claimed when this differs from
+    /// the revision at integration.
+    base_revision: u64,
 }
 
 struct CompletedAiPass {
@@ -344,6 +439,8 @@ struct CompletedAiPass {
     rejected: usize,
     scope: strop_core::diagnose::PromptScope,
     log: crate::ai_log::PassLog,
+    /// See `DeferredPass::base_revision` — snapshotted in `run_pass`.
+    base_revision: u64,
 }
 
 #[derive(Clone)]
@@ -381,7 +478,7 @@ const COL_MAX_WIDTH: f32 = 660.;
 /// the lane itself, and the card's 8px inset. The lane is reserved on the
 /// right at all times (see `column_frame`) so a note appearing never moves the
 /// column; the margin renders inline while this much space exists past it.
-const NOTE_LANE_TOTAL: f32 = MARGIN_GAP + MARGIN_WIDTH + 8.;
+const NOTE_LANE_TOTAL: f32 = MARGIN_GAP + MARGIN_WIDTH + 16.;
 /// The column is CENTRED at rest (it rhymes with the centred omnibox), and
 /// stays centred as long as the right margin can still host the note lane.
 /// Only when narrowing past that does it shift left — continuously, no
@@ -429,6 +526,44 @@ fn document_viewport_height(height: Pixels, strip_open: bool) -> Pixels {
     (height - if strip_open { px(strip::STRIP_H) } else { px(0.) }).max(px(1.))
 }
 
+const SPACE_RAIL_W: f32 = 14.;
+const SPACE_THUMB_W: f32 = 6.;
+const SPACE_THUMB_MIN_H: f32 = 32.;
+
+fn space_thumb(track: f32, viewport: f32, extent: f32, scroll: f32) -> (f32, f32) {
+    let height = (track * viewport / extent.max(viewport))
+        .clamp(SPACE_THUMB_MIN_H.min(track), track);
+    let travel = (track - height).max(0.);
+    let max_scroll = (extent - viewport).max(0.);
+    let top = if max_scroll == 0. { 0. } else { travel * scroll.clamp(0., max_scroll) / max_scroll };
+    (top, height)
+}
+
+fn space_mark_y(doc_y: f32, max_scroll: f32, track: f32, thumb_h: f32) -> f32 {
+    if max_scroll <= 0. { 0. } else { doc_y.clamp(0., max_scroll) / max_scroll * (track - thumb_h).max(0.) }
+}
+
+fn space_scroll_at(pointer_y: f32, track: f32, thumb_h: f32, max_scroll: f32) -> f32 {
+    let travel = (track - thumb_h).max(0.);
+    if travel == 0. { 0. } else { ((pointer_y - thumb_h / 2.) / travel).clamp(0., 1.) * max_scroll }
+}
+
+fn space_fleck_on_thumb(fleck_y: f32, thumb_y: f32, thumb_h: f32) -> bool {
+    fleck_y >= thumb_y && fleck_y <= thumb_y + thumb_h
+}
+
+fn space_mark_hit(ys: &[f32], pointer: f32) -> Option<usize> {
+    ys.iter().enumerate().filter_map(|(ix, y)| {
+        let distance = (pointer - *y).abs();
+        (distance <= 4.).then_some((ix, distance))
+    }).min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        .map(|(ix, _)| ix)
+}
+
+fn alpha_ink(color: u32, alpha: u8) -> u32 {
+    color << 8 | u32::from(alpha)
+}
+
 fn strip_center_mode(parked: bool, pinned: bool) -> StripCenterMode {
     match (parked, pinned) {
         (true, true) => StripCenterMode::Comparing,
@@ -463,6 +598,10 @@ const AUTO_CUT_MIN_CHARS: usize = 80;
 /// The Scraps chip's arrival ring: two expanding beats (the mockup's
 /// `chippulse`, 1.4s ease-out × 2) — an event, never a standing light.
 const CHIP_PULSE_MS: u64 = 2800;
+
+/// The editor button's cooking-dot breathing cycle (item: the pulse). Slow —
+/// attention-motion's calm band (~2.5–3.5 s) — so the periphery reads "still
+/// at work", never a blink. One full opacity breath per cycle.
 /// The provenance one-liner's id namespace in the margin lane (a packer
 /// citizen beside real note cards — the flag keeps record ids and note ids
 /// from ever colliding in the motion/appearing maps).
@@ -695,7 +834,8 @@ actions!(
         WordRight, ParagraphUp, ParagraphDown, SelectLeft, SelectRight, SelectUp, SelectDown,
         SelectWordLeft, SelectWordRight, SelectParagraphUp, SelectParagraphDown, SelectAll, Home,
         End, SelectToHome, SelectToEnd, DocStart, DocEnd, SelectToDocStart, SelectToDocEnd,
-        PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, Undo, Redo,
+        PageUp, PageDown, SelectPageUp, SelectPageDown, Newline, Copy, Cut, Paste, PastePlain,
+        Undo, Redo,
         ToggleStrong, ToggleEmphasis, ToggleUnderline, ToggleStrikethrough, ToggleHighlight,
         ToggleCode, Heading1, Heading2, Heading3, ToggleQuoteBlock, ToggleCodeBlock,
         ToggleBulletList, ToggleOrderedList, AddCheckpoint, ExportMarkdown, InsertFootnote,
@@ -802,6 +942,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-2", Heading2, ctx),
         KeyBinding::new("ctrl-alt-3", Heading3, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
+        KeyBinding::new("escape", EscapeMode, Some("Keymap")),
         KeyBinding::new("escape", EscapeMode, Some("QuitGuard")),
         // GNOME's menu key opens the palette — it IS the menu.
         KeyBinding::new("f10", TogglePalette, ctx),
@@ -1066,7 +1207,8 @@ fn output_token_budget(kind: &PassKind, language_code: &str) -> u32 {
 /// a PRIORITY over it, not four exclusive states: a cooking pass while the door
 /// is open must resolve to ONE face, and Error/NeedsSetup can't fall through to
 /// a bare idle button while `render_ai_status` shows the failure. The door word
-/// is the glossary's presence pair (`Reading`), never the internal "Reviewing".
+/// no longer contributes copy; this internal variant only selects the
+/// open-fan ink treatment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EditorFace {
     /// No provider configured — routes to setup (the card lives on render_ai_status).
@@ -1080,7 +1222,7 @@ enum EditorFace {
     /// A valid read completed with no new queries and has not yet been
     /// acknowledged through the attached menu.
     Empty,
-    /// The door is open — "Reading · {n} open".
+    /// The fan is out; the button still says only "Ask the editor".
     Reading,
     /// Drafting, nothing pending — the bare "Ask the editor ▾".
     Idle,
@@ -1130,6 +1272,35 @@ fn face_for(i: &FaceInputs) -> EditorFace {
         EditorFace::Reading
     } else {
         EditorFace::Idle
+    }
+}
+
+fn door_chip_semantics(unverified: impl Iterator<Item = bool>) -> Option<(usize, bool)> {
+    let mut total = 0;
+    let mut current = 0;
+    for stale in unverified {
+        total += 1;
+        if !stale {
+            current += 1;
+        }
+    }
+    (total > 0).then_some((current, current == 0))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DoorEscape {
+    Glance,
+    Fan,
+    None,
+}
+
+fn door_escape_step(fan_resting: bool, glanced: bool, has_diagnoses: bool) -> DoorEscape {
+    if fan_resting && glanced {
+        DoorEscape::Glance
+    } else if !fan_resting && has_diagnoses {
+        DoorEscape::Fan
+    } else {
+        DoorEscape::None
     }
 }
 
@@ -1314,10 +1485,25 @@ pub struct Editor {
     /// Last pointer position during a drag, for edge autoscrolling.
     drag_point: Option<Point<Pixels>>,
     autoscroll_active: bool,
+    /// Pointer-owned space-rail state. The offset keeps a thumb press under
+    /// the hand; a track press uses half the thumb and therefore warps and
+    /// grabs in the same synchronous gesture.
+    space_drag_offset: Option<f32>,
+    space_hover: bool,
+    space_hover_mark: Option<usize>,
+    space_readout_fade: Option<u64>,
+    space_readout_seq: u64,
     cursor_visible: bool,
     last_input: Instant,
     /// Durable layer; edits mirror into it, a background task saves when idle.
     store: Option<Store>,
+    /// Lazy birth (a .md opened without a sibling .strop): the imported
+    /// state, held here instead of seeded into the store, so glancing at a
+    /// Markdown file creates NOTHING on disk. The first persistent mutation
+    /// takes it (`materialize_store`), seeds the store and seals "Started"
+    /// with this state — the journal-era birth checkpoint. While this is
+    /// `Some`, `save_now` refuses to touch the filesystem.
+    pending_birth: Option<(String, SpanSet, BlockMap)>,
     store_dirty: bool,
     /// Loro export stays on this thread; only immutable bytes cross into the
     /// ordered filesystem worker.
@@ -1334,6 +1520,11 @@ pub struct Editor {
     /// A close request is a small state machine, not an irrevocable event:
     /// the window remains alive until the newest generation reaches disk.
     quit_guard: QuitGuard,
+    /// The "Saving before closing" veil earns its pixels only when the
+    /// final save is still pending after `QUIT_VEIL_DELAY` — most closes
+    /// finish first and never flash a frame of chrome. Armed by a timer,
+    /// never by `request_quit` itself.
+    quit_veil: bool,
     /// History mode (rewind v2): list + read-only diff preview.
     history_view: Option<HistoryView>,
     history_preview: Option<PreviewDoc>,
@@ -1487,8 +1678,10 @@ pub struct Editor {
     palette_freq: HashMap<String, u32>,
     /// In-titlebar document rename (PLAN.md E2).
     doc_rename_input: Option<Entity<TextField>>,
-    /// The keyboard-map overlay (PLAN.md E4, ctrl-?).
-    shortcuts_open: bool,
+    /// A refused rename stays witnessed beside the still-open field.
+    doc_rename_error: Option<&'static str>,
+    /// The one modeless keyboard-reference window (impl/18, ctrl-?).
+    keymap_window: Option<gpui::WindowHandle<crate::keymap_window::KeymapWindow>>,
     /// The AI settings panel (DESIGN §2-ai, F4): form + async test +
     /// /models picker; saves write through toml_edit.
     ai_settings: Option<AiSettings>,
@@ -1686,6 +1879,10 @@ pub struct Editor {
     /// inside the draw pass (the 2026-06-12 corruption rule, like
     /// `zone_row_bounds`).
     strip_rail: std::rc::Rc<std::cell::RefCell<Option<StripGeom>>>,
+    /// The Now chip's shaped label width — a constant per session, so it
+    /// is measured once instead of on every open-strip render (review
+    /// finding). Whoever localizes the label owns invalidating this.
+    strip_now_w: std::cell::Cell<Option<f32>>,
     /// Painted date-control bounds and sitting targets, from strip prepaint.
     strip_date_hits: std::rc::Rc<std::cell::RefCell<Vec<StripDateHit>>>,
     /// Painted station label/tick targets, resolved before dates and lanes.
@@ -1708,6 +1905,10 @@ pub struct Editor {
     /// moment's edit site (§3a); a drag never yanks the eye — the writer
     /// parked it on a passage to watch it change.
     strip_drag_moved: bool,
+    /// Window-space origin of a rail gesture. Motion under 3px remains a
+    /// click; in particular, releasing a scrub over the desk must not turn
+    /// the desk's discrete return gesture into a drag exit.
+    strip_drag_origin: Option<Point<Pixels>>,
     /// The cold read (impl 05 Wave B): the writer-invoked, read-only, paged
     /// takeover — the reading room. `Some` while the room is up; beside
     /// `history_preview` per the state-on-Editor + render-switch precedent.
@@ -1842,6 +2043,64 @@ struct ParagraphLayout {
     /// to decide whether the shaped line can be reused verbatim (per-block
     /// layout reuse) instead of re-shaping — a few `TextRun`s per block.
     runs: Vec<TextRun>,
+    /// Paragraph-local bytes of the one promoted diagnosis anchor. Its tint
+    /// is custom-painted below run backgrounds; history frames carry none.
+    active_diagnosis: Option<Range<usize>>,
+}
+
+// GPUI's wavy-underline shader (`fs_underline`) uses these exact ratios for
+// a 1px underline: a 3px-high primitive, 0.8px amplitude, and two pi over
+// 9px. Keeping the analytic edge here beside its path consumer makes the
+// promoted band's boundary the same mark rather than a second approximation.
+const DIAGNOSIS_WAVE_AMPLITUDE: f32 = 0.8;
+const DIAGNOSIS_WAVE_LENGTH: f32 = 9.;
+// The shader draws the wavy stroke inside a 3px-high box whose TOP is the
+// underline y (`paint_underline`: height = thickness * 3) — the stroke's
+// centerline rides mid-box, 1.5 stroke-widths down. Tracing the band's
+// edge at the raw underline y left a hairline of daylight above every
+// coincident resting squiggle (operator screenshot, 2026-07-17).
+const DIAGNOSIS_WAVE_CENTER: f32 = 1.5;
+
+fn diagnosis_wave_y(x_from_segment: f32, underline_y: f32) -> f32 {
+    underline_y + DIAGNOSIS_WAVE_CENTER
+        + (x_from_segment * std::f32::consts::TAU / DIAGNOSIS_WAVE_LENGTH).sin()
+            * DIAGNOSIS_WAVE_AMPLITUDE
+}
+
+fn paint_diagnosis_band(
+    origin: Point<Pixels>,
+    top: Pixels,
+    underline_y: Pixels,
+    left: Pixels,
+    right: Pixels,
+    window: &mut Window,
+) {
+    if right <= left {
+        return;
+    }
+    // A breath of air at the top: the line above's squiggle bottoms out
+    // ~2.8px past its underline y, which can graze this band's top edge
+    // (same operator screenshot). Well under padding_top, so no glyph's
+    // ascender is ever uncovered.
+    let top = top + px(1.5);
+    let mut path = PathBuilder::fill();
+    path.move_to(origin + point(left, top));
+    path.line_to(origin + point(right, top));
+    // Half-pixel sampling is comfortably below the shader's one-pixel
+    // antialias fringe while retaining its segment-anchored phase.
+    let width = f32::from(right - left);
+    let mut dx = width;
+    while dx > 0. {
+        path.line_to(origin + point(
+            left + px(dx),
+            px(diagnosis_wave_y(dx, f32::from(underline_y))),
+        ));
+        dx = (dx - 0.5).max(0.);
+    }
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, rgba(DIAGNOSIS_TINT_ACTIVE));
+    }
 }
 
 impl ParagraphLayout {
@@ -2027,14 +2286,17 @@ fn format_thousands(n: usize) -> String {
 }
 
 /// The auto-cut predicate (docs/impl/02-asides.md §4): a single
-/// SELECTION-deletion op — an EMPTY replacement over a non-empty selection —
-/// of at least `AUTO_CUT_MIN_CHARS` chars. The old manuscript-only gate is
-/// gone (adjudicated, graveyard-interplay 5: ONE capture law on both sides
+/// selection-removal op of at least `AUTO_CUT_MIN_CHARS` chars, with or
+/// without replacement text — "anything big that leaves in one stroke,
+/// survives" (adjudicated: the old emptiness gate let a type-over or a
+/// paste-over destroy 500 chars and file NOTHING). The old manuscript-only
+/// gate is gone too (graveyard-interplay 5: ONE capture law on both sides
 /// of the seam — rope text always qualifies; only the graveyard slab, which
 /// is not rope text, sits outside it). Pure, so both sides of the threshold
-/// and the move-vs-cut distinction are unit-tested.
-fn auto_cut_qualifies(new_text: &str, range_chars: usize) -> bool {
-    new_text.is_empty() && range_chars >= AUTO_CUT_MIN_CHARS
+/// are unit-tested; the IME and typograph exemptions live at the call site
+/// (`apply_replace`), where the op's provenance is known.
+fn auto_cut_qualifies(range_chars: usize) -> bool {
+    range_chars >= AUTO_CUT_MIN_CHARS
 }
 
 /// A tiny deterministic PNG for the rig (`seed:image`): 8-bit RGB, zlib
@@ -2233,9 +2495,15 @@ impl Editor {
             autoscroll_request: false,
             drag_point: None,
             autoscroll_active: false,
+            space_drag_offset: None,
+            space_hover: false,
+            space_hover_mark: None,
+            space_readout_fade: None,
+            space_readout_seq: 0,
             cursor_visible: true,
             last_input: Instant::now(),
             store: None,
+            pending_birth: None,
             store_dirty: false,
             save_worker: None,
             save_revision: SaveRevision(0),
@@ -2244,6 +2512,7 @@ impl Editor {
             save_retry_delay: Duration::from_secs(1),
             save_error: None,
             quit_guard: QuitGuard::Idle,
+            quit_veil: false,
             history_view: None,
             history_preview: None,
             compare_preview: None,
@@ -2293,7 +2562,8 @@ impl Editor {
             omni_return: None,
             palette_freq: HashMap::new(),
             doc_rename_input: None,
-            shortcuts_open: false,
+            doc_rename_error: None,
+            keymap_window: None,
             ai_settings: None,
             ai_settings_generation: 0,
             replace_input: None,
@@ -2336,6 +2606,7 @@ impl Editor {
             last_frame: None,
             strip: Strip::default(),
             strip_rail: std::rc::Rc::default(),
+            strip_now_w: std::cell::Cell::new(None),
             strip_date_hits: std::rc::Rc::default(),
             strip_station_hits: std::rc::Rc::default(),
             strip_well_hits: std::rc::Rc::default(),
@@ -2345,6 +2616,7 @@ impl Editor {
             past_stamps: std::cell::Cell::new(0),
             strip_reveal_byte: None,
             strip_drag_moved: false,
+            strip_drag_origin: None,
             cold_read: None,
             cr_page_bounds: std::rc::Rc::default(),
         }
@@ -2356,7 +2628,35 @@ impl Editor {
     pub fn attach_store(&mut self, store: Store, cx: &mut Context<Self>) {
         let legacy = !store.checkpoints_materialized();
         self.store = Some(store);
-        self.save_worker = Some(SaveWorker::new());
+        // Completions drain the moment they arrive (quit guard b): the
+        // worker thread rings the doorbell, the task below wakes on the
+        // foreground and drains — a fast final write closes a quit-guarded
+        // window in milliseconds. The 1s heartbeat keeps draining too, as
+        // the belt under this suspender.
+        let wake = Arc::new(SaveWake::default());
+        let bell = wake.clone();
+        self.save_worker = Some(SaveWorker::with_notify(move || bell.ring()));
+        cx.spawn(async move |this, cx| {
+            loop {
+                wake.wait().await;
+                let alive = this.update(cx, |editor: &mut Editor, cx| {
+                    let error_before = editor.save_error.clone();
+                    editor.drain_save_completions();
+                    editor.finish_quit_if_ready(cx);
+                    // Repaint only when the drain changed something the
+                    // writer can see; routine autosaves stay invisible.
+                    if editor.save_error != error_before
+                        || !matches!(editor.quit_guard, QuitGuard::Idle)
+                    {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Heal a legacy file without waiting for the writer to open history:
         // materialize its checkpoint states in the background now, so the
         // sidebar is instant whenever it IS opened — and the next open of
@@ -2403,11 +2703,40 @@ impl Editor {
         .detach();
     }
 
+    /// Lazy birth, staged (main.rs, the .md import path): the store stays
+    /// an empty doc over a missing file, and this holds what the import
+    /// read. Must be called before the writer can act — main stages it in
+    /// the same closure that attaches the store.
+    pub fn stage_import_birth(&mut self, text: String, spans: SpanSet, blocks: BlockMap) {
+        self.pending_birth = Some((text, spans, blocks));
+    }
+
+    /// The moment of birth: the first persistent mutation seeds the store
+    /// with the IMPORTED state and seals "Started" — the checkpoint the
+    /// journal-era strip anchors on (without it the record believes the doc
+    /// began empty, and a scrub past the first keystroke replays an
+    /// imported novel away). Until this runs, nothing exists on disk and
+    /// `save_now` refuses to write; a no-edit open quits byte-identical.
+    /// Idempotent — every caller past the first is a no-op.
+    fn materialize_store(&mut self) {
+        if self.store.is_none() {
+            return; // storeless (smoke): the birth state stays parked
+        }
+        let Some((text, spans, blocks)) = self.pending_birth.take() else { return };
+        let store = self.store.as_ref().expect("checked just above");
+        store.seed(&text);
+        store.seal_session_with("Started", false, (text, spans, blocks));
+    }
+
     /// The single "the document changed, it must be saved" chokepoint. Every
     /// mutation site routes through here instead of poking `store_dirty`
     /// directly, so no field can silently skip persistence the way the note
     /// composer once did. Keep this the ONLY place that sets the flag true.
     fn mark_dirty(&mut self) {
+        // A persistent mutation is exactly what ends lazy birth — cards,
+        // goals and every other non-text channel route through here, so an
+        // unborn import materializes before its first save can be gated.
+        self.materialize_store();
         self.store_dirty = true;
         self.save_revision.0 = self
             .save_revision
@@ -2463,6 +2792,10 @@ impl Editor {
         // from a lull (deferred_pass), so caret moves must never touch it.
         self.last_text_edit = Some(Instant::now());
         self.word_count = self.manuscript_word_count();
+        // Lazy birth ends HERE, before the mirror: these ops are positioned
+        // against the imported text, so the seed must land under them first
+        // (applying an op at char N to an unseeded empty doc would panic).
+        self.materialize_store();
         // Apply to the store before releasing the borrow, so the dirty-flag
         // chokepoint (mark_dirty) can take &mut self.
         match &self.store {
@@ -2513,6 +2846,13 @@ impl Editor {
     /// mid-sentence. The only thing quit records now — the intent question
     /// (and its End Session verb) is gone (impl 04 §1).
     pub fn record_exit_state(&self) {
+        if cfg!(test) {
+            // The quit tests drive real close paths; the caret memory
+            // writes to the REAL state dir (files.rs isolates env-dependent
+            // behavior in its own single sequential test) and must not
+            // collect junk temp-path entries from every test run.
+            return;
+        }
         let Some(store) = &self.store else { return };
         crate::files::record_caret(store.path(), self.cursor_offset());
     }
@@ -2769,6 +3109,10 @@ impl Editor {
         if name.is_empty() {
             return false;
         }
+        // Naming a version is a deliberate act of record: an unborn import
+        // materializes first, so the checkpoint lands on a seeded store
+        // (and after the "Started" seal, keeping the birth first).
+        self.materialize_store();
         let Some(store) = &self.store else { return false };
         let before = store.checkpoints().len();
         let timestamp_ms = if self.strip.parked {
@@ -3328,6 +3672,11 @@ impl Editor {
         from_unix: i64,
         cx: &mut Context<Self>,
     ) {
+        // A restore IS a document mutation: an unborn import materializes
+        // before the record below snapshots the store (unreachable today —
+        // pre-birth there is no history to restore FROM — but this keeps
+        // the invariant local instead of relying on that distance).
+        self.materialize_store();
         // Save first so the "Before restore" checkpoint materializes the
         // present exactly as it stands (see add_checkpoint). Its name is a
         // bare automatic: inlining the source version's title composed
@@ -3767,7 +4116,6 @@ impl Editor {
     /// keeps its exactness under the hand); only the release settles, so the
     /// cloth contract holds while deliberate moments win the landing.
     fn strip_settle_ms(&self, pos_ms: i64) -> i64 {
-        const SNAP_PX: f32 = 4.;
         // Comparing is fine forensics — B often needs the moment just
         // beside a mark, so the detent stands down while a pin is set
         // (corridor round two). The rescue visit keeps it.
@@ -3777,13 +4125,21 @@ impl Editor {
         let Some(bake) = self.strip.bake.as_ref() else {
             return pos_ms;
         };
+        let (station_snap_px, now_snap_px) = strip_snap_radii();
         let w = bake.timeline.work_at(pos_ms);
-        bake.stations
+        let station = bake.stations
             .iter()
             .map(|s| (s.at_ms, (bake.timeline.work_at(s.at_ms) - w).abs()))
-            .filter(|(_, d)| *d <= SNAP_PX)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map_or(pos_ms, |(ms, _)| ms)
+            .filter(|(_, d)| *d <= station_snap_px)
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let now_d = (bake.timeline.total_work - w).abs();
+        if now_d <= now_snap_px
+            && station.is_none_or(|(_, station_d)| now_d < station_d)
+        {
+            bake.now_ms
+        } else {
+            station.map_or(pos_ms, |(ms, _)| ms)
+        }
     }
 
     /// One discrete pointer park = one reveal (§3a, corridor round three):
@@ -4569,8 +4925,9 @@ impl Editor {
         cx.spawn(async move |_, _| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 let Some(path) = paths.first() else { return };
+                let path = crate::files::resolve_portal_path_async(path.clone()).await;
                 let Ok(exe) = std::env::current_exe() else { return };
-                if let Err(e) = std::process::Command::new(exe).arg(path).spawn() {
+                if let Err(e) = std::process::Command::new(exe).arg(&path).spawn() {
                     eprintln!("strop: open in new window: {e}");
                 }
             }
@@ -4590,11 +4947,10 @@ impl Editor {
             eprintln!("strop: no document to copy");
             return;
         };
-        let dir = store
-            .path()
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // Seed the dialog with the HOST directory: seeding a portal FUSE
+        // dir invites the picker to mint a foreign name inside the doc
+        // mount — the invisible-temp trap (files.rs law).
+        let dir = crate::files::host_parent_or_documents(store.path());
         let suggested = format!(
             "{} copy.strop",
             store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
@@ -4603,6 +4959,7 @@ impl Editor {
         let markdown = MarkdownExport::prepare(&self.doc, store);
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
+                let path = crate::files::resolve_portal_path_async(path).await;
                 if path.extension().is_some_and(|e| e == "md") {
                     if let Err(e) = markdown.write_to(&path) {
                         eprintln!("strop: save copy: {e}");
@@ -4868,8 +5225,10 @@ impl Editor {
         // it has no card to snapshot). The model itself commits immediately —
         // only the light lingers (departing), never the data.
         if matches!(status, NoteStatus::Done | NoteStatus::Dismissed)
-            && let Some(card) =
-                self.margin_cards(true).cards.into_iter().find(|c| c.id == id)
+            && let Some(card) = {
+                let layout = self.margin_cards(true);
+                layout.cards.into_iter().chain(layout.glance).find(|c| c.id == id)
+            }
         {
             self.departing.push((card, Instant::now()));
             self.schedule_departing_clear(cx);
@@ -4941,13 +5300,28 @@ impl Editor {
         self.toggle_door(cx);
     }
 
-    /// The door's flush-and-flip, shared by the ctrl-shift-r action, the editor
-    /// menu's presence verb (`Reading ⇄ Away`), and the rig hook. Touching the
-    /// door is an explicit attention shift — a parked pass lands right now,
-    /// mid-burst or not.
+    /// The chip/shortcut transition. Opening lands a parked pass; closing
+    /// commits transient card text and never flushes hidden work.
     fn toggle_door(&mut self, cx: &mut Context<Self>) {
-        self.flush_deferred_pass(cx);
+        let opening = self.drafting;
+        if !opening {
+            self.commit_composer_no_focus(cx);
+            let closing: Vec<MarginCard> = self
+                .margin_cards(true)
+                .cards
+                .into_iter()
+                .filter(|card| card.kind == NoteKind::Diagnosis)
+                .collect();
+            if !closing.is_empty() {
+                self.departing.extend(closing.into_iter().map(|card| (card, Instant::now())));
+                self.schedule_departing_clear(cx);
+            }
+            self.focus = CardFocus::Idle;
+        }
         self.drafting = !self.drafting;
+        if opening {
+            self.flush_deferred_pass(cx);
+        }
         cx.notify();
     }
 
@@ -4966,6 +5340,18 @@ impl Editor {
             .open()
             .filter(|n| n.kind == NoteKind::Diagnosis)
             .count()
+    }
+
+    /// The chip counts current editorial claims. An all-unverified set keeps
+    /// its referent but drains the count's ink.
+    fn door_chip_count(&self) -> Option<(usize, bool)> {
+        door_chip_semantics(
+            self.doc
+                .notes()
+                .open()
+                .filter(|n| n.kind == NoteKind::Diagnosis)
+                .map(|n| n.unverified),
+        )
     }
 
     /// Copy-level diagnoses suppressed while a developmental one is still
@@ -5025,20 +5411,6 @@ impl Editor {
     /// counts exactly these, regardless of the door.
     fn open_query_count(&self) -> usize {
         self.resting_diagnoses()
-    }
-
-    /// Queries the writer RESOLVED (marked Done) in this document — the footer's
-    /// "{resolved} resolved". Deliberately Done-ONLY: Dismissed cards are
-    /// permanent suppression tombstones (`is_suppressed` leans on them), not work
-    /// done, so counting them would inflate the tally with silenced nags (review
-    /// mid). Bounded by the document's real annotation set.
-    fn resolved_query_count(&self) -> usize {
-        self.doc
-            .notes()
-            .notes()
-            .iter()
-            .filter(|n| n.kind == NoteKind::Diagnosis && n.status == NoteStatus::Done)
-            .count()
     }
 
     /// The copy row's gate (impl 04 §0): while any developmental query is open,
@@ -5140,8 +5512,8 @@ impl Editor {
         // come back into view alongside them). Asking again is also the most
         // explicit attention shift there is: a still-parked earlier pass
         // lands now rather than racing the run it just triggered.
-        self.flush_deferred_pass(cx);
         self.drafting = false;
+        self.flush_deferred_pass(cx);
         // Scope is manuscript-relative even when the document has a compost
         // rail. A selected passage is the target; neighboring paragraphs are
         // context only. With no selection the whole piece is eligible up to
@@ -5182,6 +5554,10 @@ impl Editor {
         };
         let target_language = self.resolved_ai_language(&manuscript);
         let max_tokens = output_token_budget(&kind, &target_language.code);
+        // The staleness snapshot: the revision this read is asked against.
+        // Integration compares it to the revision THEN — a "draft changed"
+        // verdict without an actual change in between is a fabrication.
+        let base_revision = self.doc.revision();
         self.ai_generation += 1;
         let generation = self.ai_generation;
         self.ai_worker_active = true;
@@ -5280,6 +5656,7 @@ impl Editor {
                         rejected,
                         scope,
                         log,
+                        base_revision,
                     })
                 })
                 .await;
@@ -5300,6 +5677,7 @@ impl Editor {
                             completed.diagnoses,
                             completed.rejected,
                             Some(completed.scope),
+                            completed.base_revision,
                             generation,
                             cx,
                         )
@@ -5334,6 +5712,10 @@ impl Editor {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
+        self.cancel_ai_run_inner(cx);
+    }
+
+    fn cancel_ai_run_inner(&mut self, cx: &mut Context<Self>) {
         // UI-level cancel: the response of the abandoned generation is
         // ignored when it lands (no need to abort the request itself).
         // A parked deferral dies with its generation too (flush checks it),
@@ -5366,6 +5748,7 @@ impl Editor {
         diagnoses: Vec<strop_core::diagnose::Diagnosis>,
         rejected: usize,
         scope: Option<strop_core::diagnose::PromptScope>,
+        base_revision: u64,
         _generation: u64,
         cx: &mut Context<Self>,
     ) {
@@ -5374,12 +5757,17 @@ impl Editor {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let count = diagnoses.len();
+        // Read BEFORE this integration's own mutations: did the document
+        // actually change between the ask and the landing? Only an actual
+        // change may ever be blamed for ungroundable quotes.
+        let doc_changed = self.doc.revision() != base_revision;
         // Anchor against the text as it is NOW — quotes
         // that no longer match are dropped.
         self.diagnosis_pass += 1;
         let pass_id = self.diagnosis_pass;
         let grounded = ground_diagnoses(&self.doc, diagnoses, scope.as_ref(), now, pass_id);
         let groundable = grounded.groundable;
+        let context_grounded = grounded.context_grounded;
         let target_missing = grounded.target_missing;
         let annotations = grounded.annotations;
         let kept = annotations.len();
@@ -5416,7 +5804,15 @@ impl Editor {
             })
             .detach();
         }
-        match ai_landing(count, rejected, groundable, target_missing, kept) {
+        match ai_landing(
+            count,
+            rejected,
+            groundable,
+            target_missing,
+            kept,
+            doc_changed,
+            context_grounded,
+        ) {
             AiLanding::Cards => {
                 // The cards are the result. Malformed/stale sibling counts
                 // remain in diagnostics; backend maintenance is not writer work.
@@ -5438,6 +5834,17 @@ impl Editor {
                     title: "The draft changed before the read landed".into(),
                     detail: "The old quotes were not attached to different text.".into(),
                     recovery: AiRecovery::ReadAgain,
+                });
+            }
+            AiLanding::Unlanded => {
+                // Verdict honesty: the revision did NOT change (or the
+                // quotes only match context) — the failed grounding is the
+                // read's, never the draft's. Short and factual; no advice.
+                self.ai_empty_result = None;
+                self.ai_status = Some(AiStatus::Error {
+                    title: "The read did not land".into(),
+                    detail: "The reply quoted text that is not in the passage it read.".into(),
+                    recovery: AiRecovery::Retry,
                 });
             }
             AiLanding::Empty => {
@@ -5466,7 +5873,10 @@ impl Editor {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
-        self.deliver_pass_report(diagnoses, 0, None, generation, cx);
+        // The seed/demo path has no run_pass snapshot; "asked against the
+        // current revision" is the honest equivalent.
+        let base_revision = self.doc.revision();
+        self.deliver_pass_report(diagnoses, 0, None, base_revision, generation, cx);
     }
 
     fn deliver_pass_report(
@@ -5474,10 +5884,11 @@ impl Editor {
         diagnoses: Vec<strop_core::diagnose::Diagnosis>,
         rejected: usize,
         scope: Option<strop_core::diagnose::PromptScope>,
+        base_revision: u64,
         generation: u64,
         cx: &mut Context<Self>,
     ) {
-        if self.typing_burst_live() || self.cold_read.is_some() {
+        if self.drafting || self.typing_burst_live() || self.cold_read.is_some() {
             // F7: the reveal clock holds in the reading room — a pass
             // completing mid-read parks; exit flushes it after the
             // suppressed surfaces restore.
@@ -5486,6 +5897,7 @@ impl Editor {
                 rejected,
                 scope,
                 generation,
+                base_revision,
             });
             // The provider call is complete. Ready outranks neither a real
             // worker nor an error, so clear Running before the button derives
@@ -5494,7 +5906,7 @@ impl Editor {
             self.ai_status = None;
             self.watch_for_lull(cx);
         } else {
-            self.integrate_pass(diagnoses, rejected, scope, generation, cx);
+            self.integrate_pass(diagnoses, rejected, scope, base_revision, generation, cx);
         }
     }
 
@@ -5508,7 +5920,7 @@ impl Editor {
         if d.generation != self.ai_generation {
             return; // cancelled or superseded while parked
         }
-        self.integrate_pass(d.diagnoses, d.rejected, d.scope, d.generation, cx);
+        self.integrate_pass(d.diagnoses, d.rejected, d.scope, d.base_revision, d.generation, cx);
     }
 
     /// Poll (4×/s) until the typing burst ends, then flush the parked pass.
@@ -5528,7 +5940,10 @@ impl Editor {
                     // F7: the room holds results parked like a live burst
                     // does — the lull watcher waits it out; the exit flush
                     // usually lands them first.
-                    if editor.typing_burst_live() || editor.cold_read.is_some() {
+                    if editor.drafting
+                        || editor.typing_burst_live()
+                        || editor.cold_read.is_some()
+                    {
                         return false;
                     }
                     editor.flush_deferred_pass(cx);
@@ -6229,6 +6644,7 @@ impl Editor {
                 TextFieldEvent::Commit(title) => editor.finish_rename(title.clone(), window, cx),
                 TextFieldEvent::Cancel => {
                     editor.doc_rename_input = None;
+                    editor.doc_rename_error = None;
                     window.focus(&editor.focus_handle, cx);
                     cx.notify();
                 }
@@ -6250,9 +6666,10 @@ impl Editor {
     }
 
     fn finish_rename(&mut self, title: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.doc_rename_input = None;
-        window.focus(&self.focus_handle, cx);
+        self.doc_rename_error = None;
         let Some(stem) = crate::files::stem_from_title(&title) else {
+            self.doc_rename_input = None;
+            window.focus(&self.focus_handle, cx);
             cx.notify();
             return;
         };
@@ -6260,21 +6677,37 @@ impl Editor {
         // a delayed write cannot recreate the old path after the rename.
         if let Err(e) = self.flush_saves() {
             eprintln!("strop: save before rename: {e}");
+            self.doc_rename_input = None;
+            window.focus(&self.focus_handle, cx);
             cx.notify();
             return;
         }
         if let Some(store) = &mut self.store {
             let old = store.path().to_owned();
-            let new_path = old
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
+            // Mint the new name in the HOST directory, never inside the
+            // portal mount — a foreign filename in a doc mount becomes an
+            // invisible `.xdp-*` temp on the host (files.rs law).
+            let new_path = crate::files::host_parent_or_documents(&old)
                 .join(format!("{stem}.strop"));
             match store.rename_file(new_path) {
                 Ok(()) => {
                     crate::files::replace_recent(&old, store.path());
                     window.set_window_title(&format!("{stem} — Strop"));
+                    self.doc_rename_input = None;
+                    window.focus(&self.focus_handle, cx);
                 }
-                Err(e) => eprintln!("strop: rename: {e}"),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    self.doc_rename_error = Some("another file has this name");
+                    if let Some(input) = &self.doc_rename_input {
+                        let focus = input.read(cx).focus_handle.clone();
+                        window.focus(&focus, cx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("strop: rename: {e}");
+                    self.doc_rename_input = None;
+                    window.focus(&self.focus_handle, cx);
+                }
             }
         }
         cx.notify();
@@ -6496,6 +6929,7 @@ impl Editor {
             .pb(px(6.));
         let mut last_section = "";
         for (ix, row) in rows.iter().enumerate() {
+            let missing = matches!(row, OmniRow::Recent(path) if !path.exists());
             if grouped {
                 let section = omni_row_section(row);
                 if section != last_section {
@@ -6518,7 +6952,10 @@ impl Editor {
                     (cmd.label.to_owned(), cmd.keys.map(|k| k.to_owned()), None)
                 }
                 OmniRow::Recent(p) => {
-                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_owned();
+                    let mut stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_owned();
+                    if missing {
+                        stem.push_str(" · missing");
+                    }
                     let dir = p
                         .parent()
                         .map(|d| d.display().to_string().replace(&home, "~"))
@@ -6554,6 +6991,7 @@ impl Editor {
                     .items_center()
                     .gap(px(10.))
                     .cursor(CursorStyle::PointingHand)
+                    .when(missing, |d| d.bg(rgb(STALE_BG)))
                     .when(ix == selected, |d| d.bg(rgba(0x1A1A1812u32)))
                     .hover(|d| d.bg(rgba(0x1A1A180Au32)))
                     .on_mouse_down(
@@ -6584,7 +7022,7 @@ impl Editor {
                             .min_w(px(0.))
                             .truncate()
                             .text_size(px(13.))
-                            .text_color(rgb(TEXT_COLOR))
+                            .text_color(rgb(if missing { MUTED_COLOR } else { TEXT_COLOR }))
                             .child(label),
                     )
                     .when_some(right, |d, right| {
@@ -6997,6 +7435,13 @@ impl Editor {
         let perf = std::env::var_os("STROP_PERF").map(|_| std::time::Instant::now());
         let mut queued = None;
         self.sync_mutations();
+        // Unborn import (lazy birth): sync_mutations above would have
+        // materialized any pending ops, so a birth still pending here means
+        // NO persistent mutation has ever happened — and no file may be
+        // created. Every save path funnels through this one refusal.
+        if self.pending_birth.is_some() {
+            return Ok(None);
+        }
         // Settle the journal's tail run: persisted runs are immutable once
         // written, so the store only ever pushes finished items. Saves fire
         // at ≥1s idle, a natural run boundary anyway.
@@ -7088,8 +7533,38 @@ impl Editor {
         }
     }
 
+    /// The clean-close predicate (quit guard a): true when a close can skip
+    /// the final save because every byte is already durable. The editor's
+    /// own flags cover marked mutations and in-flight/failed saves; the
+    /// store's frontier baseline (`Store::needs_save`) covers doc mutations
+    /// that never route through the dirty chokepoint — open-time session
+    /// seals, idle-gap checkpoints — and the journal's unpersisted tail. An
+    /// unborn import (lazy birth) is clean BY LAW: nothing exists on disk,
+    /// and a mere close must not create anything.
+    fn quit_close_clean(&mut self) -> bool {
+        // Fold any just-committed transient-field ops in first — they are
+        // exactly the bytes LAW 2 exists to protect.
+        self.sync_mutations();
+        if self.store_dirty || self.latest_save.is_some() || self.save_error.is_some() {
+            return false;
+        }
+        if self.pending_birth.is_some() {
+            return true;
+        }
+        match &self.store {
+            Some(store) => !store.needs_save(self.doc.journal()),
+            None => true,
+        }
+    }
+
     /// Queue the newest snapshot and wait only at a shutdown/rename boundary.
     pub fn flush_saves(&mut self) -> std::io::Result<()> {
+        // Clean close writes nothing: when the flags AND the store's own
+        // frontier baseline agree that disk already matches, the last-ditch
+        // flush must not rewrite (or, under lazy birth, CREATE) the file.
+        if self.quit_close_clean() {
+            return Ok(());
+        }
         // Use the generation produced by THIS attempt. Consulting editor
         // state here could accidentally select an older queued snapshot after
         // preparation of the newest revision failed.
@@ -7120,6 +7595,7 @@ impl Editor {
         }
         self.sync_active_note_draft(cx);
         self.quit_guard = QuitGuard::Saving;
+        self.quit_veil = false;
         window.focus(&self.quit_focus, cx);
         // LAW 2: quit's resolution boundary is broader than any gesture's — the
         // composer AND every single-line field (link, cold-read reaction) must
@@ -7132,11 +7608,61 @@ impl Editor {
         self.commit_composer_no_focus(cx);
         self.commit_transient_fields_on_quit(cx);
         cx.defer_in(window, |editor, _, cx| {
-            let _ = editor.save_now();
-            editor.finish_quit_if_ready(cx);
-            cx.notify();
+            editor.settle_quit(cx);
         });
         cx.notify();
+    }
+
+    /// The deferred half of `request_quit`, after every transient field has
+    /// resolved into the document. Clean close (quit guard a): nothing to
+    /// flush means the window closes NOW — no save, no veil, no frame of
+    /// chrome. Otherwise the final save is queued and the veil is armed on
+    /// a delay (quit guard c); the completion doorbell (`SaveWake`) usually
+    /// closes the window long before that timer fires.
+    fn settle_quit(&mut self, cx: &mut Context<Self>) {
+        if self.quit_close_clean() {
+            self.record_exit_state();
+            self.quit_guard = QuitGuard::Bypass;
+            cx.quit();
+            return;
+        }
+        let _ = self.save_now();
+        self.finish_quit_if_ready(cx);
+        self.arm_quit_veil(cx);
+        cx.notify();
+    }
+
+    /// Quit guard c: the veil renders only if the final save is still
+    /// pending after this long. A local disk finishes in single-digit
+    /// milliseconds; only a genuinely slow write (network mount, spun-down
+    /// drive) earns the "Saving before closing" chrome.
+    fn arm_quit_veil(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.quit_guard, QuitGuard::Saving) {
+            return; // already closed — or Failed, which renders regardless
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(QUIT_VEIL_DELAY).await;
+            this.update(cx, |editor: &mut Editor, cx| {
+                if editor.reveal_quit_veil() {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The timer's half of quit guard c, separated so the transition is a
+    /// testable fact: the veil shows only while a save is still holding the
+    /// window open. Returns whether anything changed.
+    fn reveal_quit_veil(&mut self) -> bool {
+        let saving = matches!(self.quit_guard, QuitGuard::Saving | QuitGuard::SavingCopy);
+        if saving && !self.quit_veil {
+            self.quit_veil = true;
+            true
+        } else {
+            false
+        }
     }
 
     fn finish_quit_if_ready(&mut self, cx: &mut Context<Self>) {
@@ -7165,6 +7691,7 @@ impl Editor {
     fn cancel_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.quit_guard, QuitGuard::Failed(_)) {
             self.quit_guard = QuitGuard::Idle;
+            self.quit_veil = false;
             window.focus(&self.focus_handle, cx);
             cx.notify();
         }
@@ -7175,17 +7702,40 @@ impl Editor {
         cx.quit();
     }
 
+    /// The unhandled-quit salvage: when the last-ditch flush fails there is
+    /// no window left for the Failed dialog, so LAW 2's final line is a full
+    /// snapshot into the machine-local state dir — announced on stderr,
+    /// never silently abandoned.
+    pub fn salvage_recovery_copy(&self) {
+        let Some(store) = &self.store else { return };
+        let stem = store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document");
+        let dir = crate::paths::state_dir().join("recovery");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("strop: recovery dir failed too: {e}");
+            return;
+        }
+        let path = dir.join(format!("{stem} {}.strop", strop_core::journal::now_ms()));
+        match store.prepare_copy_to(&path).map(|save| save.write()) {
+            Ok(Ok(())) => eprintln!("strop: salvaged a full copy at {}", path.display()),
+            Ok(Err(e)) | Err(e) => eprintln!("strop: recovery copy failed: {e}"),
+        }
+    }
+
     fn save_quit_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let QuitGuard::Failed(previous_error) = &self.quit_guard else { return };
         let previous_error = previous_error.clone();
         let Some(store) = &self.store else { return };
-        let dir = store.path().parent().map(ToOwned::to_owned)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // Same host-directory law as save_copy_as: never seed the picker
+        // with a portal FUSE dir (files.rs, the invisible-temp trap).
+        let dir = crate::files::host_parent_or_documents(store.path());
         let suggested = format!(
             "{} recovery.strop",
             store.path().file_stem().and_then(|s| s.to_str()).unwrap_or("document")
         );
         self.quit_guard = QuitGuard::SavingCopy;
+        // The copy flow holds a path dialog open — deliberate, slow, and
+        // exactly what today's veil narrates. No 200ms grace here.
+        self.quit_veil = true;
         let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
         cx.spawn(async move |this, cx| {
             let path = match rx.await {
@@ -7198,6 +7748,7 @@ impl Editor {
                     return;
                 }
             };
+            let path = crate::files::resolve_portal_path_async(path).await;
             let prepared = this.update(cx, |editor: &mut Editor, _| {
                 editor.store.as_ref()
                     .ok_or_else(|| std::io::Error::other("document store is no longer open"))?
@@ -7533,6 +8084,14 @@ impl Editor {
         // Remember the manuscript caret so Esc from a pile caret returns
         // exactly here (review B3). A seamless doc is all manuscript.
         let ch = self.doc.rope().byte_to_char(offset.min(self.doc.len_bytes()));
+        if self.drafting && self.focus.active_id().is_some_and(|id| {
+            self.doc.notes().get(id).is_some_and(|note| {
+                note.kind == NoteKind::Diagnosis
+                    && (ch < note.range.start || ch > note.range.end)
+            })
+        }) {
+            self.focus = CardFocus::Idle;
+        }
         if self.doc.region_of_char(ch) == strop_core::document::Region::Manuscript {
             self.last_manuscript_caret = offset;
         }
@@ -7753,22 +8312,95 @@ impl Editor {
         format!("{above}\n{below}")
     }
 
+    /// The two clipboard flavors are born together. For ordinary live prose
+    /// this records the exact source spans and block extents; seam rewriting
+    /// still receives a valid guarded envelope but deliberately has no rich
+    /// operation, because its visible text is not a contiguous document
+    /// slice. Whole image assets are sibling bitmap entries in id order.
+    fn clipboard_item(&self, range: &Range<usize>) -> ClipboardItem {
+        let text = self.clipboard_text(range);
+        let mut rich = RichPaste {
+            spans: Vec::new(),
+            blocks: Vec::new(),
+            starts_at_boundary: false,
+            ends_at_boundary: false,
+        };
+        let mut image_asset_ids = Vec::new();
+        if !self.selection_spans_seam(range) && text == self.doc.slice_bytes(range.clone()) {
+            let rope = self.doc.rope();
+            let first = rope.byte_to_line(range.start);
+            let last = rope.byte_to_line(range.end.min(self.doc.len_bytes()));
+            rich.starts_at_boundary = range.start == rope.line_to_byte(first);
+            rich.ends_at_boundary = range.end == rope.line_to_byte(last);
+            for block in first..=last.min(self.doc.blocks().len().saturating_sub(1)) {
+                let start = rope.line_to_byte(block);
+                let end = if block + 1 < rope.len_lines() {
+                    rope.line_to_byte(block + 1)
+                } else {
+                    self.doc.len_bytes()
+                };
+                let covered_start = start.max(range.start);
+                let covered_end = end.min(range.end);
+                if covered_start >= covered_end { continue; }
+                let kind = self.doc.blocks().kind(block).clone();
+                let complete = range.start <= start && end <= range.end;
+                if complete && let BlockKind::Image { src, .. } = &kind {
+                    image_asset_ids.push(src.clone());
+                }
+                rich.blocks.push(ClipboardBlock {
+                    range: covered_start - range.start..covered_end - range.start,
+                    kind,
+                    complete,
+                });
+            }
+            let char_start = rope.byte_to_char(range.start);
+            let char_end = rope.byte_to_char(range.end);
+            for source in self.doc.spans().spans() {
+                let start = source.range.start.max(char_start);
+                let end = source.range.end.min(char_end);
+                if start < end && !matches!(source.attr, InlineAttr::FootnoteRef(_)) {
+                    rich.spans.push(Span {
+                        range: start - char_start..end - char_start,
+                        attr: source.attr.clone(),
+                    });
+                }
+            }
+        }
+        let envelope = RichClipboardEnvelope {
+            v: RICH_CLIPBOARD_VERSION,
+            text_len: text.len(),
+            rich,
+            image_asset_ids: image_asset_ids.clone(),
+        };
+        let metadata = serde_json::to_string(&envelope).expect("clipboard payload serializes");
+        let mut item = ClipboardItem::new_string_with_metadata(text, metadata);
+        for id in image_asset_ids {
+            if let Some(bytes) = self.store.as_ref().and_then(|s| s.get_asset(&id)) {
+                item.entries.push(ClipboardEntry::Image(gpui::Image::from_bytes(
+                    image_format_for_src(&id),
+                    bytes,
+                )));
+            }
+        }
+        item
+    }
+
     /// Linux PRIMARY-selection contract: any selection (mouse or keyboard)
     /// is published; middle-click pastes it. With auto_copy_selection
     /// (config), the regular clipboard gets it too — Kirill's habit.
     fn publish_primary(&self, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            let text = self.clipboard_text(&self.selected_range.clone());
+            let item = self.clipboard_item(&self.selected_range.clone());
             if self.config.auto_copy_selection {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                cx.write_to_clipboard(item.clone());
             }
             // The PRIMARY selection is an X11/Wayland concept; gpui exposes it
             // only on Linux/BSD. macOS and Windows have no PRIMARY — the
             // regular clipboard above is the only target there.
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            cx.write_to_primary(ClipboardItem::new_string(text));
+            cx.write_to_primary(item);
             #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-            let _ = text;
+            let _ = item;
         }
     }
 
@@ -9379,12 +10011,6 @@ impl Editor {
             self.close_palette(window, cx);
             return;
         }
-        if self.shortcuts_open {
-            self.shortcuts_open = false;
-            window.focus(&self.focus_handle, cx);
-            cx.notify();
-            return;
-        }
         if self.editor_menu_open {
             self.editor_menu_open = false;
             cx.notify();
@@ -9455,6 +10081,21 @@ impl Editor {
             self.exit_history(cx);
             return;
         }
+        let glanced = self.focus.active_id().is_some_and(|id| {
+            self.doc.notes().get(id).is_some_and(|n| n.kind == NoteKind::Diagnosis)
+        });
+        match door_escape_step(self.drafting, glanced, self.resting_diagnoses() > 0) {
+            DoorEscape::Glance => {
+                self.focus = CardFocus::Idle;
+                cx.notify();
+                return;
+            }
+            DoorEscape::Fan => {
+                self.toggle_door(cx);
+                return;
+            }
+            DoorEscape::None => {}
+        }
         // The flanks are NEVER their own Escape layer (LAW 1): with nothing
         // bigger to dismiss, Escape collapses a live selection to a caret, which
         // lowers the flanks as a consequence. Latch so a restore can't re-raise
@@ -9515,12 +10156,36 @@ impl Editor {
         cx.notify();
     }
 
-    fn show_shortcuts(&mut self, _: &ShowShortcuts, _: &mut Window, cx: &mut Context<Self>) {
-        if self.cr_guard(cx) {
-            return; // the reading room refuses with the pulse (F4 belt 2)
+    fn show_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reference) = self.keymap_window {
+            if reference.update(cx, |_, reference_window, _| {
+                match crate::keymap_window::toggle_decision(true) {
+                    crate::keymap_window::ToggleDecision::CloseAndRestore => {
+                        reference_window.remove_window();
+                    }
+                    crate::keymap_window::ToggleDecision::Open => unreachable!(),
+                }
+            }).is_ok() {
+                self.keymap_closed();
+                window.activate_window();
+                window.focus(&self.focus_handle, cx);
+                return;
+            }
+            self.keymap_window = None;
         }
-        self.shortcuts_open = !self.shortcuts_open;
-        cx.notify();
+        let editor = cx.entity();
+        if let Some(reference) = crate::keymap_window::open(
+            editor,
+            window.window_handle(),
+            window.bounds(),
+            cx,
+        ) {
+            self.keymap_window = Some(reference);
+        }
+    }
+
+    pub(crate) fn keymap_closed(&mut self) {
+        self.keymap_window = None;
     }
 
     fn open_welcome(&mut self, _: &OpenWelcome, _: &mut Window, cx: &mut Context<Self>) {
@@ -9528,116 +10193,6 @@ impl Editor {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
         crate::files::open_welcome_window();
-    }
-
-    /// The keyboard map (GNOME's ctrl-? convention): every command from
-    /// the registry plus the text-editing baseline, at a glance. The
-    /// palette is for doing; this is for learning.
-    fn render_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut sections: Vec<(&'static str, Vec<(String, String)>)> = Vec::new();
-        for cmd in crate::commands::all() {
-            let keys = cmd.keys.map_or_else(|| "palette".to_owned(), |k| k.to_owned());
-            match sections.iter_mut().find(|(s, _)| *s == cmd.section) {
-                Some((_, rows)) => rows.push((cmd.label.to_owned(), keys)),
-                None => sections.push((cmd.section, vec![(cmd.label.to_owned(), keys)])),
-            }
-        }
-        sections.push((
-            "Text editing",
-            [
-                ("Move by word / paragraph", "ctrl-arrows"),
-                ("Select by word / paragraph", "ctrl-shift-arrows"),
-                ("Document start / end", "ctrl-home / ctrl-end"),
-                ("Select all", "ctrl-a"),
-                ("Copy / Cut / Paste", "ctrl-c / x / v"),
-                ("Markdown headings", "# ## ### + space"),
-                ("Escape any mode", "escape"),
-            ]
-            .into_iter()
-            .map(|(a, b)| (a.to_owned(), b.to_owned()))
-            .collect(),
-        ));
-        div()
-            .absolute()
-            .inset_0()
-            .bg(rgba(0x1A1A1830u32))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    editor.shortcuts_open = false;
-                    // §0.6 law 4: closing a layer restores focus beneath it.
-                    window.focus(&editor.focus_handle, cx);
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .id("shortcuts-panel")
-                    .w(px(700.))
-                    .max_h(px(560.))
-                    .overflow_y_scroll()
-                    .bg(rgb(0xFCFAF4))
-                    .border_1()
-                    .border_color(rgb(RULE_COLOR))
-                    .rounded(px(8.))
-                    .shadow_lg()
-                    .p(px(18.))
-                    .font_family("PT Serif")
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .pb(px(10.))
-                            .flex()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(15.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(TEXT_COLOR))
-                                    .child("Keyboard map"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child("esc closes · ctrl-shift-p runs any of these by name"),
-                            ),
-                    )
-                    .child(div().flex().flex_wrap().gap(px(16.)).children(
-                        sections.into_iter().map(|(section, rows)| {
-                            div()
-                                .w(px(320.))
-                                .child(
-                                    div()
-                                        .pt(px(6.))
-                                        .pb(px(3.))
-                                        .text_size(px(10.))
-                                        .text_color(rgb(MUTED_COLOR))
-                                        .child(section.to_uppercase()),
-                                )
-                                .children(rows.into_iter().map(|(label, keys)| {
-                                    div()
-                                        .flex()
-                                        .justify_between()
-                                        .gap(px(10.))
-                                        .py(px(1.))
-                                        .text_size(px(12.))
-                                        .child(div().text_color(rgb(TEXT_COLOR)).child(label))
-                                        .child(
-                                            div()
-                                                .text_color(rgb(MUTED_COLOR))
-                                                .text_size(px(11.))
-                                                .child(keys),
-                                        )
-                                }))
-                        }),
-                    )),
-            )
     }
 
     /// The AI settings panel (DESIGN §2-ai, F4): centered in-surface
@@ -10439,7 +10994,12 @@ impl Editor {
             // Live copy strips the seam from a spanning selection
             // (seam-mechanics 2 — the fragments join with one newline) and
             // carries whole-covered pictures in their Markdown form (§9).
-            None => self.clipboard_text(&self.selected_range.clone()),
+            None => {
+                let item = self.clipboard_item(&self.selected_range.clone());
+                crate::smoke::mirror_clipboard_item(&item);
+                cx.write_to_clipboard(item);
+                return;
+            }
         };
         crate::smoke::mirror_clipboard(&text);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -10473,13 +11033,21 @@ impl Editor {
         // spanning selection's fragments (pictures in Markdown form, §9);
         // the delete path below splits at the seam and leaves it between
         // the remnants.
-        let text = self.clipboard_text(&self.selected_range.clone());
-        crate::smoke::mirror_clipboard(&text);
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        let item = self.clipboard_item(&self.selected_range.clone());
+        crate::smoke::mirror_clipboard_item(&item);
+        cx.write_to_clipboard(item);
         self.replace_text_in_range(None, "", window, cx);
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste_from_clipboard(false, cx);
+    }
+
+    fn paste_plain(&mut self, _: &PastePlain, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste_from_clipboard(true, cx);
+    }
+
+    fn paste_from_clipboard(&mut self, plain: bool, cx: &mut Context<Self>) {
         if self.cr_guard(cx) {
             return; // the reading room refuses with the pulse (F4 belt 2)
         }
@@ -10493,10 +11061,17 @@ impl Editor {
         else {
             return;
         };
+        if plain {
+            if let Some((text, _)) = clipboard_text_and_rich(&item, true) {
+                self.apply_replace(None, &text, false, true, cx);
+            }
+            return;
+        }
         // §9's gates, priced for prose: one reference pass over the
         // entries, and the image-line parse runs only when the text even
         // contains "![" — an ordinary paste pays two finds and a substring
         // scan, no allocation beyond what it always paid.
+        let rich = clipboard_text_and_rich(&item, false).and_then(|(_, rich)| rich);
         let mut entries = item.entries;
         let text_entry: Option<String> = entries.iter().find_map(|e| match e {
             ClipboardEntry::String(s) => Some(s.text().replace("\r\n", "\n")),
@@ -10614,23 +11189,85 @@ impl Editor {
                 return;
             }
         }
-        // The ordinary path, order-preserved from before §9: a foreign
-        // bitmap takes the bare §5b import; text pastes as text (never
-        // typographed — already authored).
-        for entry in entries {
+        if let (Some(text), Some(rich)) = (text_entry.as_deref(), rich.as_ref())
+            && !rich.blocks.is_empty()
+        {
+            let range = self.marked_range.clone().unwrap_or(self.selected_range.clone());
+            if !self.selection_spans_seam(&range) {
+                let line = self.doc.rope().byte_to_line(range.start);
+                let prefix = usize::from(rich.starts_at_boundary
+                    && range.start > self.doc.rope().line_to_byte(line));
+                let suffix = usize::from(rich.ends_at_boundary
+                    && range.start < line_text_end_bytes(self.doc.rope(), line)
+                    && !text.ends_with('\n'));
+                self.doc.paste_rich(range.clone(), text, rich);
+                let caret = (range.start + prefix + text.len() + suffix)
+                    .min(self.doc.len_bytes());
+                self.selected_range = caret..caret;
+                self.selection_reversed = false;
+                self.marked_range = None;
+                self.goal_x = None;
+                self.caret_attrs.clear();
+                self.mark_dirty();
+                self.sync_mutations();
+                self.bump_activity();
+                cx.notify();
+                self.reconcile_dead_anchors(cx);
+                return;
+            }
+        }
+        // The ordinary path (§9, amended with ExternalPaths import): the
+        // FIRST entry decides the paste's meaning — a foreign bitmap takes
+        // the bare §5b import, text pastes as text (never typographed —
+        // already authored), copied file paths go to the image importer.
+        // Every arm is terminal, so this is an `if`, not a loop.
+        if let Some(entry) = entries.into_iter().next() {
             match entry {
                 ClipboardEntry::Image(image) => {
                     self.import_image_bytes(image.bytes, cx);
-                    return;
                 }
                 ClipboardEntry::String(text) => {
                     let text = text.text().replace("\r\n", "\n");
                     self.apply_replace(None, &text, false, true, cx);
-                    return;
                 }
-                // New variant post-0.2.2; pasting file paths did nothing
-                // before, keep it that way (file *drops* import images).
-                ClipboardEntry::ExternalPaths(_) => {}
+                ClipboardEntry::ExternalPaths(paths) => {
+                    let mut files = Vec::new();
+                    let mut refused = false;
+                    for path in paths.paths() {
+                        // Copied file paths arrive through the same portal
+                        // door as drops — resolve before reading.
+                        let path = crate::files::resolve_portal_path(path);
+                        match std::fs::read(&path) {
+                            Ok(bytes) => files.push(bytes),
+                            Err(e) => {
+                                refused = true;
+                                eprintln!("strop: cannot read {}: {e}", path.display());
+                            }
+                        }
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let (imported, refused) = cx.background_executor().spawn(async move {
+                            let mut imported = Vec::new();
+                            let mut refused = refused;
+                            for bytes in files {
+                                match strop_core::images::import_image(bytes) {
+                                    Ok(image) => imported.push(image),
+                                    Err(e) => {
+                                        refused = true;
+                                        eprintln!("strop: {e}");
+                                    }
+                                }
+                            }
+                            (imported, refused)
+                        }).await;
+                        this.update(cx, |editor: &mut Editor, cx| {
+                            for image in imported {
+                                editor.insert_imported_image(image, "", "", cx);
+                            }
+                            if refused { editor.pulse_strip(cx); }
+                        }).ok();
+                    }).detach();
+                }
             }
         }
     }
@@ -10864,7 +11501,8 @@ impl Editor {
             && let Some(sel) = self.image_sel_live()
             && self.image_pixel_hit(position) == Some(sel.block)
         {
-            match std::fs::read(path) {
+            let path = crate::files::resolve_portal_path(path);
+            match std::fs::read(&path) {
                 Ok(bytes) => self.replace_selected_image_pixels(sel, bytes, cx),
                 Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
             }
@@ -10879,7 +11517,8 @@ impl Editor {
         };
         let mut files = Vec::new();
         for path in paths.paths() {
-            match std::fs::read(path) {
+            let path = crate::files::resolve_portal_path(path);
+            match std::fs::read(&path) {
                 Ok(bytes) => files.push(bytes),
                 Err(e) => eprintln!("strop: cannot read {}: {e}", path.display()),
             }
@@ -11118,12 +11757,14 @@ impl Editor {
         // §0.6 law 1, second line of defense: while a blocking overlay is
         // up, the document never scrolls — even if a wheel event slips
         // past the overlay's own stop_propagation.
-        if self.palette_input.is_some() || self.ai_settings.is_some() || self.shortcuts_open {
+        if self.palette_input.is_some() || self.ai_settings.is_some() {
             return;
         }
-        // Scrolling is the writer looking around — a parked pass lands now
-        // (attention already moved; nothing can pop "under" it mid-thought).
-        self.flush_deferred_pass(cx);
+        // Scrolling may end the typing reveal clock only while the fan is
+        // already out. A closed fan continues to park until an explicit open.
+        if !self.drafting {
+            self.flush_deferred_pass(cx);
+        }
         // Exit-fade ghosts are viewport-frozen snapshots: once the text
         // moves under them they'd hang mid-air, so a scroll just drops them.
         self.departing.clear();
@@ -11183,6 +11824,30 @@ impl Editor {
             self.select_card(target.id, window, cx);
             cx.notify();
         }
+    }
+
+    /// Opening must visibly reveal a referent even when every diagnosis anchor
+    /// starts outside the viewport. Reuse the edge-pill reveal path so the
+    /// nearest anchor lands at the near edge.
+    fn reveal_after_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let layout = self.margin_cards(true);
+        if !layout.cards.is_empty() {
+            return;
+        }
+        let above = layout.above.last().copied();
+        let below = layout.below.first().copied();
+        let choose_below = match (above, below) {
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => {
+                let Some(frame) = self.last_frame.as_ref() else { return };
+                let top = f32::from(frame.scroll_top);
+                let bottom = top + f32::from(frame.viewport_height);
+                (b.anchor_y - bottom).abs() <= (top - a.anchor_y).abs()
+            }
+            (None, None) => return,
+        };
+        self.reveal_offscreen(choose_below, window, cx);
     }
 
     /// One tick of drag-edge autoscroll: while the pointer is held beyond
@@ -11398,11 +12063,6 @@ impl Editor {
         if self.palette_input.is_some() {
             self.close_palette(window, cx);
         }
-        if self.shortcuts_open {
-            self.shortcuts_open = false;
-            window.focus(&self.focus_handle, cx);
-            cx.notify();
-        }
         // A click outside the flank commits its open link argument-field before
         // the popover itself is dismissed, so the URL lands (spec §0.1).
         if let Some(url) = self.link_input.as_ref().map(|(_, f)| f.read(cx).content.clone()) {
@@ -11567,14 +12227,9 @@ impl Editor {
                     .map(|n| (n.id, n.range.start, n.range.end))
                     .collect();
                 let hit_id = note_at_char(&ranges, c);
-                let hit = hit_id.and_then(|id| self.doc.notes().get(id));
-                // Reaching for a resting diagnosis opens the door (DESIGN
-                // §4.4), so the card it activates is actually on screen —
-                // and an attention shift this explicit lands a parked pass.
-                if self.drafting && hit.is_some_and(|n| n.kind == NoteKind::Diagnosis) {
-                    self.flush_deferred_pass(cx);
-                    self.drafting = false;
-                }
+                // Reaching for a diagnosis is a glance, not a stance change.
+                // The selected-card exemption paints it without opening the
+                // rest of the fan or landing a parked pass.
                 // Clicking the text selects the hit card (or clears selection);
                 // either way it commits and closes any composer first, so a
                 // click into the document never strands an open note editor.
@@ -11749,9 +12404,6 @@ impl Editor {
         }
         if self.palette_input.is_some() {
             overlays.push("palette");
-        }
-        if self.shortcuts_open {
-            overlays.push("shortcuts");
         }
         // Key on the RENDER gate, not the bare predicate (V9b): a settled
         // selection scrolled off-screen passes `flanks_visible` but paints
@@ -12240,6 +12892,49 @@ impl Editor {
         cx.notify();
     }
 
+    /// Rig fixtures for the space rail: a long structured document with a
+    /// real Scraps seam, a long markless document, or a short markless page.
+    pub fn debug_seed_scrollbar(&mut self, mode: &str, cx: &mut Context<Self>) {
+        let count = if mode == "short" { 3 } else { 90 };
+        let mut lines = Vec::with_capacity(count);
+        let mut kinds = vec![BlockKind::Paragraph; count];
+        for ix in 0..count {
+            lines.push(format!("Rail fixture paragraph {ix}: rendered lines make position honest."));
+        }
+        if mode == "long" {
+            for (ix, kind, label) in [
+                (0, BlockKind::Heading(1), "The first crossing"),
+                (12, BlockKind::Heading(2), "Soundings"),
+                (25, BlockKind::Divider, "⁂"),
+                (42, BlockKind::Heading(1), "The far bank"),
+                (55, BlockKind::Heading(2), "Night water"),
+                (72, BlockKind::Heading(2), "Unplaced ending"),
+                (80, BlockKind::Divider, "⁂"),
+            ] {
+                kinds[ix] = kind;
+                lines[ix] = label.into();
+            }
+        }
+        let text = lines.join("\n");
+        self.doc.restore_state(&text, SpanSet::default(), BlockMap::from_kinds(kinds));
+        if mode == "long" {
+            self.doc.set_scrap_line(Some(68));
+        }
+        self.selected_range = 0..0;
+        self.scroll_top = px(0.);
+        self.sync_mutations();
+        self.word_count = self.manuscript_word_count();
+        cx.notify();
+    }
+
+    pub fn debug_space_drag(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        let Some(frame) = self.last_frame.as_ref() else { return };
+        self.scroll_top = frame.max_scroll() * fraction.clamp(0., 1.);
+        self.space_readout_fade = None;
+        self.space_drag_offset = Some(SPACE_THUMB_MIN_H / 2.);
+        cx.notify();
+    }
+
     /// Rig hook (`seed:topera`): rebuild the LIVE doc in the SHIPPED
     /// compost-at-top shape and save — so the NEXT launch of this same file
     /// exercises the one-time migration against a real store. The direct
@@ -12662,10 +13357,49 @@ impl Editor {
         cx.notify();
     }
 
-    /// Rig hook (`ebtn:door`): the menu footer's presence verb — flush a parked
-    /// pass and flip the door, exactly the path a click on it takes.
+    /// Rig hook (`ebtn:door`): exercise the chip/shortcut transition.
     pub fn debug_toggle_door(&mut self, cx: &mut Context<Self>) {
         self.toggle_door(cx);
+    }
+
+    /// Rig hook (`notes:glance`): select the first open diagnosis the way a
+    /// squiggle click would — while the fan rests, the selected card paints
+    /// as the glance overlay. Coordinates-free, so the still can't miss.
+    pub fn debug_glance_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self
+            .doc
+            .notes()
+            .open()
+            .find(|n| n.kind == NoteKind::Diagnosis)
+            .map(|n| n.id);
+        if let Some(id) = id {
+            self.select_card(id, window, cx);
+        }
+    }
+
+    /// Rig hook (`notes:drain`): mark every open diagnosis unverified so the
+    /// chip's all-stale treatment can be captured without synthesizing edits.
+    pub fn debug_drain_diagnoses(&mut self, cx: &mut Context<Self>) {
+        let mut edits: Vec<(Range<usize>, String)> = self
+            .doc
+            .notes()
+            .open()
+            .filter(|note| note.kind == NoteKind::Diagnosis)
+            .filter_map(|note| {
+                let start = self.doc.char_to_byte(note.range.start);
+                let end_char = (note.range.start + 1).min(note.range.end);
+                let end = self.doc.char_to_byte(end_char);
+                (end > start).then(|| {
+                    (start..end, self.doc.rope().byte_slice(start..end).to_string())
+                })
+            })
+            .collect();
+        edits.reverse();
+        for (range, same_text) in edits {
+            self.doc.edit_bytes(range, &same_text);
+        }
+        self.sync_mutations();
+        cx.notify();
     }
 
     /// Rig hook (`seed:journal`): install a deterministic synthetic fortnight —
@@ -12846,6 +13580,9 @@ impl Editor {
         use strop_core::journal::{EditRun, Journal, JournalEvent};
         use strop_core::store::CheckpointState;
 
+        // Birth-first, like seed:legacy: the fixture's checkpoints must land
+        // AFTER the "Started" seal, never before it.
+        self.materialize_store();
         let now = strop_core::journal::now_ms();
         let day = 86_400_000i64;
         let hour = 3_600_000i64;
@@ -12964,6 +13701,11 @@ impl Editor {
     pub fn debug_seed_legacy(&mut self, cx: &mut Context<Self>) {
         use strop_core::journal::Journal;
         use strop_core::store::CheckpointState;
+        // A seed IS a persistent mutation: an unborn .md fixture materializes
+        // first, so the "Started" birth seal keeps index 0 and the seeded
+        // plan lands at 1.. — the order the rig's index-addressed scrubs
+        // (coldread:past:N) and the record's birth-first law both expect.
+        self.materialize_store();
         let Some(store) = self.store.as_ref() else {
             eprintln!("strop: seed:legacy needs a document file");
             return;
@@ -13459,10 +14201,12 @@ impl Editor {
         // A seam-spanning selection (legalized by seam-mechanics 2): ONE
         // transaction, TWO edits — above and below the separator, the seam
         // between the remnants, the replacement landing manuscript-side.
-        // A spanning DELETION files up to two region-honest graveyard
-        // entries, threshold per side (graveyard-interplay 6); a type-over
-        // files nothing. Only the tail era has live spanning input (top-era
-        // docs migrate at open; the past is preview-only).
+        // A spanning REMOVAL files up to two region-honest graveyard
+        // entries, threshold per side (graveyard-interplay 6) — type-over
+        // included (§4's amendment); only the IME commit, which replaces
+        // its own preedit and never manuscript, files nothing. Only the
+        // tail era has live spanning input (top-era docs migrate at open;
+        // the past is preview-only).
         if !range.is_empty()
             && matches!(
                 self.doc.boundary(),
@@ -13481,7 +14225,7 @@ impl Editor {
                 above,
                 below,
                 new_text,
-                new_text.is_empty(),
+                self.marked_range.is_none(),
                 AUTO_CUT_MIN_CHARS,
                 quote,
                 now_unix(),
@@ -13508,30 +14252,42 @@ impl Editor {
         }
 
         // The auto-cut trigger (docs/impl/02-asides.md §4): a SINGLE
-        // selection-deletion op ≥ AUTO_CUT_MIN_CHARS files itself in the
-        // graveyard — on either side of the seam (one capture law,
-        // graveyard-interplay 5). Only a real deletion of a real selection —
-        // a replace-by-typing keeps its text and never files; a backspace
-        // run is many one-char ops, none reaching the threshold (H24 + H43).
-        // See `auto_cut_qualifies` for the pure predicate.
-        if !range.is_empty() {
+        // selection-removal op ≥ AUTO_CUT_MIN_CHARS files itself in the
+        // graveyard — with or without replacement text ("anything big that
+        // leaves in one stroke, survives"), on either side of the seam (one
+        // capture law, graveyard-interplay 5). A backspace run is many
+        // one-char ops, none reaching the threshold (H24 + H43); an IME
+        // commit only replaces its own preedit, never manuscript, so a live
+        // marked range exempts the op; typograph substitutions are tiny
+        // direct edits that never pass through here. See
+        // `auto_cut_qualifies` for the pure predicate.
+        let auto_cut = !range.is_empty() && self.marked_range.is_none() && {
             let start_char = self.doc.rope().byte_to_char(range.start);
             let end_char = self.doc.rope().byte_to_char(range.end);
-            if auto_cut_qualifies(new_text, end_char - start_char) {
-                // The auto path never collapses the seam itself: the caret
-                // ends inside the emptied pile, and the retype-race guard
-                // (seam-mechanics 6) owns the evaporation moment. Plain delete
-                // stays exact-bytes — only the exile verb interprets blocks.
-                self.file_cut(range, false, false, cx);
-                return;
-            }
+            auto_cut_qualifies(end_char - start_char)
+        };
+        if auto_cut && new_text.is_empty() {
+            // The auto path never collapses the seam itself: the caret
+            // ends inside the emptied pile, and the retype-race guard
+            // (seam-mechanics 6) owns the evaporation moment. Plain delete
+            // stays exact-bytes — only the exile verb interprets blocks.
+            self.file_cut(range, false, false, cx);
+            return;
         }
 
         // A machine-performed insertion (paste) re-anchors spans verbatim: no
         // right-edge expansion dresses it in a neighbour's mark (papercuts §A3
         // machine-insertion law). The typing hand still extends via the
-        // coalescing path.
-        if machine {
+        // coalescing path. A qualifying type-over files the removed text and
+        // lands the replacement in ONE transaction (undo restores both and
+        // drops the entry — the cut law's parity).
+        if auto_cut {
+            let quote = self.origin_quote_before(range.start);
+            self.doc
+                .replace_to_graveyard(range.clone(), new_text, machine, quote, now_unix());
+            self.grave_flash = Some(Instant::now());
+            self.schedule_flash_clear(cx);
+        } else if machine {
             self.doc.edit_bytes_verbatim(range.clone(), new_text);
         } else {
             self.doc.edit_bytes_coalescing(range.clone(), new_text);
@@ -13565,7 +14321,10 @@ impl Editor {
                 Language::En => typograph::Lang::En,
                 Language::Auto => typograph::detect_lang(self.doc.rope().chars()),
             };
-            if let Some(sub) = typograph::process(&prefix, lang) {
+            let next = self.doc.rope().byte_to_char(cursor);
+            let next = (next < self.doc.rope().len_chars())
+                .then(|| self.doc.rope().char(next));
+            if let Some(sub) = typograph::process(&prefix, next, lang) {
                 // The substitution is its own transaction: one undo reverts
                 // it alone, restoring the literally-typed characters — and
                 // since rules fire only on the typed char, the restored text
@@ -13605,6 +14364,11 @@ impl Editor {
 
         self.bump_activity();
         cx.notify();
+        // A filed type-over may have carried a margin note / diagnosis on the
+        // removed text — the same anchor tidy-up `file_cut` performs (Bug C).
+        if auto_cut {
+            self.reconcile_dead_anchors(cx);
+        }
     }
 }
 
@@ -13967,6 +14731,29 @@ fn image_gap_below(paragraph_gap: f32, caption_line_height: f32) -> f32 {
     paragraph_gap.max(IMAGE_CAPTION_GAP + caption_line_height)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShapedListGap {
+    Solid,
+    Blank,
+}
+
+fn shaped_list_gap(texts: &[&str], shaped: &[bool], i: usize) -> Option<ShapedListGap> {
+    if shaped.get(i) == Some(&true) && shaped.get(i + 1) == Some(&true) {
+        Some(ShapedListGap::Solid)
+    } else if (shaped.get(i) == Some(&true)
+        && texts.get(i + 1) == Some(&"")
+        && shaped.get(i + 2) == Some(&true))
+        || (i > 0
+            && shaped.get(i - 1) == Some(&true)
+            && texts.get(i) == Some(&"")
+            && shaped.get(i + 1) == Some(&true))
+    {
+        Some(ShapedListGap::Blank)
+    } else {
+        None
+    }
+}
+
 /// Painted footnote numbers (DESIGN §2-footnotes): the Nth distinct ref in
 /// text order paints as N — numbering derives from ref order while stored
 /// ids stay stable internal labels, the universal Word/Pandoc architecture.
@@ -14020,6 +14807,7 @@ fn blend_over(top: gpui::Rgba, bottom: gpui::Rgba) -> gpui::Rgba {
 #[allow(clippy::too_many_arguments)]
 fn runs_for_paragraph(
     par_range: &Range<usize>,
+    text: &str,
     selection: &Range<usize>,
     marked: Option<&Range<usize>>,
     spans: &[(Range<usize>, InlineAttr)],
@@ -14028,22 +14816,36 @@ fn runs_for_paragraph(
     dels: &[Range<usize>],
     base: &TextRun,
 ) -> Vec<TextRun> {
+    // Defense in depth: every cut source SHOULD arrive char-aligned (the
+    // history gate keeps live-domain carets out of preview layout), but one
+    // stale offset against re-laid-out text silently corrupts glyph shaping
+    // for the whole block — so every cut snaps back to a char boundary of
+    // THIS text before windowing. `text` is the paragraph's slice; cuts are
+    // absolute. The strop-bug tripwire downstream stays armed: it now flags
+    // a broken snap, never a routine scrub frame.
+    let snap = |b: usize| {
+        let mut b = b.clamp(par_range.start, par_range.end);
+        while b > par_range.start && !text.is_char_boundary(b - par_range.start) {
+            b -= 1;
+        }
+        b
+    };
     let mut cuts = vec![par_range.start, par_range.end];
     for r in [Some(selection), marked].into_iter().flatten() {
-        cuts.push(r.start.clamp(par_range.start, par_range.end));
-        cuts.push(r.end.clamp(par_range.start, par_range.end));
+        cuts.push(snap(r.start));
+        cuts.push(snap(r.end));
     }
     for (r, _) in spans {
-        cuts.push(r.start.clamp(par_range.start, par_range.end));
-        cuts.push(r.end.clamp(par_range.start, par_range.end));
+        cuts.push(snap(r.start));
+        cuts.push(snap(r.end));
     }
     for (r, _, _) in notes {
-        cuts.push(r.start.clamp(par_range.start, par_range.end));
-        cuts.push(r.end.clamp(par_range.start, par_range.end));
+        cuts.push(snap(r.start));
+        cuts.push(snap(r.end));
     }
     for r in matches.iter().chain(dels.iter()) {
-        cuts.push(r.start.clamp(par_range.start, par_range.end));
-        cuts.push(r.end.clamp(par_range.start, par_range.end));
+        cuts.push(snap(r.start));
+        cuts.push(snap(r.end));
     }
     cuts.sort_unstable();
     cuts.dedup();
@@ -14137,9 +14939,25 @@ fn runs_for_paragraph(
                     // pointing here), a writer note warm amber. A resting note
                     // keeps its faint amber tint; a resting diagnosis took the
                     // squiggle branch above and never reaches here.
-                    let tint = if *is_diagnosis {
-                        rgba(DIAGNOSIS_TINT_ACTIVE)
-                    } else if *active {
+                    if *is_diagnosis {
+                        // The band keeps the squiggle as its lower border —
+                        // same wave, same ink, same thickness as the resting
+                        // mark, so promotion reads as the SAME mark lit up,
+                        // not a different object (one mark family). The
+                        // writer's own straight underline still outranks it
+                        // (get_or_insert).
+                        underline.get_or_insert(UnderlineStyle {
+                            color: Some(rgb(AI_ACCENT).into()),
+                            thickness: px(1.),
+                            wavy: true,
+                        });
+                    }
+                    if *is_diagnosis {
+                        // The active diagnosis tint is a shaped element-paint
+                        // path. Its run keeps only the existing squiggle.
+                        continue;
+                    }
+                    let tint = if *active {
                         rgba(NOTE_TINT_ACTIVE)
                     } else {
                         rgba(NOTE_TINT)
@@ -14689,10 +15507,21 @@ impl Element for EditorElement {
             Some(p) => (p.text, p.inserts, p.deletes, Some(p.spans_bytes), Some(p.kinds)),
             None => (editor.doc.text(), Vec::new(), Vec::new(), None, None),
         };
-        // The selection survives into history frames (offsets index the
-        // laid-out text, which IS the preview while previewing — the same
-        // source `copy` slices; see that comment).
-        let selection = editor.selected_range.clone();
+        // A selection MADE in the preview survives into history frames —
+        // it's the surgical rescue (history-strip §3b: selection works and
+        // RENDERS in a parked preview; `copy` slices the same source). A
+        // collapsed caret is different: parking saves the LIVE caret byte
+        // (`strip_save_live_locus`), and that offset means nothing against
+        // reconstructed text — injected as a run cut it lands mid-multibyte-
+        // char and trips the run-misalignment tripwire on every scrub frame.
+        // So in history an empty selection contributes nothing to layout
+        // (0..0), the same gate `marked` already wears; non-empty is
+        // preview-domain by construction (park always collapses first).
+        let selection = if in_history && editor.selected_range.is_empty() {
+            0..0
+        } else {
+            editor.selected_range.clone()
+        };
         let marked = if in_history {
             None
         } else {
@@ -14744,6 +15573,8 @@ impl Element for EditorElement {
         } else {
             editor.doc.blocks().kinds().to_vec()
         };
+        let paragraph_texts: Vec<&str> = text.split('\n').collect();
+        let shaped_lists = shaped_list_paragraphs(&paragraph_texts, &kinds, true);
         // Painted footnote numbers, derived from ref order in this frame's
         // text (preview or live) — stored ids stay internal labels.
         let fn_numbers = {
@@ -15047,6 +15878,7 @@ impl Element for EditorElement {
             });
             let runs = runs_for_paragraph(
                 &range,
+                par_text,
                 &selection,
                 marked.as_ref(),
                 &par_spans,
@@ -15183,6 +16015,16 @@ impl Element for EditorElement {
                 text_top,
                 centered: bstyle.centered,
                 runs,
+                active_diagnosis: note_ranges.iter().find_map(|(note, active, diagnosis)| {
+                    if !*active || !*diagnosis {
+                        return None;
+                    }
+                    let start = note.start.max(range.start);
+                    let end = note.end.min(range.end);
+                    // then (not then_some): the subtraction must stay lazy —
+                    // a note wholly before this paragraph underflows it.
+                    (start < end).then(|| start - range.start..end - range.start)
+                }),
             });
             // The pile keeps a tighter vertical rhythm (the mockup's
             // ~0.95em item spacing): its blank separator lines are honest
@@ -15190,6 +16032,19 @@ impl Element for EditorElement {
             top += height
                 + if in_pile {
                     px((f32::from(paragraph_gap) * 0.5 / 2.).round() * 2.)
+                } else if matches!(kind, BlockKind::ListItem { .. })
+                    && matches!(kinds.get(block_ix + 1), Some(BlockKind::ListItem { .. }))
+                {
+                    paragraph_gap * 0.25
+                } else if let Some(gap) =
+                    shaped_list_gap(&paragraph_texts, &shaped_lists, block_ix)
+                {
+                    match gap {
+                        ShapedListGap::Solid => paragraph_gap * 0.25,
+                        ShapedListGap::Blank => {
+                            px((f32::from(paragraph_gap) * 0.5 / 2.).round() * 2.)
+                        }
+                    }
                 } else if is_image && par_text.is_empty() {
                     // The empty caption slot's borrowed margin (§3): must
                     // hold one caption caret — a no-op at the default
@@ -15494,6 +16349,27 @@ impl Element for EditorElement {
             // translators mirror (`center_shift`), so glyphs, wash and
             // caret agree to the pixel.
             let align = if par.centered { TextAlign::Center } else { TextAlign::Left };
+            if let Some(active) = &par.active_diagnosis {
+                let layout = &par.line.unwrapped_layout;
+                let padding_top =
+                    (par.line_height - layout.ascent - layout.descent) / 2.;
+                let underline_in_line = padding_top + layout.ascent + layout.descent * 0.618;
+                let first = par.line_of(active.start, true);
+                let last = par.line_of(active.end, false);
+                for line in first..=last {
+                    let start = active.start.max(par.line_start(line));
+                    let end = active.end.min(par.line_end(line));
+                    paint_diagnosis_band(
+                        bounds.origin,
+                        y + par.text_top + par.line_height * (line as f32),
+                        y + par.text_top + par.line_height * (line as f32)
+                            + underline_in_line,
+                        par.x_for(start, line),
+                        par.x_for(end, line),
+                        window,
+                    );
+                }
+            }
             par.line
                 .paint_background(origin, par.line_height, align, None, window, cx)
                 .expect("paint_background failed");
@@ -16490,6 +17366,7 @@ impl Editor {
             // hit-test resolves to this control rather than HTCAPTION.
             .occlude()
             .flex_shrink_0()
+            .ml(px(8.))
             // 28, not the old 34: the cells were sized for glyph labels;
             // the matched 13px marks need less air, and the freed width is
             // what lets "Ask the editor" rest untruncated in an 800px-
@@ -16524,10 +17401,10 @@ impl Editor {
         // the doc name keeps its rename (both entrances pierce). The muted
         // mode label rides beside the name (L16).
         let in_cold = self.cold_read.is_some();
-        let cr_mode_label: Option<String> = self.cold_read.as_ref().map(|cr| match &cr.source {
-            ColdReadSource::Live => "\u{2014} reading".to_owned(),
+        let cr_mode_label: Option<String> = self.cold_read.as_ref().and_then(|cr| match &cr.source {
+            ColdReadSource::Live => None,
             ColdReadSource::Past { name, .. } => {
-                format!("\u{2014} viewing \u{201c}{name}\u{201d}")
+                Some(format!("\u{2014} viewing \u{201c}{name}\u{201d}"))
             }
         });
         // Dragging the bar moves the window — by two mechanisms, because the
@@ -16577,8 +17454,13 @@ impl Editor {
                     (Some(input), _) => div()
                         .occlude()
                         .ml(px(8.))
-                        .w(px(220.))
-                        .child(input.clone())
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().w(px(220.)).child(input.clone()))
+                        .when_some(self.doc_rename_error, |row, error| {
+                            row.child(div().text_color(rgb(ERROR)).child(error))
+                        })
                         .into_any_element(),
                     (None, Some(store)) => {
                         let stem = store
@@ -16732,9 +17614,11 @@ impl Editor {
                     .id("palette-toggle")
                     .occlude()
                     .flex_shrink_0()
-                    .px(px(6.))
-                    .py(px(4.))
-                    .mr(px(6.))
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .mr(px(8.))
                     .rounded(px(5.))
                     .map(|d| {
                         if in_cold {
@@ -16894,24 +17778,25 @@ impl Editor {
                     .flex()
                     .items_center()
                     .justify_end()
-                // History first in the cluster (2026-07-11 ordering round):
-                // the ↺-clock keeps the top-right residency where Docs and
-                // Time Machine taught it, but the editor button and the
-                // moat below now stand between it and the OS verbs — a
-                // misclick on its neighbour opens a menu (esc, free), never
-                // minimizes the window.
+                // History keeps its Docs/Time-Machine top-right residency —
+                // an icon on the omnibar's flank read as the field's Submit
+                // button (product-owner catch). The wide elastic Ask button
+                // is the moat between the two icon twins: a stray click on
+                // history's neighbour opens a menu (Esc, free), never enters
+                // the reading room or the OS verbs.
                 .child(
                     div()
                         .id("history-toggle")
                         .occlude()
                         .flex_shrink_0()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .mr(px(2.))
+                        .size(px(28.))
+                        .mr(px(8.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .rounded(px(5.))
                         .map(|d| {
                             if in_cold {
-                                // Dimmed; the click pulses (Scopes 7).
                                 d.opacity(0.55).tooltip(tip("History", None))
                             } else {
                                 d.cursor(CursorStyle::PointingHand)
@@ -16922,75 +17807,29 @@ impl Editor {
                         })
                         .on_mouse_down(
                             MouseButton::Left,
-                            // The clock toggles the STRIP (the new first history
-                            // surface); the right-side panel lives on in the palette
-                            // ("History panel"). The two never open together.
                             cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
                                 editor.toggle_strip(&ToggleStrip, window, cx);
                             }),
                         )
-                        .child(
-                            // History: the counter-clockwise clock — the one
-                            // "versions" form the corridor already knows
-                            // (docs/iconography.md).
-                            icon(
-                                icons::HISTORY,
-                                13.,
-                                if self.strip.open && !in_cold {
-                                    TEXT_COLOR
-                                } else {
-                                    MUTED_COLOR
-                                },
-                            ),
-                        ),
-                )
-                // The reading room's doorknob (spec D4): a resting place, not an
-                // advertisement (P2/P5). `ReadItCold` already toggles, so the
-                // control IS the indicator (P12) — muted at rest, lit inside the
-                // room, and a click leaves. It is the ONE right-cluster control
-                // that stays LIVE in the cold read (the word pill and editor
-                // button hide there), so every still of the room shows the lit
-                // mark that exits it (P6). An open book, the reader's mark —
-                // the pictorial family's newest member (docs/iconography.md).
-                .child(
-                    div()
-                        .id("cold-read-toggle")
-                        .occlude()
-                        .flex_shrink_0()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .mr(px(2.))
-                        .rounded(px(5.))
-                        .cursor(CursorStyle::PointingHand)
-                        .when(in_cold, |d| d.bg(rgba(0x1A1A1812u32)))
-                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                        .tooltip(tip("Read it cold", Some("ctrl-shift-l")))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.read_it_cold(&ReadItCold, window, cx);
-                            }),
-                        )
                         .child(icon(
-                            icons::BOOK,
+                            icons::HISTORY,
                             13.,
-                            if in_cold { TEXT_COLOR } else { MUTED_COLOR },
+                            if self.strip.open && !in_cold { TEXT_COLOR } else { MUTED_COLOR },
                         )),
                 )
                 // The editor button (impl 04 §0): the AI subsystem's single home,
                 // where its results live — just left of the margin side. The old
                 // drawn mini-card is gone; the control now WEARS its state (a
                 // priority face) and opens the dropdown that names the reads.
-                // Hidden in the reading room (L16) — which also keeps the two
-                // "Reading"s from ever co-occurring (O10).
-                .when(!in_cold, |bar| bar.child({
+                // The control keeps its place in the reading room, dimmed and
+                // inert, so its location never depends on the active view.
+                .child({
                     let face = self.editor_face();
                     let open = self.editor_menu_open;
                     let n = self.open_query_count();
-                    // The face's label. "Reading" is the glossary presence word,
-                    // never the internal "Reviewing" (review H31).
+                    // The face never exposes the internal fan state; the
+                    // artifact and its chip carry that state.
                     let label: String = match face {
                         EditorFace::NeedsSetup => "Ask the editor · needs setup".to_owned(),
                         EditorFace::Cooking | EditorFace::Error | EditorFace::Idle => {
@@ -16998,10 +17837,8 @@ impl Editor {
                         }
                         EditorFace::Ready => "Ask the editor · a read is ready".to_owned(),
                         EditorFace::Empty => "Ask the editor · 0 new".to_owned(),
-                        EditorFace::Reading if n > 0 => {
-                            format!("Reading · {n} open · Ask the editor")
-                        }
-                        EditorFace::Reading => "Reading · Ask the editor".to_owned(),
+                        EditorFace::Reading if n > 0 => "Ask the editor".to_owned(),
+                        EditorFace::Reading => "Ask the editor".to_owned(),
                     };
                     // A colour cue only where the words don't carry it: cool = the
                     // machine is at work, red = it failed (color-language.md axis).
@@ -17027,7 +17864,7 @@ impl Editor {
                         // The one elastic control in the cluster: when the bar
                         // tightens, THIS label truncates — the OS verbs and the
                         // toggles right of it are shrink-proof, so the wide
-                        // "Reading · …" face can never crush them into a
+                        // A long status face can never crush them into a
                         // clipped clump at the window edge.
                         .min_w(px(0.))
                         .ml(px(4.))
@@ -17039,7 +17876,8 @@ impl Editor {
                         .rounded(px(7.))
                         .border_1()
                         .border_color(rgb(RULE_COLOR))
-                        .cursor(CursorStyle::PointingHand)
+                        .when(in_cold, |d| d.opacity(0.55))
+                        .when(!in_cold, |d| d.cursor(CursorStyle::PointingHand))
                         .flex()
                         .items_center()
                         .gap(px(5.))
@@ -17055,11 +17893,18 @@ impl Editor {
                             MouseButton::Left,
                             cx.listener(|editor, _: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
+                                if editor.cold_read.is_some() {
+                                    return;
+                                }
                                 editor.toggle_editor_menu(cx);
                             }),
                         )
                         .when_some(dot, |d, color| {
-                            d.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(rgb(color)))
+                            d.child(div()
+                                .flex_shrink_0()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(rgb(color)))
                         })
                         .child(div().min_w(px(0.)).truncate().child(label))
                         // The dropdown wedge — the pictorial family's one
@@ -17075,7 +17920,38 @@ impl Editor {
                                 MUTED_COLOR
                             },
                         ))
-                }))
+                })
+                // The book keeps the Ask control as its left moat and the
+                // drag surface as its right moat. Its latch is visible in the
+                // reading room; entering it closes history first.
+                .child(
+                    div()
+                        .id("cold-read-toggle")
+                        .occlude()
+                        .flex_shrink_0()
+                        .size(px(28.))
+                        .ml(px(8.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .cursor(CursorStyle::PointingHand)
+                        .when(in_cold, |d| d.bg(rgba(0x1A1A1812u32)))
+                        .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                        .tooltip(tip("Read it cold", Some("ctrl-shift-l")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.read_it_cold(&ReadItCold, window, cx);
+                            }),
+                        )
+                        .child(icon(
+                            icons::BOOK,
+                            13.,
+                            if in_cold { TEXT_COLOR } else { MUTED_COLOR },
+                        )),
+                )
                 // Windows/Linux get our own drawn window controls. macOS keeps its
                 // native traffic lights (top-left) instead, so we omit these here —
                 // which also retires the macOS papercut that our "×" quit the whole
@@ -17187,10 +18063,12 @@ impl Editor {
     /// the gradient's descent. Each hides while its own section is on screen;
     /// neither exists before its section does.
     ///
-    /// The warm Scraps chip carries the region's word count and pulses on
-    /// arrivals (an expanding ring — the mockup's chippulse; reduce_motion
-    /// swaps it for the 420ms ARRIVAL_FLASH blink: luminance, not travel);
-    /// click = the travel verb (latch + seam / pile_end).
+    /// The warm Scraps chip is presence-only — just the word "Scraps"
+    /// (asides.md §5's refusal: no counter that gamifies compost size; the
+    /// SEAM row and the caret-scoped count keep the scope arithmetic) — and
+    /// pulses on arrivals (an expanding ring — the mockup's chippulse;
+    /// reduce_motion swaps it for the 420ms ARRIVAL_FLASH blink: luminance,
+    /// not travel); click = the travel verb (latch + seam / pile_end).
     ///
     /// The drained Graveyard chip keeps the band's FULL shipped contract
     /// (surfaces-attention 2): "Graveyard · N" + mark, the 420ms exile blink,
@@ -17206,12 +18084,10 @@ impl Editor {
         let scraps_chip = matches!(
             self.doc.boundary(),
             Some((strop_core::document::BoundaryEra::Tail, _))
-        )
-        .then(|| self.scraps_word_count())
-        .filter(|_| !self.scraps_region_on_screen());
+        ) && !self.scraps_region_on_screen();
         let n = self.doc.graveyard().len();
         let grave_chip = (n > 0 && !self.grave_tail_on_screen()).then_some(n);
-        if scraps_chip.is_none() && grave_chip.is_none() {
+        if !scraps_chip && grave_chip.is_none() {
             return None;
         }
         let reduce_motion = self.config.reduce_motion;
@@ -17233,7 +18109,7 @@ impl Editor {
                 .gap(px(10.))
                 .font_family("PT Sans")
                 .text_size(px(11.5))
-                .when_some(scraps_chip, |d, words| {
+                .when(scraps_chip, |d| {
                     let blink = reduce_motion && self.arrival_flash.is_some();
                     let pulsing = !reduce_motion && self.chip_pulse.is_some();
                     d.child(
@@ -17285,10 +18161,10 @@ impl Editor {
                                             editor.scraps_travel(&ScrapsTravel, window, cx);
                                         }),
                                     )
-                                    .child(format!(
-                                        "Scraps · {}",
-                                        format_thousands(words)
-                                    )),
+                                    // Presence-only: no count (asides.md §5 —
+                                    // a counter would gamify compost size; the
+                                    // seam row owns the live arithmetic).
+                                    .child("Scraps"),
                             ),
                     )
                 })
@@ -17358,12 +18234,23 @@ impl Editor {
     /// viewing, with the one verb (Restore) and the exit. It lives in the
     /// column's top padding — never over prose.
     fn render_history_banner(&self, panel_w: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let (name, stamp) = self
+        // The banner obeys the strip's law too (history-strip §2): a
+        // session-ranked automatic never prints its internal name — the
+        // timestamp is the whole datum. Unnamed autos say "Auto-save", the
+        // panel row's word.
+        let label = self
             .history_view
             .as_ref()
             .map(|hv| {
                 let e = &hv.entries[hv.selected];
-                (e.name.clone(), format_unix(e.created_unix))
+                let stamp = format_unix(e.created_unix);
+                if strip::session_named(&e.name, e.manual) {
+                    stamp
+                } else if e.name.is_empty() {
+                    format!("Auto-save · {stamp}")
+                } else {
+                    format!("{} · {stamp}", e.name)
+                }
             })
             .unwrap_or_default();
         div()
@@ -17388,7 +18275,7 @@ impl Editor {
                     .min_w(px(0.))
                     .truncate()
                     .text_color(rgb(TEXT_COLOR))
-                    .child(format!("{name} · {stamp}")),
+                    .child(label),
             )
             .child(div().flex_1())
             .child(
@@ -17519,6 +18406,12 @@ impl Editor {
             let stamp = format_unix(e.created_unix);
             let (_, time) = stamp.split_once(' ').unwrap_or((stamp.as_str(), ""));
             let time = time.to_owned();
+            // The strip's law applies to the panel too (history-strip §2: no
+            // string containing "session" reaches the chrome, ever): a
+            // session-ranked automatic's datum is its TIMESTAMP, never the
+            // internal name. Writer-named rows are untouched — a manual name
+            // outranks the vocabulary in `session_named`.
+            let session = strip::session_named(&e.name, e.manual);
             // Word delta against the previous version, spelled with its
             // unit (the bare "+412 −0" read as a riddle).
             let (ins, del) = e.delta;
@@ -17590,12 +18483,18 @@ impl Editor {
                                             } else {
                                                 rgb(TEXT_COLOR)
                                             })
-                                            .when(e.manual, |d| {
+                                            // Bold marks a writer's deliberate
+                                            // name, never a stamped datum.
+                                            .when(e.manual && !session, |d| {
                                                 d.font_weight(FontWeight::BOLD)
                                             })
                                             // Autos have no name: label them so
                                             // the row never reads as a blank.
-                                            .child(if e.name.is_empty() {
+                                            // Session-ranked automatics show
+                                            // their timestamp as the datum.
+                                            .child(if session {
+                                                stamp.clone()
+                                            } else if e.name.is_empty() {
                                                 "Auto-save".to_owned()
                                             } else {
                                                 e.name.clone()
@@ -17612,7 +18511,12 @@ impl Editor {
                                 .gap(px(6.))
                                 .text_size(px(11.))
                                 .child(
-                                    div().text_color(rgb(MUTED_COLOR)).child(if delta.is_empty() {
+                                    // A session row's stamp IS the datum on
+                                    // the left; repeating the time here would
+                                    // print it twice. The delta still shows.
+                                    div().text_color(rgb(MUTED_COLOR)).child(if session {
+                                        delta
+                                    } else if delta.is_empty() {
                                         time
                                     } else {
                                         format!("{time} · {delta}")
@@ -18306,6 +19210,10 @@ struct AiEmptyResult {
 
 struct GroundedDiagnoses {
     groundable: usize,
+    /// Quotes that ground in the scope's CONTEXT but not the target: the
+    /// model quoted its surroundings. Ungroundable — no card can anchor —
+    /// but never staleness evidence: the text it quoted demonstrably exists.
+    context_grounded: usize,
     target_missing: bool,
     annotations: Vec<Annotation>,
 }
@@ -18333,10 +19241,27 @@ fn ground_diagnoses(
             (0, manuscript.clone())
         }
     });
+    // Lenient grounding, shared with the anchoring path (`anchor`'s
+    // normalized fallback): models normalize apostrophes, collapse
+    // whitespace runs and turn U+2028 into \n when quoting — none of which
+    // is evidence the draft changed.
+    let grounds = |haystack: &str, quote: &str| {
+        strop_core::diagnose::anchor(haystack, quote, 0).is_some()
+    };
     let groundable = diagnoses
         .iter()
-        .filter(|diagnosis| target_text.contains(&diagnosis.quote))
+        .filter(|diagnosis| grounds(&target_text, &diagnosis.quote))
         .count();
+    let context_grounded = scope.map_or(0, |scope| {
+        diagnoses
+            .iter()
+            .filter(|d| {
+                !grounds(&target_text, &d.quote)
+                    && (grounds(&scope.context_before, &d.quote)
+                        || grounds(&scope.context_after, &d.quote))
+            })
+            .count()
+    });
     let target_doc_start = base + target_start;
     let target_doc_end = target_doc_start + target_text.chars().count();
     let mut existing = Annotations::default();
@@ -18361,6 +19286,7 @@ fn ground_diagnoses(
     }
     GroundedDiagnoses {
         groundable,
+        context_grounded,
         target_missing,
         annotations,
     }
@@ -18371,6 +19297,10 @@ enum AiLanding {
     Cards,
     Empty,
     Stale,
+    /// Nothing grounded, but the draft is NOT to blame: the revision never
+    /// changed between ask and landing (or the quotes only match context).
+    /// The failure is the read's — a different card than Stale.
+    Unlanded,
     Invalid,
 }
 
@@ -18380,13 +19310,22 @@ fn ai_landing(
     groundable: usize,
     target_missing: bool,
     kept: usize,
+    doc_changed: bool,
+    context_grounded: usize,
 ) -> AiLanding {
     if kept > 0 {
         AiLanding::Cards
     } else if rejected > 0 {
         AiLanding::Invalid
     } else if accepted > 0 && (target_missing || groundable == 0) {
-        AiLanding::Stale
+        // "The draft changed" requires the draft to have CHANGED — and a
+        // quote that grounds in the context paragraphs proves the model
+        // read real text, so it never counts as staleness evidence either.
+        if doc_changed && context_grounded == 0 {
+            AiLanding::Stale
+        } else {
+            AiLanding::Unlanded
+        }
     } else {
         AiLanding::Empty
     }
@@ -18717,6 +19656,9 @@ struct MarginLayout {
     /// Door-held cards are NOT here; the rail (render_margin_rail) owns those.
     above: Vec<OffscreenRef>,
     below: Vec<OffscreenRef>,
+    /// A closed-fan diagnosis selected through its prose mark. It is painted
+    /// by the live card renderer but never enters placement or edge counts.
+    glance: Option<MarginCard>,
 }
 
 /// Project a byte anchor through the paragraph geometry which painted the
@@ -19329,6 +20271,7 @@ impl Editor {
                 cards: Vec::new(),
                 above: Vec::new(),
                 below: Vec::new(),
+                glance: None,
             };
         };
         let rope = self.doc.rope();
@@ -19338,6 +20281,7 @@ impl Editor {
         // AND navigated by reveal_offscreen (one source of truth).
         let mut above: Vec<OffscreenRef> = Vec::new();
         let mut below: Vec<OffscreenRef> = Vec::new();
+        let mut glance = None;
         // The door (DESIGN §4.4): drafting hides the editor's cards (the
         // writer's own notes stay); reviewing shows them, but suppresses
         // copy-level cards while a developmental one is still open (the
@@ -19411,7 +20355,7 @@ impl Editor {
                     CARD_CHROME_H + (title_rows + body_rows) * CARD_LINE_H
                 })
             };
-            cards.push(MarginCard {
+            let card = MarginCard {
                 id: n.id,
                 top: desired,
                 anchor_y: f32::from(pos.y),
@@ -19427,7 +20371,12 @@ impl Editor {
                 collapsed: false,
                 provenance: None,
                 created_unix: n.created_unix,
-            });
+            };
+            if drafting && active && is_diag {
+                glance = Some(card);
+            } else {
+                cards.push(card);
+            }
         }
         // The caret-block's provenance one-liner (08 §2; surfaces-attention
         // 5): a packer citizen beside the real cards, shown only after the
@@ -19522,7 +20471,7 @@ impl Editor {
             card.top = top;
         }
         if !cull {
-            return MarginLayout { cards, above, below };
+            return MarginLayout { cards, above, below, glance };
         }
         // Packing can shove an on-screen-anchored card off an edge (the active
         // card wins the bottom slot and displaces the run above it up; or a run
@@ -19556,6 +20505,7 @@ impl Editor {
             cards: visible,
             above,
             below,
+            glance,
         }
     }
 
@@ -19730,12 +20680,7 @@ impl Editor {
     /// ones recede to one-line cards, still in the lane), so it owes the rail
     /// nothing. `None` means the rail stands down — a quiet margin.
     fn margin_rail_count(&self) -> Option<usize> {
-        let n = if self.drafting {
-            self.resting_diagnoses()
-        } else {
-            self.suppressed_copy()
-        };
-        (n > 0).then_some(n)
+        self.door_chip_count().map(|(n, _)| n)
     }
 
     /// Cheap emptiness predicate for `lane_has_content`: would ANY open note
@@ -20121,7 +21066,11 @@ impl Editor {
             mut cards,
             above,
             below,
+            glance,
         } = self.margin_cards(true);
+        if let Some(glance) = glance {
+            cards.push(glance);
+        }
         if cards.is_empty() && above.is_empty() && below.is_empty() && self.departing.is_empty() {
             return None;
         }
@@ -20176,30 +21125,41 @@ impl Editor {
             })
             .collect();
         let (above_n, below_n) = (above.len(), below.len());
-        let floor = self.margin_card_floor();
-        // A quiet pill at a lane edge when cards are hidden past it — the honest
-        // "there's more here, it didn't vanish" cue (DESIGN principle 2).
+        // The margin-chrome law (2026-07-17 arrangement round, amended same
+        // day): ONE pill family in TWO fixed rows, sharing the door chip's
+        // geometry (18px, full radius, PT Sans 10.5). The above/below count
+        // pills CENTER on the cards' column — the pair reads as one
+        // vertical axis, top and bottom rhyming (operator adjudication over
+        // the right-align draft; the door chip alone holds the corner).
+        // Top row rides the padding band — never overlapping a card.
+        // Warm fill on the count pills (they count the writer's notes
+        // too), cool on the chip — provenance in one glance.
+        let chrome_row = self.margin_floor();
         let edge_chip = move |label: String, at_bottom: bool| {
-            let chip = div()
-                .absolute()
-                .left(px((MARGIN_WIDTH - 88.) / 2.))
-                .w(px(88.))
+            let pill = div()
+                .h(px(18.))
                 .flex()
-                .justify_center()
+                .items_center()
                 .px(px(8.))
-                .py(px(2.))
-                .rounded(px(10.))
+                .rounded_full()
                 .bg(rgb(CARD_BG))
                 .border_1()
                 .border_color(rgb(RULE_COLOR))
-                .text_size(px(10.))
+                .text_size(px(10.5))
                 .text_color(rgb(MUTED_COLOR))
-                .font_family("PT Serif")
+                .font_family("PT Sans")
                 .child(label);
+            let row = div()
+                .absolute()
+                .left_0()
+                .w(px(MARGIN_WIDTH - 8.))
+                .flex()
+                .justify_center()
+                .child(pill);
             if at_bottom {
-                chip.bottom(px(6.))
+                row.bottom(px(6.))
             } else {
-                chip.top(px(floor))
+                row.top(px(chrome_row))
             }
         };
         // Paint the active card LAST so it sits ON TOP of any neighbour it
@@ -20709,13 +21669,8 @@ impl Editor {
             .w(px(MARGIN_WIDTH)).children(children).into_any_element())
     }
 
-    /// The door's visible state (DESIGN §4.4, principle 5 — no hidden modes):
-    /// a thin rail at the lane top that names what the closed door is holding
-    /// ("3 resting · open") and opens it on a click; in reviewing it instead
-    /// notes copy-level cards held back until the structural ones clear.
-    /// Returns None when nothing is held — a quiet margin with nothing to
-    /// gate looks exactly like an empty one, so the mode only shows when it
-    /// is actually doing something.
+    /// The document-global diagnosis chip: fixed at the lane top, wordless,
+    /// present in both fan states, and absent when it has no referent.
     fn render_margin_rail(
         &self,
         window: &Window,
@@ -20728,47 +21683,74 @@ impl Editor {
         let lane_left = col_right + MARGIN_GAP + 8.;
         let top = self.margin_floor();
         let drafting = self.drafting;
-        let n = self.margin_rail_count()?;
-        let label = if drafting {
-            format!("{n} resting · open")
-        } else {
-            format!("{n} copy-level · after structure")
-        };
+        // The rail's readout owns this band while the hand is on the rail
+        // (impl/15 §4): the chip yields rather than overprint.
+        if self.space_drag_offset.is_some() || self.space_readout_fade.is_some() {
+            return None;
+        }
+        let (n, drained) = self.door_chip_count()?;
+        let ready = self.deferred_pass.is_some();
         let styled = |d: gpui::Div| {
             d.absolute()
                 .top(px(top))
-                .left(px(lane_left))
-                .w(px(MARGIN_WIDTH - 8.))
-                .px(px(8.))
-                .py(px(4.))
-                .rounded(px(6.))
+                .left(px(lane_left + MARGIN_WIDTH - 54.))
+                .w(px(46.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(4.))
+                .rounded_full()
                 .border_1()
-                .border_color(rgb(RULE_COLOR))
-                .bg(rgb(0xF7F5EF))
+                // A waiting read is the machine's state — the ready ring is
+                // cool (color-language: warm never marks machinery).
+                .border_color(rgb(if ready { AI_ACCENT } else { RULE_COLOR }))
+                .bg(rgb(DIAGNOSIS_CARD_BG))
                 .font_family("PT Sans")
-                .text_size(px(11.))
+                .text_size(px(10.5))
                 .text_color(rgb(MUTED_COLOR))
-                .child(label.clone())
+                .when(drained, |d| d.opacity(0.55))
+                // The anchor's own mark, drawn — the same horizontal
+                // squiggle the prose wears (one mark family, every place
+                // the editor's notes are counted).
+                .child(icon(icons::SQUIGGLE, 13., MUTED_COLOR))
+                .child(format!("{n}"))
         };
-        Some(if drafting {
-            styled(div())
-                .id("margin-door-open")
+        let chip = styled(div())
+                .id("margin-door-chip")
                 .cursor(CursorStyle::PointingHand)
+                .when(!drafting, |d| d.bg(rgba(0x1A1A1812u32)))
                 .hover(|d| d.text_color(rgb(TEXT_COLOR)))
-                .tooltip(tip("Open the door — show the editor's notes", Some("ctrl-shift-r")))
+                .tooltip(tip(if drafting {
+                    "Show the editor's notes"
+                } else {
+                    "Put the editor's notes away"
+                }, Some("ctrl-shift-r")))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        editor.flush_deferred_pass(cx);
-                        editor.drafting = false;
-                        cx.notify();
+                        let opening = editor.drafting;
+                        editor.toggle_door(cx);
+                        if opening {
+                            editor.reveal_after_open(window, cx);
+                        }
                     }),
-                )
-                .into_any_element()
-        } else {
-            styled(div()).into_any_element()
-        })
+                );
+        let animate_ready = ready && !self.config.reduce_motion;
+        Some(chip.with_animation(
+            ("door-chip", n ^ if ready { self.ai_generation as usize } else { 0 }),
+            Animation::new(Duration::from_millis(550)),
+            move |el, t| {
+                let beat = if t < 0.28 { t / 0.28 } else { (1. - t) / 0.72 };
+                let count_fade = (t / (120. / 550.)).min(1.);
+                el.opacity(if animate_ready {
+                    0.82 + 0.18 * beat.max(0.)
+                } else {
+                    0.45 + 0.55 * count_fade
+                })
+            },
+        ).into_any_element())
     }
 
     /// How many lane items the narrow drawer should advertise: the visible
@@ -20957,9 +21939,8 @@ impl Editor {
         // believing read's qualifier beside its ctrl-shift-b chip). A window
         // too narrow for that cedes width, never the button's edge.
         let menu_w = 430f32.min(vw - menu_right - 8.);
-        let door_open = !self.drafting;
         let active_read = match &self.ai_status {
-            Some(AiStatus::Running { label }) => Some(
+            Some(AiStatus::Running { .. }) => Some(
                 div()
                     .px(px(12.))
                     .py(px(7.))
@@ -20967,16 +21948,9 @@ impl Editor {
                     .border_color(rgb(RULE_COLOR))
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .justify_end()
                     .gap(px(10.))
                     .text_size(px(11.))
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_color(rgb(MUTED_COLOR))
-                            .child(format!("Reading · {label}")),
-                    )
                     .child(
                         div()
                             .id("editor-menu-cancel")
@@ -21001,83 +21975,6 @@ impl Editor {
             ),
             _ => None,
         };
-        let last_result = self.ai_empty_result.as_ref().map(|result| {
-            div()
-                .px(px(12.))
-                .py(px(5.))
-                .border_b_1()
-                .border_color(rgb(RULE_COLOR))
-                .text_size(px(11.))
-                .text_color(rgb(MUTED_COLOR))
-                .child(format!("Last: {} · 0 new queries", result.kind.run_label()))
-                .into_any_element()
-        });
-        let footer = div()
-            .pt(px(7.))
-            .px(px(12.))
-            .pb(px(8.))
-            .border_t_1()
-            .border_color(rgb(RULE_COLOR))
-            .flex()
-            .items_center()
-            .justify_between()
-            .text_size(px(11.))
-            .child(div().text_color(rgb(MUTED_COLOR)).child(format!(
-                "{} queries open · {} resolved",
-                self.open_query_count(),
-                self.resolved_query_count(),
-            )))
-            .child(
-                // The presence pair (glossary): Reading (door open) / Away
-                // (drafting). A drawn toggle — the current pole wears the ink
-                // AND the weight (never color alone, WCAG 1.4.1), and the
-                // OTHER pole — the one a click flips to — wears the dashed
-                // underline, the product's "this text is clickable" mark
-                // (state in ink, action dashed). A click anywhere flips
-                // through toggle_door's flush semantics. No "⇄" glyph (not
-                // in the bundled PT fonts); a dot divides the poles.
-                div()
-                    .id("editor-menu-door")
-                    .cursor(CursorStyle::PointingHand)
-                    .flex()
-                    .items_center()
-                    .gap(px(5.))
-                    .px(px(4.))
-                    .py(px(1.))
-                    .rounded(px(4.))
-                    .hover(|d| d.bg(rgba(0x1A1A180Au32)))
-                    .tooltip(tip("The door", Some("ctrl-shift-r")))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            editor.toggle_door(cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .text_color(rgb(if door_open { TEXT_COLOR } else { MUTED_COLOR }))
-                            .when(door_open, |d| d.font_weight(FontWeight::BOLD))
-                            .when(!door_open, |d| {
-                                d.border_b_1()
-                                    .border_dashed()
-                                    .border_color(rgb(MUTED_COLOR))
-                            })
-                            .child("Reading"),
-                    )
-                    .child(div().size(px(3.)).rounded_full().bg(rgb(MUTED_COLOR)))
-                    .child(
-                        div()
-                            .text_color(rgb(if door_open { MUTED_COLOR } else { TEXT_COLOR }))
-                            .when(!door_open, |d| d.font_weight(FontWeight::BOLD))
-                            .when(door_open, |d| {
-                                d.border_b_1()
-                                    .border_dashed()
-                                    .border_color(rgb(MUTED_COLOR))
-                            })
-                            .child("Away"),
-                    ),
-            );
         Some(
             div()
                 .id("editor-menu")
@@ -21109,8 +22006,32 @@ impl Editor {
                         .text_color(rgb(MUTED_COLOR))
                         .child("Ask the editor for…"),
                 )
+                // The conditional setup row (impl/14 §5): with no provider
+                // configured, the menu's first verb is the one that makes
+                // the others possible.
+                .when(self.editor_face() == EditorFace::NeedsSetup, |d| {
+                    d.child(
+                        div()
+                            .id("er-setup")
+                            .px(px(12.))
+                            .py(px(7.))
+                            .border_b_1()
+                            .border_color(rgb(RULE_COLOR))
+                            .text_size(px(12.))
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.editor_menu_open = false;
+                                    editor.open_ai_settings(&OpenAiSettings, window, cx);
+                                }),
+                            )
+                            .child("Set up the editor…"),
+                    )
+                })
                 .when_some(active_read, |d, active| d.child(active))
-                .when_some(last_result, |d, result| d.child(result))
                 .child(self.editor_menu_row(
                     "er-believing",
                     ("A believing read", "— what's alive here, what it's secretly about"),
@@ -21151,7 +22072,6 @@ impl Editor {
                     None,
                     cx,
                 ))
-                .child(footer)
                 .into_any_element(),
         )
     }
@@ -21182,7 +22102,6 @@ impl Editor {
             return None;
         }
         let open = self.narrow_notes_open;
-        let noun = if count == 1 { "note" } else { "notes" };
         Some(
             div()
                 .id("narrow-notes-pill")
@@ -21214,7 +22133,9 @@ impl Editor {
                 )
                 // The note-card mark, so the pill rhymes with what it holds.
                 .child(icon(icons::NOTE, 13., MUTED_COLOR))
-                .child(format!("{count} {noun}"))
+                // The mark is the noun (impl/14 §6: no count+word in any
+                // language); the icon beside the numeral carries "of what".
+                .child(format!("{count}"))
                 .into_any_element(),
         )
     }
@@ -21273,7 +22194,7 @@ impl Editor {
                     .text_size(px(12.))
                     .text_color(rgb(MUTED_COLOR))
                     .hover(|d| d.text_color(rgb(TEXT_COLOR)))
-                    .tooltip(tip("Open the door — show the editor's notes", Some("ctrl-shift-r")))
+                    .tooltip(tip("Show the editor's notes", Some("ctrl-shift-r")))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
@@ -21283,7 +22204,11 @@ impl Editor {
                             cx.notify();
                         }),
                     )
-                    .child(format!("{n} resting — open the door")),
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(icon(icons::SQUIGGLE, 12., MUTED_COLOR))
+                    .child(format!("{n}")),
             );
         } else {
             for card in &cards {
@@ -21441,9 +22366,233 @@ impl Editor {
 }
 
 impl Editor {
+    fn finish_space_drag(&mut self, cx: &mut Context<Self>) {
+        self.space_drag_offset = None;
+        if self.config.reduce_motion {
+            self.space_readout_fade = None;
+            cx.notify();
+            return;
+        }
+        self.space_readout_seq = self.space_readout_seq.wrapping_add(1);
+        let seq = self.space_readout_seq;
+        self.space_readout_fade = Some(seq);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            this.update(cx, |editor, cx| {
+                if editor.space_readout_fade == Some(seq) {
+                    editor.space_readout_fade = None;
+                    cx.notify();
+                }
+            }).ok();
+        }).detach();
+    }
+
+    fn render_space_rail(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if self.cold_read.is_some() {
+            return None;
+        }
+        let frame = self.last_frame.as_ref()?;
+        let max_scroll = f32::from(frame.max_scroll());
+        if max_scroll <= 0. {
+            return None;
+        }
+        // The rail is a child of the content surface, which is ALREADY
+        // inset by the CSD shadow gutter on each untiled edge — and clips
+        // (overflow_hidden). Placement is therefore content-LOCAL:
+        // content_width() is the visible width, y starts below the top
+        // gutter. Painting at raw viewport width pushed the rail past the
+        // clipped edge — present maximized (gutter 0), gone floating
+        // (content_width's own lesson, inherited late). Only the mouse
+        // handlers see window-ABSOLUTE positions, which do include the
+        // gutter — track_top carries it for them alone.
+        let (gutter_top, gutter_bottom) = match window.window_decorations() {
+            Decorations::Client { tiling } => (
+                if tiling.top { 0. } else { CSD_GUTTER },
+                if tiling.bottom { 0. } else { CSD_GUTTER },
+            ),
+            Decorations::Server => (0., 0.),
+        };
+        let track_top = gutter_top + BAR_HEIGHT;
+        let track_h = (f32::from(window.viewport_size().height) - track_top - gutter_bottom
+            - if self.strip.open { strip::STRIP_H } else { 0. }).max(1.);
+        let extent = f32::from(frame.content_height + frame.line_height + px(24.));
+        let (thumb_y, thumb_h) = space_thumb(
+            track_h,
+            f32::from(frame.viewport_height),
+            extent,
+            f32::from(self.scroll_top),
+        );
+        let kinds: &[BlockKind] = self.history_preview.as_ref()
+            .map_or(self.doc.blocks().kinds(), |p| p.kinds.as_slice());
+        let source = self.history_preview.as_ref().map_or_else(|| self.doc.text(), |p| p.text.clone());
+        let lines: Vec<&str> = source.split('\n').collect();
+        let mut marks = Vec::new();
+        let mut governing = None;
+        for (ix, par) in frame.paragraphs.iter().enumerate() {
+            let kind = kinds.get(ix).unwrap_or(&BlockKind::Paragraph);
+            if matches!(kind, BlockKind::Heading(1) | BlockKind::Heading(2))
+                && f32::from(par.top) <= f32::from(self.scroll_top)
+            {
+                governing = lines.get(ix).copied();
+            }
+            let w = match kind {
+                BlockKind::Heading(1) => Some(10.),
+                BlockKind::Heading(2) => Some(6.),
+                BlockKind::Divider => Some(2.),
+                _ => None,
+            };
+            if let Some(w) = w {
+                marks.push((ix, space_mark_y(f32::from(par.top), max_scroll, track_h, thumb_h), w,
+                    matches!(kind, BlockKind::Divider)));
+            }
+        }
+        let mark_hits: Vec<(f32, f32)> = marks.iter().map(|(ix, y, _, _)| {
+            (*y, f32::from(frame.paragraphs[*ix].top).clamp(0., max_scroll))
+        }).collect();
+        let mark_hits_down = mark_hits.clone();
+        let mark_ys_down: Vec<f32> = mark_hits_down.iter().map(|(y, _)| *y).collect();
+        let mark_ys: Vec<f32> = mark_hits.iter().map(|(y, _)| *y).collect();
+        // The window IS the page (the round's ontology: since the left
+        // drawer died, the whole window is the writer's sheet — the column
+        // is a typewriter's line on it, the cards are notes stuck beside
+        // it). The rail therefore lives at the TRUE window edge, where
+        // every scrollbar the corridor knows lives — never mid-desk, where
+        // it would partition the sheet into page-and-not-page
+        // (product-owner adjudication over the frame-edge draft; Word's
+        // bar is at the window, not the page).
+        let content_w = self.content_width(window);
+        let rail_left = content_w - SPACE_RAIL_W;
+        let dragging = self.space_drag_offset.is_some();
+        // A held drag follows the hand anywhere (P7): the hit surface grows
+        // to the whole content surface for the drag's lifetime. Maximized,
+        // the column touches the screen edge — throw-right lands by geometry.
+        let (hit_left, hit_w) = if dragging {
+            (0., content_w)
+        } else {
+            (rail_left, SPACE_RAIL_W)
+        };
+        let bright = self.space_hover || dragging;
+        let rail = div().id("space-rail").absolute().left(px(hit_left)).top(px(BAR_HEIGHT))
+            .w(px(hit_w)).h(px(track_h)).cursor(CursorStyle::PointingHand)
+            .on_hover(cx.listener(|editor, hover: &bool, _, cx| {
+                editor.space_hover = *hover;
+                if !*hover {
+                    editor.space_hover_mark = None;
+                }
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |editor, ev: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                editor.space_readout_fade = None;
+                // A rail jump moves the text under any exit-fade ghosts,
+                // exactly like a wheel scroll — drop them (fleet finding).
+                editor.departing.clear();
+                let local = f32::from(ev.position.y) - track_top;
+                if let Some(ix) = space_mark_hit(&mark_ys_down, local) {
+                    let target = mark_hits_down[ix].1;
+                    editor.scroll_top = px(target);
+                    editor.space_drag_offset = Some(thumb_h / 2.);
+                    cx.notify();
+                    return;
+                }
+                let offset = if local >= thumb_y && local <= thumb_y + thumb_h {
+                    local - thumb_y
+                } else {
+                    thumb_h / 2.
+                };
+                editor.space_drag_offset = Some(offset);
+                editor.scroll_top = px(space_scroll_at(local - offset + thumb_h / 2., track_h,
+                    thumb_h, max_scroll));
+                cx.notify();
+            }))
+            .on_mouse_move(cx.listener(move |editor, ev: &MouseMoveEvent, _, cx| {
+                let local = f32::from(ev.position.y) - track_top;
+                if editor.space_drag_offset.is_none() {
+                    editor.space_hover_mark = space_mark_hit(&mark_ys, local);
+                    cx.notify();
+                    return;
+                }
+                let offset = editor.space_drag_offset.expect("checked above");
+                editor.departing.clear();
+                editor.scroll_top = px(((local - offset) / (track_h - thumb_h).max(1.))
+                    .clamp(0., 1.) * max_scroll);
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|editor, _: &MouseUpEvent, _, cx| {
+                editor.finish_space_drag(cx);
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|editor, _: &MouseUpEvent, _, cx| {
+                editor.finish_space_drag(cx);
+            }));
+        // The painted rail keeps its exact 14px geometry regardless of how
+        // wide the hit surface currently is.
+        let mut paint = div().absolute().left(px(rail_left - hit_left)).top_0()
+            .w(px(SPACE_RAIL_W)).h(px(track_h));
+        for (mark_ix, (_, y, w, dot)) in marks.into_iter().enumerate() {
+            let hovered = self.space_hover_mark == Some(mark_ix);
+            paint = paint.child(div().absolute().top(px(y - if dot { 1. } else { 0.5 }))
+                .right(px(0.)).w(px(w)).h(px(if dot { 2. } else { 1. }))
+                .bg(rgba(alpha_ink(MUTED_COLOR, if hovered { 0xBF } else { 0x8C }))));
+        }
+        if let Some(seam) = frame.seam_top {
+            let y = space_mark_y(f32::from(seam), max_scroll, track_h, thumb_h);
+            paint = paint.child(div().absolute().top(px(y)).left_0().w_full().h(px(1.))
+                .bg(rgba(alpha_ink(MUTED_COLOR, 0x8C))));
+        }
+        let caret_y = frame.paragraphs.iter().find(|p| {
+            p.range.start <= self.cursor_offset() && self.cursor_offset() <= p.range.end
+        }).map(|p| space_mark_y(f32::from(p.top), max_scroll, track_h, thumb_h));
+        paint = paint.child(div().absolute().top(px(thumb_y)).left(px(4.))
+            .w(px(SPACE_THUMB_W)).h(px(thumb_h)).rounded(px(3.))
+            .bg(rgba(alpha_ink(MUTED_COLOR, if bright { 0xBF } else { 0x73 }))));
+        if let Some(y) = caret_y {
+            let paint_y = if space_fleck_on_thumb(y, thumb_y, thumb_h) {
+                y.clamp(thumb_y + 1., thumb_y + thumb_h - 1.)
+            } else { y };
+            paint = paint.child(div().absolute().top(px(paint_y - 1.)).left(px(6.))
+                .w(px(2.)).h(px(2.)).rounded(px(1.)).bg(rgb(ACTIVE_BORDER))
+                .on_mouse_down(MouseButton::Left, cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    editor.autoscroll_request = true;
+                    editor.space_drag_offset = None;
+                    cx.notify();
+                })));
+        }
+        let rail = rail.child(paint);
+        let mut out = div().absolute().inset_0().child(rail);
+        if (self.space_drag_offset.is_some() || self.space_readout_fade.is_some())
+            && let Some(label) = governing.filter(|s| !s.is_empty())
+        {
+            let readout = div().absolute().top(px(self.margin_floor())).right(px(
+                f32::from(window.viewport_size().width) - rail_left + 8.))
+                .max_w(px(248.)).overflow_hidden().whitespace_nowrap()
+                .font_family("PT Serif").text_size(px(13.))
+                .text_color(rgba(alpha_ink(TEXT_COLOR, 0xBF))).child(label.to_owned());
+            out = out.child(if let Some(seq) = self.space_readout_fade {
+                readout.with_animation(
+                    ("space-readout-exit", seq as usize),
+                    Animation::new(Duration::from_millis(120)),
+                    |el, t| el.opacity(1. - t),
+                ).into_any_element()
+            } else {
+                readout.into_any_element()
+            });
+        }
+        Some(out.into_any_element())
+    }
+
     fn render_quit_guard(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (title, detail, working) = match &self.quit_guard {
             QuitGuard::Idle | QuitGuard::Bypass => return None,
+            // Quit guard c: within QUIT_VEIL_DELAY of the close the save is
+            // almost always already done — no chrome for a fast goodbye.
+            // Failed below renders regardless: errors never hide.
+            QuitGuard::Saving if !self.quit_veil => return None,
             QuitGuard::Saving => ("Saving before closing", "The window will close as soon as the newest changes are safely on disk.".into(), true),
             QuitGuard::SavingCopy => ("Saving a recovery copy", "The original file is unchanged. The window will close when the copy is safe.".into(), true),
             QuitGuard::Failed(message) => ("Your changes could not be saved", message.clone(), false),
@@ -21675,6 +22824,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::copy))
                     .on_action(cx.listener(Self::cut))
                     .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::paste_plain))
                     .on_action(cx.listener(Self::undo))
                     .on_action(cx.listener(Self::redo))
                     .on_action(cx.listener(Self::toggle_strong))
@@ -21834,6 +22984,12 @@ impl Render for Editor {
                     None => d,
                 }
             })
+            // The standing space rail owns its reserved column and paints
+            // after the opaque footnote zone and margin furniture.
+            .map(|d| match self.render_space_rail(window, cx) {
+                Some(rail) => d.child(rail),
+                None => d,
+            })
             .map(|d| {
                 if !self.margin_fits(window) && self.cold_read.is_none() {
                     match self.render_composer_strip() {
@@ -21921,12 +23077,11 @@ impl Render for Editor {
                 Some(menu) => d.child(menu),
                 None => d,
             })
-            // Last children = topmost: the omnibox, the keyboard map and
-            // the AI settings panel cover everything below.
+            // Last children = topmost: the omnibox and AI settings panel
+            // cover everything below. The keyboard map owns another window.
             .when(self.palette_input.is_some(), |d| {
                 d.child(self.render_omni(window, cx))
             })
-            .when(self.shortcuts_open, |d| d.child(self.render_shortcuts(cx)))
             .when(self.ai_settings.is_some(), |d| {
                 d.child(self.render_ai_settings(cx))
             })
@@ -22445,46 +23600,100 @@ fn strip_travel(rail_w: f32, total_work: f32) -> f32 {
     total_work.min(rail_w).max(0.)
 }
 
+const STRIP_STATION_SNAP_PX: f32 = 4.;
+const STRIP_NOW_SNAP_PX: f32 = 12.;
+
+fn strip_snap_radii() -> (f32, f32) {
+    (STRIP_STATION_SNAP_PX, STRIP_NOW_SNAP_PX)
+}
+
 /// Window x of the sheet's cream tail edge for the current fixed-scale view.
 fn strip_sheet_tail(rail_x0: f32, rail_x1: f32, total_work: f32, view: f32) -> f32 {
     (rail_x0 + total_work - view).clamp(rail_x0, rail_x1)
 }
 
-/// Prefer the playhead's right side, flip left when that is the side that
-/// fits, and finally clamp. Pure geometry keeps narrow-width behavior stable.
-/// `now_zone` is the Now label's reserved span: the dock may stand on either
-/// side of it, never across it — on a young sheet the whole interval between
-/// the readout and the selvage can be narrower than the dock, and the dock
-/// then takes the desk to Now's right (the callout-from-the-sheet reading),
-/// leaving the terminal label legible.
-fn strip_dock_left(
-    playhead_x: f32,
-    width: f32,
-    left: f32,
-    right: f32,
-    now_zone: (f32, f32),
-) -> f32 {
-    let gap = 10.;
-    let candidate = if playhead_x + gap + width <= right {
-        playhead_x + gap
-    } else {
-        playhead_x - gap - width
-    };
-    let mut x = candidate.clamp(left, (right - width).max(left));
-    if x < now_zone.1 && x + width > now_zone.0 {
-        let after = (now_zone.1 + gap).min((right - width).max(left));
-        let before = (now_zone.0 - gap - width).max(left);
-        // Prefer the side that actually clears the zone; right wins ties
-        // (the desk is empty there by definition).
-        x = if after + width <= right && after >= now_zone.1 + gap - 0.5 {
-            after
-        } else if before + width <= now_zone.0 {
-            before
-        } else {
-            after
-        };
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StripTopSlots {
+    readout: (f32, f32),
+    close: (f32, f32),
+}
+
+/// Allocate the strip's two standing frame-owned addresses together.
+fn strip_top_slots(frame_w: f32, readout_w: f32) -> StripTopSlots {
+    let close_w = 19.;
+    let close_x = (frame_w - 8. - close_w).max(0.);
+    let readout_x = strip::SIDE_PAD;
+    // The smallest dock (Restore + ellipsis) must retain one legal fallback
+    // even when the readout degrades on a narrow frame.
+    let readout_limit = (close_x - 2. * GAP_DOCK - 80. - readout_x).max(0.);
+    let readout_w = readout_w.min(readout_limit);
+    StripTopSlots {
+        readout: (readout_x, readout_w),
+        close: (close_x, close_w),
     }
-    x
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NowHome {
+    Selvage(f32),
+    Cap,
+}
+
+fn strip_now_home(tail_x: f32, label_w: f32, rail_x1: f32) -> NowHome {
+    let x = tail_x + 14.;
+    if x + label_w + 14. <= rail_x1 {
+        NowHome::Selvage(x)
+    } else {
+        NowHome::Cap
+    }
+}
+
+const GAP_DOCK: f32 = 10.;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripDockTier {
+    More,
+    Name,
+    NameCompare,
+}
+
+fn strip_dock_tier(free_interval: f32) -> StripDockTier {
+    if free_interval >= 230. {
+        StripDockTier::NameCompare
+    } else if free_interval >= 104. {
+        StripDockTier::Name
+    } else {
+        StripDockTier::More
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StripDockGeometry {
+    x: f32,
+    fallback: f32,
+    traveling: bool,
+}
+
+/// P14's complete placement law. Sizing has already happened from the frame's
+/// free interval; this function decides only where that immutable tier sits.
+/// One motion, no flip: the dock trails the playhead and parks gracefully at
+/// BOTH rails — the field verdict (2026-07-18) was that the left edge's clamp
+/// felt right and the right edge's side-swap jump did not, so the clamp is
+/// the whole law: position is continuous in playhead_x, |Δdock| ≤ |Δplayhead|.
+fn strip_dock_geometry(
+    playhead_x: f32,
+    dock_w: f32,
+    readout_r: f32,
+    right_edge: f32,
+    naming: bool,
+) -> StripDockGeometry {
+    let fallback = readout_r + GAP_DOCK;
+    let right_limit = right_edge - GAP_DOCK;
+    if naming || fallback + dock_w > right_limit {
+        return StripDockGeometry { x: fallback, fallback, traveling: false };
+    }
+    let x = (playhead_x + GAP_DOCK).min(right_limit - dock_w).max(fallback);
+    StripDockGeometry { x, fallback, traveling: x > fallback }
 }
 
 /// An rgb constant with an explicit alpha — the strip's translucent fabric
@@ -22664,9 +23873,10 @@ impl CrGeom {
                 CR_AVG_EN * ratio,
                 CR_AVG_RU * ratio,
             ),
-            // The approved mock's inter-paragraph air (1em — scene 1 CSS);
-            // a named §3.2-register entry at Gate 2.
-            para_gap: self.body.round(),
+            // Book paragraphs sit on the bare line grid; first-line indents
+            // carry their separation (impl 16 §1).
+            para_gap: 0.0,
+            language: None,
         }
     }
 }
@@ -22721,6 +23931,7 @@ fn cr_frag_size(
     match role {
         // Headings set in Demi at ~1.15× body (spec §2.7).
         crate::bookpage::Role::Heading(_) => (body * 1.15).round(),
+        crate::bookpage::Role::Footnote => body * crate::bookpage::FOOTNOTE_SCALE,
         crate::bookpage::Role::Code => body * CR_CODE_SIZE,
         _ if !runs.is_empty() && runs.iter().all(|(_, st)| st.code) => body * CR_CODE_SIZE,
         _ => body,
@@ -22752,6 +23963,20 @@ fn cr_text_run(len: usize, role: crate::bookpage::Role, st: crate::bookpage::Sty
             color: None,
         }),
     }
+}
+
+/// Marks which cross an inter-fragment word space. Fragments deliberately
+/// exclude spaces so justification can set their advance independently;
+/// the paint joins equal marks at the two neighboring edges.
+fn cr_gap_marks(
+    left: crate::bookpage::Style,
+    right: crate::bookpage::Style,
+) -> (bool, bool, bool) {
+    (
+        left.highlight && right.highlight,
+        (left.underline || left.link) && (right.underline || right.link),
+        left.strike && right.strike,
+    )
 }
 
 /// The engine's width oracle over the real shaper (spec §2.6): gpui's
@@ -22800,16 +24025,25 @@ impl crate::bookpage::Measure for CrMeasure<'_> {
 }
 
 /// Paginate a slice triple at `geom` — same input, same layout, bit for bit.
+/// The measuring apparatus cr_layout borrows for one pagination: image
+/// sizes, the shaped-width cache, and the window's text system.
+struct CrLayoutMeasure<'a> {
+    sizes: &'a HashMap<String, (f32, f32)>,
+    widths: &'a mut HashMap<CrWidthKey, f32>,
+    ts: &'a std::sync::Arc<gpui::WindowTextSystem>,
+}
+
 fn cr_layout(
     text: &str,
     spans: &SpanSet,
     blocks: &BlockMap,
     geom: &CrGeom,
-    sizes: &HashMap<String, (f32, f32)>,
-    widths: &mut HashMap<CrWidthKey, f32>,
-    ts: &std::sync::Arc<gpui::WindowTextSystem>,
+    language: typograph::Lang,
+    measure: CrLayoutMeasure<'_>,
 ) -> crate::bookpage::BookLayout {
-    let metrics = geom.metrics();
+    let CrLayoutMeasure { sizes, widths, ts } = measure;
+    let mut metrics = geom.metrics();
+    metrics.language = Some(language);
     let mut m = CrMeasure { ts: ts.clone(), widths, sizes, body: geom.body };
     if metrics.justify {
         crate::bookpage::paginate(text, spans, blocks, &metrics, &mut m, &mut crate::hyphen::DictHyphenator)
@@ -22844,7 +24078,10 @@ struct CrDrag {
 #[derive(Clone)]
 enum CrOp {
     Ink { x: f32, y: f32, line_h: f32, shaped: Box<gpui::ShapedLine> },
-    Rule { x: f32, y: f32, w: f32 },
+    Wash { x: f32, y: f32, w: f32, h: f32 },
+    Underline { x: f32, y: f32, w: f32 },
+    Strike { x: f32, y: f32, w: f32 },
+    Rule { x: f32, y: f32, w: f32, alpha: f32 },
     Image { x: f32, y: f32, w: f32, h: f32, src: String },
 }
 
@@ -22864,6 +24101,9 @@ struct ColdRead {
     text: String,
     spans: SpanSet,
     blocks: BlockMap,
+    /// Config override first, automatic detection otherwise — the same
+    /// document-language oracle used by the typing typograph.
+    language: typograph::Lang,
     /// A Past read keeps the checkpoint's FULL state for its Restore chip
     /// (the slice above is only what the book paints).
     restore_state: Option<(String, SpanSet, BlockMap)>,
@@ -23281,8 +24521,13 @@ impl Editor {
         self.flank_risen = false; // the reading room suppresses the flanks; reset on exit
         // L3: entry quietly checkpoints — fingerprint-guarded, reflex tier.
         // (On a legacy file mid-backfill the store defers silently —
-        // accepted and named, regions 13.)
-        if let Some(store) = &self.store {
+        // accepted and named, regions 13.) An unborn import skips it too:
+        // reading is not a mutation, the seal would snapshot an unseeded
+        // (empty) store, and lazy birth forbids creating a record before
+        // the first edit — the .md itself still holds this exact state.
+        if self.pending_birth.is_none()
+            && let Some(store) = &self.store
+        {
             store.add_checkpoint_if_changed("Cold read", false);
         }
         self.dirty_since_checkpoint = false;
@@ -23444,7 +24689,15 @@ impl Editor {
         let geom = if small { cr_geom(desk_w, desk_h, scale, true, live) } else { normal };
         let ts = window.text_system().clone();
         let mut widths = HashMap::new();
-        let book = cr_layout(&text, &spans, &blocks, &geom, &image_sizes, &mut widths, &ts);
+        let language = match self.config.language {
+            Language::Ru => typograph::Lang::Ru,
+            Language::En => typograph::Lang::En,
+            Language::Auto => typograph::detect_lang(text.chars()),
+        };
+        let book = cr_layout(
+            &text, &spans, &blocks, &geom, language,
+            CrLayoutMeasure { sizes: &image_sizes, widths: &mut widths, ts: &ts },
+        );
         let page = entry_char.map_or(0, |c| book.page_of_char(c));
         let paper = crate::paths::asset_file("paper-noise-256.png").and_then(|p| {
             std::fs::read(&p)
@@ -23456,6 +24709,7 @@ impl Editor {
             text,
             spans,
             blocks,
+            language,
             restore_state,
             book,
             geom,
@@ -24137,7 +25391,10 @@ impl Editor {
         let ts = cr.ts.clone();
         let (text, spans, blocks) = (cr.text.clone(), cr.spans.clone(), cr.blocks.clone());
         let sizes = cr.image_sizes.clone();
-        let book = cr_layout(&text, &spans, &blocks, &geom, &sizes, &mut cr.widths, &ts);
+        let book = cr_layout(
+            &text, &spans, &blocks, &geom, cr.language,
+            CrLayoutMeasure { sizes: &sizes, widths: &mut cr.widths, ts: &ts },
+        );
         cr.page = book.page_of_char(top_char);
         cr.book = book;
         cr.geom = geom;
@@ -24187,7 +25444,8 @@ impl Editor {
                             (cr.text.clone(), cr.spans.clone(), cr.blocks.clone());
                         let sizes = cr.image_sizes.clone();
                         let book = cr_layout(
-                            &text, &spans, &blocks, &geom, &sizes, &mut cr.widths, &ts,
+                            &text, &spans, &blocks, &geom, cr.language,
+                            CrLayoutMeasure { sizes: &sizes, widths: &mut cr.widths, ts: &ts },
                         );
                         cr.page = book.page_of_char(top_char);
                         cr.book = book;
@@ -24394,7 +25652,7 @@ impl Editor {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         match &cr.source {
             ColdReadSource::Live => banner
-                .child(bold("Reading".into()))
+                .child(bold("Read it cold".into()))
                 .child(div().child(match &cr.station {
                     Some(s) => format!("\u{b7} \u{201c}{s}\u{201d} \u{b7} {words}"),
                     None => format!("\u{b7} {words}"),
@@ -24915,6 +26173,34 @@ impl Element for BookElement {
                     ),
                 ));
             }
+            // Run washes and their justified-space bridges sit beneath all
+            // glyphs and beneath the reader's transient selection (S14).
+            for op in &p.ops {
+                match op {
+                    CrOp::Ink { x, y, line_h, shaped } => {
+                        shaped
+                            .paint_background(
+                                origin + point(px(*x), px(*y)),
+                                px(*line_h),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
+                    }
+                    CrOp::Wash { x, y, w, h } => {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                origin + point(px(*x), px(*y)),
+                                size(px(*w), px(*h)),
+                            ),
+                            rgba(HIGHLIGHT_COLOR),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             // Selection tint and the anchor flash: painted before ink (S14).
             for &(x, y, w, h) in &p.tints {
                 window.paint_quad(fill(
@@ -24943,10 +26229,32 @@ impl Element for BookElement {
                             )
                             .ok();
                     }
-                    CrOp::Rule { x, y, w } => {
+                    CrOp::Wash { .. } => {}
+                    CrOp::Underline { x, y, w } => {
+                        window.paint_underline(
+                            origin + point(px(*x), px(*y)),
+                            px(*w),
+                            &UnderlineStyle {
+                                thickness: px(1.),
+                                color: Some(rgb(TEXT_COLOR).into()),
+                                wavy: false,
+                            },
+                        );
+                    }
+                    CrOp::Strike { x, y, w } => {
+                        window.paint_strikethrough(
+                            origin + point(px(*x), px(*y)),
+                            px(*w),
+                            &StrikethroughStyle {
+                                thickness: px(1.),
+                                color: Some(rgb(TEXT_COLOR).into()),
+                            },
+                        );
+                    }
+                    CrOp::Rule { x, y, w, alpha } => {
                         window.paint_quad(fill(
                             Bounds::new(origin + point(px(*x), px(*y)), size(px(*w), px(1.))),
-                            rgb(RULE_COLOR),
+                            tint(TEXT_COLOR, *alpha),
                         ));
                     }
                     CrOp::Image { x, y, w, h, src } => {
@@ -25011,23 +26319,28 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                         x: g.side + g.measure * 0.25,
                         y: ly + line.height / 2.,
                         w: g.measure * 0.5,
+                        alpha: 1.0,
                     });
                     continue;
                 }
                 if let Some(mk) = &line.marker {
                     let run = TextRun {
                         len: mk.text.len(),
-                        font: cr_font(Role::Body, crate::bookpage::Style::default()),
+                        font: cr_font(line.role, crate::bookpage::Style::default()),
                         color: rgb(TEXT_COLOR).into(),
                         background_color: None,
                         underline: None,
                         strikethrough: None,
                     };
-                    let shaped =
-                        ts.shape_line(SharedString::from(mk.text.clone()), px(g.body), &[run], None);
+                    let shaped = ts.shape_line(
+                        SharedString::from(mk.text.clone()),
+                        px(cr_frag_size(line.role, &[(mk.text.len(), Default::default())], g.body)),
+                        &[run],
+                        None,
+                    );
                     ops.push(CrOp::Ink { x: g.side + mk.x, y: ly, line_h: line.height, shaped: Box::new(shaped) });
                 }
-                for frag in &line.frags {
+                for (frag_ix, frag) in line.frags.iter().enumerate() {
                     let runs: Vec<TextRun> = frag
                         .runs
                         .iter()
@@ -25039,6 +26352,42 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                         &runs,
                         None,
                     );
+                    if let Some(next) = line.frags.get(frag_ix + 1) {
+                        let left = frag.runs.last().map(|r| r.1).unwrap_or_default();
+                        let right = next.runs.first().map(|r| r.1).unwrap_or_default();
+                        let (wash, underline, strike) = cr_gap_marks(left, right);
+                        let gap_x = g.side + frag.x + f32::from(shaped.width());
+                        let gap_w = (g.side + next.x - gap_x).max(0.);
+                        let padding =
+                            (line.height - f32::from(shaped.ascent) - f32::from(shaped.descent))
+                                / 2.;
+                        if wash && gap_w > 0. {
+                            ops.push(CrOp::Wash {
+                                x: gap_x,
+                                y: ly,
+                                w: gap_w,
+                                h: line.height,
+                            });
+                        }
+                        if underline && gap_w > 0. {
+                            ops.push(CrOp::Underline {
+                                x: gap_x,
+                                y: ly + padding + f32::from(shaped.ascent)
+                                    + f32::from(shaped.descent) * 0.618,
+                                w: gap_w,
+                            });
+                        }
+                        if strike && gap_w > 0. {
+                            ops.push(CrOp::Strike {
+                                x: gap_x,
+                                y: ly + ((f32::from(shaped.ascent) * 0.5
+                                    + padding
+                                    + f32::from(shaped.ascent))
+                                    * 0.5),
+                                w: gap_w,
+                            });
+                        }
+                    }
                     // Footnote refs paint as superior figures over their
                     // invisible carriers, numbered by slice order
                     // (regions 11; the fn_marks machinery's grammar).
@@ -25060,7 +26409,7 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                             let sup_run = TextRun {
                                 len: label.len(),
                                 font: cr_font(line.role, crate::bookpage::Style::default()),
-                                color: rgb(LINK_COLOR).into(),
+                                color: rgb(TEXT_COLOR).into(),
                                 background_color: None,
                                 underline: None,
                                 strikethrough: None,
@@ -25090,6 +26439,12 @@ fn cr_shape_page(cr: &ColdRead, ts: &std::sync::Arc<gpui::WindowTextSystem>) -> 
                     ops.push(CrOp::Ink { x: g.side + frag.x, y: ly, line_h: line.height, shaped: Box::new(shaped) });
                 }
             }
+            PageItem::FootnoteRule { y } => ops.push(CrOp::Rule {
+                x: g.side,
+                y: g.top + y,
+                w: g.measure / 3.0,
+                alpha: 0.45,
+            }),
             PageItem::Image { x, y, width, height, src, caption, .. } => {
                 ops.push(CrOp::Image {
                     x: g.side + x,
@@ -25147,25 +26502,11 @@ impl Editor {
             return None;
         }
         let parked = self.strip.parked;
-        let desk_w = f32::from(window.viewport_size().width);
-        let rail_x0 = strip::SIDE_PAD;
-        let rail_x1 = desk_w - strip::SIDE_PAD;
-        let view = self.strip.bake.as_ref().map_or(0., |b| {
-            self.strip.view_offset.clamp(
-                0.,
-                (b.timeline.total_work - (rail_x1 - rail_x0)).max(0.),
-            )
-        });
-        let (playhead_x, selvage_x) = self.strip.bake.as_ref().map_or(
-            (rail_x0, rail_x0),
-            |b| (
-                (rail_x0 + b.timeline.work_at(self.strip.pos_ms) - view)
-                    .clamp(rail_x0, rail_x1),
-                strip_sheet_tail(rail_x0, rail_x1, b.timeline.total_work, view),
-            ),
-        );
-        let dock_w = if desk_w >= 720. { 300. } else if desk_w >= 560. { 250. } else { 154. };
-        let free_interval = dock_w - if parked { 70. } else { 0. };
+        // CONTENT width, not viewport: the strip is a child of the CSD-inset
+        // surface, so slot x's live in its domain — viewport width overflows
+        // the visible frame by a gutter per floating side (the clipped-Now
+        // bug, 2026-07-17; same lesson as the invisible rail).
+        let desk_w = self.content_width(window);
         let now_ms = self
             .strip
             .bake
@@ -25173,20 +26514,96 @@ impl Editor {
             .map_or_else(strop_core::journal::now_ms, |b| b.now_ms);
         let center_mode = strip_center_mode(parked, self.strip.pin_ms.is_some());
         let comparing = center_mode == StripCenterMode::Comparing;
-        // The dock never overprints the origin's readout: its clamp floor is
-        // the readout's reserved width (two blocks while comparing), not the
-        // rail edge — the young-sheet case parks the playhead AT the origin.
-        let dock_floor = rail_x0 + if comparing { 470. } else { 230. };
-        // Now's reserved span: the label sits 6px right of the selvage,
-        // clamped to the near edge when the selvage is off-view (§3e).
-        let now_x = (selvage_x + 6.).min(rail_x1 - 30.);
-        let dock_left = strip_dock_left(
-            playhead_x, dock_w, dock_floor, rail_x1, (now_x - 8., now_x + 38.));
         let readout = if parked {
             strip::format_readout(self.strip.pos_ms, self.strip.words_at, now_ms)
         } else {
             strip::format_readout(now_ms, self.word_count, now_ms)
         };
+        let now_label = "Now";
+        let now_label_w = match self.strip_now_w.get() {
+            Some(w) => w,
+            None => {
+                let now_run = TextRun {
+                    len: now_label.len(),
+                    font: window.text_style().font(),
+                    color: rgb(0xE7E1D0).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let w = f32::from(window.text_system()
+                    .shape_line(now_label.into(), px(11.), &[now_run], None).width());
+                self.strip_now_w.set(Some(w));
+                w
+            }
+        };
+        let measure_text = |text: &str, size: f32| {
+            let run = TextRun {
+                len: text.len(),
+                font: window.text_style().font(),
+                color: rgb(0xE7E1D0).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(window.text_system()
+                .shape_line(text.into(), px(size), &[run], None).width())
+        };
+        let readout_w = if let Some(pin) = self.strip.pin_ms.filter(|_| parked) {
+            let forms = strip::compare_readouts(
+                pin, self.strip.pin_words, self.strip.pos_ms,
+                self.strip.words_at, now_ms);
+            measure_text(&forms.full_a, 12.) + measure_text(&forms.full_b, 12.) + 38.
+        } else {
+            measure_text(&readout, 12.) + 16.
+        };
+        let slots = strip_top_slots(desk_w, readout_w);
+        let readout_r = slots.readout.0 + slots.readout.1;
+        let rail_x0 = strip::SIDE_PAD;
+        let rail_x1 = desk_w - strip::SIDE_PAD;
+        let view = self.strip.bake.as_ref().map_or(0., |b| self.strip.view_offset.clamp(
+            0., (b.timeline.total_work - (rail_x1 - rail_x0)).max(0.)));
+        let playhead_x = self.strip.bake.as_ref().map_or(rail_x0, |b| {
+            (rail_x0 + b.timeline.work_at(self.strip.pos_ms) - view)
+                .clamp(rail_x0, rail_x1)
+        });
+        let tail_x = self.strip.bake.as_ref().map_or(rail_x0, |b| {
+            strip_sheet_tail(rail_x0, rail_x1, b.timeline.total_work, view)
+        });
+        let now_home = strip_now_home(tail_x, now_label_w, rail_x1);
+        let now_x = match now_home {
+            NowHome::Selvage(x) => x,
+            NowHome::Cap => slots.close.0 - 12. - now_label_w,
+        };
+        // P14: every collision is declared. At the Cap home the Now label
+        // shares the dock's row, so the label's padded box — not close —
+        // bounds the dock; C5 then sizes the tier from that same interval.
+        let dock_right_edge = match now_home {
+            NowHome::Selvage(_) => slots.close.0,
+            NowHome::Cap => now_x - 12.,
+        };
+        let free_interval = (dock_right_edge - GAP_DOCK) - (readout_r + GAP_DOCK);
+        let restore_w = measure_text("Restore", 11.) + 16.;
+        let verb_interval = (free_interval - if parked { restore_w + 6. } else { 0. }).max(0.);
+        let dock_tier = strip_dock_tier(verb_interval);
+        let composer_w = verb_interval.min(280.);
+        let center_w = if self.strip_name_input.is_some() {
+            composer_w
+        } else if comparing {
+            measure_text("Done comparing", 11.) + 12.
+        } else {
+            match dock_tier {
+                StripDockTier::NameCompare =>
+                    measure_text("Name this version", 11.) + 12.
+                        + measure_text("Compare", 11.) + 24.,
+                StripDockTier::Name => measure_text("Name version", 11.) + 12.,
+                StripDockTier::More => measure_text("…", 11.) + 12.,
+            }
+        };
+        let dock_w = center_w + if parked { restore_w + 6. } else { 0. };
+        let dock = strip_dock_geometry(
+            playhead_x, dock_w, readout_r, dock_right_edge,
+            self.strip_name_input.is_some());
 
         // Recessed data. It has no border, hover, or pointer semantics.
         let chip = |label: SharedString, bright: bool| {
@@ -25215,7 +26632,7 @@ impl Editor {
                 f32::from(window.text_system()
                     .shape_line(s.into(), px(12.), &[run], None).width()) + 16.
             };
-            let available = (desk_w - 190.).max(120.);
+            let available = slots.readout.1.max(120.);
             let full_w = measure(&forms.full_a) + measure(&forms.full_b) + 6.;
             let shared_w = forms.shared_date.as_ref().map(|(date, a, b)| {
                 measure(date) + measure(a) + measure(b) + 12.
@@ -25274,23 +26691,18 @@ impl Editor {
         // Now: dim at the present, bright when parked (it and Restore announce
         // themselves as the pair they are — design §3, review H4: the two
         // exits from the past light up in the same beat). Click / Esc return.
-        let now_chip = chip("Now".into(), parked)
+        let now_chip = div()
             .id("strip-now")
-            .occlude()
+            .font_family("PT Sans")
+            .text_size(px(11.))
+            .text_color(if parked { rgb(0xE7E1D0) } else { rgb(0x8F8A7C) })
+            .child(now_label)
             .when(parked, |d| {
                 d.cursor(CursorStyle::PointingHand)
                     .border_b_1()
                     .border_dashed()
                     .border_color(rgb(0xE7E1D0))
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    editor.resolve_strip_name(window, cx);
-                    editor.strip_return_to_now(cx);
-                }),
-            );
+            });
 
         // Close affordance (Bug C): the pictorial dismiss saltire in the
         // strip's top-right (muted → bright on hover, pointing hand) — the
@@ -25350,7 +26762,7 @@ impl Editor {
             let empty = input.read(cx).content.is_empty();
             div()
                 .relative()
-                .w(px(free_interval.clamp(160., 280.)))
+                .w(px(composer_w))
                 .h(px(22.))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .when(empty, |d| {
@@ -25366,13 +26778,13 @@ impl Editor {
                     )
                 })
                 .child(input)
-        } else if free_interval >= 104. {
+        } else if dock_tier != StripDockTier::More {
             // Parked ON a writer-named version (the detent's common landing),
             // the verb inverts to Rename (§3c): the composer opens holding
             // the current name; clearing it demotes.
             let renaming = parked
                 && self.strip_named_station_at(self.strip.pos_ms).is_some();
-            let label = match (renaming, free_interval >= 132.) {
+            let label = match (renaming, dock_tier == StripDockTier::NameCompare) {
                 (true, true) => "Rename this version",
                 (true, false) => "Rename version",
                 (false, true) => "Name this version",
@@ -25386,7 +26798,8 @@ impl Editor {
                 }),
             );
             div().flex().items_center().gap(px(12.)).child(naming)
-                .when(center_mode == StripCenterMode::Parked, |d| d.child(
+                .when(center_mode == StripCenterMode::Parked
+                    && dock_tier == StripDockTier::NameCompare, |d| d.child(
                     strip_action("strip-compare", "Compare").on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|editor, _: &MouseDownEvent, _, cx| {
@@ -25428,6 +26841,8 @@ impl Editor {
                     cx.listener(|editor, ev: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         editor.resolve_strip_name(window, cx);
+                        editor.strip_drag_origin = Some(ev.position);
+                        editor.strip_drag_moved = false;
                         editor.strip_park_at_x(
                             f32::from(ev.position.x),
                             f32::from(ev.position.y),
@@ -25467,7 +26882,11 @@ impl Editor {
                         }
                     }
                     if editor.strip.scrubbing && ev.pressed_button == Some(MouseButton::Left) {
-                        editor.strip_drag_moved = true;
+                        if let Some(origin) = editor.strip_drag_origin {
+                            let dx = f32::from(ev.position.x - origin.x);
+                            let dy = f32::from(ev.position.y - origin.y);
+                            editor.strip_drag_moved |= dx * dx + dy * dy >= 9.;
+                        }
                         let fabric = editor.strip.scrub_fabric;
                         let pos = if fabric {
                             editor.strip_pos_at_fabric_x(f32::from(ev.position.x))
@@ -25492,6 +26911,7 @@ impl Editor {
                                 editor.strip_reveal_edit_at(editor.strip.pos_ms);
                             }
                         }
+                        editor.strip_drag_origin = None;
                         cx.notify();
                     }),
                 )
@@ -25508,7 +26928,22 @@ impl Editor {
                                 editor.strip_reveal_edit_at(editor.strip.pos_ms);
                             }
                         }
+                        editor.strip_drag_origin = None;
                         cx.notify();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|editor, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let on_rail = (*editor.strip_rail.borrow()).is_some_and(|geom| {
+                            let y = f32::from(ev.position.y);
+                            y >= geom.band_top
+                                && y - geom.band_top <= strip::RAIL_Y + 8.
+                        });
+                        if on_rail {
+                            editor.strip_return_to_now(cx);
+                        }
                     }),
                 )
                 .on_scroll_wheel(cx.listener(|editor, ev: &ScrollWheelEvent, _, cx| {
@@ -25518,38 +26953,66 @@ impl Editor {
                     editor.strip_pan(d, cx);
                 }))
                 .child(StripElement { editor: cx.entity() })
-                // The sheet origin owns the readout.
+                // The sheet origin owns the readout. Every top-row slot takes
+                // the same 22px centered band — one row, one optical baseline.
                 .child(
                     div()
                         .absolute()
-                        .left(px(strip::SIDE_PAD))
+                        .left(px(slots.readout.0))
                         .top(px(4.))
+                        .w(px(slots.readout.1))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
                         .child(readout_chip),
                 )
-                // The parked playhead owns the moment dock.
-                .child(
+                // P14: the moment verbs travel with the live playhead. Mouse
+                // move bubbles to the container, so the dock rides a scrub.
+                .when(parked || self.strip.scrubbing, |strip| strip.child(
                     div()
                         .absolute()
-                        .left(px(dock_left))
+                        .left(px(dock.x))
                         .top(px(4.))
                         .w(px(dock_w))
                         .h(px(22.))
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .when(parked, |d| d.child(restore_btn))
+                        .when(!self.strip.scrubbing, |d| d.occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
+                        .child(restore_btn)
                         .child(center),
-                )
-                // The selvage owns Now; only the frame owns close.
+                ))
+                // Now belongs to the selvage when the desk has room. Its
+                // padded chrome target paints after the fabric's dimming; the
+                // top-row end cap is only the declared collision fallback.
                 .child(
                     div()
                         .absolute()
-                        .left(px((selvage_x - 14.).clamp(rail_x0, rail_x1 - 36.)))
-                        .top(px(4.))
-                        .child(now_chip),
+                        .left(px(now_x - 12.))
+                        .w(px(now_label_w + 24.))
+                        .top(px(match now_home {
+                            NowHome::Selvage(_) => strip::TOP_ROW_H + 2.,
+                            NowHome::Cap => 4.,
+                        }))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(now_chip)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                editor.resolve_strip_name(window, cx);
+                                editor.strip_return_to_now(cx);
+                            }),
+                        )
                 )
                 .child(
-                    div().absolute().right(px(8.)).top(px(4.)).child(close_x),
+                    div().absolute().left(px(slots.close.0)).top(px(4.)).child(close_x),
                 ),
         )
     }
@@ -25719,6 +27182,13 @@ impl Element for StripElement {
             } else {
                 wx + 3.
             };
+            if let Some(now_w) = editor.strip_now_w.get()
+                && let NowHome::Selvage(now_x) = strip_now_home(tail_x, now_w, rail_x1)
+                && lx < now_x + now_w
+                && now_x < lx + f32::from(line.width)
+            {
+                continue;
+            }
             let ly = band_top + strip::TOP_ROW_H + 2. + (st.row as f32) * 13.;
             labels.push(StripText {
                 origin: point(px(lx), px(ly)),
@@ -26199,6 +27669,85 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn structural_clipboard(text: &str) -> ClipboardItem {
+        let rich = RichPaste {
+            spans: Vec::new(),
+            blocks: vec![ClipboardBlock {
+                range: 0..text.len(),
+                kind: BlockKind::Blockquote,
+                complete: true,
+            }],
+            starts_at_boundary: true,
+            ends_at_boundary: true,
+        };
+        let metadata = serde_json::to_string(&RichClipboardEnvelope {
+            v: RICH_CLIPBOARD_VERSION,
+            text_len: text.len(),
+            rich,
+            image_asset_ids: Vec::new(),
+        }).unwrap();
+        ClipboardItem::new_string_with_metadata(text.into(), metadata)
+    }
+
+    #[test]
+    fn mismatched_clipboard_metadata_falls_back_to_plain_text_paste() {
+        let mut item = structural_clipboard("source\n");
+        let ClipboardEntry::String(text) = &mut item.entries[0] else { unreachable!() };
+        text.text.push('x'); // clipboard manager rewrote only the visible flavor
+        let (plain, rich) = clipboard_text_and_rich(&item, false).unwrap();
+        assert_eq!(plain, "source\nx");
+        assert!(rich.is_none(), "the stale structural operation is rejected");
+
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(1));
+        let mut doc = Document::new("heading", SpanSet::default(), blocks);
+        doc.edit_bytes(3..3, &plain);
+        assert!(doc.blocks().kinds().iter().all(|kind| kind == &BlockKind::Heading(1)),
+            "fallback follows the ordinary paste/type destination semantics");
+    }
+
+    #[test]
+    fn paste_as_plain_text_bypasses_an_applicable_rich_payload() {
+        let item = structural_clipboard("source\n");
+        assert!(clipboard_text_and_rich(&item, false).unwrap().1.is_some(),
+            "the control payload really would apply richly");
+        let (plain, rich) = clipboard_text_and_rich(&item, true).unwrap();
+        assert!(rich.is_none(), "Paste as Plain Text bypasses private metadata");
+
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(2));
+        let mut doc = Document::new("heading", SpanSet::default(), blocks);
+        doc.edit_bytes(3..3, &plain);
+        assert!(doc.blocks().kinds().iter().all(|kind| kind == &BlockKind::Heading(2)),
+            "source block kinds are not applied");
+    }
+
+    #[test]
+    fn shaped_list_layout_tightens_only_the_run_interior() {
+        let text = "a\n\n- one\n\n- two\n\nb";
+        let texts: Vec<&str> = text.split('\n').collect();
+        let kinds = vec![BlockKind::Paragraph; texts.len()];
+        let shaped = shaped_list_paragraphs(&texts, &kinds, true);
+        let paragraph_height = 20.;
+        let paragraph_gap = 20.;
+        let pile_gap = (paragraph_gap * 0.5_f32 / 2.).round() * 2.;
+        let mut tops = vec![0.];
+        for i in 0..texts.len() - 1 {
+            let gap = match shaped_list_gap(&texts, &shaped, i) {
+                Some(ShapedListGap::Solid) => paragraph_gap * 0.25,
+                Some(ShapedListGap::Blank) => pile_gap,
+                None => paragraph_gap,
+            };
+            tops.push(tops[i] + paragraph_height + gap);
+        }
+
+        assert_eq!(tops, vec![0., 40., 80., 110., 140., 180., 220.]);
+        assert_eq!(tops[2] - tops[1] - paragraph_height, paragraph_gap,
+            "the run keeps full entering air");
+        assert_eq!(tops[5] - tops[4] - paragraph_height, paragraph_gap,
+            "the run keeps full leaving air");
+    }
+
     #[test]
     fn station_hit_arbitrates_by_tick_then_rank() {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(30.), px(24.)));
@@ -26283,28 +27832,119 @@ mod tests {
     }
 
     #[test]
-    fn strip_dock_flips_and_clamps_at_the_frame_edges() {
-        // A far-away Now zone leaves the classic flip/clamp behavior alone.
-        let far = (1000., 1040.);
-        assert_eq!(strip_dock_left(100., 120., 28., 428., far), 110.);
-        assert_eq!(strip_dock_left(390., 120., 28., 428., far), 260.);
-        assert_eq!(strip_dock_left(30., 500., 28., 428., far), 28.);
+    fn strip_top_slots_are_disjoint_at_representative_widths() {
+        for width in [480., 600., 800., 1600.] {
+            let slots = strip_top_slots(width, 220.);
+            assert!(slots.readout.0 + slots.readout.1 <= slots.close.0);
+            assert!(slots.close.0 + slots.close.1 <= width);
+            assert_eq!(width - (slots.close.0 + slots.close.1), 8.);
+        }
     }
 
     #[test]
-    fn strip_dock_never_stands_across_the_now_label() {
-        // Young sheet: readout floor at 230, selvage/Now right there — the
-        // interval left of Now cannot hold a 300px dock, so it takes the
-        // desk to Now's right (the callout-from-the-sheet reading).
-        let x = strip_dock_left(240., 300., 230., 1590., (238., 284.));
-        assert!(x >= 294., "dock {x} must clear Now's right edge");
-        // Wide sheet, parked mid-fabric: Now at the far selvage stays clear
-        // and the dock still prefers the playhead's right.
-        assert_eq!(strip_dock_left(800., 300., 230., 1590., (1520., 1566.)), 810.);
-        // Parked NEAR the selvage: the dock flips left of the zone when the
-        // right side cannot fit.
-        let x = strip_dock_left(1500., 300., 230., 1590., (1508., 1554.));
-        assert!(x + 300. <= 1508., "dock {x}+300 must clear Now's left edge");
+    fn strip_now_home_uses_the_young_selvage() {
+        assert_eq!(strip_now_home(strip::SIDE_PAD + 40., 24., 572.),
+            NowHome::Selvage(strip::SIDE_PAD + 54.));
+    }
+
+    #[test]
+    fn strip_now_home_flips_to_cap_immediately_past_the_room_boundary() {
+        assert_eq!(strip_now_home(520., 24., 572.), NowHome::Selvage(534.));
+        assert_eq!(strip_now_home(520.001, 24., 572.), NowHome::Cap);
+        assert_eq!(strip_now_home(572., 24., 572.), NowHome::Cap);
+    }
+
+    #[test]
+    fn strip_now_home_uses_the_measured_russian_width() {
+        let ru_now_w = 46.; // shaped corridor measurement for «Сейчас»
+        assert_eq!(strip_now_home(498., ru_now_w, 572.), NowHome::Selvage(512.));
+        assert_eq!(strip_now_home(498.001, ru_now_w, 572.), NowHome::Cap);
+    }
+
+    #[test]
+    fn strip_top_slots_degrade_compare_space_before_name_space() {
+        let free = |width, readout_w| {
+            let slots = strip_top_slots(width, readout_w);
+            (slots.close.0 - GAP_DOCK)
+                - (slots.readout.0 + slots.readout.1 + GAP_DOCK)
+        };
+        let wide = free(800., 220.);
+        let middle = free(480., 220.);
+        let narrow = free(420., 520.);
+        assert!(wide >= 230., "wide action slot admits Compare");
+        assert!((104.0..230.0).contains(&middle), "middle keeps Name only");
+        assert!(narrow < 104., "narrow folds actions behind ellipsis");
+    }
+
+    proptest! {
+        #[test]
+        fn traveling_dock_never_overlaps_readout_now_or_close_at_any_playhead(
+            content_width in 420f32..1600., readout_w in 180f32..520.,
+            playhead_frac in 0f32..1.,
+        ) {
+            let slots = strip_top_slots(content_width, readout_w);
+            let readout_r = slots.readout.0 + slots.readout.1;
+            let free = (slots.close.0 - GAP_DOCK) - (readout_r + GAP_DOCK);
+            let dock_w = match strip_dock_tier(free) {
+                StripDockTier::NameCompare => 220.,
+                StripDockTier::Name => 100.,
+                StripDockTier::More => free.clamp(0., 30.),
+            };
+            let rail_x1 = content_width - strip::SIDE_PAD;
+            let playhead = strip::SIDE_PAD
+                + (rail_x1 - strip::SIDE_PAD) * playhead_frac;
+            let dock = strip_dock_geometry(
+                playhead, dock_w, readout_r, slots.close.0, false);
+            prop_assert!(dock.x >= readout_r + GAP_DOCK);
+            prop_assert!(dock.x + dock_w <= slots.close.0 - GAP_DOCK + 0.001);
+            // Cap home: the Now label shares the row, and its padded box —
+            // not close — bounds the dock (declared collision, P14).
+            let cap_left = slots.close.0 - 12. - 46.;
+            let capped = strip_dock_geometry(
+                playhead, dock_w, readout_r, cap_left - 12., false);
+            prop_assert!(capped.x + dock_w <= cap_left - 12. - GAP_DOCK + 0.001
+                || !capped.traveling);
+            // Graceful parking (field verdict 2026-07-18): the dock's motion
+            // is continuous — a 1px playhead step never moves it more than
+            // 1px, so neither rail can make it jump sides.
+            let stepped = strip_dock_geometry(
+                playhead + 1., dock_w, readout_r, slots.close.0, false);
+            prop_assert!((stepped.x - dock.x).abs() <= 1.001);
+        }
+    }
+
+    #[test]
+    fn dock_parks_gracefully_at_the_right_rail() {
+        let slots = strip_top_slots(800., 220.);
+        let readout_r = slots.readout.0 + slots.readout.1;
+        let dock = strip_dock_geometry(772., 220., readout_r, slots.close.0, false);
+        assert_eq!(dock.x, slots.close.0 - GAP_DOCK - 220.);
+        assert!(dock.traveling);
+    }
+
+    #[test]
+    fn verb_tier_is_independent_of_playhead_at_fixed_frame_width() {
+        let slots = strip_top_slots(800., 220.);
+        let free = (slots.close.0 - GAP_DOCK)
+            - (slots.readout.0 + slots.readout.1 + GAP_DOCK);
+        let tiers = [strip::SIDE_PAD, 400., 772.].map(|_| strip_dock_tier(free));
+        assert_eq!(tiers, [tiers[0]; 3]);
+    }
+
+    #[test]
+    fn young_doc_parked_early_dock_sits_at_the_fallback_address() {
+        let slots = strip_top_slots(600., 220.);
+        let readout_r = slots.readout.0 + slots.readout.1;
+        let dock = strip_dock_geometry(
+            strip::SIDE_PAD, 100., readout_r, slots.close.0, false);
+        assert_eq!(dock.x, readout_r + GAP_DOCK);
+        assert_eq!(dock.x, dock.fallback);
+    }
+
+    #[test]
+    fn now_snap_radius_is_strictly_largest_on_the_rail() {
+        let (station, now) = strip_snap_radii();
+        assert!(now > station);
     }
 
     #[test]
@@ -26385,10 +28025,12 @@ mod tests {
                 level: "line".into(),
             };
 
+            let base_revision = editor.doc.revision();
             editor.integrate_pass(
                 vec![diagnosis("duplicate"), diagnosis("new issue")],
                 0,
                 Some(scope),
+                base_revision,
                 1,
                 cx,
             );
@@ -26418,11 +28060,91 @@ mod tests {
                 label: "line read · model".into(),
             });
 
-            editor.deliver_pass_report(Vec::new(), 0, None, editor.ai_generation, cx);
+            let base_revision = editor.doc.revision();
+            editor.deliver_pass_report(Vec::new(), 0, None, base_revision, editor.ai_generation, cx);
 
             assert!(editor.deferred_pass.is_some());
             assert!(!matches!(editor.ai_status, Some(AiStatus::Running { .. })));
             assert_eq!(editor.editor_face(), EditorFace::Ready);
+        });
+    }
+
+    #[gpui::test]
+    fn completed_read_parks_while_closed_and_open_lands_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "A bright sentence.", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            editor.config.ai.base_url = "http://rig.invalid/v1".into();
+            editor.config.ai.model = "model".into();
+            let diagnosis = strop_core::diagnose::Diagnosis {
+                quote: "bright sentence".into(),
+                problem: "The light is generic".into(),
+                query: "Which light is particular?".into(),
+                level: "line".into(),
+            };
+            editor.deliver_pass(vec![diagnosis], editor.ai_generation, cx);
+            assert!(editor.drafting);
+            assert!(editor.deferred_pass.is_some());
+            assert_eq!(editor.resting_diagnoses(), 0);
+            assert_eq!(editor.editor_face(), EditorFace::Ready);
+
+            // Closing again is impossible from this pole; only the explicit
+            // opening transition consumes the parked pass.
+            editor.toggle_door(cx);
+            assert!(!editor.drafting);
+            assert!(editor.deferred_pass.is_none());
+            assert_eq!(editor.resting_diagnoses(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn cancel_drops_running_and_parked_read_without_landing_a_card(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "A sentence.", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            editor.ai_status = Some(AiStatus::Running { label: "line read".into() });
+            editor.deliver_pass(vec![strop_core::diagnose::Diagnosis {
+                quote: "sentence".into(),
+                problem: "Problem".into(),
+                query: "Question?".into(),
+                level: "line".into(),
+            }], editor.ai_generation, cx);
+            let generation = editor.ai_generation;
+            assert!(editor.deferred_pass.is_some());
+            editor.cancel_ai_run_inner(cx);
+            assert_eq!(editor.ai_generation, generation + 1);
+            assert!(editor.deferred_pass.is_none());
+            assert!(editor.ai_status.is_none());
+            assert_eq!(editor.resting_diagnoses(), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn closing_never_flushes_a_typing_parked_read(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "A sentence.", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, cx| {
+            editor.drafting = false;
+            editor.last_text_edit = Some(Instant::now());
+            editor.deliver_pass(vec![strop_core::diagnose::Diagnosis {
+                quote: "sentence".into(),
+                problem: "Problem".into(),
+                query: "Question?".into(),
+                level: "line".into(),
+            }], editor.ai_generation, cx);
+            assert!(editor.deferred_pass.is_some());
+
+            editor.toggle_door(cx);
+            assert!(editor.drafting);
+            assert!(editor.deferred_pass.is_some());
+            assert_eq!(editor.resting_diagnoses(), 0);
         });
     }
 
@@ -26720,19 +28442,73 @@ mod tests {
     }
 
     #[test]
-    fn auto_cut_fires_only_on_a_big_selection_deletion() {
-        // At/over the threshold, a pure selection-deletion fires — on EITHER
-        // side of the seam (one capture law, graveyard-interplay 5; the old
-        // region gate is gone — capture is region-agnostic, the ENTRY is
-        // region-honest instead).
-        assert!(auto_cut_qualifies("", AUTO_CUT_MIN_CHARS));
-        assert!(auto_cut_qualifies("", 500));
-        // Just under the threshold does NOT.
-        assert!(!auto_cut_qualifies("", AUTO_CUT_MIN_CHARS - 1));
-        // A replace-by-typing never files, however large the deleted run.
-        assert!(!auto_cut_qualifies("x", 500));
+    fn auto_cut_fires_on_any_big_selection_removal() {
+        // At/over the threshold, a selection-removal fires — deletion and
+        // type-over alike ("anything big that leaves in one stroke,
+        // survives"), on EITHER side of the seam (one capture law,
+        // graveyard-interplay 5; capture is region-agnostic, the ENTRY is
+        // region-honest instead). The IME exemption lives at the call site,
+        // where the marked range is known.
+        assert!(auto_cut_qualifies(AUTO_CUT_MIN_CHARS));
+        assert!(auto_cut_qualifies(500));
+        // Just under the threshold does NOT — so a typograph substitution
+        // (a tiny prefix replace) could never qualify even if it routed
+        // through the trigger.
+        assert!(!auto_cut_qualifies(AUTO_CUT_MIN_CHARS - 1));
         // An empty selection never fires.
-        assert!(!auto_cut_qualifies("", 0));
+        assert!(!auto_cut_qualifies(0));
+    }
+
+    #[gpui::test]
+    fn select_all_and_paste_files_exactly_one_entry_with_the_old_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let long = "x".repeat(120);
+        let editor = cx.new(|cx| Editor::new(cx, &long, SpanSet::default(), BlockMap::default()));
+        cx.update_entity(&editor, |editor, cx| {
+            editor.selected_range = 0..editor.doc.len_bytes();
+            editor.apply_replace(None, "fresh start", false, true, cx);
+            assert_eq!(editor.doc.text(), "fresh start");
+            assert_eq!(editor.doc.graveyard().len(), 1, "exactly ONE entry");
+            assert_eq!(editor.doc.graveyard().entries()[0].text, long);
+            // One undo: old text back, replacement gone, entry dropped.
+            editor.doc.undo();
+            assert_eq!(editor.doc.text(), long);
+            assert!(editor.doc.graveyard().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn ime_commit_over_its_own_preedit_never_files(cx: &mut gpui::TestAppContext) {
+        // The commit replaces the marked preedit, never manuscript — however
+        // long the composition grew, nothing lands in the graveyard.
+        let preedit = "か".repeat(100);
+        let editor =
+            cx.new(|cx| Editor::new(cx, &preedit, SpanSet::default(), BlockMap::default()));
+        cx.update_entity(&editor, |editor, cx| {
+            editor.marked_range = Some(0..editor.doc.len_bytes());
+            editor.apply_replace(None, "漢字", false, false, cx);
+            assert_eq!(editor.doc.text(), "漢字");
+            assert!(editor.doc.graveyard().is_empty(), "IME commit paths never file");
+        });
+    }
+
+    #[gpui::test]
+    fn typograph_substitution_after_a_filing_type_over_files_nothing_extra(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Type "-" over a 100-char selection right after a literal "-": the
+        // type-over files ONE entry, and the em-dash substitution that fires
+        // on the result (a tiny prefix replace) files nothing.
+        let text = format!("-{}", "a".repeat(100));
+        let editor = cx.new(|cx| Editor::new(cx, &text, SpanSet::default(), BlockMap::default()));
+        cx.update_entity(&editor, |editor, cx| {
+            editor.selected_range = 1..101;
+            editor.apply_replace(None, "-", true, false, cx);
+            assert_eq!(editor.doc.text(), "—", "the substitution still fired");
+            assert_eq!(editor.doc.graveyard().len(), 1, "the selection filed, the typograph did not");
+            assert_eq!(editor.doc.graveyard().entries()[0].text, "a".repeat(100));
+        });
     }
 
     #[test]
@@ -26946,6 +28722,24 @@ mod tests {
     }
 
     #[test]
+    fn door_chip_count_excludes_stale_and_drains_when_all_stale() {
+        assert_eq!(door_chip_semantics([].into_iter()), None);
+        assert_eq!(door_chip_semantics([false, true, false].into_iter()), Some((2, false)));
+        assert_eq!(door_chip_semantics([true, true].into_iter()), Some((0, true)));
+        // Door state and glance focus are intentionally absent from the pure
+        // inputs: neither can change the document-global truth.
+        assert_eq!(door_chip_semantics([false, true].into_iter()), Some((1, false)));
+    }
+
+    #[test]
+    fn escape_recedes_a_glance_before_the_fan() {
+        assert_eq!(door_escape_step(true, true, true), DoorEscape::Glance);
+        assert_eq!(door_escape_step(false, false, true), DoorEscape::Fan);
+        assert_eq!(door_escape_step(true, false, true), DoorEscape::None);
+        assert_eq!(door_escape_step(false, false, false), DoorEscape::None);
+    }
+
+    #[test]
     fn ai_recovery_actions_are_typed_to_the_failure() {
         use AiRecoveryAction::*;
         assert_eq!(
@@ -26977,20 +28771,37 @@ mod tests {
     #[test]
     fn ai_landing_separates_empty_stale_and_invalid_results() {
         use AiLanding::*;
-        assert_eq!(ai_landing(0, 0, 0, false, 0), Empty);
+        assert_eq!(ai_landing(0, 0, 0, false, 0, false, 0), Empty);
         assert_eq!(
-            ai_landing(2, 0, 2, false, 0),
+            ai_landing(2, 0, 2, false, 0, true, 0),
             Empty,
             "grounded duplicates mean no new queries, not a failed read"
         );
-        assert_eq!(ai_landing(2, 0, 0, false, 0), Stale);
-        assert_eq!(ai_landing(2, 0, 2, true, 0), Stale);
-        assert_eq!(ai_landing(0, 1, 0, false, 0), Invalid);
+        assert_eq!(ai_landing(2, 0, 0, false, 0, true, 0), Stale);
+        assert_eq!(ai_landing(2, 0, 2, true, 0, true, 0), Stale);
+        assert_eq!(ai_landing(0, 1, 0, false, 0, false, 0), Invalid);
         assert_eq!(
-            ai_landing(2, 1, 1, false, 1),
+            ai_landing(2, 1, 1, false, 1, true, 0),
             Cards,
             "valid cards land despite malformed siblings"
         );
+    }
+
+    #[test]
+    fn staleness_requires_an_actual_edit_and_context_quotes_never_count() {
+        use AiLanding::*;
+        // Nothing grounded but the revision never changed: the read did not
+        // land — the draft may not be blamed for it.
+        assert_eq!(ai_landing(2, 0, 0, false, 0, false, 0), Unlanded);
+        assert_eq!(ai_landing(2, 0, 2, true, 0, false, 0), Unlanded);
+        // Quotes grounding only in the context paragraphs prove the model
+        // read real text — never staleness evidence, even after an edit.
+        assert_eq!(ai_landing(2, 0, 0, false, 0, true, 2), Unlanded);
+        // The genuine staleness case still names the draft.
+        assert_eq!(ai_landing(2, 0, 0, false, 0, true, 0), Stale);
+        // Cards and Invalid outrank the staleness question entirely.
+        assert_eq!(ai_landing(2, 1, 0, false, 1, false, 0), Cards);
+        assert_eq!(ai_landing(2, 1, 0, false, 0, false, 0), Invalid);
     }
 
     #[test]
@@ -27092,7 +28903,8 @@ mod tests {
             (2..5, InlineAttr::Strong),
             (5..8, InlineAttr::Highlight),
         ];
-        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &[], &[], &base());
+        let runs =
+            runs_for_paragraph(&par, "0123456789", &(0..0), None, &spans, &[], &[], &[], &base());
         // Segments: [0,2) plain, [2,5) bold, [5,8) highlight, [8,10) plain.
         assert_eq!(runs.len(), 4);
         assert_eq!(runs[1].font.weight, FontWeight::BOLD);
@@ -27103,13 +28915,32 @@ mod tests {
     }
 
     #[test]
+    fn cold_read_marks_join_only_matching_frag_edges() {
+        let marked = crate::bookpage::Style {
+            highlight: true,
+            underline: true,
+            strike: true,
+            ..Default::default()
+        };
+        assert_eq!(cr_gap_marks(marked, marked), (true, true, true));
+
+        let link = crate::bookpage::Style { link: true, ..Default::default() };
+        assert_eq!(cr_gap_marks(marked, link), (false, true, false));
+        assert_eq!(
+            cr_gap_marks(marked, crate::bookpage::Style::default()),
+            (false, false, false)
+        );
+    }
+
+    #[test]
     fn selection_composites_over_highlight() {
         // Markings stay visible through selection: the selected-and-
         // highlighted segment gets a blend distinct from both pure colors;
         // partial overlap splits into its own runs.
         let par = 0..6;
         let spans = vec![(0..6, InlineAttr::Highlight)];
-        let runs = runs_for_paragraph(&par, &(2..4), None, &spans, &[], &[], &[], &base());
+        let runs =
+            runs_for_paragraph(&par, "abcdef", &(2..4), None, &spans, &[], &[], &[], &base());
         let blended = blend_over(rgba(SELECTION_COLOR), rgba(HIGHLIGHT_COLOR));
         assert_eq!(runs[1].background_color, Some(blended.into()));
         assert_ne!(
@@ -27123,7 +28954,8 @@ mod tests {
         // Outside the selection the pure highlight shows.
         assert_eq!(runs[0].background_color, Some(rgba(HIGHLIGHT_COLOR).into()));
         // Selection over plain text stays the plain selection color.
-        let plain = runs_for_paragraph(&par, &(2..4), None, &[], &[], &[], &[], &base());
+        let plain =
+            runs_for_paragraph(&par, "abcdef", &(2..4), None, &[], &[], &[], &[], &base());
         assert_eq!(
             plain[1].background_color,
             Some(rgba(SELECTION_COLOR).into())
@@ -27176,7 +29008,8 @@ mod tests {
         // superior figure is painted over it in the paint phase.
         let par = 0..5;
         let spans = vec![(2..3, InlineAttr::FootnoteRef("1".into()))];
-        let runs = runs_for_paragraph(&par, &(0..0), None, &spans, &[], &[], &[], &base());
+        let runs =
+            runs_for_paragraph(&par, "abcde", &(0..0), None, &spans, &[], &[], &[], &base());
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[1].color.a, 0.);
         assert!(runs[1].background_color.is_none());
@@ -27188,9 +29021,44 @@ mod tests {
     fn code_run_switches_family_and_marked_text_underlines() {
         let par = 0..8;
         let spans = vec![(0..4, InlineAttr::Code)];
-        let runs = runs_for_paragraph(&par, &(0..0), Some(&(4..8)), &spans, &[], &[], &[], &base());
+        let runs = runs_for_paragraph(
+            &par,
+            "abcdefgh",
+            &(0..0),
+            Some(&(4..8)),
+            &spans,
+            &[],
+            &[],
+            &[],
+            &base(),
+        );
         assert_eq!(runs[0].font.family.as_ref(), CODE_FONT);
         assert!(runs[1].underline.is_some());
+    }
+
+    #[test]
+    fn stale_cuts_snap_to_char_boundaries() {
+        // The history-preview hazard: an offset from ANOTHER text (the live
+        // caret, a stale selection) injected as a run cut into multibyte
+        // text. Every cut must snap back to a char boundary of THIS text —
+        // the runs partition the paragraph and shaping never sees a torn
+        // char. "привет" is 6 chars × 2 bytes; 3 and 7 are mid-char.
+        let text = "привет";
+        let par = 0..text.len();
+        let check = |runs: &[TextRun]| {
+            let mut at = 0usize;
+            for run in runs {
+                assert!(text.is_char_boundary(at), "run cut mid-char at {at}");
+                at += run.len;
+            }
+            assert_eq!(at, text.len(), "runs must cover the paragraph");
+        };
+        // A collapsed caret off-boundary (the parked live caret's shape).
+        check(&runs_for_paragraph(&par, text, &(3..3), None, &[], &[], &[], &[], &base()));
+        // A non-empty stale selection, both ends mid-char.
+        check(&runs_for_paragraph(&par, text, &(3..7), None, &[], &[], &[], &[], &base()));
+        // Beyond the paragraph entirely.
+        check(&runs_for_paragraph(&par, text, &(15..40), None, &[], &[], &[], &[], &base()));
     }
 
     #[test]
@@ -27317,7 +29185,7 @@ mod tests {
         assert_eq!(text_h % g.line_h, 0., "whole lines");
         assert!(g.lane, "Live reserves the lane from entry (S2)");
         assert!(g.metrics().justify);
-        assert_eq!(g.metrics().para_gap, 17., "1em air, rounded");
+        assert_eq!(g.metrics().para_gap, 0., "book body sits on the line grid");
     }
 
     #[test]
@@ -27898,4 +29766,271 @@ mod tests {
         assert_eq!(image_format_for_src("asset:ab.webp"), gpui::ImageFormat::Webp);
         assert_eq!(image_format_for_src("asset:legacy"), gpui::ImageFormat::Png);
     }
+
+    #[test]
+    fn space_rail_mapping_uses_one_clamped_rendered_axis() {
+        let (top, height) = space_thumb(500., 500., 2000., 750.);
+        assert_eq!(height, 125.);
+        assert_eq!(top, 187.5);
+        assert_eq!(space_mark_y(750., 1500., 500., height), top);
+        assert_eq!(space_scroll_at(top + height / 2., 500., height, 1500.), 750.);
+        assert!(space_fleck_on_thumb(top, top, height));
+        assert!(!space_fleck_on_thumb(top - 0.1, top, height));
+
+        let (clamped_top, clamped_height) = space_thumb(100., 100., 10000., 9900.);
+        assert_eq!(clamped_height, 32.);
+        assert_eq!(clamped_top, 68.);
+        // The seam is merely another rendered document y on this axis.
+        assert_eq!(space_mark_y(4950., 9900., 100., clamped_height), 34.);
+
+        let marks = [10., 14., 30.];
+        assert_eq!(space_mark_hit(&marks, 11.9), Some(0));
+        assert_eq!(space_mark_hit(&marks, 12.), Some(0), "midpoint tie is stable");
+        assert_eq!(space_mark_hit(&marks, 12.1), Some(1));
+        assert_eq!(space_mark_hit(&marks, 20.), None, "padding never magnetizes track");
+    }
+
+    // ---- Quit guard + lazy birth (see request_quit / materialize_store) ----
+
+    fn quit_test_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("strop-quit-test-{}-{tag}.strop", std::process::id()))
+    }
+
+    /// An editor over an attached store, the way main.rs assembles one.
+    fn editor_with_store(
+        cx: &mut gpui::TestAppContext,
+        text: &str,
+        store: Store,
+        birth: bool,
+    ) -> gpui::Entity<Editor> {
+        let text = text.to_owned();
+        cx.new(|cx| {
+            let mut editor = Editor::new(cx, &text, SpanSet::default(), BlockMap::default());
+            if birth {
+                editor.stage_import_birth(text, SpanSet::default(), BlockMap::default());
+            }
+            editor.attach_store(store, cx);
+            editor
+        })
+    }
+
+    #[gpui::test]
+    fn clean_close_bypasses_instantly_and_writes_nothing(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("clean-close");
+        let _ = std::fs::remove_file(&path);
+        {
+            // A settled file from an earlier "session".
+            let (store, _) = Store::open(&path).unwrap();
+            store.seed("settled prose");
+            store.add_checkpoint("Started", false);
+            store.save().unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let (store, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        let editor = editor_with_store(cx, &loaded.text, store, false);
+        cx.update_entity(&editor, |editor, cx| {
+            editor.quit_guard = QuitGuard::Saving; // as request_quit sets before deferring
+            editor.settle_quit(cx);
+            assert!(
+                matches!(editor.quit_guard, QuitGuard::Bypass),
+                "a clean close bypasses immediately — no save, no wait"
+            );
+            assert!(!editor.quit_veil, "no frame of veil for a fast goodbye");
+            assert!(editor.latest_save.is_none(), "a clean close queues nothing");
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a clean close rewrote the file");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn dirty_close_flushes_before_the_window_closes(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("dirty-close");
+        let _ = std::fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        let editor = editor_with_store(cx, "", store, false);
+        cx.update_entity(&editor, |editor, cx| {
+            editor.doc.edit_bytes(0..0, "dirty bytes");
+            editor.quit_guard = QuitGuard::Saving;
+            editor.settle_quit(cx);
+            // LAW 2 (papercuts): dirty bytes in flight — no bypass yet.
+            assert!(matches!(editor.quit_guard, QuitGuard::Saving));
+            assert!(editor.latest_save.is_some(), "the final save is in flight");
+        });
+        // Drain the way the doorbell/heartbeat would, until the worker lands.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let closed = cx.update_entity(&editor, |editor, cx| {
+                editor.drain_save_completions();
+                editor.finish_quit_if_ready(cx);
+                matches!(editor.quit_guard, QuitGuard::Bypass)
+            });
+            if closed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the dirty close never became durable");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (_, loaded) = Store::open(&path).unwrap();
+        assert_eq!(loaded.unwrap().text, "dirty bytes", "the flush landed before the close");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn quit_never_bypasses_a_pending_dirty_save(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("law-two");
+        let _ = std::fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        let editor = editor_with_store(cx, "", store, false);
+        cx.update_entity(&editor, |editor, cx| {
+            editor.doc.edit_bytes(0..0, "unflushed");
+            editor.sync_mutations();
+            let _ = editor.save_now();
+            editor.quit_guard = QuitGuard::Saving;
+            // The completion has not been drained: the guard must hold.
+            editor.finish_quit_if_ready(cx);
+            assert!(
+                matches!(editor.quit_guard, QuitGuard::Saving),
+                "a generation in flight can never be bypassed"
+            );
+            // Dirty bytes with a FAILED save must surface, never exit.
+            let _ = editor.latest_save.take();
+            editor.store_dirty = true;
+            editor.save_error = Some("simulated: disk full".into());
+            editor.finish_quit_if_ready(cx);
+            assert!(
+                matches!(editor.quit_guard, QuitGuard::Failed(_)),
+                "dirty + failed must reach the recovery dialog"
+            );
+            // And the clean-close shortcut may not call this clean either.
+            assert!(!editor.quit_close_clean(), "dirty bytes are never 'clean'");
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn the_veil_shows_only_while_a_close_is_still_saving(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|cx| {
+            Editor::new(cx, "text", SpanSet::default(), BlockMap::default())
+        });
+        cx.update_entity(&editor, |editor, _| {
+            assert!(!editor.quit_veil, "the veil starts down");
+            editor.quit_guard = QuitGuard::Saving;
+            assert!(
+                editor.reveal_quit_veil(),
+                "still saving at the threshold: the veil earns its pixels"
+            );
+            assert!(editor.quit_veil);
+            editor.quit_veil = false;
+            editor.quit_guard = QuitGuard::Bypass;
+            assert!(!editor.reveal_quit_veil(), "already closing: nothing to show");
+            editor.quit_guard = QuitGuard::Idle;
+            assert!(!editor.reveal_quit_veil(), "not quitting: nothing to show");
+        });
+    }
+
+    #[gpui::test]
+    fn a_failed_final_write_reaches_the_failed_dialog(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("failed-close");
+        let _ = std::fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        // Occupy the destination with a DIRECTORY: the atomic replace
+        // cannot land, so the final write genuinely fails.
+        std::fs::create_dir_all(&path).unwrap();
+        let editor = editor_with_store(cx, "", store, false);
+        cx.update_entity(&editor, |editor, cx| {
+            editor.doc.edit_bytes(0..0, "doomed");
+            editor.quit_guard = QuitGuard::Saving;
+            editor.settle_quit(cx);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let failed = cx.update_entity(&editor, |editor, cx| {
+                editor.drain_save_completions();
+                editor.finish_quit_if_ready(cx);
+                assert!(
+                    !matches!(editor.quit_guard, QuitGuard::Bypass),
+                    "a failed write must never let the process exit"
+                );
+                matches!(editor.quit_guard, QuitGuard::Failed(_))
+            });
+            if failed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the failed write never surfaced");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(path.with_extension("strop.tmp"));
+    }
+
+    #[gpui::test]
+    fn an_unborn_import_quits_without_creating_the_strop(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("unborn");
+        let _ = std::fs::remove_file(&path);
+        let (store, existing) = Store::open(&path).unwrap();
+        assert!(existing.is_none());
+        let editor = editor_with_store(cx, "imported prose", store, true);
+        cx.update_entity(&editor, |editor, cx| {
+            // Even explicit save requests refuse to write before birth.
+            assert!(
+                editor.save_now().unwrap().is_none(),
+                "an unborn import never queues a save"
+            );
+            editor.flush_saves().unwrap();
+            editor.quit_guard = QuitGuard::Saving;
+            editor.settle_quit(cx);
+            assert!(matches!(editor.quit_guard, QuitGuard::Bypass));
+        });
+        assert!(!path.exists(), "glancing at a .md must not litter a .strop");
+    }
+
+    #[gpui::test]
+    fn the_first_edit_births_the_store_with_the_started_seal(cx: &mut gpui::TestAppContext) {
+        let path = quit_test_path("birth");
+        let _ = std::fs::remove_file(&path);
+        let (store, _) = Store::open(&path).unwrap();
+        let editor = editor_with_store(cx, "imported prose", store, true);
+        cx.update_entity(&editor, |editor, _| {
+            let end = editor.doc.rope().len_bytes();
+            editor.doc.edit_bytes(end..end, " and more");
+            // flush_saves waits for the generation: the birth write lands
+            // before the assertions below reopen the file.
+            editor.flush_saves().unwrap();
+        });
+        assert!(path.exists(), "the first edit materializes the file");
+        let (store, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.text, "imported prose and more");
+        let checkpoints = store.checkpoints();
+        assert_eq!(
+            checkpoints.first().map(|cp| cp.name.as_str()),
+            Some("Started"),
+            "birth seals the journal-era anchor checkpoint"
+        );
+        let birth_state = checkpoints[0].state.as_ref().expect("materialized state");
+        assert_eq!(
+            birth_state.text, "imported prose",
+            "the seal holds the state AS IMPORTED, not as edited"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
+    #[test]
+    fn diagnosis_band_edge_is_the_gpui_underline_wave() {
+        let underline_y = 17.;
+        // The band's edge rides the shader's stroke CENTERLINE: mid-box,
+        // 1.5 stroke-widths below the underline y the primitive is given.
+        let center = underline_y + DIAGNOSIS_WAVE_CENTER;
+        for x in [0., 1., 2.25, 4.5, 6.75, 9., 18.] {
+            let shader_y = center
+                + (x * std::f32::consts::TAU / 9.).sin() * 0.8;
+            assert!((diagnosis_wave_y(x, underline_y) - shader_y).abs() < 0.0001);
+            assert!((diagnosis_wave_y(x, underline_y) - center).abs()
+                <= DIAGNOSIS_WAVE_AMPLITUDE + f32::EPSILON);
+        }
+        assert!((diagnosis_wave_y(2.25, underline_y)
+            - (center + DIAGNOSIS_WAVE_AMPLITUDE)).abs() < 0.0001);
+        assert!((diagnosis_wave_y(6.75, underline_y)
+            - (center - DIAGNOSIS_WAVE_AMPLITUDE)).abs() < 0.0001);
+    }

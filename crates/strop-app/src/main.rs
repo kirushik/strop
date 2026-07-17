@@ -23,6 +23,7 @@ mod draw_guard;
 mod editor;
 mod hyphen;
 mod icons;
+mod keymap_window;
 mod files;
 mod paths;
 mod single_instance;
@@ -33,7 +34,7 @@ mod text_field;
 mod theme;
 mod tutorial;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
@@ -116,16 +117,47 @@ fn data_file() -> (PathBuf, bool) {
     match std::env::args().nth(1).as_deref() {
         Some("--new") => return (files::untitled_path(), false),
         Some("--welcome") => return (files::welcome_path(), true),
-        Some(arg) => return (arg.into(), false),
+        Some(arg) => return (files::resolve_portal_path(arg), false),
         None => {}
     }
     if let Some(migrated) = files::migrate_scratch() {
         return (migrated, false);
     }
-    if let Some(recent) = files::recents().into_iter().next() {
+    if let Some(recent) = files::recents()
+        .into_iter()
+        .find(|path| path.exists())
+    {
         return (recent, false);
     }
     (files::welcome_path(), true)
+}
+
+/// Where a document path durably lives, and whether opening it means a
+/// Markdown import: a .md maps to its sibling .strop, importing only when
+/// that sibling does not exist yet — once born, the .strop is the source
+/// of truth and wins every later open. The import itself is LAZY (see
+/// `Editor::stage_import_birth`): deciding `true` here creates nothing.
+/// An unborn sidecar is minted through the sibling-minting law (Copilot,
+/// PR #28): a .md that reached us as an UNRESOLVABLE portal path must not
+/// grow its .strop inside the doc mount, where a foreign name strands as
+/// an invisible `.xdp-*` temp — `files::host_parent_or_documents` sends
+/// it to the documents folder instead. For any ordinary path that law
+/// answers with the .md's own parent, so nothing moves.
+fn open_target(doc_path: &Path) -> (PathBuf, bool) {
+    if doc_path.extension().is_some_and(|e| e == "md") {
+        let sibling = doc_path.with_extension("strop");
+        if sibling.exists() {
+            return (sibling, false);
+        }
+        let name = sibling
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("Untitled.strop"));
+        let minted = files::host_parent_or_documents(doc_path).join(name);
+        let import = !minted.exists();
+        (minted, import)
+    } else {
+        (doc_path.to_owned(), false)
+    }
 }
 
 fn main() {
@@ -200,14 +232,35 @@ fn main() {
                 (Some(p), welcome)
             };
         let mut instance_guard: Option<single_instance::InstanceGuard> = None;
+        // Where the durable file lives and whether this open is a Markdown
+        // import — decided once, up front (`open_target`): the answer gates
+        // both the store below and the lazy-birth staging at the end.
+        let open_plan = doc_path.as_ref().map(|p| open_target(p));
         let store = match &doc_path {
             None => None,
             Some(p) => {
-                let store_path = if p.extension().is_some_and(|e| e == "md") {
-                    p.with_extension("strop")
-                } else {
-                    p.clone()
-                };
+                let (store_path, planned_import) = open_plan.clone().expect("doc_path is Some");
+                let require_existing = std::env::var_os("STROP_REQUIRE_EXISTING").is_some();
+                // Intentional birth at an explicit CLI path may create its
+                // parent; a LAZY .md import must not — its sidecar's parent
+                // is the .md's own directory, and a glance creates nothing
+                // (fleet finding: failed lazy opens littered empty dirs).
+                if !require_existing
+                    && !planned_import
+                    && !store_path.exists()
+                    && let Some(parent) = store_path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    startup_error::show(
+                        startup_error::OpenFailure::from_io(
+                            startup_error::OpenOperation::Open,
+                            store_path,
+                            &e,
+                        ),
+                        cx,
+                    );
+                    return;
+                }
                 // One writer per document: if a live instance already holds
                 // this file, ask it to surface and exit BEFORE we open (and
                 // mutate) the Loro store — two writers on one store is the
@@ -232,6 +285,19 @@ fn main() {
                     }
                 }
                 match Store::open(&store_path) {
+                    Ok((_, None)) if require_existing => {
+                        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+                        drop(instance_guard.take());
+                        startup_error::show(
+                            startup_error::OpenFailure::from_io(
+                                startup_error::OpenOperation::Open,
+                                store_path,
+                                &e,
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
                     Ok(opened) => {
                         if !smoke {
                             files::push_recent(opened.0.path());
@@ -258,9 +324,13 @@ fn main() {
         };
         // Opening a .md imports it into a sibling .strop (existing .strop
         // wins — the durable file is the source of truth once it exists).
+        // The import is READ here but BORN lazily: the state is staged on
+        // the editor (`stage_import_birth`) and the .strop file — plus its
+        // "Started" birth seal — appears only at the first mutation, so a
+        // user whose default .md opener is Strop can glance at any folder
+        // without littering it (quit-without-edits is byte-identical).
         let md_import: Option<(String, SpanSet, BlockMap)> = if let Some(arg) = &doc_path
-            && arg.extension().is_some_and(|e| e == "md")
-            && !arg.with_extension("strop").exists()
+            && open_plan.as_ref().is_some_and(|(_, import)| *import)
         {
             match std::fs::read_to_string(arg) {
                 Ok(md) => {
@@ -306,17 +376,14 @@ fn main() {
                 }
                 None => match &md_import {
                     Some((text, spans, blocks)) => {
-                        store.seed(text);
-                        // The import is the document's birth: a materialized
-                        // "Started" checkpoint. Without it the journal-era
-                        // strip believes the doc began EMPTY — its envelope
-                        // shrinks to today's churn, and a scrub past the
-                        // first keystroke replays an imported novel away.
-                        store.seal_session_with(
-                            "Started",
-                            false,
-                            (text.clone(), spans.clone(), blocks.clone()),
-                        );
+                        // Lazy birth: NOTHING is seeded or sealed here. The
+                        // store stays an empty doc over a missing file; the
+                        // staged state below seeds it — and seals "Started",
+                        // the birth checkpoint the journal-era strip anchors
+                        // on — at the first mutation (Editor::materialize_
+                        // store). Until then the editor is fully functional
+                        // over the imported text, and a quit leaves the
+                        // filesystem exactly as the open found it.
                         (text.clone(), spans.clone(), blocks.clone(), None)
                     }
                     None if welcome => {
@@ -355,6 +422,7 @@ fn main() {
         };
         let window = cx.open_window(
             WindowOptions {
+                app_id: Some("strop".to_owned()),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.clone().into()),
@@ -433,6 +501,12 @@ fn main() {
                         editor.restore_session(entry);
                     }
                     editor.start_blink(cx);
+                    // Lazy birth staging must ride with the store: both are
+                    // in hand before the writer's first act can possibly
+                    // reach `materialize_store`.
+                    if let Some((text, spans, blocks)) = md_import {
+                        editor.stage_import_birth(text, spans, blocks);
+                    }
                     if let Some((store, _)) = store {
                         editor.attach_store(store, cx);
                     }
@@ -493,7 +567,13 @@ fn main() {
                 // the process exit with the bytes still in flight. A graceful
                 // quit has already saved by this point, and the fingerprint
                 // guards make this second call a no-op that writes nothing.
-                let _ = editor.flush_saves();
+                if let Err(e) = editor.flush_saves() {
+                    // LAW 2's last line: the process may not exit with
+                    // dirty bytes and no witness. Salvage a full snapshot
+                    // into the state dir and say where it went.
+                    eprintln!("strop: final save failed at quit: {e}");
+                    editor.salvage_recovery_copy();
+                }
                 // Caret remembered for next open (resume mid-sentence);
                 // never a question, never a dialog (DESIGN §4b tension 6).
                 editor.record_exit_state();
@@ -586,6 +666,34 @@ mod tests {
             .unwrap()
         });
         VisualTestContext::from_window(window.into(), cx)
+    }
+
+    #[test]
+    fn open_target_routes_md_imports_and_the_sibling_strop_wins() {
+        let dir = std::env::temp_dir()
+            .join(format!("strop-open-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("essay.md");
+        std::fs::write(&md, "# hi").unwrap();
+        assert_eq!(
+            open_target(&md),
+            (dir.join("essay.strop"), true),
+            "a lone .md maps to its sibling and imports (lazily)"
+        );
+        std::fs::write(dir.join("essay.strop"), b"x").unwrap();
+        assert_eq!(
+            open_target(&md),
+            (dir.join("essay.strop"), false),
+            "an existing sibling .strop wins — never a re-import"
+        );
+        let strop = dir.join("direct.strop");
+        assert_eq!(
+            open_target(&strop),
+            (strop.clone(), false),
+            "a .strop opens as itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui::test]

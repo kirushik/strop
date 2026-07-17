@@ -1170,6 +1170,18 @@ fn station_rank(name: &str, manual: bool) -> u8 {
     }
 }
 
+/// The strip's no-session law, exported for the OTHER history chrome (the
+/// legacy side panel and its banner): is this checkpoint a session-ranked
+/// automatic whose internal name ("Session start", "Session", auto
+/// "Started", "Fresh tutorial") must never print? No string containing
+/// "session" reaches the chrome, ever (docs/history-strip.md §2) — such a
+/// row's datum is its timestamp. A writer's OWN name always outranks the
+/// vocabulary (station_rank's manual arm), so a manually named "Session
+/// start" still prints.
+pub fn session_named(name: &str, manual: bool) -> bool {
+    station_rank(name, manual) == RANK_SESSION
+}
+
 /// Reflex checkpoints are deliberately unnamed on the strip (bare ticks,
 /// lowest rank — design §2), and so are session starts: the date lane already
 /// says when a sitting began, and a lane full of "Session start" echoes was
@@ -1630,6 +1642,25 @@ mod tests {
         JournalEvent::CardRaised { t, id, card_kind: NoteKind::Diagnosis, range,
             body: body.into(), title: "Question".into(), level: "line".into(),
             pass_id: 1, status: NoteStatus::Open, orphaned: false, unverified: false }
+    }
+
+    #[test]
+    fn session_names_never_reach_the_chrome_but_writer_names_always_do() {
+        // The vocabulary of Strop-written session automatics.
+        for name in ["Session start", "Session", "Started"] {
+            assert!(session_named(name, false), "{name} (auto) must not print");
+        }
+        // The tutorial carve-out persisted its chrome name as manual.
+        assert!(session_named("Fresh tutorial", true));
+        assert!(session_named("Fresh tutorial", false));
+        // A writer's OWN title outranks the vocabulary, verbatim.
+        assert!(!session_named("Session start", true));
+        assert!(!session_named("Started", true));
+        // Everything else keeps its name (or its Auto-save placeholder).
+        assert!(!session_named("", false));
+        assert!(!session_named("Checkpoint 3", false));
+        assert!(!session_named("Restored", false));
+        assert!(!session_named("Draft complete", false));
     }
 
     #[test]

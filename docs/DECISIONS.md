@@ -172,3 +172,41 @@ Round 1:
   color-language.md already draws this line: warm = writer = full ink,
   drained = machine material receding from life). Any future "drain"
   proposal must name machine material as its subject or it is out of order.
+
+## D10. The sharp-corners round (2026-07-16)
+
+Twenty-three field notes ran through investigation (six read-only
+agents), adversarial persona panels (Raskin/Norman/Birman/Tufte/
+Bringhurst/the working writer), and a mixed Fable+Sol build fleet.
+The durable rulings, where they live:
+
+- **Mode nouns are dead** — no "Reading"/"Away" string reaches the
+  chrome in any language; the door's state is the artifact (the
+  wordless ⌇+count chip, `docs/impl/14-door-chip.md`). Presence
+  words survive only where true and transient.
+- **The space rail** (`docs/impl/15-scrollbar.md`): a standing map
+  of the writer's structure — marks act, warp-and-grab, the scrap
+  seam is the mapping's truth condition, one warm caret fleck
+  forever, and the rail answers *where*, never *how far along*.
+- **Book typography goes full convention**
+  (`docs/impl/16-book-typography.md`): 1.5em indent on a bare grid,
+  language-conditional suppression (RU indents uniformly), lists
+  detected by shape but never promoted, quotes close their own
+  empty pairs (never after «).
+- **Trust repairs as law**: any single stroke removing ≥80 chars
+  survives in the graveyard, replacement or not (impl/02 §4); a
+  glanced .md births nothing until the first edit; a clean close is
+  instant and writes nothing; a failed final save salvages a copy
+  and says where (LAW 2's last line); saves never recreate a
+  vanished directory.
+- **Looping/breathing chrome animation stays banned**
+  (attention-motion.md:80 upheld against a wished-for pulse);
+  discrete onset + completion pip is the lawful in-flight grammar.
+- **Non-features, refused with reasons**: list automation (P1),
+  mode auto-detection (P2), a minimap (P1/P11), chat surfaces
+  (locked — questions anchor to text, one card, no thread), forced
+  onboarding (P2). The system-voice/subscription primitive is
+  parked with a charter in `docs/system-voice-backlog.md`.
+- **Test isolation is a hard rule** (AGENTS.md): every run outside
+  wrun.sh scrubs the display env and uses a private runtime dir —
+  a worker's test windows were stealing the operator's focus.

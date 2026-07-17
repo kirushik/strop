@@ -192,3 +192,58 @@ Wave order: A ∥ B, merge; then C ∥ D, merge; then E. Workers never
 commit; never run cargo fmt; target dirs on the real disk only
 (NEVER /tmp); XDG_RUNTIME_DIR=/tmp/strop-runtime for socket tests
 and the rig.
+
+## Amendment (2026-07-17): the dock comes home
+
+Supersedes item 4's control geometry ONLY (readout de-chipping, mark
+grammar, banner rules, saltire, ellipsis fold all stand). Trigger: on
+a young document the selvage-owned Now clamps onto the readout's
+x=28 origin and the two garble (operator screenshot); and the
+playhead-anchored dock's travel/flip is itself a defect, not a
+feature — controls need addresses (five-persona RFC, run
+sol-now-ribbon, 2026-07-17; the full-height right ribbon proposal
+was evaluated and REJECTED — a second geometric "present" competing
+with the honest selvage, and it dominates exactly the young
+histories that have the least data).
+
+The law now: the top row is FOUR frame-owned, disjoint, fixed slots,
+computed together before render — readout at x=28 (existing width +
+Compare degradation), a fixed action slot after it (Restore first,
+then Name/Rename, then Compare; overflow folds behind the dashed
+ellipsis, contents may change but the slot's x never moves), a
+locale-measured Now slot immediately left of close, and close at the
+frame edge. `playhead_x`/`selvage_x` drive NO control positions.
+Now stays visible at present (muted, pointer-inert), brightens +
+dashes when parked, returns via the existing Esc/Now path with the
+180 ms beat (cross-fade under reduce_motion). The cream selvage
+remains the sole geometric present — no vertical fill, no line from
+the Now chip into the fabric. EN "Now", RU «Сейчас» (provisional,
+corridor-tested), horizontal only.
+
+### Coda (2026-07-17 night): the frame is the CONTENT frame
+
+The four-slot law shipped with a coordinate-domain defect: slots were
+allocated in viewport width but positioned inside the CSD-inset
+content surface, so a floating window clipped Now at the edge and
+pushed close outside it entirely (operator screenshot). The law
+gains its missing sentence: slot arithmetic runs in
+`content_width()`, the same domain the strip's own edges live in —
+any strip control positioned from `viewport_size` is wrong by one
+gutter per floating side. Plus two care rules: 12px minimum air
+between Now and close (opposite verbs never touch), and all four
+slots share one 22px centered band (one row, one optical baseline;
+Now right-aligns as the axis end cap).
+
+The dock returns under P14's declared collision law: the verb tier is
+chosen from frame width alone (C5), then placement is one continuous
+motion — the dock trails the playhead and parks gracefully at both
+rails; the side-swap flip was cut after a field session found the left
+clamp graceful and the right flip a jump (2026-07-18) — with the fixed
+fallback when nothing fits (C4); the naming composer freezes
+at fallback (C6), the dock occludes the fabric (C7), and follows the scrub
+on every frame (C8), with young-document convergence expected (C9). Now
+returns to the selvage at `tail + 14px` when the measured label plus 14px
+far air fits before the rail end, otherwise it uses its former top-row
+end-cap address; its padded target owns the lane collision. The desk-click
+experiment is retired after one field session found it undiscoverable and
+prone to accidental exits.

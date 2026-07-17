@@ -136,8 +136,19 @@ markers (justified, marker-indented); quotes indent one em both
 sides; code blocks set in PT Mono, ragged, never hyphenated; images
 scale to the measure, keep whole (move to next page if short; scale
 to page if oversized). Footnote refs paint as superscripts (the
-fn_marks machinery); definitions stay off-page (v1 law; on-page
-placement is G1's open research item).
+fn_marks machinery). *AMENDED 2026-07-17 (supersedes the v1
+off-page law; G1's research item is resolved by convention):*
+definitions set at the BOTTOM of the page whose body carries their
+ref's superscript — print convention: reduced-alpha third-of-measure
+rule, `FOOTNOTE_AIR`, 0.85× face with proportionate leading, the
+ref-order number as a hanging marker, justified/hyphenated by the
+body engine. Pagination reserves the space; a ref whose note cannot
+share its page moves forward WITH the note (whole-note move-forward
+v1; continued-note splitting only when a single note exceeds a
+page's usable area). A definition with no in-text ref sets on the
+final page after the anchored notes — the writer's text is never
+silently dropped; the unanchored note IS the honest rendering of an
+unanchored source line.
 
 **2.8 Unit tests (Wave A gate).** The breaker/paginator run over a
 fake measurer: badness candidate choice, hyphen-streak cap, widow/

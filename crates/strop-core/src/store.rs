@@ -310,11 +310,11 @@ fn compact_on_open(doc: LoroDoc, original: &[u8], path: &Path) -> LoroDoc {
     {
         return doc;
     }
-    let bak = path.with_extension("strop.pre-compact.bak");
+    let bak = sidecar_path(path, ".pre-compact.bak");
     if !bak.exists() && fs::write(&bak, original).is_err() {
         return doc;
     }
-    let tmp = path.with_extension("strop.tmp");
+    let tmp = sidecar_path(path, ".tmp");
     if fs::write(&tmp, &shallow).is_err() || fs::rename(&tmp, path).is_err() {
         let _ = fs::remove_file(&tmp);
         return doc;
@@ -542,6 +542,13 @@ pub struct Store {
     /// a save appends only the tail past these counts. Seeded from the file
     /// at open; a fresh document starts at zero.
     journal_saved: std::cell::RefCell<(usize, usize)>,
+    /// The doc's frontiers as of open / the last prepared save — the quit
+    /// guard's clean predicate (`needs_save`). The editor's `store_dirty`
+    /// flag only knows about edits routed through its dirty chokepoint;
+    /// open-time session seals, idle-gap "Session" checkpoints and the
+    /// cold-read seal mutate the doc directly, and a close must still
+    /// flush them (papercuts LAW 2: never exit with unflushed bytes).
+    saved_frontiers: std::cell::RefCell<Frontiers>,
 }
 
 /// See `Store::saved`. Zeroes mean "unknown" — the next save writes.
@@ -613,6 +620,15 @@ pub struct SaveWorker {
 
 impl SaveWorker {
     pub fn new() -> Self {
+        Self::with_notify(|| {})
+    }
+
+    /// A worker whose thread calls `notify` after posting each completion.
+    /// The hook is how a save's arrival WAKES the owning thread (the editor
+    /// parks a waker behind it) instead of the completion sitting in the
+    /// channel until the next 1s heartbeat — the quit guard's "a fast final
+    /// write closes the window in milliseconds, not a second" requirement.
+    pub fn with_notify(notify: impl Fn() + Send + 'static) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<(SaveGeneration, PreparedSave)>();
         let (completion_tx, completion_rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -626,6 +642,7 @@ impl SaveWorker {
                     {
                         break;
                     }
+                    notify();
                 }
             })
             .expect("spawn filesystem save worker");
@@ -672,10 +689,7 @@ impl Default for SaveWorker {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("strop.tmp");
+    let tmp = sidecar_path(path, ".tmp");
     let mut file = fs::File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -686,6 +700,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 #[cfg(not(windows))]
@@ -739,6 +759,15 @@ impl Store {
         match fs::rename(&self.path, &new_path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // Escaping a portal mount crosses filesystems (FUSE → host);
+            // rename can't, copy-then-remove can. If the remove fails,
+            // keep both files — two copies beat zero.
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                fs::copy(&self.path, &new_path)?;
+                if let Err(e) = fs::remove_file(&self.path) {
+                    eprintln!("strop: rename left the old file behind: {e}");
+                }
+            }
             Err(e) => return Err(e),
         }
         self.path = new_path;
@@ -761,6 +790,7 @@ impl Store {
                     path,
                     saved: Default::default(),
                     journal_saved: Default::default(),
+                    saved_frontiers: Default::default(),
                 };
                 // The aside boundary persists as its OWN key beside "kinds"
                 // (review B13/H42): an older build reads only "kinds" and so
@@ -869,6 +899,13 @@ impl Store {
                         ..Default::default()
                     };
                 }
+                // The clean-close baseline is the doc AS OPENED — after the
+                // open-time normalizations above (schema/caption migration,
+                // compaction). A read-only session therefore closes without
+                // a write; a legacy file's migrations simply re-run at the
+                // next open (deterministic) and persist with the first real
+                // save, instead of every glance rewriting the file.
+                *store.saved_frontiers.borrow_mut() = store.doc.oplog_frontiers();
                 Ok((
                     store,
                     Some(Loaded {
@@ -889,6 +926,9 @@ impl Store {
                     path,
                     saved: Default::default(),
                     journal_saved: Default::default(),
+                    // An empty doc over a missing file: the default (empty)
+                    // frontiers already say "nothing to flush".
+                    saved_frontiers: Default::default(),
                 },
                 None,
             )),
@@ -1477,10 +1517,31 @@ impl Store {
             .doc
             .export(ExportMode::Snapshot)
             .map_err(io::Error::other)?;
+        // These bytes ARE the doc at this frontier; once they land, disk
+        // matches. Optimistic on write failure — but a failed write also
+        // raises `save_error`, which every quit path checks before the
+        // clean-close shortcut, so the LAW holds regardless.
+        *self.saved_frontiers.borrow_mut() = self.doc.oplog_frontiers();
         Ok(PreparedSave {
             path: self.path.clone(),
             bytes,
         })
+    }
+
+    /// Has anything moved past the last PREPARED save (or the open read)?
+    /// The frontiers baseline advances in `prepare_save`, before the bytes
+    /// land — deliberately optimistic: a failed write raises `save_error`,
+    /// and every quit path consults that alongside this predicate, so a
+    /// lost write can never look clean (see `prepare_save`'s comment).
+    /// Doc ops via the frontiers baseline; the journal's unpersisted tail by
+    /// count (its items live editor-side until a save pushes them). The
+    /// quit guard's clean predicate: false means a close may skip the final
+    /// save entirely — nothing would be lost.
+    pub fn needs_save(&self, journal: &Journal) -> bool {
+        if *self.journal_saved.borrow() != (journal.runs.len(), journal.events.len()) {
+            return true;
+        }
+        self.doc.oplog_frontiers() != *self.saved_frontiers.borrow()
     }
 
     pub fn path(&self) -> &Path {
@@ -1519,8 +1580,63 @@ mod tests {
         fs::write(&path, b"old").unwrap();
         atomic_write(&path, b"new snapshot").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new snapshot");
-        assert!(!path.with_extension("strop.tmp").exists());
+        assert!(!sidecar_path(&path, ".tmp").exists());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rename_survives_a_filesystem_boundary() {
+        // temp_dir is usually tmpfs while target/ sits on the repo's disk —
+        // when they differ this exercises the CrossesDevices copy fallback
+        // (the portal-mount escape); when they don't, plain rename covers
+        // the same contract. Either way: content moves, old path empties.
+        let old = temp_path("rename-across");
+        let _ = fs::remove_file(&old);
+        let (mut store, loaded) = Store::open(&old).unwrap();
+        assert!(loaded.is_none());
+        fs::write(&old, b"the manuscript").unwrap();
+        let far_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/strop-test-rename");
+        fs::create_dir_all(&far_dir).unwrap();
+        let new = far_dir.join(format!("moved-{}.strop", std::process::id()));
+        let _ = fs::remove_file(&new);
+
+        store.rename_file(&new).unwrap();
+        assert_eq!(store.path(), new);
+        assert_eq!(fs::read(&new).unwrap(), b"the manuscript");
+        assert!(!old.exists());
+        let _ = fs::remove_file(&new);
+    }
+
+    #[test]
+    fn sidecars_append_to_extensionless_dotted_names() {
+        let path = Path::new("my-notes v0.2");
+        assert_eq!(
+            sidecar_path(path, ".tmp"),
+            PathBuf::from("my-notes v0.2.tmp")
+        );
+        assert_eq!(
+            sidecar_path(path, ".pre-compact.bak"),
+            PathBuf::from("my-notes v0.2.pre-compact.bak")
+        );
+        assert_eq!(
+            sidecar_path(Path::new("doc.strop"), ".tmp"),
+            PathBuf::from("doc.strop.tmp")
+        );
+    }
+
+    #[test]
+    fn atomic_save_does_not_recreate_a_vanished_parent() {
+        let dir = temp_path("vanished-parent");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("document.strop");
+        fs::remove_dir(&dir).unwrap();
+
+        assert!(atomic_write(&path, b"snapshot").is_err());
+        assert!(!dir.exists());
+        assert!(!path.exists());
+        assert!(!sidecar_path(&path, ".tmp").exists());
     }
 
     #[test]
@@ -1920,7 +2036,7 @@ manuscript opens here");
     #[test]
     fn bloated_file_compacts_at_open_without_losing_state() {
         let path = temp_path("compact");
-        let bak = path.with_extension("strop.pre-compact.bak");
+        let bak = sidecar_path(&path, ".pre-compact.bak");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&bak);
 
@@ -2758,7 +2874,7 @@ manuscript opens here");
         let history = History::default();
         let notes = Annotations::default();
         let mut graveyard = Graveyard::default();
-        graveyard.file("a cut sentence".into(), "origin".into(), 6, 111, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
+        graveyard.file("a cut sentence".into(), "origin".into(), 6, 111, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false, false);
 
         store
             .save_with_state(&spans, &blocks, &history, &notes, &Journal::default(), &graveyard, &Provenance::default())
@@ -2866,6 +2982,74 @@ manuscript opens here");
         let checkpoints = store.checkpoints();
         assert_eq!(checkpoints.len(), 2, "duplicate names are allowed");
         assert!(checkpoints.iter().all(|c| c.manual && c.created_ms == Some(1_234_567)));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn needs_save_sees_seals_and_journal_tail_but_not_a_clean_open() {
+        let path = temp_path("needs-save");
+        let _ = fs::remove_file(&path);
+        let (store, existing) = Store::open(&path).unwrap();
+        assert!(existing.is_none());
+        let empty = Journal::default();
+        assert!(!store.needs_save(&empty), "an empty doc over a missing file has nothing to flush");
+        store.seed("imported prose");
+        assert!(store.needs_save(&empty), "seeding moved the doc past the baseline");
+        store
+            .save_with_state(
+                &SpanSet::default(),
+                &BlockMap::default(),
+                &History::default(),
+                &Annotations::default(),
+                &empty,
+                &Graveyard::default(),
+                &Provenance::default(),
+            )
+            .unwrap();
+        assert!(!store.needs_save(&empty), "a save re-baselines the frontiers");
+        // A checkpoint seal never routes through the editor's dirty flag —
+        // the frontier baseline is what keeps LAW 2 honest about it.
+        store.add_checkpoint("Session start", false);
+        assert!(store.needs_save(&empty), "a seal must reach disk before a close");
+        drop(store);
+
+        let (store, loaded) = Store::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert!(
+            !store.needs_save(&loaded.journal),
+            "a read-only reopen starts clean — glancing at a file must not rewrite it"
+        );
+        let tail = Journal::from_parts(
+            vec![EditRun { t0: 1, t1: 2, pos: 0, del_chars: 0, del_words: None, ins: "x".into() }],
+            Vec::new(),
+        );
+        assert!(store.needs_save(&tail), "an unpersisted journal tail counts as dirty");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_worker_wakes_its_owner_on_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let path = temp_path("worker-notify");
+        let notified = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = notified.clone();
+        let mut worker = SaveWorker::with_notify(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let generation = worker.request(PreparedSave {
+            path: path.clone(),
+            bytes: b"woken".to_vec(),
+        });
+        worker.wait_for(generation).result.unwrap();
+        // The completion send happens-before the notify on the worker
+        // thread, but `wait_for` returns on the send — give the trailing
+        // notify a bounded moment rather than assert a race.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while notified.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "completion never notified");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let _ = fs::remove_file(&path);
     }
 }

@@ -8,6 +8,115 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// The document ID and path below it for an XDG document-portal path.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn portal_path_parts(path: &Path, runtime_dir: &Path) -> Option<(String, PathBuf)> {
+    let relative = path.strip_prefix(runtime_dir.join("doc")).ok()?;
+    let mut components = relative.components();
+    let doc_id = components.next()?.as_os_str().to_str()?.to_owned();
+    if doc_id.is_empty() {
+        return None;
+    }
+    Some((doc_id, components.collect()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> PathBuf {
+    let Some((doc_id, tail)) = portal_path_parts(&path, runtime_dir) else {
+        return path;
+    };
+    // One honest attempt per document id per process (Copilot, PR #28):
+    // recents() sits on the palette's render path via omni_rows, so a doc
+    // id whose GetHostPaths already refused us must not cost a fresh
+    // blocking D-Bus round-trip on every keystroke. The verdict is sticky
+    // until relaunch — a portal that starts answering mid-session is far
+    // rarer than the render loop is hot, and the keep-rule below already
+    // tolerates an unresolved entry.
+    static DEAD_DOC_IDS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashSet<String>>,
+    > = std::sync::LazyLock::new(Default::default);
+    if DEAD_DOC_IDS.lock().unwrap().contains(&doc_id) {
+        return path;
+    }
+    let result: Result<PathBuf, String> = async {
+        let documents = ashpd::documents::Documents::new().await
+            .map_err(|error| error.to_string())?;
+        let id = ashpd::documents::DocumentID::from(doc_id.as_str());
+        let paths = documents.host_paths(std::slice::from_ref(&id)).await
+            .map_err(|error| error.to_string())?;
+        let host_path = paths.get(&id)
+            .ok_or_else(|| "portal returned no document host path".to_owned())?;
+        let host_dir = host_path.as_ref().parent().unwrap_or(Path::new(""));
+        Ok(host_dir.join(tail))
+    }
+    .await;
+    match result {
+        Ok(host_path) => host_path,
+        Err(error) => {
+            eprintln!("strop: could not resolve portal path {}: {error}", path.display());
+            DEAD_DOC_IDS.lock().unwrap().insert(doc_id);
+            path
+        }
+    }
+}
+
+/// Resolve an XDG document-portal path, failing open when the portal is
+/// absent. On OSes without an XDG portal (macOS, Windows) this is the
+/// identity — the portal stack compiles only where a portal can exist.
+pub async fn resolve_portal_path_async(path: PathBuf) -> PathBuf {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return resolve_portal_path_async_at(path, Path::new(&runtime_dir)).await;
+    }
+    path
+}
+
+/// Synchronous convenience for path boundaries outside GPUI tasks.
+pub fn resolve_portal_path(path: impl Into<PathBuf>) -> PathBuf {
+    gpui::block_on(resolve_portal_path_async(path.into()))
+}
+
+/// Still under the portal mount — i.e. `resolve_portal_path` couldn't
+/// escape it (dead doc id, portal absent). Such a path names plumbing,
+/// not a place a writer knows.
+///
+/// Field forensics 2026-07-17: a dev build launched through the snap
+/// rustup's `cargo run` lives in a `snap.rustup.cargo-*.scope` cgroup, so
+/// xdg-desktop-portal classifies it as a CONFINED snap app — the file
+/// chooser then hands out doc-portal paths, and GetHostPaths refuses that
+/// same caller, so resolution fails 100% in-app while succeeding from any
+/// unconfined shell. Identical binary, different cgroup, opposite result.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "freebsd")),
+    allow(unused_variables)
+)]
+fn is_portal_path(path: &Path) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return portal_path_parts(path, Path::new(&runtime_dir)).is_some();
+    }
+    false
+}
+
+/// The host directory a sibling of `path` should be minted in — rename
+/// targets, "save a copy" seeds, recovery copies. A resolvable path
+/// answers with its own parent. An UNRESOLVABLE portal path must never
+/// mint one: a foreign filename written into a single-file doc mount
+/// lands on the host as a hidden `.xdp-*` temp that no finalize ever
+/// renames — the writer's file goes invisible (observed live,
+/// 2026-07-17). The fallback is the one place Strop promises files
+/// live: the documents folder.
+pub fn host_parent_or_documents(path: &Path) -> PathBuf {
+    let resolved = resolve_portal_path(path.to_path_buf());
+    if is_portal_path(&resolved) {
+        return crate::paths::documents_dir();
+    }
+    resolved
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::paths::documents_dir)
+}
+
 /// First free "Untitled.strop" / "Untitled 2.strop" / … in the Strop folder.
 pub fn untitled_path() -> PathBuf {
     let dir = crate::paths::documents_dir();
@@ -57,13 +166,46 @@ fn recents_file() -> PathBuf {
     crate::paths::state_dir().join("recents.json")
 }
 
-/// Most-recent-first, existing files only.
+/// Most-recent-first. Missing files stay visible as stale evidence.
+/// Portal paths persisted before the resolver existed heal at read: the
+/// resolved list is written back, so a healed entry never re-triggers a
+/// D-Bus round-trip on later reads — recents() sits on the palette's
+/// render path via omni_rows. An entry that FAILS to resolve is kept as
+/// long as its FUSE path still opens (the grant may outlive a failed
+/// GetHostPaths, and this entry can be the only pointer to the writer's
+/// last document — dropping it once cost a night of "why does Untitled
+/// open", 2026-07-17); only a dead mount — unresolvable AND gone — is
+/// dropped as plumbing.
 pub fn recents() -> Vec<PathBuf> {
     let Ok(json) = std::fs::read_to_string(recents_file()) else {
         return Vec::new();
     };
     let list: Vec<PathBuf> = serde_json::from_str(&json).unwrap_or_default();
-    list.into_iter().filter(|p| p.exists()).collect()
+    let resolved: Vec<PathBuf> = list
+        .iter()
+        .cloned()
+        .map(resolve_portal_path)
+        .filter(|p| !is_portal_path(p) || p.exists())
+        .collect();
+    if resolved != list {
+        let _ = std::fs::write(
+            recents_file(),
+            serde_json::to_string_pretty(&resolved).unwrap_or_default(),
+        );
+    }
+    resolved
+}
+
+fn cap_recents(list: &mut Vec<PathBuf>) {
+    let mut live = 0;
+    list.retain(|path| {
+        if path.exists() {
+            live += 1;
+            live <= 20
+        } else {
+            true
+        }
+    });
 }
 
 pub fn push_recent(path: &Path) {
@@ -79,7 +221,7 @@ pub fn push_recent(path: &Path) {
     let mut list = recents();
     list.retain(|p| p != &path);
     list.insert(0, path);
-    list.truncate(20);
+    cap_recents(&mut list);
     let file = recents_file();
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -308,7 +450,10 @@ pub fn reveal(path: &Path) {
 /// the same CRDT file unless the user opens the same path twice).
 pub fn open_in_new_window(path: &Path) {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).arg(path).spawn();
+        let _ = std::process::Command::new(exe)
+            .env("STROP_REQUIRE_EXISTING", "1")
+            .arg(path)
+            .spawn();
     }
 }
 
@@ -340,23 +485,90 @@ pub fn open_welcome_window() {
     }
 }
 
-/// Sanitize a typed title into a file stem (keeps Unicode letters, trims
-/// path separators and leading dots).
+/// Sanitize a typed title into a portable file stem. Legal punctuation such
+/// as hyphens and interior dots is preserved because titles rely on it.
 pub fn stem_from_title(title: &str) -> Option<String> {
-    let cleaned: String = title
+    let mut cleaned: String = title
         .trim()
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == '\0' { ' ' } else { c })
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect::<String>()
         .trim()
         .trim_start_matches('.')
+        .trim_end_matches(['.', ' '])
         .to_string();
-    (!cleaned.is_empty()).then_some(cleaned)
+    if cleaned.is_empty() {
+        return None;
+    }
+    let device = cleaned
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let numbered_device = |prefix| {
+        device
+            .strip_prefix(prefix)
+            .is_some_and(|n| {
+                matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+    };
+    let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || numbered_device("COM")
+        || numbered_device("LPT");
+    if reserved {
+        cleaned.push('_');
+    }
+    Some(cleaned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn document_portal_path_exposes_id_and_filename() {
+        let runtime = Path::new("/tmp/strop-test-runtime");
+        let path = runtime.join("doc/7ad41c2e/Draft.strop");
+        assert_eq!(
+            portal_path_parts(&path, runtime),
+            Some(("7ad41c2e".to_owned(), PathBuf::from("Draft.strop")))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn ordinary_path_is_not_a_document_portal_path() {
+        let runtime = Path::new("/tmp/strop-test-runtime");
+        let path = Path::new("/home/writer/Documents/Draft.strop");
+        assert_eq!(portal_path_parts(path, runtime), None);
+        assert_eq!(
+            gpui::block_on(resolve_portal_path_async_at(path.to_owned(), runtime)),
+            path
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn document_portal_path_keeps_nested_tail() {
+        let runtime = Path::new("/tmp/strop-test-runtime");
+        let path = runtime.join("doc/7ad41c2e/Project/images/cover.png");
+        assert_eq!(
+            portal_path_parts(&path, runtime),
+            Some((
+                "7ad41c2e".to_owned(),
+                PathBuf::from("Project/images/cover.png")
+            ))
+        );
+    }
 
     /// One sequential test for everything env-dependent (env is process
     /// global; parallel tests must not each repoint HOME). Linux/BSD only:
@@ -374,6 +586,7 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", tmp.join("state"));
             std::env::set_var("XDG_DATA_HOME", tmp.join("data"));
             std::env::set_var("XDG_CONFIG_HOME", tmp.join("config"));
+            std::env::set_var("XDG_RUNTIME_DIR", tmp.join("runtime"));
         }
 
         // Recents: round-trip, dedupe, most-recent-first.
@@ -394,6 +607,15 @@ mod tests {
         assert!(u1.parent().unwrap().is_dir(), "folder exists from birth");
         std::fs::write(&u1, b"x").unwrap();
         assert!(untitled_path().to_string_lossy().contains("Untitled 2"));
+
+        // Sibling minting: a host path mints next to itself; an
+        // unresolvable portal path must NEVER mint inside the doc mount
+        // (the invisible `.xdp-*` temp trap) — it falls back to the
+        // documents folder. The fake doc id can't resolve whether or not
+        // a session bus is reachable, so this holds hermetically.
+        assert_eq!(host_parent_or_documents(&a), tmp);
+        let trapped = tmp.join("runtime/doc/deadbeef/Chapter.strop");
+        assert_eq!(host_parent_or_documents(&trapped), untitled_path().parent().unwrap());
 
         // Legacy hidden scratch migrates into the visible folder.
         let scratch = tmp.join("data/strop/scratch.strop");
@@ -497,5 +719,36 @@ mod tests {
         assert_eq!(stem_from_title("..hidden"), Some("hidden".into()));
         assert_eq!(stem_from_title("   "), None);
         assert_eq!(stem_from_title("///"), None);
+        assert_eq!(stem_from_title("draft.old"), Some("draft.old".into()));
+        assert_eq!(
+            stem_from_title("my-notes v0.2"),
+            Some("my-notes v0.2".into())
+        );
+        assert_eq!(stem_from_title("CON"), Some("CON_".into()));
+        assert_eq!(stem_from_title("con.txt"), Some("con.txt_".into()));
+        assert_eq!(stem_from_title("notes."), Some("notes".into()));
+        assert_eq!(stem_from_title("a:b"), Some("a b".into()));
+    }
+
+    #[test]
+    fn missing_recents_do_not_consume_the_live_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "strop-recents-cap-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = root.join("missing.strop");
+        let mut list = vec![missing.clone()];
+        for ix in 0..21 {
+            let path = root.join(format!("live-{ix}.strop"));
+            std::fs::write(&path, b"x").unwrap();
+            list.push(path);
+        }
+
+        cap_recents(&mut list);
+        assert_eq!(list.iter().filter(|path| path.exists()).count(), 20);
+        assert!(list.contains(&missing));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

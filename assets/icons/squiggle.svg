@@ -1,0 +1,8 @@
+<!-- Pictorial family. The editor's mark: the same horizontal squiggle that
+     underlines a diagnosed span in the prose — one drawn mark for "the
+     editor's notes" everywhere it is counted or gathered (chip, narrow
+     drawer). Authored on the 13px display grid: two full waves, ±1.5px
+     around the vertical centre, round caps like its siblings. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13" fill="none" stroke="#000" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M1 7.5C2 5.5 3 5.5 4 7.5C5 9.5 6 9.5 7 7.5C8 5.5 9 5.5 10 7.5C10.7 8.9 11.4 9.2 12 8.2"/>
+</svg>

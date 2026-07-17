@@ -835,7 +835,7 @@ proptest! {
         let lang = if ru { Lang::Ru } else { Lang::En };
         let mut current = prefix;
         for _ in 0..4 {
-            match process(&current, lang) {
+            match process(&current, None, lang) {
                 None => return Ok(()),
                 Some(sub) => {
                     prop_assert!(
@@ -852,7 +852,7 @@ proptest! {
             }
         }
         prop_assert!(
-            process(&current, lang).is_none(),
+            process(&current, None, lang).is_none(),
             "typograph did not quiesce after 4 substitutions: {:?}", current
         );
     }

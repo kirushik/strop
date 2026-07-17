@@ -25,8 +25,13 @@ glob = "0.3"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 # Pinned to a FORK of zed-industries/zed — github.com/kirushik/zed, branch
-# `strop-patches-on-main`, tip `994cdfd1`: the two gpui-tree fixes below rebased
-# onto upstream stable v1.10.2 (adc60ccf, 2026-07-10), plus dependency trims.
+# `wrap-trailing-punctuation` (tag `strop-0.3.0`), tip `8e2f596f`: the
+# `strop-patches-on-main` lineage (994cdfd1 — the gpui-tree fixes below rebased
+# onto upstream stable v1.10.2, adc60ccf, plus dependency trims) plus the
+# line-wrap punctuation law: a wrapped line never opens with sentence-final
+# or paired punctuation (`? ! … « » " " „ ( ) [ ] { }` glue to the word
+# before them, Russian typographic tradition; deliberate trade: `foo?b=2`
+# URLs now glue too).
 # 2026-06-19 dependency review (docs/dependency-review-2026-06.md): -43 crates vs
 # the old f3f236eb pin (826 -> 783) — async-std/async-tar gone (cleared
 # RUSTSEC-2025-0052). The image trim additionally stops compiling avif(rav1e)/exr
@@ -60,8 +65,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 # whole UI renders invisible. That was issue #10 (github.com/kirushik/strop/
 # issues/10); the flag is a no-op on the Linux build (gpui_macos is a
 # cfg(target_os = "macos") dep, so nothing forwards there).
-gpui = { git = "https://github.com/kirushik/zed", rev = "994cdfd1a274030628911b607fcee96cedbce059", version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
-gpui_platform = { git = "https://github.com/kirushik/zed", rev = "994cdfd1a274030628911b607fcee96cedbce059", version = "0.1.0", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui = { git = "https://github.com/kirushik/zed", rev = "8e2f596f9f17cb401e0fb2e9253d5ed6bf5748f6", version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/kirushik/zed", rev = "8e2f596f9f17cb401e0fb2e9253d5ed6bf5748f6", version = "0.1.0", default-features = false, features = ["font-kit", "wayland", "x11"] }
 
 [profile.dev]
 # gpui is a huge dep tree; keep its codegen optimized even in dev builds

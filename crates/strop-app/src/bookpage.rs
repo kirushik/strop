@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use strop_core::document::{BlockKind, BlockMap, InlineAttr, SpanSet};
+use strop_core::typograph::{self, Lang};
 
 // ---- Parameters (research-linebreak §4, the spec table) -------------------
 
@@ -77,6 +78,13 @@ pub const QUOTE_INDENT_EM: f32 = 1.0;
 pub const LIST_INDENT_EM: f32 = 1.5;
 /// Gap between a list marker's right edge and its item text, in em.
 pub const MARKER_GAP_EM: f32 = 0.5;
+/// First-line paragraph indent in the book door (impl 16 §1).
+pub const PARA_INDENT_EM: f32 = 1.5;
+/// Protect the paragraph signal when the final line is exceptionally short
+/// or almost fills the measure (impl 16 §1).
+pub const LAST_LINE_PENALTY: f32 = 2_000.0;
+/// Heading air is independent of the body paragraph grid (impl 16 §1).
+pub const HEAD_AIR_BELOW: f32 = 8.0;
 /// The deterministic box for an image whose dimensions are unknown — the
 /// editor's own decoding/missing placeholder height (editor.rs); regions 12
 /// wants the same input to paginate identically every time.
@@ -87,6 +95,10 @@ pub const IMAGE_PLACEHOLDER_HEIGHT: f32 = 56.0;
 /// clamp and the paint's font size share this one number, so the width
 /// the clamp reasons about IS the width the ink takes.
 pub const CAPTION_SCALE: f32 = 0.8;
+/// Footnotes use the conventional smaller face and proportionate leading.
+pub const FOOTNOTE_SCALE: f32 = 0.85;
+/// Air above the separator and between it and the first note line.
+pub const FOOTNOTE_AIR: f32 = 12.0;
 
 const EPS: f32 = 0.01;
 
@@ -114,6 +126,7 @@ pub struct Style {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
     Body,
+    Footnote,
     Heading(u8),
     Code,
     /// A Divider block: an empty decorated line; Wave B paints the rule.
@@ -246,6 +259,8 @@ pub struct Line {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PageItem {
     Line(Line),
+    /// The short rule opening a page's bottom-set footnote area.
+    FootnoteRule { y: f32 },
     /// A deterministic image box (regions 12): the caller paints the asset
     /// or the missing-image degradation at exactly these bounds; the
     /// caption (one line, no source range — N10) sits under it.
@@ -266,6 +281,7 @@ impl PageItem {
     pub fn anchor(&self) -> usize {
         match self {
             PageItem::Line(l) => l.anchor,
+            PageItem::FootnoteRule { .. } => 0,
             PageItem::Image { anchor, .. } => *anchor,
         }
     }
@@ -331,6 +347,9 @@ pub struct BookMetrics {
     /// Air between two consecutive text blocks (the approved mock's
     /// `margin: 0 0 1em` — ux-lab scene 1); 0 = the bare line grid.
     pub para_gap: f32,
+    /// Document-language oracle; tests and non-editor callers may leave it
+    /// automatic, while the cold-read surface supplies the config override.
+    pub language: Option<Lang>,
 }
 
 /// S7: is `measure` too narrow to justify? Below ~45 EN / ~40 RU characters
@@ -406,7 +425,32 @@ pub fn paginate(
     let body_h = metrics.line_height.round().max(1.0);
     let head_h = metrics.heading_line_height.round().max(1.0);
     let rope = ropey::Rope::from_str(text);
+    let lang = metrics.language.unwrap_or_else(|| typograph::detect_lang(rope.chars()));
     let em = metrics.em;
+    let raw: Vec<String> = (0..rope.len_lines())
+        .map(|i| rope.line(i).chars().take_while(|&c| !is_line_break(c)).collect())
+        .collect();
+    let shaped_lists = shaped_list_paragraphs(&raw, blocks.kinds(), false);
+    let mut refs: Vec<(Range<usize>, String)> = spans
+        .spans()
+        .iter()
+        .filter_map(|s| match &s.attr {
+            InlineAttr::FootnoteRef(id) => Some((s.range.clone(), id.clone())),
+            _ => None,
+        })
+        .collect();
+    refs.sort_by_key(|(r, _)| r.start);
+    let mut note_numbers = std::collections::HashMap::new();
+    for (_, id) in &refs {
+        let next = note_numbers.len() + 1;
+        note_numbers.entry(id.clone()).or_insert(next);
+    }
+    for kind in blocks.kinds() {
+        if let BlockKind::FootnoteDef { id } = kind {
+            let next = note_numbers.len() + 1;
+            note_numbers.entry(id.clone()).or_insert(next);
+        }
+    }
     let mut flows: Vec<Flow> = Vec::new();
     let mut counters: Vec<usize> = Vec::new(); // ordered-list numbering per depth
     for i in 0..rope.len_lines() {
@@ -424,9 +468,6 @@ pub fn paginate(
             counters.clear();
         }
         match &kind {
-            // Definitions stay off-page (v1 law; regions 11): the paginator
-            // skips the block entirely — refs superscript at paint.
-            BlockKind::FootnoteDef { .. } => continue,
             BlockKind::Image { src, .. } => {
                 // Deterministic box: natural size when the measurer knows
                 // it, the editor's decoding placeholder otherwise
@@ -482,11 +523,13 @@ pub fn paginate(
                 flows.push(Flow::Para {
                     lines: vec![blank_line(Role::Divider, body_h, i, cstart)],
                     heading: false,
+                    list: false,
                 });
                 continue;
             }
             _ => {}
         }
+        let shaped_list = shaped_lists[i];
         let (role, indent, rindent, mode0, line_h) = match &kind {
             // Headings set ragged: a justified two-word heading is a hole.
             BlockKind::Heading(l) => (Role::Heading(*l), 0.0, 0.0, Mode::Ragged, head_h),
@@ -506,6 +549,13 @@ pub fn paginate(
                 Mode::Justified,
                 body_h,
             ),
+            BlockKind::FootnoteDef { .. } => (
+                Role::Footnote,
+                em * 1.5,
+                0.0,
+                Mode::Justified,
+                (body_h * FOOTNOTE_SCALE).round().max(1.0),
+            ),
             _ => (Role::Body, 0.0, 0.0, Mode::Justified, body_h),
         };
         let chars: Vec<char> = ptext.chars().collect();
@@ -514,6 +564,7 @@ pub fn paginate(
             flows.push(Flow::Para {
                 lines: vec![blank_line(role, line_h, i, cstart)],
                 heading: false,
+                list: false,
             });
             continue;
         }
@@ -540,6 +591,11 @@ pub fn paginate(
             mode0
         };
         let marker = match &kind {
+            BlockKind::FootnoteDef { id } => {
+                let text = note_numbers.get(id).copied().unwrap_or(0).to_string();
+                let width = m.width(&text, Role::Footnote, &[(text.len(), Style::default())]);
+                Some(Marker { text, x: 0.0, width })
+            }
             BlockKind::ListItem { ordered, depth } => {
                 let d = usize::from(*depth);
                 if counters.len() <= d {
@@ -561,11 +617,27 @@ pub fn paginate(
         let ctx = ParaCtx { chars, styles, start: cstart };
         let frags = tokenize(&ctx, m, role);
         let avail = (metrics.measure - indent - rindent).max(1.0);
-        let broken = break_para(&ctx, frags, avail, mode, role, m, h);
+        let previous = i.checked_sub(1).map(|p| blocks.kind(p));
+        let first_indent = if matches!(kind, BlockKind::Paragraph)
+            && !shaped_list
+            && (lang == Lang::Ru
+                || (i > 0
+                    && !matches!(previous, Some(BlockKind::Heading(_) | BlockKind::Divider))
+                    && raw[i - 1].chars().any(|c| !c.is_whitespace())))
+        {
+            em * PARA_INDENT_EM
+        } else {
+            0.0
+        };
+        let first_avail = (avail - first_indent).max(1.0);
+        let widths = BreakWidths { avail, first_avail, indent: first_indent };
+        let broken = break_para(&ctx, frags, widths, mode, role, m, h);
         let n = broken.len();
         let params = LineParams {
             avail,
+            first_avail,
             indent,
+            first_indent,
             mode,
             role,
             height: line_h,
@@ -575,19 +647,89 @@ pub fn paginate(
         let mut lines: Vec<Line> = broken
             .into_iter()
             .enumerate()
-            .map(|(k, bl)| finish_line(bl, k + 1 == n, &params))
+            .map(|(k, bl)| finish_line(bl, k == 0, k + 1 == n, &params))
             .collect();
         if let Some(mk) = marker
             && let Some(first) = lines.first_mut()
         {
             first.marker = Some(mk);
         }
-        flows.push(Flow::Para {
-            lines,
-            heading: matches!(kind, BlockKind::Heading(_)),
-        });
+        if let BlockKind::FootnoteDef { id } = kind {
+            flows.push(Flow::Note { id, lines });
+        } else {
+            flows.push(Flow::Para {
+                lines,
+                heading: matches!(kind, BlockKind::Heading(_)),
+                list: matches!(kind, BlockKind::ListItem { .. }) || shaped_list,
+            });
+        }
     }
-    assemble(flows, metrics, body_h)
+    assemble(flows, refs, metrics, body_h)
+}
+
+fn list_number(text: &str) -> Option<u8> {
+    let (digits, rest) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    if digits.is_empty() || digits.len() > 2 || !(rest.starts_with(". ") || rest.starts_with(") ")) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+pub(crate) fn shaped_list_paragraphs<T: AsRef<str>>(
+    texts: &[T],
+    kinds: &[BlockKind],
+    transparent_blank: bool,
+) -> Vec<bool> {
+    let mut shaped = vec![false; texts.len()];
+    for i in 0..texts.len() {
+        if !matches!(kinds.get(i), Some(BlockKind::Paragraph)) {
+            continue;
+        }
+        let text = texts[i].as_ref();
+        let neighbours = shaped_list_neighbours(i, texts, kinds, transparent_blank);
+        if matches!(text.as_bytes(), [b'-' | b'*', b' ', ..]) || text.starts_with("• ") {
+            let adjacent = neighbours.into_iter().flatten().any(|j| {
+                let text = texts[j].as_ref();
+                matches!(text.as_bytes(), [b'-' | b'*', b' ', ..]) || text.starts_with("• ")
+            });
+            shaped[i] = adjacent;
+        } else if let Some(n) = list_number(text) {
+            shaped[i] = neighbours.into_iter().flatten().any(|j| {
+                list_number(texts[j].as_ref()).is_some_and(|m| m.abs_diff(n) == 1)
+            });
+        }
+    }
+    shaped
+}
+
+fn shaped_list_neighbours<T: AsRef<str>>(
+    i: usize,
+    texts: &[T],
+    kinds: &[BlockKind],
+    transparent_blank: bool,
+) -> [Option<usize>; 2] {
+    let neighbour = |direct: Option<usize>, beyond: Option<usize>| {
+        let direct = direct?;
+        if matches!(kinds.get(direct), Some(BlockKind::Paragraph))
+            && (!transparent_blank || !texts[direct].as_ref().is_empty())
+        {
+            return Some(direct);
+        }
+        if transparent_blank
+            && matches!(kinds.get(direct), Some(BlockKind::Paragraph))
+            && texts[direct].as_ref().is_empty()
+        {
+            return beyond.filter(|&j| matches!(kinds.get(j), Some(BlockKind::Paragraph)));
+        }
+        None
+    };
+    [
+        neighbour(i.checked_sub(1), i.checked_sub(2)),
+        neighbour(
+            (i + 1 < texts.len()).then_some(i + 1),
+            (i + 2 < texts.len()).then_some(i + 2),
+        ),
+    ]
 }
 
 // ---- Tokenizer -----------------------------------------------------------------
@@ -878,15 +1020,25 @@ fn split_at(
     Some((prefix, rest))
 }
 
+/// The line widths a paragraph breaks against: the block measure, the
+/// first line's narrower share under a paragraph indent, and the indent
+/// itself (the last-line demerit reads it).
+struct BreakWidths {
+    avail: f32,
+    first_avail: f32,
+    indent: f32,
+}
+
 fn break_para(
     ctx: &ParaCtx,
     frags: Vec<Frag>,
-    avail: f32,
+    widths: BreakWidths,
     mode: Mode,
     role: Role,
     m: &mut dyn Measure,
     h: &mut dyn Hyphenate,
 ) -> Vec<BrokenLine> {
+    let BreakWidths { avail, first_avail, indent: para_indent } = widths;
     // Bound-glued fragments form unbreakable units («слово —» — the
     // tokenizer's only Bound source). Hyphenation inside a bound group is
     // skipped: conservative, and the dash never starts a line either way.
@@ -912,10 +1064,11 @@ fn break_para(
     let mut streak = 0usize;
 
     while let Some(unit) = units.pop_front() {
+        let line_avail = if lines.is_empty() { first_avail } else { avail };
         let unit_w: f32 = unit.iter().map(|f| f.width).sum();
         let unit_g: f32 = unit.iter().take(unit.len() - 1).map(|f| f.space_after).sum();
         let join = if cur.is_empty() { 0.0 } else { cur.last().unwrap().space_after };
-        if cur_w + unit_w + (cur_g + join + unit_g) * min_factor <= avail + EPS {
+        if cur_w + unit_w + (cur_g + join + unit_g) * min_factor <= line_avail + EPS {
             cur_w += unit_w;
             cur_g += join + unit_g;
             cur.extend(unit);
@@ -930,7 +1083,15 @@ fn break_para(
             let eh = cur.last().unwrap().class == BreakClass::AtHyphen;
             let kind = if eh { EndpointKind::ExistingHyphen } else { EndpointKind::Clean };
             if let Some(extra) = endpoint_cost(kind, streak, false) {
-                best_cost = badness(cur_w, cur_g, avail) + extra;
+                let last_cost = if units.is_empty() && para_indent > 0.0
+                    && (unit_w < 2.0 * para_indent
+                        || unit_w > avail - para_indent)
+                {
+                    LAST_LINE_PENALTY
+                } else {
+                    0.0
+                };
+                best_cost = badness(cur_w, cur_g, line_avail) + extra + last_cost;
                 best = Some(None);
             }
         }
@@ -944,7 +1105,7 @@ fn break_para(
                 };
                 let w = cur_w + prefix.width;
                 let g = cur_g + join;
-                if w + g * min_factor > avail + EPS {
+                if w + g * min_factor > line_avail + EPS {
                     continue; // even at minimum spacing the prefix misses
                 }
                 let Some(extra) = endpoint_cost(
@@ -954,7 +1115,7 @@ fn break_para(
                 ) else {
                     continue;
                 };
-                let cost = badness(w, g, avail) + extra;
+                let cost = badness(w, g, line_avail) + extra;
                 if cost < best_cost {
                     best_cost = cost;
                     best = Some(Some((prefix, rest)));
@@ -1020,7 +1181,9 @@ fn break_para(
 
 struct LineParams {
     avail: f32,
+    first_avail: f32,
     indent: f32,
+    first_indent: f32,
     mode: Mode,
     role: Role,
     height: f32,
@@ -1031,7 +1194,7 @@ struct LineParams {
 /// Distribute slack across word gaps only — exact f32 arithmetic, spaces
 /// never painted; the last line sets natural, never justified (the one
 /// non-negotiable of justified setting — research §4).
-fn finish_line(bl: BrokenLine, is_last: bool, p: &LineParams) -> Line {
+fn finish_line(bl: BrokenLine, is_first: bool, is_last: bool, p: &LineParams) -> Line {
     let mut frags = bl.frags;
     let n = frags.len();
     let mut gaps: Vec<f32> = frags
@@ -1043,7 +1206,7 @@ fn finish_line(bl: BrokenLine, is_last: bool, p: &LineParams) -> Line {
     let mut loose = false;
     let justified = p.mode == Mode::Justified && !is_last && !bl.overfull && !gaps.is_empty();
     if justified {
-        let slack = p.avail - natural;
+        let slack = (if is_first { p.first_avail } else { p.avail }) - natural;
         let per: Vec<f32> = gaps
             .iter()
             .map(|g| g * if slack >= 0.0 { STRETCH_PER_GAP } else { SHRINK_PER_GAP })
@@ -1062,9 +1225,10 @@ fn finish_line(bl: BrokenLine, is_last: bool, p: &LineParams) -> Line {
             }
         }
     }
-    let x = p.indent
+    let avail = if is_first { p.first_avail } else { p.avail };
+    let x = p.indent + if is_first { p.first_indent } else { 0.0 }
         + if p.mode == Mode::RaggedLeft {
-            (p.avail - natural).max(0.0)
+            (avail - natural).max(0.0)
         } else {
             0.0
         };
@@ -1113,6 +1277,7 @@ fn blank_line(role: Role, height: f32, block: usize, anchor: usize) -> Line {
 
 // ---- The paginator (spec 05 §2.7; S8) -------------------------------------------
 
+#[derive(Clone)]
 struct ImageFlow {
     src: String,
     caption: String,
@@ -1123,9 +1288,11 @@ struct ImageFlow {
     anchor: usize,
 }
 
+#[derive(Clone)]
 enum Flow {
-    Para { lines: Vec<Line>, heading: bool },
+    Para { lines: Vec<Line>, heading: bool, list: bool },
     Image(ImageFlow),
+    Note { id: String, lines: Vec<Line> },
 }
 
 /// S8 relaxation levels: 0 full rules · 1 hyphen-avoidance dropped ·
@@ -1153,6 +1320,7 @@ fn head_height(next: &Flow, keep: usize) -> f32 {
             .sum(),
         // Images keep whole: the kept piece is the whole box.
         Flow::Image(img) => img.h + img.caption_h,
+        Flow::Note { .. } => 0.0,
     }
 }
 
@@ -1163,13 +1331,28 @@ struct Asm {
     page_h: f32,
     measure: f32,
     base: usize,
+    page_ix: usize,
+    reserves: Vec<f32>,
+    forced_refs: Vec<(Range<usize>, usize)>,
 }
 
 impl Asm {
+    fn limit(&self) -> f32 {
+        self.page_h - self.reserves.get(self.page_ix).copied().unwrap_or(0.0)
+    }
+
+    fn forced_page(&self, line: &Line) -> usize {
+        self.forced_refs.iter().filter_map(|(range, page)| {
+            line.frags.iter().any(|frag| frag.slice.start < range.end
+                && range.start < frag.slice.end).then_some(*page)
+        }).max().unwrap_or(0)
+    }
+
     fn close(&mut self) {
         if !self.cur.is_empty() {
             self.pages.push(Page { items: std::mem::take(&mut self.cur) });
             self.y = 0.0;
+            self.page_ix += 1;
         }
     }
 
@@ -1188,7 +1371,7 @@ impl Asm {
                 return; // S8: keep-with-next dropped last
             }
             let needed = own + lead + head_height(next, keep);
-            if self.y + needed <= self.page_h + EPS {
+            if self.y + needed <= self.limit() + EPS {
                 return;
             }
             if !self.cur.is_empty() {
@@ -1209,10 +1392,13 @@ impl Asm {
         while !rest.is_empty() {
             let mut level = self.base;
             let k = loop {
-                let room = self.page_h - self.y;
+                let room = self.limit() - self.y;
                 let mut fit = 0usize;
                 let mut h = 0.0f32;
                 for l in &rest {
+                    if self.forced_page(l) > self.page_ix {
+                        break;
+                    }
                     if h + l.height > room + EPS {
                         break;
                     }
@@ -1292,12 +1478,12 @@ impl Asm {
     /// taller than the room left → move to the next page (spec 05 §2.7).
     fn place_image(&mut self, img: ImageFlow) {
         let (mut w, mut h) = (img.w, img.h);
-        if h + img.caption_h > self.page_h {
-            let s = (self.page_h - img.caption_h).max(1.0) / h;
+        if h + img.caption_h > self.limit() {
+            let s = (self.limit() - img.caption_h).max(1.0) / h;
             h *= s;
             w *= s;
         }
-        if self.y + h + img.caption_h > self.page_h + EPS {
+        if self.y + h + img.caption_h > self.limit() + EPS {
             self.close();
         }
         self.cur.push(PageItem::Image {
@@ -1314,7 +1500,13 @@ impl Asm {
     }
 }
 
-fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout {
+fn assemble_once(
+    flows: &[Flow],
+    metrics: &BookMetrics,
+    body_h: f32,
+    reserves: Vec<f32>,
+    forced_refs: Vec<(Range<usize>, usize)>,
+) -> BookLayout {
     let capacity = (metrics.page_height / body_h).floor() as usize;
     let mut asm = Asm {
         pages: vec![],
@@ -1323,32 +1515,44 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
         page_h: metrics.page_height,
         measure: metrics.measure,
         base: usize::from(capacity < RELAX_CAPACITY),
+        page_ix: 0,
+        reserves,
+        forced_refs,
     };
-    let mut q: VecDeque<Flow> = flows.into();
     let mut prev_text = false;
-    while let Some(flow) = q.pop_front() {
+    let mut prev_list = false;
+    for (flow_ix, flow) in flows.iter().enumerate() {
         // Inter-paragraph air (`para_gap`, the lab mock's `margin: 0 0 1em`
         // — scene 1 CSS): between two consecutive TEXT blocks only; a
         // writer's own blank line (or a divider's empty line) is already
         // separation, and a page never opens with a gap (close() resets y).
-        let is_text = match &flow {
+        let is_text = match flow {
             Flow::Para { lines, .. } => lines.iter().any(|l| !l.frags.is_empty()),
             Flow::Image(_) => true,
+            Flow::Note { .. } => false,
         };
+        let is_list = matches!(&flow, Flow::Para { list: true, .. });
+        if prev_list != is_list && asm.y > 0.0 {
+            asm.y += body_h / 2.0;
+        }
+        if matches!(&flow, Flow::Para { heading: true, .. }) && asm.y > 0.0 {
+            asm.y += body_h;
+        }
         if prev_text && is_text && asm.y > 0.0 {
             asm.y += metrics.para_gap;
         }
         prev_text = is_text;
+        prev_list = is_list;
         match flow {
-            Flow::Para { lines, heading } => {
-                if heading {
+            Flow::Para { lines, heading, .. } => {
+                if *heading {
                     // The keep must look PAST invisible flows: a writer's
                     // blank line after a chapter heading would otherwise
                     // satisfy it with a line the reader can't see, and the
                     // page would visually end on the heading.
                     let mut lead = 0.0f32;
                     let mut next_vis = None;
-                    for f in &q {
+                    for f in &flows[flow_ix + 1..] {
                         if let Flow::Para { lines, .. } = f
                             && lines.iter().all(|l| l.frags.is_empty())
                         {
@@ -1363,15 +1567,22 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
                             // Text directly after the heading takes the
                             // gap; an intervening blank suppresses it (the
                             // loop's own prev_text rule above).
-                            lead = metrics.para_gap;
+                            lead = HEAD_AIR_BELOW;
                         }
-                        asm.reserve_heading(&lines, next, lead);
+                        asm.reserve_heading(lines, next, lead);
                     }
                 }
-                asm.place_para(lines);
+                asm.place_para(lines.clone());
+                if *heading {
+                    asm.y += HEAD_AIR_BELOW;
+                }
             }
-            Flow::Image(img) => asm.place_image(img),
+            Flow::Image(img) => asm.place_image(img.clone()),
+            Flow::Note { .. } => unreachable!("notes are separated before body assembly"),
         }
+    }
+    if prev_list && asm.y > 0.0 {
+        asm.y += body_h / 2.0;
     }
     asm.close();
     if asm.pages.is_empty() {
@@ -1381,9 +1592,202 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
     BookLayout { pages: asm.pages }
 }
 
+fn assemble(
+    flows: Vec<Flow>,
+    refs: Vec<(Range<usize>, String)>,
+    metrics: &BookMetrics,
+    body_h: f32,
+) -> BookLayout {
+    let mut body = Vec::new();
+    let mut notes = Vec::new();
+    for flow in flows {
+        match flow {
+            Flow::Note { id, lines } => notes.push((id, lines)),
+            other => body.push(other),
+        }
+    }
+    if notes.is_empty() {
+        return assemble_once(&body, metrics, body_h, vec![], vec![]);
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    struct NoteSegment {
+        note: usize,
+        start: usize,
+        end: usize,
+    }
+
+    // A footnote reserve may consume everything except two derived body
+    // lines. This makes S8's unconditional progress path safe: even the
+    // terminal relaxation can never paint body through the bottom-set area.
+    let reserve_cap = (metrics.page_height - 2.0 * body_h).max(0.0);
+    let note_cap = (reserve_cap - FOOTNOTE_AIR).max(0.0);
+    assert!(notes.iter().flat_map(|(_, lines)| lines).all(|line|
+        line.height <= note_cap + EPS),
+        "page is too short for one footnote line while preserving two body lines");
+    let mut reserves = Vec::new();
+    let mut assignments: Vec<Vec<NoteSegment>> = Vec::new();
+    let mut forced_refs = Vec::new();
+    let mut book = assemble_once(&body, metrics, body_h, reserves.clone(), forced_refs.clone());
+    let mut converged = false;
+    for _ in 0..32 {
+        let mut order = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, id) in &refs {
+            let Some(note_ix) = notes.iter().position(|(note_id, _)| note_id == id) else {
+                continue;
+            };
+            if seen.insert(note_ix) {
+                order.push(note_ix);
+            }
+        }
+        for note_ix in 0..notes.len() {
+            if seen.insert(note_ix) {
+                order.push(note_ix);
+            }
+        }
+
+        let mut next: Vec<Vec<NoteSegment>> = vec![Vec::new(); book.pages.len().max(1)];
+        let mut used = vec![0.0f32; next.len()];
+        let mut cursor = 0usize;
+        for note_ix in order {
+            let anchor = refs.iter().find(|(_, id)| id == &notes[note_ix].0)
+                .and_then(|(range, _)| book.pages.iter().position(|page| {
+                    page.items.iter().any(|item| matches!(item, PageItem::Line(line)
+                        if line.frags.iter().any(|frag| frag.slice.start < range.end
+                            && range.start < frag.slice.end)))
+                })).unwrap_or(book.pages.len().saturating_sub(1));
+            cursor = cursor.max(anchor);
+            let lines = &notes[note_ix].1;
+            let total = lines.iter().map(|line| line.height).sum::<f32>();
+            if total <= note_cap + EPS {
+                if cursor >= used.len() {
+                    used.resize(cursor + 1, 0.0);
+                    next.resize(cursor + 1, Vec::new());
+                }
+                if used[cursor] + total > note_cap + EPS {
+                    cursor += 1;
+                    used.resize(cursor + 1, 0.0);
+                    next.resize(cursor + 1, Vec::new());
+                }
+                next[cursor].push(NoteSegment { note: note_ix, start: 0, end: lines.len() });
+                used[cursor] += total;
+                continue;
+            }
+
+            // Only an individually oversized note splits. Its already-shaped
+            // lines stream forward, and every iteration consumes a line.
+            let mut start = 0usize;
+            while start < lines.len() {
+                if cursor >= used.len() {
+                    used.resize(cursor + 1, 0.0);
+                    next.resize(cursor + 1, Vec::new());
+                }
+                let mut end = start;
+                while end < lines.len()
+                    && used[cursor] + lines[end].height <= note_cap + EPS
+                {
+                    used[cursor] += lines[end].height;
+                    end += 1;
+                }
+                if end == start {
+                    cursor += 1;
+                    continue;
+                }
+                next[cursor].push(NoteSegment { note: note_ix, start, end });
+                start = end;
+                if start < lines.len() {
+                    cursor += 1;
+                }
+            }
+        }
+        let next_reserves: Vec<f32> = used.iter().map(|height| {
+            if *height == 0.0 { 0.0 } else { FOOTNOTE_AIR + height }
+        }).collect();
+        if next == assignments && next_reserves == reserves {
+            assignments = next;
+            reserves = next_reserves;
+            converged = true;
+            break;
+        }
+        assignments = next;
+        reserves = next_reserves;
+        for (range, id) in &refs {
+            if let Some(note_ix) = notes.iter().position(|(note_id, _)| note_id == id)
+                && let Some(page_ix) = assignments.iter().position(|segments|
+                    segments.iter().any(|segment| segment.note == note_ix && segment.start == 0))
+            {
+                if let Some((_, floor)) = forced_refs.iter_mut().find(|(r, _)| r == range) {
+                    *floor = (*floor).max(page_ix);
+                } else {
+                    forced_refs.push((range.clone(), page_ix));
+                }
+            }
+        }
+        book = assemble_once(&body, metrics, body_h, reserves.clone(), forced_refs.clone());
+    }
+    assert!(converged, "footnote pagination did not converge within 32 passes");
+
+    // One final pass uses the converged capped reservation.
+    book = assemble_once(&body, metrics, body_h, reserves.clone(), forced_refs);
+    while book.pages.len() < assignments.len() {
+        book.pages.push(Page { items: vec![] });
+    }
+    for (page_ix, on_page) in assignments.into_iter().enumerate() {
+        if on_page.is_empty() {
+            continue;
+        }
+        let Some(page) = book.pages.get_mut(page_ix) else { continue };
+        let reserve = reserves[page_ix];
+        let mut y = metrics.page_height - reserve;
+        page.items.push(PageItem::FootnoteRule { y: y + FOOTNOTE_AIR / 2.0 });
+        y += FOOTNOTE_AIR;
+        for segment in on_page {
+            for (line_ix, line) in notes[segment.note].1[segment.start..segment.end].iter().enumerate() {
+                let mut line = line.clone();
+                if segment.start > 0 || line_ix > 0 {
+                    line.marker = None;
+                }
+                line.y = y;
+                y += line.height;
+                page.items.push(PageItem::Line(line));
+            }
+        }
+    }
+    book
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shaped_lists_share_markers_numbers_and_editor_blank_adjacency() {
+        let texts = [
+            "- one", "* two", "prose", "1. one", "2) two", "1. reset",
+            "— dialogue", "— reply", "• three", "", "- four", "", "", "- five",
+        ];
+        let kinds = vec![BlockKind::Paragraph; texts.len()];
+        assert_eq!(
+            shaped_list_paragraphs(&texts, &kinds, true),
+            vec![
+                true, true, false, true, true, true, false, false, true, false,
+                true, false, false, false,
+            ],
+        );
+        assert_eq!(
+            shaped_list_paragraphs(&["3. three", "2. two"],
+                &[BlockKind::Paragraph, BlockKind::Paragraph], true),
+            vec![true, true],
+            "number adjacency works in either direction",
+        );
+        assert_eq!(
+            shaped_list_paragraphs(&["- one", "", "- two"],
+                &vec![BlockKind::Paragraph; 3], false),
+            vec![false, false, false],
+            "the book still requires direct adjacency",
+        );
+    }
 
     /// 10 px per char, 10 px space — lines compute by hand.
     struct FakeM;
@@ -1435,6 +1839,7 @@ mod tests {
             // The pagination tests reason in whole lines; the surface's
             // inter-paragraph air is exercised by its own test below.
             para_gap: 0.0,
+            language: None,
         }
     }
 
@@ -1637,7 +2042,9 @@ mod tests {
         assert_eq!(a.token, 0..8, "both halves carry the whole token (F9)");
         assert_eq!(b.token, 0..8);
         // Narrow: the break lands at the existing hyphen, nothing added.
-        let book = lay("хх какой-то", BlockMap::new(1), 90.0, 30);
+        // The RU first-line indent consumes 24px; 114 preserves the old
+        // fixture's 90px effective first-line measure.
+        let book = lay("хх какой-то", BlockMap::new(1), 114.0, 30);
         let ls = lines(&book);
         assert!(ls[0].ends_hyphen, "the compound break is a hyphen end");
         assert_eq!(words(ls[0]).last(), Some(&"какой-"));
@@ -1785,15 +2192,17 @@ mod tests {
     /// Widows/orphans ≥ 2 lines each side of a page break (research §4).
     #[test]
     fn widow_orphan_floors_hold() {
-        // capacity 10; para2 = 3 lines: a 2-line foot chunk would leave a
+        // capacity 10; para2 = 3 lines under its first-line indent: a
+        // 2-line foot chunk would leave a
         // 1-line widow, a 1-line foot chunk is an orphan — it moves whole.
-        let text = format!("{}\n{}", prose(8), prose(3));
+        let text = format!("{}\n{}", prose(8), prose(2));
         let book = lay(&text, BlockMap::new(2), 170.0, 10);
         assert_eq!(page_line_counts(&book), vec![8, 3], "para2 moved whole");
-        // para2 = 4 lines: 2 + 2 satisfies both floors -> it splits.
+        // The larger para2 is 5 lines with its indent: 2 + 3 satisfies both
+        // floors, so it splits.
         let text = format!("{}\n{}", prose(8), prose(4));
         let book = lay(&text, BlockMap::new(2), 170.0, 10);
-        assert_eq!(page_line_counts(&book), vec![10, 2]);
+        assert_eq!(page_line_counts(&book), vec![10, 3]);
     }
 
     /// A heading is never the last block on a page: it keeps ≥ 2 lines of
@@ -1897,7 +2306,7 @@ mod tests {
     #[test]
     fn slice_final_heading_sets_on_the_last_page() {
         // Fits the first page: sets as its (vacuously legal) last line.
-        let text = format!("{}\nThe End", prose(8));
+        let text = format!("{}\nThe End", prose(7));
         let blocks =
             BlockMap::from_kinds(vec![BlockKind::Paragraph, BlockKind::Heading(1)]);
         let book = lay(&text, blocks.clone(), 170.0, 10);
@@ -1905,9 +2314,9 @@ mod tests {
         let PageItem::Line(l) = book.pages[0].items.last().unwrap() else { panic!() };
         assert!(matches!(l.role, Role::Heading(_)));
         // No room left: it opens (and closes) the last page alone.
-        let text = format!("{}\nThe End", prose(9));
+        let text = format!("{}\nThe End", prose(8));
         let book = lay(&text, blocks, 170.0, 10);
-        assert_eq!(page_line_counts(&book), vec![9, 1]);
+        assert_eq!(page_line_counts(&book), vec![8, 1]);
     }
 
     /// S8 step 1: the page-final-hyphen avoidance holds at book capacity
@@ -2003,7 +2412,7 @@ mod tests {
         );
     }
 
-    /// Per-BlockKind rules: footnote defs skipped, quotes indented 1 em,
+    /// Per-BlockKind rules: footnote defs bottom-set, quotes indented 1 em,
     /// code ragged, list markers as unanchored decoration, blank lines kept.
     #[test]
     fn block_kinds_render_by_their_rules() {
@@ -2038,7 +2447,9 @@ mod tests {
         assert_eq!(i2.marker.as_ref().unwrap().text, "2.");
         assert!(i1.marker.as_ref().unwrap().x < i1.x, "the marker hangs left of the text");
         assert_eq!(i1.x, 24.0, "list text indents 1.5 em");
-        assert!(by_block(7).is_none(), "FootnoteDef blocks are skipped entirely");
+        let note = by_block(7).expect("FootnoteDef is bottom-set");
+        assert!(matches!(note.role, Role::Footnote));
+        assert_eq!(note.marker.as_ref().unwrap().text, "1");
         let img = book.pages.iter().flat_map(|p| &p.items).find_map(|i| match i {
             PageItem::Image { block: 8, width, height, x, caption, .. } =>
                 Some((*width, *height, *x, caption.clone())),
@@ -2048,6 +2459,182 @@ mod tests {
         assert_eq!((w, h), (300.0, 150.0), "natural size fits the measure");
         assert_eq!(x, 150.0, "centered");
         assert_eq!(caption, "image-line", "the caption is the block's own line");
+    }
+
+    fn footnoted(text: &str, kinds: Vec<BlockKind>, refs: &[(Range<usize>, &str)],
+        page_lines: usize) -> BookLayout
+    {
+        let mut spans = SpanSet::default();
+        for (range, id) in refs {
+            spans.add(range.clone(), InlineAttr::FootnoteRef((*id).into()));
+        }
+        paginate(text, &spans, &BlockMap::from_kinds(kinds),
+            &metrics(600.0, page_lines), &mut FakeM, &mut FakeH)
+    }
+
+    #[test]
+    fn footnote_reservation_moves_ref_line_and_note_together() {
+        let text = "one\ntwo\nthree\nfour x\nfive\nnote words";
+        let kinds = vec![
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "a".into() },
+        ];
+        let x = text.find('x').unwrap();
+        let book = footnoted(text, kinds, &[(x..x + 1, "a")], 5);
+        let ref_page = book.pages.iter().position(|page| page.items.iter().any(|item| {
+            matches!(item, PageItem::Line(line) if line.frags.iter().any(|f| f.slice.contains(&x)))
+        })).unwrap();
+        let note_page = book.pages.iter().position(|page| page.items.iter().any(|item| {
+            matches!(item, PageItem::Line(line) if matches!(line.role, Role::Footnote))
+        })).unwrap();
+        assert_eq!(ref_page, note_page, "a ref never outruns its bottom-set note");
+        assert_eq!(ref_page, 1, "the reference line moves when its note reserve will not fit");
+        let rule_y = book.pages[ref_page].items.iter().find_map(|item| match item {
+            PageItem::FootnoteRule { y } => Some(*y),
+            _ => None,
+        }).unwrap();
+        assert!(rule_y < metrics(600.0, 5).page_height);
+    }
+
+    #[test]
+    fn footnotes_number_by_ref_order_and_orphans_finish_last() {
+        let text = "z b then a\ndef a\ndef b\norphan";
+        let b = text.find('b').unwrap();
+        let a = text.rfind('a').unwrap_or(0).min(text.find(" a").unwrap() + 1);
+        let book = footnoted(text, vec![
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "a".into() },
+            BlockKind::FootnoteDef { id: "b".into() },
+            BlockKind::FootnoteDef { id: "orphan".into() },
+        ], &[(b..b + 1, "b"), (a..a + 1, "a")], 8);
+        let notes: Vec<&Line> = book.pages.iter().flat_map(|p| &p.items).filter_map(|item| match item {
+            PageItem::Line(line) if matches!(line.role, Role::Footnote) => Some(line),
+            _ => None,
+        }).collect();
+        assert_eq!(notes.iter().map(|l| l.marker.as_ref().unwrap().text.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2", "3"]);
+        assert_eq!(notes.last().unwrap().block, 3, "the orphan is last on the final page");
+        assert_eq!(notes.last().unwrap().y + notes.last().unwrap().height,
+            metrics(600.0, 8).page_height, "the notes block is bottom-set");
+    }
+
+    fn assert_footnote_geometry(book: &BookLayout, page_lines: usize) {
+        let page_h = metrics(170.0, page_lines).page_height;
+        for page in &book.pages {
+            let rule = page.items.iter().find_map(|item| match item {
+                PageItem::FootnoteRule { y } => Some(*y),
+                _ => None,
+            });
+            let Some(rule_y) = rule else { continue };
+            let body_bottom = page.items.iter().filter_map(|item| match item {
+                PageItem::Line(line) if !matches!(line.role, Role::Footnote) =>
+                    Some(line.y + line.height),
+                PageItem::Image { y, height, .. } => Some(y + height),
+                _ => None,
+            }).fold(0.0f32, f32::max);
+            let note_bottom = page.items.iter().filter_map(|item| match item {
+                PageItem::Line(line) if matches!(line.role, Role::Footnote) =>
+                    Some(line.y + line.height),
+                _ => None,
+            }).fold(0.0f32, f32::max);
+            assert!(body_bottom <= rule_y + EPS, "body ink stays above the footnote rule");
+            assert!((note_bottom - page_h).abs() <= EPS, "notes end at the page bottom");
+            assert!(rule_y >= 2.0 * 25.0, "two derived body lines remain usable");
+        }
+    }
+
+    fn note_with_shaped_lines(wanted: usize) -> String {
+        for words in 1..200 {
+            let def = (0..words).map(|i| format!("n{i:07}"))
+                .collect::<Vec<_>>().join(" ");
+            let text = format!("x\n{def}");
+            let book = footnoted(&text, vec![
+                BlockKind::Paragraph,
+                BlockKind::FootnoteDef { id: "a".into() },
+            ], &[(0..1, "a")], 1000);
+            let count = lines(&book).iter()
+                .filter(|line| matches!(line.role, Role::Footnote)).count();
+            if count == wanted {
+                return def;
+            }
+        }
+        panic!("could not make a {wanted}-line fake footnote")
+    }
+
+    #[test]
+    fn footnote_reserve_capacity_exact_and_one_line_over() {
+        // Five body lines leave a three-footnote-line reserve after the
+        // rule air while protecting two body lines.
+        for (note_lines, expected_pages) in [(3, 1), (4, 2)] {
+            let text = format!("x\n{}", note_with_shaped_lines(note_lines));
+            let kinds = vec![
+                BlockKind::Paragraph,
+                BlockKind::FootnoteDef { id: "a".into() },
+            ];
+            let book = footnoted(&text, kinds.clone(), &[(0..1, "a")], 5);
+            let again = footnoted(&text, kinds, &[(0..1, "a")], 5);
+            assert_eq!(book, again, "capacity-boundary pagination is deterministic");
+            assert_eq!(book.pages.iter().filter(|page| page.items.iter().any(|item|
+                matches!(item, PageItem::Line(line) if matches!(line.role, Role::Footnote))))
+                .count(), expected_pages);
+            assert_footnote_geometry(&book, 5);
+        }
+    }
+
+    #[test]
+    fn oversized_note_splits_by_line_and_conserves_every_line() {
+        let def = note_with_shaped_lines(10);
+        let text = format!("x\n{def}");
+        let kinds = vec![
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "a".into() },
+        ];
+        let one_page = footnoted(&text, kinds.clone(), &[(0..1, "a")], 1000);
+        let split = footnoted(&text, kinds.clone(), &[(0..1, "a"), (0..1, "a")], 5);
+        let again = footnoted(&text, kinds, &[(0..1, "a"), (0..1, "a")], 5);
+        let note_lines = |book: &BookLayout| lines(book).iter()
+            .filter(|line| matches!(line.role, Role::Footnote)).count();
+        assert_eq!(note_lines(&split), note_lines(&one_page), "no shaped note line is lost");
+        assert_eq!(split, again, "continued-note pagination is deterministic");
+        assert_eq!(lines(&split).iter().filter(|line| matches!(line.role, Role::Footnote)
+            && line.marker.is_some()).count(), 1, "only the first segment paints the number");
+        let ref_page = split.pages.iter().position(|page| page.items.iter().any(|item|
+            matches!(item, PageItem::Line(line) if !matches!(line.role, Role::Footnote)
+                && line.frags.iter().any(|frag| frag.slice.contains(&0))))).unwrap();
+        assert!(split.pages[ref_page].items.iter().any(|item|
+            matches!(item, PageItem::Line(line) if matches!(line.role, Role::Footnote)
+                && line.marker.is_some())), "the ref page carries the note start");
+        assert_footnote_geometry(&split, 5);
+    }
+
+    #[test]
+    fn whole_note_carries_before_the_next_note_in_number_order() {
+        let def = note_with_shaped_lines(2);
+        let text = format!("x y\n{def}\n{def}");
+        let y = text.find('y').unwrap();
+        let book = footnoted(&text, vec![
+            BlockKind::Paragraph,
+            BlockKind::FootnoteDef { id: "a".into() },
+            BlockKind::FootnoteDef { id: "b".into() },
+        ], &[(0..1, "a"), (y..y + 1, "b")], 5);
+        let note_pages = |block| book.pages.iter().enumerate().filter_map(|(page_ix, page)|
+            page.items.iter().any(|item| matches!(item, PageItem::Line(line)
+                if matches!(line.role, Role::Footnote) && line.block == block))
+                .then_some(page_ix)).collect::<Vec<_>>();
+        assert_eq!(note_pages(1), vec![0], "the first whole note fits here");
+        assert_eq!(note_pages(2), vec![1], "the next whole note moves, never splits");
+        let markers: Vec<&str> = book.pages.iter().flat_map(|page| &page.items)
+            .filter_map(|item| match item {
+                PageItem::Line(line) if matches!(line.role, Role::Footnote) =>
+                    line.marker.as_ref().map(|marker| marker.text.as_str()),
+                _ => None,
+            }).collect();
+        assert_eq!(markers, vec!["1", "2"], "carried notes precede later anchored notes");
+        assert_footnote_geometry(&book, 5);
     }
 
     /// Images keep whole: move to the next page when the room is short,
@@ -2232,6 +2819,7 @@ mod tests {
             em: 16.5,
             justify: true,
             para_gap: 17.0,
+            language: None,
         };
         let spans = SpanSet::default();
         let t0 = std::time::Instant::now();
@@ -2248,24 +2836,13 @@ mod tests {
         );
     }
 
-    /// The surface's inter-paragraph air (the approved mock's 1em margin):
-    /// applied between two consecutive TEXT blocks only — a writer's own
-    /// blank line already separates, and a page never opens with a gap.
+    /// Body paragraphs use the bare grid; a writer's own blank remains one
+    /// honest line rather than acquiring synthetic air on either side.
     #[test]
-    fn para_gap_airs_consecutive_text_blocks_only() {
+    fn paragraph_indent_replaces_gap_without_disturbing_blank_lines() {
         let text = "one two\nthree four\n\nfive six";
         let blocks = BlockMap::new(4);
-        let mut m = metrics(200.0, 20);
-        m.para_gap = 5.0;
-        let book = paginate(text, &SpanSet::default(), &blocks, &m, &mut FakeM, &mut FakeH);
-        let ls = lines(&book);
-        assert_eq!(ls.len(), 4);
-        assert_eq!(ls[0].y, 0.0, "the first block never gaps");
-        assert_eq!(ls[1].y, 30.0, "text→text gets the air");
-        assert_eq!(ls[2].y, 55.0, "a blank line is already separation");
-        assert_eq!(ls[3].y, 80.0, "…on both of its sides");
-        // With the gap at 0 the grid is bare (the Wave A default).
-        let plain = paginate(
+        let book = paginate(
             text,
             &SpanSet::default(),
             &blocks,
@@ -2273,10 +2850,58 @@ mod tests {
             &mut FakeM,
             &mut FakeH,
         );
-        let pl = lines(&plain);
+        let ls = lines(&book);
+        assert_eq!(ls.len(), 4);
         assert_eq!(
-            pl.iter().map(|l| l.y).collect::<Vec<_>>(),
+            ls.iter().map(|l| l.y).collect::<Vec<_>>(),
             vec![0.0, 25.0, 50.0, 75.0]
         );
+        assert_eq!(ls[0].x, 0.0, "EN starts flush");
+        assert_eq!(ls[1].x, 24.0, "body→body uses an indent");
+        assert_eq!(ls[3].x, 0.0, "EN resumes flush after a writer's blank");
+    }
+
+    #[test]
+    fn book_indent_is_language_conditional_and_grid_is_solid() {
+        let en = lay("Plain words\nMore words", BlockMap::new(2), 200.0, 20);
+        let ls = lines(&en);
+        assert_eq!(ls[0].x, 0.0, "EN opens flush");
+        assert_eq!(ls[1].x, 24.0, "following EN body indents 1.5em");
+        assert_eq!(ls[1].y, ls[0].y + 25.0, "body blocks keep the grid");
+
+        let ru = lay("Русский текст\nЕщё текст", BlockMap::new(2), 200.0, 20);
+        let ls = lines(&ru);
+        assert_eq!(ls[0].x, 24.0, "RU indents from document start");
+        assert_eq!(ls[1].x, 24.0, "RU keeps a uniform paragraph indent");
+        assert_eq!(ls[1].y, ls[0].y + 25.0, "RU keeps the same grid");
+
+        let mut forced = metrics(200.0, 20);
+        forced.language = Some(Lang::En);
+        let book = paginate(
+            "Русский текст",
+            &SpanSet::default(),
+            &BlockMap::new(1),
+            &forced,
+            &mut FakeM,
+            &mut FakeH,
+        );
+        assert_eq!(lines(&book)[0].x, 0.0, "configured EN overrides detection");
+    }
+
+    #[test]
+    fn shaped_lists_exclude_dates_and_dialogue() {
+        let positive = lay("1. One\n2. Two", BlockMap::new(2), 200.0, 20);
+        assert!(lines(&positive).iter().all(|l| l.x == 0.0));
+
+        let date = lay("1917. Всё началось…\nОбычный абзац", BlockMap::new(2), 300.0, 20);
+        assert_eq!(lines(&date)[1].x, 24.0, "a year is not an ordered list");
+
+        let dialogue = lay(
+            "— Реплика первая\n— Реплика вторая\n— Реплика третья",
+            BlockMap::new(3),
+            300.0,
+            20,
+        );
+        assert!(lines(&dialogue).iter().all(|l| l.x == 24.0));
     }
 }

@@ -1,0 +1,119 @@
+# Hardening backlog
+
+Filed 2026-07-17 from the five-lens review of the sharp-corners
+branch (PR #28). These are prevention investments, not defects —
+each names the regression class it closes. Work them as their
+subsystems come under the knife; none blocks the merge.
+
+## 1. Coordinate-domain newtypes
+
+The rail-invisible-when-floating bug was a coordinate-frame
+confusion (content-local vs window-absolute), and the class is
+still open: `OffscreenRef.anchor_y`, `MarginCard.top/anchor_y` are
+bare `f32` across three different domains, converted by hand at
+each use (frame origin added in one place, scroll re-added in
+another, CSD insets in a third). Introduce transparent newtypes —
+`ContentY`, `ViewportY`, `WindowY`, `ContentWidth` — with explicit
+conversions that *require* the frame origin/scroll/inset as
+arguments. Apply first to rail marks, margin anchors, and reveal
+scrolling; keep raw `f32` only at the GPUI paint boundary. The
+compiler then refuses the whole bug class.
+
+## 2. Keymap window lifecycle test matrix
+
+`toggle_decision` has a three-row truth table; the shipped window
+has a much larger state space. A GPUI controller matrix: open from
+prose / text-field / flank / cold-read focus; assert single window,
+raise-on-editor-chord, close-on-reference-chord/Esc/native-close,
+and focus restoration to the *originating* handle; editor-close
+veto leaves both windows until resolved; successful quit closes
+both; reference close never saves. Plus rig scenarios capturing
+BOTH surfaces (900×560 three-col no-scroll, 559px two-col, short
+height) — needs two-surface capture support in the rig.
+
+## 3. Footnote reserve boundary/property tests
+
+The reserve algorithm converges iteratively (cap 32) but is tested
+at one near-full-page example. Table/property tests around page
+capacity: reserve exactly fits; exceeds by one line; several notes
+share a page; repeated refs consume one note; unreferenced notes
+finish last; a note taller than the body budget still makes
+progress. Invariants: body bottom ≤ rule y; note block bottom =
+page height; ref and note co-located; deterministic; converges
+before the cap on adversarial ref distributions.
+
+## 4. StripActionTier — the ladder as a type
+
+The narrow-width degradation test copies the 104/230 thresholds
+from production and samples incidental widths. Extract a
+`StripActionTier` enum (More / Name / NameAndCompare) chosen by one
+pure function; test the exact boundaries (ε below/at/above both
+thresholds); render from the enum so impossible combinations cannot
+be expressed. Keep slot disjointness as a property over a width
+range.
+
+## 5. Three missing rig stills
+
+The newest surfaces have logic tests but no pixel pinning: (a) an
+editor page with adjacent, wrapped, and blank-separated list runs
+plus trailing prose; (b) a cold-read page showing a reference and
+its bottom-set note together; (c) a styled cold-read page combining
+highlight, underline, strike, and the diagnosis band. Smoke dumps
+assert the geometry; the stills stay for eyes.
+
+## 6. Wayland raise via activation tokens (fork patch)
+
+True raise-on-command for a second window on Wayland requires
+xdg-activation done right: the FOCUSED surface (the editor) mints a
+token from its live input serial and activates the TARGET surface
+(the keymap). gpui only self-activates from stored state, which
+Mutter rejects. Fork patch ~40-80 lines in wayland/{window,client}
+(a `PlatformWindow::activate_from(&other)` or equivalent), no-op on
+other backends; then ctrl-?'s toggle could grow the raise state
+back where it genuinely works. Blocked on the next fork-pin bump.
+
+## 7. Cross-process rich clipboard (fork patch)
+
+Stage 1 (2026-07-17) carries the rich payload (spans + block kinds +
+boundary flags + image ids) in the gpui ClipboardString metadata,
+which round-trips only while the offer's `pid/<pid>` self-MIME
+matches — i.e. within ONE Strop process. One document per window
+means per-process, so cut→paste between two open essays degrades to
+plain text exactly where a writer moves paragraphs between drafts.
+Fork patch: advertise and serve a real `application/x-strop+json`
+MIME (Wayland `wayland/clipboard.rs` + the X11 twin) carrying the
+same envelope, and read it back from foreign offers before the
+plain-text fallback. The payload is already versioned (`v:1`) and
+self-contained for exactly this promotion. A `text/markdown` offer
+can ride the same patch nearly free. Blocked on the next fork-pin
+bump.
+
+## 8. Editor em-dash line-start guard
+
+The book engine binds «слово —» so тире never starts a line
+(bookpage `Bound` units); the EDITOR's wrapper cannot express the
+same rule — `is_word_char` glue is lookahead-only, so a break
+before `—` survives even after the 2026-07-17 punctuation patch
+(and an NBSP before the dash does not help: non-word chars always
+plant a candidate). Needs a lookback rule in the fork's
+LineWrapper (suppress the candidate before `—`/`–` when preceded
+by NBSP or word char + space), or acceptance that the editor
+surface tolerates it. Decide once the punctuation patch has field
+time.
+
+## 9. Footnotes across the clipboard (paste semantics)
+
+Field report 2026-07-17: pasting a selection that carries a footnote
+turns the footnote index into a regular line item. Two mechanisms
+stack: (a) `FootnoteRef` spans are deliberately excluded from the
+stage-1 envelope (a ref's id is document-scoped), so the carrier
+digits paste as bare prose; (b) a `FootnoteDef` block pasted
+mid-document keeps its kind but no longer sits in the trailing
+definition run (H4), so it renders as an ordinary line, not in the
+footnote zone. The fix is design-first, not code-first: a pasted def
+should re-home to the trailing run and renumber against the
+destination's ids (insert_footnote already owns the numbering law),
+and a pasted ref should either re-bind to its traveling def (when
+the selection carried both) or degrade to plain digits (when it
+did not). Wants the exact field repro pinned as a document test
+before any implementation.

@@ -33,6 +33,14 @@ toml_edit = { workspace = true }
 glob = { workspace = true }
 interprocess = "2.4.2"
 
+# XDG document-portal resolution (files.rs) exists only where the portal
+# does. ashpd's zbus stack does not even compile on Windows (std::os::fd),
+# and macOS was paying to build a D-Bus client it could never speak to —
+# so the dependency is target-gated, not merely unused (Copilot, PR #28).
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ashpd = { version = "0.13.11", default-features = false,
+    features = ["async-io", "documents"] }
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 ttf-parser = "0.25"

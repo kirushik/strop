@@ -26,25 +26,57 @@ if [ -n "$WSHOT_FLOAT" ]; then
   printf 'for_window [title=".*Strop"] floating enable, resize set %s %s, move position center\n' "$FW" "$FH" >> "$CFG"
 fi
 rm -f /tmp/strop-wshot.log
+# A PRIVATE runtime dir, exactly like wrun.sh's: never glob wayland-*
+# in the session's $XDG_RUNTIME_DIR — when sway is slow to make its
+# socket, the newest one there is the developer's LIVE compositor, and
+# the "headless" window opens on the real desktop, stealing focus
+# (observed live, 2026-07-17 — this script, not the callers, was the
+# leak). Private logs also make parallel runs collision-free: two rigs
+# sharing /tmp/strop-wshot.log matched each other's SMOKE HOLD and
+# shot blank frames.
+RUNDIR=$(mktemp -d); chmod 700 "$RUNDIR"
+LOG="$RUNDIR/strop.log"
+APP=; SWAY=
+# Every trap command tolerates failure (Copilot, PR #28): under
+# `set -e` a failing kill (empty PID after an early exit) would
+# abort the trap mid-way, leaking $RUNDIR and skipping the log copy.
+trap 'kill $APP $SWAY 2>/dev/null || true; cp -f "$LOG" /tmp/strop-wshot.log 2>/dev/null || true; rm -rf "$CFG" "$RUNDIR"' EXIT
 WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
-  sway -c "$CFG" > /tmp/sway.log 2>&1 &
+  XDG_RUNTIME_DIR="$RUNDIR" sway -c "$CFG" > "$RUNDIR/sway.log" 2>&1 &
 SWAY=$!
-sleep 2
-WD=$(ls -t "$XDG_RUNTIME_DIR" | grep -E '^wayland-[0-9]+$' | head -1)
+WD=
+for _ in $(seq 1 50); do
+  WD=$(ls "$RUNDIR" 2>/dev/null | grep -E '^wayland-[0-9]+$' | head -1)
+  [ -n "$WD" ] && break
+  sleep 0.2
+done
+if [ -z "$WD" ]; then
+  echo "wshot: headless sway failed to start (no wayland socket in $RUNDIR)" >&2
+  exit 2
+fi
 if [ -n "$DOC" ]; then
-  env -u DISPLAY WAYLAND_DISPLAY="$WD" STROP_SMOKE="${KEYS:-ctrl-home}" STROP_SMOKE_HOLD=1 $EXTRA_ENV \
-    "$BIN" "$DOC" 2>/tmp/strop-wshot.log &
+  env -u DISPLAY XDG_RUNTIME_DIR="$RUNDIR" WAYLAND_DISPLAY="$WD" \
+    STROP_SMOKE="${KEYS:-ctrl-home}" STROP_SMOKE_HOLD=1 $EXTRA_ENV \
+    "$BIN" "$DOC" 2>"$LOG" &
 else
-  env -u DISPLAY WAYLAND_DISPLAY="$WD" STROP_SMOKE="${KEYS:-ctrl-home}" STROP_SMOKE_HOLD=1 $EXTRA_ENV \
-    "$BIN" 2>/tmp/strop-wshot.log &
+  env -u DISPLAY XDG_RUNTIME_DIR="$RUNDIR" WAYLAND_DISPLAY="$WD" \
+    STROP_SMOKE="${KEYS:-ctrl-home}" STROP_SMOKE_HOLD=1 $EXTRA_ENV \
+    "$BIN" 2>"$LOG" &
 fi
 APP=$!
+# Readiness is a GATE, not advice (review finding): a crashed or hung
+# app must fail the run, never yield a blank "successful" frame.
+READY=
 for _ in $(seq 1 60); do
-  grep -q "SMOKE HOLD" /tmp/strop-wshot.log 2>/dev/null && break
+  grep -q "SMOKE HOLD" "$LOG" 2>/dev/null && { READY=1; break; }
+  kill -0 "$APP" 2>/dev/null || break
   sleep 0.5
 done
+if [ -z "$READY" ]; then
+  echo "wshot: app never reached SMOKE HOLD — no shot taken; log tail:" >&2
+  tail -20 "$LOG" >&2 2>/dev/null
+  exit 3
+fi
 sleep 1.5
-env -u DISPLAY WAYLAND_DISPLAY="$WD" grim -o HEADLESS-1 "$OUT"
-kill $APP $SWAY 2>/dev/null || true
-rm -f "$CFG"
+env -u DISPLAY XDG_RUNTIME_DIR="$RUNDIR" WAYLAND_DISPLAY="$WD" grim -o HEADLESS-1 "$OUT"
 echo "wshot: $OUT"

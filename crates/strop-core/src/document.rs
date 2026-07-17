@@ -887,6 +887,27 @@ pub struct SpanSet {
     spans: Vec<Span>,
 }
 
+/// One source block carried by Strop's private clipboard payload. Extents are
+/// bytes in the accompanying plain-text entry; `complete` is explicit because
+/// a trailing line break is not, by itself, evidence of selection intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardBlock {
+    pub range: Range<usize>,
+    pub kind: BlockKind,
+    pub complete: bool,
+}
+
+/// The structural portion of an internal paste. The app wraps this in the
+/// versioned, guarded clipboard envelope; keeping the application operation
+/// here makes text, blocks and spans one undo transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RichPaste {
+    pub spans: Vec<Span>,
+    pub blocks: Vec<ClipboardBlock>,
+    pub starts_at_boundary: bool,
+    pub ends_at_boundary: bool,
+}
+
 impl SpanSet {
     pub fn spans(&self) -> &[Span] {
         &self.spans
@@ -1602,6 +1623,13 @@ pub struct GraveEntry {
     /// false keeps every pre-papercuts entry loading as a plain fragment.
     #[serde(default)]
     pub whole_blocks: bool,
+    /// Whether the exile consumed a BLANK-LINE separator (the widening it
+    /// shares with Set aside: the prose closes up beneath the departing
+    /// block). Put back synthesizes the same blank line, so the round trip
+    /// is byte-identical. Only meaningful with `whole_blocks`; `serde`
+    /// default false keeps older entries returning with a plain join.
+    #[serde(default)]
+    pub blank_sep: bool,
 }
 
 /// The graveyard record: a side structure mirroring `Annotations` in every way
@@ -1665,7 +1693,9 @@ impl Graveyard {
     /// `region` records which side of the seam the text left (Put back
     /// returns through the same door — graveyard-interplay 1/2).
     /// `whole_blocks` records whether the exile verb read the cut as complete
-    /// paragraph block(s), so Put back rebuilds a paragraph, not a splice.
+    /// paragraph block(s), so Put back rebuilds a paragraph, not a splice;
+    /// `blank_sep` whether the consumed separator was a blank line, so Put
+    /// back rebuilds that too.
     #[allow(clippy::too_many_arguments)]
     pub fn file(
         &mut self,
@@ -1677,6 +1707,7 @@ impl Graveyard {
         kinds: Vec<BlockKind>,
         region: GraveRegion,
         whole_blocks: bool,
+        blank_sep: bool,
     ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
@@ -1692,6 +1723,7 @@ impl Graveyard {
             kinds,
             region,
             whole_blocks,
+            blank_sep,
         });
         id
     }
@@ -2180,7 +2212,9 @@ impl Document {
     /// Delete `byte_range` and file the removed prose in the graveyard as ONE
     /// undoable transaction. Both the auto-cut trigger and the explicit "Send
     /// to the graveyard" verb route here — on EITHER side of the seam (one
-    /// capture law, graveyard-interplay 5). Because `edit_bytes` snapshots
+    /// capture law, graveyard-interplay 5); a qualifying TYPE-OVER routes
+    /// through the sibling `replace_to_graveyard` (§4's amendment: with or
+    /// without replacement text). Because `edit_bytes` snapshots
     /// the PRE-cut side-state (graveyard included) before the filing, undoing
     /// the deletion restores a graveyard WITHOUT this entry — P13's inverse
     /// in the same grammar, no correlation table needed. `origin_pos` is the
@@ -2201,6 +2235,41 @@ impl Document {
         cut_unix: i64,
         collapse_emptied: bool,
     ) -> u64 {
+        self.file_removal(byte_range, "", false, origin_quote, cut_unix, collapse_emptied)
+    }
+
+    /// The type-over half of §4's capture law ("anything big that leaves in
+    /// one stroke, survives"): delete `byte_range`, file the REMOVED prose,
+    /// and land `replacement` where it stood — ONE undoable transaction, so
+    /// undo restores the old text, peels the replacement, and drops the
+    /// entry together (the same parity `cut_to_graveyard` documents).
+    /// `machine` picks the replacement's span anchoring: a paste re-anchors
+    /// verbatim (the A3 machine-insertion law), the typing hand extends.
+    /// The editor's auto-cut trigger is the only caller; the explicit verbs
+    /// never carry a replacement.
+    pub fn replace_to_graveyard(
+        &mut self,
+        byte_range: Range<usize>,
+        replacement: &str,
+        machine: bool,
+        origin_quote: String,
+        cut_unix: i64,
+    ) -> u64 {
+        self.file_removal(byte_range, replacement, machine, origin_quote, cut_unix, false)
+    }
+
+    /// Shared body of `cut_to_graveyard` / `replace_to_graveyard`: the one
+    /// removal-capture engine, `replacement` empty for the plain cut.
+    fn file_removal(
+        &mut self,
+        byte_range: Range<usize>,
+        replacement: &str,
+        machine: bool,
+        origin_quote: String,
+        cut_unix: i64,
+        collapse_emptied: bool,
+    ) -> u64 {
+        let repl_chars = replacement.chars().count();
         let (block, merged) = self.pre_edit_info(&byte_range);
         if self.crosses_furniture_wall(block, merged) {
             // §2 ("no text mechanic may move, clone, or absorb" furniture):
@@ -2219,13 +2288,20 @@ impl Document {
             for cut in &cuts {
                 let rope = self.buffer.rope();
                 let (s, e) = (rope.byte_to_char(cut.start), rope.byte_to_char(cut.end));
-                // Origins are POST-delete positions: each cut's start, less
+                // Origins are POST-edit positions: each cut's start, less
                 // the chars the earlier cuts take (the walls between them
-                // stand, so nothing else shifts).
-                pending.push((self.grave_capture(s, e), s - removed));
+                // stand, so nothing else shifts), plus the replacement —
+                // it lands at the range start's side, left of every cut.
+                pending.push((self.grave_capture(s, e), s - removed + repl_chars));
                 removed += e - s;
             }
-            self.edit_bytes(byte_range, ""); // re-plans identically; the clamped executor
+            // Re-plans identically; the clamped executor runs the cuts and
+            // lands the replacement in one transaction.
+            if machine {
+                self.edit_bytes_verbatim(byte_range, replacement);
+            } else {
+                self.edit_bytes(byte_range, replacement);
+            }
             self.revision += 1;
             // A separator-only range plans no cuts and files nothing; the
             // returned 0 is never a live entry id (`Graveyard::file` starts
@@ -2241,6 +2317,7 @@ impl Document {
                     kinds,
                     region,
                     whole,
+                    false,
                 );
             }
             if collapse_emptied && self.scraps_textless() {
@@ -2254,7 +2331,11 @@ impl Document {
         let (text, spans, kinds, region, whole) = self.grave_capture(start_char, end_char);
         // The non-coalescing edit always opens a fresh transaction, so the
         // pre-cut snapshot is always taken and the filing below rides it.
-        self.edit_bytes(byte_range, "");
+        if machine {
+            self.edit_bytes_verbatim(byte_range, replacement);
+        } else {
+            self.edit_bytes(byte_range, replacement);
+        }
         self.revision += 1;
         let id = self.graveyard.file(
             text,
@@ -2265,6 +2346,7 @@ impl Document {
             kinds,
             region,
             whole,
+            false,
         );
         if collapse_emptied && self.scraps_textless() {
             self.evaporate_scraps_in_tx();
@@ -2337,8 +2419,11 @@ impl Document {
     /// from a block's text start to a block's text end over one or more
     /// complete blocks — takes its bounding separator along, so the prose is
     /// left with exactly the separator that joined the neighbours and NO empty
-    /// grave; the entry records `whole_blocks: true` so Put back rebuilds a
-    /// paragraph (§B2). Anything else (a partial or mixed selection) falls
+    /// grave; a BLANK-LINE separator is consumed whole (the widening Set
+    /// aside performs, adjudicated shared — the two verbs still differ by
+    /// destination and record), and the entry records it (`blank_sep`) so
+    /// Put back restores the separator situation byte-identically. The entry
+    /// records `whole_blocks: true` so Put back rebuilds a paragraph (§B2). Anything else (a partial or mixed selection) falls
     /// through to `cut_to_graveyard`'s exact-byte semantics — two verbs, two
     /// contracts (plain delete stays exact-bytes; only exile interprets
     /// intent). Cut and its consumed separator are ONE transaction, so plain
@@ -2413,21 +2498,46 @@ impl Document {
             .collect();
         let spans = self.spans.slice(s..e);
         // A same-region block follows iff the char at `e` is a separator whose
-        // next line stays in this region.
-        let trailing_break = break_len_at(rope, e);
-        let trailing_sep = trailing_break > 0
-            && region_of_char(rope, &self.blocks, e + trailing_break)
-                == region_of_char(rope, &self.blocks, s);
-        let (del_start, del_end, origin) = if trailing_sep {
-            (s, e + trailing_break, s)
-        } else if break_len_before(rope, s) > 0 {
+        // next line stays in this region. The separator may be a BLANK LINE
+        // (Set aside's widening, adjudicated shared: exiling BBB from
+        // "AAA\n\nBBB\n\nCCC" must leave "AAA\n\nCCC" — the prose closes up
+        // beneath the departing block, never stacked blanks with the caret
+        // stranded on one). Every widened position must stay in this region:
+        // the seam's own blank line is a boundary, not a separator, and the
+        // widening never chews it. Nor is a TEXTLESS FURNITURE line one —
+        // an empty-caption image is a standing block (inline-images §5),
+        // and a neighbour's exile must not destroy the picture.
+        let my_region = region_of_char(rope, &self.blocks, s);
+        let region_of = |ch: usize| region_of_char(rope, &self.blocks, ch);
+        let tb1 = break_len_at(rope, e);
+        let tb2 = if tb1 > 0 { break_len_at(rope, e + tb1) } else { 0 };
+        let trailing_blank = tb2 > 0
+            && !self.blocks.kind(last_line + 1).is_furniture()
+            && region_of(e + tb1) == my_region
+            && region_of(e + tb1 + tb2) == my_region;
+        let trailing_sep = tb1 > 0 && region_of(e + tb1) == my_region;
+        let lb1 = break_len_before(rope, s);
+        let lb2 = if lb1 > 0 { break_len_before(rope, s - lb1) } else { 0 };
+        let leading_blank = lb2 > 0
+            && !self.blocks.kind(first_line - 1).is_furniture()
+            && region_of(s - lb1) == my_region
+            && region_of(s - lb1 - lb2) == my_region;
+        let (del_start, del_end, origin) = if trailing_blank {
+            (s, e + tb1 + tb2, s) // block + its trailing blank-line separator
+        } else if trailing_sep {
+            (s, e + tb1, s)
+        } else if leading_blank {
+            // The last block(s) of blank-separated prose: eat the blank line
+            // joining us to the block above.
+            (s - lb1 - lb2, e, s - lb1 - lb2)
+        } else if lb1 > 0 {
             // Leading separator: eat the newline joining us to the block above.
-            let leading_break = break_len_before(rope, s);
-            (s - leading_break, e, s - leading_break)
+            (s - lb1, e, s - lb1)
         } else {
             // A lone block that is the entire region: no separator to take.
             (s, e, s)
         };
+        let blank_sep = trailing_blank || leading_blank;
         let del_byte = self.char_to_byte(del_start)..self.char_to_byte(del_end);
         self.delete_bytes_whole_block(del_byte, first_line);
         // A lone block that is the entire document leaves its LINE standing
@@ -2449,6 +2559,7 @@ impl Document {
             kinds,
             region,
             true,
+            blank_sep,
         );
         if collapse_emptied && self.scraps_textless() {
             self.evaporate_scraps_in_tx();
@@ -2463,8 +2574,10 @@ impl Document {
     /// replacement lands MANUSCRIPT-side and the caret returns to the
     /// selection start. Each side that independently clears
     /// `capture_threshold` (chars) files its own region-honest graveyard
-    /// entry inside the same atom (graveyard-interplay 6) — `capture: false`
-    /// (a type-over, which keeps its text in spirit) files nothing. If the
+    /// entry inside the same atom (graveyard-interplay 6) — a type-over
+    /// files like a deletion (§4's amendment: anything big that leaves in
+    /// one stroke, survives); `capture: false` (the IME commit, which only
+    /// replaces its own preedit) files nothing. If the
     /// below edit empties the pile, evaporation rides the atom too (the
     /// caret ends manuscript-side, so the retype guard does not apply).
     /// Returns the caret char offset (the selection start).
@@ -2529,6 +2642,7 @@ impl Document {
                 above_kinds,
                 GraveRegion::Manuscript,
                 false,
+                false,
             );
         }
         if capture && b_e - b_s >= capture_threshold && !below_text.is_empty() {
@@ -2543,6 +2657,7 @@ impl Document {
                 below_spans,
                 below_kinds,
                 GraveRegion::Scraps,
+                false,
                 false,
             );
         }
@@ -2620,17 +2735,26 @@ impl Document {
             // all into an empty document (no phantom blank block) — or into a
             // trailing EMPTY block (the grave a plain delete leaves standing):
             // the return fills that block rather than opening a second blank.
-            // Synthesized LF can mix with CRLF; Ropey and BlockMap stay aligned.
+            // An entry whose exile widened over a BLANK-LINE separator
+            // (`blank_sep`) synthesizes the blank line back, so the round
+            // trip is byte-identical — at the tail, only the breaks the
+            // document is missing are prepended. Synthesized LF can mix
+            // with CRLF; Ropey and BlockMap stay aligned.
+            let sep = if entry.blank_sep { "\n\n" } else { "\n" };
             let (payload, text_offset) = if rope.len_chars() == 0 || empty_line {
                 (entry.text.clone(), 0)
             } else if at_end {
-                if break_len_before(rope, rope.len_chars()) > 0 {
-                    (entry.text.clone(), 0)
+                let b1 = break_len_before(rope, rope.len_chars());
+                let b2 = if b1 > 0 {
+                    break_len_before(rope, rope.len_chars() - b1)
                 } else {
-                    (format!("\n{}", entry.text), 1)
-                }
+                    0
+                };
+                let standing = (b1 > 0) as usize + (b2 > 0) as usize;
+                let missing = sep.len().saturating_sub(standing);
+                (format!("{}{}", &sep[..missing], entry.text), missing)
             } else {
-                (format!("{}\n", entry.text), 0)
+                (format!("{}{}", entry.text, sep), 0)
             };
             let at_byte = rope.char_to_byte(boundary);
             self.edit_bytes_verbatim(at_byte..at_byte, &payload);
@@ -3453,6 +3577,72 @@ impl Document {
         let splits = count_line_breaks(text);
         if merged != 0 || splits != 0 { self.blocks.on_edit(block, merged, splits); }
         self.absorb_buffer_ops_verbatim();
+    }
+
+    /// Apply an internal clipboard slice as one machine insertion. Complete
+    /// source blocks retain their kinds; partial edge blocks deliberately do
+    /// not get stamped and therefore inherit the destination flank. Source
+    /// spans are rebased after the splice and never consult caret attributes.
+    pub fn paste_rich(
+        &mut self,
+        byte_range: Range<usize>,
+        text: &str,
+        rich: &RichPaste,
+    ) {
+        let at = byte_range.start;
+        let destination_line = self.rope().byte_to_line(at.min(self.len_bytes()));
+        let destination_start = self.rope().line_to_byte(destination_line);
+        let destination_end = line_text_end_bytes(self.rope(), destination_line);
+        let prefix = usize::from(rich.starts_at_boundary && at > destination_start);
+        let suffix = usize::from(rich.ends_at_boundary && at < destination_end);
+        // Measured on the PRE-edit rope: does destination text remain on the
+        // replaced range's last line, to the right of the paste?
+        let tail_line = self.rope().byte_to_line(byte_range.end.min(self.len_bytes()));
+        let tail_merges = byte_range.end < line_text_end_bytes(self.rope(), tail_line);
+        let mut insertion = String::with_capacity(prefix + text.len() + suffix);
+        if prefix != 0 { insertion.push('\n'); }
+        insertion.push_str(text);
+        if suffix != 0 && !text.ends_with('\n') { insertion.push('\n'); }
+
+        self.edit_bytes_verbatim(byte_range, &insertion);
+        let char_base = self.rope().byte_to_char(at + prefix);
+        let text_chars = text.chars().count();
+        for span in &rich.spans {
+            if span.range.start < span.range.end && span.range.end <= text_chars {
+                self.spans.add(
+                    char_base + span.range.start..char_base + span.range.end,
+                    span.attr.clone(),
+                );
+            }
+        }
+        // A source kind travels with every block that does not SHARE a line
+        // with destination text — sharing happens only at the two seams: the
+        // first block merging leftward (no prefix newline, mid-line caret)
+        // and the last block merging rightward (destination text follows on
+        // the same line). The earlier `complete`-only rule left a trailing
+        // fragment unstamped even when it landed alone on a fresh line, so
+        // on_edit's destination clone won: copy two paragraphs, paste after
+        // a heading, and the SECOND paragraph arrived as a heading (Kirill,
+        // 2026-07-17). A fragment alone on its line has no destination to
+        // adopt from; its own kind is the only honest one.
+        for (i, source) in rich.blocks.iter().enumerate() {
+            if source.range.start > source.range.end || source.range.end > text.len() {
+                continue;
+            }
+            let starts_own_line = if source.range.start == 0 {
+                prefix != 0 || at == destination_start
+            } else {
+                text.as_bytes()[source.range.start - 1] == b'\n'
+            };
+            let shares_right = i + 1 == rich.blocks.len()
+                && tail_merges
+                && suffix == 0
+                && !text[source.range.clone()].ends_with('\n');
+            if starts_own_line && !shares_right {
+                let block = self.rope().byte_to_line(at + prefix + source.range.start);
+                self.blocks.set_kind(block, source.kind.clone());
+            }
+        }
     }
 
     pub fn edit_bytes_coalescing(&mut self, byte_range: Range<usize>, text: &str) {
@@ -4900,7 +5090,7 @@ mod tests {
     #[test]
     fn graveyard_apply_op_shifts_and_clamps_origin() {
         let mut g = Graveyard::default();
-        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
+        let id = g.file("cut".into(), "before".into(), 10, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false, false);
         assert_eq!(g.get(id).unwrap().words, 1);
         // Insert before the origin → shifts right (10 → 12).
         g.apply_op(&op(0, 0, "xx"));
@@ -4961,7 +5151,7 @@ mod tests {
         let base = doc.manuscript_base_char();
         assert!(base > 0);
         let mut g = Graveyard::default();
-        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false); // origin drifted into the pile
+        let id = g.file("XX".into(), String::new(), 0, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false, false); // origin drifted into the pile
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
         assert!(doc.text().starts_with("cc\n\n"), "compost untouched: {}", doc.text());
@@ -5035,8 +5225,10 @@ mod tests {
         assert!(e.spans.spans().is_empty());
         assert!(e.kinds.is_empty());
         // A pre-papercuts entry has no `whole_blocks` key: serde-default false,
-        // so it loads and puts back as a plain fragment (§B1).
+        // so it loads and puts back as a plain fragment (§B1). Same for the
+        // widening's `blank_sep` — an older entry returns with a plain join.
         assert!(!e.whole_blocks);
+        assert!(!e.blank_sep);
         // The whole record round-trips too.
         let g: Graveyard = serde_json::from_str(
             r#"{"entries":[{"id":1,"text":"x","origin_quote":"","origin_pos":0,"cut_unix":0,"words":1}],"next_id":1}"#,
@@ -5229,6 +5421,111 @@ mod tests {
         assert_eq!(caret, 8, "caret at CCC's start");
     }
 
+    // ---- exile widens over blank separators (adjudicated: shared with
+    // ---- Set aside — the verbs still differ by destination and record) ----
+
+    #[test]
+    fn exile_widens_over_the_blank_separator_and_round_trips_byte_identical() {
+        // Exiling BBB from blank-separated prose leaves "AAA\n\nCCC" — never
+        // "AAA\n\n\nCCC" with the caret stranded on a stacked blank — and
+        // Put back restores the paragraph AND its blank separator.
+        let mut doc =
+            Document::new("AAA\n\nBBB\n\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(5..8, String::new(), 0, false); // "BBB"
+        assert_eq!(doc.text(), "AAA\n\nCCC", "the prose closes up");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.whole_blocks);
+        assert!(e.blank_sep, "the entry records the blank separator");
+        assert_eq!(e.text, "BBB");
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\n\nBBB\n\nCCC", "byte-identical round trip");
+        assert_eq!(caret, 5, "caret at the returned block's start");
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn blank_separator_exile_stays_a_single_history_atom() {
+        let mut doc =
+            Document::new("AAA\n\nBBB\n\nCCC", SpanSet::default(), BlockMap::default());
+        doc.exile_to_graveyard(5..8, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA\n\nCCC");
+        // ONE undo restores the paragraph AND its blank separator, entry gone.
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\n\nBBB\n\nCCC");
+        assert_eq!(doc.blocks().len(), 5);
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn blank_separator_exile_covers_the_document_edges() {
+        // First block: the trailing blank goes with it.
+        let mut doc = Document::new("BBB\n\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(0..3, String::new(), 0, false);
+        assert_eq!(doc.text(), "CCC");
+        assert!(doc.graveyard().get(id).unwrap().blank_sep);
+        doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "BBB\n\nCCC", "first block round trip");
+
+        // Last block: the LEADING blank goes — no stacked blanks strand at
+        // the tail — and put back synthesizes the missing breaks back.
+        let mut doc = Document::new("AAA\n\nCCC", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(5..8, String::new(), 0, false);
+        assert_eq!(doc.text(), "AAA");
+        assert!(doc.graveyard().get(id).unwrap().blank_sep);
+        let caret = doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "AAA\n\nCCC", "last block round trip");
+        assert_eq!(caret, 5, "caret at CCC's start");
+
+        // A lone block has no separator to widen over.
+        let mut doc = Document::new("only", SpanSet::default(), BlockMap::default());
+        let id = doc.exile_to_graveyard(0..4, String::new(), 0, false);
+        assert_eq!(doc.text(), "");
+        assert!(!doc.graveyard().get(id).unwrap().blank_sep);
+        doc.put_back(id).unwrap();
+        assert_eq!(doc.text(), "only");
+    }
+
+    #[test]
+    fn exile_widening_never_reads_a_textless_furniture_line_as_a_blank() {
+        // [P, Image{empty caption}, P]: the image's empty line is a STANDING
+        // block (inline-images §5), not a blank separator — exiling AAA takes
+        // one join as before, never the picture's line with it.
+        let mut doc = Document::new(
+            "AAA\n\nBBB",
+            SpanSet::default(),
+            BlockMap::from_kinds(vec![
+                BlockKind::Paragraph,
+                BlockKind::Image { src: "asset:pic".into(), alt: String::new() },
+                BlockKind::Paragraph,
+            ]),
+        );
+        let id = doc.exile_to_graveyard(0..3, String::new(), 0, false);
+        assert_eq!(doc.text(), "\nBBB", "the image's line still stands");
+        assert!(!doc.graveyard().get(id).unwrap().blank_sep);
+    }
+
+    #[test]
+    fn exile_widening_never_chews_the_seam_blank_line() {
+        // The manuscript's last block with a pile below: the blank after BBB
+        // is the seam's join, not a separator — the widening stops at the
+        // region edge and takes the LEADING blank instead, leaving the seam
+        // and the pile exactly as they stood.
+        let mut doc = Document::new("x", SpanSet::default(), BlockMap::default());
+        let mut b = BlockMap::new(5);
+        b.set_scrap_line(Some(3));
+        doc.restore_state("AAA\n\nBBB\n\npile", SpanSet::default(), b);
+        let id = doc.exile_to_graveyard(5..8, String::new(), 0, false); // "BBB"
+        assert_eq!(doc.text(), "AAA\n\npile");
+        assert_eq!(doc.manuscript_slice().0, "AAA", "manuscript closed up");
+        assert!(doc.text().ends_with("pile"), "the pile untouched");
+        let e = doc.graveyard().get(id).unwrap();
+        assert!(e.blank_sep);
+        assert_eq!(e.region, GraveRegion::Manuscript);
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\n\nBBB\n\npile", "one undo restores it all");
+        assert!(doc.graveyard().is_empty());
+    }
+
     // ---- papercuts follow-up (2026-07-11 owner round): reports 3 & 4 ----
 
     #[test]
@@ -5348,6 +5645,70 @@ mod tests {
         doc.put_back(id).unwrap();
         assert_eq!(doc.text(), "AAA\nBBB\nCCC", "a fragment splices back in place");
         assert_eq!(doc.blocks().len(), 3);
+    }
+
+    // ---- §4's type-over amendment: anything big that leaves in one
+    // ---- stroke, survives — with or without replacement text ----
+
+    #[test]
+    fn type_over_files_the_removed_text_and_undoes_in_one_step() {
+        let long = "x".repeat(100);
+        let original = format!("AAA\n{long}\nCCC");
+        let mut doc = Document::new(&original, SpanSet::default(), BlockMap::default());
+        let id = doc.replace_to_graveyard(4..104, "NEW", false, "AAA".into(), 7);
+        assert_eq!(doc.text(), "AAA\nNEW\nCCC");
+        let e = doc.graveyard().get(id).unwrap();
+        assert_eq!(e.text, long, "the entry holds the REMOVED text, not the replacement");
+        assert!(e.whole_blocks, "a complete-block type-over records block-ness");
+        // ONE undo restores the old text, peels the replacement, and drops
+        // the entry together (the cut law's parity).
+        doc.undo();
+        assert_eq!(doc.text(), original);
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn paste_over_everything_files_exactly_one_entry_with_the_old_text() {
+        // Select-all + paste: the machine-performed replacement (verbatim
+        // span anchoring) still files ONE entry carrying the whole old text.
+        let mut doc = Document::new("AAA\nBBB\nCCC", SpanSet::default(), BlockMap::default());
+        let end = doc.len_bytes();
+        doc.replace_to_graveyard(0..end, "fresh start", true, String::new(), 0);
+        assert_eq!(doc.text(), "fresh start");
+        assert_eq!(doc.graveyard().len(), 1);
+        assert_eq!(doc.graveyard().entries()[0].text, "AAA\nBBB\nCCC");
+        doc.undo();
+        assert_eq!(doc.text(), "AAA\nBBB\nCCC");
+        assert!(doc.graveyard().is_empty());
+    }
+
+    #[test]
+    fn type_over_across_a_furniture_wall_clamps_and_files_the_actual_cuts() {
+        // §2 wall law under the amendment: the walls and the picture stand,
+        // the replacement lands at the range start's side, and each ACTUAL
+        // sub-deletion files its own entry at post-edit origins — never the
+        // raw slice, which would grave bytes still standing.
+        let mut doc = Document::new("0123456789\ncap\nabcdefghij", SpanSet::default(), {
+            let mut b = BlockMap::new(3);
+            b.set_kind(
+                1,
+                BlockKind::Image { src: "asset:img".into(), alt: String::new() },
+            );
+            b
+        });
+        doc.replace_to_graveyard(2..13, "XX", false, String::new(), 0);
+        assert_eq!(doc.text(), "01XX\np\nabcdefghij");
+        assert!(doc.blocks().kind(1).is_furniture(), "the picture survives the type-over");
+        assert_eq!(doc.graveyard().len(), 2, "one entry per surviving sub-deletion");
+        let entries = doc.graveyard().entries();
+        assert_eq!(entries[0].text, "23456789");
+        assert_eq!(entries[0].origin_pos, 4, "post-edit: after the landed replacement");
+        assert_eq!(entries[1].text, "ca");
+        assert_eq!(entries[1].origin_pos, 5);
+        // One undo restores text, walls, and empties the graveyard.
+        doc.undo();
+        assert_eq!(doc.text(), "0123456789\ncap\nabcdefghij");
+        assert!(doc.graveyard().is_empty());
     }
 
     #[test]
@@ -6384,6 +6745,7 @@ mod tests {
             Vec::new(),
             GraveRegion::Manuscript,
             false,
+            false,
         );
         doc.set_graveyard(g);
         doc.put_back(id).unwrap();
@@ -6427,7 +6789,7 @@ mod tests {
         let pile_note = doc.add_note(4..7, "pile note".into(), 0); // "one"
         let manu_note = doc.add_note(22..27, "manu note".into(), 0); // "piece"
         let mut g = Graveyard::default();
-        let gid = g.file("corpse".into(), String::new(), 22, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false);
+        let gid = g.file("corpse".into(), String::new(), 22, 0, SpanSet::default(), Vec::new(), GraveRegion::Manuscript, false, false);
         doc.set_graveyard(g);
         // Give it an undo stack that could reach back across the flip.
         doc.edit_bytes(0..0, "Z");
@@ -6550,5 +6912,152 @@ mod tests {
         b.set_scrap_line(Some(3));
         let r = ReplayDoc::new("a\n\nb\n\nc", SpanSet::default(), b, 0);
         assert_eq!(r.blocks.scrap_line(), Some(3), "fallback keeps a fixable seam");
+    }
+
+    #[test]
+    fn rich_paste_rebases_every_inline_attribute_without_sticky_inheritance() {
+        let mut destination_spans = SpanSet::default();
+        destination_spans.add(0..4, InlineAttr::Strong);
+        let mut doc = Document::new("bold tail", destination_spans, BlockMap::new(1));
+        let attrs = [
+            InlineAttr::Strong,
+            InlineAttr::Emphasis,
+            InlineAttr::Strikethrough,
+            InlineAttr::Underline,
+            InlineAttr::Highlight,
+            InlineAttr::Code,
+            InlineAttr::Link("https://example.test".into()),
+        ];
+        let rich = RichPaste {
+            spans: attrs.iter().enumerate().map(|(i, attr)| Span {
+                range: i..i + 1,
+                attr: attr.clone(),
+            }).collect(),
+            blocks: vec![ClipboardBlock {
+                range: 0..7,
+                kind: BlockKind::Paragraph,
+                complete: false,
+            }],
+            starts_at_boundary: false,
+            ends_at_boundary: false,
+        };
+        doc.paste_rich(4..4, "1234567", &rich);
+        for (i, attr) in attrs.iter().enumerate() {
+            assert!(doc.spans().covers(4 + i..5 + i, attr), "{attr:?} round-trips");
+        }
+        assert!(!doc.spans().covers(4..11, &InlineAttr::Strong),
+            "machine paste does not inherit the destination's sticky strong span");
+    }
+
+    #[test]
+    fn rich_complete_blocks_split_destination_flanks_and_keep_kinds() {
+        let mut blocks = BlockMap::new(2);
+        blocks.set_kind(0, BlockKind::Heading(2));
+        blocks.set_kind(1, BlockKind::Paragraph);
+        let mut doc = Document::new("Heading\ndestination", SpanSet::default(), blocks);
+        let kinds = [
+            BlockKind::Heading(1),
+            BlockKind::Paragraph,
+            BlockKind::Blockquote,
+            BlockKind::ListItem { ordered: false, depth: 0 },
+            BlockKind::CodeBlock { info: "rs".into() },
+        ];
+        let text = "head\npara\nquote\nitem\ncode\n";
+        let mut start = 0;
+        let source = kinds.iter().map(|kind| {
+            let end = text[start..].find('\n').map(|n| start + n + 1).unwrap();
+            let block = ClipboardBlock { range: start..end, kind: kind.clone(), complete: true };
+            start = end;
+            block
+        }).collect();
+        let rich = RichPaste { spans: Vec::new(), blocks: source,
+            starts_at_boundary: true, ends_at_boundary: true };
+        let at = "Heading\nde".len();
+        doc.paste_rich(at..at, text, &rich);
+        assert_eq!(doc.text(), "Heading\nde\nhead\npara\nquote\nitem\ncode\nstination");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(2));
+        assert_eq!(&doc.blocks().kinds()[2..7], &kinds);
+        assert_eq!(doc.blocks().kind(7), &BlockKind::Paragraph);
+        doc.undo();
+        assert_eq!(doc.text(), "Heading\ndestination", "the entire rich paste undoes once");
+    }
+
+    #[test]
+    fn rich_trailing_fragment_alone_on_its_line_keeps_its_source_kind() {
+        // Kirill's 2026-07-17 repro: copy two paragraphs (selection stops
+        // before the second one's newline), paste at the end of an H1 —
+        // the FIRST arrived as a paragraph, the SECOND as a heading. A
+        // fragment alone on a fresh line has no destination to adopt from.
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(1));
+        let mut doc = Document::new("Title", SpanSet::default(), blocks);
+        let text = "first para\nsecond para";
+        let rich = RichPaste {
+            spans: Vec::new(),
+            blocks: vec![
+                ClipboardBlock {
+                    range: 0..11, kind: BlockKind::Paragraph, complete: true,
+                },
+                ClipboardBlock {
+                    range: 11..22, kind: BlockKind::Paragraph, complete: false,
+                },
+            ],
+            starts_at_boundary: true,
+            ends_at_boundary: false,
+        };
+        doc.paste_rich(5..5, text, &rich);
+        assert_eq!(doc.text(), "Title\nfirst para\nsecond para");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(1));
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        assert_eq!(
+            doc.blocks().kind(2),
+            &BlockKind::Paragraph,
+            "the trailing fragment lands alone on its line — its own kind wins"
+        );
+    }
+
+    #[test]
+    fn rich_trailing_fragment_merging_into_following_text_adopts_its_line() {
+        // The counter-case that keeps ruling 2 honest: pasted mid-heading,
+        // the trailing fragment SHARES the line with the heading's tail —
+        // that composite line stays the destination's.
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(1));
+        let mut doc = Document::new("Title tail", SpanSet::default(), blocks);
+        let text = "first para\nsecond";
+        let rich = RichPaste {
+            spans: Vec::new(),
+            blocks: vec![
+                ClipboardBlock {
+                    range: 0..11, kind: BlockKind::Paragraph, complete: true,
+                },
+                ClipboardBlock {
+                    range: 11..17, kind: BlockKind::Paragraph, complete: false,
+                },
+            ],
+            starts_at_boundary: true,
+            ends_at_boundary: false,
+        };
+        doc.paste_rich(5..5, text, &rich);
+        assert_eq!(doc.text(), "Title\nfirst para\nsecond tail");
+        assert_eq!(doc.blocks().kind(1), &BlockKind::Paragraph);
+        assert_eq!(
+            doc.blocks().kind(2),
+            &BlockKind::Heading(1),
+            "a fragment merging into destination text adopts that line's kind"
+        );
+    }
+
+    #[test]
+    fn rich_fragment_adopts_destination_kind() {
+        let mut blocks = BlockMap::new(1);
+        blocks.set_kind(0, BlockKind::Heading(1));
+        let mut doc = Document::new("heading", SpanSet::default(), blocks);
+        let rich = RichPaste { spans: Vec::new(), blocks: vec![ClipboardBlock {
+            range: 0..4, kind: BlockKind::Blockquote, complete: false,
+        }], starts_at_boundary: false, ends_at_boundary: false };
+        doc.paste_rich(3..3, "frag", &rich);
+        assert_eq!(doc.text(), "heafragding");
+        assert_eq!(doc.blocks().kind(0), &BlockKind::Heading(1));
     }
 }

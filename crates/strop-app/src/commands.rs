@@ -9,7 +9,7 @@ use gpui::Action;
 
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, ExportMarkdown, Find, Heading1,
-    Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, ReadItCold, Redo,
+    Heading2, Heading3, InsertFootnote, NewDocument, OpenFile, OpenWelcome, PastePlain, ReadItCold, Redo,
     OpenAiSettings, RenameDocument, Replace, RevealInFiles, RunBelieving, RunDiagnosis, SaveCopyAs,
     MoveToManuscript, PutBackScrap, SendToGraveyard, SetAside, SetSessionGoal, ShowShortcuts, TestAiConnection, ToggleBulletList,
     ToggleCode, ToggleCodeBlock, ToggleEmphasis, ToggleGraveyard, ToggleHighlight, ToggleHistory,
@@ -115,6 +115,13 @@ pub fn all() -> &'static [Command] {
         ),
         cmd!("Undo", "Edit", Some("ctrl-z"), Undo, ["отмена"]),
         cmd!("Redo", "Edit", Some("ctrl-shift-z"), Redo, ["повтор"]),
+        cmd!(
+            "Paste as Plain Text",
+            "Edit",
+            Some("ctrl-shift-v"),
+            PastePlain,
+            ["paste unformatted", "вставить без форматирования"]
+        ),
         cmd!("Toggle Bold", "Format", Some("ctrl-b"), ToggleStrong, ["strong", "жирный"]),
         cmd!(
             "Toggle Italic",

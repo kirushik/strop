@@ -499,9 +499,7 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 continue;
             }
             // `ebtn:open` opens the editor button's dropdown; `ebtn:door`
-            // flips the door through the menu footer's presence verb. Together
-            // they let the rig assert the door law (cards rest while drafting
-            // even with the menu open) and the face's transitions.
+            // exercises the same transition as the fixed margin chip.
             if key == "ebtn:open" {
                 window
                     .update(cx, |editor, _, cx| editor.debug_open_editor_menu(cx))
@@ -530,6 +528,26 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .timer(Duration::from_millis(80))
                     .await;
                 eprintln!("SMOKE ebtn:door: door toggled");
+                continue;
+            }
+            if key == "notes:glance" {
+                window
+                    .update(cx, |editor, window, cx| editor.debug_glance_first(window, cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE notes:glance: first diagnosis lifted");
+                continue;
+            }
+            if key == "notes:drain" {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_drain_diagnoses(cx))
+                    .ok();
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                eprintln!("SMOKE notes:drain: diagnoses marked unverified");
                 continue;
             }
             if key == "ai:empty" {
@@ -588,6 +606,23 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                     .ok();
                 cx.background_executor().timer(Duration::from_millis(120)).await;
                 eprintln!("SMOKE seed:novel: round-two long fixture installed");
+                continue;
+            }
+            if let Some(mode) = key.strip_prefix("seed:scrollbar-") {
+                window
+                    .update(cx, |editor, _, cx| editor.debug_seed_scrollbar(mode, cx))
+                    .ok();
+                cx.background_executor().timer(Duration::from_millis(120)).await;
+                eprintln!("SMOKE seed:scrollbar-{mode}: rail fixture installed");
+                continue;
+            }
+            if let Some(fraction) = key.strip_prefix("rail:drag:") {
+                let fraction: f32 = fraction.parse().expect("rail:drag fraction");
+                window
+                    .update(cx, |editor, _, cx| editor.debug_space_drag(fraction, cx))
+                    .ok();
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                eprintln!("SMOKE rail:drag:{fraction}: readout held live");
                 continue;
             }
             // `seed:legacy` — the legacy litmus (Bug A): six materialized

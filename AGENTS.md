@@ -38,6 +38,30 @@ Report every command actually run with its real exit status.
 "not_run" and "failed" are legitimate outcomes; never report an
 unrun or interrupted test as passed.
 
+Test isolation (HARD RULE — protects the operator's desktop): every
+test or app invocation outside `scripts/wrun.sh` runs with the
+display env scrubbed and a PRIVATE runtime dir:
+
+```
+mkdir -p /tmp/strop-runtime
+env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR=/tmp/strop-runtime \
+  $TC/cargo test --workspace   # (RUSTC/PATH as above)
+```
+
+Why both halves: rendezvous sockets are keyed by document path in
+the REAL runtime dir — a test that touches a fixed path (Welcome)
+can surface the operator's live window; an inherited
+WAYLAND_DISPLAY lets a test-spawned binary open real windows on
+the operator's screen, which also lets stray keystrokes corrupt
+the run. The private dir additionally fixes the `single_instance`
+ReadOnlyFilesystem failures under sandboxes. Anything that truly
+needs a compositor goes through wrun.sh or wshot.sh, which bring
+their own — both are hermetic (private per-run XDG_RUNTIME_DIR,
+hard-fail with no fallback if headless sway doesn't come up; the
+2026-07-17 focus-steal was wshot globbing wayland-* in the shared
+runtime dir and racing onto the operator's live socket). Never
+launch sway or the binary against a compositor socket by hand.
+
 ## Scope
 
 - Make the smallest change that fixes the stated behavior; no
