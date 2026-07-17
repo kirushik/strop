@@ -4,7 +4,7 @@
 use gpui::{
     AnyWindowHandle, App, Bounds, BoxShadow, Context, CursorStyle, Decorations, Entity,
     FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, Pixels, Render,
-    ResizeEdge, Tiling, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    Tiling, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowHandle, WindowOptions, div, px, rgb, rgba, size,
 };
 use gpui::prelude::*;
@@ -14,17 +14,25 @@ use crate::draw_guard::EntityUpdateExt as _;
 use crate::icons::{self, icon};
 
 pub const DEFAULT_WIDTH: f32 = 900.;
-pub const DEFAULT_HEIGHT: f32 = 560.;
 const HEADER_HEIGHT: f32 = 68.;
 const SECTION_HEADING_HEIGHT: f32 = 24.;
 const ROW_PITCH: f32 = 16.;
+const SECTION_PAD: f32 = 8.;
+const GRID_TOP: f32 = 14.;
 const GRID_BOTTOM: f32 = 20.;
 const CSD_GUTTER: f32 = 22.;
 const CSD_ROUNDING: f32 = 10.;
-const RESIZE_INSET: f32 = 8.;
 
-fn default_window_size() -> (f32, f32) {
-    (DEFAULT_WIDTH + 2. * CSD_GUTTER, DEFAULT_HEIGHT + 2. * CSD_GUTTER)
+/// The sheet's one static size: contents fit by construction, and the
+/// window is not resizable — a registry that grows grows the window
+/// height, never a scrollbar (field nit, 2026-07-17: the old fixed
+/// 560px height silently clipped once the command registry outgrew a
+/// height model that forgot GRID_TOP and the per-section padding).
+fn static_window_size(sections: &[KeymapSection]) -> (f32, f32) {
+    (
+        DEFAULT_WIDTH + 2. * CSD_GUTTER,
+        content_fit_height(DEFAULT_WIDTH, sections) + 2. * CSD_GUTTER,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,12 +99,12 @@ pub struct SheetLayout {
 }
 
 fn section_height(section: &KeymapSection) -> f32 {
-    SECTION_HEADING_HEIGHT + section.1.len() as f32 * ROW_PITCH
+    SECTION_HEADING_HEIGHT + section.1.len() as f32 * ROW_PITCH + SECTION_PAD
 }
 
 /// Deterministic intact-section packing: registry order, always into the
 /// currently shortest column (leftmost wins ties).
-pub fn allocate_layout(width: f32, height: f32, sections: &[KeymapSection]) -> SheetLayout {
+fn pack_columns(width: f32, sections: &[KeymapSection]) -> (Vec<Vec<usize>>, Vec<f32>) {
     let count = if width >= 780. { 3 } else if width >= 560. { 2 } else { 1 };
     let mut columns = vec![Vec::new(); count];
     let mut heights = vec![0.; count];
@@ -110,11 +118,25 @@ pub fn allocate_layout(width: f32, height: f32, sections: &[KeymapSection]) -> S
         columns[column].push(ix);
         heights[column] += section_height(section);
     }
-    let available = (height - HEADER_HEIGHT - GRID_BOTTOM).max(0.);
+    (columns, heights)
+}
+
+pub fn allocate_layout(width: f32, height: f32, sections: &[KeymapSection]) -> SheetLayout {
+    let (columns, heights) = pack_columns(width, sections);
+    let available = (height - HEADER_HEIGHT - GRID_TOP - GRID_BOTTOM).max(0.);
     SheetLayout {
         columns,
         scrolls: heights.into_iter().any(|height| height > available),
     }
+}
+
+/// The inner sheet height at which the tallest packed column fits
+/// exactly — the static size derives from the registry, so the model
+/// and the paint must agree on every vertical constant above.
+pub fn content_fit_height(width: f32, sections: &[KeymapSection]) -> f32 {
+    let (_, heights) = pack_columns(width, sections);
+    let tallest = heights.into_iter().fold(0., f32::max);
+    HEADER_HEIGHT + GRID_TOP + tallest + GRID_BOTTOM
 }
 
 fn state_file() -> std::path::PathBuf {
@@ -166,61 +188,6 @@ pub fn containing_display(
     })
 }
 
-fn resize_strip(
-    id: &'static str,
-    edge: ResizeEdge,
-    cursor: CursorStyle,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .occlude()
-        .absolute()
-        .cursor(cursor)
-        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-            cx.stop_propagation();
-            window.start_window_resize(edge);
-        })
-}
-
-fn resize_handles(tiling: Tiling) -> Vec<gpui::AnyElement> {
-    let out = px(CSD_GUTTER - RESIZE_INSET);
-    let thick = px(2. * RESIZE_INSET);
-    let thin = px(RESIZE_INSET);
-    let mut handles = Vec::new();
-    if !tiling.top {
-        handles.push(resize_strip("keymap-rz-top", ResizeEdge::Top, CursorStyle::ResizeUpDown)
-            .top(out).left(out).right(out).h(thin).into_any_element());
-    }
-    if !tiling.bottom {
-        handles.push(resize_strip("keymap-rz-bottom", ResizeEdge::Bottom, CursorStyle::ResizeUpDown)
-            .bottom(out).left(out).right(out).h(thick).into_any_element());
-    }
-    if !tiling.left {
-        handles.push(resize_strip("keymap-rz-left", ResizeEdge::Left, CursorStyle::ResizeLeftRight)
-            .left(out).top(out).bottom(out).w(thick).into_any_element());
-    }
-    if !tiling.right {
-        handles.push(resize_strip("keymap-rz-right", ResizeEdge::Right, CursorStyle::ResizeLeftRight)
-            .right(out).top(out).bottom(out).w(thick).into_any_element());
-    }
-    if !tiling.top && !tiling.left {
-        handles.push(resize_strip("keymap-rz-tl", ResizeEdge::TopLeft, CursorStyle::ResizeUpLeftDownRight)
-            .top(out).left(out).size(thick).into_any_element());
-    }
-    if !tiling.top && !tiling.right {
-        handles.push(resize_strip("keymap-rz-tr", ResizeEdge::TopRight, CursorStyle::ResizeUpRightDownLeft)
-            .top(out).right(out).size(thick).into_any_element());
-    }
-    if !tiling.bottom && !tiling.left {
-        handles.push(resize_strip("keymap-rz-bl", ResizeEdge::BottomLeft, CursorStyle::ResizeUpRightDownLeft)
-            .bottom(out).left(out).size(thick).into_any_element());
-    }
-    if !tiling.bottom && !tiling.right {
-        handles.push(resize_strip("keymap-rz-br", ResizeEdge::BottomRight, CursorStyle::ResizeUpLeftDownRight)
-            .bottom(out).right(out).size(thick).into_any_element());
-    }
-    handles
-}
 
 pub struct KeymapWindow {
     focus_handle: FocusHandle,
@@ -333,7 +300,7 @@ impl Render for KeymapWindow {
                     .h(px((f32::from(bounds.size.height) - vertical_inset - HEADER_HEIGHT).max(0.)))
                     .when(layout.scrolls, |grid| grid.overflow_y_scroll())
                     .px(px(22.))
-                    .pt(px(14.))
+                    .pt(px(GRID_TOP))
                     .pb(px(GRID_BOTTOM))
                     .flex()
                     .gap(px(22.))
@@ -341,7 +308,7 @@ impl Render for KeymapWindow {
                         div().flex_1().min_w_0().children(column.into_iter().map(|ix| {
                             let (name, rows) = &self.sections[ix];
                             div()
-                                .pb(px(8.))
+                                .pb(px(SECTION_PAD))
                                 .child(
                                     div()
                                         .h(px(SECTION_HEADING_HEIGHT))
@@ -399,7 +366,7 @@ impl Render for KeymapWindow {
                     })
                 })
                 .child(round(content)),
-        ).when(client, |d| d.children(resize_handles(tiling)))
+        )
     }
 }
 
@@ -409,6 +376,8 @@ pub fn open(
     editor_bounds: Bounds<Pixels>,
     cx: &mut App,
 ) -> Option<WindowHandle<KeymapWindow>> {
+    let sections = keymap_sections();
+    let (default_width, default_height) = static_window_size(&sections);
     let displays = cx.displays();
     let editor_tuple = (
         f32::from(editor_bounds.origin.x), f32::from(editor_bounds.origin.y),
@@ -424,14 +393,15 @@ pub fn open(
     let work = display
         .as_ref()
         .map(|display| display.bounds())
-        .unwrap_or_else(|| Bounds::centered(None, size(px(DEFAULT_WIDTH), px(DEFAULT_HEIGHT)), cx));
+        .unwrap_or_else(|| {
+            Bounds::centered(None, size(px(default_width), px(default_height)), cx)
+        });
     let work_tuple = (
         f32::from(work.origin.x),
         f32::from(work.origin.y),
         f32::from(work.size.width),
         f32::from(work.size.height),
     );
-    let (default_width, default_height) = default_window_size();
     let editor_right = f32::from(editor_bounds.origin.x + editor_bounds.size.width);
     let editor_left = f32::from(editor_bounds.origin.x);
     // impl/18's 2026-07-17 amendment: Wayland ignores this requested origin
@@ -443,12 +413,17 @@ pub fn open(
     } else {
         work_tuple.0 + (work_tuple.2 - default_width) / 2.
     };
-    let remembered = load_bounds().unwrap_or((
-        beside_x,
-        f32::from(editor_bounds.origin.y),
-        default_width,
-        default_height,
-    ));
+    // Only the POSITION is remembered: the size is static and derived
+    // from the registry, so a stale persisted height can never clip the
+    // sheet again.
+    let remembered = load_bounds()
+        .map(|(x, y, _, _)| (x, y, default_width, default_height))
+        .unwrap_or((
+            beside_x,
+            f32::from(editor_bounds.origin.y),
+            default_width,
+            default_height,
+        ));
     let (x, y, w, h) = clamp_bounds(remembered, work_tuple);
     cx.open_window(
         WindowOptions {
@@ -462,6 +437,7 @@ pub fn open(
                 ..Default::default()
             }),
             window_decorations: Some(WindowDecorations::Client),
+            is_resizable: false,
             window_background: if cfg!(any(target_os = "linux", target_os = "freebsd")) {
                 WindowBackgroundAppearance::Transparent
             } else {
@@ -547,17 +523,20 @@ mod tests {
             assigned.sort_unstable();
             assert_eq!(assigned, (0..sections.len()).collect::<Vec<_>>());
         }
+        // The static size is DERIVED from the registry: however the
+        // command set grows, the sheet born at static_window_size can
+        // never clip or scroll — that is the whole contract of the
+        // unresizable window (field nit, 2026-07-17).
+        let fit = content_fit_height(DEFAULT_WIDTH, &sections);
+        assert!(!allocate_layout(DEFAULT_WIDTH, fit, &sections).scrolls);
         assert!(
-            !allocate_layout(900., 560., &sections).scrolls,
-            "registry outgrew the default no-scroll density budget"
+            allocate_layout(DEFAULT_WIDTH, fit - 30., &sections).scrolls,
+            "fit height is exact, not padded — the model drifted from paint"
         );
+        let (w, h) = static_window_size(&sections);
         assert!(
-            !allocate_layout(
-                default_window_size().0 - 2. * CSD_GUTTER,
-                default_window_size().1 - 2. * CSD_GUTTER,
-                &sections,
-            ).scrolls,
-            "client decoration inset broke the default no-scroll budget"
+            !allocate_layout(w - 2. * CSD_GUTTER, h - 2. * CSD_GUTTER, &sections).scrolls,
+            "client decoration inset broke the static no-scroll contract"
         );
         assert!(allocate_layout(900., 300., &sections).scrolls);
     }
