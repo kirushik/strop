@@ -32,6 +32,7 @@ use strop_core::document::{
 };
 use strop_core::{SaveCompletion, SaveGeneration, SaveWorker, Store, typograph};
 
+use crate::bookpage::shaped_list_paragraphs;
 use crate::config::{Config, Language};
 use crate::draw_guard::{DrawGuard, EntityUpdateExt as _, capture_canvas};
 use crate::icons::{self, icon};
@@ -14614,6 +14615,29 @@ fn image_gap_below(paragraph_gap: f32, caption_line_height: f32) -> f32 {
     paragraph_gap.max(IMAGE_CAPTION_GAP + caption_line_height)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShapedListGap {
+    Solid,
+    Blank,
+}
+
+fn shaped_list_gap(texts: &[&str], shaped: &[bool], i: usize) -> Option<ShapedListGap> {
+    if shaped.get(i) == Some(&true) && shaped.get(i + 1) == Some(&true) {
+        Some(ShapedListGap::Solid)
+    } else if (shaped.get(i) == Some(&true)
+        && texts.get(i + 1) == Some(&"")
+        && shaped.get(i + 2) == Some(&true))
+        || (i > 0
+            && shaped.get(i - 1) == Some(&true)
+            && texts.get(i) == Some(&"")
+            && shaped.get(i + 1) == Some(&true))
+    {
+        Some(ShapedListGap::Blank)
+    } else {
+        None
+    }
+}
+
 /// Painted footnote numbers (DESIGN §2-footnotes): the Nth distinct ref in
 /// text order paints as N — numbering derives from ref order while stored
 /// ids stay stable internal labels, the universal Word/Pandoc architecture.
@@ -15433,6 +15457,8 @@ impl Element for EditorElement {
         } else {
             editor.doc.blocks().kinds().to_vec()
         };
+        let paragraph_texts: Vec<&str> = text.split('\n').collect();
+        let shaped_lists = shaped_list_paragraphs(&paragraph_texts, &kinds, true);
         // Painted footnote numbers, derived from ref order in this frame's
         // text (preview or live) — stored ids stay internal labels.
         let fn_numbers = {
@@ -15894,6 +15920,15 @@ impl Element for EditorElement {
                     && matches!(kinds.get(block_ix + 1), Some(BlockKind::ListItem { .. }))
                 {
                     paragraph_gap * 0.25
+                } else if let Some(gap) =
+                    shaped_list_gap(&paragraph_texts, &shaped_lists, block_ix)
+                {
+                    match gap {
+                        ShapedListGap::Solid => paragraph_gap * 0.25,
+                        ShapedListGap::Blank => {
+                            px((f32::from(paragraph_gap) * 0.5 / 2.).round() * 2.)
+                        }
+                    }
                 } else if is_image && par_text.is_empty() {
                     // The empty caption slot's borrowed margin (§3): must
                     // hold one caption caret — a no-op at the default
@@ -27233,6 +27268,32 @@ impl Element for StripElement {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn shaped_list_layout_tightens_only_the_run_interior() {
+        let text = "a\n\n- one\n\n- two\n\nb";
+        let texts: Vec<&str> = text.split('\n').collect();
+        let kinds = vec![BlockKind::Paragraph; texts.len()];
+        let shaped = shaped_list_paragraphs(&texts, &kinds, true);
+        let paragraph_height = 20.;
+        let paragraph_gap = 20.;
+        let pile_gap = (paragraph_gap * 0.5_f32 / 2.).round() * 2.;
+        let mut tops = vec![0.];
+        for i in 0..texts.len() - 1 {
+            let gap = match shaped_list_gap(&texts, &shaped, i) {
+                Some(ShapedListGap::Solid) => paragraph_gap * 0.25,
+                Some(ShapedListGap::Blank) => pile_gap,
+                None => paragraph_gap,
+            };
+            tops.push(tops[i] + paragraph_height + gap);
+        }
+
+        assert_eq!(tops, vec![0., 40., 80., 110., 140., 180., 220.]);
+        assert_eq!(tops[2] - tops[1] - paragraph_height, paragraph_gap,
+            "the run keeps full entering air");
+        assert_eq!(tops[5] - tops[4] - paragraph_height, paragraph_gap,
+            "the run keeps full leaving air");
+    }
 
     #[test]
     fn station_hit_arbitrates_by_tick_then_rank() {

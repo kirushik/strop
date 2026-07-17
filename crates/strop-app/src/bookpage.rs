@@ -422,7 +422,7 @@ pub fn paginate(
     let raw: Vec<String> = (0..rope.len_lines())
         .map(|i| rope.line(i).chars().take_while(|&c| !is_line_break(c)).collect())
         .collect();
-    let shaped_lists = shaped_list_paragraphs(&raw, blocks);
+    let shaped_lists = shaped_list_paragraphs(&raw, blocks.kinds(), false);
     let mut flows: Vec<Flow> = Vec::new();
     let mut counters: Vec<usize> = Vec::new(); // ordered-list numbering per depth
     for i in 0..rope.len_lines() {
@@ -634,29 +634,61 @@ fn list_number(text: &str) -> Option<u8> {
     digits.parse().ok()
 }
 
-fn shaped_list_paragraphs(texts: &[String], blocks: &BlockMap) -> Vec<bool> {
+pub(crate) fn shaped_list_paragraphs<T: AsRef<str>>(
+    texts: &[T],
+    kinds: &[BlockKind],
+    transparent_blank: bool,
+) -> Vec<bool> {
     let mut shaped = vec![false; texts.len()];
     for i in 0..texts.len() {
-        if !matches!(blocks.kind(i), BlockKind::Paragraph) {
+        if !matches!(kinds.get(i), Some(BlockKind::Paragraph)) {
             continue;
         }
-        if matches!(texts[i].as_bytes(), [b'-' | b'*', b' ', ..]) || texts[i].starts_with("• ") {
-            let adjacent = [i.checked_sub(1), (i + 1 < texts.len()).then_some(i + 1)]
-                .into_iter().flatten().any(|j| {
-                    matches!(blocks.kind(j), BlockKind::Paragraph)
-                        && (matches!(texts[j].as_bytes(), [b'-' | b'*', b' ', ..])
-                            || texts[j].starts_with("• "))
-                });
+        let text = texts[i].as_ref();
+        let neighbours = shaped_list_neighbours(i, texts, kinds, transparent_blank);
+        if matches!(text.as_bytes(), [b'-' | b'*', b' ', ..]) || text.starts_with("• ") {
+            let adjacent = neighbours.into_iter().flatten().any(|j| {
+                let text = texts[j].as_ref();
+                matches!(text.as_bytes(), [b'-' | b'*', b' ', ..]) || text.starts_with("• ")
+            });
             shaped[i] = adjacent;
-        } else if let Some(n) = list_number(&texts[i]) {
-            shaped[i] = [i.checked_sub(1), (i + 1 < texts.len()).then_some(i + 1)]
-                .into_iter().flatten().any(|j| {
-                    matches!(blocks.kind(j), BlockKind::Paragraph)
-                        && list_number(&texts[j]).is_some_and(|m| m.abs_diff(n) == 1)
-                });
+        } else if let Some(n) = list_number(text) {
+            shaped[i] = neighbours.into_iter().flatten().any(|j| {
+                list_number(texts[j].as_ref()).is_some_and(|m| m.abs_diff(n) == 1)
+            });
         }
     }
     shaped
+}
+
+fn shaped_list_neighbours<T: AsRef<str>>(
+    i: usize,
+    texts: &[T],
+    kinds: &[BlockKind],
+    transparent_blank: bool,
+) -> [Option<usize>; 2] {
+    let neighbour = |direct: Option<usize>, beyond: Option<usize>| {
+        let direct = direct?;
+        if matches!(kinds.get(direct), Some(BlockKind::Paragraph))
+            && (!transparent_blank || !texts[direct].as_ref().is_empty())
+        {
+            return Some(direct);
+        }
+        if transparent_blank
+            && matches!(kinds.get(direct), Some(BlockKind::Paragraph))
+            && texts[direct].as_ref().is_empty()
+        {
+            return beyond.filter(|&j| matches!(kinds.get(j), Some(BlockKind::Paragraph)));
+        }
+        None
+    };
+    [
+        neighbour(i.checked_sub(1), i.checked_sub(2)),
+        neighbour(
+            (i + 1 < texts.len()).then_some(i + 1),
+            (i + 2 < texts.len()).then_some(i + 2),
+        ),
+    ]
 }
 
 // ---- Tokenizer -----------------------------------------------------------------
@@ -1490,6 +1522,34 @@ fn assemble(flows: Vec<Flow>, metrics: &BookMetrics, body_h: f32) -> BookLayout 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shaped_lists_share_markers_numbers_and_editor_blank_adjacency() {
+        let texts = [
+            "- one", "* two", "prose", "1. one", "2) two", "1. reset",
+            "— dialogue", "— reply", "• three", "", "- four", "", "", "- five",
+        ];
+        let kinds = vec![BlockKind::Paragraph; texts.len()];
+        assert_eq!(
+            shaped_list_paragraphs(&texts, &kinds, true),
+            vec![
+                true, true, false, true, true, true, false, false, true, false,
+                true, false, false, false,
+            ],
+        );
+        assert_eq!(
+            shaped_list_paragraphs(&["3. three", "2. two"],
+                &[BlockKind::Paragraph, BlockKind::Paragraph], true),
+            vec![true, true],
+            "number adjacency works in either direction",
+        );
+        assert_eq!(
+            shaped_list_paragraphs(&["- one", "", "- two"],
+                &vec![BlockKind::Paragraph; 3], false),
+            vec![false, false, false],
+            "the book still requires direct adjacency",
+        );
+    }
 
     /// 10 px per char, 10 px space — lines compute by hand.
     struct FakeM;
