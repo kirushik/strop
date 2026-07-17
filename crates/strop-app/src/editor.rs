@@ -23408,7 +23408,10 @@ fn strip_top_slots(frame_w: f32, readout_w: f32, now_label_w: f32) -> StripTopSl
     let close_w = 19.;
     let close_x = (frame_w - 8. - close_w).max(0.);
     let now_w = (now_label_w + 16.).max(48.);
-    let now_x = (close_x - now_w).max(0.);
+    // Air before the close saltire: Now (return to the present) and close
+    // (dismiss the strip) are unrelated verbs — adjacent hot targets with
+    // opposite meanings invite the misclick (2026-07-17 round).
+    let now_x = (close_x - 12. - now_w).max(0.);
     let readout_x = strip::SIDE_PAD;
     let readout_limit = (now_x - 24. - readout_x).max(0.);
     let readout_w = readout_w.min(readout_limit);
@@ -26228,7 +26231,11 @@ impl Editor {
             return None;
         }
         let parked = self.strip.parked;
-        let desk_w = f32::from(window.viewport_size().width);
+        // CONTENT width, not viewport: the strip is a child of the CSD-inset
+        // surface, so slot x's live in its domain — viewport width overflows
+        // the visible frame by a gutter per floating side (the clipped-Now
+        // bug, 2026-07-17; same lesson as the invisible rail).
+        let desk_w = self.content_width(window);
         let now_ms = self
             .strip
             .bake
@@ -26594,13 +26601,17 @@ impl Editor {
                     editor.strip_pan(d, cx);
                 }))
                 .child(StripElement { editor: cx.entity() })
-                // The sheet origin owns the readout.
+                // The sheet origin owns the readout. Every top-row slot takes
+                // the same 22px centered band — one row, one optical baseline.
                 .child(
                     div()
                         .absolute()
                         .left(px(slots.readout.0))
                         .top(px(4.))
                         .w(px(slots.readout.1))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
                         .overflow_hidden()
                         .child(readout_chip),
                 )
@@ -26618,15 +26629,19 @@ impl Editor {
                         .when(parked, |d| d.child(restore_btn))
                         .when(parked, |d| d.child(center)),
                 )
-                // Now and close are the two terminal frame-owned slots.
+                // Now and close are the two terminal frame-owned slots. Now
+                // right-aligns toward the rail's right terminus — the label
+                // reads as the axis's end cap, not a floating chip.
                 .child(
                     div()
                         .absolute()
                         .left(px(slots.now.0))
                         .w(px(slots.now.1))
                         .top(px(4.))
+                        .h(px(22.))
                         .flex()
-                        .justify_center()
+                        .items_center()
+                        .justify_end()
                         .child(now_chip),
                 )
                 .child(
