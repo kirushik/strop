@@ -89,6 +89,16 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
                 eprintln!("SMOKE {key}: clipboard set");
                 continue;
             }
+            // `open:about` dispatches the AboutStrop action app-wide — the
+            // rig hook for the colophon window (releasing.md §8): under
+            // headless sway the second window tiles beside the editor, so
+            // one grim frame shows both.
+            if key == "open:about" {
+                cx.update(|cx| cx.dispatch_action(&crate::AboutStrop));
+                cx.background_executor().timer(Duration::from_millis(400)).await;
+                eprintln!("SMOKE open:about: colophon window dispatched");
+                continue;
+            }
             // `clipimg:PATH` seeds the clipboard with a BARE bitmap entry —
             // a foreign clipboard in §9's terms (no Strop image line) — for
             // driving the §5b fallback and §4's bitmap replace-in-place.

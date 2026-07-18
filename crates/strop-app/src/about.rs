@@ -106,6 +106,10 @@ impl Focusable for AboutWindow {
 impl Render for AboutWindow {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let state = update::status();
+        // Inert (dev build, store channel) shows no updater surface at all
+        // (§5); Disabled keeps the row so its "checks are off" line can
+        // point at the config, with the button muted.
+        let show_updater = !matches!(state, UpdateState::Inert);
         let enabled = !matches!(state, UpdateState::Inert | UpdateState::Disabled);
         let status = update_text(&state, SystemTime::now());
         let notes = match &state {
@@ -123,7 +127,8 @@ impl Render for AboutWindow {
                 .child(format!("version {}", env!("CARGO_PKG_VERSION")))
                 .child(format!("commit {}", option_env!("STROP_GIT_HASH").unwrap_or("unknown")))
                 .child(channel_text(update::channel())))
-            .child(div().mt(px(16.)).pt(px(12.)).border_t_1().border_color(rgb(RULE_COLOR))
+            .when(show_updater, |d| d.child(div().mt(px(16.)).pt(px(12.))
+                .border_t_1().border_color(rgb(RULE_COLOR))
                 .flex().items_center().justify_between()
                 .child(status.unwrap_or_default())
                 .child(div().id("about-check").px(px(10.)).py(px(5.)).rounded(px(4.))
@@ -131,7 +136,7 @@ impl Render for AboutWindow {
                     .text_color(rgb(if enabled { TEXT_COLOR } else { MUTED_COLOR }))
                     .when(enabled, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left,
                         |_: &MouseDownEvent, _, _| update::check_now()))
-                    .child("Check now")))
+                    .child("Check now"))))
             .when_some(notes, |d, url| d.child(datum(url).mt(px(5.)).text_color(rgb(LINK_COLOR))))
             .child(div().mt(px(18.)).font_family("PT Serif").text_size(px(12.)).line_height(px(18.))
                 .child("© 2026 Kirill Pimenov")
