@@ -427,7 +427,7 @@ pub fn open(
     let (x, y, w, h) = clamp_bounds(remembered, work_tuple);
     cx.open_window(
         WindowOptions {
-            app_id: Some("strop".to_owned()),
+            app_id: Some("cc.pimenov.strop".to_owned()),
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: gpui::point(px(x), px(y)),
                 size: size(px(w), px(h)),

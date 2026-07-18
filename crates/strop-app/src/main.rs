@@ -33,6 +33,7 @@ mod startup_error;
 mod text_field;
 mod theme;
 mod tutorial;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -161,6 +162,13 @@ fn open_target(doc_path: &Path) -> (PathBuf, bool) {
 }
 
 fn main() {
+    // Before anything — before arguments are read and before any
+    // single-instance socket can exist: if a verified update is staged,
+    // this swaps binaries and re-execs (docs/releasing.md §4). The
+    // rendezvous below must only ever be performed by the binary that
+    // will actually run.
+    update::startup_apply_if_staged();
+
     // gpui_platform::application() replaced gpui::Application::new() after
     // the facade/platform crate split. The asset source feeds gpui's svg()
     // pipeline the embedded icon plate (docs/iconography.md).
@@ -422,7 +430,7 @@ fn main() {
         };
         let window = cx.open_window(
             WindowOptions {
-                app_id: Some("strop".to_owned()),
+                app_id: Some("cc.pimenov.strop".to_owned()),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.clone().into()),
