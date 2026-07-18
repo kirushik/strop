@@ -33,6 +33,14 @@ toml_edit = { workspace = true }
 glob = { workspace = true }
 interprocess = "2.4.2"
 
+# Self-update (docs/releasing.md §4): minisign-verify checks the signed
+# manifest against the baked key list; semver enforces the downgrade gate;
+# fs4 is the installation-wide advisory update lock (the per-document
+# rendezvous socket deliberately provides no swap exclusion).
+minisign-verify = "0.2"
+semver = { workspace = true }
+fs4 = "0.13"
+
 # XDG document-portal resolution (files.rs) exists only where the portal
 # does. ashpd's zbus stack does not even compile on Windows (std::os::fd),
 # and macOS was paying to build a D-Bus client it could never speak to —
@@ -41,7 +49,14 @@ interprocess = "2.4.2"
 ashpd = { version = "0.13.11", default-features = false,
     features = ["async-io", "documents"] }
 
+# The Windows swap dance: a running exe can be renamed but not unlinked;
+# self-replace owns that ritual (docs/releasing.md §4 "Apply").
+[target.'cfg(windows)'.dependencies]
+self-replace = "1"
+
 [dev-dependencies]
+# Test-only minisign *signing* — production only ever verifies.
+minisign = "0.7"
 gpui = { workspace = true, features = ["test-support"] }
 ttf-parser = "0.25"
 proptest = "1"

@@ -102,3 +102,8 @@ pub fn startup_apply_if_staged() {}
 /// Background check/download loop (launch + every 8 h). Spawned once the
 /// first window is up; respects `[update] check` and the channel gate.
 pub fn spawn_checks(_config: &crate::config::Config) {}
+
+/// About's "check now" button (§5): one immediate check + download,
+/// driving `status()` through the same states as the background loop.
+/// Honors the same gates; a no-op wherever the loop would be.
+pub fn check_now() {}
