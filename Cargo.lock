@@ -5988,6 +5988,8 @@ dependencies = [
  "ttf-parser",
  "unicode-normalization",
  "unicode-segmentation",
+ "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -40,6 +40,7 @@ interprocess = "2.4.2"
 minisign-verify = "0.2"
 semver = { workspace = true }
 fs4 = "0.13"
+ureq = { workspace = true }
 
 # XDG document-portal resolution (files.rs) exists only where the portal
 # does. ashpd's zbus stack does not even compile on Windows (std::os::fd),
@@ -53,6 +54,7 @@ ashpd = { version = "0.13.11", default-features = false,
 # self-replace owns that ritual (docs/releasing.md §4 "Apply").
 [target.'cfg(windows)'.dependencies]
 self-replace = "1"
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 # Test-only minisign *signing* — production only ever verifies.
