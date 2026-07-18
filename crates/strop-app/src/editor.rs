@@ -2879,7 +2879,10 @@ impl Editor {
                     Some("md") => std::fs::read_to_string(&path)
                         .ok()
                         .map(|md| strop_core::markdown::from_markdown(&md).0),
-                    Some("strop") => Store::open(&path)
+                    Some("strop") => Store::open_with_backup_destination(
+                        &path,
+                        Some(&crate::paths::migration_backups_dir()),
+                    )
                         .ok()
                         .and_then(|(_, loaded)| loaded.map(|l| l.text)),
                     _ => std::fs::read_to_string(&path).ok(),

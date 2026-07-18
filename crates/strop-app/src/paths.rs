@@ -58,6 +58,12 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|| fallback_root().join("data"))
 }
 
+/// Durable, content-addressed originals captured before migration or
+/// compaction changes a document's on-disk bytes.
+pub fn migration_backups_dir() -> PathBuf {
+    data_dir().join("migration-backups")
+}
+
 /// The Strop subfolder inside the user's Documents folder — where new
 /// documents are born visible (see `files.rs`). Lin honors `XDG_DOCUMENTS_DIR`
 /// via xdg-user-dirs (falling back to `~/Documents`); macOS and Windows use

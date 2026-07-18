@@ -1,0 +1,204 @@
+{
+  "text": "Title\nQuoted\nList\nRule\nCode\nImage caption\nFootnote\nBody Corpus edit.",
+  "spans": {
+    "spans": [
+      {
+        "attr": "Strong",
+        "range": {
+          "end": 5,
+          "start": 0
+        }
+      },
+      {
+        "attr": "Emphasis",
+        "range": {
+          "end": 12,
+          "start": 6
+        }
+      }
+    ]
+  },
+  "block_kinds": [
+    {
+      "Heading": 1
+    },
+    "Blockquote",
+    {
+      "ListItem": {
+        "depth": 1,
+        "ordered": true
+      }
+    },
+    "Divider",
+    {
+      "CodeBlock": {
+        "info": "rust"
+      }
+    },
+    {
+      "Image": {
+        "alt": "tiny",
+        "caption": "",
+        "src": "asset:82ed192ab87ac36cef798453672447286619ff3aaf748c444b4f7ffbcf490a53.png"
+      }
+    },
+    {
+      "FootnoteDef": {
+        "id": "n1"
+      }
+    },
+    "Paragraph"
+  ],
+  "note_anchors": {
+    "next_id": 1,
+    "notes": [
+      {
+        "body": "margin note",
+        "created_unix": 1600000000,
+        "id": 1,
+        "kind": "Note",
+        "level": "",
+        "orphaned": false,
+        "pass_id": 0,
+        "range": {
+          "end": 5,
+          "start": 0
+        },
+        "status": "Open",
+        "title": "",
+        "unverified": false
+      }
+    ]
+  },
+  "checkpoints": [
+    {
+      "name": "first",
+      "timestamp_ms": 1600000004000,
+      "manual": true
+    },
+    {
+      "name": "second",
+      "timestamp_ms": 1600000005000,
+      "manual": true
+    }
+  ],
+  "materialized_state": {
+    "block_kinds": [
+      {
+        "Heading": 1
+      },
+      "Blockquote",
+      {
+        "ListItem": {
+          "depth": 1,
+          "ordered": true
+        }
+      },
+      "Divider",
+      {
+        "CodeBlock": {
+          "info": "rust"
+        }
+      },
+      {
+        "Image": {
+          "alt": "tiny",
+          "caption": "",
+          "src": "asset:82ed192ab87ac36cef798453672447286619ff3aaf748c444b4f7ffbcf490a53.png"
+        }
+      },
+      {
+        "FootnoteDef": {
+          "id": "n1"
+        }
+      },
+      "Paragraph"
+    ],
+    "spans": {
+      "spans": [
+        {
+          "attr": "Strong",
+          "range": {
+            "end": 5,
+            "start": 0
+          }
+        },
+        {
+          "attr": "Emphasis",
+          "range": {
+            "end": 12,
+            "start": 6
+          }
+        }
+      ]
+    },
+    "text": "Title\nQuoted\nList\nRule\nCode\nImage caption\nFootnote\nBody"
+  },
+  "journal": {
+    "events": [
+      {
+        "kind": "export",
+        "t": 1600000001000
+      }
+    ],
+    "runs": [
+      {
+        "del_chars": 0,
+        "del_words": 0,
+        "ins": "Title",
+        "pos": 0,
+        "t0": 1600000000000,
+        "t1": 1600000000250
+      }
+    ]
+  },
+  "graveyard": {
+    "entries": [
+      {
+        "blank_sep": false,
+        "cut_unix": 1600000002,
+        "id": 1,
+        "kinds": [
+          {
+            "Image": {
+              "alt": "grave",
+              "caption": "",
+              "src": "asset:82ed192ab87ac36cef798453672447286619ff3aaf748c444b4f7ffbcf490a53.png"
+            }
+          }
+        ],
+        "origin_pos": 3,
+        "origin_quote": "from body",
+        "region": "Manuscript",
+        "spans": {
+          "spans": []
+        },
+        "text": "cut image",
+        "whole_blocks": true,
+        "words": 2
+      }
+    ],
+    "next_id": 1
+  },
+  "asset_refs": [
+    {
+      "id": "asset:82ed192ab87ac36cef798453672447286619ff3aaf748c444b4f7ffbcf490a53.png",
+      "present": true,
+      "bytes_blake3": "82ed192ab87ac36cef798453672447286619ff3aaf748c444b4f7ffbcf490a53"
+    }
+  ],
+  "provenance": {
+    "next_id": 1,
+    "records": [
+      {
+        "id": 1,
+        "origin_quote": "from quoted",
+        "parked_unix": 1600000003,
+        "range": {
+          "end": 13,
+          "start": 7
+        }
+      }
+    ]
+  }
+}

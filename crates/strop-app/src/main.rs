@@ -292,7 +292,10 @@ fn main() {
                         Err(e) => eprintln!("strop: single-instance check failed: {e}"),
                     }
                 }
-                match Store::open(&store_path) {
+                match Store::open_with_backup_destination(
+                    &store_path,
+                    Some(&paths::migration_backups_dir()),
+                ) {
                     Ok((_, None)) if require_existing => {
                         let e = std::io::Error::from(std::io::ErrorKind::NotFound);
                         drop(instance_guard.take());

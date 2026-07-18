@@ -7,7 +7,7 @@
 //! own voice corpus, and (eventually) sync.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -276,6 +276,125 @@ fn read_state_of(doc: &LoroDoc) -> (String, SpanSet, BlockMap) {
 /// a file is healthy and the extra open-time work buys nothing.
 const COMPACT_MIN_BYTES: usize = 512 * 1024;
 
+#[derive(Serialize, Deserialize)]
+struct BackupLedgerEntry {
+    when: String,
+    source_path: String,
+    source_schema: u32,
+    blake3: String,
+    backup_file: String,
+    kind: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BACKUP_FAULT: std::cell::Cell<Option<&'static str>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn backup_boundary(name: &'static str) -> io::Result<()> {
+    #[cfg(test)]
+    if BACKUP_FAULT.with(|fault| fault.get() == Some(name)) {
+        return Err(io::Error::other(format!("injected failure after {name}")));
+    }
+    #[cfg(not(test))]
+    let _ = name;
+    Ok(())
+}
+
+fn rfc3339_now() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    // Howard Hinnant's civil-from-days conversion, with Unix epoch offset.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        day_seconds / 3_600,
+        day_seconds / 60 % 60,
+        day_seconds % 60
+    )
+}
+
+fn durable_backup(
+    destination: &Path,
+    source_path: &Path,
+    source_schema: u32,
+    bytes: &[u8],
+    kind: &str,
+) -> io::Result<PathBuf> {
+    fs::create_dir_all(destination)?;
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    let backup_file = format!("{hash}.strop");
+    let backup_path = destination.join(&backup_file);
+    let ledger_path = destination.join("ledger.jsonl");
+
+    if backup_path.exists() && ledger_path.exists() {
+        let ledger = fs::File::open(&ledger_path)?;
+        for line in io::BufReader::new(ledger).lines() {
+            let Ok(entry) = serde_json::from_str::<BackupLedgerEntry>(&line?) else {
+                continue;
+            };
+            if entry.blake3 == hash
+                && entry.backup_file == backup_file
+                && entry.kind == kind
+                && fs::read(&backup_path)? == bytes
+            {
+                fs::File::open(&backup_path)?.sync_all()?;
+                fs::File::open(&ledger_path)?.sync_all()?;
+                fs::File::open(destination)?.sync_all()?;
+                return Ok(backup_path);
+            }
+        }
+    }
+
+    if !backup_path.exists() || fs::read(&backup_path)? != bytes {
+        let mut backup = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&backup_path)?;
+        backup_boundary("backup-write")?;
+        backup.write_all(bytes)?;
+    }
+    backup_boundary("backup-fsync")?;
+    fs::File::open(&backup_path)?.sync_all()?;
+
+    let entry = BackupLedgerEntry {
+        when: rfc3339_now(),
+        source_path: source_path.to_string_lossy().into_owned(),
+        source_schema,
+        blake3: hash,
+        backup_file,
+        kind: kind.into(),
+    };
+    let mut ledger = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ledger_path)?;
+    backup_boundary("ledger-append")?;
+    serde_json::to_writer(&mut ledger, &entry).map_err(io::Error::other)?;
+    ledger.write_all(b"\n")?;
+    backup_boundary("ledger-fsync")?;
+    ledger.sync_all()?;
+    backup_boundary("dir-fsync")?;
+    fs::File::open(destination)?.sync_all()?;
+    Ok(backup_path)
+}
+
 /// Opportunistic oplog compaction, at open. A long-lived file accretes
 /// history the app no longer reads: with checkpoint states materialized
 /// (`Checkpoint::state`), NOTHING needs Loro time-travel — rewind, previews,
@@ -287,7 +406,12 @@ const COMPACT_MIN_BYTES: usize = 512 * 1024;
 /// after writing a one-time `*.pre-compact.bak` of the original bytes.
 /// Every failure path keeps the original doc: compaction is strictly
 /// opportunistic, never load-bearing.
-fn compact_on_open(doc: LoroDoc, original: &[u8], path: &Path) -> LoroDoc {
+fn compact_on_open(
+    doc: LoroDoc,
+    original: &[u8],
+    path: &Path,
+    backup_destination: Option<&Path>,
+) -> LoroDoc {
     if original.len() < COMPACT_MIN_BYTES
         || !checkpoints_of(&doc).iter().all(|cp| cp.state.is_some())
     {
@@ -310,10 +434,24 @@ fn compact_on_open(doc: LoroDoc, original: &[u8], path: &Path) -> LoroDoc {
     {
         return doc;
     }
-    let bak = sidecar_path(path, ".pre-compact.bak");
-    if !bak.exists() && fs::write(&bak, original).is_err() {
-        return doc;
-    }
+    let backup = if let Some(destination) = backup_destination {
+        match durable_backup(
+            destination,
+            path,
+            schema_version_of(&doc).unwrap_or(0),
+            original,
+            "pre-compact",
+        ) {
+            Ok(path) => path,
+            Err(_) => return doc,
+        }
+    } else {
+        let bak = sidecar_path(path, ".pre-compact.bak");
+        if !bak.exists() && fs::write(&bak, original).is_err() {
+            return doc;
+        }
+        bak
+    };
     let tmp = sidecar_path(path, ".tmp");
     if fs::write(&tmp, &shallow).is_err() || fs::rename(&tmp, path).is_err() {
         let _ = fs::remove_file(&tmp);
@@ -323,7 +461,7 @@ fn compact_on_open(doc: LoroDoc, original: &[u8], path: &Path) -> LoroDoc {
         "strop: compacted {} → {} bytes (original kept once at {})",
         original.len(),
         shallow.len(),
-        bak.display()
+        backup.display()
     );
     fresh
 }
@@ -549,6 +687,10 @@ pub struct Store {
     /// cold-read seal mutate the doc directly, and a close must still
     /// flush them (papercuts LAW 2: never exit with unflushed bytes).
     saved_frontiers: std::cell::RefCell<Frontiers>,
+    /// A pristine old-schema file may not be replaced until its backup and
+    /// ledger entry are both durable. Open still succeeds so the writer can
+    /// read and recover their work; every save reports this exact failure.
+    save_blocked: Option<String>,
 }
 
 /// See `Store::saved`. Zeroes mean "unknown" — the next save writes.
@@ -689,6 +831,7 @@ impl Default for SaveWorker {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    backup_boundary("save")?;
     let tmp = sidecar_path(path, ".tmp");
     let mut file = fs::File::create(&tmp)?;
     file.write_all(bytes)?;
@@ -738,6 +881,13 @@ fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 impl Store {
+    /// Deterministic fixture seam. A release-corpus writer calls this before
+    /// its first operation; production documents keep Loro's random peer id.
+    #[doc(hidden)]
+    pub fn debug_set_peer_id(&self, peer: u64) {
+        self.doc.set_peer_id(peer).expect("unused fixture peer id");
+    }
+
     /// Rename/move the on-disk file; subsequent saves follow. Refuses to
     /// overwrite — renaming is never allowed to destroy another document.
     pub fn rename_file(&mut self, new_path: impl Into<PathBuf>) -> io::Result<()> {
@@ -777,20 +927,51 @@ impl Store {
     /// Open a `.strop` file. Returns the store and, when the file already
     /// existed, its text, formatting, and block kinds (None = brand-new).
     pub fn open(path: impl Into<PathBuf>) -> io::Result<(Self, Option<Loaded>)> {
+        Self::open_with_backup_destination(path, None)
+    }
+
+    pub fn open_with_backup_destination(
+        path: impl Into<PathBuf>,
+        backup_destination: Option<&Path>,
+    ) -> io::Result<(Self, Option<Loaded>)> {
         let path = path.into();
         let doc = LoroDoc::new();
         doc.config_text_style(style_config());
         match fs::read(&path) {
             Ok(bytes) => {
                 doc.import(&bytes).map_err(io::Error::other)?;
+                let source_schema = schema_version_of(&doc)?;
+                let save_blocked = if source_schema < CURRENT_SCHEMA_VERSION {
+                    backup_destination.and_then(|destination| {
+                        durable_backup(
+                            destination,
+                            &path,
+                            source_schema,
+                            &bytes,
+                            "pre-migration",
+                        )
+                        .err()
+                        .map(|e| format!(
+                            "saving refused: migration backup for {} failed: {e}",
+                            path.display()
+                        ))
+                    })
+                } else {
+                    None
+                };
                 migrate_schema(&doc)?;
-                let doc = compact_on_open(doc, &bytes, &path);
+                let doc = if save_blocked.is_none() {
+                    compact_on_open(doc, &bytes, &path, backup_destination)
+                } else {
+                    doc
+                };
                 let store = Self {
                     doc,
                     path,
                     saved: Default::default(),
                     journal_saved: Default::default(),
                     saved_frontiers: Default::default(),
+                    save_blocked,
                 };
                 // The aside boundary persists as its OWN key beside "kinds"
                 // (review B13/H42): an older build reads only "kinds" and so
@@ -929,6 +1110,7 @@ impl Store {
                     // An empty doc over a missing file: the default (empty)
                     // frontiers already say "nothing to flush".
                     saved_frontiers: Default::default(),
+                    save_blocked: None,
                 },
                 None,
             )),
@@ -1512,6 +1694,9 @@ impl Store {
     }
 
     pub fn prepare_save(&self) -> io::Result<PreparedSave> {
+        if let Some(reason) = &self.save_blocked {
+            return Err(io::Error::other(reason.clone()));
+        }
         stamp_schema_version(&self.doc)?;
         let bytes = self
             .doc
@@ -1558,6 +1743,9 @@ impl Store {
     /// document. Export stays with the Loro owner; the immutable result may
     /// be written by a filesystem worker.
     pub fn prepare_copy_to(&self, path: &Path) -> io::Result<PreparedSave> {
+        if let Some(reason) = &self.save_blocked {
+            return Err(io::Error::other(reason.clone()));
+        }
         stamp_schema_version(&self.doc)?;
         let bytes = self.doc.export(ExportMode::Snapshot).map_err(io::Error::other)?;
         Ok(PreparedSave { path: path.to_owned(), bytes })
@@ -1732,6 +1920,82 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("uses schema"));
         let _ = fs::remove_file(path);
+    }
+
+    fn schema_zero_bytes(text: &str) -> Vec<u8> {
+        let doc = LoroDoc::new();
+        doc.config_text_style(style_config());
+        doc.get_text(TEXT_CONTAINER).insert(0, text).unwrap();
+        doc.get_map(META_CONTAINER)
+            .insert(SCHEMA_VERSION_KEY, 0_i64)
+            .unwrap();
+        doc.commit();
+        doc.export(ExportMode::Snapshot).unwrap()
+    }
+
+    #[test]
+    fn migration_backup_transaction_blocks_save_at_every_boundary() {
+        for boundary in [
+            "backup-write",
+            "backup-fsync",
+            "ledger-append",
+            "ledger-fsync",
+            "dir-fsync",
+        ] {
+            let root = temp_path(boundary);
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("draft.strop");
+            let backups = root.join("backups");
+            let pristine = schema_zero_bytes("sacred draft");
+            fs::write(&path, &pristine).unwrap();
+
+            BACKUP_FAULT.with(|fault| fault.set(Some(boundary)));
+            let (blocked, loaded) =
+                Store::open_with_backup_destination(&path, Some(&backups)).unwrap();
+            BACKUP_FAULT.with(|fault| fault.set(None));
+            assert_eq!(loaded.unwrap().text, "sacred draft");
+            let error = blocked.prepare_save().err().expect("save stays blocked");
+            assert!(error.to_string().contains(boundary));
+            assert_eq!(fs::read(&path).unwrap(), pristine);
+
+            let (ready, _) =
+                Store::open_with_backup_destination(&path, Some(&backups)).unwrap();
+            ready.save().unwrap();
+            let hash = blake3::hash(&pristine).to_hex().to_string();
+            assert_eq!(fs::read(backups.join(format!("{hash}.strop"))).unwrap(), pristine);
+            let ledger = fs::read_to_string(backups.join("ledger.jsonl")).unwrap();
+            assert!(ledger.lines().any(|line| {
+                let entry: BackupLedgerEntry = serde_json::from_str(line).unwrap();
+                entry.blake3 == hash
+                    && entry.source_schema == 0
+                    && entry.kind == "pre-migration"
+            }));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn migrated_save_failure_keeps_the_pristine_backup() {
+        let root = temp_path("migration-save-fault");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("draft.strop");
+        let backups = root.join("backups");
+        let pristine = schema_zero_bytes("before migration");
+        fs::write(&path, &pristine).unwrap();
+        let (store, _) =
+            Store::open_with_backup_destination(&path, Some(&backups)).unwrap();
+
+        BACKUP_FAULT.with(|fault| fault.set(Some("save")));
+        assert!(store.save().is_err());
+        BACKUP_FAULT.with(|fault| fault.set(None));
+        assert_eq!(fs::read(&path).unwrap(), pristine);
+        let hash = blake3::hash(&pristine).to_hex().to_string();
+        assert_eq!(fs::read(backups.join(format!("{hash}.strop"))).unwrap(), pristine);
+        store.save().unwrap();
+        assert_ne!(fs::read(&path).unwrap(), pristine);
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Simulate a LEGACY file: strip the materialized state off every
@@ -2036,8 +2300,12 @@ manuscript opens here");
     #[test]
     fn bloated_file_compacts_at_open_without_losing_state() {
         let path = temp_path("compact");
+        let managed_path = temp_path("compact-managed");
+        let managed_backups = temp_path("compact-backups");
         let bak = sidecar_path(&path, ".pre-compact.bak");
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&managed_path);
+        let _ = fs::remove_dir_all(&managed_backups);
         let _ = fs::remove_file(&bak);
 
         let (store, _) = Store::open(&path).unwrap();
@@ -2066,6 +2334,7 @@ manuscript opens here");
         let bloated = fs::metadata(&path).unwrap().len() as usize;
         assert!(bloated > COMPACT_MIN_BYTES, "fixture must be bloated (got {bloated})");
         drop(store);
+        fs::copy(&path, &managed_path).unwrap();
 
         let (store2, loaded) = Store::open(&path).unwrap();
         let compacted = fs::metadata(&path).unwrap().len() as usize;
@@ -2086,8 +2355,27 @@ manuscript opens here");
             "текст, который переживёт уплотнение"
         );
 
+        let managed_original = fs::read(&managed_path).unwrap();
+        let (managed, loaded) = Store::open_with_backup_destination(
+            &managed_path,
+            Some(&managed_backups),
+        )
+        .unwrap();
+        assert_eq!(loaded.unwrap().text, "текст, который переживёт уплотнение");
+        assert!(managed.checkpoints_materialized());
+        assert!(!sidecar_path(&managed_path, ".pre-compact.bak").exists());
+        let hash = blake3::hash(&managed_original).to_hex().to_string();
+        assert_eq!(
+            fs::read(managed_backups.join(format!("{hash}.strop"))).unwrap(),
+            managed_original
+        );
+        let ledger = fs::read_to_string(managed_backups.join("ledger.jsonl")).unwrap();
+        assert!(ledger.contains("\"kind\":\"pre-compact\""));
+
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&bak);
+        let _ = fs::remove_file(&managed_path);
+        let _ = fs::remove_dir_all(&managed_backups);
     }
 
     /// The history-sidebar hang class: checkpoints must be readable WITHOUT
