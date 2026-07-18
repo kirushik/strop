@@ -5,10 +5,11 @@ deep-research passes (signing, update frameworks, Linux channels, update UX /
 installers) on July 2026 state of the world; primary-source precedents: Zed's
 release + auto-update pipeline (readable in our fork checkout), Obsidian's
 update model, Scrivener's migration model, Flathub's Zed manifest. Reviewed
-adversarially by Sol (read-only, 2026-07-18): 4 blockers, 7 majors — all
-adjudicated and folded in; §14 records the round. Status: DECISION SHEET —
-R1/R3/R6/R7/R9 sub-choices await Kirill; the rest are recommendations with
-counterarguments recorded.*
+adversarially by Sol (read-only, 2026-07-18, three rounds to full concur —
+§14). Status: AGREED SPEC — Kirill's decisions recorded 2026-07-18
+(identity = cc.pimenov.strop, backup-visibility law, OBS skipped, mark =
+AI calibration round); Windows signing is an empirical race (Azure attempt
+vs SignPath application), not an open decision.*
 
 ## §0 Philosophy: the release surface is product surface
 
@@ -70,10 +71,11 @@ old/new path pairs, both-exist conflict rule (old wins, new renamed aside),
 idempotence, and a test — not a hand-waved "one-time move" (Sol, F11
 concurrence condition).
 
-**Recommend:** option 1 unless the project-domain itch is real, in which case
-buy the domain *now* and align storage in the identity commit. **DECIDE
-(Kirill).** In the same commit: Wayland `app_id` (currently `"strop"` in
-`main.rs`) and the `.desktop` basename both become the chosen string.
+**DECIDED (Kirill, 2026-07-18): option 1 — `cc.pimenov.strop`.** No storage
+migration anywhere. In one commit: Wayland `app_id` (currently `"strop"` in
+`main.rs`), `.desktop` basename, macOS `CFBundleIdentifier`, and Windows
+AUMID all become `cc.pimenov.strop`; the macOS document UTI follows suit as
+`cc.pimenov.strop.document`.
 
 ## §2 R2 — Artifact shapes: ready-to-launch, per platform
 
@@ -86,8 +88,8 @@ unsigned download is effectively locked for normal users.
 
 - Build the bundle with a **hand-rolled CI script** (~60 lines: `Contents/
   {MacOS,Resources}`, `Info.plist` with `UTExportedTypeDeclarations` for
-  `com.strop.document` / `.strop` + `CFBundleDocumentTypes` role Editor rank
-  Owner, icns, binary). Zed maintains a cargo-bundle *fork* — the signal that
+  `cc.pimenov.strop.document` / `.strop` + `CFBundleDocumentTypes` role
+  Editor rank Owner, icns, binary). Zed maintains a cargo-bundle *fork* — the signal that
   upstream isn't sufficient; our needs are small enough to skip the tool
   entirely.
 - `.dmg` via `hdiutil create -format UDZO` with the `/Applications` symlink.
@@ -107,6 +109,14 @@ unsigned download is effectively locked for normal users.
   don't take its installer. (The ARP entry's displayed version is stamped by
   the installer and will drift as the exe self-updates; the updater rewrites
   the HKCU uninstall key's `DisplayVersion` as part of a successful swap.)
+- **Signing scope: both artifacts, inner-first.** The bare `strop.exe` is
+  signed (it's the self-update payload, the thing SmartScreen and AV
+  heuristics judge at run time, and what a paranoid user inspects), *then*
+  the installer is built around the already-signed exe and signed itself
+  (it's the thing SmartScreen judges at download time); Inno's `SignTool`
+  hook also signs the generated uninstaller. Two signing passes per release
+  — the §12 DAG already orders it this way; with SignPath that's ideally
+  one signing request covering both artifacts, or two approval clicks.
 - **Portable zip stays** for the portable-app crowd, and **portable builds
   never self-update** (Sol F8): a self-replacing exe on a read-only or
   removable location is a bug farm, and a portable app that rewrites itself
@@ -129,7 +139,17 @@ all other channels have **no payload** (package managers or nothing).
 existing Linux job and emit proper packages: binary, `.desktop`, hicolor
 icons, MIME XML for `application/x-strop`, postinst `update-mime-database`/
 `update-desktop-database`. These carry **no auto-update** (no repo behind
-them) — they exist so "I use Debian, give me a real package" is answerable.
+them — `apt`/`dnf` only upgrade from a configured repository, and a bare
+downloaded package configures none). What they buy instead of updates:
+proper desktop integration (association, icons, MIME) and a clean
+uninstall — the two things the tarball can't give. Their users get the
+same passive About line as tarball users ("0.3.2 is out"), linking the new
+package; that's the whole story, stated honestly. The upgrade path for
+apt/dnf users who want *real* auto-updates is Flathub (§7) — or, if demand
+ever materializes, an apt/dnf **repo hosted on GitHub Pages** (a known
+pattern, still infra-free) — declined for now because repo metadata wants
+its own GPG signing key, and we are not adding a third key custody duty
+for an audience Flathub already serves.
 Glibc floor: ubuntu-22.04 (2.35) while the runner lives (deprecation starts
 2026-09); `cargo-zigbuild --target x86_64-unknown-linux-gnu.2.28` is the
 runner-proof successor **[UNVERIFIED for our gpui/wgpu/ashpd link chain —
@@ -156,12 +176,16 @@ download volume regardless. So the expensive options buy less than folklore
 says. The landscape for us:
 
 - **Azure "Trusted Signing" (now Artifact Signing, $9.99/mo)** is closed to
-  EU *individuals* — EU *businesses* only. Available iff Kirill registers a
-  toiminimi and the Y-tunnus passes validation **[eligibility of EU sole
-  traders: PARTIALLY UNVERIFIED — Microsoft FAQ vs community reports
-  disagree]**. Its identity-bound reputation model is the only one that
-  (aspirationally) skips per-file reputation — and it broke for everyone in
-  March 2026 when Microsoft rotated the issuing CA. Not a silver bullet.
+  EU *individuals* — EU *businesses* only. New fact (2026-07-18): Kirill
+  holds a **German business registration with a VAT ID (USt-IdNr)** — a
+  registered EU business identity, which is exactly the bucket the FAQ
+  admits. Odds are good; the only real test is attempting the identity
+  validation (~an hour, first month ~$10, fully reversible) **[EU
+  sole-trader validation specifics remain UNVERIFIED until tried]**. If it
+  passes: publisher string is Kirill's own registered name, no per-release
+  portal clicks, and the identity-bound SmartScreen reputation model —
+  which (caveat) broke for everyone in March 2026 when Microsoft rotated
+  the issuing CA. Not a silver bullet, but the best-fitting one.
 - **SignPath Foundation**: free for qualifying OSS; publisher string reads
   "SignPath Foundation" (not "Kirill Pimenov"); every release needs a manual
   approval click in their portal — which happens to rhyme with our
@@ -172,12 +196,13 @@ says. The landscape for us:
 - **Peers**: Alacritty (wontfix'd signing), Helix, WezTerm ship Windows
   binaries **unsigned**. Only VC-funded Zed signs.
 
-**Recommend:** apply to SignPath now (it's free and reversible); ship 0.3.0
-unsigned-on-Windows if approval hasn't landed, exactly as peers do, with the
-SmartScreen caveat in the release notes. Revisit toiminimi+Azure only if
-Strop grows a commercial life of its own. **DECIDE (Kirill):** is the
-"SignPath Foundation" publisher string acceptable? If it offends, the choice
-collapses to unsigned-for-now.
+**Revised recommendation (post-VAT-ID fact):** attempt **Azure onboarding
+first** — own-name publisher and click-free CI beat SignPath's tradeoffs if
+the validation passes. Run the **SignPath application in parallel** (free,
+no commitment) as the fallback; unsigned-like-the-peers remains the honest
+floor if both stall past 0.3.0, with the SmartScreen caveat in the release
+notes. Whichever lands first signs 0.3.x; this is now an empirical race,
+not a decision.
 
 ### Both platforms — provenance attestations, immediately
 
@@ -429,7 +454,19 @@ with a clear message, a migration `match`. What 0.3.0 adds:
    save boundary. The bytes are in hand at open by definition. If the backup
    or ledger write fails, the document opens normally but **saving is
    refused** (with the reason) until both land — the pristine original on
-   disk stays the backup of record. Idempotent by hash; kept forever (they're small;
+   disk stays the backup of record.
+
+   **The backup-visibility law (decided 2026-07-18):** *safety copies are
+   the tool's memory, not the writer's clutter — invisible while everything
+   works, loud the moment danger strikes.* No sibling files, ever: backups
+   live in `data_dir`, indexed by the ledger, surfaced by name (never by
+   hash) in About's backups view — and when something actually goes wrong
+   (a failed migration, a rollback crossing a schema bump, refuse-newer on
+   a file the ledger knows), the error itself points at the exact backup
+   for that document. This law also **retires the visible
+   `*.pre-compact.bak` sibling** that compaction drops next to the draft
+   today (`store.rs` `sidecar_path`): compaction backups move into the same
+   data_dir + ledger regime in Phase B. One regime, one view, no clutter. Idempotent by hash; kept forever (they're small;
    asset-GC does not apply). About gains a migration view: per-document
    restore (the F4 pairing), not filesystem archaeology.
 2. **A corpus, in CI — asserting semantics, not prose** (Sol F6: a
@@ -494,10 +531,11 @@ The ex-SUSE heart will not love this section. Findings, then the sting:
   needs an experimental run]**, and an ABI matrix (wayland/vulkan/
   fontconfig across distro versions) that Flatpak exists to abolish. If it
   happens, it happens as nostalgia on a rainy weekend, not as release
-  infrastructure. **DECIDE (Kirill)** — the counterargument to my
-  counterargument: OBS gives *native packages with real auto-update* to
-  zypper/dnf users, which Flathub never will, and you know the toolchain
-  cold.
+  infrastructure. **DECIDED (Kirill, 2026-07-18): skipped for now** — with
+  the amendment that if it's ever revived, it repackages the **prebuilt
+  release binary** (mirroring the Flathub trick), which deletes the
+  cargo-vendor objection entirely and leaves only the spec/dsc + ABI-matrix
+  cost. Recorded so the future rainy weekend starts from the right plan.
 - **Debian/Fedora official: don't attempt** (git-forked gpui is
   policy-impossible in Debian, painful in Fedora; even Zed doesn't try).
 - **AppImage: later, if asked.** Viable but carries the
@@ -541,9 +579,11 @@ report) not copyrightable as such — thin protection for the mark itself.
 For a GPL project this is mostly moot (the mark can still be
 trademark-registered if that ever matters, and nothing else in the project
 leans on artwork copyright), but if a legally-ownable mark matters, a human
-commission ($300–1000, Dribbble/Fiverr tier) is the alternative — best done
-*after* an AI-drafted round has fixed the brief cheaply. **DECIDE (Kirill),**
-though drafting candidates costs nothing and forecloses nothing.
+commission ($300–1000, Dribbble/Fiverr tier) is the alternative.
+**DECIDED (Kirill, 2026-07-18):** an AI-drafted SVG round now, framed as
+**calibration** — it fixes the brief, ships as icon v1, and stays cheap to
+replace when a designer falls in love with the project and draws a better
+one. The pipeline (below) doesn't care whose SVG it eats.
 
 Pipeline (pure Rust, an xtask): master SVG → `resvg` rasterize → `ico` +
 `icns` crates + hicolor PNG set + scalable SVG; `.ico` embedded in the exe
@@ -653,11 +693,12 @@ final assets.
 
 ## §13 Open questions & unverified flags
 
-**For Kirill:** §1 identity (cc.pimenov.strop vs new project domain) + the
-storage-alignment call; §3 SignPath publisher-string tolerance; §6 backup
-location taste (data_dir + About view, per Sol, is the draft's answer —
-overrule if you want siblings); §7 OBS as hobby-or-not; §9 AI-drafted vs
-commissioned mark.
+**Decided 2026-07-18 (all five):** §1 identity = `cc.pimenov.strop`; §3
+signing = try Azure (German VAT-registered business) with SignPath applied
+in parallel; §6 backups = hidden data_dir + About, one regime including
+compaction's former sidecar `.bak`s ("invisible until danger, then loud");
+§7 OBS skipped (revival plan: repackage prebuilt); §9 mark = AI calibration
+round now, designer later if love strikes.
 
 **To verify by doing (each is one small experiment):** cargo-zigbuild vs our
 link chain (§2); EU sole-trader eligibility for Azure signing, only if the
