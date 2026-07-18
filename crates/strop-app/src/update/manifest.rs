@@ -48,9 +48,13 @@ pub fn verify_signed(bytes: &[u8], signatures: &[Vec<u8>], keys: &[PublicKey]) -
     }
 }
 
+/// `Ok(None)` is the healthy everyday outcome: a valid, verified manifest
+/// that simply offers nothing newer than this build. Only genuine defects
+/// (wrong product/protocol/signature-adjacent fields, replay, bad URL) are
+/// `Err` — an up-to-date install must land in Idle, never in Failed.
 pub fn parse_and_validate(
     bytes: &[u8], channel: Channel, highest_seen: Option<&Version>,
-) -> Result<(Manifest, Target, Version), String> {
+) -> Result<Option<(Manifest, Target, Version)>, String> {
     let manifest: Manifest = serde_json::from_slice(bytes)
         .map_err(|e| format!("invalid update manifest: {e}"))?;
     if manifest.product != "strop" { return Err("manifest is for another product".into()); }
@@ -63,7 +67,7 @@ pub fn parse_and_validate(
         return Err("manifest publication date is not valid RFC3339".into());
     }
     let current = Version::parse(env!("CARGO_PKG_VERSION")).expect("package version is semver");
-    if version <= current { return Err("manifest is not newer than this build".into()); }
+    if version <= current { return Ok(None); }
     if highest_seen.is_some_and(|highest| &version < highest) {
         return Err("manifest version is below the highest version previously seen".into());
     }
@@ -78,7 +82,7 @@ pub fn parse_and_validate(
         return Err("target SHA-256 is malformed".into());
     }
     super::fetch::validate_url(&target.url)?;
-    Ok((manifest, target, version))
+    Ok(Some((manifest, target, version)))
 }
 
 fn valid_rfc3339(value: &str) -> bool {
@@ -172,7 +176,13 @@ mod tests {
         refused(valid(), |v| v["product"] = json!("other"));
         refused(valid(), |v| v["updater_protocol"] = json!(2));
         refused(valid(), |v| v["version"] = json!("banana"));
-        refused(valid(), |v| v["version"] = json!(env!("CARGO_PKG_VERSION")));
+        // Same-or-older version is NOT a refusal — it is the healthy
+        // everyday outcome, and must read as Ok(None), never as an error
+        // (an up-to-date install lands in Idle, not Failed).
+        let mut same = valid();
+        same["version"] = json!(env!("CARGO_PKG_VERSION"));
+        assert!(matches!(parse_and_validate(&serde_json::to_vec(&same).unwrap(),
+            Channel::GithubLinux, None), Ok(None)));
         refused(valid(), |v| v["pub_date"] = json!("next Thursday"));
         refused(valid(), |v| v["notes_url"] = json!("https://evil.example/notes"));
         refused(valid(), |v| v["targets"] = json!({}));

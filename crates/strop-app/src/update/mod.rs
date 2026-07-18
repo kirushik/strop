@@ -2,14 +2,9 @@
 //!
 //! This module is the surface the rest of the app sees: `main()` hooks
 //! `startup_apply_if_staged()` before any rendezvous socket is claimed, and
-//! About renders `status()`. The machinery (manifest fetch + minisign
-//! verification, staging, the installation update lock, the journaled swap)
-//! lands inside this directory behind these exact types; until it does,
-//! everything here is inert by construction.
-
-// Skeleton allowance: every item below gains a consumer as the updater
-// machinery (W1) and About (W2) land. Remove with the last stub.
-#![allow(dead_code)]
+//! About renders `status()`. The machinery — manifest fetch + minisign
+//! verification, staging, the installation update lock, the journaled
+//! swap — lives in this directory's submodules behind these types.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +12,9 @@ use std::time::{Duration, SystemTime};
 
 mod fetch;
 mod manifest;
+// The recovery table's consumers are the cfg-gated Windows/macOS apply
+// paths; a Linux build carries the module (and its tests) target-dead.
+#[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
 mod recovery;
 mod sha256;
 mod storage;
@@ -186,7 +184,15 @@ fn check_cycle(fetcher: &dyn fetch::Fetcher) {
         manifest::verify_signed(&bytes, &signatures, &keys)?;
         let mut state = storage::load_state();
         let highest = state.highest_seen.as_deref().and_then(|s| semver::Version::parse(s).ok());
-        let (manifest, target, version) = manifest::parse_and_validate(&bytes, channel(), highest.as_ref())?;
+        let Some((manifest, target, version)) =
+            manifest::parse_and_validate(&bytes, channel(), highest.as_ref())?
+        else {
+            // The healthy everyday outcome: verified, and nothing newer.
+            state.failed_reason = None;
+            storage::save_state(&state)?;
+            set_status(UpdateState::Idle { last_check: Some(SystemTime::now()) });
+            return Ok(());
+        };
         state.highest_seen = Some(version.to_string());
         state.failed_reason = None;
         storage::save_state(&state)?;

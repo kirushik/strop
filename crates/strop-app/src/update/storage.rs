@@ -52,6 +52,9 @@ pub fn save_state(state: &PersistentState) -> Result<(), String> {
     durable_json(&state_path(), state)
 }
 
+// Callers are the cfg-gated Windows/macOS apply bodies; on a Linux build
+// only the recovery reader survives, so the writer is target-dead here.
+#[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
 pub fn save_journal(value: &impl Serialize) -> Result<(), String> {
     fs::create_dir_all(root()).map_err(|e| e.to_string())?;
     durable_json(&root().join("journal.json"), value)

@@ -8,5 +8,8 @@
 # Working documents (Loro snapshots) — never commit a user's file
 *.strop
 *.strop.tmp
+# The committed corpus fixtures are the one exception to the dogfooding
+# ignore above: frozen released-format bytes (releasing.md §6.3).
+!crates/strop-core/tests/corpus/*.strop
 target-main/
 packaging/generated/
