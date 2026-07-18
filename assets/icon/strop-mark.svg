@@ -1,0 +1,30 @@
+<!-- The mark, v1 (calibration round — docs/releasing.md §9). A razor strop:
+     the leather band that keeps an edge keen, hanging from its ring —
+     the tool that sharpens, never the blade. Drawn in the pictorial
+     family's voice (round joins, humanist warmth) in the warm-amber
+     human hue of the color language. Master at 1024; every platform
+     size is rasterized from this file by the icon xtask — the pipeline
+     is svg-agnostic, so a better hand can replace this drawing without
+     touching anything downstream. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- paper plate: the page the tool lives on -->
+  <rect x="64" y="64" width="896" height="896" rx="196" fill="#F5EFE2"/>
+  <rect x="64" y="64" width="896" height="896" rx="196" fill="none" stroke="#DACFB8" stroke-width="10"/>
+  <!-- hanging ring -->
+  <circle cx="512" cy="252" r="60" fill="none" stroke="#4A3826" stroke-width="38"/>
+  <!-- clip joining ring to strap -->
+  <rect x="462" y="300" width="100" height="56" rx="20" fill="#4A3826"/>
+  <!-- the strap: a supple band, gentle S — leather, not a ruler -->
+  <path d="M 402 344
+           C 380 480 426 600 398 718
+           C 388 774 398 814 452 838
+           L 572 838
+           C 626 814 636 774 626 718
+           C 598 600 644 480 622 344
+           Q 512 326 402 344 Z"
+        fill="#C68A3F" stroke="#7A5A2E" stroke-width="12" stroke-linejoin="round"/>
+  <!-- the sheen: the polished line a kept edge leaves -->
+  <path d="M 452 372
+           C 436 484 470 596 448 706"
+        fill="none" stroke="#E8B96A" stroke-width="26" stroke-linecap="round"/>
+</svg>
