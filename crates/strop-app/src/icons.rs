@@ -22,6 +22,7 @@ use gpui::{AssetSource, Result, SharedString, Styled, px, rgb, svg};
 /// The embedded icon table: `include_bytes!` like the PT fonts, so a
 /// missing file is a compile error, not a blank control at runtime.
 static ICONS: &[(&str, &[u8])] = &[
+    ("icon/strop-mark.svg", include_bytes!("../../../assets/icon/strop-mark.svg")),
     ("icons/book.svg", include_bytes!("../../../assets/icons/book.svg")),
     ("icons/caret-down.svg", include_bytes!("../../../assets/icons/caret-down.svg")),
     ("icons/dismiss.svg", include_bytes!("../../../assets/icons/dismiss.svg")),
@@ -39,6 +40,7 @@ static ICONS: &[(&str, &[u8])] = &[
 // Path constants so a typo is a compile error at the call site, not a
 // silently empty svg().
 pub const BOOK: &str = "icons/book.svg";
+pub const STROP_MARK: &str = "icon/strop-mark.svg";
 pub const CARET_DOWN: &str = "icons/caret-down.svg";
 pub const DISMISS: &str = "icons/dismiss.svg";
 pub const GRAVE: &str = "icons/grave.svg";

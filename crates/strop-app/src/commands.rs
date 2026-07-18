@@ -6,6 +6,7 @@
 //! palette is the menu, and menus don't list "move cursor left".
 
 use gpui::Action;
+use crate::AboutStrop;
 
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, ExportMarkdown, Find, Heading1,
@@ -376,6 +377,13 @@ pub fn all() -> &'static [Command] {
             Some("ctrl-?"),
             ShowShortcuts,
             ["shortcuts", "cheatsheet", "горячие клавиши"]
+        ),
+        cmd!(
+            "About Strop",
+            "Help",
+            None,
+            AboutStrop,
+            ["version", "license", "updates", "о программе"]
         ),
         cmd!(
             "Open Welcome Guide",
