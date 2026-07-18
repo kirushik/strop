@@ -9,3 +9,4 @@
 *.strop
 *.strop.tmp
 target-main/
+packaging/generated/

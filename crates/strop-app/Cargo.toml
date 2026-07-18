@@ -60,3 +60,32 @@ minisign = "0.7"
 gpui = { workspace = true, features = ["test-support"] }
 ttf-parser = "0.25"
 proptest = "1"
+
+[package.metadata.deb]
+maintainer = "Kirill Pimenov <kirushik@gmail.com>"
+depends = "$auto"
+assets = [
+    ["target/release/strop", "usr/bin/", "755"],
+    ["../../COPYING", "usr/share/doc/strop/COPYING", "644"],
+    ["../../NOTICE", "usr/share/doc/strop/NOTICE", "644"],
+    ["../../packaging/linux/cc.pimenov.strop.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/cc.pimenov.strop.mime.xml", "usr/share/mime/packages/", "644"],
+    ["../../packaging/linux/cc.pimenov.strop.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../packaging/generated/hicolor", "usr/share/icons/hicolor/", "644"],
+]
+
+[package.metadata.generate-rpm]
+post_install_script = "../../packaging/linux/rpm-post.sh"
+post_uninstall_script = "../../packaging/linux/rpm-post.sh"
+assets = [
+    { source = "target/release/strop", dest = "/usr/bin/strop", mode = "755" },
+    { source = "../../COPYING", dest = "/usr/share/doc/strop/COPYING", mode = "644" },
+    { source = "../../NOTICE", dest = "/usr/share/doc/strop/NOTICE", mode = "644" },
+    { source = "../../packaging/linux/cc.pimenov.strop.desktop", dest = "/usr/share/applications/cc.pimenov.strop.desktop", mode = "644" },
+    { source = "../../packaging/linux/cc.pimenov.strop.mime.xml", dest = "/usr/share/mime/packages/cc.pimenov.strop.xml", mode = "644" },
+    { source = "../../packaging/linux/cc.pimenov.strop.metainfo.xml", dest = "/usr/share/metainfo/cc.pimenov.strop.metainfo.xml", mode = "644" },
+    { source = "../../packaging/generated/hicolor/**/*", dest = "/usr/share/icons/hicolor/", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+shared-mime-info = "*"

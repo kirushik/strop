@@ -1,11 +1,16 @@
-//! Repo chores runner. First resident: the icon pipeline
-//! (`cargo run -p xtask -- icons`) — master SVG to ico/icns/hicolor.
-//! Implementation lands with the packaging round (W4).
-
 fn main() {
-    let task = std::env::args().nth(1).unwrap_or_default();
-    match task.as_str() {
-        "icons" => todo!("icon pipeline lands with the packaging round"),
-        _ => eprintln!("usage: cargo run -p xtask -- icons"),
+    let result = match std::env::args().nth(1).as_deref() {
+        Some("icons") => xtask::icons(
+            "assets/icon/strop-mark.svg",
+            "packaging/generated",
+        ),
+        _ => {
+            eprintln!("usage: cargo run -p xtask -- icons");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = result {
+        eprintln!("xtask: {error}");
+        std::process::exit(1);
     }
 }

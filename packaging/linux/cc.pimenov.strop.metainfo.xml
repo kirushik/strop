@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>cc.pimenov.strop</id>
+  <metadata_license>GPL-3.0+</metadata_license>
+  <project_license>GPL-3.0+</project_license>
+  <name>Strop</name>
+  <summary>A quiet writing tool</summary>
+  <description>
+    <p>Strop is a focused desktop editor for long-form writing.</p>
+  </description>
+  <launchable type="desktop-id">cc.pimenov.strop.desktop</launchable>
+  <!-- Screenshot URL is added when release screenshots have a stable home. -->
+</component>

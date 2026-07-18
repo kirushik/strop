@@ -1,159 +1,157 @@
-# Strop release builds.
-#
-# Trigger: push a `v*` tag (e.g. `v0.1.0`). Builds the `dist` profile binary
-# (thin LTO + codegen-units=1 + full strip — see Cargo.toml) on each of the three
-# CI platforms, packages it with its license files, and attaches the archives to
-# a GitHub Release created as a DRAFT — nothing is published until a human reviews
-# and hits publish.
-#
-# `workflow_dispatch` runs the build matrix WITHOUT creating a release, so the
-# three dist builds (which ci.yml never exercises — it builds debug) can be
-# dry-run on a branch before a tag is ever cut.
-#
-# Honesty for the early releases: only Linux is runtime-tested. The macOS and
-# Windows binaries build and pass a headless launch smoke (ci.yml) but are
-# otherwise unverified, and they are UNSIGNED — Gatekeeper / SmartScreen will
-# warn, and users must clear quarantine by hand. The release body says so.
-
 name: Release
-
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-
-# Read-only by default; the release job opts into contents:write locally.
 permissions:
   contents: read
-
 env:
   CARGO_TERM_COLOR: always
+  STROP_UPDATE_PUBKEYS: ${{ vars.STROP_UPDATE_PUBKEYS }}
 
 jobs:
-  build:
-    name: build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: strop
-          - os: macos-latest # Apple Silicon runner
-            target: aarch64-apple-darwin
-            bin: strop
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: strop.exe
+  linux:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
-      - name: exclude build dirs from Defender (Windows build speedup)
-        # The dist build (thin LTO + cg=1) is the slowest leg; Defender scanning
-        # every compiler artifact drags it further. Exclude the build dirs.
-        # Non-fatal — see the matching note in ci.yml.
-        if: runner.os == 'Windows'
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libvulkan-dev libgbm-dev libgl1-mesa-dev libasound2-dev libfontconfig-dev libssl-dev libxcb1-dev libx11-dev libxext-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { key: release-linux }
+      - name: install pinned packagers
+        run: |
+          cargo install cargo-deb --version 3.6.1 --locked
+          cargo install cargo-generate-rpm --version 0.19.1 --locked
+      - name: stage 1 — build channels and construct final Linux payloads
+        shell: bash
+        run: |
+          ver=${GITHUB_REF_NAME#v}; [[ "${{ github.event_name }}" == workflow_dispatch ]] && ver=dev
+          cargo run --locked -p xtask -- icons
+          STROP_DIST_CHANNEL=github-linux cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
+          strip --strip-all target/x86_64-unknown-linux-gnu/dist/strop
+          n=strop-$ver-x86_64-unknown-linux-gnu; mkdir -p dist/$n
+          cp target/x86_64-unknown-linux-gnu/dist/strop README.md COPYING NOTICE dist/$n/
+          tar -C dist -czf dist/$n.tar.gz $n
+          STROP_DIST_CHANNEL=deb cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
+          STROP_DIST_CHANNEL=deb cargo deb -p strop-app --profile dist --target x86_64-unknown-linux-gnu --no-build
+          cp target/x86_64-unknown-linux-gnu/debian/*.deb dist/
+          STROP_DIST_CHANNEL=rpm cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
+          cargo generate-rpm -p crates/strop-app --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/generate-rpm/*.rpm dist/
+      - uses: actions/upload-artifact@v7
+        with: { name: linux, path: "dist/*", if-no-files-found: error }
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-apple-darwin }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: release-mac }
+      - name: import signing certificate
+        if: vars.MACOS_SIGNING_ENABLED == 'true'
+        env:
+          P12: ${{ secrets.MACOS_CERT_P12 }}
+          PASSWORD: ${{ secrets.MACOS_CERT_P12_PASSWORD }}
+        run: |
+          echo "$P12" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+          echo "MACOS_SIGN_IDENTITY=$(security find-identity -v -p codesigning build.keychain | sed -n '1s/.*"\(.*\)"/\1/p')" >> "$GITHUB_ENV"
+      - name: stage 1-4 — build, sign, bundle, notarize, and staple
+        env:
+          APPLE_API_KEY: ${{ vars.MACOS_SIGNING_ENABLED == 'true' && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_KEY_ID: ${{ vars.MACOS_SIGNING_ENABLED == 'true' && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ vars.MACOS_SIGNING_ENABLED == 'true' && secrets.APPLE_API_KEY_ISSUER || '' }}
+        run: |
+          ver=${GITHUB_REF_NAME#v}; [[ "${{ github.event_name }}" == workflow_dispatch ]] && ver=dev
+          cargo run --locked -p xtask -- icons
+          STROP_DIST_CHANNEL=github-mac cargo build --profile dist --locked --target aarch64-apple-darwin -p strop-app
+          strip target/aarch64-apple-darwin/dist/strop
+          bash script/bundle-mac.sh target/aarch64-apple-darwin/dist/strop "$ver" dist packaging/macos/entitlements.plist
+          rm -rf dist/dmg-root dist/Strop.app dist/*-notary.zip
+      - uses: actions/upload-artifact@v7
+        with: { name: mac, path: "dist/*", if-no-files-found: error }
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: exclude build dirs from Defender
+        shell: pwsh
+        run: foreach ($p in @($env:GITHUB_WORKSPACE, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup")) { try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop } catch { Write-Warning $_ } }
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { key: release-windows }
+      - name: stage 1 — two channel builds
+        shell: bash
+        run: |
+          ver=${GITHUB_REF_NAME#v}; [[ "${{ github.event_name }}" == workflow_dispatch ]] && ver=dev
+          cargo run --locked -p xtask -- icons
+          STROP_DIST_CHANNEL=github-win cargo build --profile dist --locked --target x86_64-pc-windows-msvc -p strop-app
+          mkdir dist; cp target/x86_64-pc-windows-msvc/dist/strop.exe dist/strop-$ver-x86_64-pc-windows-msvc.exe
+          STROP_DIST_CHANNEL=github-win-portable cargo build --profile dist --locked --target x86_64-pc-windows-msvc -p strop-app
+          mkdir portable; cp target/x86_64-pc-windows-msvc/dist/strop.exe README.md COPYING NOTICE portable/
+          7z a dist/strop-$ver-x86_64-pc-windows-msvc-portable.zip ./portable/* >/dev/null
+          echo "VER=$ver" >> "$GITHUB_ENV"
+      - name: stage 2 — optional SignPath/Azure inner EXE signing
+        if: vars.WINDOWS_SIGNING_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: strop
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-exe
+          input-artifact-path: dist/strop-${{ env.VER }}-x86_64-pc-windows-msvc.exe
+          output-artifact-directory: dist/signed
+      - name: stage 3 — construct installer around final inner EXE
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
-          foreach ($p in @($env:GITHUB_WORKSPACE, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup")) {
-            try   { Add-MpPreference -ExclusionPath $p -ErrorAction Stop; Write-Host "excluded $p" }
-            catch { Write-Host "::warning::could not exclude $p from Defender: $_" }
+          $exe = "dist/strop-$env:VER-x86_64-pc-windows-msvc.exe"
+          if (Test-Path dist/signed) {
+            $signed = Get-ChildItem dist/signed -Filter *.exe | Select-Object -First 1
+            if (-not $signed) { throw "signing produced no inner executable" }
+            Copy-Item $signed.FullName $exe -Force
+            Remove-Item dist/signed -Recurse -Force
           }
-      - name: gpui system dependencies (Linux only)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libvulkan-dev \
-            libgbm-dev \
-            libgl1-mesa-dev \
-            libasound2-dev \
-            libfontconfig-dev \
-            libssl-dev \
-            libxcb1-dev \
-            libx11-dev \
-            libxext-dev
-      - uses: dtolnay/rust-toolchain@stable
+          $env:STROP_VERSION=$env:VER; $env:STROP_EXE=(Resolve-Path $exe); $env:STROP_OUTPUT=(Resolve-Path dist)
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\strop.iss
+      - name: stage 4 — optional installer signing
+        if: vars.WINDOWS_SIGNING_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@v2
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
-      - name: build (dist)
-        # Build the exact matrix triple so the artifact label is true by
-        # construction (not an assumption about the runner's host arch), and
-        # --locked so the published binary matches the committed Cargo.lock.
-        # `dist` profile = thin LTO + codegen-units=1 + strip (see Cargo.toml):
-        # spend CI compile time once for a smaller, faster download-and-run binary.
-        run: cargo build --profile dist --locked --target ${{ matrix.target }} -p strop-app
-      - name: strip symbol table
-        # `strip=symbols` in the profile drops debuginfo but leaves the static
-        # symbol table (.symtab/.strtab ~5 MB here); a full strip removes it.
-        # Per-OS because the tools differ:
-        #   Linux  — GNU binutils: `strip --strip-all`.
-        #   macOS  — cctools strip has NO `--strip-all` (and its `-s` means
-        #            something else); bare `strip` IS the full strip for an
-        #            executable. It also invalidates the linker's ad-hoc
-        #            signature, so re-sign — Apple Silicon won't launch an
-        #            unsigned/altered binary.
-        #   Windows — skipped: MSVC keeps symbols in a separate .pdb, not the .exe.
-        if: runner.os != 'Windows'
-        shell: bash
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: strop
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-installer
+          input-artifact-path: dist/strop-${{ env.VER }}-x86_64-windows-installer.exe
+          output-artifact-directory: dist/signed-installer
+      - name: promote signed installer to its final asset name
+        if: vars.WINDOWS_SIGNING_ENABLED == 'true'
+        shell: pwsh
         run: |
-          f="target/${{ matrix.target }}/dist/${{ matrix.bin }}"
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            strip "$f"
-            codesign --force --sign - "$f"
-          else
-            strip --strip-all "$f"
-          fi
-      - name: package
-        shell: bash
-        run: |
-          # Version from the tag (v0.1.0 -> 0.1.0); "dev" for a dispatch dry-run.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            ver="dev"
-          else
-            ver="${GITHUB_REF_NAME#v}"
-          fi
-          name="strop-${ver}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/dist/${{ matrix.bin }}" "dist/$name/"
-          # GPL: convey the licence and notices with the binary.
-          cp README.md COPYING NOTICE "dist/$name/"
-          cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "$name.zip" "$name" >/dev/null
-            echo "ASSET=dist/$name.zip" >> "$GITHUB_ENV"
-          else
-            tar czf "$name.tar.gz" "$name"
-            echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
-          fi
+          $signed = Get-ChildItem dist/signed-installer -Filter *.exe | Select-Object -First 1
+          if (-not $signed) { throw "signing produced no installer" }
+          Copy-Item $signed.FullName "dist/strop-$env:VER-x86_64-windows-installer.exe" -Force
+          Remove-Item dist/signed-installer -Recurse -Force
       - uses: actions/upload-artifact@v7
-        with:
-          name: strop-${{ matrix.target }}
-          path: ${{ env.ASSET }}
-          if-no-files-found: error
+        with: { name: windows, path: "dist/*", if-no-files-found: error }
 
-  release:
-    name: create draft GitHub Release
-    needs: build
-    # Tag pushes only — a dispatch run stops after building artifacts.
+  draft:
+    needs: [linux, mac, windows]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    permissions: { contents: write }
     steps:
       - uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: create draft release
+        with: { path: artifacts, merge-multiple: true }
+      - name: stage 5 — upload immutable payloads into a draft
         uses: softprops/action-gh-release@v3
         with:
           name: Strop ${{ github.ref_name }}
@@ -162,15 +160,26 @@ jobs:
           fail_on_unmatched_files: true
           files: artifacts/**/*
           body: |
-            > **Early release.** Only **Linux (Wayland)** is runtime-tested.
-            > The **macOS** and **Windows** binaries build and pass a headless
-            > launch smoke, but are otherwise unverified — and **unsigned**, so
-            > Gatekeeper (macOS) and SmartScreen (Windows) will warn. On macOS,
-            > clear quarantine with `xattr -d com.apple.quarantine ./strop`.
-            >
-            > Building from source is the supported path — see
-            > [DEVELOPMENT.md](https://github.com/kirushik/strop/blob/main/DEVELOPMENT.md).
-            > The Linux binary is dynamically linked against the gpui system
-            > libraries listed there (Wayland, Vulkan, fontconfig, …).
+            > **Early release.** Linux is runtime-tested. macOS and Windows
+            > signing is conditional: signed when the corresponding repository
+            > gate variable is enabled, otherwise the OS may warn.
 
-            ---
+  manifest:
+    needs: draft
+    runs-on: ubuntu-latest
+    permissions: { contents: write, id-token: write, attestations: write }
+    steps:
+      - uses: actions/checkout@v7
+      - name: stage 6 — download draft bytes and emit the exact manifest
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          ver=${GITHUB_REF_NAME#v}; mkdir assets
+          gh release download "$GITHUB_REF_NAME" --dir assets
+          win=strop-$ver-x86_64-pc-windows-msvc.exe
+          mac=strop-$ver-aarch64-apple-darwin-app.tar.gz
+          entry() { jq -n --arg url "https://github.com/kirushik/strop/releases/download/$GITHUB_REF_NAME/$1" --arg hash "$(sha256sum "assets/$1"|cut -d' ' -f1)" --argjson size "$(stat -c %s "assets/$1")" '{url:$url,sha256:$hash,size:$size}'; }
+          jq -n --arg version "$ver" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg notes "https://github.com/kirushik/strop/releases/tag/$GITHUB_REF_NAME" --argjson win "$(entry "$win")" --argjson mac "$(entry "$mac")" '{product:"strop",updater_protocol:1,version:$version,pub_date:$date,notes_url:$notes,targets:{"github-win/x86_64-pc-windows-msvc/exe":$win,"github-mac/aarch64-apple-darwin/app-tar":$mac}}' > assets/latest.json
+          gh release upload "$GITHUB_REF_NAME" assets/latest.json
+      - name: stage 7 — attest only immutable final payloads
+        uses: actions/attest-build-provenance@v4
+        with: { subject-path: "assets/*" }
