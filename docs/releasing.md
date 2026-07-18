@@ -65,6 +65,10 @@ frozen legacy namespace) or move in the same commit. The installed base today
 is Kirill plus a handful of testers, so aligning now is nearly free (a
 one-time if-old-dir-exists move on macOS/Windows; Linux needs nothing) — and
 it is the *last* moment that is true. Under option 1 the question dissolves.
+If option 2 is chosen, the move gets a real contract before Phase A code:
+old/new path pairs, both-exist conflict rule (old wins, new renamed aside),
+idempotence, and a test — not a hand-waved "one-time move" (Sol, F11
+concurrence condition).
 
 **Recommend:** option 1 unless the project-domain itch is real, in which case
 buy the domain *now* and align storage in the identity commit. **DECIDE
@@ -245,13 +249,19 @@ not certificate pinning**, and the doc says so honestly (Sol security note).
 
 ### The key
 
-One minisign keypair. Public key + its key ID baked into the binary
+A managed minisign key *set* (one key at a time in the normal case; two
+during a rotation window). Public keys + their key IDs baked into the binary
 (`minisign-verify` crate — pure Rust, tiny); unknown key IDs are refused.
 Private key lives on Kirill's machine, passphrase-protected, backed up
 offline, **never in CI** — CI produces everything except the one signature
-(§12), so a compromised CI cannot feed updates to anyone. Rotation = ship a
-release signed by the old key whose binary trusts old+new, then drop the old
-key next minor.
+(§12), so a compromised CI cannot feed updates to anyone. Routine rotation
+(Sol's missed-bridge catch): the manifest carries **multiple signatures**
+(`latest.json.minisig`, `.minisig2`) and a client accepts any signature from
+its baked key list; a rotation **dual-signs for at least one full minor
+series**, so clients that slept through the bridge release still update; the
+key list in new binaries only grows until a retired key ages out, and
+clients older than the whole dual-signing window are manual-reinstall
+(stated, like the other residuals).
 
 **Stated residual risks** (accepted, not hidden — Sol F7 adjudicated): (a)
 *key compromise is unrecoverable in-band* — a stolen key can sign an
@@ -270,12 +280,20 @@ wipes state and that's fine).
 
 ### Staging (crash-consistent, Sol F12)
 
-Download into `data_dir/updates/stage-<version>/` via temp file + fsync +
-rename; verify sha256 + manifest signature; then atomically write a `ready`
-marker naming the exact artifact hash. Partial downloads are invisible by
-construction (temp names); marker/payload disagreement = delete the stage;
-one stage at a time, size-capped, and any stage not matching the current
-manifest is garbage-collected at check time.
+Two phases with different ownership (Sol N2 — the first revision's lock rule
+contradicted itself). **Download phase, no lock**: fetch and verify into a
+**uniquely-named temp dir owned by that check alone** (pid+random suffix), so
+concurrent checkers cannot touch each other's bytes. **Publication phase,
+under the update lock, briefly**: reconcile against the current manifest,
+atomically promote the verified temp dir to `data_dir/updates/stage-<version>/`
++ its `ready` marker naming the exact artifact hash, and garbage-collect
+every other stage and orphaned temp dir. All `ready`-marker writes, stage
+promotion, GC, and apply happen under the lock; no network I/O ever does.
+Partial downloads are invisible by construction; **a stage without its
+matching `ready` marker does not exist** as far as apply is concerned;
+marker/payload disagreement = delete the stage; one stage at a time,
+size-capped; GC distinguishes live owned temp dirs (pid alive) from
+orphans.
 
 ### The update lock (Sol F1 — the finding that reshaped this section)
 
@@ -309,22 +327,26 @@ the dying listener and exit as "already open" (Sol F2). Sequence:
   running instances keep executing their old image (Windows keeps the
   renamed file's image alive) and pick the new binary up at their next
   launch.
-- **macOS** (Sol F3 — "atomic rename" was a fiction; this is a journaled
-  state machine instead): the staged `.app` is first **copied to a sibling
-  temp dir on the destination volume** (`Strop.app.staged` next to
-  `Strop.app` — same filesystem, so the renames below cannot EXDEV) and
-  re-verified there. Then, journaled phase by phase:
-  `Strop.app` → `Strop.app.previous` (rename); `Strop.app.staged` →
-  `Strop.app` (rename); journal `done`. Renaming the bundle out from under
-  the running process is safe (the image is inode-backed). **Recovery table
-  at every launch**: journal says mid-swap + no `Strop.app` but `.previous`
-  exists → restore `.previous`, report in About; `.staged` exists + journal
-  pre-swap → resume or discard by re-verification. Every crash point lands
-  in a state the next launch can name. If `/Applications` isn't writable
-  (IT-managed Macs): no elevation attempt, calm About line, done. The
-  bundle CI ships is already signed+notarized+stapled, so the swapped-in
-  app verifies offline; our process sets no quarantine flags on files it
-  writes.
+- **macOS** (Sol F3/N1 — "atomic rename" was a fiction, and a naive
+  two-rename journal has a crash window where `Strop.app` *doesn't exist*
+  and the recovery code lives inside the missing bundle): the staged `.app`
+  is first **copied to a sibling temp dir on the destination volume**
+  (`Strop.app.staged` next to `Strop.app` — same filesystem, no EXDEV) and
+  re-verified there. The swap itself is **`renamex_np(RENAME_SWAP)`** — the
+  atomic directory-entry *exchange* APFS provides and Sparkle relies on:
+  one syscall, after which `Strop.app` is the new version and `.staged`
+  holds the old bundle. **A valid `Strop.app` exists at every durable
+  boundary**; there is no state in which the Dock icon points at nothing.
+  Then journal, rename old aside as `Strop.app.previous`, journal `done`.
+  Recovery at launch only ever relabels leftovers (`.staged` present +
+  journal pre-swap → discard by re-verification; post-swap → finish the
+  aside rename). Exchanging the bundle out from under the running process
+  is safe (the image is inode-backed). If `renamex_np` fails (non-APFS
+  volume): no clever fallback — calm About line, manual update, done. If
+  `/Applications` isn't writable (IT-managed Macs): same — no elevation
+  attempt. The bundle CI ships is already signed+notarized+stapled, so the
+  swapped-in app verifies offline; our process sets no quarantine flags on
+  files it writes.
 - Any verification or permission failure: run the current binary, one About
   line, delete the stage. Never block launch.
 
@@ -399,11 +421,15 @@ with a clear message, a migration `match`. What 0.3.0 adds:
    **exact bytes just read** are written to
    `data_dir/migration-backups/<full-blake3>.strop` (full hash — no prefix
    collisions), fsynced, and recorded in a ledger line (`when, source path,
-   source schema, hash`) **before any migrated save can be prepared**. The
-   bytes are in hand at that moment by definition. If the backup write
-   fails, the document opens normally but **saving is refused** (with the
-   reason) until a backup lands — the pristine original on disk stays the
-   backup of record. Idempotent by hash; kept forever (they're small;
+   source schema, hash`) **before any migrated save can be prepared** — and
+   the ledger commit is itself a crash-consistent transaction (Sol N3):
+   append + fsync the ledger *and* fsync its parent directory before the
+   save-block clears, so no crash can leave a migrated document without its
+   About mapping. Fault-injection tests sit between every backup / ledger /
+   save boundary. The bytes are in hand at open by definition. If the backup
+   or ledger write fails, the document opens normally but **saving is
+   refused** (with the reason) until both land — the pristine original on
+   disk stays the backup of record. Idempotent by hash; kept forever (they're small;
    asset-GC does not apply). About gains a migration view: per-document
    restore (the F4 pairing), not filesystem archaeology.
 2. **A corpus, in CI — asserting semantics, not prose** (Sol F6: a
@@ -655,3 +681,21 @@ overruled; fork's Wayland `app_id`-timing fix (§10).
   key-epoch scheme (TUF creep). Cut on Sol's concurrence: the
   `min_supported_schema` manifest lever (uninventoriable, therefore
   theater).
+- **2026-07-18, Sol, concurrence round on the revision**: overall *dissent*
+  with three findings, all folded in: N1 (blocker) — the two-rename macOS
+  journal could crash into a state with no `Strop.app` and the recovery
+  code inside the missing bundle → replaced with `renamex_np(RENAME_SWAP)`
+  atomic exchange (Sparkle's approach; a valid bundle exists at every
+  durable boundary, no helper binary needed); N2 — the lock/staging rules
+  contradicted each other → split into lock-free download-to-owned-temp +
+  brief-lock publication/GC/apply; N3 — ledger durability now a
+  crash-consistent transaction (fsync file + parent dir before the
+  save-block clears). Plus the missed-bridge rotation hole → multi-signature
+  manifests, dual-signing for a full minor series. Sol *concurred* with both
+  CEO overrules (F7 attenuation, `min_supported_schema` cut).
+- **2026-07-18, Sol, final ack round**: overall **concur** — "I would now
+  build this as specified." N1/N3 resolve outright; N2 and rotation resolve
+  with two editorial notes, both folded (stage-requires-marker made
+  explicit + live-temp-dir GC rule; "one keypair" → "managed key set").
+  Design review CLOSED; implementation may reference this doc as the
+  agreed spec.
