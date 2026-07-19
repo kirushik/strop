@@ -94,7 +94,12 @@ pub fn maybe_run(window: WindowHandle<Editor>, cx: &mut App) {
             // headless sway the second window tiles beside the editor, so
             // one grim frame shows both.
             if key == "open:about" {
-                cx.update(|cx| cx.dispatch_action(&crate::AboutStrop));
+                // Window dispatch, deliberately — the same route the palette
+                // takes (execute_palette_entry), so the rig exercises the
+                // path a writer's click travels, not a shortcut through App.
+                let _ = window.update(cx, |_, window, cx| {
+                    window.dispatch_action(Box::new(crate::AboutStrop), cx);
+                });
                 cx.background_executor().timer(Duration::from_millis(400)).await;
                 eprintln!("SMOKE open:about: colophon window dispatched");
                 continue;

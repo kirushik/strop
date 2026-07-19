@@ -561,22 +561,11 @@ fn main() {
         let editor = window
             .update(cx, |_, _, cx| cx.entity())
             .expect("window just opened");
-        let about_window = std::rc::Rc::new(std::cell::RefCell::new(
-            None::<gpui::WindowHandle<about::AboutWindow>>,
-        ));
-        let about_slot = about_window.clone();
-        let editor_window = window;
-        cx.on_action(move |_: &AboutStrop, cx| {
-            if let Some(reference) = *about_slot.borrow()
-                && reference.update(cx, |_, window, _| window.activate_window()).is_ok()
-            {
-                return;
-            }
-            *about_slot.borrow_mut() = None;
-            if let Ok(bounds) = editor_window.update(cx, |_, window, _| window.bounds()) {
-                *about_slot.borrow_mut() = about::open(editor_window.into(), bounds, cx);
-            }
-        });
+        // AboutStrop is handled in the editor's render tree (the
+        // ShowShortcuts shape; editor.rs show_about) — window dispatch
+        // never reaches app-level on_action handlers in the real runtime,
+        // a fact this file once assumed the other way. The editor owns
+        // the one about-window slot.
         let window_for_quit = window;
         cx.on_app_quit(move |cx| {
             // Finding 7 / LAW 2: an open transient field must not lose its
