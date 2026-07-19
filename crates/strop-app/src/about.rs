@@ -13,7 +13,7 @@ use crate::aux_window;
 use crate::draw_guard::EntityUpdateExt as _;
 use crate::editor::{Editor, EscapeMode};
 use crate::icons::{self, icon};
-use crate::theme::{BG_COLOR, LINK_COLOR, MUTED_COLOR, RULE_COLOR, TEXT_COLOR};
+use crate::theme::{AUX_BG, LINK_COLOR, MUTED_COLOR, RULE_COLOR, TEXT_COLOR};
 use crate::update::{self, Channel, UpdateState};
 
 const WIDTH: f32 = 660.;
@@ -153,7 +153,7 @@ impl Render for AboutWindow {
         let datum = |text: String| div().font_family("PT Mono").text_size(px(11.)).child(text);
         let entity = cx.entity();
         let body = div()
-            .size_full().bg(rgb(BG_COLOR)).text_color(rgb(TEXT_COLOR)).font_family("PT Sans")
+            .size_full().bg(rgb(AUX_BG)).text_color(rgb(TEXT_COLOR)).font_family("PT Sans")
             .px(px(42.)).pt(px(32.)).pb(px(48.)).flex().flex_col()
             .child(div().flex().items_center().gap(px(18.))
                 .child(icon(icons::STROP_MARK, 52., TEXT_COLOR))
@@ -192,7 +192,7 @@ impl Render for AboutWindow {
         let content = div().key_context("About").track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &EscapeMode, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|this, _: &crate::AboutStrop, window, cx| this.close(window, cx)))
-            .size_full().bg(rgb(BG_COLOR)).font_family("PT Sans").text_color(rgb(TEXT_COLOR))
+            .size_full().bg(rgb(AUX_BG)).font_family("PT Sans").text_color(rgb(TEXT_COLOR))
             .child(aux_window::titlebar(
                 "About Strop", None, metrics.client, "about-close", "about-close",
                 move |_: &MouseDownEvent, window, cx| {

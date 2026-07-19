@@ -54,6 +54,12 @@
 /// The page: a warm off-white, not pure white (easier on the eye, sets the
 /// "paper" baseline the card tints are read against).
 pub const BG_COLOR: u32 = 0xFBFAF8;
+/// Auxiliary windows (keymap, About — everything in the aux_window shell):
+/// a step warmer and dimmer than the page, so a window floating OVER the
+/// manuscript can never be mistaken for the manuscript. Furniture, not
+/// paper. Was the keymap window's local hardcode; promoted when About
+/// arrived in page-white and read as the page it covered.
+pub const AUX_BG: u32 = 0xF6F4EF;
 /// Primary ink: near-black with a hint of warmth, never pure `#000`.
 pub const TEXT_COLOR: u32 = 0x1A1A18;
 /// Secondary / provisional / quiet text: stale diagnoses, labels, captions.

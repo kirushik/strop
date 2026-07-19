@@ -245,7 +245,7 @@ impl Render for KeymapWindow {
             .on_action(cx.listener(|this, _: &ShowShortcuts, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)))
             .size_full()
-            .bg(rgb(0xF6F4EF))
+            .bg(rgb(crate::theme::AUX_BG))
             .font_family("PT Sans")
             .text_color(rgb(0x242321))
             .child(
