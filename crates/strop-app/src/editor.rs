@@ -1682,6 +1682,9 @@ pub struct Editor {
     doc_rename_error: Option<&'static str>,
     /// The one modeless keyboard-reference window (impl/18, ctrl-?).
     keymap_window: Option<gpui::WindowHandle<crate::keymap_window::KeymapWindow>>,
+    /// The one modeless colophon window, owned beside the keyboard map so
+    /// palette dispatch stays in the editor window's action tree.
+    about_window: Option<gpui::WindowHandle<crate::about::AboutWindow>>,
     /// The AI settings panel (DESIGN §2-ai, F4): form + async test +
     /// /models picker; saves write through toml_edit.
     ai_settings: Option<AiSettings>,
@@ -2564,6 +2567,7 @@ impl Editor {
             doc_rename_input: None,
             doc_rename_error: None,
             keymap_window: None,
+            about_window: None,
             ai_settings: None,
             ai_settings_generation: 0,
             replace_input: None,
@@ -10185,6 +10189,19 @@ impl Editor {
         ) {
             self.keymap_window = Some(reference);
         }
+    }
+
+    fn show_about(&mut self, _: &crate::AboutStrop, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reference) = self.about_window
+            && reference.update(cx, |_, reference_window, _| {
+                reference_window.activate_window()
+            }).is_ok()
+        {
+            return;
+        }
+        self.about_window = None;
+        self.about_window = crate::about::open(
+            window.window_handle().into(), window.bounds(), cx);
     }
 
     pub(crate) fn keymap_closed(&mut self) {
@@ -22740,6 +22757,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::set_session_goal))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::show_shortcuts))
+            .on_action(cx.listener(Self::show_about))
             .on_action(cx.listener(Self::open_welcome))
             .on_action(cx.listener(Self::read_it_cold))
             .on_action(cx.listener(Self::request_quit))
@@ -22871,6 +22889,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::test_ai_connection))
                     .on_action(cx.listener(Self::cancel_ai_run))
                     .on_action(cx.listener(Self::show_shortcuts))
+                    .on_action(cx.listener(Self::show_about))
                     .on_action(cx.listener(Self::open_welcome))
                     .on_action(cx.listener(Self::read_it_cold))
                     .on_action(cx.listener(Self::scraps_travel))
@@ -27690,6 +27709,28 @@ mod tests {
             image_asset_ids: Vec::new(),
         }).unwrap();
         ClipboardItem::new_string_with_metadata(text.into(), metadata)
+    }
+
+    #[test]
+    fn about_palette_entry_opens_the_colophon_through_the_editor_window() {
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window(|window, cx| {
+            let editor = Editor::new(
+                cx, "test", SpanSet::default(), BlockMap::default());
+            window.focus(&editor.focus_handle, cx);
+            editor
+        });
+
+        window.update(|editor, window, cx| {
+            let rows = editor.omni_rows(">About Strop");
+            let ix = rows.iter().position(|row| matches!(row,
+                OmniRow::Cmd(cmd) if cmd.label == "About Strop"))
+                .expect("About Strop must be a palette row");
+            editor.execute_palette_entry(">About Strop", ix, window, cx);
+        });
+
+        assert!(window.read(|editor, _| editor.about_window.is_some()),
+            "the real palette dispatch path must open the About window");
     }
 
     #[test]
