@@ -21,18 +21,7 @@ const HEIGHT: f32 = 720.;
 const LICENSE_HEIGHT: f32 = 210.;
 const LICENSE_CHUNK_LINES: usize = 80;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToggleDecision {
-    Open,
-    CloseAndRestore,
-}
-
-pub fn toggle_decision(present: bool) -> ToggleDecision {
-    match present {
-        false => ToggleDecision::Open,
-        true => ToggleDecision::CloseAndRestore,
-    }
-}
+pub use aux_window::{ToggleDecision, toggle_decision};
 
 pub fn channel_text(channel: Channel) -> &'static str {
     match channel {
@@ -129,9 +118,16 @@ impl AboutWindow {
         window.remove_window();
         save_position(bounds);
         editor.update_checked(cx, |editor, _| editor.about_closed());
-        let _ = editor_window.update(cx, |_, window, cx| {
-            window.activate_window();
-            window.focus(&editor.focus_handle(cx), cx);
+        aux_window::restore_editor_focus(&editor, editor_window, cx);
+    }
+
+    fn request_quit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor.clone();
+        let _ = self.editor_window.update(cx, move |_, editor_window, cx| {
+            editor_window.activate_window();
+            editor.update_checked(cx, |editor, cx| {
+                editor.request_quit(&crate::Quit, editor_window, cx);
+            });
         });
     }
 }
@@ -189,9 +185,10 @@ impl Render for AboutWindow {
             .child(div().mt(px(16.)).font_family("PT Serif").text_size(px(11.))
                 .text_color(rgb(MUTED_COLOR)).child(format!(
                     "Set in PT Serif & PT Mono · typeset by Strop {}", env!("CARGO_PKG_VERSION"))));
-        let content = div().key_context("About").track_focus(&self.focus_handle)
+        let content = div().key_context(aux_window::KEY_CONTEXT).track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &EscapeMode, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|this, _: &crate::AboutStrop, window, cx| this.close(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)))
             .size_full().bg(rgb(AUX_BG)).font_family("PT Sans").text_color(rgb(TEXT_COLOR))
             .child(aux_window::titlebar(
                 "About Strop", None, metrics.client, "about-close", "about-close",
@@ -211,17 +208,35 @@ pub fn open(
     editor_bounds: Bounds<Pixels>,
     cx: &mut App,
 ) -> Option<WindowHandle<AboutWindow>> {
+    let width = WIDTH + 2. * aux_window::CSD_GUTTER;
+    let height = content_fit_height() + aux_window::HEADER_HEIGHT
+        + 2. * aux_window::CSD_GUTTER;
+    let displays = cx.displays();
+    let editor_tuple = (
+        f32::from(editor_bounds.origin.x), f32::from(editor_bounds.origin.y),
+        f32::from(editor_bounds.size.width), f32::from(editor_bounds.size.height));
+    let display = aux_window::containing_display(editor_tuple, &displays.iter().map(|display| {
+        let bounds = display.bounds();
+        (f32::from(bounds.origin.x), f32::from(bounds.origin.y),
+         f32::from(bounds.size.width), f32::from(bounds.size.height))
+    }).collect::<Vec<_>>())
+        .and_then(|ix| displays.get(ix).cloned())
+        .or_else(|| cx.primary_display());
+    let work = display.as_ref().map(|display| display.bounds()).unwrap_or_else(|| {
+        Bounds::centered(None, size(px(width), px(height)), cx)
+    });
+    let work_tuple = (f32::from(work.origin.x), f32::from(work.origin.y),
+        f32::from(work.size.width), f32::from(work.size.height));
     let remembered = load_position().unwrap_or((
         f32::from(editor_bounds.origin.x) + 36., f32::from(editor_bounds.origin.y) + 36.));
+    let (x, y, w, h) = aux_window::clamp_bounds(
+        (remembered.0, remembered.1, width, height), work_tuple);
     cx.open_window(WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: gpui::point(px(remembered.0), px(remembered.1)),
-            size: size(
-                px(WIDTH + 2. * aux_window::CSD_GUTTER),
-                px(content_fit_height() + aux_window::HEADER_HEIGHT
-                    + 2. * aux_window::CSD_GUTTER),
-            ),
+            origin: gpui::point(px(x), px(y)),
+            size: size(px(w), px(h)),
         })),
+        display_id: display.as_ref().map(|display| display.id()),
         ..aux_window::window_options("About Strop")
     }, move |window, cx| {
         window.set_window_title("About Strop");
@@ -240,10 +255,7 @@ pub fn open(
         window.on_window_should_close(cx, move |window, cx| {
             save_position(window.bounds());
             close_editor.update_checked(cx, |editor, _| editor.about_closed());
-            let _ = restore_window.update(cx, |_, window, cx| {
-                window.activate_window();
-                window.focus(&close_editor.focus_handle(cx), cx);
-            });
+            aux_window::restore_editor_focus(&close_editor, restore_window, cx);
             true
         });
         view

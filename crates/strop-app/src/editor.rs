@@ -884,6 +884,7 @@ pub fn bind_keys(cx: &mut App) {
             .expect("bad chord in command registry"),
         )
     }));
+    cx.bind_keys(crate::aux_window::bindings());
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, ctx),
         // GTK binds this too, "to help with mis-typing" during shift-selection.
@@ -942,7 +943,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-2", Heading2, ctx),
         KeyBinding::new("ctrl-alt-3", Heading3, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
-        KeyBinding::new("escape", EscapeMode, Some("Keymap")),
         KeyBinding::new("escape", EscapeMode, Some("QuitGuard")),
         // GNOME's menu key opens the palette — it IS the menu.
         KeyBinding::new("f10", TogglePalette, ctx),
@@ -1439,6 +1439,12 @@ struct ImageSel {
 struct DropAnchor {
     byte: usize,
     revision: u64,
+}
+
+#[derive(Clone, Copy)]
+enum AuxSlot {
+    Keymap,
+    About,
 }
 
 pub struct Editor {
@@ -10213,11 +10219,18 @@ impl Editor {
     }
 
     pub(crate) fn keymap_closed(&mut self) {
-        self.keymap_window = None;
+        self.aux_closed(AuxSlot::Keymap);
     }
 
     pub(crate) fn about_closed(&mut self) {
-        self.about_window = None;
+        self.aux_closed(AuxSlot::About);
+    }
+
+    fn aux_closed(&mut self, slot: AuxSlot) {
+        match slot {
+            AuxSlot::Keymap => self.keymap_window = None,
+            AuxSlot::About => self.about_window = None,
+        }
     }
 
     fn open_welcome(&mut self, _: &OpenWelcome, _: &mut Window, cx: &mut Context<Self>) {

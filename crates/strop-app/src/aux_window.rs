@@ -4,7 +4,8 @@
 //! a subtly different border, shadow, or close affordance.
 
 use gpui::{
-    App, BoxShadow, CursorStyle, Decorations, Div, Hsla, IntoElement, MouseButton,
+    AnyWindowHandle, App, BoxShadow, CursorStyle, Decorations, Div, Entity, Focusable, Hsla,
+    IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, Tiling, Window, WindowBackgroundAppearance, WindowControlArea,
     WindowDecorations, WindowOptions, div, px, rgb, rgba,
 };
@@ -12,9 +13,61 @@ use gpui::prelude::*;
 
 use crate::icons::{self, icon};
 
+pub const KEY_CONTEXT: &str = "AuxWindow";
 pub const HEADER_HEIGHT: f32 = 68.;
 pub const CSD_GUTTER: f32 = 22.;
 const CSD_ROUNDING: f32 = 10.;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToggleDecision {
+    Open,
+    CloseAndRestore,
+}
+
+pub fn toggle_decision(present: bool) -> ToggleDecision {
+    if present { ToggleDecision::CloseAndRestore } else { ToggleDecision::Open }
+}
+
+/// Shared keyboard grammar for every auxiliary window.  Keeping the
+/// context and bindings together makes it impossible for a new sheet to
+/// listen for a verb which its focused tree can never resolve.
+pub fn bindings() -> Vec<KeyBinding> {
+    vec![KeyBinding::new(
+        "escape", crate::editor::EscapeMode, Some(KEY_CONTEXT))]
+}
+
+pub fn restore_editor_focus(
+    editor: &Entity<crate::editor::Editor>,
+    editor_window: AnyWindowHandle,
+    cx: &mut App,
+) {
+    let _ = editor_window.update(cx, |_, window, cx| {
+        window.activate_window();
+        window.focus(&editor.focus_handle(cx), cx);
+    });
+}
+
+pub fn clamp_bounds(
+    record: (f32, f32, f32, f32),
+    work: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    let (wx, wy, ww, wh) = work;
+    let w = record.2.max(400.).min(ww);
+    let h = record.3.max(300.).min(wh);
+    let x = record.0.max(wx).min(wx + ww - w);
+    let y = record.1.max(wy).min(wy + wh - h);
+    (x, y, w, h)
+}
+
+pub fn containing_display(
+    editor: (f32, f32, f32, f32),
+    displays: &[(f32, f32, f32, f32)],
+) -> Option<usize> {
+    let (ex, ey, ew, eh) = editor;
+    displays.iter().position(|&(x, y, w, h)| {
+        ex >= x && ey >= y && ex + ew <= x + w && ey + eh <= y + h
+    })
+}
 
 pub struct Metrics {
     pub client: bool,
@@ -130,4 +183,65 @@ pub fn shell(content: Div, metrics: Metrics) -> impl IntoElement {
                 })
                 .child(round(content)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{Context, FocusHandle, Focusable, Render, TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    struct AuxSurface {
+        escapes: Rc<Cell<usize>>,
+        focus: FocusHandle,
+    }
+
+    impl Focusable for AuxSurface {
+        fn focus_handle(&self, _: &App) -> FocusHandle { self.focus.clone() }
+    }
+
+    impl Render for AuxSurface {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let escapes = self.escapes.clone();
+            div().key_context(KEY_CONTEXT).track_focus(&self.focus)
+                .on_action(move |_: &crate::editor::EscapeMode, _, _| {
+                    escapes.set(escapes.get() + 1);
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn escape_resolves_through_the_shared_context_for_both_aux_surfaces(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.bind_keys(bindings()));
+        for _window_kind in ["keymap", "about"] {
+            let escapes = Rc::new(Cell::new(0));
+            let window = cx.update({
+                let escapes = escapes.clone();
+                move |cx| cx.open_window(Default::default(), |window, cx| {
+                    let surface = cx.new(|cx| AuxSurface {
+                        escapes,
+                        focus: cx.focus_handle(),
+                    });
+                    window.focus(&surface.focus_handle(cx), cx);
+                    surface
+                }).unwrap()
+            });
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            visual.update(|window, cx| {
+                window.dispatch_keystroke(gpui::Keystroke::parse("escape").unwrap(), cx);
+            });
+            assert_eq!(escapes.get(), 1);
+        }
+    }
+
+    #[test]
+    fn toggle_grammar_is_one_shared_two_state_switch() {
+        assert_eq!(toggle_decision(false), ToggleDecision::Open);
+        assert_eq!(toggle_decision(true), ToggleDecision::CloseAndRestore);
+    }
 }

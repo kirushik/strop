@@ -33,18 +33,7 @@ fn static_window_size(sections: &[KeymapSection]) -> (f32, f32) {
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToggleDecision {
-    Open,
-    CloseAndRestore,
-}
-
-pub fn toggle_decision(present: bool) -> ToggleDecision {
-    match present {
-        false => ToggleDecision::Open,
-        true => ToggleDecision::CloseAndRestore,
-    }
-}
+pub use aux_window::{ToggleDecision, toggle_decision};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeymapRow {
@@ -161,32 +150,11 @@ fn save_bounds(bounds: Bounds<Pixels>) {
     }
 }
 
-pub fn clamp_bounds(
-    record: (f32, f32, f32, f32),
-    work: (f32, f32, f32, f32),
-) -> (f32, f32, f32, f32) {
-    let (wx, wy, ww, wh) = work;
-    let w = record.2.max(400.).min(ww);
-    let h = record.3.max(300.).min(wh);
-    let x = record.0.max(wx).min(wx + ww - w);
-    let y = record.1.max(wy).min(wy + wh - h);
-    (x, y, w, h)
-}
+pub use aux_window::{clamp_bounds, containing_display};
 
 /// The editor chooses the monitor: remembered keymap coordinates must not pull
 /// the reference back to a different display. A display contains the editor
 /// only when it contains the editor's whole window rectangle.
-pub fn containing_display(
-    editor: (f32, f32, f32, f32),
-    displays: &[(f32, f32, f32, f32)],
-) -> Option<usize> {
-    let (ex, ey, ew, eh) = editor;
-    displays.iter().position(|&(x, y, w, h)| {
-        ex >= x && ey >= y && ex + ew <= x + w && ey + eh <= y + h
-    })
-}
-
-
 pub struct KeymapWindow {
     focus_handle: FocusHandle,
     editor: Entity<Editor>,
@@ -208,10 +176,7 @@ impl KeymapWindow {
         window.remove_window();
         save_bounds(bounds);
         editor.update_checked(cx, |editor, _| editor.keymap_closed());
-        let _ = editor_window.update(cx, |_, window, cx| {
-            window.activate_window();
-            window.focus(&editor.focus_handle(cx), cx);
-        });
+        aux_window::restore_editor_focus(&editor, editor_window, cx);
     }
 
 
@@ -239,7 +204,7 @@ impl Render for KeymapWindow {
         );
         let entity = cx.entity();
         let content = div()
-            .key_context("Keymap")
+            .key_context(aux_window::KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &EscapeMode, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, window, cx| this.close(window, cx)))
@@ -385,10 +350,7 @@ pub fn open(
             window.on_window_should_close(cx, move |window, cx| {
                 save_bounds(window.bounds());
                 close_editor.update_checked(cx, |editor, _| editor.keymap_closed());
-                let _ = restore_window.update(cx, |_, window, cx| {
-                    window.activate_window();
-                    window.focus(&close_editor.focus_handle(cx), cx);
-                });
+                aux_window::restore_editor_focus(&close_editor, restore_window, cx);
                 true
             });
             view
