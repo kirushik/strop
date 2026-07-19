@@ -160,9 +160,15 @@ jobs:
           fail_on_unmatched_files: true
           files: artifacts/**/*
           body: |
-            > **Early release.** Linux is runtime-tested. macOS and Windows
-            > signing is conditional: signed when the corresponding repository
-            > gate variable is enabled, otherwise the OS may warn.
+            > **Install note.** These binaries are built and uploaded straight
+            > from tagged CI, each carrying a verifiable [build-provenance
+            > attestation](https://github.com/kirushik/strop/attestations). When
+            > a platform is not OS-code-signed, Windows SmartScreen shows an
+            > unknown-publisher prompt (choose *More info → Run anyway*) and
+            > macOS Gatekeeper needs a manual override — expected, not a
+            > compromise. Updates verify against Strop's own embedded key
+            > regardless of OS signing. Linux is the primary runtime-tested
+            > platform.
 
   manifest:
     needs: draft

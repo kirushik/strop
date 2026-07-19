@@ -168,7 +168,7 @@ workflow is copyable nearly verbatim). Fallback if we ever want to drop the
 macOS runner: `rcodesign` signs *and* notarizes from Linux, but its last
 release was Nov 2024 — reference, not foundation.
 
-### Windows — SignPath Foundation first; unsigned is the honest fallback
+### Windows — unsigned for 0.3.0; Azure walled by Play Integrity; SignPath deferred
 
 Reality check from research: since 2024, **neither OV nor EV certificates
 grant SmartScreen reputation** — reputation accrues per-file/publisher with
@@ -196,13 +196,40 @@ says. The landscape for us:
 - **Peers**: Alacritty (wontfix'd signing), Helix, WezTerm ship Windows
   binaries **unsigned**. Only VC-funded Zed signs.
 
-**Revised recommendation (post-VAT-ID fact):** attempt **Azure onboarding
-first** — own-name publisher and click-free CI beat SignPath's tradeoffs if
-the validation passes. Run the **SignPath application in parallel** (free,
-no commitment) as the fallback; unsigned-like-the-peers remains the honest
-floor if both stall past 0.3.0, with the SmartScreen caveat in the release
-notes. Whichever lands first signs 0.3.x; this is now an empirical race,
-not a decision.
+**OUTCOME (2026-07-19, the race was run):** Azure was attempted end to end and
+**abandoned** — but *not* on eligibility. The German-VAT-business path was
+accepted; the identity validation itself proceeded through billing (three walls
+cleared: West Europe was capacity-closed → North Europe; the Azure free
+account's $200-credit "Azure Plan" is rejected as "free/trial/sponsored" until
+upgraded via the only door that offers it, the `+Add subscription` "please
+upgrade first" link; account `stropsigning` then created cleanly). It died at
+the **individual Verified-ID step: Microsoft Authenticator demands the Play
+Integrity API, which GrapheneOS structurally cannot pass** (a hardened, more
+secure OS *punished* by the attestation gate — the whole enshittification in
+one image). The block is device-bound, not account-bound: a borrowed stock
+phone would clear it in ten minutes, but it isn't worth it — the SmartScreen
+reputation Azure would buy already broke in the March-2026 CA rotation.
+
+SignPath was then applied for and **deferred**: Strop clears every hard
+criterion (GPL-3.0, public repo, MFA via FIDO, solo dev = signing team) but
+stalls on the application's **"Reputation"** field — media/downloads/insights/
+community, of which a two-week-old project has none. Revisit after a real
+footprint exists (and apply as *"Strop (text editor)"* — the bare word collides
+with the dictionary).
+
+**DECISION: Windows 0.3.0 ships UNSIGNED** — the peer floor (Helix, WezTerm,
+Alacritty), SmartScreen caveat in the release notes, `attest-build-provenance`
+as the open trust anchor (already wired, `release.yml` stage 7). Crucially this
+costs no *security*: the §4 updater verifies every update against the binary's
+own embedded minisign key, independent of any OS/CA. The gate only shields
+first-install SmartScreen friction, which no cert would have removed anyway.
+The `release.yml` SignPath steps stay in place, dormant behind
+`WINDOWS_SIGNING_ENABLED`, ready for the day the footprint earns the cert.
+
+*(macOS is a separate call — see §2: unlike Windows, an unsigned/un-notarized
+`.app` is progressively unrunnable on Sequoia, so Mac is the one platform where
+finishing the paid path is worth it. Its enrollment has no Play-Integrity trap —
+Apple ID via phone 2FA + web enrolment, no device required.)*
 
 ### Both platforms — provenance attestations, immediately
 
