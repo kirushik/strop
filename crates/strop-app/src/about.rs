@@ -146,7 +146,21 @@ impl Render for AboutWindow {
             UpdateState::AppliedThisLaunch { notes_url, .. } => Some(notes_url.clone()),
             _ => None,
         };
-        let datum = |text: String| div().font_family("PT Mono").text_size(px(11.)).child(text);
+        // A link looks clickable, so it IS clickable (blue text that does
+        // nothing is a lie in link's clothing). occlude + stop_propagation
+        // punch through the shell's whole-window drag surface, exactly the
+        // close button's arrangement.
+        let link = |id: &'static str, text: String, url: String| {
+            div().id(id).occlude().cursor_pointer()
+                .font_family("PT Mono").text_size(px(11.))
+                .text_color(rgb(LINK_COLOR))
+                .hover(|d| d.text_color(rgb(TEXT_COLOR)))
+                .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    cx.open_url(&url);
+                })
+                .child(text)
+        };
         let entity = cx.entity();
         let body = div()
             .size_full().bg(rgb(AUX_BG)).text_color(rgb(TEXT_COLOR)).font_family("PT Sans")
@@ -168,13 +182,16 @@ impl Render for AboutWindow {
                     .when(enabled, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left,
                         |_: &MouseDownEvent, _, _| update::check_now()))
                     .child("Check now"))))
-            .when_some(notes, |d, url| d.child(datum(url).mt(px(5.)).text_color(rgb(LINK_COLOR))))
+            .when_some(notes, |d, url| d.child(
+                link("about-notes", url.clone(), url).mt(px(5.))))
             .child(div().mt(px(18.)).font_family("PT Serif").text_size(px(12.)).line_height(px(18.))
                 .child("© 2026 Kirill Pimenov")
                 .child("This program comes with absolutely no warranty.")
                 .child("This is free software — you may redistribute it under GPL-3.0-or-later."))
-            .child(datum("COPYING".into()).mt(px(6.)).text_color(rgb(LINK_COLOR)))
-            .child(datum("https://github.com/kirushik/strop".into()).text_color(rgb(LINK_COLOR)))
+            .child(link("about-copying", "COPYING".into(),
+                "https://github.com/kirushik/strop/blob/main/COPYING".into()).mt(px(6.)))
+            .child(link("about-repo", "https://github.com/kirushik/strop".into(),
+                "https://github.com/kirushik/strop".into()))
             .child(div().mt(px(16.)).mb(px(5.)).text_size(px(10.)).text_color(rgb(MUTED_COLOR))
                 .child("THIRD-PARTY LICENSES"))
             .child(div().id("about-licenses").h(px(LICENSE_HEIGHT)).overflow_y_scroll()

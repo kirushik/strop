@@ -10215,7 +10215,7 @@ impl Editor {
             self.about_window = None;
         }
         self.about_window = crate::about::open(
-            cx.entity(), window.window_handle().into(), window.bounds(), cx);
+            cx.entity(), window.window_handle(), window.bounds(), cx);
     }
 
     pub(crate) fn keymap_closed(&mut self) {
