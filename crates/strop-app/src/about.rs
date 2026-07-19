@@ -3,12 +3,15 @@
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, IntoElement, MouseButton,
-    MouseDownEvent, Pixels, Render, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowHandle, WindowOptions, div, px, rgb, size,
+    AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement,
+    MouseButton, MouseDownEvent, Pixels, Render, Window, WindowBounds, WindowHandle,
+    WindowOptions, div, px, rgb, size,
 };
 use gpui::prelude::*;
 
+use crate::aux_window;
+use crate::draw_guard::EntityUpdateExt as _;
+use crate::editor::{Editor, EscapeMode};
 use crate::icons::{self, icon};
 use crate::theme::{BG_COLOR, LINK_COLOR, MUTED_COLOR, RULE_COLOR, TEXT_COLOR};
 use crate::update::{self, Channel, UpdateState};
@@ -17,6 +20,19 @@ const WIDTH: f32 = 660.;
 const HEIGHT: f32 = 720.;
 const LICENSE_HEIGHT: f32 = 210.;
 const LICENSE_CHUNK_LINES: usize = 80;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToggleDecision {
+    Open,
+    CloseAndRestore,
+}
+
+pub fn toggle_decision(present: bool) -> ToggleDecision {
+    match present {
+        false => ToggleDecision::Open,
+        true => ToggleDecision::CloseAndRestore,
+    }
+}
 
 pub fn channel_text(channel: Channel) -> &'static str {
     match channel {
@@ -96,6 +112,8 @@ pub fn content_fit_height() -> f32 {
 
 pub struct AboutWindow {
     focus_handle: FocusHandle,
+    editor: Entity<Editor>,
+    editor_window: AnyWindowHandle,
     chunks: Vec<String>,
 }
 
@@ -103,8 +121,24 @@ impl Focusable for AboutWindow {
     fn focus_handle(&self, _: &App) -> FocusHandle { self.focus_handle.clone() }
 }
 
+impl AboutWindow {
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = window.bounds();
+        let editor = self.editor.clone();
+        let editor_window = self.editor_window;
+        window.remove_window();
+        save_position(bounds);
+        editor.update_checked(cx, |editor, _| editor.about_closed());
+        let _ = editor_window.update(cx, |_, window, cx| {
+            window.activate_window();
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+    }
+}
+
 impl Render for AboutWindow {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let metrics = aux_window::metrics(window);
         let state = update::status();
         // Inert (dev build, store channel) shows no updater surface at all
         // (§5); Disabled keeps the row so its "checks are off" line can
@@ -117,7 +151,8 @@ impl Render for AboutWindow {
             _ => None,
         };
         let datum = |text: String| div().font_family("PT Mono").text_size(px(11.)).child(text);
-        div().key_context("About").track_focus(&self.focus_handle)
+        let entity = cx.entity();
+        let body = div()
             .size_full().bg(rgb(BG_COLOR)).text_color(rgb(TEXT_COLOR)).font_family("PT Sans")
             .px(px(42.)).pt(px(32.)).pb(px(48.)).flex().flex_col()
             .child(div().flex().items_center().gap(px(18.))
@@ -153,33 +188,46 @@ impl Render for AboutWindow {
             .child(div().mt(px(12.)).text_size(px(11.)).child(backups_text(backup_count())))
             .child(div().mt(px(16.)).font_family("PT Serif").text_size(px(11.))
                 .text_color(rgb(MUTED_COLOR)).child(format!(
-                    "Set in PT Serif & PT Mono · typeset by Strop {}", env!("CARGO_PKG_VERSION"))))
+                    "Set in PT Serif & PT Mono · typeset by Strop {}", env!("CARGO_PKG_VERSION"))));
+        let content = div().key_context("About").track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &EscapeMode, window, cx| this.close(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::AboutStrop, window, cx| this.close(window, cx)))
+            .size_full().bg(rgb(BG_COLOR)).font_family("PT Sans").text_color(rgb(TEXT_COLOR))
+            .child(aux_window::titlebar(
+                "About Strop", None, metrics.client, "about-close", "about-close",
+                move |_: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    entity.update_checked(cx, |this, cx| this.close(window, cx));
+                },
+            ))
+            .child(body);
+        aux_window::shell(content, metrics)
     }
 }
 
 pub fn open(
-    _editor_window: gpui::AnyWindowHandle,
+    editor: Entity<Editor>,
+    editor_window: AnyWindowHandle,
     editor_bounds: Bounds<Pixels>,
     cx: &mut App,
 ) -> Option<WindowHandle<AboutWindow>> {
     let remembered = load_position().unwrap_or((
         f32::from(editor_bounds.origin.x) + 36., f32::from(editor_bounds.origin.y) + 36.));
     cx.open_window(WindowOptions {
-        app_id: Some("cc.pimenov.strop".to_owned()),
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: gpui::point(px(remembered.0), px(remembered.1)),
-            size: size(px(WIDTH), px(content_fit_height())),
+            size: size(
+                px(WIDTH + 2. * aux_window::CSD_GUTTER),
+                px(content_fit_height() + aux_window::HEADER_HEIGHT
+                    + 2. * aux_window::CSD_GUTTER),
+            ),
         })),
-        titlebar: Some(gpui::TitlebarOptions { title: Some("About Strop".into()), ..Default::default() }),
-        window_decorations: Some(WindowDecorations::Server),
-        is_resizable: false,
-        window_background: WindowBackgroundAppearance::Opaque,
-        focus: true,
-        ..Default::default()
+        ..aux_window::window_options("About Strop")
     }, move |window, cx| {
         window.set_window_title("About Strop");
         let view = cx.new(|cx| AboutWindow {
-            focus_handle: cx.focus_handle(), chunks: license_chunks(),
+            focus_handle: cx.focus_handle(), editor: editor.clone(), editor_window,
+            chunks: license_chunks(),
         });
         window.focus(&view.focus_handle(cx), cx);
         let weak = view.downgrade();
@@ -187,7 +235,17 @@ pub fn open(
             cx.background_executor().timer(Duration::from_secs(30)).await;
             if weak.update(cx, |_, cx| cx.notify()).is_err() { break; }
         }).detach();
-        window.on_window_should_close(cx, |window, _| { save_position(window.bounds()); true });
+        let close_editor = editor.clone();
+        let restore_window = editor_window;
+        window.on_window_should_close(cx, move |window, cx| {
+            save_position(window.bounds());
+            close_editor.update_checked(cx, |editor, _| editor.about_closed());
+            let _ = restore_window.update(cx, |_, window, cx| {
+                window.activate_window();
+                window.focus(&close_editor.focus_handle(cx), cx);
+            });
+            true
+        });
         view
     }).ok()
 }
@@ -231,5 +289,16 @@ mod tests {
         assert_eq!(backups_text(1), "1 migration backup");
         assert_eq!(backups_text(7), "7 migration backups");
         assert_eq!(content_fit_height(), HEIGHT);
+    }
+
+    #[test]
+    fn escape_closes_the_about_sheet() {
+        assert_eq!(toggle_decision(true), ToggleDecision::CloseAndRestore);
+    }
+
+    #[test]
+    fn second_about_dispatch_is_a_toggle_close() {
+        assert_eq!(toggle_decision(false), ToggleDecision::Open);
+        assert_eq!(toggle_decision(true), ToggleDecision::CloseAndRestore);
     }
 }

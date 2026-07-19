@@ -17,6 +17,7 @@
 
 mod ai_log;
 mod about;
+mod aux_window;
 mod bookpage;
 mod commands;
 mod config;

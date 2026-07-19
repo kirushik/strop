@@ -2,26 +2,24 @@
 //! the authority; this module owns only its presentation model and window.
 
 use gpui::{
-    AnyWindowHandle, App, Bounds, BoxShadow, Context, CursorStyle, Decorations, Entity,
-    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, Pixels, Render,
-    Tiling, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowHandle, WindowOptions, div, px, rgb, rgba, size,
+    AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement,
+    MouseDownEvent, Pixels, Render, Window, WindowBounds, WindowHandle, WindowOptions,
+    div, px, rgb, size,
 };
 use gpui::prelude::*;
 
 use crate::editor::{Editor, EscapeMode, ShowShortcuts};
 use crate::draw_guard::EntityUpdateExt as _;
-use crate::icons::{self, icon};
+use crate::aux_window;
 
 pub const DEFAULT_WIDTH: f32 = 900.;
-const HEADER_HEIGHT: f32 = 68.;
+const HEADER_HEIGHT: f32 = aux_window::HEADER_HEIGHT;
 const SECTION_HEADING_HEIGHT: f32 = 24.;
 const ROW_PITCH: f32 = 16.;
 const SECTION_PAD: f32 = 8.;
 const GRID_TOP: f32 = 14.;
 const GRID_BOTTOM: f32 = 20.;
-const CSD_GUTTER: f32 = 22.;
-const CSD_ROUNDING: f32 = 10.;
+const CSD_GUTTER: f32 = aux_window::CSD_GUTTER;
 
 /// The sheet's one static size: contents fit by construction, and the
 /// window is not resizable — a registry that grows grows the window
@@ -231,29 +229,15 @@ impl KeymapWindow {
 impl Render for KeymapWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds = window.bounds();
-        let decorations = window.window_decorations();
-        let tiling = match decorations {
-            Decorations::Client { tiling } => tiling,
-            Decorations::Server => Tiling::default(),
-        };
-        let client = matches!(decorations, Decorations::Client { .. });
-        window.set_client_inset(px(if client { CSD_GUTTER } else { 0. }));
-        let horizontal_inset = if client {
-            (if tiling.left { 0. } else { CSD_GUTTER })
-                + if tiling.right { 0. } else { CSD_GUTTER }
-        } else { 0. };
-        let vertical_inset = if client {
-            (if tiling.top { 0. } else { CSD_GUTTER })
-                + if tiling.bottom { 0. } else { CSD_GUTTER }
-        } else { 0. };
+        let metrics = aux_window::metrics(window);
+        let client = metrics.client;
+        let vertical_inset = metrics.vertical_inset;
         let layout = allocate_layout(
-            f32::from(bounds.size.width) - horizontal_inset,
+            f32::from(bounds.size.width) - metrics.horizontal_inset,
             f32::from(bounds.size.height) - vertical_inset,
             &self.sections,
         );
-        let drag = |_: &MouseDownEvent, window: &mut Window, _: &mut App| {
-            window.start_window_move();
-        };
+        let entity = cx.entity();
         let content = div()
             .key_context("Keymap")
             .track_focus(&self.focus_handle)
@@ -265,34 +249,18 @@ impl Render for KeymapWindow {
             .font_family("PT Sans")
             .text_color(rgb(0x242321))
             .child(
-                div()
-                    .h(px(HEADER_HEIGHT))
-                    .px(px(22.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(rgb(0xC9C4BA))
-                    .child(div().text_size(px(18.)).child("Keyboard map"))
-                    .child(
-                        div().flex().items_center().h_full().child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(rgb(0x716D66))
-                                .child("PHYSICAL KEYS"),
-                        ).when(client, |d| d.child(
-                            div().id("keymap-close").occlude().ml(px(14.)).w(px(28.)).h_full()
-                                .flex().items_center().justify_center().cursor(CursorStyle::PointingHand)
-                                .group("keymap-close").hover(|d| d.bg(rgba(0x1A1A180A)))
-                                .on_mouse_down(MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.close(window, cx);
-                                    }))
-                                .child(icon(icons::WIN_CLOSE, 13., 0x716D66)
-                                    .group_hover("keymap-close", |s| s.text_color(rgb(0x242321))))
-                        )),
-                    ),
+                aux_window::titlebar(
+                    "Keyboard map",
+                    Some(div().text_size(px(10.)).text_color(rgb(0x716D66))
+                        .child("PHYSICAL KEYS")),
+                    client,
+                    "keymap-close",
+                    "keymap-close",
+                    move |_: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        entity.update_checked(cx, |this, cx| this.close(window, cx));
+                    },
+                ),
             )
             .child(
                 div()
@@ -335,38 +303,7 @@ impl Render for KeymapWindow {
                     })),
             );
 
-        let inset = |tiled: bool| px(if client && !tiled { CSD_GUTTER } else { 0. });
-        let floating = client && !tiling.top && !tiling.bottom && !tiling.left && !tiling.right;
-        let round = move |d: gpui::Div| {
-            d.when(!tiling.top && !tiling.left, |d| d.rounded_tl(px(CSD_ROUNDING)))
-                .when(!tiling.top && !tiling.right, |d| d.rounded_tr(px(CSD_ROUNDING)))
-                .when(!tiling.bottom && !tiling.left, |d| d.rounded_bl(px(CSD_ROUNDING)))
-                .when(!tiling.bottom && !tiling.right, |d| d.rounded_br(px(CSD_ROUNDING)))
-        };
-        div().size_full().relative().bg(rgba(0x00000000))
-            .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down(MouseButton::Left, drag)
-            .child(
-            div().absolute()
-                .top(inset(tiling.top)).bottom(inset(tiling.bottom))
-                .left(inset(tiling.left)).right(inset(tiling.right))
-                .overflow_hidden()
-                .when(client, |d| {
-                    let d = d.border_color(rgb(0xC9C4BA))
-                        .when(!tiling.top, |d| d.border_t_1())
-                        .when(!tiling.bottom, |d| d.border_b_1())
-                        .when(!tiling.left, |d| d.border_l_1())
-                        .when(!tiling.right, |d| d.border_r_1());
-                    round(d).when(floating, |d| {
-                        let shadow = |y: f32, blur: f32, a: f32| {
-                            BoxShadow::new(px(0.), px(y), Hsla { h: 0., s: 0., l: 0., a })
-                                .blur_radius(px(blur))
-                        };
-                        d.shadow(vec![shadow(1., 2., 0.14), shadow(3., 8., 0.10), shadow(6., 14., 0.07)])
-                    })
-                })
-                .child(round(content)),
-        )
+        aux_window::shell(content, metrics)
     }
 }
 
@@ -427,25 +364,12 @@ pub fn open(
     let (x, y, w, h) = clamp_bounds(remembered, work_tuple);
     cx.open_window(
         WindowOptions {
-            app_id: Some("cc.pimenov.strop".to_owned()),
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: gpui::point(px(x), px(y)),
                 size: size(px(w), px(h)),
             })),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Keyboard map".into()),
-                ..Default::default()
-            }),
-            window_decorations: Some(WindowDecorations::Client),
-            is_resizable: false,
-            window_background: if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-                WindowBackgroundAppearance::Transparent
-            } else {
-                WindowBackgroundAppearance::Opaque
-            },
             display_id: display.as_ref().map(|display| display.id()),
-            focus: true,
-            ..Default::default()
+            ..aux_window::window_options("Keyboard map")
         },
         move |window, cx| {
             window.set_window_title("Keyboard map");

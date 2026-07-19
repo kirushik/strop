@@ -10192,20 +10192,32 @@ impl Editor {
     }
 
     fn show_about(&mut self, _: &crate::AboutStrop, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(reference) = self.about_window
-            && reference.update(cx, |_, reference_window, _| {
-                reference_window.activate_window()
-            }).is_ok()
-        {
-            return;
+        if let Some(reference) = self.about_window {
+            if reference.update(cx, |_, reference_window, _| {
+                match crate::about::toggle_decision(true) {
+                    crate::about::ToggleDecision::CloseAndRestore => {
+                        reference_window.remove_window();
+                    }
+                    crate::about::ToggleDecision::Open => unreachable!(),
+                }
+            }).is_ok() {
+                self.about_closed();
+                window.activate_window();
+                window.focus(&self.focus_handle, cx);
+                return;
+            }
+            self.about_window = None;
         }
-        self.about_window = None;
         self.about_window = crate::about::open(
-            window.window_handle().into(), window.bounds(), cx);
+            cx.entity(), window.window_handle().into(), window.bounds(), cx);
     }
 
     pub(crate) fn keymap_closed(&mut self) {
         self.keymap_window = None;
+    }
+
+    pub(crate) fn about_closed(&mut self) {
+        self.about_window = None;
     }
 
     fn open_welcome(&mut self, _: &OpenWelcome, _: &mut Window, cx: &mut Context<Self>) {
