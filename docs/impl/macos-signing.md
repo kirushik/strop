@@ -34,12 +34,25 @@ PKCS#12:
 
 ```bash
 openssl x509 -inform DER -in developerID.cer -out developerID.pem
-openssl pkcs12 -export -name "Developer ID Application" \
+openssl pkcs12 -export -legacy -name "Developer ID Application" \
   -inkey developerID.key -in developerID.pem \
   -out developerID.p12 -passout pass:CHOOSE_A_STRONG_PASSWORD
 
 base64 -w0 developerID.p12   # → paste as the MACOS_CERT_P12 secret
 ```
+
+**`-legacy` is load-bearing.** OpenSSL 3.x defaults to modern PKCS#12
+algorithms (PBES2/AES key wrap, SHA-256 MAC) that Apple's `security import`
+cannot parse — the failure reads `MAC verification failed during PKCS12
+import (wrong password?)`, which sends you chasing a password typo that
+isn't there (observed on the first 0.3.0 rehearsal, 2026-07-21). `-legacy`
+selects the RC2/3DES + SHA-1 shapes macOS accepts; the reduced cipher
+strength only guards the file in transit to the secret store, so it costs
+nothing real. The flag exists only in OpenSSL 3.x — OpenSSL 1.1.x and
+LibreSSL reject it as an unknown option, and don't need it: their defaults
+already emit these shapes, so there just drop `-legacy`. The version-proof
+explicit spelling (also the fix for an OpenSSL 3 built without the legacy
+provider) is `-certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1`.
 
 - `MACOS_CERT_P12` = the base64 blob above.
 - `MACOS_CERT_P12_PASSWORD` = the password you chose.

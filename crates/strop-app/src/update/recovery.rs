@@ -27,11 +27,6 @@ pub fn classify(phase: Phase, seen: Observed) -> Action {
     }
 }
 
-pub fn observe(current: &std::path::Path, staged: &std::path::Path,
-    previous: &std::path::Path) -> Observed {
-    Observed { current: current.exists(), staged: staged.exists(), previous: previous.exists() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

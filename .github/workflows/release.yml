@@ -19,8 +19,8 @@ jobs:
         with: { key: release-linux }
       - name: install pinned packagers
         run: |
-          cargo install cargo-deb --version 3.6.1 --locked
-          cargo install cargo-generate-rpm --version 0.19.1 --locked
+          cargo install cargo-deb --version 3.7.0 --locked
+          cargo install cargo-generate-rpm --version 0.21.0 --locked
       - name: stage 1 — build channels and construct final Linux payloads
         shell: bash
         run: |
