@@ -53,7 +53,12 @@ jobs:
         env:
           P12: ${{ secrets.MACOS_CERT_P12 }}
           PASSWORD: ${{ secrets.MACOS_CERT_P12_PASSWORD }}
+          NOTARY_COMPLETE: ${{ secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_KEY_ISSUER != '' }}
         run: |
+          # Signing enabled means notarization too — a Developer-ID-signed but
+          # unnotarized app is rejected by Gatekeeper, so an incomplete secret
+          # set must fail here, before the build, not silently skip stapling.
+          [[ "$NOTARY_COMPLETE" == "true" ]] || { echo "MACOS_SIGNING_ENABLED is true but APPLE_API_KEY / _KEY_ID / _KEY_ISSUER are incomplete" >&2; exit 1; }
           echo "$P12" | base64 --decode > cert.p12
           security create-keychain -p ci build.keychain
           security import cert.p12 -k build.keychain -P "$PASSWORD" -T /usr/bin/codesign

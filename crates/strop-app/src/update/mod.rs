@@ -341,14 +341,49 @@ fn recover_if_needed() -> Result<(), String> {
         match action {
             recovery::Action::RestorePrevious => self_replace::self_replace(previous).map_err(|e| e.to_string())?,
             recovery::Action::Finish | recovery::Action::DiscardStaged => storage::clear_journal()?,
+            recovery::Action::ResumeSwap => {
+                // Prepared spans three crash positions; whether the swap
+                // already happened is decided by content, not guesswork —
+                // the staged artifact IS the executable we would become.
+                let Some((artifact, ready, _)) = storage::find_ready()? else {
+                    return Err("recovery expected a staged update".into());
+                };
+                let swapped = storage::verify_ready(&current, &ready).is_ok();
+                if swapped {
+                    // The swap completed but its journal record didn't:
+                    // finish the interrupted bookkeeping. The binary on disk
+                    // is already the new version — consume the stage, or the
+                    // next launch re-applies it and copies the NEW executable
+                    // over strop-prev.exe, destroying the rollback.
+                    rewrite_display_version(&journal.to);
+                    let mut state = storage::load_state();
+                    state.applied_from = Some(journal.from); state.applied_to = Some(journal.to);
+                    state.applied_notes_url = Some(journal.notes_url); storage::save_state(&state)?;
+                    storage::remove_stage_for(&artifact)?;
+                }
+                // Otherwise the swap never happened: current is still the old
+                // binary, so clearing the journal and letting the normal
+                // startup path re-verify and re-apply from scratch is correct
+                // (re-copying old-current to strop-prev.exe loses nothing).
+                storage::clear_journal()?;
+            }
             recovery::Action::RespawnCurrent => {
+                // The journal proves the previous binary was saved, but the
+                // stage must still be consumed here — same rollback-erasing
+                // re-apply as ResumeSwap otherwise — and the display version
+                // rewritten (the crash may have preceded it).
+                rewrite_display_version(&journal.to);
                 let mut state = storage::load_state();
                 state.applied_from = Some(journal.from); state.applied_to = Some(journal.to);
                 state.applied_notes_url = Some(journal.notes_url); storage::save_state(&state)?;
+                if let Some((artifact, _, _)) = storage::find_ready()? {
+                    storage::remove_stage_for(&artifact)?;
+                }
                 storage::clear_journal()?;
             }
             recovery::Action::Fail => return Err("update recovery found no valid executable".into()),
-            _ => storage::clear_journal()?,
+            // Mac-shaped action; Windows never journals the Swapped phase.
+            recovery::Action::SavePrevious => storage::clear_journal()?,
         }
     }
     #[cfg(target_os = "macos")]

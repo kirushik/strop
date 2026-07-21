@@ -7,7 +7,7 @@
 //! own voice corpus, and (eventually) sync.
 
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -381,11 +381,25 @@ fn durable_backup(
         backup_file,
         kind: kind.into(),
     };
+    // A crash mid-append can leave a partial record with no trailing
+    // newline; appending straight after it would weld the new record onto
+    // the malformed tail and lose both. Start on a fresh line instead —
+    // readers already skip the one torn line.
+    let torn_tail = fs::metadata(&ledger_path).is_ok_and(|m| m.len() > 0) && {
+        let mut reader = fs::File::open(&ledger_path)?;
+        reader.seek(io::SeekFrom::End(-1))?;
+        let mut tail = [0u8; 1];
+        reader.read_exact(&mut tail)?;
+        tail[0] != b'\n'
+    };
     let mut ledger = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&ledger_path)?;
     backup_boundary("ledger-append")?;
+    if torn_tail {
+        ledger.write_all(b"\n")?;
+    }
     serde_json::to_writer(&mut ledger, &entry).map_err(io::Error::other)?;
     ledger.write_all(b"\n")?;
     backup_boundary("ledger-fsync")?;
@@ -1973,6 +1987,35 @@ mod tests {
             }));
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn torn_ledger_tail_cannot_swallow_the_next_record() {
+        let root = temp_path("torn-ledger-tail");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("draft.strop");
+        let backups = root.join("backups");
+        let pristine = schema_zero_bytes("survives a torn tail");
+        fs::write(&path, &pristine).unwrap();
+        // A crash mid-append leaves a partial record with no newline — the
+        // next append must start on a fresh line, not weld onto the wreck.
+        fs::create_dir_all(&backups).unwrap();
+        fs::write(
+            backups.join("ledger.jsonl"),
+            br#"{"when":"2026-07-21T00:00:00Z","source_"#,
+        )
+        .unwrap();
+        let (_store, loaded) =
+            Store::open_with_backup_destination(&path, Some(&backups)).unwrap();
+        assert_eq!(loaded.unwrap().text, "survives a torn tail");
+        let hash = blake3::hash(&pristine).to_hex().to_string();
+        let ledger = fs::read_to_string(backups.join("ledger.jsonl")).unwrap();
+        assert!(ledger.lines().any(|line| {
+            serde_json::from_str::<BackupLedgerEntry>(line)
+                .is_ok_and(|entry| entry.blake3 == hash && entry.kind == "pre-migration")
+        }));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

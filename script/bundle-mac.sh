@@ -72,6 +72,11 @@ if [[ $(uname -s) == Darwin ]]; then
     xcrun stapler validate "$app"
     rm -rf "$out/dmg-root/$name.app"
     cp -R "$app" "$out/dmg-root/"
+  elif [[ -n ${MACOS_SIGN_IDENTITY:-} ]]; then
+    # A Developer-ID-signed but unnotarized app is never a shippable state:
+    # Gatekeeper rejects it while the green job would claim acceptance.
+    echo "signing identity is present but notarization credentials are incomplete" >&2
+    exit 1
   fi
   hdiutil create -quiet -format UDZO -srcfolder "$out/dmg-root" \
     "$out/strop-$version-aarch64-apple-darwin.dmg"
