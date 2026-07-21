@@ -16,6 +16,8 @@
 #![recursion_limit = "256"]
 
 mod ai_log;
+mod about;
+mod aux_window;
 mod bookpage;
 mod commands;
 mod config;
@@ -33,6 +35,7 @@ mod startup_error;
 mod text_field;
 mod theme;
 mod tutorial;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,7 +50,7 @@ use strop_core::document::{BlockMap, SpanSet};
 use draw_guard::EntityUpdateExt as _;
 use editor::Editor;
 
-actions!(strop, [Quit]);
+actions!(strop, [Quit, AboutStrop]);
 
 fn register_unhandled_quit(
     cx: &mut App,
@@ -161,6 +164,13 @@ fn open_target(doc_path: &Path) -> (PathBuf, bool) {
 }
 
 fn main() {
+    // Before anything — before arguments are read and before any
+    // single-instance socket can exist: if a verified update is staged,
+    // this swaps binaries and re-execs (docs/releasing.md §4). The
+    // rendezvous below must only ever be performed by the binary that
+    // will actually run.
+    update::startup_apply_if_staged();
+
     // gpui_platform::application() replaced gpui::Application::new() after
     // the facade/platform crate split. The asset source feeds gpui's svg()
     // pipeline the embedded icon plate (docs/iconography.md).
@@ -284,7 +294,10 @@ fn main() {
                         Err(e) => eprintln!("strop: single-instance check failed: {e}"),
                     }
                 }
-                match Store::open(&store_path) {
+                match Store::open_with_backup_destination(
+                    &store_path,
+                    Some(&paths::migration_backups_dir()),
+                ) {
                     Ok((_, None)) if require_existing => {
                         let e = std::io::Error::from(std::io::ErrorKind::NotFound);
                         drop(instance_guard.take());
@@ -422,7 +435,7 @@ fn main() {
         };
         let window = cx.open_window(
             WindowOptions {
-                app_id: Some("strop".to_owned()),
+                app_id: Some("cc.pimenov.strop".to_owned()),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.clone().into()),
@@ -475,6 +488,9 @@ fn main() {
                 let editor = cx.new(|cx| {
                     let mut editor = Editor::new(cx, &initial_text, initial_spans, initial_blocks);
                     editor.config = config::load();
+                    // The first window is up: start the update checks (§4/§5
+                    // — launch + every 8 h; channel- and config-gated inside).
+                    update::spawn_checks(&editor.config);
                     editor.load_voice_corpus();
                     if let Some(history) = initial_history {
                         editor.restore_history(history);
@@ -546,6 +562,11 @@ fn main() {
         let editor = window
             .update(cx, |_, _, cx| cx.entity())
             .expect("window just opened");
+        // AboutStrop is handled in the editor's render tree (the
+        // ShowShortcuts shape; editor.rs show_about) — window dispatch
+        // never reaches app-level on_action handlers in the real runtime,
+        // a fact this file once assumed the other way. The editor owns
+        // the one about-window slot.
         let window_for_quit = window;
         cx.on_app_quit(move |cx| {
             // Finding 7 / LAW 2: an open transient field must not lose its

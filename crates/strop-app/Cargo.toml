@@ -33,6 +33,15 @@ toml_edit = { workspace = true }
 glob = { workspace = true }
 interprocess = "2.4.2"
 
+# Self-update (docs/releasing.md §4): minisign-verify checks the signed
+# manifest against the baked key list; semver enforces the downgrade gate;
+# fs4 is the installation-wide advisory update lock (the per-document
+# rendezvous socket deliberately provides no swap exclusion).
+minisign-verify = "0.2"
+semver = { workspace = true }
+fs4 = "0.13"
+ureq = { workspace = true }
+
 # XDG document-portal resolution (files.rs) exists only where the portal
 # does. ashpd's zbus stack does not even compile on Windows (std::os::fd),
 # and macOS was paying to build a D-Bus client it could never speak to —
@@ -41,7 +50,47 @@ interprocess = "2.4.2"
 ashpd = { version = "0.13.11", default-features = false,
     features = ["async-io", "documents"] }
 
+# The Windows swap dance: a running exe can be renamed but not unlinked;
+# self-replace owns that ritual (docs/releasing.md §4 "Apply").
+[target.'cfg(windows)'.dependencies]
+self-replace = "1"
+windows-sys = { workspace = true }
+
 [dev-dependencies]
+# Test-only minisign *signing* — production only ever verifies.
+minisign = "0.7"
 gpui = { workspace = true, features = ["test-support"] }
 ttf-parser = "0.25"
 proptest = "1"
+
+[build-dependencies]
+embed-resource = "3"
+
+[package.metadata.deb]
+maintainer = "Kirill Pimenov <kirushik@gmail.com>"
+depends = "$auto"
+assets = [
+    ["target/release/strop", "usr/bin/", "755"],
+    ["../../COPYING", "usr/share/doc/strop/COPYING", "644"],
+    ["../../NOTICE", "usr/share/doc/strop/NOTICE", "644"],
+    ["../../packaging/linux/cc.pimenov.strop.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/cc.pimenov.strop.mime.xml", "usr/share/mime/packages/", "644"],
+    ["../../packaging/linux/cc.pimenov.strop.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../packaging/generated/hicolor", "usr/share/icons/hicolor/", "644"],
+]
+
+[package.metadata.generate-rpm]
+post_install_script = "../../packaging/linux/rpm-post.sh"
+post_uninstall_script = "../../packaging/linux/rpm-post.sh"
+assets = [
+    { source = "target/release/strop", dest = "/usr/bin/strop", mode = "755" },
+    { source = "../../COPYING", dest = "/usr/share/doc/strop/COPYING", mode = "644" },
+    { source = "../../NOTICE", dest = "/usr/share/doc/strop/NOTICE", mode = "644" },
+    { source = "../../packaging/linux/cc.pimenov.strop.desktop", dest = "/usr/share/applications/cc.pimenov.strop.desktop", mode = "644" },
+    { source = "../../packaging/linux/cc.pimenov.strop.mime.xml", dest = "/usr/share/mime/packages/cc.pimenov.strop.xml", mode = "644" },
+    { source = "../../packaging/linux/cc.pimenov.strop.metainfo.xml", dest = "/usr/share/metainfo/cc.pimenov.strop.metainfo.xml", mode = "644" },
+    { source = "../../packaging/generated/hicolor/**/*", dest = "/usr/share/icons/hicolor/", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+shared-mime-info = "*"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Strop
+Exec=strop %F
+Icon=cc.pimenov.strop
+MimeType=application/x-strop;
+Categories=Office;WordProcessor;
+StartupWMClass=cc.pimenov.strop
+Terminal=false

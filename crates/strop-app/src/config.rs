@@ -25,6 +25,23 @@ pub struct Config {
     pub reduce_motion: bool,
     pub ai: AiConfig,
     pub voice: VoiceConfig,
+    pub update: UpdateConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// `false` kills even the version check — the GitHub fetch is the only
+    /// network call Strop ever makes unprompted, and it is disable-able
+    /// (docs/releasing.md §4). Applies only to channels that update or
+    /// notify at all; store-managed builds ignore it.
+    pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

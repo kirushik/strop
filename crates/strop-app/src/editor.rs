@@ -884,6 +884,7 @@ pub fn bind_keys(cx: &mut App) {
             .expect("bad chord in command registry"),
         )
     }));
+    cx.bind_keys(crate::aux_window::bindings());
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, ctx),
         // GTK binds this too, "to help with mis-typing" during shift-selection.
@@ -942,7 +943,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-2", Heading2, ctx),
         KeyBinding::new("ctrl-alt-3", Heading3, ctx),
         KeyBinding::new("escape", EscapeMode, ctx),
-        KeyBinding::new("escape", EscapeMode, Some("Keymap")),
         KeyBinding::new("escape", EscapeMode, Some("QuitGuard")),
         // GNOME's menu key opens the palette — it IS the menu.
         KeyBinding::new("f10", TogglePalette, ctx),
@@ -1441,6 +1441,12 @@ struct DropAnchor {
     revision: u64,
 }
 
+#[derive(Clone, Copy)]
+enum AuxSlot {
+    Keymap,
+    About,
+}
+
 pub struct Editor {
     focus_handle: FocusHandle,
     /// The raised flank's own keyboard focus (A1, the ctrl-. deliberate path):
@@ -1682,6 +1688,9 @@ pub struct Editor {
     doc_rename_error: Option<&'static str>,
     /// The one modeless keyboard-reference window (impl/18, ctrl-?).
     keymap_window: Option<gpui::WindowHandle<crate::keymap_window::KeymapWindow>>,
+    /// The one modeless colophon window, owned beside the keyboard map so
+    /// palette dispatch stays in the editor window's action tree.
+    about_window: Option<gpui::WindowHandle<crate::about::AboutWindow>>,
     /// The AI settings panel (DESIGN §2-ai, F4): form + async test +
     /// /models picker; saves write through toml_edit.
     ai_settings: Option<AiSettings>,
@@ -2564,6 +2573,7 @@ impl Editor {
             doc_rename_input: None,
             doc_rename_error: None,
             keymap_window: None,
+            about_window: None,
             ai_settings: None,
             ai_settings_generation: 0,
             replace_input: None,
@@ -2879,7 +2889,10 @@ impl Editor {
                     Some("md") => std::fs::read_to_string(&path)
                         .ok()
                         .map(|md| strop_core::markdown::from_markdown(&md).0),
-                    Some("strop") => Store::open(&path)
+                    Some("strop") => Store::open_with_backup_destination(
+                        &path,
+                        Some(&crate::paths::migration_backups_dir()),
+                    )
                         .ok()
                         .and_then(|(_, loaded)| loaded.map(|l| l.text)),
                     _ => std::fs::read_to_string(&path).ok(),
@@ -10184,8 +10197,40 @@ impl Editor {
         }
     }
 
+    fn show_about(&mut self, _: &crate::AboutStrop, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reference) = self.about_window {
+            if reference.update(cx, |_, reference_window, _| {
+                match crate::about::toggle_decision(true) {
+                    crate::about::ToggleDecision::CloseAndRestore => {
+                        reference_window.remove_window();
+                    }
+                    crate::about::ToggleDecision::Open => unreachable!(),
+                }
+            }).is_ok() {
+                self.about_closed();
+                window.activate_window();
+                window.focus(&self.focus_handle, cx);
+                return;
+            }
+            self.about_window = None;
+        }
+        self.about_window = crate::about::open(
+            cx.entity(), window.window_handle(), window.bounds(), cx);
+    }
+
     pub(crate) fn keymap_closed(&mut self) {
-        self.keymap_window = None;
+        self.aux_closed(AuxSlot::Keymap);
+    }
+
+    pub(crate) fn about_closed(&mut self) {
+        self.aux_closed(AuxSlot::About);
+    }
+
+    fn aux_closed(&mut self, slot: AuxSlot) {
+        match slot {
+            AuxSlot::Keymap => self.keymap_window = None,
+            AuxSlot::About => self.about_window = None,
+        }
     }
 
     fn open_welcome(&mut self, _: &OpenWelcome, _: &mut Window, cx: &mut Context<Self>) {
@@ -22737,6 +22782,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::set_session_goal))
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::show_shortcuts))
+            .on_action(cx.listener(Self::show_about))
             .on_action(cx.listener(Self::open_welcome))
             .on_action(cx.listener(Self::read_it_cold))
             .on_action(cx.listener(Self::request_quit))
@@ -22868,6 +22914,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::test_ai_connection))
                     .on_action(cx.listener(Self::cancel_ai_run))
                     .on_action(cx.listener(Self::show_shortcuts))
+                    .on_action(cx.listener(Self::show_about))
                     .on_action(cx.listener(Self::open_welcome))
                     .on_action(cx.listener(Self::read_it_cold))
                     .on_action(cx.listener(Self::scraps_travel))
@@ -27687,6 +27734,28 @@ mod tests {
             image_asset_ids: Vec::new(),
         }).unwrap();
         ClipboardItem::new_string_with_metadata(text.into(), metadata)
+    }
+
+    #[test]
+    fn about_palette_entry_opens_the_colophon_through_the_editor_window() {
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window(|window, cx| {
+            let editor = Editor::new(
+                cx, "test", SpanSet::default(), BlockMap::default());
+            window.focus(&editor.focus_handle, cx);
+            editor
+        });
+
+        window.update(|editor, window, cx| {
+            let rows = editor.omni_rows(">About Strop");
+            let ix = rows.iter().position(|row| matches!(row,
+                OmniRow::Cmd(cmd) if cmd.label == "About Strop"))
+                .expect("About Strop must be a palette row");
+            editor.execute_palette_entry(">About Strop", ix, window, cx);
+        });
+
+        assert!(window.read(|editor, _| editor.about_window.is_some()),
+            "the real palette dispatch path must open the About window");
     }
 
     #[test]

@@ -1,0 +1,23 @@
+# cargo-about config (docs/releasing.md §8): the About window's
+# third-party attribution document is generated from this. CI keeps the
+# committed output fresh; regenerate with
+#   cargo about generate about.hbs -o assets/third-party-licenses.txt
+accepted = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "OFL-1.1",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "0BSD",
+    "bzip2-1.0.6",
+]
