@@ -20,6 +20,10 @@ This document is alive — edit anything. It is a real file in your documents fo
 
 Select a word and try `ctrl-b` bold, `ctrl-i` italic, `ctrl-shift-h` highlight. Headings are `ctrl-1`–`3`, and `ctrl-shift-o` opens an outline of them on the left — click one to jump. The typograph quietly sets quotes, dashes and spaces as you type — «так», “so”, 1941—1945 — and a single undo always returns exactly what you typed.
 
+## Pictures
+
+Paste or drop a picture and it settles in as furniture: it keeps a caption — its own line of text — survives any amount of editing around it, and lives inside the `.strop` file, so one file still carries everything.
+
 ## The margin
 
 The cards on the right are the point of this editor — and an editorial pass wrote the two diagnoses in this section, the same kind you can run on your own words in a minute. Each one names a problem and asks a question; deciding is your job, and a dismissed card never comes back. There is two of them anchored here, so you can feel how a diagnosis reads before you run one.
@@ -30,13 +34,21 @@ To run your own: press `ctrl-shift-d`, or click the little card in the title bar
 
 Writing and editing are different jobs, and doing both at once is how sentences die — the inner editor strangles a line before it is fully born. So Strop keeps a door between them. While you draft, press `ctrl-shift-r` to close it: the margin goes quiet and its cards rest behind a thin rail (nothing is lost — one click on the rail, or `ctrl-shift-r` again, brings them back). When you are ready to read with an editor's eye, open the door; running a pass opens it for you. Your own notes never hide — the door quiets the editor, not you.
 
+## Scraps
+
+Not everything belongs in the manuscript yet. `ctrl-shift-a` sets the selected passage aside — parked on the compost rail, out of the text but in reach. A paragraph you cut outright lands in the graveyard at the document's foot, one “Put back” from returning whole. Deleting is safe here; that is the point.
+
 ## Rewind
 
-Every keystroke is kept, across sessions — `ctrl-z` works after a restart. Try it: delete this whole paragraph — really, all of it — then press `ctrl-alt-h` and step back through versions to bring it home, or just `ctrl-z`. Nothing in Strop can be lost. Restoring is itself undoable, and `ctrl-alt-s` names a checkpoint; this document already has one — open history and look.
+Every keystroke is kept, across sessions — `ctrl-z` works after a restart. Try it: delete this whole paragraph — really, all of it — then press `ctrl-alt-h` and step back through versions to bring it home, or just `ctrl-z`. The strip in the history panel is the whole past as a seek bar — scrub it and watch the draft reassemble. Nothing in Strop can be lost: restoring is itself undoable, and `ctrl-alt-s` names a checkpoint; this document already has one — open history and look.
+
+## Read it cold
+
+When the draft wants distance, `ctrl-shift-l` lays it out as a book — justified, hyphenated, paged, no caret anywhere. Read it like a stranger and file reactions in the margin as you go; the same chord returns you to the desk.
 
 ## Files
 
-Documents are real files in ~/Documents/Strop — `ctrl-n` new, `ctrl-o` open, `ctrl-shift-e` exports Markdown next to the file. Work saves continuously; there is no Save.
+Documents are real files in ~/Documents/Strop — `ctrl-n` new, `ctrl-o` open, `ctrl-shift-e` exports Markdown next to the file. Work saves continuously; there is no Save. Strop looks after itself the same way: updates arrive quietly and apply on the next launch, and “About Strop” in the palette always says what you're running.
 
 ## When you're done today
 
