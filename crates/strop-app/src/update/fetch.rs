@@ -3,6 +3,11 @@ use std::io::Read;
 
 pub const LATEST_URL: &str =
     "https://github.com/kirushik/strop/releases/latest/download/latest.json";
+/// The canonical over-budget error. check_cycle matches on it to tell "the
+/// published bytes are bigger than the signed manifest declares" (a
+/// publisher defect worth memoizing) apart from transient network failures
+/// (which must stay retryable).
+pub const OVERSIZE: &str = "update response exceeds size limit";
 const HOSTS: &[&str] = &["github.com", "objects.githubusercontent.com",
     "release-assets.githubusercontent.com"];
 
@@ -33,7 +38,7 @@ impl Fetcher for NetworkFetcher {
         if !(300..400).contains(&status) {
             response.into_body().as_reader().take(limit + 1).read_to_end(&mut body)
                 .map_err(|e| format!("update response read failed: {e}"))?;
-            if body.len() as u64 > limit { return Err("update response exceeds size limit".into()); }
+            if body.len() as u64 > limit { return Err(OVERSIZE.into()); }
         }
         Ok(Response { status, headers, body })
     }
@@ -50,7 +55,7 @@ pub fn fetch_following(fetcher: &dyn Fetcher, initial: &str, limit: u64) -> Resu
         validate_url(&url)?;
         let response = fetcher.get(&url, remaining)?;
         if response.body.len() as u64 > remaining {
-            return Err("update response exceeds size limit".into());
+            return Err(OVERSIZE.into());
         }
         remaining -= response.body.len() as u64;
         if (300..400).contains(&response.status) {
@@ -122,11 +127,15 @@ mod tests {
             ("https://objects.githubusercontent.com/mid".into(), response(200, None, b"payload")),
         ]) };
         assert_eq!(fetch_following(&fetcher, "https://github.com/start", 7).unwrap(), b"payload");
-        // And a body over the whole budget is refused even with no redirects.
+        // And a body over the whole budget is refused even with no
+        // redirects — with the CANONICAL error, which check_cycle matches
+        // to memoize publisher-defect releases; any other wording would
+        // silently turn the memo off for this class.
         let fetcher = Scripted { responses: Mutex::new(vec![
             ("https://github.com/start".into(), response(200, None, b"12345678901")),
         ]) };
-        assert!(fetch_following(&fetcher, "https://github.com/start", 10).is_err());
+        assert_eq!(fetch_following(&fetcher, "https://github.com/start", 10),
+            Err(OVERSIZE.into()));
     }
 
     #[test]

@@ -235,7 +235,20 @@ fn check_cycle(fetcher: &dyn fetch::Fetcher) {
         }
         // The fetch budget is the size the SIGNED manifest declares, not the
         // global ceiling — a 5 MiB update can never cost 256 MiB.
-        let artifact = fetch::fetch_following(fetcher, &target.url, target.size)?;
+        let artifact = match fetch::fetch_following(fetcher, &target.url, target.size) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                // Bytes past the declared size are the publisher's defect,
+                // not the network's: memoize like a sha mismatch, or this
+                // broken-release class re-downloads its cap every cycle.
+                if reason == fetch::OVERSIZE {
+                    let mut state = storage::load_state();
+                    state.failed_target_sha = Some(target.sha256.clone());
+                    let _ = storage::save_state(&state);
+                }
+                return Err(reason);
+            }
+        };
         let (hash, size) = sha256::reader(&artifact[..]).map_err(|e| e.to_string())?;
         if size != target.size || !hash.eq_ignore_ascii_case(&target.sha256) {
             let mut state = storage::load_state();
