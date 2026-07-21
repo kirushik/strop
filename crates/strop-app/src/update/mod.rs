@@ -215,14 +215,13 @@ fn check_cycle(fetcher: &dyn fetch::Fetcher) {
         // Already staged and intact? Spend zero bytes — a healthy client
         // that hasn't relaunched yet must not re-download the artifact
         // every cycle until it does.
-        if let Some((staged_artifact, ready, _)) = storage::find_ready().ok().flatten() {
-            if ready.version == version.to_string()
-                && ready.sha256.eq_ignore_ascii_case(&target.sha256)
-                && storage::verify_ready(&staged_artifact, &ready).is_ok()
-            {
-                set_status(UpdateState::Staged { version: version.to_string() });
-                return Ok(());
-            }
+        if let Some((staged_artifact, ready, _)) = storage::find_ready().ok().flatten()
+            && ready.version == version.to_string()
+            && ready.sha256.eq_ignore_ascii_case(&target.sha256)
+            && storage::verify_ready(&staged_artifact, &ready).is_ok()
+        {
+            set_status(UpdateState::Staged { version: version.to_string() });
+            return Ok(());
         }
         // The failure memo: a release whose bytes already failed
         // verification is never fetched again until the publisher ships
