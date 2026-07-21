@@ -23,7 +23,7 @@ semver = "1"
 similar = { version = "3", features = ["unicode"] }
 whatlang = "0.18"
 glob = "0.3"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry"] }
 
 # Pinned to a FORK of zed-industries/zed — github.com/kirushik/zed, branch
 # `wrap-trailing-punctuation` (tag `strop-0.3.0`), tip `8e2f596f`: the

@@ -367,7 +367,12 @@ fn copy_tree(source: &std::path::Path, destination: &std::path::Path) -> Result<
 #[cfg(windows)]
 fn rewrite_display_version(version: &str) {
     use windows_sys::Win32::System::Registry::*;
-    let path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Strop\0"
+    // Inno registers the uninstall entry under "{AppId}_is1" — the braced
+    // GUID must match packaging/windows/strop.iss AppId (which spells it
+    // {{...} per Inno's brace escaping). A portable/bare install has no
+    // such key and the open below fails silently, which is correct.
+    let path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\\
+                          {A2CD8091-B899-48DB-B96E-FEA4A18F256F}_is1\0"
         .encode_utf16().collect();
     let name: Vec<u16> = "DisplayVersion\0".encode_utf16().collect();
     let value: Vec<u16> = format!("{version}\0").encode_utf16().collect();
