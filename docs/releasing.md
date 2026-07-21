@@ -117,13 +117,31 @@ unsigned download is effectively locked for normal users.
   hook also signs the generated uninstaller. Two signing passes per release
   — the §12 DAG already orders it this way; with SignPath that's ideally
   one signing request covering both artifacts, or two approval clicks.
-- **Portable zip stays** for the portable-app crowd, and **portable builds
-  never self-update** (Sol F8): a self-replacing exe on a read-only or
-  removable location is a bug farm, and a portable app that rewrites itself
-  isn't portable. Distinct channel (`github-win-portable`), passive
-  About-notice only. It writes no registry keys — associations come with the
-  installer or by hand.
+- ~~**Portable zip stays** for the portable-app crowd~~ — **CUT 2026-07-21
+  (Kirill)**: the per-user installer already needs no admin rights, which
+  was the portable's whole justification; an extra download row is
+  choice-paralysis; and the passive-update portable would rot in the wild.
+  The bare exe remains ONLY as the updater payload. The
+  `github-win-portable` channel stays in the enum, inert, in case demand
+  materializes. (Sol F8's never-self-update rule still governs any
+  revival.)
 - x86_64 only, as today.
+
+### Runtime assets are part of every artifact (added 2026-07-21)
+
+Three runtime works load from disk by deliberate license posture —
+hyphenation dictionaries (LPPL), the URW Bookman faces
+(AGPL-3.0-with-exception), the paper tile — as loose, intact, independent
+files with their license/attribution texts beside them (mere aggregation;
+never `include_bytes!`). LAW: every install artifact ships this set, and
+`script/stage-runtime-assets.sh` is its single source of truth — a missing
+source file fails the build, never silently degrades an install. Locations:
+`assets/` beside the exe (Windows, Linux tarball),
+`/usr/share/strop/assets` (deb/rpm), `Contents/Resources/assets` (mac) —
+all on `paths::asset_file`'s search chain. The single-exe update payload
+cannot deliver NEW asset files; a release that adds one must accept
+graceful degradation for updated-not-reinstalled users or ship a fatter
+payload format — deferred (§13).
 
 ### Update payload contract (per channel)
 
@@ -739,6 +757,52 @@ final assets.
    publish. (There is no fleet before 0.3.0 — it is the first
    self-updating release.)
 
+### Pre-tag evidence bundle (added 2026-07-21, Sol robustness round)
+
+Before pushing any release tag, record in the release log: the exact SHA
+and its green `ci-success` check; the workspace Cargo version (must equal
+the tag, CI preflights it but the human checks first); the minisign key
+fingerprint; the pinned action SHAs in force; and the expected asset
+inventory. The tag itself is protected (`v*` requires the owner) and
+releases are **serialized** — one tag, one workflow attempt, one signer at
+a time; never process two version tags concurrently.
+
+### Recovery cards (added 2026-07-21 — what to do when phase N dies)
+
+- **Platform build fails** → fix on a branch, merge, delete the draft if
+  one was created, re-run by re-pushing the tag only if the tag still
+  points at the released SHA; otherwise re-cut a higher version. Never
+  build a release from a moved tag.
+- **Notarization times out / runner killed** → Apple keeps processing the
+  submission. Re-running the mac job uploads an identical bundle and gets
+  a fresh submission; that wastes a slot but is safe. Check
+  `notarytool history` (submission id is in the job log) before assuming
+  failure. Status `Invalid` → read the notary log printed by the job; fix;
+  re-cut.
+- **Draft creation fails after builds** → artifacts are still in the run;
+  re-run the draft job alone. A duplicate draft for the same tag must be
+  deleted before retrying (two drafts on one tag confuse `gh release`).
+- **Manifest job fails before upload** → re-run it; hashing is
+  deterministic over immutable draft bytes and `pub_date` derives from the
+  tag commit, so a re-run is byte-identical.
+- **Attestation fails after `latest.json` uploaded** → re-run the manifest
+  job; the upload is `--clobber` and byte-identical, attestation retries.
+- **`release-sign.sh` refuses** (inventory, hash, attestation, or TOCTOU
+  drift) → the draft is untouched; the error names the next step. A draft
+  is always safe to delete and re-cut.
+- **Publish succeeded but something is wrong** → never delete or
+  un-publish; supersede with a fixed higher version (§12.4). The canary
+  in the sign script is the last pre-announcement check.
+
+### The rc rehearsal (added 2026-07-21)
+
+Before the first real tag of a release generation, push a disposable
+`vX.Y.Z-rc.N` tag and walk the ENTIRE pipeline — draft, manifest,
+attestation, local sign — stopping before publish. Semver pre-release
+sorts below the release, so even a mistaken publish cannot pull a fleet
+forward. Delete the draft and the rc tag afterwards. 0.3.0's rc run doubles
+as the first live test of the tag path, which has otherwise never executed.
+
 ## §13 Open questions & unverified flags
 
 **Decided 2026-07-18 (all five):** §1 identity = `cc.pimenov.strop`; §3
@@ -801,3 +865,16 @@ overruled; fork's Wayland `app_id`-timing fix (§10).
   ignored, unbounded "Check now" concurrency, non-streaming hashing; fixed
   per the §4 traffic amendment above, plus a finding Sol missed: a staged
   client re-downloaded the full artifact every cycle until relaunch.
+- **2026-07-21, Sol (high effort), release-robustness round** after the
+  first two rehearsal runs each failed on something only a live run could
+  catch (phantom packager pins, OpenSSL-3 .p12, bare-directory deb asset,
+  notarytool's buffered silence). Two blockers: no package shipped the
+  disk-loaded runtime assets (→ the §2 law above + the staging script);
+  tag runs could silently ship unsigned mac builds (→ fail-closed tag
+  guard). Eight majors adopted: tag/Cargo version preflight, CI-success
+  gate on the tagged SHA, manifest idempotency + deterministic pub_date,
+  release-sign.sh inventory/attestation/TOCTOU/canary hardening,
+  notarization submission-id capture, action SHA-pinning, explicit
+  `--latest`, `%f` desktop fix. Process adoptions: pre-tag evidence
+  bundle, serialized releases + protected tags, recovery cards, the rc
+  rehearsal (all §12). Same round, Kirill: portable zip cut.
