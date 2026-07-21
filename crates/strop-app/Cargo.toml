@@ -77,6 +77,14 @@ assets = [
     ["../../packaging/linux/cc.pimenov.strop.mime.xml", "usr/share/mime/packages/", "644"],
     ["../../packaging/linux/cc.pimenov.strop.metainfo.xml", "usr/share/metainfo/", "644"],
     ["../../packaging/generated/hicolor/**/*", "usr/share/icons/hicolor/", "644"],
+    ["../../assets/fonts/coldread/URWBookman-Light.otf", "usr/share/strop/assets/fonts/coldread/URWBookman-Light.otf", "644"],
+    ["../../assets/fonts/coldread/URWBookman-LightItalic.otf", "usr/share/strop/assets/fonts/coldread/URWBookman-LightItalic.otf", "644"],
+    ["../../assets/fonts/coldread/URWBookman-Demi.otf", "usr/share/strop/assets/fonts/coldread/URWBookman-Demi.otf", "644"],
+    ["../../assets/fonts/coldread/LICENSE", "usr/share/strop/assets/fonts/coldread/LICENSE", "644"],
+    ["../../assets/hyphenation/en-us.standard.bincode", "usr/share/strop/assets/hyphenation/en-us.standard.bincode", "644"],
+    ["../../assets/hyphenation/ru.standard.bincode", "usr/share/strop/assets/hyphenation/ru.standard.bincode", "644"],
+    ["../../assets/hyphenation/ATTRIBUTION.txt", "usr/share/strop/assets/hyphenation/ATTRIBUTION.txt", "644"],
+    ["../../assets/paper-noise-256.png", "usr/share/strop/assets/paper-noise-256.png", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -90,6 +98,14 @@ assets = [
     { source = "../../packaging/linux/cc.pimenov.strop.mime.xml", dest = "/usr/share/mime/packages/cc.pimenov.strop.xml", mode = "644" },
     { source = "../../packaging/linux/cc.pimenov.strop.metainfo.xml", dest = "/usr/share/metainfo/cc.pimenov.strop.metainfo.xml", mode = "644" },
     { source = "../../packaging/generated/hicolor/**/*", dest = "/usr/share/icons/hicolor/", mode = "644" },
+    { source = "../../assets/fonts/coldread/URWBookman-Light.otf", dest = "/usr/share/strop/assets/fonts/coldread/URWBookman-Light.otf", mode = "644" },
+    { source = "../../assets/fonts/coldread/URWBookman-LightItalic.otf", dest = "/usr/share/strop/assets/fonts/coldread/URWBookman-LightItalic.otf", mode = "644" },
+    { source = "../../assets/fonts/coldread/URWBookman-Demi.otf", dest = "/usr/share/strop/assets/fonts/coldread/URWBookman-Demi.otf", mode = "644" },
+    { source = "../../assets/fonts/coldread/LICENSE", dest = "/usr/share/strop/assets/fonts/coldread/LICENSE", mode = "644" },
+    { source = "../../assets/hyphenation/en-us.standard.bincode", dest = "/usr/share/strop/assets/hyphenation/en-us.standard.bincode", mode = "644" },
+    { source = "../../assets/hyphenation/ru.standard.bincode", dest = "/usr/share/strop/assets/hyphenation/ru.standard.bincode", mode = "644" },
+    { source = "../../assets/hyphenation/ATTRIBUTION.txt", dest = "/usr/share/strop/assets/hyphenation/ATTRIBUTION.txt", mode = "644" },
+    { source = "../../assets/paper-noise-256.png", dest = "/usr/share/strop/assets/paper-noise-256.png", mode = "644" },
 ]
 
 [package.metadata.generate-rpm.requires]
