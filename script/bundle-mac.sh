@@ -15,6 +15,7 @@ contents="$app/Contents"
 mkdir -p "$contents/MacOS" "$contents/Resources"
 install -m 755 "$binary" "$contents/MacOS/strop"
 install -m 644 packaging/generated/strop.icns "$contents/Resources/strop.icns"
+script/stage-runtime-assets.sh "$contents/Resources/assets"
 cat > "$contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,10 +70,33 @@ if [[ $(uname -s) == Darwin ]]; then
     # extended review ~an hour; a wedge must not eat a six-hour runner).
     # Note the tool's stdout is pipe-buffered in CI: silence after codesign
     # means "waiting on Apple", not "hung before submit".
+    notary_result="$out/strop-$version-notary.json"
+    notary_rc=0
     xcrun notarytool submit "$out/strop-$version-notary.zip" --wait \
       --timeout 60m \
       --key "$keyfile" --key-id "$APPLE_API_KEY_ID" \
-      --issuer "$APPLE_API_ISSUER"
+      --issuer "$APPLE_API_ISSUER" --output-format json \
+      > "$notary_result" || notary_rc=$?
+    notary_id=$(plutil -extract id raw -o - "$notary_result" 2>/dev/null) || {
+      echo "notarytool did not return a submission id:" >&2
+      cat "$notary_result" >&2
+      exit 1
+    }
+    echo "notarytool submission id: $notary_id"
+    notary_status=$(plutil -extract status raw -o - "$notary_result" 2>/dev/null) || {
+      echo "notarytool did not return a submission status for $notary_id:" >&2
+      cat "$notary_result" >&2
+      exit 1
+    }
+    echo "notarytool submission status: $notary_status"
+    if [[ $notary_status != Accepted || $notary_rc -ne 0 ]]; then
+      xcrun notarytool log "$notary_id" \
+        --key "$keyfile" --key-id "$APPLE_API_KEY_ID" \
+        --issuer "$APPLE_API_ISSUER" || true
+      echo "notarization failed with status $notary_status" >&2
+      exit 1
+    fi
+    rm -f "$notary_result"
     xcrun stapler staple "$app"
     # The maintainer has no Mac; this runner is the verification machine.
     # A green job must mean Gatekeeper acceptance, not merely a completed

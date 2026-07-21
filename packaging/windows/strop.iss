@@ -27,6 +27,14 @@ ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
 Source: "{#MySource}"; DestDir: "{app}"; DestName: "strop.exe"; Flags: ignoreversion
+Source: "..\..\assets\fonts\coldread\URWBookman-Light.otf"; DestDir: "{app}\assets\fonts\coldread"; Flags: ignoreversion
+Source: "..\..\assets\fonts\coldread\URWBookman-LightItalic.otf"; DestDir: "{app}\assets\fonts\coldread"; Flags: ignoreversion
+Source: "..\..\assets\fonts\coldread\URWBookman-Demi.otf"; DestDir: "{app}\assets\fonts\coldread"; Flags: ignoreversion
+Source: "..\..\assets\fonts\coldread\LICENSE"; DestDir: "{app}\assets\fonts\coldread"; Flags: ignoreversion
+Source: "..\..\assets\hyphenation\en-us.standard.bincode"; DestDir: "{app}\assets\hyphenation"; Flags: ignoreversion
+Source: "..\..\assets\hyphenation\ru.standard.bincode"; DestDir: "{app}\assets\hyphenation"; Flags: ignoreversion
+Source: "..\..\assets\hyphenation\ATTRIBUTION.txt"; DestDir: "{app}\assets\hyphenation"; Flags: ignoreversion
+Source: "..\..\assets\paper-noise-256.png"; DestDir: "{app}\assets"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Strop"; Filename: "{app}\strop.exe"

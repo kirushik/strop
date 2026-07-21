@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Strop
-Exec=strop %F
+Exec=strop %f
 Icon=cc.pimenov.strop
 MimeType=application/x-strop;
 Categories=Office;WordProcessor;
