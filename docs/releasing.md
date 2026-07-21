@@ -130,10 +130,10 @@ unsigned download is effectively locked for normal users.
 ### Runtime assets are part of every artifact (added 2026-07-21)
 
 Three runtime works load from disk by deliberate license posture —
-hyphenation dictionaries (LPPL), the URW Bookman faces
-(AGPL-3.0-with-exception), the paper tile — as loose, intact, independent
-files with their license/attribution texts beside them (mere aggregation;
-never `include_bytes!`). LAW: every install artifact ships this set, and
+hyphenation dictionaries (LPPL, ATTRIBUTION.txt beside them), the URW
+Bookman faces (AGPL-3.0-with-exception, LICENSE beside them), and the
+first-party paper tile (no license text of its own to carry) — as loose,
+intact, independent files (mere aggregation; never `include_bytes!`). LAW: every install artifact ships this set, and
 `script/stage-runtime-assets.sh` is its single source of truth — a missing
 source file fails the build, never silently degrades an install. Locations:
 `assets/` beside the exe (Windows, Linux tarball),

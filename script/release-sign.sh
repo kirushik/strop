@@ -58,10 +58,10 @@ release_id=$(gh release view "$tag" --repo "$repo" --json databaseId,isDraft \
   --jq 'select(.isDraft == true) | .databaseId') || die "$tag is not a draft"
 [[ -n $release_id ]] || die "$tag is not a draft"
 
-# Exact stage 5/6 inventory derived from .github/workflows/release.yml.
-# The portable ZIP is deliberately absent by owner decision W-C. The branch
-# workflow still constructs/uploads it; its presence is therefore a fatal
-# workflow discrepancy, not part of the approved release inventory.
+# Exact stage 5/6 inventory derived from .github/workflows/release.yml —
+# keep the two in lockstep: an asset added there must be added here, and
+# anything the draft carries beyond this list (including the retired
+# Windows portable ZIP, cut 2026-07-21) is a fatal discrepancy.
 expected=(
   "strop-$version-x86_64-unknown-linux-gnu.tar.gz"
   "strop-app_${version}-1_amd64.deb"
@@ -86,7 +86,7 @@ printf '%s\n' "${expected[@]}" | sort > "$work/names.expected"
 grep -v -E '^latest\.json\.minisig2?$' "$work/names.actual" \
   | sort > "$work/names.base" || true
 if ! cmp -s "$work/names.expected" "$work/names.base"; then
-  echo "release-sign: exact inventory mismatch (portable ZIP is cut even though release.yml still uploads it):" >&2
+  echo "release-sign: exact inventory mismatch between the draft and the expected release.yml asset set:" >&2
   diff -u "$work/names.expected" "$work/names.base" >&2 || true
   die "missing, duplicate, or unexpected draft assets"
 fi
