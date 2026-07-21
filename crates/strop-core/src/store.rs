@@ -355,7 +355,7 @@ fn durable_backup(
             {
                 fs::File::open(&backup_path)?.sync_all()?;
                 fs::File::open(&ledger_path)?.sync_all()?;
-                fs::File::open(destination)?.sync_all()?;
+                fsync_dir(destination)?;
                 return Ok(backup_path);
             }
         }
@@ -405,8 +405,21 @@ fn durable_backup(
     backup_boundary("ledger-fsync")?;
     ledger.sync_all()?;
     backup_boundary("dir-fsync")?;
-    fs::File::open(destination)?.sync_all()?;
+    fsync_dir(destination)?;
     Ok(backup_path)
+}
+
+/// Directory fsync, the `atomic_write` convention: on Unix the directory
+/// entry must reach disk before a new file's existence is durable. Windows
+/// cannot open a directory as a file and NTFS exposes no equivalent — the
+/// file's own sync_all is the strongest guarantee available there, and a
+/// hard error here would block saving for every Windows user.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Opportunistic oplog compaction, at open. A long-lived file accretes
@@ -852,9 +865,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()?;
     drop(file);
     atomic_replace(&tmp, path)?;
-    #[cfg(unix)]
     if let Some(dir) = path.parent() {
-        fs::File::open(dir)?.sync_all()?;
+        fsync_dir(dir)?;
     }
     Ok(())
 }

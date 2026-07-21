@@ -58,6 +58,11 @@ if [[ $(uname -s) == Darwin ]]; then
     keyfile=$APPLE_API_KEY
     if [[ ! -f $keyfile ]]; then
       keyfile=$(mktemp "${TMPDIR:-/tmp}/asc_api_key.XXXXXX.p8")
+      # A long-lived notarization credential must not outlive the run —
+      # delete the materialized key on ANY exit (only when we created it;
+      # a user-supplied key file is theirs to keep).
+      trap 'if [[ -n ${asc_key_tmp:-} ]]; then rm -f "$asc_key_tmp"; fi' EXIT
+      asc_key_tmp=$keyfile
       printf '%s' "$APPLE_API_KEY" | base64 --decode > "$keyfile"
     fi
     xcrun notarytool submit "$out/strop-$version-notary.zip" --wait \
