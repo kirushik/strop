@@ -65,7 +65,9 @@ jobs:
           # dist/* would sweep its files into the draft and the signing
           # ritual's exact inventory would refuse the release.
           rm -rf dist/$n
-          tar -tzf dist/$n.tar.gz | grep -q "^$n/assets/fonts/coldread/URWBookman-Light.otf$" || { echo "tarball is missing assets/ beside the binary" >&2; exit 1; }
+          # Not grep -q: under pipefail an early-exit grep kills tar with a
+          # write error, failing the check precisely when the asset IS there.
+          tar -tzf dist/$n.tar.gz | grep "^$n/assets/fonts/coldread/URWBookman-Light.otf$" >/dev/null || { echo "tarball is missing assets/ beside the binary" >&2; exit 1; }
           STROP_DIST_CHANNEL=deb cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
           STROP_DIST_CHANNEL=deb cargo deb -p strop-app --profile dist --target x86_64-unknown-linux-gnu --no-build
           cp target/x86_64-unknown-linux-gnu/debian/*.deb dist/
