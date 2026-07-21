@@ -20,6 +20,13 @@ pub struct PersistentState {
     pub applied_from: Option<String>,
     pub applied_to: Option<String>,
     pub applied_notes_url: Option<String>,
+    /// Failure memo: the sha256 of a published artifact that already failed
+    /// download verification once. That release is never fetched again —
+    /// the memo only clears when the publisher ships different bytes, so a
+    /// broken release costs each client one download total, not one per
+    /// check cycle forever.
+    #[serde(default)]
+    pub failed_target_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

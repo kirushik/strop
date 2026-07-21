@@ -82,6 +82,7 @@ pub fn parse_and_validate(
     let target = manifest.targets.get(&key).cloned()
         .ok_or_else(|| format!("manifest has no target {key}"))?;
     if target.size > super::MAX_ARTIFACT_SIZE { return Err("update artifact exceeds size limit".into()); }
+    if target.size == 0 { return Err("update artifact declares no size".into()); }
     if target.sha256.len() != 64 || !target.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("target SHA-256 is malformed".into());
     }
@@ -194,6 +195,8 @@ mod tests {
             .next().unwrap()["sha256"] = json!("no"));
         refused(valid(), |v| v["targets"].as_object_mut().unwrap().values_mut()
             .next().unwrap()["size"] = json!(super::super::MAX_ARTIFACT_SIZE + 1));
+        refused(valid(), |v| v["targets"].as_object_mut().unwrap().values_mut()
+            .next().unwrap()["size"] = json!(0));
         refused(valid(), |v| v["targets"].as_object_mut().unwrap().values_mut()
             .next().unwrap()["url"] = json!("https://evil.example/strop"));
         let highest = Version::parse("0.4.0").unwrap();

@@ -28,18 +28,31 @@ impl Fetcher for NetworkFetcher {
             value.to_str().ok().map(|v| (name.as_str().to_ascii_lowercase(), v.to_owned()))
         }).collect();
         let mut body = Vec::new();
-        response.into_body().as_reader().take(limit + 1).read_to_end(&mut body)
-            .map_err(|e| format!("update response read failed: {e}"))?;
-        if body.len() as u64 > limit { return Err("update response exceeds size limit".into()); }
+        // A redirect's body is never wanted — only its Location header. Not
+        // reading it means a hop can't spend the transfer budget at all.
+        if !(300..400).contains(&status) {
+            response.into_body().as_reader().take(limit + 1).read_to_end(&mut body)
+                .map_err(|e| format!("update response read failed: {e}"))?;
+            if body.len() as u64 > limit { return Err("update response exceeds size limit".into()); }
+        }
         Ok(Response { status, headers, body })
     }
 }
 
 pub fn fetch_following(fetcher: &dyn Fetcher, initial: &str, limit: u64) -> Result<Vec<u8>, String> {
     let mut url = initial.to_owned();
+    // ONE cumulative byte budget for the whole redirect chain, enforced
+    // here regardless of what the fetcher returns — per-hop budgets would
+    // multiply the cap by the hop count. The caps must bound the *check*,
+    // not the request.
+    let mut remaining = limit;
     for _ in 0..=8 {
         validate_url(&url)?;
-        let response = fetcher.get(&url, limit)?;
+        let response = fetcher.get(&url, remaining)?;
+        if response.body.len() as u64 > remaining {
+            return Err("update response exceeds size limit".into());
+        }
+        remaining -= response.body.len() as u64;
         if (300..400).contains(&response.status) {
             let location = response.headers.get("location")
                 .ok_or_else(|| "redirect has no Location header".to_owned())?;
@@ -89,6 +102,31 @@ mod tests {
         assert!(validate_url("http://github.com/x").is_err());
         assert!(validate_url("https://github.com.evil/x").is_err());
         assert!(validate_url("https://github.com@evil/x").is_err());
+    }
+
+    #[test]
+    fn transfer_budget_is_cumulative_across_the_chain() {
+        // A hop that returns bytes spends the ONE budget; it never resets.
+        let fetcher = Scripted { responses: Mutex::new(vec![
+            ("https://github.com/start".into(), response(302,
+                Some("https://objects.githubusercontent.com/mid"), b"xxxxxxxx")),
+            ("https://objects.githubusercontent.com/mid".into(), response(200, None, b"payload")),
+        ]) };
+        // Budget 10: the rogue 8-byte redirect body leaves 2, so the
+        // 7-byte payload must be refused.
+        assert!(fetch_following(&fetcher, "https://github.com/start", 10).is_err());
+        // Empty redirect bodies (the honest case) spend nothing.
+        let fetcher = Scripted { responses: Mutex::new(vec![
+            ("https://github.com/start".into(), response(302,
+                Some("https://objects.githubusercontent.com/mid"), b"")),
+            ("https://objects.githubusercontent.com/mid".into(), response(200, None, b"payload")),
+        ]) };
+        assert_eq!(fetch_following(&fetcher, "https://github.com/start", 7).unwrap(), b"payload");
+        // And a body over the whole budget is refused even with no redirects.
+        let fetcher = Scripted { responses: Mutex::new(vec![
+            ("https://github.com/start".into(), response(200, None, b"12345678901")),
+        ]) };
+        assert!(fetch_following(&fetcher, "https://github.com/start", 10).is_err());
     }
 
     #[test]

@@ -192,8 +192,17 @@ jobs:
           gh release download "$GITHUB_REF_NAME" --dir assets
           win=strop-$ver-x86_64-pc-windows-msvc.exe
           mac=strop-$ver-aarch64-apple-darwin-app.tar.gz
+          # Deployed clients hard-refuse artifacts over 256 MiB and manifests
+          # over 1 MiB (MAX_ARTIFACT_SIZE / MANIFEST_LIMIT in update/mod.rs).
+          # A release that outgrows the caps would strand every installed
+          # client on its current version — fail the pipeline instead.
+          for f in "$win" "$mac"; do
+            size=$(stat -c %s "assets/$f")
+            (( size > 0 && size <= 256*1024*1024 )) || { echo "$f is $size bytes — outside the clients' (0, 256 MiB] cap" >&2; exit 1; }
+          done
           entry() { jq -n --arg url "https://github.com/kirushik/strop/releases/download/$GITHUB_REF_NAME/$1" --arg hash "$(sha256sum "assets/$1"|cut -d' ' -f1)" --argjson size "$(stat -c %s "assets/$1")" '{url:$url,sha256:$hash,size:$size}'; }
           jq -n --arg version "$ver" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg notes "https://github.com/kirushik/strop/releases/tag/$GITHUB_REF_NAME" --argjson win "$(entry "$win")" --argjson mac "$(entry "$mac")" '{product:"strop",updater_protocol:1,version:$version,pub_date:$date,notes_url:$notes,targets:{"github-win/x86_64-pc-windows-msvc/exe":$win,"github-mac/aarch64-apple-darwin/app-tar":$mac}}' > assets/latest.json
+          (( $(stat -c %s assets/latest.json) <= 1024*1024 )) || { echo "latest.json exceeds the clients' 1 MiB manifest cap" >&2; exit 1; }
           gh release upload "$GITHUB_REF_NAME" assets/latest.json
       - name: stage 7 — attest only immutable final payloads
         uses: actions/attest-build-provenance@v4

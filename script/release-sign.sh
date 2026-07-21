@@ -20,6 +20,14 @@ cp "$work/latest.json" "$work/latest.ci.json"
 win="strop-$version-x86_64-pc-windows-msvc.exe"
 mac="strop-$version-aarch64-apple-darwin-app.tar.gz"
 for asset in "$win" "$mac"; do [[ -f "$work/$asset" ]] || die "missing $asset"; done
+# Independent re-check of the clients' hard caps (update/mod.rs
+# MAX_ARTIFACT_SIZE / MANIFEST_LIMIT): an artifact outside them would strand
+# every installed client on its current version.
+for asset in "$win" "$mac"; do
+  size=$(stat -c %s "$work/$asset")
+  (( size > 0 && size <= 256*1024*1024 )) || die "$asset is $size bytes — outside the clients' (0, 256 MiB] cap"
+done
+(( $(stat -c %s "$work/latest.json") <= 1024*1024 )) || die "latest.json exceeds the clients' 1 MiB manifest cap"
 pub_date=$(jq -er '.pub_date' "$work/latest.ci.json") || die "pub_date is absent"
 notes="https://github.com/kirushik/strop/releases/tag/$tag"
 entry() {

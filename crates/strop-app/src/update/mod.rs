@@ -171,7 +171,18 @@ fn active_channel() -> bool {
     !manifest::baked_keys().is_empty() && (channel().self_updates() || channel().passive_notify())
 }
 
+/// Single-flight: one check/download cycle at a time, process-wide. The
+/// background loop and every "Check now" click share this gate — repeated
+/// clicks while checking must never stack concurrent 256 MiB downloads.
+static CHECK_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 fn check_cycle(fetcher: &dyn fetch::Fetcher) {
+    if CHECK_IN_FLIGHT.swap(true, Ordering::AcqRel) { return; }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) { CHECK_IN_FLIGHT.store(false, Ordering::Release); }
+    }
+    let _done = Done;
     set_status(UpdateState::Checking);
     let result = (|| {
         let bytes = fetch::fetch_following(fetcher, fetch::LATEST_URL, MANIFEST_LIMIT)?;
@@ -201,7 +212,37 @@ fn check_cycle(fetcher: &dyn fetch::Fetcher) {
             return Ok(());
         }
         set_status(UpdateState::Available { version: version.to_string() });
-        let artifact = fetch::fetch_following(fetcher, &target.url, MAX_ARTIFACT_SIZE)?;
+        // Already staged and intact? Spend zero bytes — a healthy client
+        // that hasn't relaunched yet must not re-download the artifact
+        // every cycle until it does.
+        if let Some((staged_artifact, ready, _)) = storage::find_ready().ok().flatten() {
+            if ready.version == version.to_string()
+                && ready.sha256.eq_ignore_ascii_case(&target.sha256)
+                && storage::verify_ready(&staged_artifact, &ready).is_ok()
+            {
+                set_status(UpdateState::Staged { version: version.to_string() });
+                return Ok(());
+            }
+        }
+        // The failure memo: a release whose bytes already failed
+        // verification is never fetched again until the publisher ships
+        // different bytes. One download per broken release per client —
+        // never one per cycle.
+        if state.failed_target_sha.as_deref()
+            .is_some_and(|sha| sha.eq_ignore_ascii_case(&target.sha256))
+        {
+            return Err("published update previously failed verification; waiting for a corrected release".into());
+        }
+        // The fetch budget is the size the SIGNED manifest declares, not the
+        // global ceiling — a 5 MiB update can never cost 256 MiB.
+        let artifact = fetch::fetch_following(fetcher, &target.url, target.size)?;
+        let (hash, size) = sha256::reader(&artifact[..]).map_err(|e| e.to_string())?;
+        if size != target.size || !hash.eq_ignore_ascii_case(&target.sha256) {
+            let mut state = storage::load_state();
+            state.failed_target_sha = Some(target.sha256.clone());
+            let _ = storage::save_state(&state);
+            return Err("downloaded artifact failed size or SHA-256 verification".into());
+        }
         storage::stage(&version, &manifest.notes_url, &target, &artifact)?;
         set_status(UpdateState::Staged { version: version.to_string() });
         Ok::<_, String>(())

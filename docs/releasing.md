@@ -299,6 +299,21 @@ Fetch discipline: the manifest and artifact fetches follow redirects only to
 an allowlist (github.com + GitHub's CDN hosts); this is **host restriction,
 not certificate pinning**, and the doc says so honestly (Sol security note).
 
+*Amended 2026-07-21 (Sol traffic-and-cost round):* transfer is bounded by
+**one cumulative byte budget per logical fetch** across the whole redirect
+chain (redirect bodies are never read); the artifact budget is the size the
+signed manifest declares, not the global ceiling; zero-size targets are
+refused; hashing is streaming with a fixed buffer; checks are single-flight
+process-wide ("Check now" cannot stack downloads); an intact staged artifact
+short-circuits the cycle (a client awaiting relaunch spends zero bytes); and
+a **failure memo** remembers the sha256 of a release that failed
+verification — it is never fetched again until the published bytes change,
+so a broken release costs each client one download total. The release
+pipeline enforces the mirror image: the manifest job and `release-sign.sh`
+both refuse artifacts outside the clients' (0, 256 MiB] cap and manifests
+over 1 MiB, because shipping past the caps would strand every installed
+client.
+
 ### The key
 
 A managed minisign key *set* (one key at a time in the normal case; two
@@ -778,3 +793,11 @@ overruled; fork's Wayland `app_id`-timing fix (§10).
   `minisign.pub` (see §4 "The key") after the first CI dry-run built
   keyless binaries with nobody noticing — fewer moving parts, fail-closed
   at compile time, key history in git.
+- **2026-07-21, Sol, pre-merge review rounds**: round 1 — four findings
+  (0.2.0 version identity, Windows ResumeSwap recovery destroying the
+  rollback binary, ledger torn-tail concatenation, silent notarization
+  skip), all confirmed and fixed. Round 2 (traffic-and-cost lens, after the
+  operator's $30k CDN-bill scar) — per-hop budget reset, declared-size
+  ignored, unbounded "Check now" concurrency, non-streaming hashing; fixed
+  per the §4 traffic amendment above, plus a finding Sol missed: a staged
+  client re-downloaded the full artifact every cycle until relaunch.
