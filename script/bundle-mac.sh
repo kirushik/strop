@@ -52,8 +52,16 @@ if [[ $(uname -s) == Darwin ]]; then
   ln -s /Applications "$out/dmg-root/Applications"
   ditto -c -k --keepParent "$app" "$out/strop-$version-notary.zip"
   if [[ -n ${APPLE_API_KEY:-} && -n ${APPLE_API_KEY_ID:-} && -n ${APPLE_API_ISSUER:-} ]]; then
+    # notarytool --key wants a .p8 FILE PATH. Accept either an existing path or
+    # (the CI convention, matching MACOS_CERT_P12) a base64-encoded .p8 in the
+    # env var, and materialize it to a temp file.
+    keyfile=$APPLE_API_KEY
+    if [[ ! -f $keyfile ]]; then
+      keyfile=$(mktemp "${TMPDIR:-/tmp}/asc_api_key.XXXXXX.p8")
+      printf '%s' "$APPLE_API_KEY" | base64 --decode > "$keyfile"
+    fi
     xcrun notarytool submit "$out/strop-$version-notary.zip" --wait \
-      --key "$APPLE_API_KEY" --key-id "$APPLE_API_KEY_ID" \
+      --key "$keyfile" --key-id "$APPLE_API_KEY_ID" \
       --issuer "$APPLE_API_ISSUER"
     xcrun stapler staple "$app"
     rm -rf "$out/dmg-root/$name.app"
