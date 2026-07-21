@@ -788,20 +788,30 @@ a time; never process two version tags concurrently.
 - **Attestation fails after `latest.json` uploaded** → re-run the manifest
   job; the upload is `--clobber` and byte-identical, attestation retries.
 - **`release-sign.sh` refuses** (inventory, hash, attestation, or TOCTOU
-  drift) → the draft is untouched; the error names the next step. A draft
-  is always safe to delete and re-cut.
+  drift) → payloads are untouched; the error names the next step and says
+  honestly whether this run already uploaded signature assets (a failure
+  after the first upload leaves them on the draft; a rerun re-verifies
+  them against the byte-identical manifest). A draft is always safe to
+  delete and re-cut.
 - **Publish succeeded but something is wrong** → never delete or
   un-publish; supersede with a fixed higher version (§12.4). The canary
   in the sign script is the last pre-announcement check.
 
-### The rc rehearsal (added 2026-07-21)
+### The rehearsal series (added 2026-07-21; reshaped 2026-07-22)
 
-Before the first real tag of a release generation, push a disposable
-`vX.Y.Z-rc.N` tag and walk the ENTIRE pipeline — draft, manifest,
-attestation, local sign — stopping before publish. Semver pre-release
-sorts below the release, so even a mistaken publish cannot pull a fleet
-forward. Delete the draft and the rc tag afterwards. 0.3.0's rc run doubles
-as the first live test of the tag path, which has otherwise never executed.
+Before the first real tag of a release generation, walk the ENTIRE
+pipeline — preflight, draft, manifest, attestation, local sign — stopping
+before publish. *Not* with an `-rc.N` pre-release tag (assembly review
+2026-07-22: preflight's strict stable-semver gate rejects it, and
+cargo-deb's `-`→`~` translation would split the artifact naming across
+the signer's exact inventory). Instead: the disposable **`v0.0.N`
+series** — on a throwaway branch, bump the workspace version to `0.0.N`,
+push the matching tag. Strict semver, exact version match, consistent
+naming through every packager, and `0.0.N` sorts below every real
+release forever, so even a mistaken publish could not move a fleet.
+Delete the draft, the tag, and the branch afterwards; `N` only ever
+increments. 0.3.0's rehearsal doubles as the first live test of the tag
+path, which has otherwise never executed.
 
 ## §13 Open questions & unverified flags
 
@@ -811,6 +821,14 @@ in parallel; §6 backups = hidden data_dir + About, one regime including
 compaction's former sidecar `.bak`s ("invisible until danger, then loud");
 §7 OBS skipped (revival plan: repackage prebuilt); §9 mark = AI calibration
 round now, designer later if love strikes.
+
+**Recorded debt (2026-07-22, assembly review):** the runtime-asset set is
+enumerated in four places (stage-runtime-assets.sh, deb metadata, rpm
+metadata, strop.iss); the CI count-assertion on the deb catches drift of
+the script-vs-metadata class, but true single-source generation of all
+four inventories is future work. The notarization submission-ID
+resume machinery and the updater's end-to-end failure-memo test seam
+remain open from the robustness round.
 
 **To verify by doing (each is one small experiment):** cargo-zigbuild vs our
 link chain (§2); EU sole-trader eligibility for Azure signing, only if the

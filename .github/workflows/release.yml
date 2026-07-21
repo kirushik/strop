@@ -20,6 +20,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Strict stable semver only. Rehearsals do NOT use -rc suffixes
+          # (cargo-deb's ~-translation would split the naming across the
+          # inventory); they use the disposable v0.0.N series with the
+          # workspace version bumped to match on a throwaway branch
+          # (docs/releasing.md §12 "The rehearsal series").
           [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid release tag: $GITHUB_REF_NAME" >&2; exit 1; }
           workspace_version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
           [[ -n "$workspace_version" && "$GITHUB_REF_NAME" == "v$workspace_version" ]] || { echo "tag $GITHUB_REF_NAME does not match workspace version $workspace_version" >&2; exit 1; }
@@ -52,11 +57,23 @@ jobs:
           strip --strip-all target/x86_64-unknown-linux-gnu/dist/strop
           n=strop-$ver-x86_64-unknown-linux-gnu; mkdir -p dist/$n
           cp target/x86_64-unknown-linux-gnu/dist/strop README.md COPYING NOTICE dist/$n/
-          bash script/stage-runtime-assets.sh dist/$n
+          # assets/ must sit BESIDE the binary inside the archive — that is
+          # the exe-sibling path paths::asset_file searches first.
+          bash script/stage-runtime-assets.sh dist/$n/assets
           tar -C dist -czf dist/$n.tar.gz $n
+          # The unpacked staging tree must not ride into the artifact upload:
+          # dist/* would sweep its files into the draft and the signing
+          # ritual's exact inventory would refuse the release.
+          rm -rf dist/$n
+          tar -tzf dist/$n.tar.gz | grep -q "^$n/assets/fonts/coldread/URWBookman-Light.otf$" || { echo "tarball is missing assets/ beside the binary" >&2; exit 1; }
           STROP_DIST_CHANNEL=deb cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
           STROP_DIST_CHANNEL=deb cargo deb -p strop-app --profile dist --target x86_64-unknown-linux-gnu --no-build
           cp target/x86_64-unknown-linux-gnu/debian/*.deb dist/
+          # The deb metadata enumerates the runtime-asset set independently
+          # of stage-runtime-assets.sh; hold the two to the same count so a
+          # file added to one but not the other fails the build (full SSOT
+          # generation is recorded debt, releasing.md §13).
+          [[ "$(dpkg-deb -c dist/*.deb | grep -c 'share/strop/assets/.*[^/]$')" == "8" ]] || { echo "deb runtime-asset set drifted from stage-runtime-assets.sh" >&2; exit 1; }
           STROP_DIST_CHANNEL=rpm cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
           cargo generate-rpm -p crates/strop-app --target x86_64-unknown-linux-gnu --profile dist
           cp target/x86_64-unknown-linux-gnu/generate-rpm/*.rpm dist/

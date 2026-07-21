@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-die() { echo "release-sign: $*; draft unchanged. Next step: fix and rerun." >&2; exit 1; }
+# Before any upload this run has mutated nothing; after the first signature
+# upload "draft unchanged" would be a lie (assembly review 2026-07-22).
+mutated=0
+die() {
+  if (( mutated )); then
+    echo "release-sign: $*; payloads are unchanged, but signature assets uploaded by this run remain on the draft and will be re-verified on rerun. Next step: fix and rerun." >&2
+  else
+    echo "release-sign: $*; draft unchanged. Next step: fix and rerun." >&2
+  fi
+  exit 1
+}
 published_die() {
   echo "release-sign: $*; the release is already published and cannot be rolled back. Next step: fix the published assets if they are byte-identical to the approved release, or re-cut a higher version; do not delete the published release." >&2
   exit 1
@@ -134,6 +144,7 @@ read -r -p "Type PUBLISH $tag to sign and publish: " confirmation
 
 minisign -Sm "$work/latest.approved.json" \
   -x "$work/latest.json.minisig" || die "primary signing failed"
+mutated=1
 gh release upload "$tag" --repo "$repo" "$work/latest.json.minisig" --clobber \
   || die "signature upload failed"
 signatures=(latest.json.minisig)
