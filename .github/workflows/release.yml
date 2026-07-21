@@ -114,6 +114,12 @@ jobs:
           [[ "$NOTARY_COMPLETE" == "true" ]] || { echo "MACOS_SIGNING_ENABLED is true but APPLE_API_KEY / _KEY_ID / _KEY_ISSUER are incomplete" >&2; exit 1; }
           echo "$P12" | base64 --decode > cert.p12
           security create-keychain -p ci build.keychain
+          # A fresh keychain auto-locks after 300s; the release build runs
+          # far longer than that between this import and the first codesign,
+          # and codesign against a locked keychain blocks forever on a UI
+          # prompt no headless runner can answer. 21600s outlives any job
+          # timeout here.
+          security set-keychain-settings -lut 21600 build.keychain
           security import cert.p12 -k build.keychain -P "$PASSWORD" -T /usr/bin/codesign
           security list-keychains -d user -s build.keychain
           security unlock-keychain -p ci build.keychain
