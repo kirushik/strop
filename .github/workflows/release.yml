@@ -145,7 +145,7 @@ jobs:
           echo "VER=$ver" >> "$GITHUB_ENV"
       - name: stage 2 — optional SignPath/Azure inner EXE signing
         if: vars.WINDOWS_SIGNING_ENABLED == 'true'
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
@@ -168,7 +168,7 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\strop.iss
       - name: stage 4 — optional installer signing
         if: vars.WINDOWS_SIGNING_ENABLED == 'true'
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
