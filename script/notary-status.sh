@@ -40,7 +40,13 @@ else
   curl -fsS -H "Authorization: Bearer $token" "$base?limit=10" \
     | python3 -c "
 import json, sys
-for s in json.load(sys.stdin)['data']:
+subs = json.load(sys.stdin)['data']
+if not subs:
+    # An empty list is a LOUD fact: nothing has ever reached Apple from
+    # this team — a 'hung' CI notarization is wedged client-side (upload),
+    # not sitting in Apple's review queue.
+    print('no submissions on record for this team')
+for s in subs:
     a = s['attributes']
     print(f\"{s['id']}  {a['createdDate']}  {a['status']:<12} {a['name']}\")"
 fi
