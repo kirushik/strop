@@ -13,3 +13,12 @@
 !crates/strop-core/tests/corpus/*.strop
 target-main/
 packaging/generated/
+
+# Signing secrets — NEVER commit. The update-signing minisign PUBLIC key
+# (minisign.pub) is deliberately exempt below; everything here is private.
+*.key
+*.p12
+*.p8
+AuthKey_*
+minisign.key
+!minisign.pub
