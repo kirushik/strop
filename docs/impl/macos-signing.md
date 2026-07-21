@@ -48,8 +48,11 @@ import (wrong password?)`, which sends you chasing a password typo that
 isn't there (observed on the first 0.3.0 rehearsal, 2026-07-21). `-legacy`
 selects the RC2/3DES + SHA-1 shapes macOS accepts; the reduced cipher
 strength only guards the file in transit to the secret store, so it costs
-nothing real. If your OpenSSL lacks the legacy provider, the equivalent is
-`-certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1`.
+nothing real. The flag exists only in OpenSSL 3.x — OpenSSL 1.1.x and
+LibreSSL reject it as an unknown option, and don't need it: their defaults
+already emit these shapes, so there just drop `-legacy`. The version-proof
+explicit spelling (also the fix for an OpenSSL 3 built without the legacy
+provider) is `-certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1`.
 
 - `MACOS_CERT_P12` = the base64 blob above.
 - `MACOS_CERT_P12_PASSWORD` = the password you chose.
