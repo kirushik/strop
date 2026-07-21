@@ -75,6 +75,14 @@ launch sway or the binary against a compositor socket by hand.
 - Unit tests live in-module under `#[cfg(test)]`, in the house
   naming voice (read the neighbours first).
 
+## Build cache (HARD RULE)
+
+- Never run `cargo clean` or delete anything under `target/`. Worktree
+  slots are a persistent build-cache pool; a cold build costs 6-8
+  minutes, a warm one seconds (measured 2026-07-22: only the 2 workspace
+  crates recompile across slots — dep fingerprints ignore the workspace
+  path).
+
 ## Never
 
 - Never run `cargo fmt` or any formatter (yes, again).
