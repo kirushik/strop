@@ -304,6 +304,12 @@ not certificate pinning**, and the doc says so honestly (Sol security note).
 A managed minisign key *set* (one key at a time in the normal case; two
 during a rotation window). Public keys + their key IDs baked into the binary
 (`minisign-verify` crate — pure Rust, tiny); unknown key IDs are refused.
+*Amended 2026-07-21 (Kirill):* the baking mechanism is `include_str!` of the
+repo's committed `minisign.pub` — the same file humans verify against — not
+a CI variable. A mis-set variable could silently produce a keyless binary
+that can never self-update (the first dry-run did exactly that); a missing
+file is a compile error, and key changes are commits, auditable in history.
+A rotation bridge is a second key block appended to the file.
 Private key lives on Kirill's machine, passphrase-protected, backed up
 offline, **never in CI** — CI produces everything except the one signature
 (§12), so a compromised CI cannot feed updates to anyone. Routine rotation
@@ -767,3 +773,8 @@ overruled; fork's Wayland `app_id`-timing fix (§10).
   explicit + live-temp-dir GC rule; "one keypair" → "managed key set").
   Design review CLOSED; implementation may reference this doc as the
   agreed spec.
+- **2026-07-21, Kirill, post-keygen amendment**: runtime trust anchor moved
+  from the `STROP_UPDATE_PUBKEYS` build variable to the committed
+  `minisign.pub` (see §4 "The key") after the first CI dry-run built
+  keyless binaries with nobody noticing — fewer moving parts, fail-closed
+  at compile time, key history in git.

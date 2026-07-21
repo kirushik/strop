@@ -86,15 +86,22 @@ Set the **Variable** (Variables tab): `MACOS_SIGNING_ENABLED = true`.
 
 ## 4. Verify
 
-Trigger the workflow (`workflow_dispatch`, or push a tag). The `mac` job should
-import the identity, `codesign --options runtime`, `notarytool submit --wait`
-(a few minutes), and `stapler staple`. Confirm on the produced `.app`:
+Trigger the workflow (`workflow_dispatch` **on the branch that carries the new
+`release.yml`** — a dispatch on a branch without it runs whatever old workflow
+lives there — or push a tag). The `mac` job should import the identity,
+`codesign --options runtime`, `notarytool submit --wait` (a few minutes), and
+`stapler staple`. The job then verifies its own product on the runner — the
+maintainer has no Mac, so a green job IS the proof of Gatekeeper acceptance:
 
 ```bash
 codesign --verify --deep --strict --verbose=2 Strop.app
-spctl -a -vvv -t install Strop.app        # → "accepted, source=Notarized Developer ID"
+spctl -a -vv -t install Strop.app         # → "accepted, source=Notarized Developer ID"
 xcrun stapler validate Strop.app
 ```
+
+(These run in `bundle-mac.sh` after stapling; an unusable certificate also
+fails the job at the import step rather than falling through to an ad-hoc
+signature.)
 
 If notarization is rejected, `notarytool log <submission-id>` (in the run output)
 names the exact offending binary/entitlement.

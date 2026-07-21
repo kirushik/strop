@@ -7,7 +7,6 @@ permissions:
   contents: read
 env:
   CARGO_TERM_COLOR: always
-  STROP_UPDATE_PUBKEYS: ${{ vars.STROP_UPDATE_PUBKEYS }}
 
 jobs:
   linux:
@@ -61,7 +60,12 @@ jobs:
           security list-keychains -d user -s build.keychain
           security unlock-keychain -p ci build.keychain
           security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
-          echo "MACOS_SIGN_IDENTITY=$(security find-identity -v -p codesigning build.keychain | sed -n '1s/.*"\(.*\)"/\1/p')" >> "$GITHUB_ENV"
+          identity=$(security find-identity -v -p codesigning build.keychain | sed -n '1s/.*"\(.*\)"/\1/p')
+          # Signing is enabled, so an unusable certificate must fail the job
+          # here — an empty identity would otherwise fall through bundle-mac.sh
+          # and ship an ad-hoc-signed artifact under a green build.
+          [[ -n "$identity" ]] || { echo "no valid codesigning identity in the imported .p12 (missing intermediate chain?)" >&2; security find-identity -p codesigning build.keychain >&2; exit 1; }
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
       - name: stage 1-4 — build, sign, bundle, notarize, and staple
         env:
           APPLE_API_KEY: ${{ vars.MACOS_SIGNING_ENABLED == 'true' && secrets.APPLE_API_KEY || '' }}

@@ -25,13 +25,17 @@ pub struct Target {
     pub size: u64,
 }
 
+/// The runtime trust anchor is the repo's committed `minisign.pub`, baked
+/// at compile time: a keyless binary cannot be produced by mis-set CI
+/// state, and key rotation is a commit (hence a release), never a mutable
+/// variable. A rotation bridge is extra key blocks appended to the file.
 pub fn baked_keys() -> Vec<PublicKey> {
-    option_env!("STROP_UPDATE_PUBKEYS")
-        .unwrap_or("")
-        .split(',')
+    include_str!("../../../../minisign.pub")
+        .lines()
         .filter_map(|s| {
             let line = s.trim();
-            (!line.is_empty()).then(|| PublicKey::from_base64(line).ok()).flatten()
+            (!line.is_empty() && !line.starts_with("untrusted comment"))
+                .then(|| PublicKey::from_base64(line).ok()).flatten()
         })
         .collect()
 }
@@ -210,6 +214,18 @@ mod tests {
         assert!(verify_signed(b"tampered", &[signature], &keys).is_err());
         assert!(verify_signed(message, &[], &keys).is_err());
         assert!(verify_signed(message, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn every_committed_key_line_bakes() {
+        // The binary's trust anchor and the human-verifiable file are the
+        // same bytes; a key line that fails to parse would silently shrink
+        // the trusted set, so pin count(parsed) == count(key lines) >= 1.
+        let key_lines = include_str!("../../../../minisign.pub").lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with("untrusted comment"))
+            .count();
+        assert!(key_lines >= 1);
+        assert_eq!(baked_keys().len(), key_lines);
     }
 
     #[test]

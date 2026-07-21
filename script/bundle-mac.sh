@@ -64,6 +64,12 @@ if [[ $(uname -s) == Darwin ]]; then
       --key "$keyfile" --key-id "$APPLE_API_KEY_ID" \
       --issuer "$APPLE_API_ISSUER"
     xcrun stapler staple "$app"
+    # The maintainer has no Mac; this runner is the verification machine.
+    # A green job must mean Gatekeeper acceptance, not merely a completed
+    # upload — so assess the stapled bundle exactly as an end user's Mac would.
+    codesign --verify --deep --strict --verbose=2 "$app"
+    spctl -a -vv -t install "$app"
+    xcrun stapler validate "$app"
     rm -rf "$out/dmg-root/$name.app"
     cp -R "$app" "$out/dmg-root/"
   fi

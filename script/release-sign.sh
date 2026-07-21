@@ -5,7 +5,10 @@ die() { echo "release-sign: $*; draft unchanged. Next step: fix and rerun." >&2;
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool '$1' is missing"; }
 for tool in gh jq sha256sum stat minisign git mktemp; do need "$tool"; done
 (( $# == 1 )) || die "usage: $0 VERSION (without v)"
-[[ -n ${MINISIGN_PUBKEY:-} ]] || die "MINISIGN_PUBKEY is required for independent verification"
+# Independent verification defaults to the same committed key the binary
+# bakes; override MINISIGN_PUBKEY only when bridging a rotation.
+MINISIGN_PUBKEY=${MINISIGN_PUBKEY:-"$(git rev-parse --show-toplevel)/minisign.pub"}
+[[ -f $MINISIGN_PUBKEY ]] || die "public key file $MINISIGN_PUBKEY is missing"
 version=$1
 tag="v$version"
 work=$(mktemp -d)
