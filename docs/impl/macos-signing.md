@@ -51,8 +51,11 @@ Developer ID certs are valid ~5 years — this is not an every-release chore.
 
 ## 2. App Store Connect API key for notarization (→ `APPLE_API_KEY*`)
 
-Portal → **App Store Connect → Users and Access → Integrations → Team Keys** →
-**Generate API Key**. Least privilege that notarizes is the **Developer** role.
+Portal → **App Store Connect → Users and Access → Integrations → Keys → App
+Store Connect API** → **Generate API Key** (labelled "Team Keys" in older docs;
+Apple renamed it). A fresh account shows **Request Access** first — as the
+Account Holder you self-approve instantly, then the Generate button appears.
+Least privilege that notarizes is the **Developer** role.
 
 - **Download the `AuthKey_XXXXXXXXXX.p8` — once only**, Apple never shows it again.
 - Note the **Key ID** (10 chars, in the key row).
