@@ -65,7 +65,12 @@ if [[ $(uname -s) == Darwin ]]; then
       asc_key_tmp=$keyfile
       printf '%s' "$APPLE_API_KEY" | base64 --decode > "$keyfile"
     fi
+    # --timeout bounds the wait (a first-ever submission can sit in Apple's
+    # extended review ~an hour; a wedge must not eat a six-hour runner).
+    # Note the tool's stdout is pipe-buffered in CI: silence after codesign
+    # means "waiting on Apple", not "hung before submit".
     xcrun notarytool submit "$out/strop-$version-notary.zip" --wait \
+      --timeout 60m \
       --key "$keyfile" --key-id "$APPLE_API_KEY_ID" \
       --issuer "$APPLE_API_ISSUER"
     xcrun stapler staple "$app"

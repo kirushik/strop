@@ -76,7 +76,7 @@ assets = [
     ["../../packaging/linux/cc.pimenov.strop.desktop", "usr/share/applications/", "644"],
     ["../../packaging/linux/cc.pimenov.strop.mime.xml", "usr/share/mime/packages/", "644"],
     ["../../packaging/linux/cc.pimenov.strop.metainfo.xml", "usr/share/metainfo/", "644"],
-    ["../../packaging/generated/hicolor", "usr/share/icons/hicolor/", "644"],
+    ["../../packaging/generated/hicolor/**/*", "usr/share/icons/hicolor/", "644"],
 ]
 
 [package.metadata.generate-rpm]
