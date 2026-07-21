@@ -809,9 +809,14 @@ series** — on a throwaway branch, bump the workspace version to `0.0.N`,
 push the matching tag. Strict semver, exact version match, consistent
 naming through every packager, and `0.0.N` sorts below every real
 release forever, so even a mistaken publish could not move a fleet.
-Delete the draft, the tag, and the branch afterwards; `N` only ever
-increments. 0.3.0's rehearsal doubles as the first live test of the tag
-path, which has otherwise never executed.
+The signing leg is one command: `script/release-sign.sh --sign-only` —
+with no version argument it resolves the CURRENT draft (which is never a
+guess: releases are serialized, so exactly one draft may exist; zero or
+several is a hard error naming them), runs the full verification
+gauntlet, signs, uploads, re-verifies, and stops with the draft
+unpublished. Delete the draft, the tag, and the branch afterwards; `N`
+only ever increments. 0.3.0's rehearsal doubles as the first live test
+of the tag path, which has otherwise never executed.
 
 ## §13 Open questions & unverified flags
 

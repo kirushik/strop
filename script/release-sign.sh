@@ -18,11 +18,34 @@ published_die() {
 }
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool '$1' is missing"; }
 for tool in gh jq sha256sum stat minisign git mktemp curl cmp awk; do need "$tool"; done
-(( $# == 1 )) || die "usage: $0 VERSION (without v)"
-version=$1
+repo=kirushik/strop
+
+# usage: release-sign.sh [VERSION] [--sign-only]
+#   VERSION omitted → the CURRENT draft is used, and "current" is never a
+#   guess: §12 serializes releases (one tag, one signer at a time), so
+#   EXACTLY ONE draft may exist. Zero or several → die, listing them.
+#   --sign-only → verify + sign + upload + re-verify the signature, then
+#   STOP with the draft unpublished (the v0.0.N rehearsal's mode).
+version=
+sign_only=0
+for arg in "$@"; do
+  case $arg in
+    --sign-only) sign_only=1 ;;
+    -*) die "unknown flag $arg (usage: $0 [VERSION] [--sign-only])" ;;
+    *) [[ -z $version ]] || die "usage: $0 [VERSION] [--sign-only]"; version=$arg ;;
+  esac
+done
+if [[ -z $version ]]; then
+  drafts=$(gh release list --repo "$repo" --json tagName,isDraft \
+    --jq '[.[] | select(.isDraft)] | map(.tagName) | join(" ")')
+  read -r -a draft_tags <<<"$drafts"
+  (( ${#draft_tags[@]} == 1 )) \
+    || die "expected exactly one draft release, found ${#draft_tags[@]}${drafts:+ ($drafts)} — name the VERSION explicitly"
+  version=${draft_tags[0]#v}
+  echo "release-sign: current draft is ${draft_tags[0]}"
+fi
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || die "VERSION is not a release version"
 tag="v$version"
-repo=kirushik/strop
 
 # Independent verification defaults to the same committed key the binary
 # bakes; override MINISIGN_PUBKEY only when bridging a rotation.
@@ -139,8 +162,13 @@ for asset in "${expected[@]}"; do
     "$(stat -c %s "$work/assets/$asset")" "$hash"
 done
 echo "Tag commit: $(git rev-list -n 1 "$tag")"
-read -r -p "Type PUBLISH $tag to sign and publish: " confirmation
-[[ $confirmation == "PUBLISH $tag" ]] || die "confirmation was not exact"
+if (( sign_only )); then
+  read -r -p "Type SIGN $tag to sign the manifest (draft stays unpublished): " confirmation
+  [[ $confirmation == "SIGN $tag" ]] || die "confirmation was not exact"
+else
+  read -r -p "Type PUBLISH $tag to sign and publish: " confirmation
+  [[ $confirmation == "PUBLISH $tag" ]] || die "confirmation was not exact"
+fi
 
 minisign -Sm "$work/latest.approved.json" \
   -x "$work/latest.json.minisig" || die "primary signing failed"
@@ -188,6 +216,11 @@ done
 minisign -Vm "$work/final-download/latest.json" \
   -x "$work/final-download/latest.json.minisig" -p "$MINISIGN_PUBKEY" >/dev/null \
   || die "final primary signature verification failed"
+
+if (( sign_only )); then
+  echo "$tag manifest signed, signature uploaded and re-verified; the draft remains UNPUBLISHED (--sign-only). Rehearsal complete: delete the draft, the tag, and the branch when done."
+  exit 0
+fi
 
 gh release edit "$tag" --repo "$repo" --draft=false --latest \
   || die "publish failed"
