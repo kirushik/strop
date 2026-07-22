@@ -1,11 +1,14 @@
 //! The app's colophon (docs/releasing.md §8), and the updater's only UI.
 
-use std::time::{Duration, SystemTime};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
     AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement,
-    MouseButton, MouseDownEvent, Pixels, Render, Window, WindowBounds, WindowHandle,
-    WindowOptions, div, px, rgb, size,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
+    Transformation, Window, WindowBounds, WindowHandle, WindowOptions, div, point, px,
+    radians, rgb, size,
 };
 use gpui::prelude::*;
 
@@ -20,6 +23,84 @@ const WIDTH: f32 = 660.;
 const HEIGHT: f32 = 720.;
 const LICENSE_HEIGHT: f32 = 210.;
 const LICENSE_CHUNK_LINES: usize = 80;
+
+mod pendulum {
+    pub const LIMIT: f32 = 1.31;
+    const W0: f32 = 7.;
+    const ZETA: f32 = 0.10;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct State {
+        pub theta: f32,
+        pub omega: f32,
+    }
+
+    fn clamp(mut state: State) -> State {
+        if state.theta >= LIMIT {
+            state.theta = LIMIT;
+            if state.omega > 0. {
+                state.omega = 0.;
+            }
+        } else if state.theta <= -LIMIT {
+            state.theta = -LIMIT;
+            if state.omega < 0. {
+                state.omega = 0.;
+            }
+        }
+        state
+    }
+
+    pub fn step(mut state: State, dt: f32) -> State {
+        let dt = dt.clamp(0., 1. / 30.);
+        state.omega += (-W0 * W0 * state.theta.sin()
+            - 2. * ZETA * W0 * state.omega) * dt;
+        state.theta += state.omega * dt;
+        state = clamp(state);
+        if state.theta.abs() < 0.002 && state.omega.abs() < 0.004 {
+            State::default()
+        } else {
+            state
+        }
+    }
+
+    pub fn impulse(mut state: State, omega_add: f32) -> State {
+        state.omega = (state.omega + omega_add).clamp(-6., 6.);
+        clamp(state)
+    }
+
+    pub fn follow_grab(
+        state: State,
+        pointer: (f32, f32),
+        pivot: (f32, f32),
+        dt: f32,
+    ) -> State {
+        let theta = (pointer.0 - pivot.0)
+            .atan2(pointer.1 - pivot.1)
+            .clamp(-LIMIT, LIMIT);
+        let omega = if dt > 0. { (theta - state.theta) / dt } else { 0. };
+        clamp(State { theta, omega })
+    }
+
+    // gpui's rotate matrix is [[cos,-sin],[sin,cos]] about the element
+    // origin, which carries the ring point (0,-26) to x = +26·sin θ —
+    // so the compensating translation is tx = -26·sin θ (the original
+    // spec's sign, derived under the opposite convention, doubled the
+    // drift; the fixed-ring invariant below is the normative law).
+    pub fn pivot_translation(theta: f32) -> (f32, f32) {
+        let py = -26.;
+        (py * theta.sin(), py - py * theta.cos())
+    }
+}
+
+#[derive(Default)]
+struct MarkMotion {
+    state: pendulum::State,
+    pivot: Option<(f32, f32)>,
+    grabbed: bool,
+    last_sample: Option<(f32, Instant)>,
+    last_frame: Option<Instant>,
+    last_window_x: Option<f32>,
+}
 
 pub use aux_window::{ToggleDecision, toggle_decision};
 
@@ -108,6 +189,9 @@ pub struct AboutWindow {
     editor: Entity<Editor>,
     editor_window: AnyWindowHandle,
     chunks: Vec<String>,
+    motion: Rc<RefCell<MarkMotion>>,
+    reduce_motion: bool,
+    config_pending: bool,
 }
 
 impl Focusable for AboutWindow {
@@ -134,10 +218,75 @@ impl AboutWindow {
             });
         });
     }
+
+
+    fn follow_mark(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.reduce_motion { return; }
+        let mut motion = self.motion.borrow_mut();
+        if !motion.grabbed { return; }
+        let Some(pivot) = motion.pivot else { return };
+        let now = Instant::now();
+        let dt = motion.last_sample
+            .map(|(_, at)| now.duration_since(at).as_secs_f32())
+            .unwrap_or(0.);
+        motion.state = pendulum::follow_grab(
+            motion.state,
+            (f32::from(ev.position.x), f32::from(ev.position.y)),
+            pivot,
+            dt,
+        );
+        motion.last_sample = Some((motion.state.theta, now));
+        motion.last_frame = Some(now);
+        cx.notify();
+    }
+
+    fn release_mark(&mut self, cx: &mut Context<Self>) {
+        let mut motion = self.motion.borrow_mut();
+        if !motion.grabbed { return; }
+        motion.grabbed = false;
+        motion.last_sample = None;
+        motion.last_frame = Some(Instant::now());
+        cx.notify();
+    }
 }
 
 impl Render for AboutWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
+        let bounds = window.bounds();
+        if self.config_pending {
+            // `open` is called while Editor is leased by its action handler,
+            // and GPUI draws a new window synchronously. Stay inert for that
+            // first draw, then sample the setting on the requested frame.
+            self.config_pending = false;
+            window.request_animation_frame();
+        } else {
+            self.reduce_motion = self.editor.read(cx).config.reduce_motion;
+        }
+        let reduce_motion = self.reduce_motion;
+        {
+            let mut motion = self.motion.borrow_mut();
+            if reduce_motion {
+                *motion = MarkMotion::default();
+            } else {
+                let window_x = f32::from(bounds.origin.x);
+                if let Some(previous_x) = motion.last_window_x {
+                    let dx = window_x - previous_x;
+                    if dx != 0. { motion.state = pendulum::impulse(motion.state, -0.006 * dx); }
+                }
+                motion.last_window_x = Some(window_x);
+                if !motion.grabbed {
+                    if let Some(previous) = motion.last_frame {
+                        motion.state = pendulum::step(
+                            motion.state, now.duration_since(previous).as_secs_f32());
+                    }
+                    motion.last_frame = Some(now);
+                }
+                if motion.state != pendulum::State::default() {
+                    window.request_animation_frame();
+                }
+            }
+        }
         let metrics = aux_window::metrics(window);
         let state = update::status();
         // Inert (dev build, store channel) shows no updater surface at all
@@ -166,11 +315,37 @@ impl Render for AboutWindow {
                 .child(text)
         };
         let entity = cx.entity();
+        let motion = self.motion.clone();
+        let theta = motion.borrow().state.theta;
+        let translation = pendulum::pivot_translation(theta);
+        let mark = div().on_children_prepainted({
+                let motion = motion.clone();
+                move |bounds, _, _| {
+                    if let Some(bounds) = bounds.first() {
+                        motion.borrow_mut().pivot = Some((
+                            f32::from(bounds.origin.x + bounds.size.width / 2.),
+                            f32::from(bounds.origin.y)));
+                    }
+                }
+            })
+            .id("about-mark").occlude().size(px(52.)).flex_shrink_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(
+                |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if this.reduce_motion { return; }
+                    let mut motion = this.motion.borrow_mut();
+                    motion.grabbed = true;
+                    let theta = motion.state.theta;
+                    motion.last_sample = Some((theta, Instant::now()));
+                }))
+            .child(icon(icons::STROP_MARK, 52., TEXT_COLOR).with_transformation(
+                Transformation::rotate(radians(theta)).with_translation(
+                    point(px(translation.0), px(translation.1)))));
         let body = div()
             .size_full().bg(rgb(AUX_BG)).text_color(rgb(TEXT_COLOR)).font_family("PT Sans")
             .px(px(42.)).pt(px(32.)).pb(px(48.)).flex().flex_col()
             .child(div().flex().items_center().gap(px(18.))
-                .child(icon(icons::STROP_MARK, 52., TEXT_COLOR))
+                .child(mark)
                 .child(div().font_family("PT Serif").text_size(px(34.)).child("Strop")))
             .child(div().mt(px(18.)).font_family("PT Mono").text_size(px(11.)).line_height(px(17.))
                 .child(format!("version {}", env!("CARGO_PKG_VERSION")))
@@ -211,7 +386,18 @@ impl Render for AboutWindow {
             .child(div().mt(px(16.)).font_family("PT Serif").text_size(px(11.))
                 .text_color(rgb(MUTED_COLOR)).child(format!(
                     "Set in PT Serif & PT Mono · typeset by Strop {}", env!("CARGO_PKG_VERSION"))));
-        let content = div().key_context(aux_window::KEY_CONTEXT).track_focus(&self.focus_handle)
+        let content = div().id("about-content")
+            .key_context(aux_window::KEY_CONTEXT).track_focus(&self.focus_handle)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered { this.release_mark(cx); }
+            }))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                this.follow_mark(ev, cx);
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(
+                |this, _: &MouseUpEvent, _, cx| this.release_mark(cx)))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(
+                |this, _: &MouseUpEvent, _, cx| this.release_mark(cx)))
             .on_action(cx.listener(|this, _: &EscapeMode, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|this, _: &crate::AboutStrop, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)))
@@ -224,7 +410,18 @@ impl Render for AboutWindow {
                 },
             ))
             .child(body);
-        aux_window::shell(content, metrics)
+        let motion = self.motion.clone();
+        let content = div().size_full().child(content);
+        aux_window::shell_with_move(content, metrics, Some(Box::new(
+            move |ev, window, _| {
+                if reduce_motion { return; }
+                let midpoint = f32::from(window.bounds().size.width) / 2.;
+                let kick = if f32::from(ev.position.x) < midpoint { 1.8 } else { -1.8 };
+                let mut motion = motion.borrow_mut();
+                motion.state = pendulum::impulse(motion.state, kick);
+                motion.last_frame = Some(Instant::now());
+                window.request_animation_frame();
+            })))
     }
 }
 
@@ -269,6 +466,8 @@ pub fn open(
         let view = cx.new(|cx| AboutWindow {
             focus_handle: cx.focus_handle(), editor: editor.clone(), editor_window,
             chunks: license_chunks(),
+            motion: Rc::new(RefCell::new(MarkMotion::default())),
+            reduce_motion: true, config_pending: true,
         });
         window.focus(&view.focus_handle(cx), cx);
         let weak = view.downgrade();
@@ -302,6 +501,71 @@ fn save_position(bounds: Bounds<Pixels>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pendulum_impulse_decays_by_half_cycles_and_rests() {
+        let mut state = pendulum::impulse(pendulum::State::default(), 0.9);
+        let mut previous_sign = state.omega.signum();
+        let mut peaks = Vec::new();
+        // ~9 s to full rest at ζ=0.10: visible motion dies in 3-4 s, the
+        // sub-pixel tail runs longer; 10 simulated seconds bounds it.
+        for _ in 0..(10 * 60) {
+            state = pendulum::step(state, 1. / 60.);
+            let sign = state.omega.signum();
+            if sign != 0. && sign != previous_sign {
+                peaks.push(state.theta.abs());
+                previous_sign = sign;
+            }
+        }
+        assert!(peaks.len() >= 4);
+        assert!(peaks.windows(2).all(|pair| pair[1] < pair[0]));
+        assert_eq!(state, pendulum::State::default());
+    }
+
+    #[test]
+    fn pendulum_dt_and_angle_clamps_are_hard() {
+        let state = pendulum::State { theta: 0.4, omega: 2. };
+        assert_eq!(pendulum::step(state, 2.), pendulum::step(state, 1. / 30.));
+        let high = pendulum::step(
+            pendulum::State { theta: pendulum::LIMIT, omega: 2. }, 0.);
+        let low = pendulum::step(
+            pendulum::State { theta: -pendulum::LIMIT, omega: -2. }, 0.);
+        assert_eq!(high, pendulum::State { theta: pendulum::LIMIT, omega: 0. });
+        assert_eq!(low, pendulum::State { theta: -pendulum::LIMIT, omega: 0. });
+        let grabbed = pendulum::follow_grab(
+            pendulum::State::default(), (100., 1.), (0., 0.), 1. / 60.);
+        assert_eq!(grabbed, pendulum::State { theta: pendulum::LIMIT, omega: 0. });
+    }
+
+    #[test]
+    fn pivot_composition_keeps_the_ring_fixed() {
+        assert_eq!(pendulum::pivot_translation(0.), (0., 0.));
+        for theta in [-1.1_f32, -0.2, 0.2, 1.1] {
+            let (tx, ty) = pendulum::pivot_translation(theta);
+            // gpui's [[cos,-sin],[sin,cos]] carries (0,-26) to
+            // (+26·sin θ, -26·cos θ); the ring must land back on itself.
+            let pivot = (26. * theta.sin() + tx, -26. * theta.cos() + ty);
+            assert!(pivot.0.abs() < 0.01);
+            assert!((pivot.1 + 26.).abs() < 0.01);
+        }
+        let theta = 0.2_f32;
+        let (tx, _) = pendulum::pivot_translation(theta);
+        // The bottom of the mark (0, +26) must actually travel — the
+        // translation compensates the ring, not the whole element.
+        assert!(-26. * theta.sin() + tx < 0.);
+        assert!(pendulum::follow_grab(
+            pendulum::State::default(), (10., 20.), (0., 0.), 1.).theta > 0.);
+    }
+
+    #[test]
+    fn reduce_motion_integration_seam_stays_zero() {
+        let mut motion = MarkMotion::default();
+        motion.state = pendulum::impulse(motion.state, 1.8);
+        let reduce_motion = true;
+        if reduce_motion { motion = MarkMotion::default(); }
+        assert_eq!(motion.state, pendulum::State::default());
+        assert!(!motion.grabbed);
+    }
 
     #[test]
     fn every_update_state_has_the_spec_string() {

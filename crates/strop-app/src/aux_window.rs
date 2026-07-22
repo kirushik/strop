@@ -153,6 +153,16 @@ pub fn titlebar(
 }
 
 pub fn shell(content: Div, metrics: Metrics) -> impl IntoElement {
+    shell_with_move(content, metrics, None)
+}
+
+type MoveHandler = dyn Fn(&MouseDownEvent, &mut Window, &mut App);
+
+pub fn shell_with_move(
+    content: Div,
+    metrics: Metrics,
+    on_move: Option<Box<MoveHandler>>,
+) -> impl IntoElement {
     let client = metrics.client;
     let tiling = metrics.tiling;
     let inset = |tiled: bool| px(if client && !tiled { CSD_GUTTER } else { 0. });
@@ -163,7 +173,8 @@ pub fn shell(content: Div, metrics: Metrics) -> impl IntoElement {
             .when(!tiling.bottom && !tiling.left, |d| d.rounded_bl(px(CSD_ROUNDING)))
             .when(!tiling.bottom && !tiling.right, |d| d.rounded_br(px(CSD_ROUNDING)))
     };
-    let drag = |_: &MouseDownEvent, window: &mut Window, _: &mut App| {
+    let drag = move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+        if let Some(on_move) = &on_move { on_move(ev, window, cx); }
         window.start_window_move();
     };
     div().size_full().relative().bg(rgba(0x00000000))
