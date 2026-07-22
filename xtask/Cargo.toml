@@ -9,7 +9,7 @@ publish = false
 # platform format out. resvg is pinned to the version already in the tree
 # (gpui ships it), so this costs no new heavy dependency.
 [dependencies]
-resvg = { version = "0.46", default-features = false }
+resvg = { version = "0.47", default-features = false }
 png = "0.18"
-ico = "0.4"
-icns = "0.3"
+ico = "0.5"
+icns = "0.4"

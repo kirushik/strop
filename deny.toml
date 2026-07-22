@@ -20,11 +20,8 @@ ignore = [
     # move to `skrifa` is the real fix). REVISIT by 2027-01, or sooner when the
     # gpui text stack moves.
     "RUSTSEC-2026-0192",
-    # `rustybuzz` unmaintained — transitive (gpui → usvg/resvg); the maintainer
-    # points to `harfrust` as the successor, but the migration is usvg's (and
-    # thus upstream Zed's) to make; no safe upgrade from here. REVISIT by
-    # 2027-01, or sooner when the gpui pin moves.
-    "RUSTSEC-2026-0206",
+    # (`rustybuzz` RUSTSEC-2026-0206 left the graph with the 0.3.1 dependency
+    # refresh — the ignore is gone so deny fails loudly if it ever returns.)
     # `quick-xml 0.39.4` DoS vulns (patched in 0.41) — the "explicit exception"
     # above. Purely transitive and not exposed to documents or remote network
     # input: `wayland-scanner` parses trusted build-time protocol XML, while
