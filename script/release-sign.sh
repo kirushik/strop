@@ -54,9 +54,16 @@ MINISIGN_PUBKEY=${MINISIGN_PUBKEY:-"$(git rev-parse --show-toplevel)/minisign.pu
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-release_id=$(gh release view "$tag" --repo "$repo" --json databaseId,isDraft \
-  --jq 'select(.isDraft == true) | .databaseId') || die "$tag is not a draft"
-[[ -n $release_id ]] || die "$tag is not a draft"
+# Not `gh release view --json databaseId`: that field's name varies
+# across gh versions (2.46 spells it `id`), and a failed field lookup
+# used to die here as "not a draft" — a wrong diagnosis for a tooling
+# gap. The REST list is stable across versions and is authoritative
+# about drafts. $tag is regex-vetted above, safe to splice into jq.
+mapfile -t release_ids < <(gh api --paginate "repos/$repo/releases?per_page=100" \
+  --jq ".[] | select(.draft and .tag_name == \"$tag\") | .id") \
+  || die "could not list releases while resolving the $tag draft"
+(( ${#release_ids[@]} == 1 )) || die "expected exactly one draft for $tag, found ${#release_ids[@]}"
+release_id=${release_ids[0]}
 
 # Exact stage 5/6 inventory derived from .github/workflows/release.yml —
 # keep the two in lockstep: an asset added there must be added here, and
