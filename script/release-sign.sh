@@ -18,6 +18,11 @@ published_die() {
 }
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool '$1' is missing"; }
 for tool in gh jq sha256sum stat minisign git mktemp curl cmp awk; do need "$tool"; done
+# Not just any gh: `gh attestation` shipped in 2.49, and distro builds
+# (Ubuntu ESM carries 2.46) predate it. Discover the gap here, before
+# any verification starts, not five gates in with a confusing usage dump.
+gh attestation --help >/dev/null 2>&1 \
+  || die "this gh ($(gh --version | head -1)) lacks 'gh attestation' (needs >= 2.49) — install the official build from https://cli.github.com"
 repo=kirushik/strop
 
 # usage: release-sign.sh [VERSION] [--sign-only]
