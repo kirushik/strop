@@ -17488,9 +17488,13 @@ impl Editor {
                 // macOS draws its native traffic-light buttons over the top-left of
                 // our (full-size-content) titlebar — recentred by `traffic_light_
                 // position` in main.rs. Reserve their width so the document name
-                // starts to their right instead of underneath them.
+                // starts to their right instead of underneath them. flex_shrink_0
+                // because the reservation must hold even when the row overflows:
+                // the rename editor's fixed-width field plus an error line can
+                // exceed the left third, and a shrinkable spacer would collapse
+                // first — sliding the field under the lights.
                 .when(cfg!(target_os = "macos"), |bar| {
-                    bar.child(div().w(px(76.)).h_full())
+                    bar.child(div().w(px(76.)).h_full().flex_shrink_0())
                 })
                 // (The compost-rail toggle + its presence dot lived here; the
                 // rail died with the Scraps flip — the footer chip is the
@@ -17503,9 +17507,11 @@ impl Editor {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(div().w(px(220.)).child(input.clone()))
+                        // The field keeps its width when space runs out; the
+                        // error line is the one allowed to give way.
+                        .child(div().w(px(220.)).flex_shrink_0().child(input.clone()))
                         .when_some(self.doc_rename_error, |row, error| {
-                            row.child(div().text_color(rgb(ERROR)).child(error))
+                            row.child(div().min_w(px(0.)).text_color(rgb(ERROR)).child(error))
                         })
                         .into_any_element(),
                     (None, Some(store)) => {

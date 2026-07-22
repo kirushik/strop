@@ -7,6 +7,27 @@ versions may still break things).
 
 ## [Unreleased]
 
+### Added
+- **A citizen of your dock** — Strop now feeds the desktop's own recent-files
+  machinery: the Dock menu on macOS, the taskbar jump list on Windows, and
+  the freedesktop recent list on Linux (written carefully — other
+  applications' entries, private flags and all, are preserved to the byte).
+  The launcher's right-click menu gains "New Document" on Linux and macOS,
+  Windows taskbar pinning and grouping key off a proper application
+  identity, and launching from the GNOME shell no longer flashes a
+  placeholder cog before the Strop icon arrives.
+
+### Fixed
+- **macOS**: renaming a document no longer slides the name field underneath
+  the traffic-light buttons when the titlebar runs out of room.
+
+### Changed
+- Dependency refresh: the icon pipeline moves to current resvg/ico/icns,
+  the test-side minisign signer to 0.9.1 (production signature
+  verification is unchanged), plus a workspace-wide sweep of compatible
+  updates — which also retired the unmaintained `rustybuzz` from the
+  dependency tree.
+
 ## [0.3.0] — 2026-07-22
 
 The shipping release. Strop used to arrive as a bare binary in an archive;
