@@ -28,19 +28,54 @@ pub fn add(path: &Path) {
 fn add_at(file: &Path, path: &Path) -> io::Result<()> {
     let uri = file_uri(path)?;
     let now = timestamp();
+    // The user may point recently-used.xbel at a shared location via a
+    // symlink; rename() would replace the link itself and strand the
+    // target, so all work happens on the resolved destination. A dangling
+    // or unresolvable link is a skip, never a clobber.
+    let file: PathBuf = match std::fs::canonicalize(file) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => file.to_owned(),
+        Err(error) => return Err(error),
+    };
+    let Some(dir) = file.parent() else { return Err(io::Error::other("XBEL path has no parent")) };
+    std::fs::create_dir_all(dir)?;
+    // One Strop process per document means two saves can race this file;
+    // an exclusive advisory lock (our own processes only — GTK does not
+    // lock, matching its own single-writer assumption) makes the whole
+    // read-modify-rename a transaction, so neither writer loses the
+    // other's bookmark. The lock file is permanent litter by design:
+    // removing it would reopen the race it exists to close.
+    let lock_path = dir.join(".recently-used.xbel.strop.lock");
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false)
+        .open(&lock_path)?;
+    fs4::fs_std::FileExt::lock_exclusive(&lock)?;
+    let result = locked_add(&file, dir, &uri, &now, path);
+    let _ = fs4::fs_std::FileExt::unlock(&lock);
+    result
+}
+
+fn locked_add(file: &Path, dir: &Path, uri: &str, now: &str, path: &Path) -> io::Result<()> {
     let source = match std::fs::read(file) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => fresh().into_bytes(),
         Err(error) => return Err(error),
     };
-    let output = update(&source, &uri, &now, path.extension().is_some_and(|ext| ext == "md"))
+    let output = update(&source, uri, now, path.extension().is_some_and(|ext| ext == "md"))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let Some(dir) = file.parent() else { return Err(io::Error::other("XBEL path has no parent")) };
-    std::fs::create_dir_all(dir)?;
     let temp = dir.join(format!(".recently-used.xbel.strop-{}-{}.tmp", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()));
     let result = (|| {
-        let mut handle = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        // 0600 always: the desktop-wide recent list is a privacy surface
+        // (GTK creates it 0600 for the same reason), and a umask-default
+        // 0644 replacement would open the user's document history to
+        // other local accounts.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut handle = options.open(&temp)?;
         handle.write_all(&output)?;
         handle.sync_all()?;
         std::fs::rename(&temp, file)?;
@@ -129,11 +164,16 @@ fn attribute(event: &BytesStart<'_>, name: &[u8]) -> Option<String> {
 }
 
 fn replace_attrs(event: &mut BytesStart<'_>, now: &str, count: Option<u64>) {
-    let attrs: Vec<(Vec<u8>, String)> = event.attributes().with_checks(false).filter_map(Result::ok)
-        .filter(|a| !matches!(a.key.local_name().as_ref(), b"modified" | b"visited" | b"timestamp" | b"count"))
-        .map(|a| (a.key.as_ref().to_vec(), a.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default().into_owned())).collect();
+    // Untouched attributes pass through as RAW bytes — decoding entities
+    // (normalized_value) and pushing the decoded text back as a byte
+    // slice would re-emit `&` unescaped, corrupting the shared file for
+    // every other reader. Only the exact unprefixed XBEL bookkeeping
+    // attributes are replaced; a namespaced foo:count is foreign data.
+    let attrs: Vec<(Vec<u8>, Vec<u8>)> = event.attributes().with_checks(false).filter_map(Result::ok)
+        .filter(|a| !matches!(a.key.as_ref(), b"modified" | b"visited" | b"timestamp" | b"count"))
+        .map(|a| (a.key.as_ref().to_vec(), a.value.into_owned())).collect();
     event.clear_attributes();
-    for (key, value) in &attrs { event.push_attribute((key.as_slice(), value.as_bytes())); }
+    for (key, value) in &attrs { event.push_attribute((key.as_slice(), value.as_slice())); }
     if count.is_some() { event.push_attribute(("timestamp", now)); } else {
         event.push_attribute(("modified", now)); event.push_attribute(("visited", now));
     }
@@ -172,7 +212,21 @@ fn file_uri(path: &Path) -> io::Result<String> {
     #[cfg(not(unix))] let owned = path.to_string_lossy().into_owned();
     #[cfg(not(unix))] let bytes = owned.as_bytes();
     let mut uri = String::from("file://");
-    for &byte in bytes { if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') { uri.push(byte as char); } else { uri.push_str(&format!("%{byte:02X}")); } }
+    // The allowed set mirrors GLib's g_filename_to_uri (unreserved +
+    // sub-delims + ':' '@' for paths): diverging from it — e.g. escaping
+    // ':' that GTK leaves bare — makes the same file dedupe-miss against
+    // a GTK-written bookmark and collect duplicate entries.
+    for &byte in bytes {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~'
+                | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*'
+                | b'+' | b',' | b';' | b'=' | b':' | b'@')
+        {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
     Ok(uri)
 }
 
@@ -234,5 +288,68 @@ mod tests {
         let dir = temp("atomic"); let file = dir.join("recently-used.xbel"); let doc = dir.join("Draft.strop"); std::fs::write(&doc, b"").unwrap();
         add_at(&file, &doc).unwrap(); assert!(file.exists());
         assert!(std::fs::read_dir(dir).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
+    fn the_recent_list_stays_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp("mode"); let file = dir.join("recently-used.xbel"); let doc = dir.join("Draft.strop"); std::fs::write(&doc, b"").unwrap();
+        add_at(&file, &doc).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_symlinked_recent_list_updates_its_target_not_the_link() {
+        let dir = temp("symlink"); let target = dir.join("real.xbel");
+        let link = dir.join("recently-used.xbel"); let doc = dir.join("Draft.strop");
+        std::fs::write(&doc, b"").unwrap(); std::fs::write(&target, fresh()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        add_at(&link, &doc).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::read_to_string(&target).unwrap().contains("name=\"Strop\""));
+    }
+
+    #[test]
+    fn foreign_entities_survive_the_dedupe_rewrite_byte_faithfully() {
+        let dir = temp("entities"); let file = dir.join("recently-used.xbel"); let doc = dir.join("Draft.strop"); std::fs::write(&doc, b"").unwrap();
+        // Our own bookmark carrying a foreign escaped attribute: the dedupe
+        // path rewrites this element's bookkeeping attrs and must NOT
+        // decode-without-re-encoding its neighbors.
+        add_at(&file, &doc).unwrap();
+        let uri = file_uri(&doc).unwrap();
+        let xml = std::fs::read_to_string(&file).unwrap()
+            .replace(&format!("href=\"{uri}\""), &format!("href=\"{uri}\" x-note=\"A &amp; B\""));
+        std::fs::write(&file, xml).unwrap();
+        add_at(&file, &doc).unwrap();
+        let xml = std::fs::read_to_string(&file).unwrap();
+        assert!(xml.contains("x-note=\"A &amp; B\""), "entity was decoded without re-encoding: {xml}");
+        assert!(Reader::from_str(&xml).read_event().is_ok());
+    }
+
+    #[test]
+    fn uri_escaping_matches_gtk_for_shared_dedupe() {
+        let dir = temp("uri"); let doc = dir.join("Draft:final+notes.strop"); std::fs::write(&doc, b"").unwrap();
+        let uri = file_uri(&doc).unwrap();
+        // GLib leaves ':' and '+' bare in file URIs; escaping them would
+        // make the same file dedupe-miss against a GTK-written bookmark.
+        assert!(uri.ends_with("/Draft:final+notes.strop"), "{uri}");
+        assert!(!uri.contains("%3A") && !uri.contains("%2B"), "{uri}");
+    }
+
+    #[test]
+    fn concurrent_writers_lose_no_bookmarks() {
+        let dir = temp("race"); let file = dir.join("recently-used.xbel");
+        let docs: Vec<_> = (0..8).map(|i| dir.join(format!("Doc{i}.strop"))).collect();
+        for doc in &docs { std::fs::write(doc, b"").unwrap(); }
+        std::thread::scope(|scope| {
+            for doc in &docs {
+                scope.spawn(|| add_at(&file, doc).unwrap());
+            }
+        });
+        let xml = std::fs::read_to_string(&file).unwrap();
+        for doc in &docs {
+            let uri = file_uri(doc).unwrap();
+            assert!(xml.contains(&format!("href=\"{uri}\"")), "lost {uri}");
+        }
     }
 }
