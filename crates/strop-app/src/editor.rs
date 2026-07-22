@@ -17425,15 +17425,28 @@ impl Editor {
             // The svg's ink is its own (no text-color cascade), so the
             // hover brightening rides a group.
             .group(icon_path)
-            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
             .tooltip(tip(tip_label, chord))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 action(window, cx);
             })
+            // The hitbox is the whole cell (generous target); the hover wash
+            // is a 26px rounded square centred on the mark — an edge-to-edge
+            // wash reads as a rendering artifact, not a control (the aux
+            // windows' 68px header made that painfully visible).
             .child(
-                icon(icon_path, 13., MUTED_COLOR)
-                    .group_hover(icon_path, |s| s.text_color(rgb(TEXT_COLOR))),
+                div()
+                    .w(px(26.))
+                    .h(px(26.))
+                    .rounded(px(5.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .group_hover(icon_path, |d| d.bg(rgba(0x1A1A180Au32)))
+                    .child(
+                        icon(icon_path, 13., MUTED_COLOR)
+                            .group_hover(icon_path, |s| s.text_color(rgb(TEXT_COLOR))),
+                    ),
             )
     }
 

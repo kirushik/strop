@@ -197,7 +197,12 @@ impl Render for AboutWindow {
             .child(div().id("about-licenses").h(px(LICENSE_HEIGHT)).overflow_y_scroll()
                 .p(px(10.)).border_1().border_color(rgb(RULE_COLOR)).bg(rgb(0xFFFDF9))
                 .font_family("PT Mono").text_size(px(10.)).line_height(px(15.))
-                .children(self.chunks.iter().cloned().map(|chunk| div().child(chunk))))
+                .children(self.chunks.iter().cloned().map(|chunk| div().child(chunk)))
+                // For the one reader in ten thousand who scrolls every license
+                // to the floor: a quiet nod, in serif, where only they will
+                // ever stand. Sought, never announced.
+                .child(div().mt(px(15.)).font_family("PT Serif").text_color(rgb(MUTED_COLOR))
+                    .child("You read all of it. The blade is yours.")))
             .child(div().mt(px(12.)).text_size(px(11.)).child(backups_text(backup_count())))
             .child(div().mt(px(16.)).font_family("PT Serif").text_size(px(11.))
                 .text_color(rgb(MUTED_COLOR)).child(format!(

@@ -135,12 +135,19 @@ pub fn titlebar(
             div().flex().items_center().h_full()
                 .when_some(trailing, |d, trailing| d.child(trailing))
                 .when(client, |d| d.child(
+                    // Full-height hitbox, but the hover wash is the same 26px
+                    // rounded square the editor's window controls wear — in a
+                    // 68px header the old edge-to-edge wash was a floor-to-
+                    // ceiling sliver that read as a glitch.
                     div().id(close_id).occlude().ml(px(14.)).w(px(28.)).h_full()
                         .flex().items_center().justify_center().cursor(CursorStyle::PointingHand)
-                        .group(close_group).hover(|d| d.bg(rgba(0x1A1A180A)))
+                        .group(close_group)
                         .on_mouse_down(MouseButton::Left, close)
-                        .child(icon(icons::WIN_CLOSE, 13., 0x716D66)
-                            .group_hover(close_group, |s| s.text_color(rgb(0x242321))))
+                        .child(div().w(px(26.)).h(px(26.)).rounded(px(5.))
+                            .flex().items_center().justify_center()
+                            .group_hover(close_group, |d| d.bg(rgba(0x1A1A180A)))
+                            .child(icon(icons::WIN_CLOSE, 13., 0x716D66)
+                                .group_hover(close_group, |s| s.text_color(rgb(0x242321)))))
                 )),
         )
 }
