@@ -31,10 +31,20 @@ fn add_at(file: &Path, path: &Path) -> io::Result<()> {
     // The user may point recently-used.xbel at a shared location via a
     // symlink; rename() would replace the link itself and strand the
     // target, so all work happens on the resolved destination. A dangling
-    // or unresolvable link is a skip, never a clobber.
+    // or unresolvable link is a skip, never a clobber — canonicalize
+    // reports a dangling link as NotFound, same as a genuinely absent
+    // file, so the two cases are told apart by symlink_metadata before
+    // NotFound may mean "fresh file, safe to create".
     let file: PathBuf = match std::fs::canonicalize(file) {
         Ok(resolved) => resolved,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => file.to_owned(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(file)
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Ok(());
+            }
+            file.to_owned()
+        }
         Err(error) => return Err(error),
     };
     let Some(dir) = file.parent() else { return Err(io::Error::other("XBEL path has no parent")) };
@@ -296,6 +306,17 @@ mod tests {
         let dir = temp("mode"); let file = dir.join("recently-used.xbel"); let doc = dir.join("Draft.strop"); std::fs::write(&doc, b"").unwrap();
         add_at(&file, &doc).unwrap();
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_skipped_never_replaced() {
+        let dir = temp("dangling"); let link = dir.join("recently-used.xbel");
+        let doc = dir.join("Draft.strop"); std::fs::write(&doc, b"").unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere.xbel"), &link).unwrap();
+        add_at(&link, &doc).unwrap();
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the dangling link was replaced");
+        assert!(!dir.join("nowhere.xbel").exists());
     }
 
     #[test]
