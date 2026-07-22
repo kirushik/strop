@@ -54,6 +54,27 @@ use editor::Editor;
 
 actions!(strop, [Quit, AboutStrop, CheckForUpdates, DockNewDocument]);
 
+/// Minimal %XX decoder for the file:// URLs the OS hands to
+/// `on_open_urls`. Any malformed escape rejects the whole URL — better
+/// no window than a mangled path.
+fn percent_decode(input: &str) -> Result<String, ()> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok())
+                .ok_or(())?;
+            out.push(u8::from_str_radix(hex, 16).map_err(|_| ())?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| ())
+}
+
 fn register_unhandled_quit(
     cx: &mut App,
     listener: impl Fn(&mut App) + 'static,
@@ -184,7 +205,23 @@ fn main() {
     // gpui_platform::application() replaced gpui::Application::new() after
     // the facade/platform crate split. The asset source feeds gpui's svg()
     // pipeline the embedded icon plate (docs/iconography.md).
-    gpui_platform::application().with_assets(icons::StropAssets).run(|cx: &mut App| {
+    let app = gpui_platform::application().with_assets(icons::StropAssets);
+    // macOS delivers Open Recent / Dock-recents selections to the RUNNING
+    // process as application:openURLs: — without this registration those
+    // clicks would silently do nothing. One process per document: each
+    // URL becomes its own spawn, and the rendezvous socket routes
+    // already-open documents to their holder.
+    app.on_open_urls(|urls| {
+        let Ok(exe) = std::env::current_exe() else { return };
+        for url in urls {
+            if let Some(path) = url.strip_prefix("file://")
+                && let Ok(path) = percent_decode(path)
+            {
+                let _ = std::process::Command::new(&exe).arg(path).spawn();
+            }
+        }
+    });
+    app.run(|cx: &mut App| {
         cx.text_system()
             .add_fonts(vec![
                 PT_SERIF.into(),
@@ -237,6 +274,12 @@ fn main() {
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         register_unhandled_quit(cx, |cx| cx.quit());
         cx.on_action(|_: &DockNewDocument, _| files::new_window_blank());
+        // macOS only: gpui's Windows backend turns a dock menu into Jump
+        // List tasks whose argv (`--dock-action N`) our CLI would parse as
+        // a document path — and Windows already gets its Recent jump list
+        // from SHAddToRecentDocs, Linux its quicklist from the .desktop
+        // Actions entry.
+        #[cfg(target_os = "macos")]
         cx.set_dock_menu(vec![gpui::MenuItem::action("New Document", DockNewDocument)]);
 
         // Smoke runs must not steal the user's OS focus — keystroke dispatch

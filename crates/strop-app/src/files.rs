@@ -232,6 +232,15 @@ pub fn push_recent(path: &Path) {
 }
 
 pub fn add_platform_recent(path: &Path, cx: &gpui::App) {
+    // The OS recent lists must never learn a path that isn't real yet:
+    // a fresh --new document and a lazily-imported .md both open over a
+    // not-yet-materialized .strop path, and publishing it would plant a
+    // permanently broken entry in the user's desktop history. (The
+    // in-app recents list keeps its own rules; it heals missing paths
+    // at read.) Such documents register on their first rename instead.
+    if !path.exists() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     cx.add_recent_document(path);
     #[cfg(target_os = "windows")]

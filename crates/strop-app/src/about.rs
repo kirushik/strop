@@ -77,7 +77,10 @@ mod pendulum {
         let theta = (pointer.0 - pivot.0)
             .atan2(pointer.1 - pivot.1)
             .clamp(-LIMIT, LIMIT);
-        let omega = if dt > 0. { (theta - state.theta) / dt } else { 0. };
+        // A fast flick over one 8ms mouse sample would otherwise derive
+        // tens of rad/s and slam the release into the ±75° clamp; the
+        // hand's throw is bounded like every other drive.
+        let omega = if dt > 0. { ((theta - state.theta) / dt).clamp(-6., 6.) } else { 0. };
         clamp(State { theta, omega })
     }
 
@@ -355,11 +358,14 @@ impl Render for AboutWindow {
                 .border_t_1().border_color(rgb(RULE_COLOR))
                 .flex().items_center().justify_between()
                 .child(status.unwrap_or_default())
-                .child(div().id("about-check").px(px(10.)).py(px(5.)).rounded(px(4.))
+                // occlude + stop_propagation: without them the click ALSO
+                // starts a whole-window drag (and Windows caption hit-testing
+                // may swallow it entirely) — same arrangement as the links.
+                .child(div().id("about-check").occlude().px(px(10.)).py(px(5.)).rounded(px(4.))
                     .border_1().border_color(rgb(RULE_COLOR))
                     .text_color(rgb(if enabled { TEXT_COLOR } else { MUTED_COLOR }))
                     .when(enabled, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left,
-                        |_: &MouseDownEvent, _, _| update::check_now()))
+                        |_: &MouseDownEvent, _, cx| { cx.stop_propagation(); update::check_now(); }))
                     .child("Check now"))))
             .when_some(notes, |d, url| d.child(
                 link("about-notes", url.clone(), url).mt(px(5.))))
@@ -472,7 +478,16 @@ pub fn open(
         window.focus(&view.focus_handle(cx), cx);
         let weak = view.downgrade();
         cx.spawn(async move |cx| loop {
-            cx.background_executor().timer(Duration::from_secs(30)).await;
+            // The row is an indicator (P12): while a check is in flight its
+            // state changes on a worker thread, so the refresh tightens to
+            // 500ms — the 30s cadence is only for aging the "checked N ago"
+            // line at rest.
+            let interval = if matches!(update::status(), UpdateState::Checking) {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(30)
+            };
+            cx.background_executor().timer(interval).await;
             if weak.update(cx, |_, cx| cx.notify()).is_err() { break; }
         }).detach();
         let close_editor = editor.clone();

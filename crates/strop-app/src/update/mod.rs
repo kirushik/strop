@@ -235,6 +235,11 @@ fn check_cycle(fetcher: &dyn fetch::Fetcher) {
             set_status(UpdateState::Available { version: version.to_string() });
             return Ok(());
         }
+        // Self-update channels past this point; the validator guarantees
+        // them a resolved target.
+        let Some(target) = target else {
+            return Err("this channel has no update target".into());
+        };
         set_status(UpdateState::Available { version: version.to_string() });
         // Already staged and intact? Spend zero bytes — a healthy client
         // that hasn't relaunched yet must not re-download the artifact

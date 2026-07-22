@@ -10225,6 +10225,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Ensure-open, never toggle: AboutStrop owns the toggle grammar,
+        // but "check for updates" with About already open must bring the
+        // updater's one surface forward, not remove it mid-request.
+        if let Some(reference) = self.about_window {
+            if reference.update(cx, |_, about_window, _| {
+                about_window.activate_window();
+            }).is_ok() {
+                crate::update::check_now();
+                return;
+            }
+        }
         self.show_about(&crate::AboutStrop, window, cx);
         crate::update::check_now();
     }
@@ -17530,11 +17541,15 @@ impl Editor {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        // The field keeps its width when space runs out; the
-                        // error line is the one allowed to give way.
-                        .child(div().w(px(220.)).flex_shrink_0().child(input.clone()))
+                        // The traffic-light spacer is the only rigid member:
+                        // the field may give down to a still-usable 120px
+                        // (at 960px the left third can't fit spacer + full
+                        // field + error at once), and the error line
+                        // truncates rather than wrapping out of the bar.
+                        .child(div().w(px(220.)).min_w(px(120.)).child(input.clone()))
                         .when_some(self.doc_rename_error, |row, error| {
-                            row.child(div().min_w(px(0.)).text_color(rgb(ERROR)).child(error))
+                            row.child(div().min_w(px(0.)).overflow_hidden()
+                                .whitespace_nowrap().text_color(rgb(ERROR)).child(error))
                         })
                         .into_any_element(),
                     (None, Some(store)) => {
