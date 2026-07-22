@@ -58,7 +58,7 @@ windows-sys = { workspace = true }
 
 [dev-dependencies]
 # Test-only minisign *signing* — production only ever verifies.
-minisign = "0.7"
+minisign = "0.9"
 gpui = { workspace = true, features = ["test-support"] }
 ttf-parser = "0.25"
 proptest = "1"
