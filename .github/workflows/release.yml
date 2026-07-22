@@ -233,13 +233,13 @@ jobs:
           body: |
             > **Install note.** These binaries are built and uploaded straight
             > from tagged CI, each carrying a verifiable [build-provenance
-            > attestation](https://github.com/kirushik/strop/attestations). When
-            > a platform is not OS-code-signed, Windows SmartScreen shows an
-            > unknown-publisher prompt (choose *More info → Run anyway*) and
-            > macOS Gatekeeper needs a manual override — expected, not a
-            > compromise. Updates verify against Strop's own embedded key
-            > regardless of OS signing. Linux is the primary runtime-tested
-            > platform.
+            > attestation](https://github.com/kirushik/strop/attestations).
+            > macOS builds are Developer-ID signed and notarized. Windows
+            > builds are not yet OS-code-signed, so SmartScreen shows an
+            > unknown-publisher prompt (choose *More info → Run anyway*) —
+            > expected, not a compromise. Updates verify against Strop's own
+            > embedded key regardless of OS signing. Linux is the primary
+            > runtime-tested platform.
 
   manifest:
     needs: draft

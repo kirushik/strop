@@ -7,6 +7,68 @@ versions may still break things).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-22
+
+The shipping release. Strop used to arrive as a bare binary in an archive;
+0.3.0 makes it something you install, something that proves where it came
+from, and something that keeps itself current. Real packages on every
+platform, macOS builds signed and notarized, every artifact carrying a
+verifiable build attestation, quiet self-updates checked against a signing
+key baked into the app — and, underneath, a draft that backs itself up
+before anything else touches it. The writing room moved too: footnotes
+reached the book page, the keyboard map got a room of its own, and the
+clipboard finally carries structure.
+
+### Added
+- **Quiet self-updates** — builds installed from GitHub releases check for
+  a new version in the background and say so in one calm line. The update
+  manifest is signed (minisign) and verified against a public key compiled
+  into the binary — no key on disk, no env var, nothing to misplace.
+  Downloads are size-capped, verified by hash, staged, and applied on the
+  next start; a failed attempt is remembered and never retried in a loop.
+  Package-manager builds never self-update.
+- **About** — a real colophon: version and commit, the licenses Strop
+  stands on, and a "check for updates" that shows what it's doing. Opens
+  from the palette.
+- **Real packages** — `.deb` and `.rpm` with desktop entry, icons and file
+  association; a signed, notarized macOS `.dmg`; a Windows installer with
+  honest uninstall. Runtime assets (the reading-room fonts, hyphenation
+  patterns) ship beside the binary in every one of them.
+- **Provenance you can check** — every release asset carries a GitHub
+  build attestation (`gh attestation verify`), and macOS builds are
+  Developer-ID signed and stapled. Windows binaries are unsigned this
+  release — SmartScreen will warn, and the README says so plainly instead
+  of pretending otherwise.
+- **Backup at open** — before a document is touched, the previous on-disk
+  state is preserved; the ledger survives torn writes and crashes
+  mid-save. The draft is sacred.
+- **The keyboard map's own room** — the shortcut map left its overlay and
+  became a window you can keep open beside your work.
+- **Footnotes on the book page** — the reading room renders footnote
+  definitions by print convention, at the foot of the page they belong to.
+- **A clipboard that keeps structure** — what you cut is what you paste:
+  headings, lists, code and captions survive the round trip, in and out.
+
+### Changed
+- **One identity everywhere** — the app is `cc.pimenov.strop` across
+  desktop entries, bundles, installers and the single-instance socket.
+- **The dock under law** — the editor's dock parks gracefully at either
+  rail and rides the history scrub instead of fighting it.
+- **Welcome, brought current** — new sections for pictures, scraps and
+  the reading room; the strip explained as the seek bar it is.
+
+### Fixed
+- Files opened through portals (Flatpak-style document mounts) resolve to
+  their real paths at every door — the file stays where you put it, and
+  a moved or renamed draft no longer risks saving to a stale location.
+- Wrapped lines in the reading room hold their punctuation at the break.
+- Footnote reserves respect their bounds; the two-page spread no longer
+  copies the book's convergence behaviour where it shouldn't.
+- The keyboard-map window earned correct chrome: client-side decorations
+  where the compositor offers none, one quit path, the right display.
+- Margin chrome shares one geometry; the active band's bottom edge sits
+  exactly on the squiggle it belongs to.
+
 ## [0.2.0] — 2026-07-15
 
 The interface release. The writing–editing–checkpointing loop that 0.1 kept in
@@ -211,7 +273,8 @@ unverified and unsigned.
 - Configuration via `~/.config/strop/config.toml`.
 - GPL-3.0-or-later. Supply-chain gating (cargo-deny) and three-OS CI.
 
-[Unreleased]: https://github.com/kirushik/strop/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kirushik/strop/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kirushik/strop/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kirushik/strop/releases/tag/v0.2.0
 [0.1.1]: https://github.com/kirushik/strop/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kirushik/strop/releases/tag/v0.1.0
