@@ -251,8 +251,13 @@ jobs:
       - name: stage 6 — download draft bytes and emit the exact manifest
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
-          ver=${GITHUB_REF_NAME#v}; mkdir assets
-          gh release download "$GITHUB_REF_NAME" --dir assets
+          # Draft bytes stage OUTSIDE the checkout: the repo has its own
+          # assets/ (a bare mkdir died here on v0.3.0's first cut), and a
+          # merged directory would sweep repo files into stage 7's
+          # attestation as release payloads.
+          dl="$RUNNER_TEMP/draft"; mkdir "$dl"
+          ver=${GITHUB_REF_NAME#v}
+          gh release download "$GITHUB_REF_NAME" --dir "$dl"
           win=strop-$ver-x86_64-pc-windows-msvc.exe
           mac=strop-$ver-aarch64-apple-darwin-app.tar.gz
           # Deployed clients hard-refuse artifacts over 256 MiB and manifests
@@ -260,13 +265,13 @@ jobs:
           # A release that outgrows the caps would strand every installed
           # client on its current version — fail the pipeline instead.
           for f in "$win" "$mac"; do
-            size=$(stat -c %s "assets/$f")
+            size=$(stat -c %s "$dl/$f")
             (( size > 0 && size <= 256*1024*1024 )) || { echo "$f is $size bytes — outside the clients' (0, 256 MiB] cap" >&2; exit 1; }
           done
-          entry() { jq -n --arg url "https://github.com/kirushik/strop/releases/download/$GITHUB_REF_NAME/$1" --arg hash "$(sha256sum "assets/$1"|cut -d' ' -f1)" --argjson size "$(stat -c %s "assets/$1")" '{url:$url,sha256:$hash,size:$size}'; }
-          jq -n --arg version "$ver" --arg date "$(date -u -d "$(git log -1 --format=%cI HEAD)" +%Y-%m-%dT%H:%M:%SZ)" --arg notes "https://github.com/kirushik/strop/releases/tag/$GITHUB_REF_NAME" --argjson win "$(entry "$win")" --argjson mac "$(entry "$mac")" '{product:"strop",updater_protocol:1,version:$version,pub_date:$date,notes_url:$notes,targets:{"github-win/x86_64-pc-windows-msvc/exe":$win,"github-mac/aarch64-apple-darwin/app-tar":$mac}}' > assets/latest.json
-          (( $(stat -c %s assets/latest.json) <= 1024*1024 )) || { echo "latest.json exceeds the clients' 1 MiB manifest cap" >&2; exit 1; }
-          gh release upload "$GITHUB_REF_NAME" assets/latest.json --clobber
+          entry() { jq -n --arg url "https://github.com/kirushik/strop/releases/download/$GITHUB_REF_NAME/$1" --arg hash "$(sha256sum "$dl/$1"|cut -d' ' -f1)" --argjson size "$(stat -c %s "$dl/$1")" '{url:$url,sha256:$hash,size:$size}'; }
+          jq -n --arg version "$ver" --arg date "$(date -u -d "$(git log -1 --format=%cI HEAD)" +%Y-%m-%dT%H:%M:%SZ)" --arg notes "https://github.com/kirushik/strop/releases/tag/$GITHUB_REF_NAME" --argjson win "$(entry "$win")" --argjson mac "$(entry "$mac")" '{product:"strop",updater_protocol:1,version:$version,pub_date:$date,notes_url:$notes,targets:{"github-win/x86_64-pc-windows-msvc/exe":$win,"github-mac/aarch64-apple-darwin/app-tar":$mac}}' > "$dl/latest.json"
+          (( $(stat -c %s "$dl/latest.json") <= 1024*1024 )) || { echo "latest.json exceeds the clients' 1 MiB manifest cap" >&2; exit 1; }
+          gh release upload "$GITHUB_REF_NAME" "$dl/latest.json" --clobber
       - name: stage 7 — attest only immutable final payloads
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
-        with: { subject-path: "assets/*" }
+        with: { subject-path: "${{ runner.temp }}/draft/*" }

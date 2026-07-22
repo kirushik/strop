@@ -772,7 +772,14 @@ a time; never process two version tags concurrently.
 - **Platform build fails** → fix on a branch, merge, delete the draft if
   one was created, re-run by re-pushing the tag only if the tag still
   points at the released SHA; otherwise re-cut a higher version. Never
-  build a release from a moved tag.
+  build a release from a moved tag. *Draft-only carve-out (invoked for
+  v0.3.0's first cut, 2026-07-22):* while nothing has been signed or
+  published — the release still a draft, `release-sign.sh` never run —
+  the version number is not yet spent. Delete the draft AND the tag,
+  land the fix, and re-cut the same version at the new commit. That is
+  not a moved tag; it is an unreleased one. The carve-out closes the
+  moment a signature is uploaded or the release goes public: from then
+  on, higher version only.
 - **Notarization times out / runner killed** → Apple keeps processing the
   submission. Re-running the mac job uploads an identical bundle and gets
   a fresh submission; that wastes a slot but is safe. Check
