@@ -262,4 +262,44 @@ mod tests {
         assert_eq!(toggle_decision(false), ToggleDecision::Open);
         assert_eq!(toggle_decision(true), ToggleDecision::CloseAndRestore);
     }
+
+    struct MoveHookSurface {
+        kicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for MoveHookSurface {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let kicks = self.kicks.clone();
+            // Mirrors the About window's drag-kick hook: mutate state, then
+            // refresh(). The draw-phase sibling (request_animation_frame)
+            // asserts outside layout/prepaint/paint and panicked debug
+            // builds from exactly this dispatch path. The real shell can't
+            // mount here — the test platform leaves start_window_move
+            // unimplemented — so this pins the handler-context contract on
+            // the same on_mouse_down dispatch the shell uses.
+            div().size_full()
+                .window_control_area(WindowControlArea::Drag)
+                .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                    kicks.set(kicks.get() + 1);
+                    window.refresh();
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn move_hook_shape_survives_real_mouse_dispatch(
+        cx: &mut TestAppContext,
+    ) {
+        let kicks = Rc::new(Cell::new(0));
+        let window = cx.update({
+            let kicks = kicks.clone();
+            move |cx| cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| MoveHookSurface { kicks })
+            }).unwrap()
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_mouse_down(gpui::point(gpui::px(200.), gpui::px(200.)),
+            gpui::MouseButton::Left, gpui::Modifiers::default());
+        assert_eq!(kicks.get(), 1);
+    }
 }

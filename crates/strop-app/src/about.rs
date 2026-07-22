@@ -426,7 +426,13 @@ impl Render for AboutWindow {
                 let mut motion = motion.borrow_mut();
                 motion.state = pendulum::impulse(motion.state, kick);
                 motion.last_frame = Some(Instant::now());
-                window.request_animation_frame();
+                // refresh(), NOT request_animation_frame(): this runs in a
+                // mouse-down handler, and draw-phase APIs assert (and panic
+                // debug builds) outside layout/prepaint/paint. refresh()
+                // self-guards, marks the window dirty, and render's own
+                // in-motion request_animation_frame loop takes over from
+                // the next frame.
+                window.refresh();
             })))
     }
 }

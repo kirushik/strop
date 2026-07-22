@@ -10228,13 +10228,13 @@ impl Editor {
         // Ensure-open, never toggle: AboutStrop owns the toggle grammar,
         // but "check for updates" with About already open must bring the
         // updater's one surface forward, not remove it mid-request.
-        if let Some(reference) = self.about_window {
-            if reference.update(cx, |_, about_window, _| {
+        if let Some(reference) = self.about_window
+            && reference.update(cx, |_, about_window, _| {
                 about_window.activate_window();
-            }).is_ok() {
-                crate::update::check_now();
-                return;
-            }
+            }).is_ok()
+        {
+            crate::update::check_now();
+            return;
         }
         self.show_about(&crate::AboutStrop, window, cx);
         crate::update::check_now();
