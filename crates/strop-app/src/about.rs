@@ -45,14 +45,18 @@ fn age_text(last_check: SystemTime, now: SystemTime) -> String {
     }
 }
 
-pub fn update_text(state: &UpdateState, now: SystemTime) -> Option<String> {
+pub fn update_text(state: &UpdateState, channel: Channel, now: SystemTime) -> Option<String> {
     match state {
         UpdateState::Inert => None,
         UpdateState::Disabled => Some("update checks are off ([update] in config.toml)".into()),
         UpdateState::Idle { last_check: None } => Some("not checked yet".into()),
         UpdateState::Idle { last_check: Some(at) } => Some(age_text(*at, now)),
         UpdateState::Checking => Some("checking…".into()),
-        UpdateState::Available { version } => Some(format!("{version} is out")),
+        UpdateState::Available { version } => match channel {
+            Channel::Deb | Channel::Rpm | Channel::Flathub => Some(format!(
+                "Strop {version} is available — it arrives through your package manager.")),
+            _ => Some(format!("{version} is out")),
+        },
         UpdateState::Staged { version } => {
             Some(format!("{version} downloaded — next launch gets it"))
         }
@@ -141,7 +145,7 @@ impl Render for AboutWindow {
         // point at the config, with the button muted.
         let show_updater = !matches!(state, UpdateState::Inert);
         let enabled = !matches!(state, UpdateState::Inert | UpdateState::Disabled);
-        let status = update_text(&state, SystemTime::now());
+        let status = update_text(&state, update::channel(), SystemTime::now());
         let notes = match &state {
             UpdateState::AppliedThisLaunch { notes_url, .. } => Some(notes_url.clone()),
             _ => None,
@@ -314,7 +318,18 @@ mod tests {
             (UpdateState::Failed { attempted: Some("0.3.2".into()), kept: "0.3.1".into(), reason: "x".into() }, Some("couldn't apply 0.3.2 — kept 0.3.1")),
             (UpdateState::Failed { attempted: None, kept: "0.3.1".into(), reason: "x".into() }, Some("couldn't check for updates — running 0.3.1")),
         ];
-        for (state, expected) in cases { assert_eq!(update_text(&state, now).as_deref(), expected); }
+        for (state, expected) in cases {
+            assert_eq!(update_text(&state, Channel::GithubLinux, now).as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn package_manager_available_state_names_the_delivery_path() {
+        let state = UpdateState::Available { version: "0.3.2".into() };
+        for channel in [Channel::Deb, Channel::Rpm, Channel::Flathub] {
+            assert_eq!(update_text(&state, channel, SystemTime::UNIX_EPOCH).as_deref(),
+                Some("Strop 0.3.2 is available — it arrives through your package manager."));
+        }
     }
 
     #[test]

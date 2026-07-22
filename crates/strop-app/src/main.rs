@@ -52,7 +52,7 @@ use strop_core::document::{BlockMap, SpanSet};
 use draw_guard::EntityUpdateExt as _;
 use editor::Editor;
 
-actions!(strop, [Quit, AboutStrop, DockNewDocument]);
+actions!(strop, [Quit, AboutStrop, CheckForUpdates, DockNewDocument]);
 
 fn register_unhandled_quit(
     cx: &mut App,

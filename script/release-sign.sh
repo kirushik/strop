@@ -76,8 +76,8 @@ release_id=${release_ids[0]}
 # Windows portable ZIP, cut 2026-07-21) is a fatal discrepancy.
 expected=(
   "strop-$version-x86_64-unknown-linux-gnu.tar.gz"
-  "strop-app_${version}-1_amd64.deb"
-  "strop-app-${version}-1.x86_64.rpm"
+  "strop_${version}-1_amd64.deb"
+  "strop-${version}-1.x86_64.rpm"
   "strop-$version-aarch64-apple-darwin.dmg"
   "strop-$version-aarch64-apple-darwin-app.tar.gz"
   "strop-$version-x86_64-pc-windows-msvc.exe"

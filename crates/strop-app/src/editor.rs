@@ -10219,6 +10219,16 @@ impl Editor {
             cx.entity(), window.window_handle(), window.bounds(), cx);
     }
 
+    fn check_for_updates(
+        &mut self,
+        _: &crate::CheckForUpdates,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_about(&crate::AboutStrop, window, cx);
+        crate::update::check_now();
+    }
+
     pub(crate) fn keymap_closed(&mut self) {
         self.aux_closed(AuxSlot::Keymap);
     }
@@ -22803,6 +22813,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::show_shortcuts))
             .on_action(cx.listener(Self::show_about))
+            .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::open_welcome))
             .on_action(cx.listener(Self::read_it_cold))
             .on_action(cx.listener(Self::request_quit))
@@ -22935,6 +22946,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::cancel_ai_run))
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::show_about))
+                    .on_action(cx.listener(Self::check_for_updates))
                     .on_action(cx.listener(Self::open_welcome))
                     .on_action(cx.listener(Self::read_it_cold))
                     .on_action(cx.listener(Self::scraps_travel))

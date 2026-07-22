@@ -69,8 +69,12 @@ proptest = "1"
 embed-resource = "3"
 
 [package.metadata.deb]
+name = "strop"
 maintainer = "Kirill Pimenov <kirushik@gmail.com>"
 depends = "$auto"
+conflicts = "strop-app"
+replaces = "strop-app"
+provides = "strop-app"
 assets = [
     ["target/release/strop", "usr/bin/", "755"],
     ["../../COPYING", "usr/share/doc/strop/COPYING", "644"],
@@ -90,6 +94,7 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
+name = "strop"
 post_install_script = "../../packaging/linux/rpm-post.sh"
 post_uninstall_script = "../../packaging/linux/rpm-post.sh"
 assets = [
@@ -112,3 +117,9 @@ assets = [
 
 [package.metadata.generate-rpm.requires]
 shared-mime-info = "*"
+
+[package.metadata.generate-rpm.obsoletes]
+strop-app = "*"
+
+[package.metadata.generate-rpm.provides]
+strop-app = "*"
