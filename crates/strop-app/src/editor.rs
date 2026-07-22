@@ -6705,6 +6705,7 @@ impl Editor {
             match store.rename_file(new_path) {
                 Ok(()) => {
                     crate::files::replace_recent(&old, store.path());
+                    crate::files::add_platform_recent(store.path(), cx);
                     window.set_window_title(&format!("{stem} — Strop"));
                     self.doc_rename_input = None;
                     window.focus(&self.focus_handle, cx);

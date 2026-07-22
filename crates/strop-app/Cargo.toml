@@ -32,6 +32,7 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 glob = { workspace = true }
 interprocess = "2.4.2"
+quick-xml = "0.41"
 
 # Self-update (docs/releasing.md §4): minisign-verify checks the signed
 # manifest against the baked key list; semver enforces the downgrade gate;
@@ -55,6 +56,7 @@ ashpd = { version = "0.13.11", default-features = false,
 [target.'cfg(windows)'.dependencies]
 self-replace = "1"
 windows-sys = { workspace = true }
+windows = { version = "0.62.2", features = ["Win32_UI_Shell"] }
 
 [dev-dependencies]
 # Test-only minisign *signing* — production only ever verifies.

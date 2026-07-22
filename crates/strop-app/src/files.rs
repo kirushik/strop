@@ -231,6 +231,30 @@ pub fn push_recent(path: &Path) {
     }
 }
 
+pub fn add_platform_recent(path: &Path, cx: &gpui::App) {
+    #[cfg(target_os = "macos")]
+    cx.add_recent_document(path);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            windows::Win32::UI::Shell::SHAddToRecentDocs(
+                windows::Win32::UI::Shell::SHARD_PATHW.0 as u32,
+                Some(wide.as_ptr().cast()),
+            );
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        let path = path.to_owned();
+        let _ = std::thread::Builder::new().name("strop-xdg-recents".into())
+            .spawn(move || crate::xdg_recents::add(&path));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = cx;
+}
+
 pub fn replace_recent(old: &Path, new: &Path) {
     let mut list = recents();
     list.retain(|p| p != old);

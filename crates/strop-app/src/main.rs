@@ -36,6 +36,8 @@ mod text_field;
 mod theme;
 mod tutorial;
 mod update;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod xdg_recents;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -50,7 +52,7 @@ use strop_core::document::{BlockMap, SpanSet};
 use draw_guard::EntityUpdateExt as _;
 use editor::Editor;
 
-actions!(strop, [Quit, AboutStrop]);
+actions!(strop, [Quit, AboutStrop, DockNewDocument]);
 
 fn register_unhandled_quit(
     cx: &mut App,
@@ -164,6 +166,14 @@ fn open_target(doc_path: &Path) -> (PathBuf, bool) {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if let Err(error) = unsafe {
+        windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
+            windows::core::w!("cc.pimenov.strop"),
+        )
+    } {
+        eprintln!("strop: could not set process AppUserModelID: {error}");
+    }
     // Before anything — before arguments are read and before any
     // single-instance socket can exist: if a verified update is staged,
     // this swaps binaries and re-execs (docs/releasing.md §4). The
@@ -226,6 +236,8 @@ fn main() {
         editor::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         register_unhandled_quit(cx, |cx| cx.quit());
+        cx.on_action(|_: &DockNewDocument, _| files::new_window_blank());
+        cx.set_dock_menu(vec![gpui::MenuItem::action("New Document", DockNewDocument)]);
 
         // Smoke runs must not steal the user's OS focus — keystroke dispatch
         // uses GPUI's internal focus, which we set explicitly below. They
@@ -314,6 +326,7 @@ fn main() {
                     Ok(opened) => {
                         if !smoke {
                             files::push_recent(opened.0.path());
+                            files::add_platform_recent(opened.0.path(), cx);
                         }
                         Some(opened)
                     }

@@ -7,3 +7,9 @@ MimeType=application/x-strop;
 Categories=Office;WordProcessor;
 StartupWMClass=cc.pimenov.strop
 Terminal=false
+StartupNotify=true
+Actions=NewDocument;
+
+[Desktop Action NewDocument]
+Name=New Document
+Exec=strop --new
