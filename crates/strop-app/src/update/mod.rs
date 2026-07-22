@@ -65,7 +65,8 @@ impl Channel {
     /// Channels that only ever *mention* a new version in About — the
     /// passive "0.3.2 is out" line, nothing more.
     pub fn passive_notify(self) -> bool {
-        matches!(self, Channel::GithubWinPortable | Channel::GithubLinux)
+        matches!(self, Channel::GithubWinPortable | Channel::GithubLinux |
+            Channel::Deb | Channel::Rpm | Channel::Flathub)
     }
 }
 
@@ -167,8 +168,31 @@ pub fn check_now() {
         .spawn(|| check_cycle(&fetch::NetworkFetcher));
 }
 
-fn active_channel() -> bool {
+pub(crate) fn active_channel() -> bool {
     !manifest::baked_keys().is_empty() && (channel().self_updates() || channel().passive_notify())
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::Channel;
+
+    #[test]
+    fn passive_notify_is_exactly_the_five_display_only_channels() {
+        for channel in [Channel::GithubWinPortable, Channel::GithubLinux,
+            Channel::Deb, Channel::Rpm, Channel::Flathub]
+        {
+            assert!(channel.passive_notify(), "{channel:?}");
+        }
+        for channel in [Channel::GithubWin, Channel::GithubMac, Channel::Dev] {
+            assert!(!channel.passive_notify(), "{channel:?}");
+        }
+    }
+
+    #[test]
+    fn dev_channel_stays_fully_inert() {
+        assert!(!Channel::Dev.self_updates());
+        assert!(!Channel::Dev.passive_notify());
+    }
 }
 
 /// Single-flight: one check/download cycle at a time, process-wide. The
@@ -211,6 +235,11 @@ fn check_cycle(fetcher: &dyn fetch::Fetcher) {
             set_status(UpdateState::Available { version: version.to_string() });
             return Ok(());
         }
+        // Self-update channels past this point; the validator guarantees
+        // them a resolved target.
+        let Some(target) = target else {
+            return Err("this channel has no update target".into());
+        };
         set_status(UpdateState::Available { version: version.to_string() });
         // Already staged and intact? Spend zero bytes — a healthy client
         // that hasn't relaunched yet must not re-download the artifact

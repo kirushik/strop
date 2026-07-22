@@ -37,11 +37,12 @@ Source: "..\..\assets\hyphenation\ATTRIBUTION.txt"; DestDir: "{app}\assets\hyphe
 Source: "..\..\assets\paper-noise-256.png"; DestDir: "{app}\assets"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Strop"; Filename: "{app}\strop.exe"
+Name: "{group}\Strop"; Filename: "{app}\strop.exe"; AppUserModelID: "cc.pimenov.strop"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\.strop"; ValueType: string; ValueData: "Strop.Document"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\Strop.Document"; ValueType: string; ValueData: "Strop document"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Strop.Document"; ValueType: string; ValueName: "AppUserModelID"; ValueData: "cc.pimenov.strop"
 Root: HKCU; Subkey: "Software\Classes\Strop.Document\DefaultIcon"; ValueType: string; ValueData: "{app}\strop.exe,0"
 Root: HKCU; Subkey: "Software\Classes\Strop.Document\shell\open\command"; ValueType: string; ValueData: """{app}\strop.exe"" ""%1"""
 

@@ -58,7 +58,7 @@ pub fn verify_signed(bytes: &[u8], signatures: &[Vec<u8>], keys: &[PublicKey]) -
 /// `Err` — an up-to-date install must land in Idle, never in Failed.
 pub fn parse_and_validate(
     bytes: &[u8], channel: Channel, highest_seen: Option<&Version>,
-) -> Result<Option<(Manifest, Target, Version)>, String> {
+) -> Result<Option<(Manifest, Option<Target>, Version)>, String> {
     let manifest: Manifest = serde_json::from_slice(bytes)
         .map_err(|e| format!("invalid update manifest: {e}"))?;
     if manifest.product != "strop" { return Err("manifest is for another product".into()); }
@@ -78,6 +78,14 @@ pub fn parse_and_validate(
     if !manifest.notes_url.starts_with("https://github.com/kirushik/strop/") {
         return Err("manifest notes URL is outside the Strop repository".into());
     }
+    // Passive channels only ever ANNOUNCE a newer version — they never
+    // touch an artifact, so a manifest that (correctly) carries only the
+    // self-update targets must still validate for them. Requiring a
+    // target here made every passive channel fail closed the moment a
+    // newer release existed: the exact moment the notice matters.
+    if !channel.self_updates() {
+        return Ok(Some((manifest, None, version)));
+    }
     let key = target_key(channel).ok_or_else(|| "this channel has no update target".to_owned())?;
     let target = manifest.targets.get(&key).cloned()
         .ok_or_else(|| format!("manifest has no target {key}"))?;
@@ -87,7 +95,7 @@ pub fn parse_and_validate(
         return Err("target SHA-256 is malformed".into());
     }
     super::fetch::validate_url(&target.url)?;
-    Ok(Some((manifest, target, version)))
+    Ok(Some((manifest, Some(target), version)))
 }
 
 fn valid_rfc3339(value: &str) -> bool {
@@ -159,7 +167,7 @@ mod tests {
             "version": "0.3.1", "pub_date": "2026-07-18T12:34:56+02:00",
             "notes_url": "https://github.com/kirushik/strop/releases/tag/v0.3.1",
             "targets": {
-                format!("github-linux/{}/exe", target_triple()): {
+                format!("github-win/{}/exe", target_triple()): {
                     "url": "https://github.com/kirushik/strop/releases/download/v0.3.1/strop",
                     "sha256": "00".repeat(32), "size": 3
                 }
@@ -167,17 +175,37 @@ mod tests {
         })
     }
 
+    // Target-shaped refusals only bind on a SELF-UPDATE channel now:
+    // passive channels validate the signed envelope and stop before
+    // targets (they announce, never fetch).
     fn refused(mut value: Value, edit: impl FnOnce(&mut Value)) {
         edit(&mut value);
         assert!(parse_and_validate(&serde_json::to_vec(&value).unwrap(),
-            Channel::GithubLinux, None).is_err());
+            Channel::GithubWin, None).is_err());
     }
 
     #[test]
     fn manifest_refusal_matrix() {
         let value = valid();
         assert!(parse_and_validate(&serde_json::to_vec(&value).unwrap(),
-            Channel::GithubLinux, None).is_ok());
+            Channel::GithubWin, None).is_ok());
+        // The passive contract, pinned: a manifest carrying only the
+        // self-update targets — the shipping shape — must still read as
+        // Available (target-free) for every announce-only channel, even
+        // with an empty targets table. This exact gap once turned "0.3.2
+        // exists" into "couldn't check for updates" on all of them.
+        for channel in [Channel::GithubLinux, Channel::GithubWinPortable,
+            Channel::Deb, Channel::Rpm, Channel::Flathub]
+        {
+            assert!(matches!(
+                parse_and_validate(&serde_json::to_vec(&valid()).unwrap(), channel, None),
+                Ok(Some((_, None, _)))), "{channel:?}");
+            let mut empty = valid();
+            empty["targets"] = json!({});
+            assert!(matches!(
+                parse_and_validate(&serde_json::to_vec(&empty).unwrap(), channel, None),
+                Ok(Some((_, None, _)))), "{channel:?}");
+        }
         refused(valid(), |v| v["product"] = json!("other"));
         refused(valid(), |v| v["updater_protocol"] = json!(2));
         refused(valid(), |v| v["version"] = json!("banana"));

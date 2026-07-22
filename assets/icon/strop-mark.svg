@@ -1,12 +1,13 @@
-<!-- The mark, v1 (calibration round — docs/releasing.md §9). A razor strop:
-     the leather band that keeps an edge keen, hanging from its ring —
-     the tool that sharpens, never the blade. Drawn in the pictorial
-     family's voice (round joins, humanist warmth) in the warm-amber
-     human hue of the color language. Master at 1024; every platform
-     size is rasterized from this file by the icon xtask — the pipeline
-     is svg-agnostic, so a better hand can replace this drawing without
-     touching anything downstream. -->
+<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- The mark, v1 (calibration round — docs/releasing.md §9). A razor strop:
+       the leather band that keeps an edge keen, hanging from its ring —
+       the tool that sharpens, never the blade. Drawn in the pictorial
+       family's voice (round joins, humanist warmth) in the warm-amber
+       human hue of the color language. Master at 1024; every platform
+       size is rasterized from this file by the icon xtask — the pipeline
+       is svg-agnostic, so a better hand can replace this drawing without
+       touching anything downstream. -->
   <!-- paper plate: the page the tool lives on -->
   <rect x="64" y="64" width="896" height="896" rx="196" fill="#F5EFE2"/>
   <rect x="64" y="64" width="896" height="896" rx="196" fill="none" stroke="#DACFB8" stroke-width="10"/>

@@ -7,3 +7,13 @@ MimeType=application/x-strop;
 Categories=Office;WordProcessor;
 StartupWMClass=cc.pimenov.strop
 Terminal=false
+# StartupNotify: on Wayland gpui consumes XDG_ACTIVATION_TOKEN at startup;
+# on X11 the app sends no completion itself, but StartupWMClass above lets
+# the launcher end the sequence when our window maps (startup-notification
+# spec's wmclass rule) — no stuck busy cursor either way.
+StartupNotify=true
+Actions=NewDocument;
+
+[Desktop Action NewDocument]
+Name=New Document
+Exec=strop --new

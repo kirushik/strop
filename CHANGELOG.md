@@ -7,6 +7,43 @@ versions may still break things).
 
 ## [Unreleased]
 
+### Added
+- **A citizen of your dock** — Strop now feeds the desktop's own recent-files
+  machinery: the Dock menu on macOS, the taskbar jump list on Windows, and
+  the freedesktop recent list on Linux (written carefully — other
+  applications' entries, private flags and all, are preserved to the byte).
+  The launcher's right-click menu gains "New Document" on Linux and macOS,
+  Windows taskbar pinning and grouping key off a proper application
+  identity, and launching from the GNOME shell no longer flashes a
+  placeholder cog before the Strop icon arrives.
+
+### Fixed
+- **macOS**: renaming a document no longer slides the name field underneath
+  the traffic-light buttons when the titlebar runs out of room.
+- **Linux**: the GNOME apps-overlay search no longer shows Strop iconless —
+  the scalable icon opened with a long comment that format sniffers
+  couldn't see past, so the theme engine kept picking an "unrecognizable"
+  SVG over perfectly good PNGs.
+- Hovering the window controls paints a small rounded square around the
+  mark instead of a full-height sliver (most visible in the About and
+  keyboard-map windows).
+
+### Changed
+- **Every Linux build now tells you about updates** — deb, rpm, and (one day)
+  Flatpak installs get the same quiet About line and "Check now" button as
+  the tarball; package-manager builds say plainly that the new version
+  arrives through your package manager, and never download anything
+  themselves. A "Check for updates" entry joins the command palette on
+  builds where checking exists.
+- **The Linux packages are now named `strop`**, not `strop-app` — with the
+  proper Conflicts/Replaces/Provides (deb) and Obsoletes (rpm) so an
+  existing strop-app install upgrades cleanly instead of coexisting.
+- Dependency refresh: the icon pipeline moves to current resvg/ico/icns,
+  the test-side minisign signer to 0.9.1 (production signature
+  verification is unchanged), plus a workspace-wide sweep of compatible
+  updates — which also retired the unmaintained `rustybuzz` from the
+  dependency tree.
+
 ## [0.3.0] — 2026-07-22
 
 The shipping release. Strop used to arrive as a bare binary in an archive;

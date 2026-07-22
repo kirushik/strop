@@ -6,7 +6,7 @@
 //! palette is the menu, and menus don't list "move cursor left".
 
 use gpui::Action;
-use crate::AboutStrop;
+use crate::{AboutStrop, CheckForUpdates};
 
 use crate::editor::{
     AddCheckpoint, AddNote, CancelAiRun, CopyDocumentPath, ExportMarkdown, Find, Heading1,
@@ -386,6 +386,13 @@ pub fn all() -> &'static [Command] {
             ["version", "license", "updates", "о программе"]
         ),
         cmd!(
+            "Check for updates",
+            "Help",
+            None,
+            CheckForUpdates,
+            ["update", "new version", "проверить обновления"]
+        ),
+        cmd!(
             "Open Welcome Guide",
             "Help",
             None,
@@ -457,10 +464,11 @@ pub fn ranked_with_freq(
 ) -> Vec<&'static Command> {
     let all = all();
     if query.trim().is_empty() {
-        return all.iter().collect();
+        return all.iter().filter(|command| palette_available(command)).collect();
     }
     let mut scored: Vec<(i32, &Command)> = all
         .iter()
+        .filter(|command| palette_available(command))
         .filter_map(|c| {
             score(query.trim(), c).map(|s| {
                 let boost = freq.get(c.label).map_or(0, |&n| (n as i32).min(20));
@@ -479,6 +487,7 @@ pub fn ranked_with_freq(
 pub fn frequent(freq: &std::collections::HashMap<String, u32>) -> Vec<&'static Command> {
     let mut hits: Vec<(u32, &Command)> = all()
         .iter()
+        .filter(|command| palette_available(command))
         .filter_map(|c| {
             freq.get(c.label)
                 .copied()
@@ -489,6 +498,10 @@ pub fn frequent(freq: &std::collections::HashMap<String, u32>) -> Vec<&'static C
     hits.sort_by_key(|&(count, _)| std::cmp::Reverse(count)); // stable: table order breaks ties
     hits.truncate(5);
     hits.into_iter().map(|(_, c)| c).collect()
+}
+
+fn palette_available(command: &Command) -> bool {
+    command.label != "Check for updates" || crate::update::active_channel()
 }
 
 #[cfg(test)]
@@ -502,8 +515,15 @@ mod tests {
 
     #[test]
     fn empty_query_lists_everything_in_table_order() {
-        assert_eq!(labels("").len(), all().len());
+        assert_eq!(labels("").len(), all().iter()
+            .filter(|command| palette_available(command)).count());
         assert_eq!(labels("")[0], "New Document");
+    }
+
+    #[test]
+    fn dev_palette_hides_the_dead_update_verb() {
+        assert_eq!(crate::update::channel(), crate::update::Channel::Dev);
+        assert!(!labels("").contains(&"Check for updates"));
     }
 
     #[test]

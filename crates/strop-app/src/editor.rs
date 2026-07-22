@@ -6705,6 +6705,7 @@ impl Editor {
             match store.rename_file(new_path) {
                 Ok(()) => {
                     crate::files::replace_recent(&old, store.path());
+                    crate::files::add_platform_recent(store.path(), cx);
                     window.set_window_title(&format!("{stem} — Strop"));
                     self.doc_rename_input = None;
                     window.focus(&self.focus_handle, cx);
@@ -10216,6 +10217,27 @@ impl Editor {
         }
         self.about_window = crate::about::open(
             cx.entity(), window.window_handle(), window.bounds(), cx);
+    }
+
+    fn check_for_updates(
+        &mut self,
+        _: &crate::CheckForUpdates,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Ensure-open, never toggle: AboutStrop owns the toggle grammar,
+        // but "check for updates" with About already open must bring the
+        // updater's one surface forward, not remove it mid-request.
+        if let Some(reference) = self.about_window
+            && reference.update(cx, |_, about_window, _| {
+                about_window.activate_window();
+            }).is_ok()
+        {
+            crate::update::check_now();
+            return;
+        }
+        self.show_about(&crate::AboutStrop, window, cx);
+        crate::update::check_now();
     }
 
     pub(crate) fn keymap_closed(&mut self) {
@@ -17424,15 +17446,28 @@ impl Editor {
             // The svg's ink is its own (no text-color cascade), so the
             // hover brightening rides a group.
             .group(icon_path)
-            .hover(|d| d.bg(rgba(0x1A1A180Au32)))
             .tooltip(tip(tip_label, chord))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 action(window, cx);
             })
+            // The hitbox is the whole cell (generous target); the hover wash
+            // is a 26px rounded square centred on the mark — an edge-to-edge
+            // wash reads as a rendering artifact, not a control (the aux
+            // windows' 68px header made that painfully visible).
             .child(
-                icon(icon_path, 13., MUTED_COLOR)
-                    .group_hover(icon_path, |s| s.text_color(rgb(TEXT_COLOR))),
+                div()
+                    .w(px(26.))
+                    .h(px(26.))
+                    .rounded(px(5.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .group_hover(icon_path, |d| d.bg(rgba(0x1A1A180Au32)))
+                    .child(
+                        icon(icon_path, 13., MUTED_COLOR)
+                            .group_hover(icon_path, |s| s.text_color(rgb(TEXT_COLOR))),
+                    ),
             )
     }
 
@@ -17487,9 +17522,13 @@ impl Editor {
                 // macOS draws its native traffic-light buttons over the top-left of
                 // our (full-size-content) titlebar — recentred by `traffic_light_
                 // position` in main.rs. Reserve their width so the document name
-                // starts to their right instead of underneath them.
+                // starts to their right instead of underneath them. flex_shrink_0
+                // because the reservation must hold even when the row overflows:
+                // the rename editor's fixed-width field plus an error line can
+                // exceed the left third, and a shrinkable spacer would collapse
+                // first — sliding the field under the lights.
                 .when(cfg!(target_os = "macos"), |bar| {
-                    bar.child(div().w(px(76.)).h_full())
+                    bar.child(div().w(px(76.)).h_full().flex_shrink_0())
                 })
                 // (The compost-rail toggle + its presence dot lived here; the
                 // rail died with the Scraps flip — the footer chip is the
@@ -17502,9 +17541,15 @@ impl Editor {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(div().w(px(220.)).child(input.clone()))
+                        // The traffic-light spacer is the only rigid member:
+                        // the field may give down to a still-usable 120px
+                        // (at 960px the left third can't fit spacer + full
+                        // field + error at once), and the error line
+                        // truncates rather than wrapping out of the bar.
+                        .child(div().w(px(220.)).min_w(px(120.)).child(input.clone()))
                         .when_some(self.doc_rename_error, |row, error| {
-                            row.child(div().text_color(rgb(ERROR)).child(error))
+                            row.child(div().min_w(px(0.)).overflow_hidden()
+                                .whitespace_nowrap().text_color(rgb(ERROR)).child(error))
                         })
                         .into_any_element(),
                     (None, Some(store)) => {
@@ -22783,6 +22828,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::show_shortcuts))
             .on_action(cx.listener(Self::show_about))
+            .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::open_welcome))
             .on_action(cx.listener(Self::read_it_cold))
             .on_action(cx.listener(Self::request_quit))
@@ -22915,6 +22961,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::cancel_ai_run))
                     .on_action(cx.listener(Self::show_shortcuts))
                     .on_action(cx.listener(Self::show_about))
+                    .on_action(cx.listener(Self::check_for_updates))
                     .on_action(cx.listener(Self::open_welcome))
                     .on_action(cx.listener(Self::read_it_cold))
                     .on_action(cx.listener(Self::scraps_travel))

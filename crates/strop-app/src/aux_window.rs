@@ -135,17 +135,34 @@ pub fn titlebar(
             div().flex().items_center().h_full()
                 .when_some(trailing, |d, trailing| d.child(trailing))
                 .when(client, |d| d.child(
+                    // Full-height hitbox, but the hover wash is the same 26px
+                    // rounded square the editor's window controls wear — in a
+                    // 68px header the old edge-to-edge wash was a floor-to-
+                    // ceiling sliver that read as a glitch.
                     div().id(close_id).occlude().ml(px(14.)).w(px(28.)).h_full()
                         .flex().items_center().justify_center().cursor(CursorStyle::PointingHand)
-                        .group(close_group).hover(|d| d.bg(rgba(0x1A1A180A)))
+                        .group(close_group)
                         .on_mouse_down(MouseButton::Left, close)
-                        .child(icon(icons::WIN_CLOSE, 13., 0x716D66)
-                            .group_hover(close_group, |s| s.text_color(rgb(0x242321))))
+                        .child(div().w(px(26.)).h(px(26.)).rounded(px(5.))
+                            .flex().items_center().justify_center()
+                            .group_hover(close_group, |d| d.bg(rgba(0x1A1A180A)))
+                            .child(icon(icons::WIN_CLOSE, 13., 0x716D66)
+                                .group_hover(close_group, |s| s.text_color(rgb(0x242321)))))
                 )),
         )
 }
 
 pub fn shell(content: Div, metrics: Metrics) -> impl IntoElement {
+    shell_with_move(content, metrics, None)
+}
+
+type MoveHandler = dyn Fn(&MouseDownEvent, &mut Window, &mut App);
+
+pub fn shell_with_move(
+    content: Div,
+    metrics: Metrics,
+    on_move: Option<Box<MoveHandler>>,
+) -> impl IntoElement {
     let client = metrics.client;
     let tiling = metrics.tiling;
     let inset = |tiled: bool| px(if client && !tiled { CSD_GUTTER } else { 0. });
@@ -156,7 +173,8 @@ pub fn shell(content: Div, metrics: Metrics) -> impl IntoElement {
             .when(!tiling.bottom && !tiling.left, |d| d.rounded_bl(px(CSD_ROUNDING)))
             .when(!tiling.bottom && !tiling.right, |d| d.rounded_br(px(CSD_ROUNDING)))
     };
-    let drag = |_: &MouseDownEvent, window: &mut Window, _: &mut App| {
+    let drag = move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+        if let Some(on_move) = &on_move { on_move(ev, window, cx); }
         window.start_window_move();
     };
     div().size_full().relative().bg(rgba(0x00000000))
@@ -243,5 +261,45 @@ mod tests {
     fn toggle_grammar_is_one_shared_two_state_switch() {
         assert_eq!(toggle_decision(false), ToggleDecision::Open);
         assert_eq!(toggle_decision(true), ToggleDecision::CloseAndRestore);
+    }
+
+    struct MoveHookSurface {
+        kicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for MoveHookSurface {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let kicks = self.kicks.clone();
+            // Mirrors the About window's drag-kick hook: mutate state, then
+            // refresh(). The draw-phase sibling (request_animation_frame)
+            // asserts outside layout/prepaint/paint and panicked debug
+            // builds from exactly this dispatch path. The real shell can't
+            // mount here — the test platform leaves start_window_move
+            // unimplemented — so this pins the handler-context contract on
+            // the same on_mouse_down dispatch the shell uses.
+            div().size_full()
+                .window_control_area(WindowControlArea::Drag)
+                .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                    kicks.set(kicks.get() + 1);
+                    window.refresh();
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn move_hook_shape_survives_real_mouse_dispatch(
+        cx: &mut TestAppContext,
+    ) {
+        let kicks = Rc::new(Cell::new(0));
+        let window = cx.update({
+            let kicks = kicks.clone();
+            move |cx| cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| MoveHookSurface { kicks })
+            }).unwrap()
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_mouse_down(gpui::point(gpui::px(200.), gpui::px(200.)),
+            gpui::MouseButton::Left, gpui::Modifiers::default());
+        assert_eq!(kicks.get(), 1);
     }
 }

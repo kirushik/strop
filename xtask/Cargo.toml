@@ -6,10 +6,12 @@ license = "GPL-3.0-or-later"
 publish = false
 
 # The icon pipeline (docs/releasing.md §9): one master SVG in, every
-# platform format out. resvg is pinned to the version already in the tree
-# (gpui ships it), so this costs no new heavy dependency.
+# platform format out. resvg 0.47 runs deliberately ahead of the 0.46 the
+# gpui fork still pins, so the lockfile carries both families for now —
+# the duplicate collapses whenever the fork pin moves (xtask is a
+# build-time tool; the cost is compile time, not shipped weight).
 [dependencies]
-resvg = { version = "0.46", default-features = false }
+resvg = { version = "0.47", default-features = false }
 png = "0.18"
-ico = "0.4"
-icns = "0.3"
+ico = "0.5"
+icns = "0.4"

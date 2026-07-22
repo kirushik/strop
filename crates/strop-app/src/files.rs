@@ -231,6 +231,39 @@ pub fn push_recent(path: &Path) {
     }
 }
 
+pub fn add_platform_recent(path: &Path, cx: &gpui::App) {
+    // The OS recent lists must never learn a path that isn't real yet:
+    // a fresh --new document and a lazily-imported .md both open over a
+    // not-yet-materialized .strop path, and publishing it would plant a
+    // permanently broken entry in the user's desktop history. (The
+    // in-app recents list keeps its own rules; it heals missing paths
+    // at read.) Such documents register on their first rename instead.
+    if !path.exists() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    cx.add_recent_document(path);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            windows::Win32::UI::Shell::SHAddToRecentDocs(
+                windows::Win32::UI::Shell::SHARD_PATHW.0 as u32,
+                Some(wide.as_ptr().cast()),
+            );
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        let path = path.to_owned();
+        let _ = std::thread::Builder::new().name("strop-xdg-recents".into())
+            .spawn(move || crate::xdg_recents::add(&path));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = cx;
+}
+
 pub fn replace_recent(old: &Path, new: &Path) {
     let mut list = recents();
     list.retain(|p| p != old);
