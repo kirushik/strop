@@ -9,13 +9,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux:
-    runs-on: ubuntu-22.04
+  preflight:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: { contents: read, checks: read }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: validate tag, workspace version, and CI check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Strict stable semver only. Rehearsals do NOT use -rc suffixes
+          # (cargo-deb's ~-translation would split the naming across the
+          # inventory); they use the disposable v0.0.N series with the
+          # workspace version bumped to match on a throwaway branch
+          # (docs/releasing.md §12 "The rehearsal series").
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid release tag: $GITHUB_REF_NAME" >&2; exit 1; }
+          workspace_version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          [[ -n "$workspace_version" && "$GITHUB_REF_NAME" == "v$workspace_version" ]] || { echo "tag $GITHUB_REF_NAME does not match workspace version $workspace_version" >&2; exit 1; }
+          # The aggregator job ID is ci-success; its configured check-run name
+          # (the value exposed by the Checks API) is "CI passed".
+          conclusions=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs" --paginate --jq '.check_runs[] | select(.name == "CI passed") | .conclusion')
+          grep -qx success <<<"$conclusions" || { echo "tagged commit has no successful ci-success check run" >&2; exit 1; }
+
+  linux:
+    needs: preflight
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.preflight.result == 'success')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libvulkan-dev libgbm-dev libgl1-mesa-dev libasound2-dev libfontconfig-dev libssl-dev libxcb1-dev libx11-dev libxext-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { key: release-linux }
       - name: install pinned packagers
         run: |
@@ -30,23 +57,51 @@ jobs:
           strip --strip-all target/x86_64-unknown-linux-gnu/dist/strop
           n=strop-$ver-x86_64-unknown-linux-gnu; mkdir -p dist/$n
           cp target/x86_64-unknown-linux-gnu/dist/strop README.md COPYING NOTICE dist/$n/
+          # assets/ must sit BESIDE the binary inside the archive — that is
+          # the exe-sibling path paths::asset_file searches first.
+          bash script/stage-runtime-assets.sh dist/$n/assets
           tar -C dist -czf dist/$n.tar.gz $n
+          # The unpacked staging tree must not ride into the artifact upload:
+          # dist/* would sweep its files into the draft and the signing
+          # ritual's exact inventory would refuse the release.
+          rm -rf dist/$n
+          # Not grep -q: under pipefail an early-exit grep kills tar with a
+          # write error, failing the check precisely when the asset IS there.
+          tar -tzf dist/$n.tar.gz | grep "^$n/assets/fonts/coldread/URWBookman-Light.otf$" >/dev/null || { echo "tarball is missing assets/ beside the binary" >&2; exit 1; }
           STROP_DIST_CHANNEL=deb cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
           STROP_DIST_CHANNEL=deb cargo deb -p strop-app --profile dist --target x86_64-unknown-linux-gnu --no-build
           cp target/x86_64-unknown-linux-gnu/debian/*.deb dist/
+          # The deb metadata enumerates the runtime-asset set independently
+          # of stage-runtime-assets.sh; hold the two to the same count so a
+          # file added to one but not the other fails the build (full SSOT
+          # generation is recorded debt, releasing.md §13).
+          [[ "$(dpkg-deb -c dist/*.deb | grep -c 'share/strop/assets/.*[^/]$')" == "8" ]] || { echo "deb runtime-asset set drifted from stage-runtime-assets.sh" >&2; exit 1; }
           STROP_DIST_CHANNEL=rpm cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
-          cargo generate-rpm -p crates/strop-app --target x86_64-unknown-linux-gnu
+          cargo generate-rpm -p crates/strop-app --target x86_64-unknown-linux-gnu --profile dist
           cp target/x86_64-unknown-linux-gnu/generate-rpm/*.rpm dist/
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with: { name: linux, path: "dist/*", if-no-files-found: error }
 
   mac:
+    needs: preflight
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.preflight.result == 'success')
+    # 75 rather than 45: a new Apple team's FIRST notarization can sit in
+    # extended review for an hour; steady-state is minutes.
+    timeout-minutes: 75
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: require signing and notarization configuration for tags
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          SIGNING_ENABLED: ${{ vars.MACOS_SIGNING_ENABLED }}
+          NOTARY_COMPLETE: ${{ secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_KEY_ISSUER != '' }}
+        run: |
+          [[ "$SIGNING_ENABLED" == "true" ]] || { echo "MACOS_SIGNING_ENABLED must be true for tag releases" >&2; exit 1; }
+          [[ "$NOTARY_COMPLETE" == "true" ]] || { echo "APPLE_API_KEY / _KEY_ID / _KEY_ISSUER are incomplete" >&2; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with: { targets: aarch64-apple-darwin }
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { key: release-mac }
       - name: import signing certificate
         if: vars.MACOS_SIGNING_ENABLED == 'true'
@@ -61,6 +116,12 @@ jobs:
           [[ "$NOTARY_COMPLETE" == "true" ]] || { echo "MACOS_SIGNING_ENABLED is true but APPLE_API_KEY / _KEY_ID / _KEY_ISSUER are incomplete" >&2; exit 1; }
           echo "$P12" | base64 --decode > cert.p12
           security create-keychain -p ci build.keychain
+          # A fresh keychain auto-locks after 300s; the release build runs
+          # far longer than that between this import and the first codesign,
+          # and codesign against a locked keychain blocks forever on a UI
+          # prompt no headless runner can answer. 21600s outlives any job
+          # timeout here.
+          security set-keychain-settings -lut 21600 build.keychain
           security import cert.p12 -k build.keychain -P "$PASSWORD" -T /usr/bin/codesign
           security list-keychains -d user -s build.keychain
           security unlock-keychain -p ci build.keychain
@@ -83,33 +144,33 @@ jobs:
           strip target/aarch64-apple-darwin/dist/strop
           bash script/bundle-mac.sh target/aarch64-apple-darwin/dist/strop "$ver" dist packaging/macos/entitlements.plist
           rm -rf dist/dmg-root dist/Strop.app dist/*-notary.zip
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with: { name: mac, path: "dist/*", if-no-files-found: error }
 
   windows:
+    needs: preflight
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.preflight.result == 'success')
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - name: exclude build dirs from Defender
         shell: pwsh
         run: foreach ($p in @($env:GITHUB_WORKSPACE, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup")) { try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop } catch { Write-Warning $_ } }
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { key: release-windows }
-      - name: stage 1 — two channel builds
+      - name: stage 1 — updater channel build
         shell: bash
         run: |
           ver=${GITHUB_REF_NAME#v}; [[ "${{ github.event_name }}" == workflow_dispatch ]] && ver=dev
           cargo run --locked -p xtask -- icons
           STROP_DIST_CHANNEL=github-win cargo build --profile dist --locked --target x86_64-pc-windows-msvc -p strop-app
           mkdir dist; cp target/x86_64-pc-windows-msvc/dist/strop.exe dist/strop-$ver-x86_64-pc-windows-msvc.exe
-          STROP_DIST_CHANNEL=github-win-portable cargo build --profile dist --locked --target x86_64-pc-windows-msvc -p strop-app
-          mkdir portable; cp target/x86_64-pc-windows-msvc/dist/strop.exe README.md COPYING NOTICE portable/
-          7z a dist/strop-$ver-x86_64-pc-windows-msvc-portable.zip ./portable/* >/dev/null
           echo "VER=$ver" >> "$GITHUB_ENV"
       - name: stage 2 — optional SignPath/Azure inner EXE signing
         if: vars.WINDOWS_SIGNING_ENABLED == 'true'
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
@@ -132,7 +193,7 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\strop.iss
       - name: stage 4 — optional installer signing
         if: vars.WINDOWS_SIGNING_ENABLED == 'true'
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
@@ -149,19 +210,20 @@ jobs:
           if (-not $signed) { throw "signing produced no installer" }
           Copy-Item $signed.FullName "dist/strop-$env:VER-x86_64-windows-installer.exe" -Force
           Remove-Item dist/signed-installer -Recurse -Force
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with: { name: windows, path: "dist/*", if-no-files-found: error }
 
   draft:
     needs: [linux, mac, windows]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions: { contents: write }
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with: { path: artifacts, merge-multiple: true }
       - name: stage 5 — upload immutable payloads into a draft
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           name: Strop ${{ github.ref_name }}
           draft: true
@@ -182,9 +244,10 @@ jobs:
   manifest:
     needs: draft
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions: { contents: write, id-token: write, attestations: write }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: stage 6 — download draft bytes and emit the exact manifest
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
@@ -201,9 +264,9 @@ jobs:
             (( size > 0 && size <= 256*1024*1024 )) || { echo "$f is $size bytes — outside the clients' (0, 256 MiB] cap" >&2; exit 1; }
           done
           entry() { jq -n --arg url "https://github.com/kirushik/strop/releases/download/$GITHUB_REF_NAME/$1" --arg hash "$(sha256sum "assets/$1"|cut -d' ' -f1)" --argjson size "$(stat -c %s "assets/$1")" '{url:$url,sha256:$hash,size:$size}'; }
-          jq -n --arg version "$ver" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg notes "https://github.com/kirushik/strop/releases/tag/$GITHUB_REF_NAME" --argjson win "$(entry "$win")" --argjson mac "$(entry "$mac")" '{product:"strop",updater_protocol:1,version:$version,pub_date:$date,notes_url:$notes,targets:{"github-win/x86_64-pc-windows-msvc/exe":$win,"github-mac/aarch64-apple-darwin/app-tar":$mac}}' > assets/latest.json
+          jq -n --arg version "$ver" --arg date "$(date -u -d "$(git log -1 --format=%cI HEAD)" +%Y-%m-%dT%H:%M:%SZ)" --arg notes "https://github.com/kirushik/strop/releases/tag/$GITHUB_REF_NAME" --argjson win "$(entry "$win")" --argjson mac "$(entry "$mac")" '{product:"strop",updater_protocol:1,version:$version,pub_date:$date,notes_url:$notes,targets:{"github-win/x86_64-pc-windows-msvc/exe":$win,"github-mac/aarch64-apple-darwin/app-tar":$mac}}' > assets/latest.json
           (( $(stat -c %s assets/latest.json) <= 1024*1024 )) || { echo "latest.json exceeds the clients' 1 MiB manifest cap" >&2; exit 1; }
-          gh release upload "$GITHUB_REF_NAME" assets/latest.json
+          gh release upload "$GITHUB_REF_NAME" assets/latest.json --clobber
       - name: stage 7 — attest only immutable final payloads
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with: { subject-path: "assets/*" }

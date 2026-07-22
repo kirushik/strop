@@ -117,13 +117,31 @@ unsigned download is effectively locked for normal users.
   hook also signs the generated uninstaller. Two signing passes per release
   — the §12 DAG already orders it this way; with SignPath that's ideally
   one signing request covering both artifacts, or two approval clicks.
-- **Portable zip stays** for the portable-app crowd, and **portable builds
-  never self-update** (Sol F8): a self-replacing exe on a read-only or
-  removable location is a bug farm, and a portable app that rewrites itself
-  isn't portable. Distinct channel (`github-win-portable`), passive
-  About-notice only. It writes no registry keys — associations come with the
-  installer or by hand.
+- ~~**Portable zip stays** for the portable-app crowd~~ — **CUT 2026-07-21
+  (Kirill)**: the per-user installer already needs no admin rights, which
+  was the portable's whole justification; an extra download row is
+  choice-paralysis; and the passive-update portable would rot in the wild.
+  The bare exe remains ONLY as the updater payload. The
+  `github-win-portable` channel stays in the enum, inert, in case demand
+  materializes. (Sol F8's never-self-update rule still governs any
+  revival.)
 - x86_64 only, as today.
+
+### Runtime assets are part of every artifact (added 2026-07-21)
+
+Three runtime works load from disk by deliberate license posture —
+hyphenation dictionaries (LPPL, ATTRIBUTION.txt beside them), the URW
+Bookman faces (AGPL-3.0-with-exception, LICENSE beside them), and the
+first-party paper tile (no license text of its own to carry) — as loose,
+intact, independent files (mere aggregation; never `include_bytes!`). LAW: every install artifact ships this set, and
+`script/stage-runtime-assets.sh` is its single source of truth — a missing
+source file fails the build, never silently degrades an install. Locations:
+`assets/` beside the exe (Windows, Linux tarball),
+`/usr/share/strop/assets` (deb/rpm), `Contents/Resources/assets` (mac) —
+all on `paths::asset_file`'s search chain. The single-exe update payload
+cannot deliver NEW asset files; a release that adds one must accept
+graceful degradation for updated-not-reinstalled users or ship a fatter
+payload format — deferred (§13).
 
 ### Update payload contract (per channel)
 
@@ -739,6 +757,67 @@ final assets.
    publish. (There is no fleet before 0.3.0 — it is the first
    self-updating release.)
 
+### Pre-tag evidence bundle (added 2026-07-21, Sol robustness round)
+
+Before pushing any release tag, record in the release log: the exact SHA
+and its green `ci-success` check; the workspace Cargo version (must equal
+the tag, CI preflights it but the human checks first); the minisign key
+fingerprint; the pinned action SHAs in force; and the expected asset
+inventory. The tag itself is protected (`v*` requires the owner) and
+releases are **serialized** — one tag, one workflow attempt, one signer at
+a time; never process two version tags concurrently.
+
+### Recovery cards (added 2026-07-21 — what to do when phase N dies)
+
+- **Platform build fails** → fix on a branch, merge, delete the draft if
+  one was created, re-run by re-pushing the tag only if the tag still
+  points at the released SHA; otherwise re-cut a higher version. Never
+  build a release from a moved tag.
+- **Notarization times out / runner killed** → Apple keeps processing the
+  submission. Re-running the mac job uploads an identical bundle and gets
+  a fresh submission; that wastes a slot but is safe. Check
+  `notarytool history` (submission id is in the job log) before assuming
+  failure. Status `Invalid` → read the notary log printed by the job; fix;
+  re-cut.
+- **Draft creation fails after builds** → artifacts are still in the run;
+  re-run the draft job alone. A duplicate draft for the same tag must be
+  deleted before retrying (two drafts on one tag confuse `gh release`).
+- **Manifest job fails before upload** → re-run it; hashing is
+  deterministic over immutable draft bytes and `pub_date` derives from the
+  tag commit, so a re-run is byte-identical.
+- **Attestation fails after `latest.json` uploaded** → re-run the manifest
+  job; the upload is `--clobber` and byte-identical, attestation retries.
+- **`release-sign.sh` refuses** (inventory, hash, attestation, or TOCTOU
+  drift) → payloads are untouched; the error names the next step and says
+  honestly whether this run already uploaded signature assets (a failure
+  after the first upload leaves them on the draft; a rerun re-verifies
+  them against the byte-identical manifest). A draft is always safe to
+  delete and re-cut.
+- **Publish succeeded but something is wrong** → never delete or
+  un-publish; supersede with a fixed higher version (§12.4). The canary
+  in the sign script is the last pre-announcement check.
+
+### The rehearsal series (added 2026-07-21; reshaped 2026-07-22)
+
+Before the first real tag of a release generation, walk the ENTIRE
+pipeline — preflight, draft, manifest, attestation, local sign — stopping
+before publish. *Not* with an `-rc.N` pre-release tag (assembly review
+2026-07-22: preflight's strict stable-semver gate rejects it, and
+cargo-deb's `-`→`~` translation would split the artifact naming across
+the signer's exact inventory). Instead: the disposable **`v0.0.N`
+series** — on a throwaway branch, bump the workspace version to `0.0.N`,
+push the matching tag. Strict semver, exact version match, consistent
+naming through every packager, and `0.0.N` sorts below every real
+release forever, so even a mistaken publish could not move a fleet.
+The signing leg is one command: `script/release-sign.sh --sign-only` —
+with no version argument it resolves the CURRENT draft (which is never a
+guess: releases are serialized, so exactly one draft may exist; zero or
+several is a hard error naming them), runs the full verification
+gauntlet, signs, uploads, re-verifies, and stops with the draft
+unpublished. Delete the draft, the tag, and the branch afterwards; `N`
+only ever increments. 0.3.0's rehearsal doubles as the first live test
+of the tag path, which has otherwise never executed.
+
 ## §13 Open questions & unverified flags
 
 **Decided 2026-07-18 (all five):** §1 identity = `cc.pimenov.strop`; §3
@@ -747,6 +826,14 @@ in parallel; §6 backups = hidden data_dir + About, one regime including
 compaction's former sidecar `.bak`s ("invisible until danger, then loud");
 §7 OBS skipped (revival plan: repackage prebuilt); §9 mark = AI calibration
 round now, designer later if love strikes.
+
+**Recorded debt (2026-07-22, assembly review):** the runtime-asset set is
+enumerated in four places (stage-runtime-assets.sh, deb metadata, rpm
+metadata, strop.iss); the CI count-assertion on the deb catches drift of
+the script-vs-metadata class, but true single-source generation of all
+four inventories is future work. The notarization submission-ID
+resume machinery and the updater's end-to-end failure-memo test seam
+remain open from the robustness round.
 
 **To verify by doing (each is one small experiment):** cargo-zigbuild vs our
 link chain (§2); EU sole-trader eligibility for Azure signing, only if the
@@ -801,3 +888,16 @@ overruled; fork's Wayland `app_id`-timing fix (§10).
   ignored, unbounded "Check now" concurrency, non-streaming hashing; fixed
   per the §4 traffic amendment above, plus a finding Sol missed: a staged
   client re-downloaded the full artifact every cycle until relaunch.
+- **2026-07-21, Sol (high effort), release-robustness round** after the
+  first two rehearsal runs each failed on something only a live run could
+  catch (phantom packager pins, OpenSSL-3 .p12, bare-directory deb asset,
+  notarytool's buffered silence). Two blockers: no package shipped the
+  disk-loaded runtime assets (→ the §2 law above + the staging script);
+  tag runs could silently ship unsigned mac builds (→ fail-closed tag
+  guard). Eight majors adopted: tag/Cargo version preflight, CI-success
+  gate on the tagged SHA, manifest idempotency + deterministic pub_date,
+  release-sign.sh inventory/attestation/TOCTOU/canary hardening,
+  notarization submission-id capture, action SHA-pinning, explicit
+  `--latest`, `%f` desktop fix. Process adoptions: pre-tag evidence
+  bundle, serialized releases + protected tags, recovery cards, the rc
+  rehearsal (all §12). Same round, Kirill: portable zip cut.
