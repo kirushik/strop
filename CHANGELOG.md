@@ -8,6 +8,11 @@ versions may still break things).
 ## [Unreleased]
 
 ### Added
+- **Flatpak** — releases now ship a `flathub`-channel tarball, and
+  `packaging/flatpak/` carries the Flathub manifest that repackages it:
+  portal-only sandbox (no blanket filesystem access), Wayland-first, and
+  once the app is on Flathub each new release is picked up by Flathub's
+  update bot automatically.
 - **A citizen of your dock** — Strop now feeds the desktop's own recent-files
   machinery: the Dock menu on macOS, the taskbar jump list on Windows, and
   the freedesktop recent list on Linux (written carefully — other

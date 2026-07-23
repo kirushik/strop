@@ -1,0 +1,45 @@
+# Flathub manifest for Strop (docs/releasing.md §7).
+#
+# This repackages the flathub-channel tarball from the tagged GitHub
+# release instead of building Rust inside the sandbox — the same trick
+# Zed's community manifest uses, permitted for upstream-verified apps.
+# The tarball is already laid out as the /app prefix (bin/ + share/),
+# built and attested by tagged CI, so the module below is a plain copy.
+#
+# This file is the source of truth; the copy in the flathub/cc.pimenov.strop
+# repo is updated from it. After each publish, script/flathub-pin.sh VERSION
+# rewrites url: + sha256: below to the just-published asset; between
+# releases the x-checker-data bot does the same via PR on the Flathub side.
+app-id: cc.pimenov.strop
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: strop
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Two network users, both writer-controlled: the passive update check
+  # (About's "0.3.2 is out" line, [update] check=false kills it) and the
+  # writer's own OpenAI-compatible LLM endpoint. File access is
+  # portal-only — deliberately no --filesystem, a cleaner sandbox than
+  # most editors ship.
+  - --share=network
+modules:
+  - name: strop
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 bin/strop /app/bin/strop
+      - cp -r share /app/
+    sources:
+      - type: archive
+        url: https://github.com/kirushik/strop/releases/download/v0.3.1/strop-0.3.1-x86_64-unknown-linux-gnu-flathub.tar.gz
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+        only-arches: [x86_64]
+        x-checker-data:
+          type: json
+          url: https://api.github.com/repos/kirushik/strop/releases/latest
+          version-query: .tag_name | sub("^v"; "")
+          timestamp-query: .published_at
+          url-query: '"https://github.com/kirushik/strop/releases/download/" + .tag_name + "/strop-" + $version + "-x86_64-unknown-linux-gnu-flathub.tar.gz"'

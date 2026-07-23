@@ -662,7 +662,10 @@ metainfo into deb/rpm/Flatpak.
   §1 identity (this alone gets single-icon multi-window grouping on
   GNOME/KDE — `StartupWMClass` is X11-only and ignored on Wayland); verify
   our fork carries Zed's fix for `app_id` being sent late on first commit
-  (upstream PR #55583) **[UNVERIFIED — check during Flathub round]**; file
+  (upstream PR #55583) **[VERIFIED 2026-07-23, Flathub round: the fork's
+  `gpui_linux` wayland window sets the toplevel `app_id` from
+  `WindowOptions` during creation, before the initial commit, and Strop
+  passes it in options for both window kinds]**; file
   associations ride the installers (§2).
 - **Phase D:** Windows `SetCurrentProcessExplicitAppUserModelID` + the same
   AUMID stamped on the Start-menu shortcut, `SHAddToRecentDocs` per
@@ -752,7 +755,15 @@ final assets.
    anyway). Note in the release log; the key fingerprint and signing-tool
    version ride every log entry.
 5. Post-publish, the *separate* non-integrity checklist: merge the Flathub
-   bot's PR when it arrives; AUR bump if no community maintainer beat us.
+   bot's PR when it arrives (until the app is ON Flathub, the first
+   submission is manual — `script/flathub-pin.sh` + the checklist in
+   `packaging/flatpak/README.md`); `script/flathub-pin.sh X.Y.Z` keeps the
+   in-repo manifest copy honest; AUR bump if no community maintainer beat
+   us. Built 2026-07-23: the linux job ships a `flathub`-channel tarball
+   (bin/ + share/ = the `/app` prefix), preflight refuses a tag whose
+   version is absent from the metainfo `<releases>`, and the manifest's
+   x-checker-data watches `releases/latest` — which never sees drafts, so
+   the bot cannot get ahead of this ritual.
 6. Fleet behavior: from 0.3.0 on, next-launch updates within ~a day of
    publish. (There is no fleet before 0.3.0 — it is the first
    self-updating release.)

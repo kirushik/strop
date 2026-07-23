@@ -6,6 +6,7 @@
 #   app     — strop-app on Linux: builds the git-pinned gpui (wgpu + Wayland),
 #             clippy, and the headless logic tests.
 #   deny    — cargo-deny: licenses, advisories, and git sources (deny.toml).
+#   packaging — appstream/desktop-file/flatpak-manifest validation (no compile).
 #   macos   — build + a launch smoke.
 #   windows — build + tests (single_instance over named pipes) + launch smoke.
 #
@@ -103,6 +104,32 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check
+
+  packaging:
+    # Compiles nothing; exists so desktop-integration metadata can't drift
+    # unnoticed between releases. The release preflight separately refuses a
+    # tag whose version is missing from the metainfo <releases> — this job
+    # keeps the files structurally valid on every push so that refusal is
+    # the only surprise left.
+    name: packaging — appstream, desktop file, flatpak manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends appstream desktop-file-utils python3-yaml
+      - run: appstreamcli validate packaging/linux/cc.pimenov.strop.metainfo.xml
+      - run: desktop-file-validate packaging/linux/cc.pimenov.strop.desktop
+      - name: flatpak manifest sanity (parses; asset name matches release.yml's)
+        run: |
+          python3 - <<'EOF'
+          import re, yaml
+          m = yaml.safe_load(open('packaging/flatpak/cc.pimenov.strop.yml'))
+          assert m['app-id'] == 'cc.pimenov.strop', m['app-id']
+          src = m['modules'][0]['sources'][0]
+          assert isinstance(src['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', src['sha256']), 'sha256 must be a 64-hex string'
+          suffix = '-x86_64-unknown-linux-gnu-flathub.tar.gz'
+          assert src['url'].endswith(suffix), src['url']
+          assert suffix in src['x-checker-data']['url-query'], 'x-checker-data must track the flathub tarball'
+          EOF
 
   app:
     name: app shell — clippy + headless logic tests
@@ -234,16 +261,17 @@ jobs:
     # 2026-06-17 (see header); demote a leg by dropping it from `needs` and the
     # loop below.
     name: CI passed
-    needs: [core, app, deny, macos, windows]
+    needs: [core, app, deny, packaging, macos, windows]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: require core, app, deny, macOS, and Windows to have succeeded
+      - name: require core, app, deny, packaging, macOS, and Windows to have succeeded
         run: |
           ok=true
           for r in "core=${{ needs.core.result }}" \
                    "app=${{ needs.app.result }}" \
                    "deny=${{ needs.deny.result }}" \
+                   "packaging=${{ needs.packaging.result }}" \
                    "macos=${{ needs.macos.result }}" \
                    "windows=${{ needs.windows.result }}"; do
             echo "$r"
