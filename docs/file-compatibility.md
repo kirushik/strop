@@ -1,11 +1,19 @@
 # File compatibility
 
-> A document Strop was asked to open must open, or say why.
+> A document that is **on disk when Strop looks** must open, or say why.
 > There is no third outcome.
 
 The blank page is not a neutral failure. A writer who sees one believes their
 work is gone, and the belief arrives before any explanation can. Every rule
 below exists to make that page unreachable.
+
+The invariant is deliberately scoped to *when Strop looks*, and the scope is
+load-bearing. Strop cannot distinguish "this file was deleted a moment ago"
+from "you asked me to start a document here" — both are an absent path — and
+`strop notes/new-essay.strop` has to keep working. What it CAN refuse to do is
+mistake a file that is present for one that is absent. That was the actual
+bug, and that is what §2 closes; the deletion race is named in §2 and stays
+open, with its cost stated.
 
 ## 1. The field report that wrote this document
 
@@ -75,10 +83,18 @@ resolver cannot launder the promise away.
 One gap is left open deliberately. An **unconfined** build launched from the
 file manager receives an ordinary path, indistinguishable from a typed one —
 so if that file is deleted between the click and the open, it still births a
-blank instead of reporting. Closing it needs a launch signal
-`arrived_through_the_portal` cannot see (`GIO_LAUNCHED_DESKTOP_FILE` and
-friends), and the fragility of that signal is worse than the residue: the
-sandboxed case, which is the one that actually bit, is covered outright.
+blank instead of reporting. Two things bound the cost: the data is *already
+gone* in that scenario (unlike the sandbox bug, where the file was present and
+readable the whole time), and the blank is born at the same path, so the next
+save recreates rather than destroys.
+
+It is still wrong, and closing it properly is a **product decision, not a
+patch**: it needs either a launch signal `arrived_through_the_portal` cannot
+see (`GIO_LAUNCHED_DESKTOP_FILE` and friends, fragile), or splitting open from
+create at the CLI — which changes documented user-visible behaviour. The one
+sub-case worth watching is an unmounted removable or network volume, where
+"absent" is a lie about a file that still exists elsewhere; that is the same
+family as the USB stale-path note in the sharp-corners round.
 
 **Loro's verdict reaches the writer in their language** (`store.rs`). Loro
 states its policy in one line — *"backward compatible but not forward

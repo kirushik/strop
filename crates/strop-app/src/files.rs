@@ -34,6 +34,39 @@ fn sandboxed() -> bool {
     *SANDBOXED
 }
 
+/// Never resolve INTO a worse path. A candidate Strop cannot open while the
+/// original still opens means the portal was right about the document's NAME
+/// and wrong about our reach to it — every confinement we have not learned to
+/// name lands here, and so does a host path that exists but denies us. The
+/// readable path wins: the sandbox check is the diagnosis, this is the law,
+/// and the law is what holds when the diagnosis is incomplete.
+///
+/// The test is a real open, not `exists()` — an unreadable file exists
+/// (Sol review, PR #40), and so does a directory standing where a document
+/// should be. When NEITHER opens, the candidate wins: that is the minting
+/// case, where the resolved name is the point and no file exists yet.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn prefer_reachable(candidate: PathBuf, original: PathBuf) -> PathBuf {
+    // Open AND confirm a regular file: Linux happily opens a DIRECTORY
+    // read-only, so `File::open(…).is_ok()` alone would call a directory
+    // standing in a document's place "reachable" (caught by this rule's own
+    // test). Missing, denied, and not-a-file all answer false together.
+    let opens = |p: &Path| {
+        std::fs::File::open(p)
+            .and_then(|f| f.metadata())
+            .is_ok_and(|m| m.is_file())
+    };
+    if !opens(&candidate) && opens(&original) {
+        eprintln!(
+            "strop: the portal's host path {} cannot be read from here — keeping {}",
+            candidate.display(),
+            original.display(),
+        );
+        return original;
+    }
+    candidate
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> PathBuf {
     let Some((doc_id, tail)) = portal_path_parts(&path, runtime_dir) else {
@@ -79,21 +112,7 @@ async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> Path
     }
     .await;
     match result {
-        // Never resolve INTO a worse path. A host path we cannot open while
-        // the portal path still opens means the portal was right about the
-        // document's NAME and wrong about our reach to it — every
-        // confinement we have not learned to name lands here. The readable
-        // path wins: the sandbox check above is the diagnosis, this is the
-        // law, and the law is what holds when the diagnosis is incomplete.
-        Ok(host_path) if !host_path.exists() && path.exists() => {
-            eprintln!(
-                "strop: the portal's host path {} is unreachable from here — keeping {}",
-                host_path.display(),
-                path.display(),
-            );
-            path
-        }
-        Ok(host_path) => host_path,
+        Ok(host_path) => prefer_reachable(host_path, path),
         Err(error) => {
             eprintln!("strop: could not resolve portal path {}: {error}", path.display());
             DEAD_DOC_IDS.lock().unwrap().insert(doc_id);
@@ -670,6 +689,40 @@ mod tests {
         assert!(resolved.exists(), "resolution produced a path that cannot be read");
 
         let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// The rule itself, on the branch the test above cannot reach: a portal
+    /// that ANSWERS, with a candidate that is present but not openable. Only
+    /// a real open tells these apart from a readable file.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn the_reachable_path_wins_over_a_candidate_that_merely_exists() {
+        let dir = std::env::temp_dir().join(format!("strop-reach2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let readable = dir.join("readable.strop");
+        std::fs::write(&readable, b"the manuscript").unwrap();
+
+        // Absent candidate: the classic sandbox shape.
+        assert_eq!(prefer_reachable(dir.join("gone.strop"), readable.clone()), readable);
+
+        // Present but unopenable candidate — a directory wearing the name.
+        let decoy = dir.join("decoy.strop");
+        std::fs::create_dir(&decoy).unwrap();
+        assert!(decoy.exists(), "the decoy must exist for this to prove anything");
+        assert_eq!(prefer_reachable(decoy.clone(), readable.clone()), readable);
+
+        // Present and readable: resolution did its job, the candidate wins.
+        let better = dir.join("better.strop");
+        std::fs::write(&better, b"same document, real name").unwrap();
+        assert_eq!(prefer_reachable(better.clone(), readable.clone()), better);
+
+        // Neither opens: the minting case, where the resolved NAME is the
+        // point and nothing exists yet. The candidate must still win.
+        let unborn = dir.join("unborn.strop");
+        assert_eq!(prefer_reachable(unborn.clone(), dir.join("also-gone.strop")), unborn);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The desktop's verdict, which decides what a MISSING file means: a

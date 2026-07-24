@@ -1059,6 +1059,16 @@ impl Store {
             Ok(bytes) => {
                 doc.import(&bytes).map_err(import_failure)?;
                 let source_schema = schema_version_of(&doc)?;
+                // The compatibility verdict comes FIRST, before anything can
+                // touch the disk. A refusal that has already written a backup
+                // and a ledger line is not a refusal — and the two gates are
+                // independent, so a file can name a min_reader we cannot meet
+                // while its schema_version still looks old enough to migrate.
+                // (Sol review, PR #40: the old order backed up, then refused.)
+                let write_gate = match migrate_schema(&doc)? {
+                    Compat::ReadWrite => None,
+                    Compat::ReadOnly(reason) => Some(reason),
+                };
                 let save_blocked = if source_schema < CURRENT_SCHEMA_VERSION {
                     backup_destination.and_then(|destination| {
                         durable_backup(
@@ -1082,10 +1092,7 @@ impl Store {
                 // compaction away from a file we may not rewrite — which is
                 // the case that matters, since compaction is the one path
                 // that re-exports SHALLOW and so can drop the unread.
-                let save_blocked = match migrate_schema(&doc)? {
-                    Compat::ReadWrite => save_blocked,
-                    Compat::ReadOnly(reason) => save_blocked.or(Some(reason)),
-                };
+                let save_blocked = save_blocked.or(write_gate);
                 let doc = if save_blocked.is_none() {
                     compact_on_open(doc, &bytes, &path, backup_destination)
                 } else {
@@ -2079,6 +2086,40 @@ mod tests {
         assert!(err.to_string().contains("understands schema 2"), "{err}");
         assert_eq!(fs::read(&path).unwrap(), original, "a refused open rewrote the file");
         let _ = fs::remove_file(path);
+    }
+
+    /// The gates run before anything touches the disk. A file whose
+    /// `schema_version` still looks migratable but whose `min_reader` we
+    /// cannot meet used to get a backup and a ledger line written, and only
+    /// THEN be refused (Sol review, PR #40). A refusal that has already
+    /// written is not a refusal.
+    #[test]
+    fn a_refusal_never_reaches_the_backup_directory() {
+        let dir = temp_path("refusal-backups");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.strop");
+        let backups = dir.join("migration-backups");
+
+        // schema_version 0 — old enough that the pre-migration backup path
+        // fires — but a min_reader this build cannot meet.
+        let doc = LoroDoc::new();
+        doc.config_text_style(style_config());
+        doc.get_text(TEXT_CONTAINER).insert(0, "prose behind a gate we fail").unwrap();
+        let meta = doc.get_map(META_CONTAINER);
+        meta.insert(SCHEMA_VERSION_KEY, 0_i64).unwrap();
+        meta.insert(MIN_READER_KEY, CURRENT_SCHEMA_VERSION as i64 + 1).unwrap();
+        doc.commit();
+        let original = doc.export(ExportMode::Snapshot).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let err = Store::open_with_backup_destination(&path, Some(&backups))
+            .err()
+            .expect("the read gate refuses");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(fs::read(&path).unwrap(), original, "a refused open rewrote the file");
+        assert!(!backups.exists(), "a refused open wrote into the backup directory");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The write gate: readable, so the writer sees their words — and
