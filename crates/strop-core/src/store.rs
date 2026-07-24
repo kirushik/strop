@@ -30,10 +30,41 @@ const CHECKPOINTS_CONTAINER: &str = "checkpoints";
 const ASSETS_CONTAINER: &str = "assets";
 const META_CONTAINER: &str = "meta";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
+/// The two compatibility gates, reserved now so a FUTURE breaking change can
+/// be refused by builds that predate it — the one thing a version number can
+/// never do retroactively. Absent (every file written before this build) reads
+/// as zero: "any build may read, any build may write", which is exactly the
+/// promise those files were written under.
+///
+/// The pairing is EBML's `DocTypeVersion`/`DocTypeReadVersion` (RFC 8794) and
+/// SQLite's read-version/write-version bytes at header offsets 18-19, split for
+/// the reason both formats split them: `schema_version` says what the WRITER
+/// used, these two say what a READER must have. An additive change raises the
+/// first and leaves these alone, so old builds keep working — instead of every
+/// release becoming a wall, which is how a version gate stops being obeyed.
+const MIN_READER_KEY: &str = "min_reader";
+const MIN_WRITER_KEY: &str = "min_writer";
 /// Version of the durable container/schema contract, independent of the app
 /// release number. Files without a marker are legacy v0 and migrate through
 /// the same reader paths that have always used serde defaults/fallbacks.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// Raise this ONLY when an older build would render the document WRONG —
+/// text missing, blocks lost, a container it must understand to be honest
+/// about what it is showing. Not when the new data is merely invisible to it.
+pub const CURRENT_MIN_READER: u32 = 1;
+/// Raise this ONLY when an older build's SAVE would drop data it cannot see.
+/// This is the sharper of the two for Strop: a full `ExportMode::Snapshot`
+/// carries unknown containers along untouched, but `compact_on_open`
+/// re-exports a SHALLOW snapshot, and a shallow export is the one write path
+/// that can quietly discard what this build never learned to read.
+pub const CURRENT_MIN_WRITER: u32 = 1;
+
+/// This build's verdict on a file it just imported.
+enum Compat {
+    ReadWrite,
+    /// Readable, but saving would lose what this build cannot see.
+    ReadOnly(String),
+}
 // The graveyard (docs/impl/02-asides.md §4/§5) rides its own map + fingerprint
 // channel, exactly like annotations (review B12): an unguarded blob of verbatim
 // cut text rewriting per idle save is the 4.8 MB class.
@@ -49,30 +80,54 @@ const PROVENANCE_CONTAINER: &str = "provenance";
 const JOURNAL_RUNS_CONTAINER: &str = "journal.runs";
 const JOURNAL_EVENTS_CONTAINER: &str = "journal.events";
 
-fn schema_version_of(doc: &LoroDoc) -> io::Result<u32> {
-    let Some(value) = doc.get_map(META_CONTAINER).get(SCHEMA_VERSION_KEY) else {
+/// One `meta` version number. Absent is zero — the honest reading of a file
+/// written before the key existed, not an error.
+fn meta_version(doc: &LoroDoc, key: &str) -> io::Result<u32> {
+    let invalid =
+        || io::Error::new(io::ErrorKind::InvalidData, format!("invalid .strop {key}"));
+    let Some(value) = doc.get_map(META_CONTAINER).get(key) else {
         return Ok(0);
     };
     match value.into_value() {
-        Ok(LoroValue::I64(version)) => u32::try_from(version).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid .strop schema version")
-        }),
-        Ok(LoroValue::String(version)) => version.parse::<u32>().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid .strop schema version")
-        }),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid .strop schema version",
-        )),
+        Ok(LoroValue::I64(version)) => u32::try_from(version).map_err(|_| invalid()),
+        Ok(LoroValue::String(version)) => version.parse::<u32>().map_err(|_| invalid()),
+        _ => Err(invalid()),
     }
+}
+
+fn schema_version_of(doc: &LoroDoc) -> io::Result<u32> {
+    meta_version(doc, SCHEMA_VERSION_KEY)
 }
 
 /// One explicit gate for every future durable migration. Version zero is the
 /// unmarked 0.1-era format; its compatibility readers already live in
 /// `read_state_of` and the serde defaults on the side structures.
-fn migrate_schema(doc: &LoroDoc) -> io::Result<()> {
+///
+/// Three outcomes, and only three: open it, open it read-only, or refuse it
+/// out loud. There is deliberately no fourth — "open something else and call
+/// it this document" is the outcome that cost a writer their morning
+/// (docs/file-compatibility.md).
+fn migrate_schema(doc: &LoroDoc) -> io::Result<Compat> {
     let version = schema_version_of(doc)?;
-    if version > CURRENT_SCHEMA_VERSION {
+    let min_reader = meta_version(doc, MIN_READER_KEY)?;
+    let min_writer = meta_version(doc, MIN_WRITER_KEY)?;
+    // The READ gate. A file naming a minimum reader newer than this build is
+    // refused whole — not opened, not compacted, not written. Git's stated
+    // reason for MUST NOT proceed applies exactly: proceeding "risks not only
+    // producing wrong results, but actually losing data".
+    if min_reader > CURRENT_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "this .strop file needs a build that understands schema {min_reader}; this one understands up to {CURRENT_SCHEMA_VERSION}"
+            ),
+        ));
+    }
+    // A file carrying NO gates predates the reservation, so the original,
+    // stricter rule stands: an unknown schema is refused outright, because
+    // nobody ever promised it would be readable. Files that DO carry gates
+    // have already had their say above — that is what writing them is for.
+    if min_reader == 0 && version > CURRENT_SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
@@ -80,8 +135,22 @@ fn migrate_schema(doc: &LoroDoc) -> io::Result<()> {
             ),
         ));
     }
+    // The WRITE gate. Readable, but this build's save would drop what it
+    // cannot see — SQLite's write-version rule, and the reason the two
+    // numbers are separate at all. Show the writer their document; refuse
+    // to be the build that rewrites it.
+    if min_writer > CURRENT_SCHEMA_VERSION {
+        return Ok(Compat::ReadOnly(format!(
+            "saving refused: this document was written by a newer Strop (needs schema {min_writer} to write; this build has {CURRENT_SCHEMA_VERSION}). Upgrade Strop to edit it."
+        )));
+    }
     match version {
-        0 | CURRENT_SCHEMA_VERSION => Ok(()),
+        0 | CURRENT_SCHEMA_VERSION => Ok(Compat::ReadWrite),
+        // Vouched for by the gates above: this file's own writer declared
+        // this build new enough to read AND write it. What we don't parse
+        // rides along untouched — a Loro snapshot preserves containers no
+        // reader here has ever heard of (verified: full and shallow alike).
+        v if v > CURRENT_SCHEMA_VERSION => Ok(Compat::ReadWrite),
         // Kept explicit: adding v2 means adding a v1 arm here rather than
         // accidentally treating a new durable shape as the current one.
         _ => Err(io::Error::new(
@@ -93,12 +162,35 @@ fn migrate_schema(doc: &LoroDoc) -> io::Result<()> {
 
 fn stamp_schema_version(doc: &LoroDoc) -> io::Result<()> {
     let meta = doc.get_map(META_CONTAINER);
-    if schema_version_of(doc)? != CURRENT_SCHEMA_VERSION {
-        meta.insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION as i64)
-            .map_err(io::Error::other)?;
+    let mut touched = false;
+    for (key, value) in [
+        (SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION),
+        (MIN_READER_KEY, CURRENT_MIN_READER),
+        (MIN_WRITER_KEY, CURRENT_MIN_WRITER),
+    ] {
+        if meta_version(doc, key)? != value {
+            meta.insert(key, value as i64).map_err(io::Error::other)?;
+            touched = true;
+        }
+    }
+    if touched {
         doc.commit();
     }
     Ok(())
+}
+
+/// Loro's own compatibility verdict, in the vocabulary the startup dialog
+/// speaks. Loro states its policy in one line — "backward compatible but not
+/// forward compatible" — and an older build meeting a newer encode mode gets
+/// `IncompatibleFutureEncodingError`. The writer needs to hear "upgrade
+/// Strop", not "the file is damaged"; every other decode failure genuinely
+/// IS damage, and saying so points at the backup rather than the download.
+fn import_failure(error: loro::LoroError) -> io::Error {
+    let kind = match &error {
+        loro::LoroError::IncompatibleFutureEncodingError(_) => io::ErrorKind::Unsupported,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error.to_string())
 }
 
 /// Everything a reopened document restores.
@@ -965,7 +1057,7 @@ impl Store {
         doc.config_text_style(style_config());
         match fs::read(&path) {
             Ok(bytes) => {
-                doc.import(&bytes).map_err(io::Error::other)?;
+                doc.import(&bytes).map_err(import_failure)?;
                 let source_schema = schema_version_of(&doc)?;
                 let save_blocked = if source_schema < CURRENT_SCHEMA_VERSION {
                     backup_destination.and_then(|destination| {
@@ -985,7 +1077,15 @@ impl Store {
                 } else {
                     None
                 };
-                migrate_schema(&doc)?;
+                // The write gate joins the backup gate in the same channel,
+                // and the same `save_blocked.is_none()` below already keeps
+                // compaction away from a file we may not rewrite — which is
+                // the case that matters, since compaction is the one path
+                // that re-exports SHALLOW and so can drop the unread.
+                let save_blocked = match migrate_schema(&doc)? {
+                    Compat::ReadWrite => save_blocked,
+                    Compat::ReadOnly(reason) => save_blocked.or(Some(reason)),
+                };
                 let doc = if save_blocked.is_none() {
                     compact_on_open(doc, &bytes, &path, backup_destination)
                 } else {
@@ -1945,6 +2045,78 @@ mod tests {
         let err = Store::open(&path).err().expect("future schema is refused");
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("uses schema"));
+        let _ = fs::remove_file(path);
+    }
+
+    /// A file from a hypothetical future Strop: real prose, a schema this
+    /// build has never seen, and the two gates its writer chose to declare.
+    fn gated_future_bytes(text: &str, min_reader: u32, min_writer: u32) -> Vec<u8> {
+        let doc = LoroDoc::new();
+        doc.config_text_style(style_config());
+        doc.get_text(TEXT_CONTAINER).insert(0, text).unwrap();
+        let meta = doc.get_map(META_CONTAINER);
+        meta.insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION as i64 + 1).unwrap();
+        meta.insert(MIN_READER_KEY, min_reader as i64).unwrap();
+        meta.insert(MIN_WRITER_KEY, min_writer as i64).unwrap();
+        // The v2-only feature this build knows nothing about.
+        doc.get_map("footnotes").insert("list", "[{\"id\":7}]").unwrap();
+        doc.commit();
+        doc.export(ExportMode::Snapshot).unwrap()
+    }
+
+    /// The read gate: refused whole, out loud — and the bytes on disk are
+    /// exactly the bytes we found. A refusal that edits the file is not a
+    /// refusal. THE law: a document with data in it never opens blank.
+    #[test]
+    fn a_file_past_the_read_gate_is_refused_without_touching_it() {
+        let path = temp_path("read-gate");
+        let _ = fs::remove_file(&path);
+        let original = gated_future_bytes("a manuscript from the future", 2, 2);
+        fs::write(&path, &original).unwrap();
+
+        let err = Store::open(&path).err().expect("read gate refuses");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("understands schema 2"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), original, "a refused open rewrote the file");
+        let _ = fs::remove_file(path);
+    }
+
+    /// The write gate: readable, so the writer sees their words — and
+    /// unwritable, so this build cannot be the one that drops what it never
+    /// read. SQLite's write-version rule, and no compaction either.
+    #[test]
+    fn a_file_past_only_the_write_gate_opens_read_only() {
+        let path = temp_path("write-gate");
+        let _ = fs::remove_file(&path);
+        let original = gated_future_bytes("still perfectly readable", 1, 2);
+        fs::write(&path, &original).unwrap();
+
+        let (store, loaded) = Store::open(&path).expect("read gate lets this through");
+        assert_eq!(loaded.expect("a document, not a blank page").text, "still perfectly readable");
+        let err = store.save().expect_err("the write gate holds");
+        assert!(err.to_string().contains("Upgrade Strop"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), original, "a read-only open rewrote the file");
+        let _ = fs::remove_file(path);
+    }
+
+    /// The whole point of splitting the two numbers: a purely ADDITIVE
+    /// future file opens read-write in an older build, and the feature that
+    /// build cannot see survives its save untouched.
+    #[test]
+    fn an_additive_future_file_opens_read_write_and_preserves_what_it_cannot_read() {
+        let path = temp_path("additive-future");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, gated_future_bytes("edited by an older build", 1, 1)).unwrap();
+
+        let (store, loaded) = Store::open(&path).expect("additive files stay open");
+        assert_eq!(loaded.expect("not a blank page").text, "edited by an older build");
+        store.save().expect("and stay writable");
+
+        let (reopened, _) = Store::open(&path).unwrap();
+        assert!(
+            reopened.doc.get_map("footnotes").get("list").is_some(),
+            "an older build's save dropped a container it could not read",
+        );
         let _ = fs::remove_file(path);
     }
 

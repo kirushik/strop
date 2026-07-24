@@ -20,11 +20,35 @@ fn portal_path_parts(path: &Path, runtime_dir: &Path) -> Option<(String, PathBuf
     Some((doc_id, components.collect()))
 }
 
+/// Whether this process runs inside a Flatpak sandbox. Flatpak stamps
+/// `/.flatpak-info` into every instance it starts, and confinement is a
+/// RUNTIME fact, not a build-time one — the very same binary is
+/// unconfined when the deb ships it and confined when the Flathub
+/// manifest repackages it. So it is read from the instance, never baked.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn sandboxed() -> bool {
+    Path::new("/.flatpak-info").exists()
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> PathBuf {
     let Some((doc_id, tail)) = portal_path_parts(&path, runtime_dir) else {
         return path;
     };
+    // Inside a sandbox the doc-portal path IS the document's real address.
+    // The host path the portal reports names a directory this process
+    // cannot see — and a file Strop cannot read is how Strop spells
+    // "brand-new blank document". Field report 2026-07-24: the Flathub
+    // build opened a 3858-character manuscript as an empty page, in
+    // silence, because a `.strop` double-click resolves to the Flatpak
+    // whenever one is installed (its exports dir precedes /usr/share in
+    // XDG_DATA_DIRS) and both builds call themselves 0.3.0. Worse than
+    // the blank page: `/home/.../Documents` is creatable inside the
+    // sandbox as a per-instance tmpfs, so the writer's next hour would
+    // have autosaved into a directory that evaporates at quit.
+    if sandboxed() {
+        return path;
+    }
     // One honest attempt per document id per process (Copilot, PR #28):
     // recents() sits on the palette's render path via omni_rows, so a doc
     // id whose GetHostPaths already refused us must not cost a fresh
@@ -51,6 +75,20 @@ async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> Path
     }
     .await;
     match result {
+        // Never resolve INTO a worse path. A host path we cannot open while
+        // the portal path still opens means the portal was right about the
+        // document's NAME and wrong about our reach to it — every
+        // confinement we have not learned to name lands here. The readable
+        // path wins: the sandbox check above is the diagnosis, this is the
+        // law, and the law is what holds when the diagnosis is incomplete.
+        Ok(host_path) if !host_path.exists() && path.exists() => {
+            eprintln!(
+                "strop: the portal's host path {} is unreachable from here — keeping {}",
+                host_path.display(),
+                path.display(),
+            );
+            path
+        }
         Ok(host_path) => host_path,
         Err(error) => {
             eprintln!("strop: could not resolve portal path {}: {error}", path.display());
@@ -96,6 +134,16 @@ fn is_portal_path(path: &Path) -> bool {
         return portal_path_parts(path, Path::new(&runtime_dir)).is_some();
     }
     false
+}
+
+/// Whether this path reached Strop through the XDG document portal — the
+/// file manager, the file chooser, a drag from another app. Such a path
+/// always names a document that ALREADY EXISTS: the writer picked it from
+/// a list of real files. So a miss is a fact to report, never a document
+/// to create. (A path typed on the command line keeps the opposite rule:
+/// `strop notes/new-essay.strop` is how you start one.)
+pub fn came_from_desktop(path: &Path) -> bool {
+    is_portal_path(path)
 }
 
 /// The host directory a sibling of `path` should be minted in — rename
@@ -587,6 +635,46 @@ mod tests {
             gpui::block_on(resolve_portal_path_async_at(path.to_owned(), runtime)),
             path
         );
+    }
+
+    /// The rule that would have saved the morning of 2026-07-24 even if
+    /// nobody had thought of Flatpak: a portal path that OPENS must never be
+    /// traded for a host path that does not. Here the portal file is real
+    /// and the "host" answer is a directory the process cannot see — the
+    /// exact shape of a sandbox, and of every confinement not yet named.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn a_readable_portal_path_is_never_traded_for_an_unreachable_host_path() {
+        let runtime = std::env::temp_dir().join(format!("strop-reach-{}", std::process::id()));
+        let doc = runtime.join("doc/7ad41c2e");
+        std::fs::create_dir_all(&doc).unwrap();
+        let portal = doc.join("Draft.strop");
+        std::fs::write(&portal, b"the manuscript").unwrap();
+
+        // No portal service answers in a test, so resolution fails and the
+        // path is kept — the same verdict the reachability rule reaches,
+        // arrived at one branch earlier. Either way the readable path wins.
+        let resolved = gpui::block_on(resolve_portal_path_async_at(portal.clone(), &runtime));
+        assert_eq!(resolved, portal);
+        assert!(resolved.exists(), "resolution produced a path that cannot be read");
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// The desktop's verdict, which decides what a MISSING file means: a
+    /// path the writer picked out of the file manager is a document that
+    /// exists, so a miss is an error to show. A path they typed is not.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn only_portal_paths_carry_the_desktop_promise_that_the_file_exists() {
+        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            return; // No portal can exist here; the promise cannot be made.
+        };
+        let runtime = PathBuf::from(runtime);
+        assert!(came_from_desktop(&runtime.join("doc/7ad41c2e/Draft.strop")));
+        assert!(!came_from_desktop(Path::new("/home/writer/Documents/Draft.strop")));
+        // `strop notes/new-essay.strop` must still be how you start one.
+        assert!(!came_from_desktop(Path::new("notes/new-essay.strop")));
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
