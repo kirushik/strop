@@ -24,10 +24,14 @@ fn portal_path_parts(path: &Path, runtime_dir: &Path) -> Option<(String, PathBuf
 /// `/.flatpak-info` into every instance it starts, and confinement is a
 /// RUNTIME fact, not a build-time one — the very same binary is
 /// unconfined when the deb ships it and confined when the Flathub
-/// manifest repackages it. So it is read from the instance, never baked.
+/// manifest repackages it. So it is read from the instance, never baked —
+/// but read ONCE: confinement cannot change under a running process, and
+/// this sits behind `recents()`, which the palette re-reads while drawing.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn sandboxed() -> bool {
-    Path::new("/.flatpak-info").exists()
+    static SANDBOXED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| Path::new("/.flatpak-info").exists());
+    *SANDBOXED
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -136,13 +140,20 @@ fn is_portal_path(path: &Path) -> bool {
     false
 }
 
-/// Whether this path reached Strop through the XDG document portal — the
-/// file manager, the file chooser, a drag from another app. Such a path
-/// always names a document that ALREADY EXISTS: the writer picked it from
-/// a list of real files. So a miss is a fact to report, never a document
-/// to create. (A path typed on the command line keeps the opposite rule:
-/// `strop notes/new-essay.strop` is how you start one.)
-pub fn came_from_desktop(path: &Path) -> bool {
+/// Whether this path reached Strop through the XDG document portal — and
+/// nothing else. The portal only ever hands out an id for a file that
+/// already exists, so such a path names an EXISTING document and a miss is
+/// a fact to report rather than a document to create.
+///
+/// Deliberately narrow. An unconfined build launched from the file manager
+/// receives an ordinary path, indistinguishable here from one typed at a
+/// shell — and `strop notes/new-essay.strop` must stay the way to start a
+/// document, so ordinary paths keep the opposite rule. The residual gap
+/// (a real file deleted between the click and the open, in an unconfined
+/// build, births a blank instead of reporting) is named in
+/// docs/file-compatibility.md §2; closing it needs a launch signal this
+/// function cannot see.
+pub fn arrived_through_the_portal(path: &Path) -> bool {
     is_portal_path(path)
 }
 
@@ -662,19 +673,20 @@ mod tests {
     }
 
     /// The desktop's verdict, which decides what a MISSING file means: a
-    /// path the writer picked out of the file manager is a document that
-    /// exists, so a miss is an error to show. A path they typed is not.
+    /// path the PORTAL issued is a document that exists, so a miss is an
+    /// error to show. An ordinary path — typed, or handed over by an
+    /// unconfined launch — is not, and must stay birthable.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
-    fn only_portal_paths_carry_the_desktop_promise_that_the_file_exists() {
+    fn only_portal_paths_promise_that_the_file_exists() {
         let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
             return; // No portal can exist here; the promise cannot be made.
         };
         let runtime = PathBuf::from(runtime);
-        assert!(came_from_desktop(&runtime.join("doc/7ad41c2e/Draft.strop")));
-        assert!(!came_from_desktop(Path::new("/home/writer/Documents/Draft.strop")));
+        assert!(arrived_through_the_portal(&runtime.join("doc/7ad41c2e/Draft.strop")));
+        assert!(!arrived_through_the_portal(Path::new("/home/writer/Documents/Draft.strop")));
         // `strop notes/new-essay.strop` must still be how you start one.
-        assert!(!came_from_desktop(Path::new("notes/new-essay.strop")));
+        assert!(!arrived_through_the_portal(Path::new("notes/new-essay.strop")));
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]

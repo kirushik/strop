@@ -139,11 +139,14 @@ struct OpenRequest {
     path: PathBuf,
     /// Seed this document as the welcome tutorial.
     welcome: bool,
-    /// The writer picked this document from something that lists only real
-    /// files — the file manager, the file chooser, the recents list. A miss
-    /// is then a fact to report, never a blank document to create. Paths
-    /// Strop chose for itself (`--new`, the tutorial) say false: for those,
-    /// missing IS the point.
+    /// This path was already known to name a real file when we chose it, so
+    /// a miss is a fact to report rather than a blank document to create.
+    /// Exactly three origins say true: a document-portal argv path (the
+    /// portal only issues ids for files that exist), the migrated scratch
+    /// (just renamed into place), and a recents entry (existence-checked one
+    /// line before). Everything else says false — `--new` and the tutorial
+    /// because missing IS the point, and an ordinary argv path because
+    /// `strop notes/new-essay.strop` is how a document starts.
     must_exist: bool,
 }
 
@@ -168,7 +171,7 @@ fn data_file() -> OpenRequest {
             // resolver's whole job is to turn the portal's plumbing into a
             // place, and the answer must not launder away the fact that the
             // desktop handed us an existing file.
-            let must_exist = files::came_from_desktop(&named);
+            let must_exist = files::arrived_through_the_portal(&named);
             return OpenRequest {
                 path: files::resolve_portal_path(named),
                 welcome: false,
@@ -322,7 +325,7 @@ fn main() {
         let smoke = std::env::var("STROP_SMOKE").is_ok();
         // Resolve the document path exactly once: data_file() has side
         // effects (scratch migration) that smoke runs must never trigger.
-        let (doc_path, welcome, picked_by_writer): (Option<PathBuf>, bool, bool) =
+        let (doc_path, welcome, missing_is_an_error): (Option<PathBuf>, bool, bool) =
             if smoke && std::env::args().nth(1).is_none() {
                 (None, false, false)
             } else {
@@ -346,7 +349,7 @@ fn main() {
                 // (field report 2026-07-24, docs/file-compatibility.md §1).
                 // A planned .md import is exempt: its .strop is SUPPOSED to
                 // be absent, that is what "import" means.
-                let require_existing = (picked_by_writer && !planned_import)
+                let require_existing = (missing_is_an_error && !planned_import)
                     || std::env::var_os("STROP_REQUIRE_EXISTING").is_some();
                 // Intentional birth at an explicit CLI path may create its
                 // parent; a LAZY .md import must not — its sidecar's parent

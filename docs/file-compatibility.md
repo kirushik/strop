@@ -62,12 +62,23 @@ because one of them must keep holding when the other's diagnosis is wrong:
 - *Unnamed:* a portal path that **opens** is never traded for a host path that
   does not. Every confinement we have not learned to name lands here.
 
-**Birth stops being the fallthrough** (`main.rs`). A path the writer *picked*
-— from the file manager, the file chooser, the recents list — names a document
-that already exists, so a miss is now reported rather than born blank. A path
-they *typed* keeps the opposite rule: `strop notes/new-essay.strop` is still
-how you start one. The distinction is decided on the path **as it arrived**,
-before resolution, so the resolver cannot launder the promise away.
+**Birth stops being the fallthrough** (`main.rs`). Exactly three origins now
+say "a miss here is an error, not a birth": a **document-portal** argv path,
+because the portal only ever issues an id for a file that exists; the migrated
+scratch, just renamed into place; and a recents entry, existence-checked one
+line earlier. Everything else keeps the old rule — `--new` and the tutorial
+because missing *is* the point, and an ordinary argv path because
+`strop notes/new-essay.strop` is how a document starts. For the portal case
+the decision is made on the path **as it arrived**, before resolution, so the
+resolver cannot launder the promise away.
+
+One gap is left open deliberately. An **unconfined** build launched from the
+file manager receives an ordinary path, indistinguishable from a typed one —
+so if that file is deleted between the click and the open, it still births a
+blank instead of reporting. Closing it needs a launch signal
+`arrived_through_the_portal` cannot see (`GIO_LAUNCHED_DESKTOP_FILE` and
+friends), and the fragility of that signal is worse than the residue: the
+sandboxed case, which is the one that actually bit, is covered outright.
 
 **Loro's verdict reaches the writer in their language** (`store.rs`). Loro
 states its policy in one line — *"backward compatible but not forward
