@@ -134,28 +134,64 @@ fn save_bounds(b: (f32, f32, f32, f32)) {
     }
 }
 
+/// What Strop was asked to open, and what a MISSING file would mean.
+struct OpenRequest {
+    path: PathBuf,
+    /// Seed this document as the welcome tutorial.
+    welcome: bool,
+    /// This path was already known to name a real file when we chose it, so
+    /// a miss is a fact to report rather than a blank document to create.
+    /// Exactly three origins say true: a document-portal argv path (the
+    /// portal only issues ids for files that exist), the migrated scratch
+    /// (just renamed into place), and a recents entry (existence-checked one
+    /// line before). Everything else says false — `--new` and the tutorial
+    /// because missing IS the point, and an ordinary argv path because
+    /// `strop notes/new-essay.strop` is how a document starts.
+    must_exist: bool,
+}
+
 /// `strop [file.strop|file.md|--new|--welcome]`. With no argument:
 /// migrate the legacy hidden scratch if present, else reopen the most
 /// recent document, else the first run ever gets the tutorial (PLAN.md
-/// E2/E4 — documents are never created in hidden locations). The bool
-/// marks "seed this as the welcome tutorial".
-fn data_file() -> (PathBuf, bool) {
+/// E2/E4 — documents are never created in hidden locations).
+fn data_file() -> OpenRequest {
+    let mint = |path| OpenRequest { path, welcome: false, must_exist: false };
     match std::env::args().nth(1).as_deref() {
-        Some("--new") => return (files::untitled_path(), false),
-        Some("--welcome") => return (files::welcome_path(), true),
-        Some(arg) => return (files::resolve_portal_path(arg), false),
+        Some("--new") => return mint(files::untitled_path()),
+        Some("--welcome") => {
+            return OpenRequest {
+                path: files::welcome_path(),
+                welcome: true,
+                must_exist: false,
+            };
+        }
+        Some(arg) => {
+            let named = PathBuf::from(arg);
+            // Decided BEFORE resolution, on the path as it arrived: the
+            // resolver's whole job is to turn the portal's plumbing into a
+            // place, and the answer must not launder away the fact that the
+            // desktop handed us an existing file.
+            let must_exist = files::arrived_through_the_portal(&named);
+            return OpenRequest {
+                path: files::resolve_portal_path(named),
+                welcome: false,
+                must_exist,
+            };
+        }
         None => {}
     }
     if let Some(migrated) = files::migrate_scratch() {
-        return (migrated, false);
+        return OpenRequest { path: migrated, welcome: false, must_exist: true };
     }
     if let Some(recent) = files::recents()
         .into_iter()
         .find(|path| path.exists())
     {
-        return (recent, false);
+        // It existed one line ago; if it is gone by the time we read it,
+        // the writer deleted it under us and deserves to hear so.
+        return OpenRequest { path: recent, welcome: false, must_exist: true };
     }
-    (files::welcome_path(), true)
+    OpenRequest { path: files::welcome_path(), welcome: true, must_exist: false }
 }
 
 /// Where a document path durably lives, and whether opening it means a
@@ -289,12 +325,12 @@ fn main() {
         let smoke = std::env::var("STROP_SMOKE").is_ok();
         // Resolve the document path exactly once: data_file() has side
         // effects (scratch migration) that smoke runs must never trigger.
-        let (doc_path, welcome): (Option<PathBuf>, bool) =
+        let (doc_path, welcome, missing_is_an_error): (Option<PathBuf>, bool, bool) =
             if smoke && std::env::args().nth(1).is_none() {
-                (None, false)
+                (None, false, false)
             } else {
-                let (p, welcome) = data_file();
-                (Some(p), welcome)
+                let request = data_file();
+                (Some(request.path), request.welcome, request.must_exist)
             };
         let mut instance_guard: Option<single_instance::InstanceGuard> = None;
         // Where the durable file lives and whether this open is a Markdown
@@ -305,7 +341,16 @@ fn main() {
             None => None,
             Some(p) => {
                 let (store_path, planned_import) = open_plan.clone().expect("doc_path is Some");
-                let require_existing = std::env::var_os("STROP_REQUIRE_EXISTING").is_some();
+                // A document Strop was ASKED to open must open, or say why.
+                // The third outcome — a blank page where a manuscript lives —
+                // is the one this gate exists to make unreachable, and a
+                // missing file is the only way Strop ever reached it: the
+                // birth path and the failure path were the same path
+                // (field report 2026-07-24, docs/file-compatibility.md §1).
+                // A planned .md import is exempt: its .strop is SUPPOSED to
+                // be absent, that is what "import" means.
+                let require_existing = (missing_is_an_error && !planned_import)
+                    || std::env::var_os("STROP_REQUIRE_EXISTING").is_some();
                 // Intentional birth at an explicit CLI path may create its
                 // parent; a LAZY .md import must not — its sidecar's parent
                 // is the .md's own directory, and a glance creates nothing

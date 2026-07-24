@@ -20,11 +20,72 @@ fn portal_path_parts(path: &Path, runtime_dir: &Path) -> Option<(String, PathBuf
     Some((doc_id, components.collect()))
 }
 
+/// Whether this process runs inside a Flatpak sandbox. Flatpak stamps
+/// `/.flatpak-info` into every instance it starts, and confinement is a
+/// RUNTIME fact, not a build-time one — the very same binary is
+/// unconfined when the deb ships it and confined when the Flathub
+/// manifest repackages it. So it is read from the instance, never baked —
+/// but read ONCE: confinement cannot change under a running process, and
+/// this sits behind `recents()`, which the palette re-reads while drawing.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn sandboxed() -> bool {
+    static SANDBOXED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| Path::new("/.flatpak-info").exists());
+    *SANDBOXED
+}
+
+/// Never resolve INTO a worse path. A candidate Strop cannot open while the
+/// original still opens means the portal was right about the document's NAME
+/// and wrong about our reach to it — every confinement we have not learned to
+/// name lands here, and so does a host path that exists but denies us. The
+/// readable path wins: the sandbox check is the diagnosis, this is the law,
+/// and the law is what holds when the diagnosis is incomplete.
+///
+/// The test is a real open, not `exists()` — an unreadable file exists
+/// (Sol review, PR #40), and so does a directory standing where a document
+/// should be. When NEITHER opens, the candidate wins: that is the minting
+/// case, where the resolved name is the point and no file exists yet.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn prefer_reachable(candidate: PathBuf, original: PathBuf) -> PathBuf {
+    // Open AND confirm a regular file: Linux happily opens a DIRECTORY
+    // read-only, so `File::open(…).is_ok()` alone would call a directory
+    // standing in a document's place "reachable" (caught by this rule's own
+    // test). Missing, denied, and not-a-file all answer false together.
+    let opens = |p: &Path| {
+        std::fs::File::open(p)
+            .and_then(|f| f.metadata())
+            .is_ok_and(|m| m.is_file())
+    };
+    if !opens(&candidate) && opens(&original) {
+        eprintln!(
+            "strop: the portal's host path {} cannot be read from here — keeping {}",
+            candidate.display(),
+            original.display(),
+        );
+        return original;
+    }
+    candidate
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> PathBuf {
     let Some((doc_id, tail)) = portal_path_parts(&path, runtime_dir) else {
         return path;
     };
+    // Inside a sandbox the doc-portal path IS the document's real address.
+    // The host path the portal reports names a directory this process
+    // cannot see — and a file Strop cannot read is how Strop spells
+    // "brand-new blank document". Field report 2026-07-24: the Flathub
+    // build opened a 3858-character manuscript as an empty page, in
+    // silence, because a `.strop` double-click resolves to the Flatpak
+    // whenever one is installed (its exports dir precedes /usr/share in
+    // XDG_DATA_DIRS) and both builds call themselves 0.3.0. Worse than
+    // the blank page: `/home/.../Documents` is creatable inside the
+    // sandbox as a per-instance tmpfs, so the writer's next hour would
+    // have autosaved into a directory that evaporates at quit.
+    if sandboxed() {
+        return path;
+    }
     // One honest attempt per document id per process (Copilot, PR #28):
     // recents() sits on the palette's render path via omni_rows, so a doc
     // id whose GetHostPaths already refused us must not cost a fresh
@@ -51,7 +112,7 @@ async fn resolve_portal_path_async_at(path: PathBuf, runtime_dir: &Path) -> Path
     }
     .await;
     match result {
-        Ok(host_path) => host_path,
+        Ok(host_path) => prefer_reachable(host_path, path),
         Err(error) => {
             eprintln!("strop: could not resolve portal path {}: {error}", path.display());
             DEAD_DOC_IDS.lock().unwrap().insert(doc_id);
@@ -96,6 +157,23 @@ fn is_portal_path(path: &Path) -> bool {
         return portal_path_parts(path, Path::new(&runtime_dir)).is_some();
     }
     false
+}
+
+/// Whether this path reached Strop through the XDG document portal — and
+/// nothing else. The portal only ever hands out an id for a file that
+/// already exists, so such a path names an EXISTING document and a miss is
+/// a fact to report rather than a document to create.
+///
+/// Deliberately narrow. An unconfined build launched from the file manager
+/// receives an ordinary path, indistinguishable here from one typed at a
+/// shell — and `strop notes/new-essay.strop` must stay the way to start a
+/// document, so ordinary paths keep the opposite rule. The residual gap
+/// (a real file deleted between the click and the open, in an unconfined
+/// build, births a blank instead of reporting) is named in
+/// docs/file-compatibility.md §2; closing it needs a launch signal this
+/// function cannot see.
+pub fn arrived_through_the_portal(path: &Path) -> bool {
+    is_portal_path(path)
 }
 
 /// The host directory a sibling of `path` should be minted in — rename
@@ -587,6 +665,81 @@ mod tests {
             gpui::block_on(resolve_portal_path_async_at(path.to_owned(), runtime)),
             path
         );
+    }
+
+    /// The rule that would have saved the morning of 2026-07-24 even if
+    /// nobody had thought of Flatpak: a portal path that OPENS must never be
+    /// traded for a host path that does not. Here the portal file is real
+    /// and the "host" answer is a directory the process cannot see — the
+    /// exact shape of a sandbox, and of every confinement not yet named.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn a_readable_portal_path_is_never_traded_for_an_unreachable_host_path() {
+        let runtime = std::env::temp_dir().join(format!("strop-reach-{}", std::process::id()));
+        let doc = runtime.join("doc/7ad41c2e");
+        std::fs::create_dir_all(&doc).unwrap();
+        let portal = doc.join("Draft.strop");
+        std::fs::write(&portal, b"the manuscript").unwrap();
+
+        // No portal service answers in a test, so resolution fails and the
+        // path is kept — the same verdict the reachability rule reaches,
+        // arrived at one branch earlier. Either way the readable path wins.
+        let resolved = gpui::block_on(resolve_portal_path_async_at(portal.clone(), &runtime));
+        assert_eq!(resolved, portal);
+        assert!(resolved.exists(), "resolution produced a path that cannot be read");
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// The rule itself, on the branch the test above cannot reach: a portal
+    /// that ANSWERS, with a candidate that is present but not openable. Only
+    /// a real open tells these apart from a readable file.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn the_reachable_path_wins_over_a_candidate_that_merely_exists() {
+        let dir = std::env::temp_dir().join(format!("strop-reach2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let readable = dir.join("readable.strop");
+        std::fs::write(&readable, b"the manuscript").unwrap();
+
+        // Absent candidate: the classic sandbox shape.
+        assert_eq!(prefer_reachable(dir.join("gone.strop"), readable.clone()), readable);
+
+        // Present but unopenable candidate — a directory wearing the name.
+        let decoy = dir.join("decoy.strop");
+        std::fs::create_dir(&decoy).unwrap();
+        assert!(decoy.exists(), "the decoy must exist for this to prove anything");
+        assert_eq!(prefer_reachable(decoy.clone(), readable.clone()), readable);
+
+        // Present and readable: resolution did its job, the candidate wins.
+        let better = dir.join("better.strop");
+        std::fs::write(&better, b"same document, real name").unwrap();
+        assert_eq!(prefer_reachable(better.clone(), readable.clone()), better);
+
+        // Neither opens: the minting case, where the resolved NAME is the
+        // point and nothing exists yet. The candidate must still win.
+        let unborn = dir.join("unborn.strop");
+        assert_eq!(prefer_reachable(unborn.clone(), dir.join("also-gone.strop")), unborn);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The desktop's verdict, which decides what a MISSING file means: a
+    /// path the PORTAL issued is a document that exists, so a miss is an
+    /// error to show. An ordinary path — typed, or handed over by an
+    /// unconfined launch — is not, and must stay birthable.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn only_portal_paths_promise_that_the_file_exists() {
+        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            return; // No portal can exist here; the promise cannot be made.
+        };
+        let runtime = PathBuf::from(runtime);
+        assert!(arrived_through_the_portal(&runtime.join("doc/7ad41c2e/Draft.strop")));
+        assert!(!arrived_through_the_portal(Path::new("/home/writer/Documents/Draft.strop")));
+        // `strop notes/new-essay.strop` must still be how you start one.
+        assert!(!arrived_through_the_portal(Path::new("notes/new-essay.strop")));
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
