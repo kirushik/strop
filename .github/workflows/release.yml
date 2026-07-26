@@ -32,6 +32,10 @@ jobs:
           # (the value exposed by the Checks API) is "CI passed".
           conclusions=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs" --paginate --jq '.check_runs[] | select(.name == "CI passed") | .conclusion')
           grep -qx success <<<"$conclusions" || { echo "tagged commit has no successful ci-success check run" >&2; exit 1; }
+          # The metainfo rides inside the flathub tarball and deb/rpm; a tag
+          # whose version is absent from <releases> would sail through the
+          # build and die weeks later in Flathub review. Fail here instead.
+          grep -q "<release version=\"$workspace_version\"" packaging/linux/cc.pimenov.strop.metainfo.xml || { echo "packaging/linux/cc.pimenov.strop.metainfo.xml has no <release> entry for $workspace_version" >&2; exit 1; }
 
   linux:
     needs: preflight
@@ -68,6 +72,28 @@ jobs:
           # Not grep -q: under pipefail an early-exit grep kills tar with a
           # write error, failing the check precisely when the asset IS there.
           tar -tzf dist/$n.tar.gz | grep "^$n/assets/fonts/coldread/URWBookman-Light.otf$" >/dev/null || { echo "tarball is missing assets/ beside the binary" >&2; exit 1; }
+          # Flathub repackages this tarball (docs/releasing.md §7) — the
+          # channel stamp must say so, and the layout is already the /app
+          # prefix: bin/ + share/, so the manifest is a plain copy. The
+          # FHS share/strop/assets path is the exe-relative candidate
+          # paths::asset_file probes second (bin/../share/strop/assets).
+          STROP_DIST_CHANNEL=flathub cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
+          strip --strip-all target/x86_64-unknown-linux-gnu/dist/strop
+          fh=strop-$ver-x86_64-unknown-linux-gnu-flathub; mkdir -p dist/$fh/bin dist/$fh/share/applications dist/$fh/share/metainfo dist/$fh/share/mime/packages dist/$fh/share/icons dist/$fh/share/doc/strop
+          cp target/x86_64-unknown-linux-gnu/dist/strop dist/$fh/bin/
+          bash script/stage-runtime-assets.sh dist/$fh/share/strop/assets
+          cp packaging/linux/cc.pimenov.strop.desktop dist/$fh/share/applications/
+          cp packaging/linux/cc.pimenov.strop.metainfo.xml dist/$fh/share/metainfo/
+          cp packaging/linux/cc.pimenov.strop.mime.xml dist/$fh/share/mime/packages/
+          cp -r packaging/generated/hicolor dist/$fh/share/icons/
+          # flatpak's exporter hard-refuses icons above 512x512; the 1024px
+          # rendition exists for the macOS icns, not for hicolor themes.
+          rm -rf dist/$fh/share/icons/hicolor/1024x1024
+          cp COPYING NOTICE dist/$fh/share/doc/strop/
+          tar -C dist -czf dist/$fh.tar.gz $fh
+          rm -rf dist/$fh
+          tar -tzf dist/$fh.tar.gz | grep "^$fh/share/strop/assets/fonts/coldread/URWBookman-Light.otf$" >/dev/null || { echo "flathub tarball is missing share/strop/assets beside bin/" >&2; exit 1; }
+          tar -tzf dist/$fh.tar.gz | grep "^$fh/share/icons/hicolor/scalable/apps/cc.pimenov.strop.svg$" >/dev/null || { echo "flathub tarball is missing the hicolor icon set" >&2; exit 1; }
           STROP_DIST_CHANNEL=deb cargo build --profile dist --locked --target x86_64-unknown-linux-gnu -p strop-app
           STROP_DIST_CHANNEL=deb cargo deb -p strop-app --profile dist --target x86_64-unknown-linux-gnu --no-build
           cp target/x86_64-unknown-linux-gnu/debian/*.deb dist/

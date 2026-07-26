@@ -1,0 +1,61 @@
+# Flathub manifest for Strop (docs/releasing.md §7).
+#
+# This repackages the flathub-channel tarball from the tagged GitHub
+# release instead of building Rust inside the sandbox — the same trick
+# Zed's community manifest uses, permitted for upstream-verified apps.
+# The tarball is already laid out as the /app prefix (bin/ + share/),
+# built and attested by tagged CI, so the module below is a plain copy.
+#
+# This file is the source of truth; the copy in the flathub/cc.pimenov.strop
+# repo is updated from it. After each publish, script/flathub-pin.sh VERSION
+# rewrites url: + sha256: below to the just-published asset; between
+# releases the x-checker-data bot does the same via PR on the Flathub side.
+app-id: cc.pimenov.strop
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: strop
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Two network users, both writer-controlled: the passive update check
+  # (About's "0.3.2 is out" line, [update] check=false kills it) and the
+  # writer's own OpenAI-compatible LLM endpoint.
+  - --share=network
+  # Opening a file the writer picks stays portal-only. This grant exists
+  # for the other direction: documents Strop *mints* — the first-launch
+  # welcome, --new, and the sibling fallback in host_parent_or_documents
+  # — are born in the documents folder, and inside the sandbox $HOME is a
+  # per-instance tmpfs. Without this, `create_dir_all` and every autosave
+  # SUCCEED and the writer's hour evaporates at quit (reproduced
+  # 2026-07-26). §7's red line is --filesystem=home, which this is not:
+  # one well-known directory, the one Strop already promises files live in.
+  - --filesystem=xdg-documents
+modules:
+  - name: strop
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 bin/strop $FLATPAK_DEST/bin/strop
+      - cp -r share $FLATPAK_DEST/
+      # Flathub requires the license at share/licenses/$FLATPAK_ID; the
+      # tarball also carries it under share/doc/strop for the deb/rpm
+      # layout's sake, so this is a second home, not a move.
+      - install -Dm644 share/doc/strop/COPYING $FLATPAK_DEST/share/licenses/$FLATPAK_ID/COPYING
+      - install -Dm644 share/doc/strop/NOTICE $FLATPAK_DEST/share/licenses/$FLATPAK_ID/NOTICE
+    sources:
+      - type: archive
+        url: https://github.com/kirushik/strop/releases/download/v0.3.1/strop-0.3.1-x86_64-unknown-linux-gnu-flathub.tar.gz
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+        only-arches: [x86_64]
+        x-checker-data:
+          type: json
+          url: https://api.github.com/repos/kirushik/strop/releases/latest
+          version-query: .tag_name | sub("^v"; "")
+          timestamp-query: .published_at
+          # Select the asset rather than construct its URL: a naming drift
+          # or a missing upload then yields no match (the bot stays put and
+          # says so) instead of a confidently-built 404 discovered at
+          # download time.
+          url-query: '.assets[] | select(.name | endswith("-x86_64-unknown-linux-gnu-flathub.tar.gz")) | .browser_download_url'

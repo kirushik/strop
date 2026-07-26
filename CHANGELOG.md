@@ -8,6 +8,11 @@ versions may still break things).
 ## [Unreleased]
 
 ### Added
+- **Flatpak** — releases now ship a `flathub`-channel tarball, and
+  `packaging/flatpak/` carries the Flathub manifest that repackages it:
+  portal-only sandbox (no blanket filesystem access), Wayland-first, and
+  once the app is on Flathub each new release is picked up by Flathub's
+  update bot automatically.
 - **A citizen of your dock** — Strop now feeds the desktop's own recent-files
   machinery: the Dock menu on macOS, the taskbar jump list on Windows, and
   the freedesktop recent list on Linux (written carefully — other
@@ -18,6 +23,12 @@ versions may still break things).
   placeholder cog before the Strop icon arrives.
 
 ### Fixed
+- `strop --version` now prints the version, commit and channel, and
+  `--help` prints usage. Both used to be treated as filenames: Strop
+  opened a blank document *named* `--version` and sat there. Any option
+  Strop doesn't recognise is now refused by name instead of quietly
+  becoming a file, and `--` ends option parsing, so a document genuinely
+  called `--version` still opens via `strop -- --version`.
 - **macOS**: renaming a document no longer slides the name field underneath
   the traffic-light buttons when the titlebar runs out of room.
 - **Linux**: the GNOME apps-overlay search no longer shows Strop iconless —

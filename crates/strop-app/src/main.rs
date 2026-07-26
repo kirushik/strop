@@ -150,22 +150,117 @@ struct OpenRequest {
     must_exist: bool,
 }
 
+const USAGE: &str = "\
+usage: strop [OPTION | FILE]
+
+  FILE            open a .strop document, or import a .md beside it
+  --new           a fresh Untitled in the documents folder
+  --welcome       the tutorial document
+  --rollback      re-instate the previous binary (self-updating builds)
+  --version, -V   print version, commit and channel
+  --help, -h      print this
+  --              end of options: what follows is a literal path";
+
+/// What argv asks for — decided once, as a value, so both the answering
+/// below and `data_file()` read the same verdict instead of each parsing
+/// argv with its own rules.
+///
+/// The shape exists because of what the old rules did: anything
+/// unrecognised fell straight through to the path branch, so
+/// `strop --version` opened a blank document *named* `--version` (found
+/// 2026-07-26). An option Strop does not know is a mistake to report,
+/// never a filename to invent — the law the portal round wrote for
+/// missing files, applied to argv.
+#[derive(Debug, PartialEq, Eq)]
+enum Argv {
+    /// No argument: recents, or the tutorial on a first run.
+    Nothing,
+    New,
+    Welcome,
+    Rollback,
+    Version,
+    Help,
+    /// Begins with `-` and matches nothing above.
+    Unknown(String),
+    Document(String),
+}
+
+fn classify_argv<I: IntoIterator<Item = String>>(args: I) -> Argv {
+    let mut args = args.into_iter();
+    let Some(first) = args.next() else { return Argv::Nothing };
+    // `--` ends option parsing, so a document whose name genuinely begins
+    // with a dash stays openable: `strop -- --version`.
+    if first == "--" {
+        return args.next().map_or(Argv::Nothing, Argv::Document);
+    }
+    match first.as_str() {
+        "--new" => Argv::New,
+        "--welcome" => Argv::Welcome,
+        "--rollback" => Argv::Rollback,
+        "--version" | "-V" => Argv::Version,
+        "--help" | "-h" => Argv::Help,
+        other if other.starts_with('-') => Argv::Unknown(first),
+        _ => Argv::Document(first),
+    }
+}
+
+/// The questions a shell asks about the *binary* rather than about a
+/// document — answered on stdout and exited before any window, store or
+/// rendezvous socket exists.
+fn answer_cli_question() {
+    match classify_argv(std::env::args().skip(1)) {
+        Argv::Version => {
+            println!(
+                "strop {} ({}, {})",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("STROP_GIT_HASH").unwrap_or("unknown"),
+                about::channel_text(update::channel()),
+            );
+            std::process::exit(0);
+        }
+        Argv::Help => {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
+        // Consumed a moment later by `startup_apply_if_staged`, but only
+        // on channels that own their binary. Anywhere else the flag is
+        // inert, and saying so beats opening a document called
+        // "--rollback".
+        Argv::Rollback if !update::channel().self_updates() => {
+            eprintln!(
+                "strop: this build does not update itself, so there is nothing to roll back — \
+                 your package manager owns this copy"
+            );
+            std::process::exit(2);
+        }
+        Argv::Unknown(flag) => {
+            eprintln!("strop: unknown option {flag}\n{USAGE}");
+            std::process::exit(2);
+        }
+        _ => {}
+    }
+}
+
 /// `strop [file.strop|file.md|--new|--welcome]`. With no argument:
 /// migrate the legacy hidden scratch if present, else reopen the most
 /// recent document, else the first run ever gets the tutorial (PLAN.md
 /// E2/E4 — documents are never created in hidden locations).
 fn data_file() -> OpenRequest {
     let mint = |path| OpenRequest { path, welcome: false, must_exist: false };
-    match std::env::args().nth(1).as_deref() {
-        Some("--new") => return mint(files::untitled_path()),
-        Some("--welcome") => {
+    match classify_argv(std::env::args().skip(1)) {
+        Argv::New => return mint(files::untitled_path()),
+        Argv::Welcome => {
             return OpenRequest {
                 path: files::welcome_path(),
                 welcome: true,
                 must_exist: false,
             };
         }
-        Some(arg) => {
+        // Rollback was handled during startup (or refused there); Version,
+        // Help and Unknown already exited. None of them names a document,
+        // so the no-argument path below decides what opens.
+        Argv::Rollback | Argv::Version | Argv::Help | Argv::Unknown(_) | Argv::Nothing => {}
+        Argv::Document(arg) => {
             let named = PathBuf::from(arg);
             // Decided BEFORE resolution, on the path as it arrived: the
             // resolver's whole job is to turn the portal's plumbing into a
@@ -178,7 +273,6 @@ fn data_file() -> OpenRequest {
                 must_exist,
             };
         }
-        None => {}
     }
     if let Some(migrated) = files::migrate_scratch() {
         return OpenRequest { path: migrated, welcome: false, must_exist: true };
@@ -231,6 +325,9 @@ fn main() {
     } {
         eprintln!("strop: could not set process AppUserModelID: {error}");
     }
+    // A question about the binary is answered by the binary that was
+    // asked: before the staged-update swap below, before any window.
+    answer_cli_question();
     // Before anything — before arguments are read and before any
     // single-instance socket can exist: if a verified update is staged,
     // this swaps binaries and re-execs (docs/releasing.md §4). The
@@ -748,6 +845,56 @@ mod tests {
     };
 
     use super::*;
+
+    fn classify(args: &[&str]) -> Argv {
+        classify_argv(args.iter().map(|a| (*a).to_owned()))
+    }
+
+    #[test]
+    fn a_question_about_the_binary_is_never_a_document() {
+        // The 2026-07-26 defect: these fell through to the path branch and
+        // opened blank documents named after the flag.
+        assert_eq!(classify(&["--version"]), Argv::Version);
+        assert_eq!(classify(&["-V"]), Argv::Version);
+        assert_eq!(classify(&["--help"]), Argv::Help);
+        assert_eq!(classify(&["-h"]), Argv::Help);
+        assert_eq!(classify(&["--rollback"]), Argv::Rollback);
+    }
+
+    #[test]
+    fn an_unknown_option_is_a_mistake_not_a_filename() {
+        assert_eq!(classify(&["--frobnicate"]), Argv::Unknown("--frobnicate".into()));
+        assert_eq!(classify(&["-x"]), Argv::Unknown("-x".into()));
+        // The Windows dock-action argv the editor's comment warns about:
+        // refused now, rather than silently minting "--dock-action".
+        assert_eq!(classify(&["--dock-action", "1"]), Argv::Unknown("--dock-action".into()));
+    }
+
+    #[test]
+    fn the_known_document_verbs_still_answer() {
+        assert_eq!(classify(&[]), Argv::Nothing);
+        assert_eq!(classify(&["--new"]), Argv::New);
+        assert_eq!(classify(&["--welcome"]), Argv::Welcome);
+        assert_eq!(classify(&["notes/essay.strop"]), Argv::Document("notes/essay.strop".into()));
+    }
+
+    #[test]
+    fn a_dash_dash_hands_the_next_word_over_as_a_path() {
+        // A writer whose file really is called "--version" keeps it.
+        assert_eq!(classify(&["--", "--version"]), Argv::Document("--version".into()));
+        assert_eq!(classify(&["--", "--new"]), Argv::Document("--new".into()));
+        assert_eq!(classify(&["--", "-weird name.strop"]),
+            Argv::Document("-weird name.strop".into()));
+        // A bare `--` names nothing, so the usual no-argument path decides.
+        assert_eq!(classify(&["--"]), Argv::Nothing);
+    }
+
+    #[test]
+    fn a_leading_dash_only_matters_in_first_position() {
+        // Paths are never mistaken for flags on their own merits.
+        assert_eq!(classify(&["strange-file.strop"]), Argv::Document("strange-file.strop".into()));
+        assert_eq!(classify(&["./--version"]), Argv::Document("./--version".into()));
+    }
 
     struct QuitSurface {
         local_quits: Option<Rc<Cell<usize>>>,

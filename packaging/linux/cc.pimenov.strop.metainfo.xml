@@ -1,13 +1,70 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>cc.pimenov.strop</id>
-  <metadata_license>GPL-3.0+</metadata_license>
-  <project_license>GPL-3.0+</project_license>
+  <!-- Permissive license on the metadata itself (Flathub requires one from
+       the permissive set); the program stays GPL. -->
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
   <name>Strop</name>
   <summary>A quiet writing tool</summary>
+  <developer id="cc.pimenov">
+    <name>Kirill Pimenov</name>
+  </developer>
   <description>
-    <p>Strop is a focused desktop editor for long-form writing.</p>
+    <p>
+      Strop keeps you in charge of your own writing. You write every
+      sentence; the machine is the editor in the margin — it reads your
+      draft the way a sharp editor would, names what isn't working as a
+      question, and never rewrites a line.
+    </p>
+    <p>
+      One button asks the editor for a read at the depth you choose —
+      developmental, line, or copy. It returns named problems as questions
+      in the margin, never replacement text. Bring your own LLM: any
+      OpenAI-compatible API, including a local Ollama — point it at a local
+      model and nothing leaves your machine.
+    </p>
+    <ul>
+      <li>A calm, typing-first canvas with typography handled as you write</li>
+      <li>History you own: .strop files carry the whole editing history, scrubbable like a seek bar</li>
+      <li>Nothing is lost: a compost rail for clippings, a graveyard for cut paragraphs</li>
+      <li>A cold read lays the finished draft out in book typography</li>
+      <li>Plain, portable files: one .strop file per document, Markdown in and out</li>
+    </ul>
   </description>
   <launchable type="desktop-id">cc.pimenov.strop.desktop</launchable>
-  <!-- Screenshot URL is added when release screenshots have a stable home. -->
+  <content_rating type="oars-1.1"/>
+  <url type="homepage">https://github.com/kirushik/strop</url>
+  <url type="bugtracker">https://github.com/kirushik/strop/issues</url>
+  <url type="vcs-browser">https://github.com/kirushik/strop</url>
+  <branding>
+    <color type="primary" scheme_preference="light">#faf4e2</color>
+    <color type="primary" scheme_preference="dark">#2b3a54</color>
+  </branding>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/kirushik/strop/v0.3.0/assets/screenshot.png</image>
+      <caption>Editorial diagnoses anchored in the margin — named problems asked as questions, never a rewrite</caption>
+    </screenshot>
+  </screenshots>
+  <!-- The release.yml preflight refuses a tag whose version has no entry
+       here — add the new release as part of every version bump. -->
+  <releases>
+    <release version="0.3.0" date="2026-07-22">
+      <url>https://github.com/kirushik/strop/releases/tag/v0.3.0</url>
+    </release>
+    <release version="0.2.0" date="2026-07-15">
+      <url>https://github.com/kirushik/strop/releases/tag/v0.2.0</url>
+    </release>
+    <release version="0.1.1" date="2026-06-19">
+      <url>https://github.com/kirushik/strop/releases/tag/v0.1.1</url>
+    </release>
+    <release version="0.1.0" date="2026-06-17">
+      <url>https://github.com/kirushik/strop/releases/tag/v0.1.0</url>
+    </release>
+  </releases>
 </component>
