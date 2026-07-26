@@ -24,10 +24,18 @@ asset="strop-$version-x86_64-unknown-linux-gnu-flathub.tar.gz"
 manifest="$(git rev-parse --show-toplevel)/packaging/flatpak/cc.pimenov.strop.yml"
 [[ -f $manifest ]] || die "manifest $manifest is missing"
 
-# Published only: the bot on the Flathub side reads releases/latest, which
-# never sees drafts — the manual pin must not get ahead of it.
-gh release view "$tag" --repo "$repo" --json isDraft --jq '.isDraft' | grep -qx false \
-  || die "$tag is a draft (or absent) — publish first, pin after"
+# Published AND not a prerelease: the bot on the Flathub side reads
+# releases/latest, which excludes both — pinning to something it cannot
+# see would advance the manifest past the steady-state automation.
+state=$(gh release view "$tag" --repo "$repo" --json isDraft,isPrerelease \
+  --jq '"\(.isDraft) \(.isPrerelease)"') \
+  || die "$tag is absent, or its state could not be read"
+case $state in
+  "false false") ;;
+  "true "*) die "$tag is still a draft — publish first, pin after" ;;
+  *" true") die "$tag is flagged as a prerelease, which releases/latest omits; clear the flag before pinning" ;;
+  *) die "$tag is in an unexpected state ($state)" ;;
+esac
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

@@ -8,11 +8,23 @@ already laid out as the `/app` prefix, and stamped
 `STROP_DIST_CHANNEL=flathub`, so About names the channel honestly and the
 updater stays passive ("… arrives through your package manager").
 
-The sandbox is **portal-only**: no `--filesystem` at all. Known sharp
-edge, accepted for now: paths granted through the document portal are
-`/run/user/…/doc/…` handles, and the recents/visits code stores what it
-sees — cross-restart recents inside Flatpak want their own small round
-(spec §7 records this).
+**The sandbox.** Files the writer *opens* travel through portals only —
+there is no `--filesystem=home`, and no blanket host access. The single
+static grant is `--filesystem=xdg-documents`, and it exists for the
+other direction: documents Strop *mints* (first-launch welcome, `--new`,
+the sibling fallback in `host_parent_or_documents`) are born in the
+documents folder. Inside the sandbox `$HOME` is a per-instance tmpfs
+where `create_dir_all` and every autosave **succeed** and then evaporate
+at quit — verified 2026-07-26 by writing a file in one instance and
+finding it gone from the next. That is silent data loss on the default
+first-launch path, so the grant is not optional; §7's red line is
+`--filesystem=home`, which this is not.
+
+Portal paths themselves are durable: grants live in
+`~/.local/share/flatpak/db/documents` on the host, so a
+`/run/user/…/doc/…` path in recents survives restarts and reboots
+(checked with `flatpak documents`). An earlier draft of this file
+claimed otherwise — it was wrong.
 
 **The glibc law.** A repackaged binary must be built against a glibc no
 newer than the runtime's. CI builds on ubuntu-22.04 (glibc 2.35), well
@@ -46,9 +58,13 @@ to keep the in-repo copy in sync.
 2. Fork `flathub/flathub`, create a branch **off the `new-pr` branch**,
    add `cc.pimenov.strop.yml` + `flathub.json` (flat, no subdirectory),
    open a PR against `new-pr`.
-3. The buildbot builds it; address linter findings
-   (`flatpak run --command=flatpak-builder-lint org.flatpak.Builder
-   manifest cc.pimenov.strop.yml` reproduces them locally).
+3. The buildbot builds it; address linter findings. Locally,
+   `flatpak run --command=flatpak-builder-lint org.flatpak.Builder
+   manifest cc.pimenov.strop.yml` covers only the manifest — the
+   appstream/desktop/screenshot checks that Flathub actually rejects on
+   need a built tree: `… flatpak-builder-lint builddir build-dir`. That
+   run reports `appstream-external-screenshot-url` locally; Flathub's
+   buildbot passes `--mirror-screenshots-url`, which clears it.
 4. After merge, Flathub creates `flathub/cc.pimenov.strop` and invites
    the GitHub account as collaborator — accept, that's where the bot's
    PRs arrive.
