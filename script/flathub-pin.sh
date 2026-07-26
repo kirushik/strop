@@ -11,7 +11,7 @@ set -euo pipefail
 # usage: flathub-pin.sh VERSION
 
 die() { echo "flathub-pin: $*" >&2; exit 1; }
-for tool in gh sha256sum mktemp git; do
+for tool in gh sha256sum mktemp git python3; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool '$tool' is missing"
 done
 
