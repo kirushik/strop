@@ -874,8 +874,12 @@ pub struct SaveCompletion {
 /// A single-consumer queue proves generation N reaches replacement before
 /// N+1, so an older snapshot can never overwrite a newer one.
 pub struct SaveWorker {
-    requests: mpsc::Sender<(SaveGeneration, PreparedSave)>,
+    /// `None` only inside `Drop`: closing the queue is what ends the
+    /// thread's `recv`, so the sender must go before the join.
+    requests: Option<mpsc::Sender<(SaveGeneration, PreparedSave)>>,
     completions: mpsc::Receiver<SaveCompletion>,
+    /// Taken by `Drop`; `None` never occurs while the worker is in use.
+    thread: Option<std::thread::JoinHandle<()>>,
     next_generation: u64,
 }
 
@@ -892,7 +896,7 @@ impl SaveWorker {
     pub fn with_notify(notify: impl Fn() + Send + 'static) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<(SaveGeneration, PreparedSave)>();
         let (completion_tx, completion_rx) = mpsc::channel();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("strop-save".into())
             .spawn(move || {
                 while let Ok((generation, save)) = request_rx.recv() {
@@ -908,8 +912,9 @@ impl SaveWorker {
             })
             .expect("spawn filesystem save worker");
         Self {
-            requests: request_tx,
+            requests: Some(request_tx),
             completions: completion_rx,
+            thread: Some(thread),
             next_generation: 0,
         }
     }
@@ -921,6 +926,8 @@ impl SaveWorker {
             .expect("save generation overflow");
         let generation = SaveGeneration(self.next_generation);
         self.requests
+            .as_ref()
+            .expect("save worker queue closed")
             .send((generation, save))
             .expect("save worker unexpectedly stopped");
         generation
@@ -939,6 +946,44 @@ impl SaveWorker {
             if completion.generation == generation {
                 return completion;
             }
+        }
+    }
+}
+
+/// The worker never outlives its owner. An orphaned thread still holds a
+/// path it is about to write and a `notify` hook aimed at whoever spawned
+/// it — so it can land a file, or ring a doorbell, after the editor that
+/// asked for it is gone. Closing the queue ends `recv`, and the join turns
+/// "the worker is dropped" into "everything it still had in it has
+/// happened".
+///
+/// So the drop WAITS, and the wait is honest about its size: a closed
+/// sender discards nothing, so it covers every request still queued, and
+/// the filesystem is its only bound — a wedged mount blocks here the way
+/// it blocks anywhere. At quit that costs nothing: LAW 2's flush
+/// (`Editor::flush_saves`, from the app-quit observer) has already waited
+/// for the newest generation, so the queue is empty by the time the editor
+/// is dropped. Anywhere else — a test teardown, or a re-`attach_store` if
+/// one is ever written — the wait is the same one that flush would have
+/// made, and it is what makes shutdown hermetic.
+///
+/// One ordering here is load-bearing and easy to tidy away: `completions`
+/// must still be ALIVE while the join runs, and it is, only because
+/// `Drop::drop` precedes the field drops. Release the receiver first and
+/// the worker's `send` fails, it breaks out without notifying, and any
+/// `wait_for` parked on that generation meets a dead channel.
+///
+/// Nothing here can deadlock. The completion channel is unbounded, so
+/// `send` never waits; the notify hook posts a runnable to the platform's
+/// run loop and never waits on it either; so the thread's only blocking
+/// points are the closed queue and the write itself.
+impl Drop for SaveWorker {
+    fn drop(&mut self) {
+        self.requests = None;
+        if let Some(thread) = self.thread.take() {
+            // A worker that died of its own panic already surfaced through
+            // `request`; a dying editor is not the place to re-raise it.
+            let _ = thread.join();
         }
     }
 }
@@ -1975,6 +2020,45 @@ mod tests {
         assert!(first < latest);
         worker.wait_for(latest).result.unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"newer");
+        let _ = fs::remove_file(path);
+    }
+
+    /// Dropping the worker is a boundary, not an abandonment: the thread is
+    /// joined, so everything it still had in it — the write, and the ring
+    /// that trails the completion — has already happened by the time the
+    /// owner is gone. Nothing of the worker can reach a torn-down app.
+    #[test]
+    fn dropping_the_worker_joins_its_thread() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = temp_path("worker-drop");
+        let notified = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = notified.clone();
+        // The hook announces itself and THEN dawdles, so the drop below
+        // provably starts while the worker is still inside it. A sleep
+        // alone would only be a window: miss it — a descheduled test
+        // thread is enough — and "the count is 1" would prove nothing but
+        // that the worker was quick.
+        let (started, worker_started) = mpsc::channel();
+        let mut worker = SaveWorker::with_notify(move || {
+            let _ = started.send(());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        worker.request(PreparedSave {
+            path: path.clone(),
+            bytes: b"landed".to_vec(),
+        });
+        worker_started.recv().expect("the worker reached its notify hook");
+        drop(worker);
+        // The rendezvous is downstream of the write, so the file is on disk
+        // by now either way: the count below is what actually detects a
+        // missing join, and the assertion above only states the postcondition.
+        assert_eq!(fs::read(&path).unwrap(), b"landed", "the drop waited for the queued write");
+        assert_eq!(
+            notified.load(Ordering::SeqCst),
+            1,
+            "the drop waited out the hook it caught mid-flight — no ring can follow"
+        );
         let _ = fs::remove_file(path);
     }
 
