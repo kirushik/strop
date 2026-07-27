@@ -154,9 +154,20 @@ pub fn resolve_portal_path(path: impl Into<PathBuf>) -> PathBuf {
 fn is_portal_path(path: &Path) -> bool {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return portal_path_parts(path, Path::new(&runtime_dir)).is_some();
+        return is_portal_path_at(path, Path::new(&runtime_dir));
     }
     false
+}
+
+/// The verdict itself, against a runtime dir handed in — the same split
+/// `resolve_portal_path` keeps from `resolve_portal_path_async_at`, and for
+/// the same reason: a test that had to read `XDG_RUNTIME_DIR` to build its
+/// own input would read it once here and once above, and a parallel test
+/// repointing it between the two reads makes the answer disagree with the
+/// question (it did, ~1 run in 100).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn is_portal_path_at(path: &Path, runtime_dir: &Path) -> bool {
+    portal_path_parts(path, runtime_dir).is_some()
 }
 
 /// Whether this path reached Strop through the XDG document portal — and
@@ -729,17 +740,26 @@ mod tests {
     /// path the PORTAL issued is a document that exists, so a miss is an
     /// error to show. An ordinary path — typed, or handed over by an
     /// unconfined launch — is not, and must stay birthable.
+    /// The runtime dir is injected, not read: this test once took it from
+    /// `XDG_RUNTIME_DIR` to build its own input, and
+    /// `lifecycle_in_isolated_home` repoints that process-globally — so the
+    /// two reads could straddle the flip and the assertion failed ~1 run in
+    /// 100. The ambient half is asserted there instead, where env has an
+    /// owner.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn only_portal_paths_promise_that_the_file_exists() {
-        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
-            return; // No portal can exist here; the promise cannot be made.
-        };
-        let runtime = PathBuf::from(runtime);
-        assert!(arrived_through_the_portal(&runtime.join("doc/7ad41c2e/Draft.strop")));
-        assert!(!arrived_through_the_portal(Path::new("/home/writer/Documents/Draft.strop")));
+        let runtime = Path::new("/run/user/1000");
+        assert!(is_portal_path_at(&runtime.join("doc/7ad41c2e/Draft.strop"), runtime));
+        assert!(!is_portal_path_at(Path::new("/home/writer/Documents/Draft.strop"), runtime));
         // `strop notes/new-essay.strop` must still be how you start one.
-        assert!(!arrived_through_the_portal(Path::new("notes/new-essay.strop")));
+        assert!(!is_portal_path_at(Path::new("notes/new-essay.strop"), runtime));
+        // A portal path is one under THIS runtime dir — the same bytes under
+        // somebody else's promise nothing.
+        assert!(!is_portal_path_at(
+            Path::new("/run/user/1001/doc/7ad41c2e/Draft.strop"),
+            runtime
+        ));
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -802,6 +822,12 @@ mod tests {
         assert_eq!(host_parent_or_documents(&a), tmp);
         let trapped = tmp.join("runtime/doc/deadbeef/Chapter.strop");
         assert_eq!(host_parent_or_documents(&trapped), untitled_path().parent().unwrap());
+
+        // The ambient half of the portal verdict, asserted HERE because this
+        // test owns `XDG_RUNTIME_DIR` — that `arrived_through_the_portal`
+        // reads it at all is what the injected-path test upstairs cannot see.
+        assert!(arrived_through_the_portal(&trapped), "a path under the live runtime dir");
+        assert!(!arrived_through_the_portal(&a), "an ordinary host path stays birthable");
 
         // Legacy hidden scratch migrates into the visible folder.
         let scratch = tmp.join("data/strop/scratch.strop");
