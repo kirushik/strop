@@ -2030,18 +2030,19 @@ mod tests {
     #[test]
     fn dropping_the_worker_joins_its_thread() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
         let path = temp_path("worker-drop");
         let notified = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = notified.clone();
-        // The hook announces itself and THEN dawdles, so the drop below
-        // provably starts while the worker is still inside it. A sleep
-        // alone would only be a window: miss it — a descheduled test
-        // thread is enough — and "the count is 1" would prove nothing but
-        // that the worker was quick.
+        // The hook announces itself and then HOLDS, until this test lets go
+        // of it. No sleep is a proof: a sleeping hook only leaves a window,
+        // and a test thread descheduled past it would read a finished count
+        // and call a join-less drop correct.
         let (started, worker_started) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
         let mut worker = SaveWorker::with_notify(move || {
             let _ = started.send(());
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = held.recv();
             seen.fetch_add(1, Ordering::SeqCst);
         });
         worker.request(PreparedSave {
@@ -2049,16 +2050,35 @@ mod tests {
             bytes: b"landed".to_vec(),
         });
         worker_started.recv().expect("the worker reached its notify hook");
-        drop(worker);
-        // The rendezvous is downstream of the write, so the file is on disk
-        // by now either way: the count below is what actually detects a
-        // missing join, and the assertion above only states the postcondition.
-        assert_eq!(fs::read(&path).unwrap(), b"landed", "the drop waited for the queued write");
+
+        // Drop from a second thread, so the block itself is observable: the
+        // drop cannot return while the hook is held, and THAT is the join.
+        let (entering, entered) = mpsc::channel();
+        let (dropped, drop_returned) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            let _ = entering.send(());
+            drop(worker);
+            let _ = dropped.send(());
+        });
+        entered.recv().expect("the dropping thread started");
+        assert!(
+            drop_returned.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the drop returned while the worker was still inside its hook"
+        );
+        assert_eq!(notified.load(Ordering::SeqCst), 0, "the hook is still held");
+
+        // Let go, and the drop completes — with the hook run to its end.
+        drop(release);
+        drop_returned
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the drop returned once the worker was free");
+        dropper.join().expect("the dropping thread finished");
         assert_eq!(
             notified.load(Ordering::SeqCst),
             1,
-            "the drop waited out the hook it caught mid-flight — no ring can follow"
+            "the whole hook ran before the drop returned — no ring can follow"
         );
+        assert_eq!(fs::read(&path).unwrap(), b"landed", "and the queued write landed");
         let _ = fs::remove_file(path);
     }
 

@@ -29956,18 +29956,14 @@ mod tests {
             Poll::Ready(())
         ));
 
-        // Nothing rung since — the waiter parks…
-        assert!(matches!(
-            Future::poll(std::pin::pin!(wake.wait()), &mut cx),
-            Poll::Pending
-        ));
-        // …and the next ring wakes it, once, and leaves the flag for it.
+        // ONE waiter across the rest, polled where it parked: a fresh future
+        // each time would only re-read the latch and never show that the
+        // parked wait is the thing the ring completes.
+        let mut parked = std::pin::pin!(wake.wait());
+        assert!(matches!(parked.as_mut().poll(&mut cx), Poll::Pending));
         wake.ring();
         assert_eq!(woken.0.load(Ordering::SeqCst), 1, "the parked waiter was woken");
-        assert!(matches!(
-            Future::poll(std::pin::pin!(wake.wait()), &mut cx),
-            Poll::Ready(())
-        ));
+        assert!(matches!(parked.as_mut().poll(&mut cx), Poll::Ready(())));
     }
 
     /// An editor over an attached store, the way main.rs assembles one.
