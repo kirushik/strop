@@ -2645,7 +2645,20 @@ impl Editor {
         // the belt under this suspender.
         let wake = Arc::new(SaveWake::default());
         let bell = wake.clone();
-        self.save_worker = Some(SaveWorker::with_notify(move || bell.ring()));
+        // The doorbell is a FOREIGN-THREAD wake: the save thread reaches into
+        // the gpui foreground to schedule the task below. A platform executor
+        // dispatches that onto the main run loop and all is well; the TEST
+        // executor forbids it outright — it records any off-thread activity as
+        // non-determinism and fails the run, whether the ring lands mid-test or
+        // after the harness has torn its scheduler down. So a test build hangs a
+        // silent worker: every test already drains completions the explicit way
+        // (`drain_save_completions`, `flush_saves`), and the doorbell has no
+        // observable behaviour left to cover once the wake itself is illegal.
+        self.save_worker = Some(if cfg!(test) {
+            SaveWorker::new()
+        } else {
+            SaveWorker::with_notify(move || bell.ring())
+        });
         cx.spawn(async move |this, cx| {
             loop {
                 wake.wait().await;
@@ -29910,6 +29923,47 @@ mod tests {
 
     fn quit_test_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("strop-quit-test-{}-{tag}.strop", std::process::id()))
+    }
+
+    /// The doorbell's two halves, on a plain std waker. No gpui test can
+    /// cover them — the foreign-thread wake they exist for is exactly what
+    /// the test executor forbids, which is why `attach_store` leaves the
+    /// hook unarmed there — so the latch and the park are checked here or
+    /// nowhere.
+    #[test]
+    fn the_doorbell_latches_a_ring_and_wakes_a_parked_waiter() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Poll, Wake, Waker};
+
+        struct Counter(AtomicUsize);
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let woken = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(woken.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let wake = Arc::new(SaveWake::default());
+
+        // A ring with nobody listening is not lost: it latches, and the
+        // first waiter after it is Ready without ever parking.
+        wake.ring();
+        assert_eq!(woken.0.load(Ordering::SeqCst), 0, "there was no waker to wake");
+        assert!(matches!(
+            Future::poll(std::pin::pin!(wake.wait()), &mut cx),
+            Poll::Ready(())
+        ));
+
+        // ONE waiter across the rest, polled where it parked: a fresh future
+        // each time would only re-read the latch and never show that the
+        // parked wait is the thing the ring completes.
+        let mut parked = std::pin::pin!(wake.wait());
+        assert!(matches!(parked.as_mut().poll(&mut cx), Poll::Pending));
+        wake.ring();
+        assert_eq!(woken.0.load(Ordering::SeqCst), 1, "the parked waiter was woken");
+        assert!(matches!(parked.as_mut().poll(&mut cx), Poll::Ready(())));
     }
 
     /// An editor over an attached store, the way main.rs assembles one.
