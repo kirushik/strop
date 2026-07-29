@@ -58,9 +58,9 @@ fn add_at(file: &Path, path: &Path) -> io::Result<()> {
     let lock_path = dir.join(".recently-used.xbel.strop.lock");
     let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false)
         .open(&lock_path)?;
-    fs4::FileExt::lock(&lock)?;
+    lock.lock()?;
     let result = locked_add(&file, dir, &uri, &now, path);
-    let _ = fs4::FileExt::unlock(&lock);
+    let _ = lock.unlock();
     result
 }
 
