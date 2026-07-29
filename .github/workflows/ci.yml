@@ -5,7 +5,8 @@
 #             PROPTEST_CASES. Fast, dependency-light, the reliable gate.
 #   app     — strop-app on Linux: builds the git-pinned gpui (wgpu + Wayland),
 #             clippy, and the headless logic tests.
-#   deny    — cargo-deny: licenses, advisories, and git sources (deny.toml).
+#   deny    — cargo-deny (licenses, advisories, git sources) plus a freshness
+#             check on the attribution document the About window embeds.
 #   packaging — appstream/desktop-file/flatpak-manifest validation (no compile).
 #   macos   — build + a launch smoke.
 #   windows — build + tests (single_instance over named pipes) + launch smoke.
@@ -76,7 +77,7 @@ jobs:
         run: cargo test -p strop-core
 
   deny:
-    name: supply chain — cargo-deny (licenses, advisories, sources)
+    name: supply chain — cargo-deny + embedded attribution
     runs-on: ubuntu-latest
     # cargo-deny only runs `cargo metadata` — it compiles nothing. The old
     # EmbarkStudios Docker action was slow for a non-obvious reason: its musl
@@ -102,8 +103,29 @@ jobs:
           restore-keys: cargo-deny-
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2
         with:
-          tool: cargo-deny
+          # cargo-about is pinned to an exact version on purpose. Its output is
+          # compared byte-for-byte against a committed file, so an upstream
+          # formatting change would otherwise red every open PR at once instead
+          # of the one that caused it. Bump it and regenerate in the same commit.
+          tool: cargo-deny,cargo-about@0.9.1
       - run: cargo deny check
+      # The About window embeds assets/third-party-licenses.txt through
+      # include_str!, so a stale file is not untidiness — it is a shipped
+      # falsehood, crediting crates the binary no longer contains and misstating
+      # the versions of the ones it does. docs/releasing.md §8 promised this
+      # check from the start and nobody wrote it; the file was found in 2026-07
+      # still naming strop-app 0.2.0. --locked so CI compares against the
+      # committed lockfile rather than one it resolved for itself.
+      - name: the embedded attribution still matches Cargo.lock
+        run: |
+          cargo about generate --locked about.hbs -o "$RUNNER_TEMP/regenerated.txt"
+          if diff -u assets/third-party-licenses.txt "$RUNNER_TEMP/regenerated.txt" > "$RUNNER_TEMP/drift.diff"; then
+            echo "attribution matches the lockfile"
+          else
+            echo "::error::assets/third-party-licenses.txt has drifted from Cargo.lock. Regenerate with: cargo about generate about.hbs -o assets/third-party-licenses.txt"
+            head -200 "$RUNNER_TEMP/drift.diff"
+            exit 1
+          fi
 
   packaging:
     # Compiles nothing; exists so desktop-integration metadata can't drift

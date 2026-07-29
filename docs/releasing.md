@@ -619,9 +619,14 @@ a book-shaped tool; its About is a **colophon**, not a corporate box:
   redistribute under GPL-3.0-or-later"), link to COPYING and the repo. The
   GUI About box is the GPL's own suggested vehicle for this.
 - **Third-party licenses**: `cargo-about` (Zed uses it; actively maintained)
-  generates the full attribution document at build time; embedded and opened
-  as a plain scrollable text view in-app. CI gets a freshness check so the
-  embedded list can't drift from Cargo.lock.
+  generates the full attribution document; the generated file is committed,
+  embedded via `include_str!`, and opened as a plain scrollable text view
+  in-app. The `deny` CI job regenerates it and diffs, so the embedded list
+  cannot drift from Cargo.lock. That check was promised here from the start
+  and only written on 2026-07-29 — in the interval the file went stale all
+  the way back to 0.2.0 and no one noticed, which is the argument for it.
+  cargo-about is pinned to an exact version in the workflow because the diff
+  is byte-for-byte; bump and regenerate in one commit.
 - The updater's one surface (§5) and the migration-backups view (§6).
 - Typeset as an actual colophon — "Set in URW Bookman" and friends. That
   line *is* the easter egg's front door; the egg itself (this is that kind
