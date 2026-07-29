@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs4::fs_std::FileExt;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
@@ -99,10 +98,14 @@ fn try_lock_at(root: &Path) -> Result<Option<UpdateLock>, String> {
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(root.join("lock")).map_err(|e| e.to_string())?;
-    match file.try_lock_exclusive() {
-        Ok(true) => Ok(Some(UpdateLock { _file: file })),
-        Ok(false) => Ok(None),
-        Err(e) => Err(e.to_string()),
+    // Named through the trait rather than as a method call: `File` grew its
+    // own inherent `try_lock` in Rust 1.89, with an identically shaped error,
+    // so `file.try_lock()` would silently resolve to std's and leave fs4 in
+    // the manifest doing nothing. Spelling the path keeps the two apart.
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => Ok(Some(UpdateLock { _file: file })),
+        Err(fs4::TryLockError::WouldBlock) => Ok(None),
+        Err(fs4::TryLockError::Error(e)) => Err(e.to_string()),
     }
 }
 
