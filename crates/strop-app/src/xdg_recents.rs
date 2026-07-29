@@ -362,9 +362,18 @@ mod tests {
         let dir = temp("race"); let file = dir.join("recently-used.xbel");
         let docs: Vec<_> = (0..8).map(|i| dir.join(format!("Doc{i}.strop"))).collect();
         for doc in &docs { std::fs::write(doc, b"").unwrap(); }
+        // Spawning in a plain loop leaves the overlap to chance: nothing
+        // holds the first writer back until the last is born. They do collide
+        // in practice — with the lock removed this test failed 20 runs out of
+        // 20 — but that is a fact about one machine's scheduler, not about
+        // the test. The barrier holds every thread at the door so they enter
+        // the read-modify-rename together, making the collision that a lost
+        // bookmark needs arranged rather than hoped for.
+        let gate = std::sync::Barrier::new(docs.len());
+        let (gate, target) = (&gate, &file);
         std::thread::scope(|scope| {
             for doc in &docs {
-                scope.spawn(|| add_at(&file, doc).unwrap());
+                scope.spawn(move || { gate.wait(); add_at(target, doc).unwrap() });
             }
         });
         let xml = std::fs::read_to_string(&file).unwrap();

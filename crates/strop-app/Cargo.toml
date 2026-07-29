@@ -36,8 +36,10 @@ quick-xml = "0.41"
 
 # Self-update (docs/releasing.md §4): minisign-verify checks the signed
 # manifest against the baked key list; semver enforces the downgrade gate;
-# fs4 is the installation-wide advisory update lock (the per-document
-# rendezvous socket deliberately provides no swap exclusion).
+# fs4 takes the installation-wide advisory update lock (the per-document
+# rendezvous socket deliberately provides no swap exclusion), and the
+# second lock a step away in xdg_recents.rs, which serialises the
+# read-modify-rename of the freedesktop recently-used list.
 minisign-verify = "0.2"
 semver = { workspace = true }
 fs4 = "1.1"
