@@ -3,6 +3,8 @@ name = "xtask"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+# Its version and license are its own; the toolchain floor is not.
+rust-version.workspace = true
 publish = false
 
 # The icon pipeline (docs/releasing.md §9): one master SVG in, every
