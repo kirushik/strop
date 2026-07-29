@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs4::fs_std::FileExt;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
@@ -99,10 +98,27 @@ fn try_lock_at(root: &Path) -> Result<Option<UpdateLock>, String> {
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(root.join("lock")).map_err(|e| e.to_string())?;
-    match file.try_lock_exclusive() {
-        Ok(true) => Ok(Some(UpdateLock { _file: file })),
-        Ok(false) => Ok(None),
-        Err(e) => Err(e.to_string()),
+    // Named through the trait rather than as a method call: `File` grew its
+    // own inherent `try_lock` in Rust 1.89, with an identically shaped error,
+    // so `file.try_lock()` would silently resolve to std's and leave fs4 in
+    // the manifest doing nothing. Spelling the path keeps the two apart.
+    if acquired(fs4::FileExt::try_lock(&file))? {
+        Ok(Some(UpdateLock { _file: file }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Which of the three answers a lock attempt gave: `Ok(true)` we hold it,
+/// `Ok(false)` another process does and this one should stand down, `Err` the
+/// lock itself is unusable. Kept apart from the file handling so the
+/// partition can be asserted directly — the distinction is the whole contract
+/// of `try_lock_at`, and a live race can only ever demonstrate half of it.
+fn acquired(outcome: Result<(), fs4::TryLockError>) -> Result<bool, String> {
+    match outcome {
+        Ok(()) => Ok(true),
+        Err(fs4::TryLockError::WouldBlock) => Ok(false),
+        Err(fs4::TryLockError::Error(e)) => Err(e.to_string()),
     }
 }
 
@@ -276,6 +292,31 @@ mod tests {
     fn temp(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("strop-update-{}-{}-{tag}",
             std::process::id(), NONCE.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    // The race test below proves a contended lock is not mistaken for a held
+    // one. It cannot prove the other direction: it only ever produces
+    // contention, so an `Err` arm rewritten to `Ok(None)` would sail through
+    // it. That direction is what the fs4 1.1 bump put in question — the crate
+    // silently moved an errno between the two buckets — so the partition is
+    // pinned here instead of left to a race that never visits it.
+    #[test]
+    fn a_broken_lock_is_never_read_as_a_busy_one() {
+        assert_eq!(acquired(Ok(())), Ok(true), "a granted lock is held");
+        assert_eq!(acquired(Err(fs4::TryLockError::WouldBlock)), Ok(false),
+            "contention is an answer, not a fault");
+        // EACCES on the lock file is the machinery failing, not another
+        // updater standing in the way. Reading it as contention would let
+        // `stage()` blame a phantom peer for a lock it can no longer take.
+        let denied = std::io::Error::from_raw_os_error(13);
+        assert!(acquired(Err(fs4::TryLockError::Error(denied))).is_err());
+        // Windows ERROR_IO_PENDING (997) counted as contention in fs4 0.13
+        // and does not in 1.1, which matches std. We follow 1.1: `try_lock`
+        // always passes LOCKFILE_FAIL_IMMEDIATELY, and that flag rules out
+        // the asynchronous operation 997 reports, so it can only reach us as
+        // a genuine fault. This asserts the ruling, not merely the code.
+        let pending = std::io::Error::from_raw_os_error(997);
+        assert!(acquired(Err(fs4::TryLockError::Error(pending))).is_err());
     }
 
     #[test]
