@@ -40,7 +40,7 @@ quick-xml = "0.41"
 # rendezvous socket deliberately provides no swap exclusion).
 minisign-verify = "0.2"
 semver = { workspace = true }
-fs4 = "0.13"
+fs4 = "1.1"
 ureq = { workspace = true }
 
 # XDG document-portal resolution (files.rs) exists only where the portal
