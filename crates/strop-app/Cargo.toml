@@ -41,6 +41,12 @@ quick-xml = "0.41"
 # one in xdg_recents.rs serialising the recently-used read-modify-rename —
 # used to need the fs4 crate. Rust 1.89 stabilised File::lock/try_lock/
 # unlock over the same flock and LockFileEx calls, so they no longer do.
+# One thing to know before porting: std implements those over flock for
+# Linux, the BSDs, Apple and a handful more, over fcntl record locks on
+# Solaris alone, and returns Unsupported at RUNTIME everywhere else — a
+# shorter list than fs4 covered. Android and DragonFly are outside it. A
+# new target therefore fails by returning a lock it never took, not by
+# failing to build; check std's cfg gates before adding one.
 minisign-verify = "0.2"
 semver = { workspace = true }
 ureq = { workspace = true }

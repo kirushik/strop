@@ -342,6 +342,23 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // Taking a lock is the half everything else here tests. Giving it back is
+    // the half nothing did. `UpdateLock` has no Drop of its own — it holds the
+    // `File` and trusts the close to release the flock — so anything that
+    // outlived the handle, a stray `try_clone` or a `mem::forget`, would wedge
+    // every later publish behind a peer that does not exist, and the whole
+    // suite would stay green while it happened.
+    #[test]
+    fn a_released_update_lock_can_be_taken_again() {
+        let root = temp("release");
+        let first = try_lock_at(&root).unwrap();
+        assert!(first.is_some(), "an unheld lock should be free to take");
+        drop(first);
+        let second = try_lock_at(&root).unwrap();
+        assert!(second.is_some(), "dropping the lock has to hand it back");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn reconcile_removes_dead_pid_tmp_and_markerless_stage_only() {
