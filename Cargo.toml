@@ -6,6 +6,13 @@ members = ["crates/strop-core", "crates/strop-app", "xtask"]
 version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+# The floor is the pin. rust-toolchain.toml selects 1.96.0 and that is the
+# only compiler Strop is built or tested with, so nothing is gained by
+# claiming to support anything older — the claim would simply be untested.
+# Declaring it makes an out-of-date toolchain say so in one line, instead of
+# failing somewhere deep in a file that happens to use a std method
+# stabilised last spring. Move it with the pin, not separately.
+rust-version = "1.96"
 
 [workspace.dependencies]
 strop-core = { path = "crates/strop-core", version = "0.3.0" }

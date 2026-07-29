@@ -5,8 +5,13 @@ shell (`strop-app`) is built on [gpui](https://github.com/zed-industries/zed).
 
 ## Build from source
 
-You need a recent Rust (1.85+, for the 2024 edition — [rustup.rs](https://rustup.rs))
-and the system libraries gpui depends on. On Debian/Ubuntu:
+You need Rust 1.96 ([rustup.rs](https://rustup.rs)) and the system libraries
+gpui depends on. `rust-toolchain.toml` pins that version, so rustup will fetch
+it for you; the workspace also declares it as `rust-version`, so an older
+compiler is refused by name rather than failing halfway through the build.
+It is a floor by policy, not by necessity — Strop is only ever built and
+tested against the pin, and a lower number would be a claim nothing checks.
+On Debian/Ubuntu:
 
 ```sh
 sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev \

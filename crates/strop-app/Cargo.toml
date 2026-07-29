@@ -3,6 +3,7 @@ name = "strop-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Strop desktop shell (GPUI)"
 
 [[bin]]
@@ -35,14 +36,19 @@ interprocess = "2.4.2"
 quick-xml = "0.41"
 
 # Self-update (docs/releasing.md §4): minisign-verify checks the signed
-# manifest against the baked key list; semver enforces the downgrade gate;
-# fs4 takes the installation-wide advisory update lock (the per-document
-# rendezvous socket deliberately provides no swap exclusion), and the
-# second lock a step away in xdg_recents.rs, which serialises the
-# read-modify-rename of the freedesktop recently-used list.
+# manifest against the baked key list; semver enforces the downgrade gate.
+# The two advisory file locks — the installation-wide update lock, and the
+# one in xdg_recents.rs serialising the recently-used read-modify-rename —
+# used to need the fs4 crate. Rust 1.89 stabilised File::lock/try_lock/
+# unlock over the same flock and LockFileEx calls, so they no longer do.
+# One thing to know before porting: std implements those over flock for
+# Linux, the BSDs, Apple and a handful more, over fcntl record locks on
+# Solaris alone, and returns Unsupported at RUNTIME everywhere else — a
+# shorter list than fs4 covered. Android and DragonFly are outside it. A
+# new target therefore fails by returning a lock it never took, not by
+# failing to build; check std's cfg gates before adding one.
 minisign-verify = "0.2"
 semver = { workspace = true }
-fs4 = "1.1"
 ureq = { workspace = true }
 
 # XDG document-portal resolution (files.rs) exists only where the portal

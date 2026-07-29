@@ -98,11 +98,7 @@ fn try_lock_at(root: &Path) -> Result<Option<UpdateLock>, String> {
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(root.join("lock")).map_err(|e| e.to_string())?;
-    // Named through the trait rather than as a method call: `File` grew its
-    // own inherent `try_lock` in Rust 1.89, with an identically shaped error,
-    // so `file.try_lock()` would silently resolve to std's and leave fs4 in
-    // the manifest doing nothing. Spelling the path keeps the two apart.
-    if acquired(fs4::FileExt::try_lock(&file))? {
+    if acquired(file.try_lock())? {
         Ok(Some(UpdateLock { _file: file }))
     } else {
         Ok(None)
@@ -114,11 +110,11 @@ fn try_lock_at(root: &Path) -> Result<Option<UpdateLock>, String> {
 /// lock itself is unusable. Kept apart from the file handling so the
 /// partition can be asserted directly — the distinction is the whole contract
 /// of `try_lock_at`, and a live race can only ever demonstrate half of it.
-fn acquired(outcome: Result<(), fs4::TryLockError>) -> Result<bool, String> {
+fn acquired(outcome: Result<(), fs::TryLockError>) -> Result<bool, String> {
     match outcome {
         Ok(()) => Ok(true),
-        Err(fs4::TryLockError::WouldBlock) => Ok(false),
-        Err(fs4::TryLockError::Error(e)) => Err(e.to_string()),
+        Err(fs::TryLockError::WouldBlock) => Ok(false),
+        Err(fs::TryLockError::Error(e)) => Err(e.to_string()),
     }
 }
 
@@ -297,26 +293,27 @@ mod tests {
     // The race test below proves a contended lock is not mistaken for a held
     // one. It cannot prove the other direction: it only ever produces
     // contention, so an `Err` arm rewritten to `Ok(None)` would sail through
-    // it. That direction is what the fs4 1.1 bump put in question — the crate
-    // silently moved an errno between the two buckets — so the partition is
-    // pinned here instead of left to a race that never visits it.
+    // it. A dependency bump once moved an errno quietly between those two
+    // buckets, which is precisely the kind of change a race that never visits
+    // the second one cannot notice — so the partition is pinned here.
     #[test]
     fn a_broken_lock_is_never_read_as_a_busy_one() {
         assert_eq!(acquired(Ok(())), Ok(true), "a granted lock is held");
-        assert_eq!(acquired(Err(fs4::TryLockError::WouldBlock)), Ok(false),
+        assert_eq!(acquired(Err(fs::TryLockError::WouldBlock)), Ok(false),
             "contention is an answer, not a fault");
         // EACCES on the lock file is the machinery failing, not another
         // updater standing in the way. Reading it as contention would let
         // `stage()` blame a phantom peer for a lock it can no longer take.
         let denied = std::io::Error::from_raw_os_error(13);
-        assert!(acquired(Err(fs4::TryLockError::Error(denied))).is_err());
-        // Windows ERROR_IO_PENDING (997) counted as contention in fs4 0.13
-        // and does not in 1.1, which matches std. We follow 1.1: `try_lock`
-        // always passes LOCKFILE_FAIL_IMMEDIATELY, and that flag rules out
-        // the asynchronous operation 997 reports, so it can only reach us as
-        // a genuine fault. This asserts the ruling, not merely the code.
+        assert!(acquired(Err(fs::TryLockError::Error(denied))).is_err());
+        // Windows ERROR_IO_PENDING (997) is a fault here, not contention:
+        // `try_lock` always passes LOCKFILE_FAIL_IMMEDIATELY, and that flag
+        // rules out the asynchronous operation 997 reports, so it can only
+        // arrive as a genuine error. std agrees, and additionally promises it
+        // will never hand back a WouldBlock-kind error inside `Error(..)` —
+        // the second arm below would be unreachable if it did.
         let pending = std::io::Error::from_raw_os_error(997);
-        assert!(acquired(Err(fs4::TryLockError::Error(pending))).is_err());
+        assert!(acquired(Err(fs::TryLockError::Error(pending))).is_err());
     }
 
     #[test]
@@ -342,6 +339,23 @@ mod tests {
         barrier.wait();
         for thread in threads { thread.join().unwrap(); }
         assert_eq!(winners.load(Ordering::Relaxed), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Taking a lock is the half everything else here tests. Giving it back is
+    // the half nothing did. `UpdateLock` has no Drop of its own — it holds the
+    // `File` and trusts the close to release the flock — so anything that
+    // outlived the handle, a stray `try_clone` or a `mem::forget`, would wedge
+    // every later publish behind a peer that does not exist, and the whole
+    // suite would stay green while it happened.
+    #[test]
+    fn a_released_update_lock_can_be_taken_again() {
+        let root = temp("release");
+        let first = try_lock_at(&root).unwrap();
+        assert!(first.is_some(), "an unheld lock should be free to take");
+        drop(first);
+        let second = try_lock_at(&root).unwrap();
+        assert!(second.is_some(), "dropping the lock has to hand it back");
         let _ = fs::remove_dir_all(root);
     }
 
