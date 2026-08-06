@@ -101,7 +101,7 @@ jobs:
             ~/.cargo/advisory-dbs
           key: cargo-deny-${{ hashFiles('Cargo.lock', 'deny.toml') }}
           restore-keys: cargo-deny-
-      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
         with:
           # cargo-about is pinned to an exact version on purpose. Its output is
           # compared byte-for-byte against a committed file, so an upstream
