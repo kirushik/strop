@@ -37,6 +37,13 @@ ignore = [
     # input reaches it. No upgrade exists. REVISIT if hyphenation moves off
     # bincode.
     "RUSTSEC-2025-0141",
+    # `im` and its internals `bitmaps`/`sized-chunks` unmaintained (announced
+    # 2026-08) — transitive (loro-internal → im), loro's internal immutable
+    # state. No upgrade exists short of loro moving off im upstream. REVISIT
+    # when the loro pin moves.
+    "RUSTSEC-2026-0247", # bitmaps
+    "RUSTSEC-2026-0248", # im
+    "RUSTSEC-2026-0251", # sized-chunks
 ]
 
 [licenses]
