@@ -169,6 +169,13 @@ fn write_v0_2_0_fixture_deterministically() {
     fs::write(path, pristine).unwrap();
 }
 
+/// serde_json emits U+2028/U+2029 raw (valid JSON, but invisible in diffs
+/// and prone to silent editor normalization); the fixture's hard break must
+/// stay reviewable as an escape.
+fn escape_line_separators(json: String) -> String {
+    json.replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
+}
+
 /// Char range of `needle`'s first occurrence — span/anchor ranges are char
 /// ranges, and the 0.3 fixture's second line is dense enough that
 /// hand-counted offsets would be write-only.
@@ -446,7 +453,7 @@ fn write_v0_3_1_fixture_deterministically() {
     let before = support::project(&store, loaded.unwrap());
     fs::write(
         path.with_extension("expected.json"),
-        serde_json::to_vec_pretty(&before).unwrap(),
+        escape_line_separators(serde_json::to_string_pretty(&before).unwrap()),
     )
     .unwrap();
     fixed_edit(&store);
@@ -456,7 +463,7 @@ fn write_v0_3_1_fixture_deterministically() {
     let after = support::project(&store, loaded.unwrap());
     fs::write(
         path.with_extension("post-edit.expected.json"),
-        serde_json::to_vec_pretty(&after).unwrap(),
+        escape_line_separators(serde_json::to_string_pretty(&after).unwrap()),
     )
     .unwrap();
     fs::write(path, pristine).unwrap();

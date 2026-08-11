@@ -1,5 +1,5 @@
 {
-  "text": "Corpus 0.3\nStrong emph struck under mark code ref link\nQuoted aside\nFirst step\nNested bullet\nRule\nfn main() {}\nFigure caption\nFootnote body\nHard break\nBody tail Corpus edit.",
+  "text": "Corpus 0.3\nStrong emph struck under mark code ref link\nQuoted aside\nFirst step\nNested bullet\nRule\nfn main() {}\nFigure caption\nFootnote body\nHard\u2028break\nBody tail Corpus edit.",
   "spans": {
     "spans": [
       {
