@@ -1,0 +1,426 @@
+{
+  "text": "Corpus 0.3\nStrong emph struck under mark code ref link\nQuoted aside\nFirst step\nNested bullet\nRule\nfn main() {}\nFigure caption\nFootnote body\nHard\u2028break\nBody tail Corpus edit.",
+  "spans": {
+    "spans": [
+      {
+        "attr": "Strong",
+        "range": {
+          "end": 17,
+          "start": 11
+        }
+      },
+      {
+        "attr": "Emphasis",
+        "range": {
+          "end": 22,
+          "start": 18
+        }
+      },
+      {
+        "attr": "Strikethrough",
+        "range": {
+          "end": 29,
+          "start": 23
+        }
+      },
+      {
+        "attr": "Underline",
+        "range": {
+          "end": 35,
+          "start": 30
+        }
+      },
+      {
+        "attr": "Highlight",
+        "range": {
+          "end": 40,
+          "start": 36
+        }
+      },
+      {
+        "attr": "Code",
+        "range": {
+          "end": 45,
+          "start": 41
+        }
+      },
+      {
+        "attr": {
+          "FootnoteRef": "n1"
+        },
+        "range": {
+          "end": 49,
+          "start": 46
+        }
+      },
+      {
+        "attr": {
+          "Link": "https://example.org/corpus"
+        },
+        "range": {
+          "end": 54,
+          "start": 50
+        }
+      }
+    ]
+  },
+  "block_kinds": [
+    {
+      "Heading": 1
+    },
+    "Paragraph",
+    "Blockquote",
+    {
+      "ListItem": {
+        "depth": 1,
+        "ordered": true
+      }
+    },
+    {
+      "ListItem": {
+        "depth": 2,
+        "ordered": false
+      }
+    },
+    "Divider",
+    {
+      "CodeBlock": {
+        "info": "rust"
+      }
+    },
+    {
+      "Image": {
+        "alt": "figure",
+        "caption": "",
+        "src": "asset:82ed192ab87ac36cef798453672447286619ff3aaf748c444b4f7ffbcf490a53.png"
+      }
+    },
+    {
+      "FootnoteDef": {
+        "id": "n1"
+      }
+    },
+    "Paragraph",
+    "Paragraph"
+  ],
+  "note_anchors": {
+    "next_id": 4,
+    "notes": [
+      {
+        "body": "title could carry the era",
+        "created_unix": 1690000010,
+        "id": 1,
+        "kind": "Note",
+        "level": "",
+        "orphaned": false,
+        "pass_id": 0,
+        "range": {
+          "end": 10,
+          "start": 0
+        },
+        "status": "Open",
+        "title": "",
+        "unverified": false
+      },
+      {
+        "body": "Quote leans on its source.",
+        "created_unix": 1690000020,
+        "id": 2,
+        "kind": "Diagnosis",
+        "level": "line",
+        "orphaned": false,
+        "pass_id": 2,
+        "range": {
+          "end": 67,
+          "start": 55
+        },
+        "status": "Open",
+        "title": "Loose quotation",
+        "unverified": true
+      },
+      {
+        "body": "does the list need depth?",
+        "created_unix": 1690000040,
+        "id": 4,
+        "kind": "Diagnosis",
+        "level": "developmental",
+        "orphaned": true,
+        "pass_id": 1,
+        "range": {
+          "end": 92,
+          "start": 79
+        },
+        "status": "Dismissed",
+        "title": "Deep nesting",
+        "unverified": false
+      },
+      {
+        "body": "hard break holds",
+        "created_unix": 1690000030,
+        "id": 3,
+        "kind": "Note",
+        "level": "",
+        "orphaned": false,
+        "pass_id": 0,
+        "range": {
+          "end": 150,
+          "start": 140
+        },
+        "status": "Done",
+        "title": "",
+        "unverified": false
+      }
+    ]
+  },
+  "checkpoints": [
+    {
+      "name": "seed",
+      "timestamp_ms": 1690000100000,
+      "manual": true
+    },
+    {
+      "name": "figure landed",
+      "timestamp_ms": 1690000200000,
+      "manual": true
+    }
+  ],
+  "materialized_state": {
+    "block_kinds": [
+      {
+        "Heading": 1
+      },
+      "Paragraph"
+    ],
+    "spans": {
+      "spans": [
+        {
+          "attr": "Strong",
+          "range": {
+            "end": 6,
+            "start": 0
+          }
+        }
+      ]
+    },
+    "text": "Corpus 0.3\nBody tail"
+  },
+  "journal": {
+    "events": [
+      {
+        "cards": 2,
+        "kind": "pass",
+        "mode": "line",
+        "t": 1690000020000
+      },
+      {
+        "body": "Quote leans on its source.",
+        "card_kind": "Diagnosis",
+        "id": 2,
+        "kind": "card_raised",
+        "level": "line",
+        "orphaned": false,
+        "pass_id": 2,
+        "range": {
+          "end": 67,
+          "start": 55
+        },
+        "status": "Open",
+        "t": 1690000020100,
+        "title": "Loose quotation",
+        "unverified": false
+      },
+      {
+        "body": "Quote leans on its source.",
+        "id": 2,
+        "kind": "card_edited",
+        "level": "line",
+        "orphaned": false,
+        "pass_id": 2,
+        "status": "Open",
+        "t": 1690000021000,
+        "title": "Loose quotation",
+        "unverified": true
+      },
+      {
+        "id": 3,
+        "kind": "card_closed",
+        "resolved": true,
+        "t": 1690000022000
+      },
+      {
+        "at": 9,
+        "kind": "seam",
+        "t": 1690000023000
+      },
+      {
+        "from_unix": 1690000100,
+        "kind": "restore",
+        "len_chars": 160,
+        "t": 1690000024000
+      },
+      {
+        "entries": [
+          {
+            "disposition": "anchored",
+            "id": 2,
+            "level": "line",
+            "orphaned": false,
+            "pass_id": 2,
+            "range": {
+              "end": 67,
+              "start": 55
+            },
+            "status": "Open",
+            "title": "Loose quotation",
+            "unverified": true
+          },
+          {
+            "disposition": "migrated",
+            "id": 3,
+            "level": "",
+            "orphaned": false,
+            "pass_id": 0,
+            "range": {
+              "end": 150,
+              "start": 140
+            },
+            "status": "Done",
+            "title": "",
+            "unverified": false
+          },
+          {
+            "disposition": "orphaned",
+            "id": 4,
+            "level": "developmental",
+            "orphaned": true,
+            "pass_id": 1,
+            "range": {
+              "end": 92,
+              "start": 79
+            },
+            "status": "Dismissed",
+            "title": "Deep nesting",
+            "unverified": false
+          }
+        ],
+        "kind": "cards_rebased",
+        "t": 1690000024500
+      },
+      {
+        "at": null,
+        "kind": "seam",
+        "t": 1690000025000
+      },
+      {
+        "kind": "export",
+        "t": 1690000026000
+      }
+    ],
+    "runs": [
+      {
+        "del_chars": 0,
+        "del_words": 0,
+        "ins": "Corpus 0.3",
+        "pos": 0,
+        "t0": 1690000000000,
+        "t1": 1690000000400
+      },
+      {
+        "del_chars": 4,
+        "ins": "Strong",
+        "pos": 11,
+        "t0": 1690000010000,
+        "t1": 1690000010500
+      }
+    ]
+  },
+  "graveyard": {
+    "entries": [
+      {
+        "blank_sep": false,
+        "cut_unix": 1690000050,
+        "id": 1,
+        "kinds": [
+          {
+            "Image": {
+              "alt": "grave",
+              "caption": "",
+              "src": "asset:af92e54017654a4e11bdc3df00d089e3ce1dd50cec0d7a67098e70f4b081baea.png"
+            }
+          }
+        ],
+        "origin_pos": 111,
+        "origin_quote": "after the rule",
+        "region": "Manuscript",
+        "spans": {
+          "spans": [
+            {
+              "attr": "Strong",
+              "range": {
+                "end": 3,
+                "start": 0
+              }
+            }
+          ]
+        },
+        "text": "cut figure",
+        "whole_blocks": true,
+        "words": 2
+      },
+      {
+        "blank_sep": true,
+        "cut_unix": 1690000060,
+        "id": 2,
+        "kinds": [
+          "Paragraph",
+          "Paragraph"
+        ],
+        "origin_pos": 151,
+        "origin_quote": "from the tail",
+        "region": "Scraps",
+        "spans": {
+          "spans": []
+        },
+        "text": "compost line one\ncompost line two",
+        "whole_blocks": false,
+        "words": 6
+      }
+    ],
+    "next_id": 2
+  },
+  "asset_refs": [
+    {
+      "id": "asset:82ed192ab87ac36cef798453672447286619ff3aaf748c444b4f7ffbcf490a53.png",
+      "present": true,
+      "bytes_blake3": "82ed192ab87ac36cef798453672447286619ff3aaf748c444b4f7ffbcf490a53"
+    },
+    {
+      "id": "asset:af92e54017654a4e11bdc3df00d089e3ce1dd50cec0d7a67098e70f4b081baea.png",
+      "present": true,
+      "bytes_blake3": "af92e54017654a4e11bdc3df00d089e3ce1dd50cec0d7a67098e70f4b081baea"
+    }
+  ],
+  "provenance": {
+    "next_id": 2,
+    "records": [
+      {
+        "id": 1,
+        "origin_quote": "Quoted aside",
+        "parked_unix": 1690000070,
+        "range": {
+          "end": 67,
+          "start": 55
+        }
+      },
+      {
+        "id": 2,
+        "origin_quote": "the note's source",
+        "parked_unix": 1690000080,
+        "range": {
+          "end": 139,
+          "start": 126
+        }
+      }
+    ]
+  }
+}
