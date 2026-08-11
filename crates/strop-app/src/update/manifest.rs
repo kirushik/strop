@@ -161,10 +161,21 @@ mod tests {
     use serde_json::{Value, json};
     use super::*;
 
+    // The fixture must be NEWER than the binary under test, whatever the
+    // binary's version is — a number written out here is a landmine armed
+    // by every version bump (0.3.1's bump fired it: the fixture equalled
+    // the binary, and every "Available" assertion read "already current").
+    fn newer_than_current() -> Version {
+        let mut v = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        v.patch += 1;
+        v
+    }
+
     fn valid() -> Value {
         json!({
             "product": "strop", "updater_protocol": 1,
-            "version": "0.3.1", "pub_date": "2026-07-18T12:34:56+02:00",
+            "version": newer_than_current().to_string(),
+            "pub_date": "2026-07-18T12:34:56+02:00",
             "notes_url": "https://github.com/kirushik/strop/releases/tag/v0.3.1",
             "targets": {
                 format!("github-win/{}/exe", target_triple()): {
@@ -227,7 +238,11 @@ mod tests {
             .next().unwrap()["size"] = json!(0));
         refused(valid(), |v| v["targets"].as_object_mut().unwrap().values_mut()
             .next().unwrap()["url"] = json!("https://evil.example/strop"));
-        let highest = Version::parse("0.4.0").unwrap();
+        // Highest-seen sits above the fixture by construction, so the
+        // refusal stays meaningful at every future version of the binary.
+        let mut highest = newer_than_current();
+        highest.minor += 1;
+        highest.patch = 0;
         assert!(parse_and_validate(&serde_json::to_vec(&valid()).unwrap(),
             Channel::GithubLinux, Some(&highest)).is_err());
     }

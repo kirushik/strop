@@ -54,6 +54,9 @@
   <!-- The release.yml preflight refuses a tag whose version has no entry
        here — add the new release as part of every version bump. -->
   <releases>
+    <release version="0.3.1" date="2026-08-11">
+      <url>https://github.com/kirushik/strop/releases/tag/v0.3.1</url>
+    </release>
     <release version="0.3.0" date="2026-07-22">
       <url>https://github.com/kirushik/strop/releases/tag/v0.3.0</url>
     </release>

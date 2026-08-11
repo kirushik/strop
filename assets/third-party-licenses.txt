@@ -2001,7 +2001,7 @@ insights.
 
 ================================================================================
 GNU General Public License v3.0 or later (GPL-3.0-or-later)
-Used by: zlog 0.1.0 ztracing 0.1.0 ztracing_macro 0.1.0 strop-app 0.3.0 strop-core 0.3.0 xtask 0.1.0
+Used by: zlog 0.1.0 ztracing 0.1.0 ztracing_macro 0.1.0 strop-app 0.3.1 strop-core 0.3.1 xtask 0.1.0
 
 GNU GENERAL PUBLIC LICENSE
 Version 3, 29 June 2007

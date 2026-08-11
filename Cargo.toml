@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/strop-core", "crates/strop-app", "xtask"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 # The floor is the pin. rust-toolchain.toml selects 1.96.0 and that is the
@@ -15,7 +15,7 @@ license = "GPL-3.0-or-later"
 rust-version = "1.96"
 
 [workspace.dependencies]
-strop-core = { path = "crates/strop-core", version = "0.3.0" }
+strop-core = { path = "crates/strop-core", version = "0.3.1" }
 ropey = "1.6"
 loro = "1"
 serde = { version = "1", features = ["derive"] }

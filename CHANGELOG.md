@@ -7,6 +7,12 @@ versions may still break things).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-11
+
+A settling-in release: Strop takes its seat in the desktop's own furniture —
+recent files, dock menus, jump lists — grows a Flathub-ready shape, and files
+down a fistful of sharp edges.
+
 ### Added
 - **Flatpak** — releases now ship a `flathub`-channel tarball, and
   `packaging/flatpak/` carries the Flathub manifest that repackages it:
@@ -38,6 +44,9 @@ versions may still break things).
 - Hovering the window controls paints a small rounded square around the
   mark instead of a full-height sliver (most visible in the About and
   keyboard-map windows).
+- The background save worker is now joined when its editor closes, so
+  "the editor is gone" means everything it had queued has genuinely
+  reached disk first.
 
 ### Changed
 - **Every Linux build now tells you about updates** — deb, rpm, and (one day)
@@ -53,7 +62,8 @@ versions may still break things).
   the test-side minisign signer to 0.9.1 (production signature
   verification is unchanged), plus a workspace-wide sweep of compatible
   updates — which also retired the unmaintained `rustybuzz` from the
-  dependency tree.
+  dependency tree, and later the file-locking crate too: the update lock
+  now speaks to the standard library's own file locks.
 
 ## [0.3.0] — 2026-07-22
 
@@ -321,7 +331,8 @@ unverified and unsigned.
 - Configuration via `~/.config/strop/config.toml`.
 - GPL-3.0-or-later. Supply-chain gating (cargo-deny) and three-OS CI.
 
-[Unreleased]: https://github.com/kirushik/strop/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kirushik/strop/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/kirushik/strop/releases/tag/v0.3.1
 [0.3.0]: https://github.com/kirushik/strop/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kirushik/strop/releases/tag/v0.2.0
 [0.1.1]: https://github.com/kirushik/strop/releases/tag/v0.1.1
