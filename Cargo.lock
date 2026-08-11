@@ -6018,7 +6018,7 @@ dependencies = [
 
 [[package]]
 name = "strop-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ashpd",
  "directories",
@@ -6050,7 +6050,7 @@ dependencies = [
 
 [[package]]
 name = "strop-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blake3",
  "image",
