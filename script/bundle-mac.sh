@@ -20,12 +20,15 @@ cat > "$contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleExecutable</key><string>strop</string>
 <key>CFBundleIconFile</key><string>strop</string>
 <key>CFBundleIdentifier</key><string>cc.pimenov.strop</string>
 <key>CFBundleName</key><string>$name</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
 <key>CFBundleVersion</key><string>$version</string>
+<key>LSMinimumSystemVersion</key><string>11.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>UTExportedTypeDeclarations</key><array><dict>
 <key>UTTypeIdentifier</key><string>cc.pimenov.strop.document</string>
@@ -101,8 +104,12 @@ if [[ $(uname -s) == Darwin ]]; then
     # The maintainer has no Mac; this runner is the verification machine.
     # A green job must mean Gatekeeper acceptance, not merely a completed
     # upload — so assess the stapled bundle exactly as an end user's Mac would.
+    # That is `-t exec` (what a double-click runs), not `-t install`: the
+    # install assessment accepted the 0.3.x bundles, which had no
+    # CFBundlePackageType, while every launch was rejected as "does not
+    # seem to be an app".
     codesign --verify --deep --strict --verbose=2 "$app"
-    spctl -a -vv -t install "$app"
+    spctl -a -vv -t exec "$app"
     xcrun stapler validate "$app"
     rm -rf "$out/dmg-root/$name.app"
     cp -R "$app" "$out/dmg-root/"

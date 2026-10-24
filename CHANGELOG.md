@@ -7,6 +7,14 @@ versions may still break things).
 
 ## [Unreleased]
 
+### Fixed
+- **macOS**: Strop opens again. The 0.3.x app bundle was signed and
+  notarized but its `Info.plist` never declared itself an application
+  (`CFBundlePackageType`), so Gatekeeper refused every launch with
+  "Apple could not verify Strop is free of malware". The release job
+  now checks the bundle the way a double-click does, so this can't
+  ship green again.
+
 ## [0.3.1] — 2026-08-11
 
 A settling-in release: Strop takes its seat in the desktop's own furniture —

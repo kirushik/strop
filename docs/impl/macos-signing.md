@@ -108,9 +108,15 @@ maintainer has no Mac, so a green job IS the proof of Gatekeeper acceptance:
 
 ```bash
 codesign --verify --deep --strict --verbose=2 Strop.app
-spctl -a -vv -t install Strop.app         # → "accepted, source=Notarized Developer ID"
+spctl -a -vv -t exec Strop.app            # → "accepted, source=Notarized Developer ID"
 xcrun stapler validate Strop.app
 ```
+
+The assessment type must be `exec` — the one a launch runs. `-t install`
+accepts a notarized bundle that Gatekeeper still refuses to open: the 0.3.0
+and 0.3.1 bundles shipped without `CFBundlePackageType`, passed `-t install`,
+and every launch failed with "the code is valid but does not seem to be an
+app" (shown to users as "Apple could not verify Strop is free of malware").
 
 (These run in `bundle-mac.sh` after stapling; an unusable certificate also
 fails the job at the import step rather than falling through to an ad-hoc
