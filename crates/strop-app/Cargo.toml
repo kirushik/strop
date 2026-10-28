@@ -33,7 +33,7 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 glob = { workspace = true }
 interprocess = "2.4.2"
-quick-xml = "0.41"
+quick-xml = "0.42"
 
 # Self-update (docs/releasing.md §4): minisign-verify checks the signed
 # manifest against the baked key list; semver enforces the downgrade gate.
