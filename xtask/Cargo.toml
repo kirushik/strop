@@ -16,4 +16,4 @@ publish = false
 resvg = { version = "0.48", default-features = false }
 png = "0.18"
 ico = "0.5"
-icns = "0.4"
+icns = "0.5"
