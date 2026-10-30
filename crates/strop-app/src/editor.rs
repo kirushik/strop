@@ -19602,14 +19602,10 @@ fn provider_for(base_url: &str) -> Option<&'static ProviderInfo> {
         .find(|p| !p.host_match.is_empty() && url.contains(p.host_match))
 }
 
-/// What the Base URL field becomes when a chip is clicked. A provider
-/// chip prefills its endpoint; Custom (empty `base_url`) clears a known
-/// provider's URL so the chip actually takes — without this, Custom was
-/// unreachable once another chip had filled the field. A hand-typed URL
-/// is already Custom, so clicking Custom again leaves it alone.
-fn picked_base_url(current: &str, base_url: &'static str) -> Option<&'static str> {
-    if !base_url.is_empty() {
-        Some(base_url)
+fn picked_base_url(current: &str, chip_url: &'static str) -> Option<&'static str> {
+    let custom_chip = chip_url.is_empty();
+    if !custom_chip {
+        Some(chip_url)
     } else if provider_for(current).is_some() {
         Some("")
     } else {
@@ -29016,16 +29012,12 @@ mod tests {
 
     #[test]
     fn custom_chip_clears_a_known_provider_url() {
-        // A provider chip always prefills its endpoint.
         assert_eq!(
             picked_base_url("", "https://openrouter.ai/api/v1"),
             Some("https://openrouter.ai/api/v1")
         );
-        // Custom after another chip clears the field, so Custom lights up
-        // again instead of being stuck behind the old provider's URL.
         assert_eq!(picked_base_url("https://openrouter.ai/api/v1", ""), Some(""));
         assert_eq!(picked_base_url(LOCAL_OLLAMA_URL, ""), Some(""));
-        // A hand-typed endpoint is already Custom; clicking it keeps it.
         assert_eq!(picked_base_url("https://my.proxy.internal/v1", ""), None);
         assert_eq!(picked_base_url("", ""), None);
     }
