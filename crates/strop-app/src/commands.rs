@@ -504,6 +504,78 @@ fn palette_available(command: &Command) -> bool {
     command.label != "Check for updates" || crate::update::active_channel()
 }
 
+/// Rows the macOS application menu (the bold "Strop" one) owns outright:
+/// About and updates live there by platform convention, so their Help
+/// rows would only be a second address for the same verb.
+#[cfg(any(target_os = "macos", test))]
+const APP_MENU_ONLY: &[&str] = &["About Strop", "Check for updates"];
+
+/// The macOS menu bar, built from this table so it can never disagree
+/// with the palette about what exists or which chord runs it. The
+/// palette stays the menu (PLAN.md shell principle 1) — this is the
+/// same table at the address every Mac writer already re-finds (P14),
+/// one submenu per section in table order. Chords are not repeated
+/// here: gpui reads each row's key equivalent from the keymap that
+/// `bind_keys` loaded from these same rows. Availability is gpui's too:
+/// a row whose handler is off the focused dispatch path greys out, so
+/// an Editor-scoped verb can't reach the document from a field overlay
+/// through its menu equivalent either.
+#[cfg(any(target_os = "macos", test))]
+pub fn app_menus() -> Vec<gpui::Menu> {
+    use gpui::{Menu, MenuItem, SystemMenuType};
+    use crate::{HideOthers, HideStrop, Quit, ShowAll};
+
+    let row = |command: &Command| MenuItem::Action {
+        name: command.label.into(),
+        action: (command.make)(),
+        os_action: None,
+        checked: false,
+        disabled: false,
+    };
+    let by_label = |label: &str| all().iter().find(|c| c.label == label);
+
+    let mut app = Vec::new();
+    app.extend(
+        APP_MENU_ONLY
+            .iter()
+            .filter_map(|label| by_label(label))
+            .filter(|command| palette_available(command))
+            .map(row),
+    );
+    // The settings slot: the one in-app configuration surface (PLAN.md
+    // shell principle 2). It keeps its Margin & AI row as well.
+    app.push(MenuItem::separator());
+    app.extend(by_label("Set Up AI Provider…").map(row));
+    app.extend([
+        MenuItem::separator(),
+        MenuItem::os_submenu("Services", SystemMenuType::Services),
+        MenuItem::separator(),
+        MenuItem::action("Hide Strop", HideStrop),
+        MenuItem::action("Hide Others", HideOthers),
+        MenuItem::action("Show All", ShowAll),
+        MenuItem::separator(),
+        MenuItem::action("Quit Strop", Quit),
+    ]);
+
+    let mut sections: Vec<&'static str> = Vec::new();
+    for command in all() {
+        if !sections.contains(&command.section) {
+            sections.push(command.section);
+        }
+    }
+    std::iter::once(Menu::new("Strop").items(app))
+        .chain(sections.into_iter().map(|section| {
+            Menu::new(section).items(
+                all()
+                    .iter()
+                    .filter(|c| c.section == section)
+                    .filter(|c| palette_available(c) && !APP_MENU_ONLY.contains(&c.label))
+                    .map(row),
+            )
+        }))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +692,46 @@ mod tests {
                 assert!(seen.insert(k), "duplicate binding {k}");
             }
         }
+    }
+
+    #[test]
+    fn mac_menu_bar_lists_every_palette_row_once_by_section() {
+        let menus = app_menus();
+        let names = |items: &[gpui::MenuItem]| -> Vec<String> {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    gpui::MenuItem::Action { name, .. } => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The bold application menu first, then the palette's sections in
+        // table order — a section that recurs later (View) is one menu.
+        let titles: Vec<String> = menus.iter().map(|m| m.name.to_string()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Strop", "File", "Edit", "Format", "Structure", "View", "Scraps",
+                "Margin & AI", "History", "Session", "Help",
+            ]
+        );
+        let app = names(&menus[0].items);
+        assert_eq!(app.first().map(String::as_str), Some("About Strop"));
+        assert_eq!(app.last().map(String::as_str), Some("Quit Strop"));
+        assert!(app.iter().any(|n| n == "Set Up AI Provider…"));
+        // Every row the palette offers is in exactly one section menu,
+        // except those the application menu owns outright.
+        let section_rows: Vec<String> = menus[1..].iter().flat_map(|m| names(&m.items)).collect();
+        for command in all().iter().filter(|c| palette_available(c)) {
+            let hits = section_rows.iter().filter(|n| *n == command.label).count();
+            let expected = usize::from(!APP_MENU_ONLY.contains(&command.label));
+            assert_eq!(hits, expected, "{} in section menus", command.label);
+        }
+        // The dev build hides the dead update verb here as in the palette.
+        assert!(!app.iter().any(|n| n == "Check for updates"));
+        // View's later rows (after the Scraps section) join its one menu.
+        assert_eq!(names(&menus[5].items), ["Scraps", "Toggle Graveyard", "Read it cold"]);
     }
 
     #[test]
