@@ -504,6 +504,84 @@ fn palette_available(command: &Command) -> bool {
     command.label != "Check for updates" || crate::update::active_channel()
 }
 
+#[cfg(any(target_os = "macos", test))]
+const APP_MENU_ONLY: &[&str] = &["About Strop", "Check for updates"];
+
+#[cfg(any(target_os = "macos", test))]
+const SETTINGS_COMMAND: &str = "Set Up AI Provider…";
+
+#[cfg(any(target_os = "macos", test))]
+pub fn app_menus() -> Vec<gpui::Menu> {
+    std::iter::once(application_menu())
+        .chain(sections_in_table_order().into_iter().map(section_menu))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn application_menu() -> gpui::Menu {
+    use gpui::{MenuItem, SystemMenuType};
+    use crate::{HideOthers, HideStrop, Quit, ShowAll};
+
+    let mut items: Vec<MenuItem> = APP_MENU_ONLY
+        .iter()
+        .filter_map(|label| command_by_label(label))
+        .filter(|command| palette_available(command))
+        .map(menu_row)
+        .collect();
+    items.push(MenuItem::separator());
+    items.extend(command_by_label(SETTINGS_COMMAND).map(menu_row));
+    items.extend([
+        MenuItem::separator(),
+        MenuItem::os_submenu("Services", SystemMenuType::Services),
+        MenuItem::separator(),
+        MenuItem::action("Hide Strop", HideStrop),
+        MenuItem::action("Hide Others", HideOthers),
+        MenuItem::action("Show All", ShowAll),
+        MenuItem::separator(),
+        MenuItem::action("Quit Strop", Quit),
+    ]);
+    gpui::Menu::new("Strop").items(items)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn section_menu(section: &'static str) -> gpui::Menu {
+    gpui::Menu::new(section).items(
+        all()
+            .iter()
+            .filter(|command| command.section == section)
+            .filter(|command| palette_available(command))
+            .filter(|command| !APP_MENU_ONLY.contains(&command.label))
+            .map(menu_row),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn sections_in_table_order() -> Vec<&'static str> {
+    let mut sections = Vec::new();
+    for command in all() {
+        if !sections.contains(&command.section) {
+            sections.push(command.section);
+        }
+    }
+    sections
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn command_by_label(label: &str) -> Option<&'static Command> {
+    all().iter().find(|command| command.label == label)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn menu_row(command: &Command) -> gpui::MenuItem {
+    gpui::MenuItem::Action {
+        name: command.label.into(),
+        action: (command.make)(),
+        os_action: None,
+        checked: false,
+        disabled: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +698,40 @@ mod tests {
                 assert!(seen.insert(k), "duplicate binding {k}");
             }
         }
+    }
+
+    #[test]
+    fn mac_menu_bar_lists_every_palette_row_once_by_section() {
+        let menus = app_menus();
+        let names = |items: &[gpui::MenuItem]| -> Vec<String> {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    gpui::MenuItem::Action { name, .. } => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let titles: Vec<String> = menus.iter().map(|m| m.name.to_string()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Strop", "File", "Edit", "Format", "Structure", "View", "Scraps",
+                "Margin & AI", "History", "Session", "Help",
+            ]
+        );
+        let app = names(&menus[0].items);
+        assert_eq!(app.first().map(String::as_str), Some("About Strop"));
+        assert_eq!(app.last().map(String::as_str), Some("Quit Strop"));
+        assert!(app.iter().any(|n| n == SETTINGS_COMMAND));
+        let section_rows: Vec<String> = menus[1..].iter().flat_map(|m| names(&m.items)).collect();
+        for command in all().iter().filter(|c| palette_available(c)) {
+            let hits = section_rows.iter().filter(|n| *n == command.label).count();
+            let expected = usize::from(!APP_MENU_ONLY.contains(&command.label));
+            assert_eq!(hits, expected, "{} in section menus", command.label);
+        }
+        assert!(!app.iter().any(|n| n == "Check for updates"));
+        assert_eq!(names(&menus[5].items), ["Scraps", "Toggle Graveyard", "Read it cold"]);
     }
 
     #[test]
