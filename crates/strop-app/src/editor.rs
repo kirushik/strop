@@ -6278,9 +6278,10 @@ impl Editor {
             return;
         };
         panel.test = AiSettingsTest::Idle;
-        if !base_url.is_empty() {
+        let current = panel.base_url.read(cx).content.clone();
+        if let Some(next) = picked_base_url(&current, base_url) {
             panel.base_url.update_checked(cx, |input, cx| {
-                input.content = base_url.to_owned();
+                input.content = next.to_owned();
                 cx.notify();
             });
         }
@@ -19601,6 +19602,17 @@ fn provider_for(base_url: &str) -> Option<&'static ProviderInfo> {
         .find(|p| !p.host_match.is_empty() && url.contains(p.host_match))
 }
 
+fn picked_base_url(current: &str, chip_url: &'static str) -> Option<&'static str> {
+    let custom_chip = chip_url.is_empty();
+    if !custom_chip {
+        Some(chip_url)
+    } else if provider_for(current).is_some() {
+        Some("")
+    } else {
+        None
+    }
+}
+
 /// Choose a model from a provider's /models list for the one-click local
 /// path: skip obvious embedding-only models, else take the first.
 fn pick_local_model(models: Vec<String>) -> Option<String> {
@@ -28996,6 +29008,18 @@ mod tests {
         // Custom is never matched by host (its host_match is empty), so it
         // can't shadow a real provider.
         assert!(PROVIDERS.iter().any(|p| p.label == "Custom" && p.host_match.is_empty()));
+    }
+
+    #[test]
+    fn custom_chip_clears_a_known_provider_url() {
+        assert_eq!(
+            picked_base_url("", "https://openrouter.ai/api/v1"),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(picked_base_url("https://openrouter.ai/api/v1", ""), Some(""));
+        assert_eq!(picked_base_url(LOCAL_OLLAMA_URL, ""), Some(""));
+        assert_eq!(picked_base_url("https://my.proxy.internal/v1", ""), None);
+        assert_eq!(picked_base_url("", ""), None);
     }
 
     #[test]
