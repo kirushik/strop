@@ -417,10 +417,6 @@ fn main() {
         // Actions entry.
         #[cfg(target_os = "macos")]
         cx.set_dock_menu(vec![gpui::MenuItem::action("New Document", DockNewDocument)]);
-        // macOS only: the menu bar is the platform's standing address for
-        // every verb, and without one the bar shows a bare app name. It is
-        // the command table again (commands::app_menus), so it can't drift
-        // from the palette. Linux and Windows keep the palette alone.
         #[cfg(target_os = "macos")]
         {
             cx.on_action(|_: &HideStrop, cx| cx.hide());
