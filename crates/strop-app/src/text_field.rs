@@ -433,6 +433,19 @@ impl TextField {
         self.marked = None;
     }
 
+    /// Replace the whole text from outside the field — a chip prefill, a
+    /// picked model. Assigning `content` directly left the caret, the
+    /// selection, the IME preedit and any drag as byte offsets into the OLD
+    /// text, and the writer's next keystroke spliced past the new end (a
+    /// panic whenever the new text was shorter). Through `replace`, the
+    /// single splice point, so the newline policy holds here too and the
+    /// caret lands after the new text, as if it had been typed.
+    pub(crate) fn set_content(&mut self, text: &str) {
+        self.replace(0..self.content.len(), text);
+        self.is_selecting = false;
+        self.selection_origin = None;
+    }
+
     /// Move the caret to byte `target`; `extend` keeps/starts a selection,
     /// otherwise the selection collapses.
     fn move_to(&mut self, target: usize, extend: bool) {
@@ -1371,6 +1384,30 @@ impl Element for TextFieldElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn set_content_leaves_no_offset_into_the_old_text(cx: &mut gpui::TestAppContext) {
+        // A field caught mid-gesture over its old text — a selection, an
+        // IME preedit, a drag in flight — has its whole text replaced from
+        // outside. Every offset into the old text must go with it; the
+        // caret lands after the new text, as if it had been typed.
+        let field = cx.new(|cx| {
+            TextField::single_selected(cx, "https://openrouter.ai/api/v1".into())
+        });
+        cx.update_entity(&field, |field, _| {
+            field.marked = Some(20..28);
+            field.is_selecting = true;
+            field.selection_origin = Some(0..28);
+            field.set_content("ok");
+            assert_eq!(field.content, "ok");
+            assert_eq!((field.cursor, field.anchor, field.marked.clone()), (2, None, None));
+            assert!(!field.is_selecting);
+            assert_eq!(field.selection_origin, None);
+            // The keystroke that used to splice past the end.
+            field.replace(field.sel_range(), "!");
+            assert_eq!(field.content, "ok!");
+        });
+    }
 
     #[test]
     fn grapheme_motion_never_splits_a_cluster() {
