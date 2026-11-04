@@ -52,7 +52,10 @@ use strop_core::document::{BlockMap, SpanSet};
 use draw_guard::EntityUpdateExt as _;
 use editor::Editor;
 
-actions!(strop, [Quit, AboutStrop, CheckForUpdates, DockNewDocument]);
+actions!(
+    strop,
+    [Quit, AboutStrop, CheckForUpdates, DockNewDocument, HideStrop, HideOthers, ShowAll]
+);
 
 /// Minimal %XX decoder for the file:// URLs the OS hands to
 /// `on_open_urls`. Any malformed escape rejects the whole URL — better
@@ -414,6 +417,13 @@ fn main() {
         // Actions entry.
         #[cfg(target_os = "macos")]
         cx.set_dock_menu(vec![gpui::MenuItem::action("New Document", DockNewDocument)]);
+        #[cfg(target_os = "macos")]
+        {
+            cx.on_action(|_: &HideStrop, cx| cx.hide());
+            cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+            cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+            cx.set_menus(commands::app_menus());
+        }
 
         // Smoke runs must not steal the user's OS focus — keystroke dispatch
         // uses GPUI's internal focus, which we set explicitly below. They
