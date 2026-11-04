@@ -6170,7 +6170,7 @@ impl Editor {
             if !already {
                 let pick = pick.clone();
                 panel.model.update_checked(cx, |input, cx| {
-                    input.content = pick;
+                    input.set_content(&pick);
                     cx.notify();
                 });
                 cx.notify();
@@ -6281,7 +6281,7 @@ impl Editor {
         let current = panel.base_url.read(cx).content.clone();
         if let Some(next) = picked_base_url(&current, base_url) {
             panel.base_url.update_checked(cx, |input, cx| {
-                input.content = next.to_owned();
+                input.set_content(next);
                 cx.notify();
             });
         }
@@ -10364,7 +10364,7 @@ impl Editor {
                             if let Some(panel) = &editor.ai_settings {
                                 let m = model_id.clone();
                                 panel.model.update_checked(cx, |input, cx| {
-                                    input.content = m;
+                                    input.set_content(&m);
                                     cx.notify();
                                 });
                             }
@@ -29020,6 +29020,81 @@ mod tests {
         assert_eq!(picked_base_url(LOCAL_OLLAMA_URL, ""), Some(""));
         assert_eq!(picked_base_url("https://my.proxy.internal/v1", ""), None);
         assert_eq!(picked_base_url("", ""), None);
+    }
+
+    /// The AI panel as `open_ai_settings` builds it, minus the window: the
+    /// fields open with their caret at the end, as a writer finds them.
+    fn ai_panel(cx: &mut Context<Editor>, base_url: &str, model: &str) -> AiSettings {
+        AiSettings {
+            base_url: cx.new(|cx| TextField::settings(cx, base_url.into(), false)),
+            api_key: cx.new(|cx| TextField::settings(cx, String::new(), true)),
+            model: cx.new(|cx| TextField::settings(cx, model.into(), false)),
+            test: AiSettingsTest::Idle,
+            models: Vec::new(),
+            selected: 0,
+            models_note: None,
+        }
+    }
+
+    /// Type `text` into `field` the way the OS does — through the input
+    /// handler, at whatever the field believes its caret to be.
+    fn type_into(field: &Entity<TextField>, text: &str, window: &mut Window, cx: &mut App) {
+        use gpui::EntityInputHandler as _;
+        field.update_checked(cx, |field, cx| field.replace_text_in_range(None, text, window, cx));
+    }
+
+    #[gpui::test]
+    fn custom_chip_then_typing_starts_a_fresh_url(cx: &mut gpui::TestAppContext) {
+        // The field opens focused with its caret after the saved URL; the
+        // chip click never moves focus. Emptying the text under a caret
+        // still parked at byte 28 made the writer's next keystroke splice
+        // past the end of "" — a panic, on exactly the path this chip
+        // exists for ("switch to Custom, type my URL").
+        cx.add_empty_window().update(|window, cx| {
+            let editor = cx.new(|cx| Editor::new(cx, "", SpanSet::default(), BlockMap::default()));
+            let field = editor.update_checked(cx, |editor, cx| {
+                editor.ai_settings = Some(ai_panel(cx, "https://openrouter.ai/api/v1", ""));
+                editor.ai_settings_pick_provider("", false, cx);
+                editor.ai_settings.as_ref().unwrap().base_url.clone()
+            });
+            type_into(&field, "h", window, cx);
+            assert_eq!(field.read(cx).content, "h");
+        });
+    }
+
+    #[gpui::test]
+    fn a_shorter_provider_url_then_typing_appends(cx: &mut gpui::TestAppContext) {
+        // The older half of the same wound: OpenRouter (28 bytes) to Poe
+        // (22) left the caret six bytes past the end.
+        cx.add_empty_window().update(|window, cx| {
+            let editor = cx.new(|cx| Editor::new(cx, "", SpanSet::default(), BlockMap::default()));
+            let field = editor.update_checked(cx, |editor, cx| {
+                editor.ai_settings = Some(ai_panel(cx, "https://openrouter.ai/api/v1", ""));
+                editor.ai_settings_pick_provider("https://api.poe.com/v1", false, cx);
+                editor.ai_settings.as_ref().unwrap().base_url.clone()
+            });
+            type_into(&field, "/", window, cx);
+            assert_eq!(field.read(cx).content, "https://api.poe.com/v1/");
+        });
+    }
+
+    #[gpui::test]
+    fn a_model_picked_with_enter_then_typing_appends(cx: &mut gpui::TestAppContext) {
+        // The model filter trims and folds case, so a pick can be SHORTER
+        // than the query that found it ("LLAMA3  " finds "llama3"): the
+        // caret must follow the picked name, not the typed query.
+        cx.add_empty_window().update(|window, cx| {
+            let editor = cx.new(|cx| Editor::new(cx, "", SpanSet::default(), BlockMap::default()));
+            let field = editor.update_checked(cx, |editor, cx| {
+                let mut panel = ai_panel(cx, "", "LLAMA3  ");
+                panel.models = vec!["llama3".into()];
+                editor.ai_settings = Some(panel);
+                editor.ai_settings_commit(cx);
+                editor.ai_settings.as_ref().unwrap().model.clone()
+            });
+            type_into(&field, ":", window, cx);
+            assert_eq!(field.read(cx).content, "llama3:");
+        });
     }
 
     #[test]
